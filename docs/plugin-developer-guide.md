@@ -389,6 +389,7 @@ max_kv_storage_kb = 1024
 | `resources.max_execution_time_ms` | ❌ | integer | Timeout ms (default 5000) |
 | `resources.max_http_requests` | ❌ | integer | HTTP request limit (default 10) |
 | `resources.max_kv_storage_kb` | ❌ | integer | KV storage limit KB (default 1024) |
+| `resources.max_payload_bytes` | ❌ | integer | Payload cap in bytes for every WASM capability call that carries input (default: an eighth of `max_memory_mb`, floor 64 KiB). `0` is rejected; a value above `max_memory_mb` is clamped to it |
 | `config.*` | ❌ | string | Static configuration key-value pairs |
 
 ---
@@ -424,6 +425,20 @@ interface tool-exports {
 **Pattern:**
 - `get-spec` is called **once** at load time. Return your tool's name, description, and JSON Schema for parameters.
 - `execute` is called each time the LLM invokes the tool. `args` is a JSON string matching your schema.
+
+**Stop does not stop your guest.** Every tool call runs on its own task, so a user pressing Stop ends the wait, not the call: an HTTP request, a `kv` write or a memory write your guest makes still happens, up to `max_execution_time_ms`. Make side-effecting tools idempotent where you can.
+
+**When a call fails.** A tool adapter owns one wasmtime store and recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3), but every failure reaches the model as a failed tool result, never as a success:
+
+| Event | What the model sees |
+|-------|---------------------|
+| `execute` returns `success: false` | Your result, unchanged. This is an answer, not a failure of the adapter. |
+| The call traps, runs out of fuel or memory | A tool error. The next call runs on a rebuilt store. |
+| The call runs past `max_execution_time_ms` | `WASM plugin timed out after …ms`. Charged to the restart budget like a trap. Waiting for the store behind other calls is bounded by the same value and not charged, so one call can take up to about three times `max_execution_time_ms` in the worst case (wait, rebuild, call). Provider and storage calls have the same bound. |
+| Arguments larger than the payload cap | A tool error naming `max_payload_bytes`; your guest is not called. |
+| The tool is quarantined | A tool error naming the quarantine, on every call until the next plugin generation. The tool stays listed. |
+
+A trapped call is never retried for you: it may already have made an HTTP request. `wasm_plugins_status` lists each tool under `tool_adapters` with `plugin`, `tool` and the health fields described under 4.3, and a quarantine publishes `prx.plugin.tool_quarantined`.
 
 **`plugin.toml`:**
 ```toml
@@ -492,6 +507,8 @@ pattern = "tool.call"
 description = "Tool invocations only"
 ```
 
+**When a delivery fails.** A hook adapter recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3). Hooks are observe-only, so every failure fails open: a hook that traps, times out, is being rebuilt or is quarantined simply does not see that event, and a payload larger than the payload cap is skipped (`skipped_oversize`). Your `on-event` result is recorded, never acted on. Counters you keep through `kv` — as the audit example does — survive a rebuild; anything kept in guest memory does not. Event subscriptions survive a rebuild, and `subscribe` is idempotent per pattern: calling it again after a rebuild returns the existing subscription instead of adding a second delivery. `wasm_plugins_status` lists each hook under `hook_adapters` with `invocation_count` and `last_event` (deliveries that reached your guest; one refused while the hook is quarantined or awaiting a rebuild is not counted), `last_error` (the most recent failure, kept after later successes) and the health fields; a quarantine publishes `prx.plugin.hook_quarantined`.
+
 **Event patterns:**
 - Exact: `"tool.call"` — matches only that event
 - Wildcard: `"prx.lifecycle.*"` — matches all events under `prx.lifecycle.`
@@ -503,6 +520,13 @@ description = "Tool invocations only"
 |-------|-------------|---------------|
 | `prx.lifecycle.agent_start` | Agent started | `agent_id` |
 | `prx.lifecycle.agent_stop` | Agent stopped | `agent_id`, `reason` |
+| `prx.plugin.middleware_quarantined` | A middleware adapter spent its restart budget and is no longer called | `plugin`, `capability`, `reason` |
+| `prx.plugin.tool_quarantined` | A tool adapter spent its restart budget; its calls return a tool error | `plugin`, `capability`, `reason` |
+| `prx.plugin.hook_quarantined` | A hook adapter spent its restart budget and no longer observes events | `plugin`, `capability`, `reason` |
+| `prx.plugin.cron_quarantined` | A cron adapter spent its restart budget and its occurrences are skipped | `plugin`, `capability`, `reason` |
+| `prx.plugin.provider_quarantined` | A provider adapter spent its restart budget; its requests return an error | `plugin`, `capability`, `reason` |
+| `prx.plugin.storage_quarantined` | A storage adapter spent its restart budget; its operations return an error | `plugin`, `capability`, `reason` |
+| `prx.plugin.storage_restarted` | A storage adapter was rebuilt on a fresh store; entries kept in guest memory are gone | `plugin`, `capability`, `reason`, `restart_count` |
 | `tool.call` | Tool invoked | `tool_name`, `args`, `session_id` |
 | `tool.result` | Tool completed | `tool_name`, `success`, `duration_ms` |
 | `llm.request` | LLM request sent | `model`, `message_count` |
@@ -546,12 +570,49 @@ interface middleware-exports {
 
 **Pipeline stages:**
 
-| Stage | When called | `data-json` shape |
-|-------|-------------|-------------------|
-| `inbound` | After receiving a message, before agent loop | `{ text, channel, user_id, session_id }` |
-| `outbound` | After agent loop, before sending reply | `{ text, channel, session_id }` |
-| `llm_request` | Before sending to LLM | `{ messages: [...], model, temperature }` |
-| `llm_response` | After receiving LLM response | `{ text, tool_calls: [...], model }` |
+| Stage | When called | Invocations per turn | `data-json` shape |
+|-------|-------------|----------------------|-------------------|
+| `inbound` | After receiving a message, before agent loop | Once per admitted turn | `{ text, channel, user_id, session_id }` |
+| `outbound` | After the agent loop has accepted the final response, before delivery and history insertion | Once per delivered turn; zero for tool-call iterations, for responses a corrective retry replaces, and for silent turns | `{ channel, text, has_tool_calls }` |
+| `llm_request` | Before sending to LLM | Once per provider call | `{ messages: [...], model, temperature }` |
+| `llm_response` | After receiving LLM response | Once per provider response | `{ text, tool_calls: [...], model }` |
+
+**`outbound` runs exactly once per delivered turn.** It is invoked on the
+terminal text after every retry, repair and marker guard has accepted the
+response, and immediately before that text is streamed, stored in history and
+returned. It is not invoked on a tool-call iteration (those keep their
+pre-outbound assistant representation in history), on a response that a
+corrective retry then replaces, or on a turn that delivers nothing
+(`stay_silent`).
+
+A turn that fails before its terminal response is accepted never reaches the
+stage. A turn cancelled while the accepted reply is being streamed has already
+run it: the stage runs before the first chunk leaves the loop, so the plugin
+executed once for a turn the caller is told failed. If your `outbound` path has
+side effects, treat an execution as "a reply was accepted", not as "a reply was
+delivered in full".
+
+On entrypoints that stream provider tokens live — chat and TUI provider
+streaming — the user sees the provider's own text as it arrives, before
+`outbound` runs on that turn. The reply stored in history and returned to the
+caller is the post-outbound text, and so are the chunks the tool loop itself
+emits; only the live provider deltas of those entrypoints are pre-outbound. A
+middleware plugin that redacts text cannot rely on `outbound` alone to keep the
+redacted string off those screens.
+
+> **Compatibility warning.** Before this contract was enforced, outbound was
+> invoked once per loop iteration instead of once per accepted delivered turn:
+> a turn with N tool rounds ran the stage N+1 times, and every corrective retry
+> added one more. Middleware whose `outbound` path has side effects — counters,
+> audit records, rate budgets, billing, notifications, external writes — was
+> therefore executed several times for one delivered reply, and should be
+> re-checked against the exactly-once contract. Pure text transformations are
+> unaffected in their delivered output.
+>
+> `has_tool_calls` is now always `false` at the single call site, because the
+> stage runs only on a terminal response. The field is kept in the envelope so
+> existing plugins that read it still parse the payload; do not use it to decide
+> whether a response is final.
 
 **`plugin.toml`:**
 ```toml
@@ -585,7 +646,32 @@ pub fn process_impl(stage: &str, data_json: &str) -> Result<String, String> {
 }
 ```
 
-**Returning an error from `process` blocks the pipeline.** Use this for enforcement (content filters, auth checks). The error message is returned to the caller.
+**Returning an error from `process` does not block the turn:** the envelope passes through unchanged (fail open). Do not rely on middleware for enforcement.
+
+**Every middleware stage fails open.** A plugin that returns an error, traps, times out, is being rebuilt, is quarantined, or is skipped for an oversized payload leaves the envelope unchanged; the turn continues. This is the same for trusted and untrusted plugins, so `outbound` alone cannot guarantee that a redaction reaches the user.
+
+#### Trap recovery, restart budget and quarantine
+
+A middleware adapter owns one wasmtime `Store`. Wasmtime poisons the whole store when anything unwinds out of wasm — a trap, exhausted fuel, a failed `memory.grow`, or the host timeout — and a poisoned store refuses every later call. PRX therefore rebuilds the adapter on a brand-new store:
+
+| Event | What PRX does |
+|-------|---------------|
+| The call traps or times out (a guest still computing in wasm at `max_execution_time_ms` is interrupted by the epoch deadline, and that counts as a timeout) | The adapter is marked dead and the envelope passes through unchanged. One `error` log line carries `plugin`, `capability` (`middleware`), `operation` (the stage), `reason`, `restart_count`. |
+| The caller gives up mid-call (a stopped turn, a disconnected client, a caller deadline shorter than yours) | Nothing happens to your guest: every call runs on its own task, so it finishes, or reaches `max_execution_time_ms` and is charged as a timeout, exactly as if the caller had waited. Its side effects (HTTP requests, `kv` and memory writes) therefore still happen after the user pressed Stop, and a caller that retries a call it gave up on can run it twice. Only a runtime shutdown can drop a call mid-guest; that marks the adapter dead without charging the restart budget, and `cancelled_count` records it. |
+| The next call arrives | The adapter is rebuilt on a fresh store — new limits, fuel, epoch deadline and instantiation — and the call runs against it. |
+| The rebuild itself fails to instantiate | The attempt is charged to the restart budget, the adapter stays dead, the envelope passes through unchanged and the next call retries. One `warn` line. |
+| A fourth charged rebuild attempt inside one rolling window of `max(60 s, 4 × max_execution_time_ms)` (the window grows with the timeout so that a guest that hangs on every call, or on three calls in four, is caught while it is called back to back — less than about a third of the timeout idle between calls, for timeouts of 15 s or more (a shorter timeout gets a 60 s window, which tolerates more idle); faults further apart, such as an hourly job whose guest traps through an outage, keep being retried), or a fourth `max_execution_time_ms` timeout in a row with no call returning from your guest in between, at any pace — whether the guest was waiting in a host call or computing in wasm, where the epoch deadline interrupts it (other traps do not count; any result or guest-returned error resets it) | The adapter is quarantined: it is skipped entirely, one `error` line and one `prx.plugin.middleware_quarantined` event are emitted, every skipped call afterwards increments `skipped_quarantined`, and `wasm_plugins_status` reports it. |
+| Any reload, refresh, install, enable or disable | A new plugin generation builds new adapters, so quarantine ends. |
+
+**A rebuilt instance loses guest state.** Anything a plugin kept in its own linear memory — a counter, a cache, a compiled regex — starts empty after a rebuild. Data written through the `kv` host functions lives in host state and survives. Keep anything that has to outlive a trap in `kv`.
+
+`wasm_plugins_status` reports per middleware adapter: `state` (`live`, `restarting`, `quarantined`), `restart_count`, `failure_count`, `cancelled_count`, `skipped_oversize`, `skipped_quarantined`, `consecutive_timeouts`, `last_error`, `last_error_at`, and `quarantined_for_ms` and `quarantine_rule` (`restart_window` or `timeout_streak`) while quarantined. `restart_count` counts rebuild attempts, successful or not, including the uncharged ones that follow a cancellation. `last_error` may contain the error string your guest returned, so it is truncated to 512 characters, followed by a ` ... (truncated)` marker.
+
+#### Payload size
+
+Before a call is made, PRX compares the envelope against the adapter's payload cap. Over the cap the plugin is skipped for that call, the envelope passes through unchanged and `skipped_oversize` is incremented. The cap defaults to an eighth of `max_memory_mb` (with a 64 KiB floor), because a guest that parses its input into a DOM holds three live copies of the text at once. Raise it with `resources.max_payload_bytes` if the guest streams its input instead of parsing it whole.
+
+Two values are not accepted as written. `max_payload_bytes = 0` is rejected at load: it does not mean "unlimited", it skips every call for the adapter's whole life. A value above `max_memory_mb` is clamped down to the guest's linear memory with a warning, because a cap the guest could never hold re-arms the trap-rebuild-quarantine loop this guard exists to close.
 
 ---
 
@@ -646,6 +732,8 @@ pub fn run_impl() -> Result<String, String> {
     Ok(format!("Done. Total processed: {count}"))
 }
 ```
+
+**When a run fails.** A cron adapter recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3). A run that traps, times out or is refused while the job is quarantined returns an error — `cron_run` shows it, the scheduler records it — and is not retried before the job's next scheduled time. Keep state that must outlive a trap in `kv`, as the example above does: a rebuilt job starts with empty guest memory. `wasm_plugins_status` lists each job under `cron_adapters` with `plugin`, `schedule` and the health fields; a quarantine publishes `prx.plugin.cron_quarantined`.
 
 ---
 
@@ -727,6 +815,8 @@ pub fn chat_impl(
 }
 ```
 
+**When a request fails.** A provider adapter recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3). Every failure is returned to PRX as an error — a trap, a timeout, a refusal while quarantined, or a request larger than the payload cap (the sum of all message roles and contents plus the model name) — so the caller's retry and fallback layer decides what happens next. Nothing is truncated to fit and no response is invented. Long conversations grow with every turn: raise `max_memory_mb` and `max_payload_bytes` together if your provider must accept large histories. `wasm_plugins_status` lists each provider under `provider_adapter_status` with `plugin`, `provider` and the health fields; a quarantine publishes `prx.plugin.provider_quarantined`.
+
 ---
 
 ### 4.6 Storage
@@ -774,6 +864,8 @@ api_key = ""        # set at deploy time
 index_name = "prx-memory"
 namespace = "default"
 ```
+
+**When an operation fails.** Like every guest call, storage operations run detached from their caller: a caller that gives up does not cancel an operation already handed to your guest, so it completes (or hits `max_execution_time_ms`) as if the caller had waited. A storage adapter recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3), and every failure is an error: a write that traps, times out, is refused while quarantined, or is larger than the payload cap (key, content, category and session together) is reported as failed and never retried for you; a read that fails is an error, never an empty result; `health-check` failures read as unhealthy. **Entries kept in your guest's own memory do not survive a rebuild** — the trap already made them unreachable, and the rebuilt guest starts empty. The reset is reported in band: the first read (`recall`, `get`, `list`, `count`) made by the call that rebuilt your backend fails with an error saying the store was rebuilt and its guest-memory entries are gone, rather than answering "no memories"; the next read answers from the rebuilt store. Every storage rebuild is also logged at `warn` with the storage name and published on `prx.plugin.storage_restarted` for operators; nothing in PRX itself subscribes to it. Keep durable data outside the guest: in an external service, or in `kv`, which survives a rebuild but not a plugin reload. `wasm_plugins_status` lists each backend under `storage_adapter_status` with `plugin`, `storage` and the health fields; a quarantine publishes `prx.plugin.storage_quarantined`.
 
 ---
 
@@ -1077,6 +1169,7 @@ Resource limits protect the PRX host from misbehaving plugins.
 | Wall time | `max_execution_time_ms` | 5000 | Per-invocation timeout |
 | HTTP calls | `max_http_requests` | 10 | Outbound requests per invocation |
 | KV storage | `max_kv_storage_kb` | 1024 | Total KV data for this plugin |
+| Payload | `max_payload_bytes` | an eighth of `max_memory_mb`, floor 64 KiB | Largest payload handed to a guest in one call (middleware, tool, hook, provider, storage); `0` is rejected and a value above `max_memory_mb` is clamped to it |
 
 ### Fuel Budget Guide
 
@@ -1089,6 +1182,8 @@ Resource limits protect the PRX host from misbehaving plugins.
 | Default limit | 100M |
 
 When fuel is exhausted, the plugin call returns an error: `"plugin ran out of fuel"`. Increase `max_fuel` if you hit this limit in production.
+
+**Fuel is metered per invocation for every capability kind.** `max_fuel` is re-armed on the adapter's store before every call (and before the load-time `get-spec` or `name()` probe), alongside the epoch deadline, so it means "the budget for one call". It used to be armed only when the adapter was built, which made it a process-lifetime allowance that every call drained until the store trapped and stayed poisoned. This is a widening: a long-running plugin now gets more total compute than before, and a `max_fuel` value chosen to cover a whole process has to be re-read as a per-call figure.
 
 ### Memory Guide
 
@@ -1289,6 +1384,7 @@ Topics are dot-separated strings. Use a hierarchy that reflects your domain:
 ```
 prx.lifecycle.agent_start
 prx.lifecycle.agent_stop
+prx.plugin.middleware_quarantined
 tool.call
 tool.result
 llm.request

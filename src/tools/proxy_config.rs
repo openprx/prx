@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::config::{
-    Config, ConfigApplyReport, ConfigReloadTrigger, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config,
+use crate::config::manage::{
+    ApplyOptions, ConfigActor, ConfigChange, ConfigChangeRisk, ConfigChangeSummary, ConfigTransactions,
 };
+use crate::config::{Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config};
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -10,6 +11,14 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::fs;
 use std::sync::Arc;
+
+/// A `set` built from one desired-configuration snapshot: the snapshot, the
+/// configuration the change produces, and the snapshot's revision.
+struct PreparedSet {
+    current: Config,
+    updated: Config,
+    revision: Option<String>,
+}
 
 pub struct ProxyConfigTool {
     config: SharedConfig,
@@ -122,11 +131,18 @@ impl ProxyConfigTool {
         Ok(output)
     }
 
+    /// A proxy URL as the model may see it: its `user:password@` replaced,
+    /// the host kept (`secret_paths::ENDPOINT_PATHS` lists the proxy URLs).
+    fn shown_url(url: Option<&str>) -> Option<String> {
+        url.map(|url| crate::providers::redact_endpoint_userinfo(url).into_owned())
+    }
+
     fn env_snapshot() -> Value {
+        let var = |name: &str| Self::shown_url(std::env::var(name).ok().as_deref());
         json!({
-            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok(),
-            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok(),
-            "ALL_PROXY": std::env::var("ALL_PROXY").ok(),
+            "HTTP_PROXY": var("HTTP_PROXY"),
+            "HTTPS_PROXY": var("HTTPS_PROXY"),
+            "ALL_PROXY": var("ALL_PROXY"),
             "NO_PROXY": std::env::var("NO_PROXY").ok(),
         })
     }
@@ -135,9 +151,9 @@ impl ProxyConfigTool {
         json!({
             "configured": proxy.has_any_proxy_url(),
             "scope": proxy.scope,
-            "http_proxy": proxy.http_proxy,
-            "https_proxy": proxy.https_proxy,
-            "all_proxy": proxy.all_proxy,
+            "http_proxy": Self::shown_url(proxy.http_proxy.as_deref()),
+            "https_proxy": Self::shown_url(proxy.https_proxy.as_deref()),
+            "all_proxy": Self::shown_url(proxy.all_proxy.as_deref()),
             "no_proxy": proxy.normalized_no_proxy(),
             "services": proxy.normalized_services(),
         })
@@ -173,16 +189,18 @@ impl ProxyConfigTool {
         })
     }
 
-    async fn reload_saved_config(&self) -> anyhow::Result<ConfigApplyReport> {
-        let manager = Arc::clone(&self.config);
-        crate::runtime::blocking::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool))
-            .await
-            .map_err(|error| anyhow::anyhow!("proxy config reload worker failed: {error}"))?
-    }
-
-    async fn handle_set(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let mut cfg = self.load_config_without_env()?;
-        let previous_scope = cfg.proxy.scope;
+    /// The configuration `set` changes (the complete desired configuration,
+    /// every `config.d` fragment and decrypted secret included) and the one
+    /// it would store. Nothing is written: the change is classified first
+    /// (D-049 C) and then saved as a configuration transaction (D-050).
+    fn prepare_set(&self, args: &Value) -> anyhow::Result<PreparedSet> {
+        // The snapshot and its revision are read together (D-051): the save
+        // is bound to exactly the configuration the change was built on, so
+        // a write that lands in between is a conflict, never silently undone.
+        let desired = self.config.desired();
+        let current = desired.config.as_ref().clone();
+        let revision = ConfigTransactions::base_revision(&desired);
+        let mut cfg = current.clone();
         let mut proxy = cfg.proxy.clone();
 
         if let Some(scope_raw) = args.get("scope") {
@@ -235,9 +253,63 @@ impl ProxyConfigTool {
         proxy.services = proxy.normalized_services();
         proxy.validate()?;
 
-        cfg.proxy = proxy.clone();
-        cfg.save().await?;
-        let report = self.reload_saved_config().await?;
+        cfg.proxy = proxy;
+        Ok(PreparedSet {
+            current,
+            updated: cfg,
+            revision,
+        })
+    }
+
+    /// The approval tier of a `set`: the configuration plan's risk decides
+    /// it, through the same classifier every configuration write uses
+    /// (`config::manage::plan`). A proxy URL is an endpoint every
+    /// credentialed request goes through, so re-pointing one (or adding
+    /// userinfo) is high risk; a scope, service or `no_proxy` change is not.
+    fn set_risk(current: &Config, updated: &Config) -> anyhow::Result<(ResourceRiskLevel, ConfigChangeSummary)> {
+        let summary = ConfigChangeSummary::between(Some(current), updated)?;
+        let risk = if summary.risk == ConfigChangeRisk::High {
+            ResourceRiskLevel::High
+        } else {
+            ResourceRiskLevel::Medium
+        };
+        Ok((risk, summary))
+    }
+
+    async fn handle_set(&self, prepared: &PreparedSet, summary: &ConfigChangeSummary) -> anyhow::Result<ToolResult> {
+        let (current, cfg) = (&prepared.current, &prepared.updated);
+        let previous_scope = current.proxy.scope;
+        let proxy = cfg.proxy.clone();
+        // Saved through the transaction layer: history record, revision check
+        // against the configuration the change was built on, compensating
+        // restore if the runtime refuses it (D-050). The approval gate has
+        // already approved the plan's risk; it confirms exactly the reasons
+        // it classified, bound to that revision. A plan with more (the files
+        // drifted from the desired configuration) is refused.
+        let transactions = ConfigTransactions::new(Arc::clone(&self.config));
+        let base_revision = prepared.revision.clone();
+        let plan = transactions
+            .plan(ConfigChange::Structured(Box::new(cfg.clone())))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let confirmed = plan
+            .summary()
+            .risk_reasons
+            .iter()
+            .all(|reason| summary.risk_reasons.contains(reason));
+        let outcome = transactions
+            .apply(
+                plan,
+                ConfigActor::AgentProxyConfig,
+                ApplyOptions {
+                    expected_revision: base_revision.as_deref(),
+                    confirm_high_risk: confirmed,
+                    confirmed_revision: base_revision.as_deref(),
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let report = &outcome.report;
         let active_proxy = self.config.load_full().proxy.clone();
 
         if report.rebuilt.iter().any(|field| field == "proxy")
@@ -263,6 +335,11 @@ impl ProxyConfigTool {
                 "desired_proxy": Self::proxy_json(&proxy),
                 "active_runtime_proxy": Self::proxy_json(&active_proxy),
                 "environment": Self::env_snapshot(),
+                // The plan's risk, which set the approval tier; reasons carry
+                // paths only.
+                "risk": summary.risk,
+                "risk_reasons": summary.risk_reasons,
+                "record_id": outcome.record_id,
             }))?,
             error: None,
         })
@@ -395,13 +472,34 @@ impl Tool for ProxyConfigTool {
                 self.handle_get()
             }
             "list_services" => self.handle_list_services(),
-            "set" | "apply_env" | "clear_env" => {
+            "set" => {
+                if let Some(blocked) = self.require_write_access() {
+                    return Ok(blocked);
+                }
+                // Classify before approval: the plan's risk is the approval
+                // tier (D-049 C). At `supervised` a high-risk set needs a
+                // runtime grant; at `full` it is approved (D-037).
+                match self.prepare_set(&args).and_then(|prepared| {
+                    Self::set_risk(&prepared.current, &prepared.updated).map(|risk| (prepared, risk))
+                }) {
+                    Ok((prepared, (risk, summary))) => {
+                        if let Some(blocked) =
+                            self.authorize_resource_operation("proxy_config:set", risk, approval_grant.as_ref())
+                        {
+                            return Ok(blocked);
+                        }
+                        self.handle_set(&prepared, &summary).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "apply_env" | "clear_env" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
 
                 let operation_name = match action.as_str() {
-                    "set" | "apply_env" => "proxy_config:set",
+                    "apply_env" => "proxy_config:set",
                     "clear_env" => "proxy_config:unset",
                     other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
                 };
@@ -414,7 +512,6 @@ impl Tool for ProxyConfigTool {
                 }
 
                 match action.as_str() {
-                    "set" => self.handle_set(&args).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
                     other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
@@ -636,5 +733,188 @@ mod tests {
         let parsed: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(parsed["proxy"]["http_proxy"].is_null());
         assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
+    }
+
+    /// RED before SECRETS-OTHER: `set` and `get` returned a proxy URL's
+    /// `user:password@` to the model verbatim. After: the URLs are shown with
+    /// only their userinfo replaced; the stored value keeps the credential.
+    #[tokio::test]
+    async fn proxy_urls_are_shown_without_their_userinfo() {
+        const PASSWORD: &str = "userinfo-sentinel-proxy-pw";
+        let tmp = TempDir::new().unwrap();
+        let shared = test_config(&tmp).await;
+        let tool = ProxyConfigTool::new(Arc::clone(&shared), test_security());
+
+        let set_result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": format!("http://proxy-user:{PASSWORD}@127.0.0.1:7890"),
+                "all_proxy": format!("socks5://proxy-user:{PASSWORD}@127.0.0.1:7891"),
+            }))
+            .await
+            .unwrap();
+        assert!(set_result.success, "{:?}", set_result.error);
+        assert!(
+            !set_result.output.contains(PASSWORD),
+            "set leaked: {}",
+            set_result.output
+        );
+        assert!(
+            set_result.output.contains("http://[redacted]@127.0.0.1:7890"),
+            "{}",
+            set_result.output
+        );
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        assert!(
+            !get_result.output.contains(PASSWORD),
+            "get leaked: {}",
+            get_result.output
+        );
+        assert!(
+            get_result.output.contains("socks5://[redacted]@127.0.0.1:7891"),
+            "{}",
+            get_result.output
+        );
+
+        assert_eq!(
+            shared.desired().config.proxy.http_proxy.as_deref(),
+            Some(format!("http://proxy-user:{PASSWORD}@127.0.0.1:7890").as_str()),
+            "the stored proxy keeps its credential"
+        );
+    }
+
+    /// D-049 C, RED before SECRETS-h (R-SECRETSfg P17): `set` re-pointed
+    /// every credentialed request through a proxy at a fixed Medium tier,
+    /// outside the configuration plan. After: the plan classifies the change;
+    /// a new proxy URL is high risk (an endpoint every credentialed request
+    /// goes through, here with userinfo), the approval tier is High, and the
+    /// output reports the risk and its reasons by path only. At `full`
+    /// autonomy it is approved (D-037); a scope-only change stays below High.
+    #[tokio::test]
+    async fn set_is_classified_by_the_configuration_plan() {
+        const PASSWORD: &str = "userinfo-sentinel-proxy-plan";
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "https_proxy": format!("http://proxy-user:{PASSWORD}@127.0.0.1:7890"),
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(!result.output.contains(PASSWORD), "{}", result.output);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["risk"], json!("high"), "{}", result.output);
+        let reasons = output["risk_reasons"].to_string();
+        assert!(reasons.contains("endpoint_changed"), "{reasons}");
+        assert!(reasons.contains("proxy.https_proxy"), "{reasons}");
+
+        let result = tool
+            .execute(json!({"action": "set", "no_proxy": ["localhost"]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["risk"], json!("low"), "{}", result.output);
+    }
+
+    /// D-049 C: at `supervised` a high-risk `set` without a runtime grant is
+    /// refused before anything is written.
+    #[tokio::test]
+    async fn a_high_risk_set_needs_approval_when_supervised() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, supervised_security());
+        let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let result = tool
+            .execute(json!({"action": "set", "http_proxy": "http://127.0.0.1:7890"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(), before);
+    }
+
+    /// D-050 item 6, RED before SECRETS-i (R-SECRETSfg H-8): `set` saved
+    /// straight to `config.toml`, outside the transaction layer (no history
+    /// record, no revision check). After: it is a configuration transaction:
+    /// the output names the history record, and a file changed since the
+    /// configuration was read is not overwritten.
+    #[tokio::test]
+    async fn set_is_a_configuration_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({"action": "set", "no_proxy": ["localhost"]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(output["record_id"].is_string(), "{}", result.output);
+
+        // Another writer changes the file; the tool has not seen it.
+        let path = tmp.path().join("config.toml");
+        let edited = format!("{}\n# edited by hand\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &edited).unwrap();
+        let result = tool
+            .execute(json!({"action": "set", "no_proxy": ["localhost", "example.invalid"]}))
+            .await
+            .unwrap();
+        assert!(!result.success, "a stale set must not overwrite: {}", result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    /// D-051, RED before SECRETS-j (R-SECRETSfg I-1): `set` built its change
+    /// from one snapshot but read the revision it saved against later, at
+    /// save time. A low-risk write landing in between was then silently
+    /// reverted (the candidate was the old snapshot plus the proxy change).
+    /// After: the revision is captured with the snapshot, the stale save is
+    /// a conflict, and the interleaved change survives.
+    #[tokio::test]
+    async fn an_interleaved_write_is_never_reverted() {
+        let tmp = TempDir::new().unwrap();
+        let shared = test_config(&tmp).await;
+        let tool = ProxyConfigTool::new(Arc::clone(&shared), test_security());
+
+        let prepared = tool.prepare_set(&json!({"no_proxy": ["localhost"]})).unwrap();
+        let (_, summary) = ProxyConfigTool::set_risk(&prepared.current, &prepared.updated).unwrap();
+
+        // Another writer commits a low-risk change after the snapshot.
+        let desired = shared.desired();
+        let mut other = desired.config.as_ref().clone();
+        other.default_temperature = 0.33;
+        let transactions = ConfigTransactions::new(Arc::clone(&shared));
+        let base = ConfigTransactions::base_revision(&desired);
+        let plan = transactions
+            .plan(ConfigChange::Structured(Box::new(other)))
+            .await
+            .unwrap();
+        transactions
+            .apply(
+                plan,
+                ConfigActor::GatewayConfigApi,
+                ApplyOptions {
+                    expected_revision: base.as_deref(),
+                    ..ApplyOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!((shared.desired().config.default_temperature - 0.33).abs() < 1e-9);
+
+        let result = tool.handle_set(&prepared, &summary).await;
+        assert!(
+            result.is_err(),
+            "a save built on the old snapshot must conflict: {result:?}"
+        );
+        assert!(
+            (shared.desired().config.default_temperature - 0.33).abs() < 1e-9,
+            "the interleaved change must survive"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(on_disk.contains("default_temperature = 0.33"), "{on_disk}");
     }
 }

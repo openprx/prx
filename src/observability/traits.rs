@@ -68,21 +68,10 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
-    /// A Causal Tree Engine pipeline run has completed (or failed).
-    CteRun {
-        /// Number of candidate branches expanded.
-        branch_count: usize,
-        /// ID of the branch selected for execution (empty on failure).
-        chosen_branch: String,
-        /// Semantic label of the chosen branch (e.g., "direct_answer").
-        chosen_label: String,
-        /// Extra latency added by the CTE pipeline (ms).
-        extra_latency_ms: u64,
-        /// Whether the pipeline succeeded and committed a branch.
-        commit_succeeded: bool,
-        /// Whether the circuit breaker tripped.
-        circuit_breaker_tripped: bool,
-    },
+    /// A decision-plane event (CDP 18): a kind, the lineage of its decision
+    /// and bounded fields. The lineage goes to logs and trace attributes
+    /// only, never to a metric label.
+    Causal(Box<crate::decision::telemetry::CausalEvent>),
 }
 
 /// Numeric metrics emitted by the agent runtime.
@@ -99,8 +88,6 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
-    /// Extra latency introduced by a CTE pipeline run.
-    CteExtraLatency(Duration),
 }
 
 /// Core observability trait for recording agent runtime telemetry.

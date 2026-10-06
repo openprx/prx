@@ -15,7 +15,11 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+mod catalog_snapshot;
+pub use catalog_snapshot::{SharedToolCatalogEntry, SharedToolCatalogSnapshot};
+
 pub mod agents_list;
+pub(crate) mod capability;
 pub(crate) mod chat_assignment;
 pub mod chat_profile_update;
 pub mod composio;
@@ -35,7 +39,16 @@ pub mod git_operations;
 pub mod http_request;
 pub mod image;
 pub mod image_info;
-pub mod intent;
+pub(crate) mod owner_filesystem;
+mod owner_filesystem_dispatch;
+// Historical selectors remain test-only until their positive coverage has
+// migrated to decision-scoped discovery. Production must not expose them.
+#[cfg(test)]
+#[path = "../../tests/support/legacy_tool_intent.rs"]
+pub(crate) mod legacy_intent_tests;
+#[cfg(test)]
+#[path = "../../tests/support/legacy_tool_surface_budget.rs"]
+mod legacy_tool_surface_budget;
 pub mod mcp;
 pub mod memory_forget;
 pub mod memory_get;
@@ -101,12 +114,12 @@ pub use message_send::{DaemonMessageSendTool, MessageSendTool};
 pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use schema::ToolSchemaDialect;
+pub use schema::{ToolSchemaDialect, ToolSchemaRefusals};
 pub use session_status::SessionStatusTool;
 pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
-pub use sessions_spawn::SessionsSpawnTool;
+pub use sessions_spawn::{ParentToolRegistry, SessionsSpawnTool};
 pub use shell::ShellTool;
 pub use skills::{SkillExecuteTool, SkillReadTool, SkillsListTool, SkillsManageTool};
 pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
@@ -122,6 +135,7 @@ pub use xin::XinTool;
 /// eligibility filtering. Dynamic Skill, MCP, and WASM aliases are intentionally
 /// excluded because their names come from the active runtime generation.
 pub const STATIC_PUBLIC_TOOL_NAMES: &[&str] = &[
+    "capability_search",
     "shell",
     "file_read",
     "file_write",
@@ -269,6 +283,26 @@ impl Tool for ArcDelegatingTool {
         self.inner.specs()
     }
 
+    fn spec_for_name(&self, name: &str) -> Option<ToolSpec> {
+        self.inner.spec_for_name(name)
+    }
+
+    fn catalog_specs(&self) -> Vec<ToolSpec> {
+        self.inner.catalog_specs()
+    }
+
+    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+        self.inner.immutable_catalog_specs()
+    }
+
+    fn shared_catalog_snapshot(&self) -> Option<SharedToolCatalogSnapshot> {
+        self.inner.shared_catalog_snapshot()
+    }
+
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        self.inner.catalog_binding_snapshot()
+    }
+
     async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute_named(name, args).await
     }
@@ -295,6 +329,10 @@ impl Tool for ArcDelegatingTool {
     fn availability(&self) -> crate::capability::CapabilityAvailability {
         self.inner.availability()
     }
+
+    fn catalog_availability_is_configured(&self) -> bool {
+        self.inner.catalog_availability_is_configured()
+    }
 }
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
@@ -313,6 +351,7 @@ pub fn default_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let workspace_dir = security.workspace_dir.clone();
     vec![
+        Box::new(capability::search_tool::CapabilitySearchTool),
         Box::new(ShellTool::new(runtime, workspace_dir)),
         Box::new(FileReadTool::new(security.clone(), false)),
         Box::new(FileWriteTool::new(security.clone())),
@@ -481,6 +520,7 @@ pub fn all_tools_with_runtime_ext_and_extensions(
         // advertised to the model on smart group turns (loop-side `expose_stay_silent`
         // gate). A defensive `execute` makes any out-of-loop call a no-op.
         Arc::new(StaySilentTool::new()),
+        Arc::new(capability::search_tool::CapabilitySearchTool),
     ];
 
     // The delegate snapshot is built later from this same Arc collection, so
@@ -548,11 +588,19 @@ pub fn all_tools_with_runtime_ext_and_extensions(
 
     // MCP is always registered. An empty server catalog is a configured-state
     // fact exposed by the tool, not a module-disable switch.
-    let mcp = Arc::new(McpTool::new(
-        security.clone(),
-        config.mcp.clone(),
-        workspace_dir.to_path_buf(),
-    ));
+    // Stdio MCP servers start in dedicated directories beside config.toml,
+    // outside the agent's workspace (D-088 C-3).
+    // Never inside the workspace: without a configuration directory, only a
+    // server with an absolute `working_dir` starts (D-095 N-4).
+    let mut mcp_tool = McpTool::new(security.clone(), config.mcp.clone(), workspace_dir.to_path_buf());
+    if let Some(config_dir) = root_config
+        .config_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        mcp_tool = mcp_tool.with_launch_root(config_dir.join("mcp"));
+    }
+    let mcp = Arc::new(mcp_tool);
     tool_arcs.push(mcp.clone());
     tool_arcs.push(Arc::new(McpStatusTool::new(mcp.clone())));
     let mcp_tool_ref = Some(mcp);
@@ -595,18 +643,32 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     if !agents.is_empty() {
         let delegate_agents: HashMap<String, DelegateAgentConfig> =
             agents.iter().map(|(name, cfg)| (name.clone(), cfg.clone())).collect();
-        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
-            let trimmed_value = value.trim();
-            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
-        });
+        // The fallback is the root credential, and it travels only together
+        // with the root base URL it was configured with. A fallback that is not
+        // the root key has no known endpoint, so it is not used at all.
+        let root_api_key = root_config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let delegate_fallback_credential = fallback_api_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && Some(*value) == root_api_key)
+            .map(str::to_owned);
         let parent_tools = Arc::new(tool_arcs.clone());
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential,
             security.clone(),
             crate::providers::provider_runtime_options_from_config(root_config),
         )
-        .with_fallback_provider(root_config.default_provider.clone())
+        .with_root_connection(delegate::RootConnection {
+            provider: root_config.default_provider.clone(),
+            key: delegate_fallback_credential,
+            api_url: root_config.api_url.clone(),
+        })
+        .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(root_config))
+        .with_model_catalog(crate::providers::selection::catalog_for(root_config))
+        .with_hint_config(root_config)
         .with_parent_tools(parent_tools)
         .with_reliability(root_config.reliability.clone())
         .with_multimodal_config(root_config.multimodal.clone())
@@ -666,7 +728,7 @@ mod tests {
         }
     }
 
-    struct DynamicDeclaredTool;
+    struct DynamicDeclaredTool(Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
     impl Tool for DynamicDeclaredTool {
@@ -694,6 +756,26 @@ mod tests {
             vec![self.spec(), spec("dynamic_alias")]
         }
 
+        fn catalog_specs(&self) -> Vec<ToolSpec> {
+            vec![self.spec(), spec("catalog_alias")]
+        }
+
+        fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+            static SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+            Some(SPECS.get_or_init(|| self.catalog_specs()))
+        }
+
+        fn shared_catalog_snapshot(&self) -> Option<SharedToolCatalogSnapshot> {
+            Some(SharedToolCatalogSnapshot::new(vec![(
+                spec("catalog_alias"),
+                Some([7; 32]),
+            )]))
+        }
+
+        fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+            std::collections::BTreeMap::from([("catalog_alias".to_string(), [7; 32])])
+        }
+
         fn supports_name(&self, name: &str) -> bool {
             matches!(name, "dynamic_root" | "dynamic_alias")
         }
@@ -701,17 +783,117 @@ mod tests {
         fn availability(&self) -> crate::capability::CapabilityAvailability {
             crate::capability::CapabilityAvailability::declared("test backend unavailable")
         }
+
+        fn catalog_availability_is_configured(&self) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
     }
 
     #[test]
     fn arc_registry_adapter_preserves_dynamic_contract() {
-        let tools = boxed_registry_from_arcs(vec![Arc::new(DynamicDeclaredTool)]);
+        let fact_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = boxed_registry_from_arcs(vec![Arc::new(DynamicDeclaredTool(Arc::clone(&fact_calls)))]);
         assert_eq!(tools[0].specs().len(), 2);
         assert!(tools[0].supports_name("dynamic_alias"));
         assert_eq!(
             tools[0].availability().level,
             crate::capability::CapabilityAvailabilityLevel::Declared
         );
+        assert_eq!(tools[0].catalog_specs().get(1).unwrap().name, "catalog_alias");
+        assert_eq!(
+            tools[0].immutable_catalog_specs().unwrap().get(1).unwrap().name,
+            "catalog_alias"
+        );
+        assert_eq!(tools[0].catalog_binding_snapshot().get("catalog_alias"), Some(&[7; 32]));
+        let shared = tools[0].shared_catalog_snapshot().unwrap();
+        assert_eq!(shared.entry("catalog_alias").unwrap().binding_digest(), Some([7; 32]));
+        assert!(shared.entry("dynamic_alias").is_none());
+        assert!(!tools[0].catalog_availability_is_configured());
+        assert_eq!(fact_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct CatalogAliasTool;
+
+    #[async_trait]
+    impl Tool for CatalogAliasTool {
+        fn name(&self) -> &str {
+            "prx_catalog_root"
+        }
+
+        fn description(&self) -> &str {
+            "PRX executable catalog alias fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+
+        fn catalog_specs(&self) -> Vec<ToolSpec> {
+            vec![self.spec(), spec("prx_catalog_alias")]
+        }
+
+        fn spec_for_name(&self, name: &str) -> Option<ToolSpec> {
+            self.catalog_specs().into_iter().find(|entry| entry.name == name)
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            matches!(name, "prx_catalog_root" | "prx_catalog_alias")
+        }
+
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            anyhow::bail!("catalog alias fixture requires named dispatch")
+        }
+
+        async fn execute_named(&self, name: &str, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            if !self.supports_name(name) {
+                anyhow::bail!("unsupported PRX fixture alias");
+            }
+            Ok(ToolResult {
+                success: true,
+                output: format!("executed:{name}"),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_registry_adapter_resolves_and_executes_catalog_only_alias() {
+        let tools = boxed_registry_from_arcs(vec![Arc::new(CatalogAliasTool)]);
+        let tool = tools.first().expect("wrapped fixture");
+        assert!(tool.specs().iter().all(|entry| entry.name != "prx_catalog_alias"));
+        let catalog_spec = tool
+            .catalog_specs()
+            .into_iter()
+            .find(|entry| entry.name == "prx_catalog_alias")
+            .expect("catalog-only alias");
+        let exact = tool.spec_for_name("prx_catalog_alias").expect("exact catalog alias");
+        assert_eq!(exact.name, catalog_spec.name);
+        assert_eq!(exact.description, catalog_spec.description);
+        assert_eq!(exact.parameters, catalog_spec.parameters);
+        assert!(tool.spec_for_name("prx_unknown_alias").is_none());
+        assert!(!tool.supports_name("prx_unknown_alias"));
+        let result = tool
+            .execute_named("prx_catalog_alias", serde_json::json!({}))
+            .await
+            .expect("named alias dispatch");
+        assert!(result.success);
+        assert_eq!(result.output, "executed:prx_catalog_alias");
+        assert!(
+            tool.execute_named("prx_unknown_alias", serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        let service = crate::tools::execution::ToolExecutionService::with_security_policy(
+            tools,
+            Arc::new(SecurityPolicy::default()),
+        );
+        let descriptor = service
+            .current_descriptor("prx_catalog_alias")
+            .expect("executor exact alias resolution");
+        assert_eq!(descriptor.backend_name, "prx_catalog_root");
+        assert_eq!(descriptor.public_name, "prx_catalog_alias");
+        assert!(service.current_descriptor("prx_unknown_alias").is_none());
     }
 
     #[test]
@@ -754,7 +936,7 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
     }
 
     #[test]
@@ -930,6 +1112,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"capability_search"));
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
@@ -985,6 +1168,7 @@ mod tests {
                 model: "test-model".to_string(),
                 system_prompt: None,
                 api_key: None,
+                credential_ref: None,
                 temperature: None,
                 max_depth: 1,
                 agentic: false,
@@ -1103,6 +1287,7 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                credential_ref: None,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1128,6 +1313,76 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+    }
+
+    /// INT-2B a32: the registry hands the delegate its root connection as
+    /// one unit, so a child on the root provider reaches the root `api_url`
+    /// with the root key. Wiring coverage (no red-before): drop `api_url`
+    /// from the `RootConnection` the registry builds and the request goes to
+    /// the catalog default host instead, so this test fails.
+    #[tokio::test]
+    async fn all_tools_delegate_reaches_the_root_api_url_with_the_root_key() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+        const ROOT_SENTINEL: &str = "A32-ALL-TOOLS-ROOT-SENTINEL";
+        let tmp = TempDir::new().unwrap();
+        let probe = CredentialProbe::start().await;
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut root = test_config(&tmp);
+        root.default_provider = Some("litellm".to_string());
+        root.api_key = Some(ROOT_SENTINEL.to_string());
+        root.api_url = Some(probe.base_url());
+        root.auth.codex_auth_json_path = tmp.path().join("no-codex-auth.json");
+        let agents = HashMap::from([(
+            "a".to_string(),
+            DelegateAgentConfig {
+                provider: "litellm".to_string(),
+                model: PROBE_MODEL.to_string(),
+                system_prompt: None,
+                api_key: None,
+                credential_ref: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        )]);
+
+        let tools = all_tools(
+            Arc::new(root.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+            tmp.path(),
+            &agents,
+            Some(ROOT_SENTINEL),
+            &root,
+        );
+        let delegate = tools
+            .iter()
+            .find(|tool| tool.name() == "delegate")
+            .expect("test: the delegate is registered");
+        let result = delegate
+            .execute(serde_json::json!({"agent": "a", "prompt": "hi"}))
+            .await
+            .expect("test: delegate returns a tool result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(probe.requests().len(), 1, "the child reached the root api_url");
+        assert!(probe.saw(ROOT_SENTINEL), "with the root key");
     }
 
     #[test]

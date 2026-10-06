@@ -377,31 +377,9 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
 
     // DNS rebinding defense: resolve the hostname and check if any resolved
-    // IP is private/local. This catches hostnames that pass string checks
-    // but resolve to internal addresses (e.g. attacker-controlled DNS that
-    // alternates between public and private IPs).
-    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
-        for addr in addrs {
-            let ip = addr.ip();
-            if ip.is_loopback() || ip.is_unspecified() {
-                return true;
-            }
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    if is_non_global_v4(v4) {
-                        return true;
-                    }
-                }
-                std::net::IpAddr::V6(v6) => {
-                    if is_non_global_v6(v6) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    false
+    // IP is private/local (one resolver for both tools; under test it never
+    // touches the network).
+    super::http_request::resolves_to_non_global(host)
 }
 
 fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
@@ -552,5 +530,13 @@ mod tests {
             .validate_url("http://localhost:8080")
             .expect_err("localhost must still be blocked");
         assert!(err.to_string().contains("Blocked local/private host"));
+    }
+
+    /// INT-2B FLAKE-DNS, RED before: see the `http_request` test of the same
+    /// name; `web_fetch` resolves through the same test table.
+    #[test]
+    fn hostname_checks_use_the_test_resolver_and_never_the_network() {
+        assert!(is_private_or_local_host("rebind.test"));
+        assert!(!is_private_or_local_host("example.com"));
     }
 }

@@ -46,11 +46,23 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         channels: configured_channel_names(&config),
         gateway_port: state.gateway_port,
         provider_degraded: availability.degraded,
-        provider_available: availability.available,
+        // Labels and reasons may quote a `custom:` URL carrying
+        // `user:password@`; this response leaves the host.
+        provider_available: availability
+            .available
+            .iter()
+            .map(|name| crate::providers::redact_endpoint_userinfo(name).into_owned())
+            .collect(),
         provider_unavailable: availability
             .unavailable
             .into_iter()
-            .map(|(name, reason)| format!("{name}: {reason}"))
+            .map(|(name, reason)| {
+                format!(
+                    "{}: {}",
+                    crate::providers::redact_endpoint_userinfo(&name),
+                    crate::providers::redact_endpoint_userinfo(&reason)
+                )
+            })
             .collect(),
         active_config_generation: generation.id.0,
         active_config_source_revision: generation.source_revision.fingerprint_sha256.clone(),

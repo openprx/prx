@@ -94,15 +94,17 @@
 //!   gateway.
 
 use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::runtime::registry::{WorkGuard, WorkId};
+use crate::runtime::sqlite_pool::{BOUNDED_BUSY_WAIT, BoundedBusyBudget, bounded_busy_remaining};
 use crate::security::op_id::ref_for_channel_recipient;
 use crate::security::policy::SecurityPolicy;
 
@@ -664,6 +666,18 @@ impl Session {
     }
 }
 
+/// What [`ResultLog::insert`] did with an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum Admission {
+    /// On the feed.
+    Added,
+    /// That sequence is already on the feed.
+    Duplicate,
+    /// Below the feed's floor: treated as already trimmed.
+    BelowFloor,
+}
+
 struct ResultLog {
     entries: VecDeque<AssignmentResult>,
     next_seq: u64,
@@ -683,9 +697,11 @@ impl ResultLog {
 
     /// Reserve the next sequence.
     ///
-    /// Taken before the store is asked and published after, so no lock is held
-    /// across a database wait; [`Self::insert`] puts the entry in sequence
-    /// order whatever order the publications arrive in.
+    /// Taken before the store is asked and published after, so this log's lock
+    /// is never held across a database wait. The caller holds
+    /// `ChatSessions::publication` over that whole span, which is what makes
+    /// publications arrive in sequence order; [`Self::insert`] merges by
+    /// sequence for the replay path, where the same record can come twice.
     const fn mint(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -701,15 +717,18 @@ impl ResultLog {
     /// duplicated every persisted result — and duplicates break exactly what
     /// [`ResultsPage`] promises, an ordered feed whose sequences a consumer can
     /// use as a cursor.
-    fn insert(&mut self, result: AssignmentResult) {
+    ///
+    /// Says what became of the entry. A replay is expected to be refused
+    /// often; a live publication never should be, and its caller logs it.
+    fn insert(&mut self, result: AssignmentResult) -> Admission {
         if result.seq < self.oldest_seq {
             // Already trimmed. Re-admitting it would move the feed's floor
             // backwards and tell a consumer it had *not* missed entries it had.
-            return;
+            return Admission::BelowFloor;
         }
         let seq = result.seq;
         match self.entries.binary_search_by(|entry| entry.seq.cmp(&seq)) {
-            Ok(_) => return,
+            Ok(_) => return Admission::Duplicate,
             Err(index) => self.entries.insert(index, result),
         }
         // The sequence keeps climbing across restarts. Restarting it at 1 would
@@ -717,6 +736,7 @@ impl ResultLog {
         // older than the ones it already saw.
         self.next_seq = self.next_seq.max(seq.saturating_add(1));
         self.trim();
+        Admission::Added
     }
 
     /// Drop the oldest entries past the buffer's capacity and move the floor
@@ -733,6 +753,161 @@ impl ResultLog {
     }
 }
 
+/// The right to mint and publish results: held from a sequence's mint until
+/// that result is on the feed.
+///
+/// [`ResultLog`] merges by sequence and the store write between mint and
+/// publish can take any time, so without a turn two concurrent reports could
+/// publish in the opposite order to their sequences — see
+/// `ChatSessions::publication` for what that cost. The ordering is carried by
+/// the types: [`Self::mint`] hands back a [`Minted`] that borrows this turn,
+/// and only [`Self::publish`] consumes it, so a result minted under a turn
+/// cannot be published after that turn has ended.
+///
+/// # Bounded by the contention budget
+///
+/// The turn opens the thread's [`BoundedBusyBudget`] *before* it queues for
+/// the lock, so the wait for the lock and the store write share one budget.
+/// A writer that waits the whole budget out still asks the store, with no
+/// budget left: the write fails fast while the database is busy — counted by
+/// the store as the failure it is — and lands when the database has come
+/// free. It still mints and publishes in order. Whoever holds the lock is
+/// inside its own budget, so K writers behind a stuck database give up in
+/// about one budget rather than K, and the store counts K failures, not one.
+struct PublicationTurn<'a> {
+    sessions: &'a ChatSessions,
+    _order: MutexGuard<'a, ()>,
+    /// False when waiting for the turn spent the whole budget. The store is
+    /// still asked; this only selects the warning that a write made with no
+    /// budget left may not be durable.
+    durable: bool,
+    /// Declared after the guard so it is dropped after it: the budget
+    /// outlives the turn it bounds.
+    _budget: BoundedBusyBudget,
+}
+
+/// A result minted under a [`PublicationTurn`], publishable only through it.
+struct Minted<'turn> {
+    entry: AssignmentResult,
+    _turn: PhantomData<&'turn ()>,
+}
+
+impl<'a> PublicationTurn<'a> {
+    fn take(sessions: &'a ChatSessions) -> Self {
+        let budget = BoundedBusyBudget::start();
+        let wait = bounded_busy_remaining();
+        if let Some(order) = sessions.publication.try_lock_for(wait) {
+            return Self {
+                sessions,
+                _order: order,
+                durable: true,
+                _budget: budget,
+            };
+        }
+        // The budget is gone. Still take the turn — the order is what keeps a
+        // result from being refused as already trimmed — but no longer wait
+        // on the database: this wait now lasts only as long as the holders'
+        // own budgets, each of which started before this one expired. Nothing
+        // is logged yet: the caller may turn out to owe the store nothing (a
+        // replayed report), and [`Self::write`] warns when it does.
+        Self {
+            sessions,
+            _order: sessions.publication.lock(),
+            durable: false,
+            _budget: budget,
+        }
+    }
+
+    /// Reserve a sequence and build the two forms of one finished assignment:
+    /// the row to persist, and the entry to publish once the store has been
+    /// asked.
+    ///
+    /// The result log's own lock is taken only for the mint and again for the
+    /// publish, never across the database wait, so feed readers never wait on
+    /// the store.
+    fn mint(
+        &self,
+        session: &Session,
+        assignment: &Assignment,
+        status: ResultStatus,
+        summary: String,
+    ) -> (StoredResult, Minted<'_>) {
+        let seq = self.sessions.results.lock().mint();
+        let completed_at_unix_ms = unix_ms();
+        let stored = StoredResult {
+            seq,
+            assignment_id: assignment.id.clone(),
+            session_id: session.id.clone(),
+            session_label: session.label.clone(),
+            disposition: assignment.disposition,
+            status,
+            summary: summary.clone(),
+            completed_at_unix_ms,
+            origin: assignment.origin.clone(),
+        };
+        let entry = AssignmentResult {
+            seq,
+            assignment_id: assignment.id.clone(),
+            session_id: session.id.clone(),
+            session_label: session.label.clone(),
+            disposition: assignment.disposition,
+            status,
+            summary,
+            completed_at_unix_ms,
+            origin: assignment.origin.clone(),
+        };
+        (
+            stored,
+            Minted {
+                entry,
+                _turn: PhantomData,
+            },
+        )
+    }
+
+    /// Write through to the store inside this turn's budget.
+    ///
+    /// Always asks the store, even when the budget was spent waiting for the
+    /// turn. The nested budget then joins the expired one, so the store's
+    /// connection and busy waits give up at once: the write costs
+    /// milliseconds, fails with the store's own counted error while the
+    /// database is busy, and lands when it has come free. Skipping the store
+    /// instead would leave its failure counters — and the `durable` flag the
+    /// operator reads off the pool report — claiming no result was lost.
+    fn write(&self, operation: &'static str, write: impl FnOnce(&dyn MailboxStore) -> anyhow::Result<()>) {
+        if !self.durable && self.sessions.store().is_some() {
+            tracing::warn!(
+                operation,
+                budget_ms = u64::try_from(BOUNDED_BUSY_WAIT.as_millis()).unwrap_or(u64::MAX),
+                "chat assignment results are queued behind a slow mailbox store; this mutation may not be durable"
+            );
+        }
+        self.sessions.write_through(operation, write);
+    }
+
+    /// Put one finished assignment on the live feed. Dropping the assignment
+    /// afterwards retires its registry row.
+    ///
+    /// A live result is never expected to be refused: under the turn every
+    /// sequence lands above the floor and exactly once. If one is, the
+    /// return trip waiting for it will report it lost, so the refusal is
+    /// logged — by sequence and assignment, never by recipient or body.
+    fn publish(&self, minted: Minted<'_>) -> u64 {
+        let seq = minted.entry.seq;
+        let assignment_id = minted.entry.assignment_id.clone();
+        let admission = self.sessions.results.lock().insert(minted.entry);
+        if admission != Admission::Added {
+            tracing::warn!(
+                seq,
+                assignment = %assignment_id,
+                admission = ?admission,
+                "a live chat assignment result was refused by the result feed; its return trip will report it lost"
+            );
+        }
+        seq
+    }
+}
+
 /// One registry and one mailbox.
 ///
 /// A type with methods rather than a bag of free functions over a global,
@@ -744,6 +919,27 @@ impl ResultLog {
 struct ChatSessions {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     results: Mutex<ResultLog>,
+    /// Held from minting a result's sequence until that result is on the feed.
+    ///
+    /// [`ResultLog`] is a merge by sequence, and the store write between mint
+    /// and publish can take any time, so without this two concurrent reports
+    /// could publish in the opposite order to their sequences. A later
+    /// sequence landing first moved the feed's floor past the earlier one,
+    /// which was then refused as already trimmed — a result silently gone from
+    /// the live feed while its assignment row retired, which the return trip
+    /// reads as an eviction — and it walked any cursor past the earlier one
+    /// for good. Holding this across the write keeps publication in sequence
+    /// order and every result readable the moment its report returns.
+    ///
+    /// Taken through [`PublicationTurn`], which bounds the wait by the
+    /// store's contention budget and ties every minted result to the turn
+    /// that must publish it — except by `hydrate`, which runs once at attach
+    /// and takes it directly so a replayed floor cannot land between a live
+    /// report's mint and its publish.
+    ///
+    /// Separate from `results` on purpose: readers of the feed never wait on
+    /// a database, only other result writers do.
+    publication: Mutex<()>,
     /// Monotonic revision stamped on every store write.
     ///
     /// Writes are planned while a session's state lock is held and executed
@@ -766,6 +962,7 @@ impl ChatSessions {
         Self {
             sessions: RwLock::new(HashMap::new()),
             results: Mutex::new(ResultLog::new()),
+            publication: Mutex::new(()),
             revision: AtomicU64::new(0),
             store: RwLock::new(None),
         }
@@ -796,15 +993,20 @@ impl ChatSessions {
         // opened one for a whole request — a share of that one. Without it the
         // bound is per statement, and a request that owes the database four
         // writes waits out the bound four times.
-        let _budget = crate::runtime::sqlite_pool::BoundedBusyBudget::start();
+        let _budget = BoundedBusyBudget::start();
         if let Err(error) = write(store.as_ref()) {
-            tracing::error!(operation, "chat mailbox write-through failed: {error:#}");
+            write_through_failed(operation, &error);
         }
     }
 
     fn find(&self, session_id: &str) -> Option<Arc<Session>> {
         self.sessions.read().get(session_id.trim()).map(Arc::clone)
     }
+}
+
+/// The one log line for a mutation that did not reach the store.
+fn write_through_failed(operation: &'static str, error: &anyhow::Error) {
+    tracing::error!(operation, "chat mailbox write-through failed: {error:#}");
 }
 
 fn unix_ms() -> u64 {
@@ -1018,12 +1220,17 @@ impl ChatSessions {
         }
 
         if !state.results.is_empty() {
+            // In order with live reports: a replayed floor must not land
+            // between a live report's mint and its publish. See `publication`.
+            let _in_order = self.publication.lock();
             let mut log = self.results.lock();
             for result in state.results {
                 // Merged by sequence, never appended: this replay runs again on
                 // every in-process gateway restart, and the same record offered
                 // twice must stay one entry. See [`ResultLog::insert`].
-                log.insert(AssignmentResult {
+                // A replay re-offers entries the feed may already hold or have
+                // trimmed; refusing those is the merge working, not a loss.
+                let _replayed = log.insert(AssignmentResult {
                     seq: result.seq,
                     assignment_id: result.assignment_id,
                     session_id: result.session_id,
@@ -1171,22 +1378,32 @@ impl ChatSessions {
         // cancellations that replace them have to be **one** commit. Written
         // separately, a failure between them leaves an assigner with neither
         // outstanding work nor an answer about it.
-        let mut stored = Vec::with_capacity(count);
-        let mut live = Vec::with_capacity(count);
-        for assignment in &outstanding {
-            let (record, entry) = self.mint_result(
-                &session,
-                assignment,
-                ResultStatus::Cancelled,
-                "the chat session deregistered while this assignment was still outstanding".to_string(),
-            );
-            stored.push(record);
-            live.push(entry);
+        if outstanding.is_empty() {
+            // Nothing to record, so nothing to order: the cascade need not
+            // queue behind result writers.
+            self.write_through("cascade_session", |store| store.cascade_session(&session.id, &[]));
+            return Some(count);
         }
-        self.write_through("cascade_session", |store| store.cascade_session(&session.id, &stored));
-        for entry in live {
-            self.publish_result(entry);
+        let turn = PublicationTurn::take(self);
+        {
+            let mut stored = Vec::with_capacity(count);
+            let mut minted = Vec::with_capacity(count);
+            for assignment in &outstanding {
+                let (record, entry) = turn.mint(
+                    &session,
+                    assignment,
+                    ResultStatus::Cancelled,
+                    "the chat session deregistered while this assignment was still outstanding".to_string(),
+                );
+                stored.push(record);
+                minted.push(entry);
+            }
+            turn.write("cascade_session", |store| store.cascade_session(&session.id, &stored));
+            for entry in minted {
+                turn.publish(entry);
+            }
         }
+        drop(turn);
         Some(count)
     }
 
@@ -1438,7 +1655,16 @@ impl ChatSessions {
             tokio::select! {
                 () = cancel.cancelled() => {
                     if let Some(registry) = registry.upgrade() {
-                        registry.discard(&session, &assignment_id);
+                        // Off the async worker: recording the kill waits for
+                        // the publication turn and writes to the store, and a
+                        // worker parked on either stalls every task it runs.
+                        let recorded = crate::runtime::blocking::spawn_blocking(move || {
+                            registry.discard(&session, &assignment_id);
+                        })
+                        .await;
+                        if let Err(error) = recorded {
+                            tracing::error!("recording an operator kill of a chat assignment failed: {error}");
+                        }
                     }
                 }
                 () = finished.cancelled() => {}
@@ -1449,22 +1675,29 @@ impl ChatSessions {
     /// Take one assignment out of every queue it could be in and record it as
     /// cancelled. Dropping it retires its registry row, which is what confirms
     /// the kill.
+    ///
+    /// Blocking: it waits for the publication turn and writes to the store.
+    /// The kill watcher calls it on the blocking pool for that reason.
     fn discard(&self, session: &Arc<Session>, assignment_id: &str) {
+        let turn = PublicationTurn::take(self);
         let removed = {
             let mut state = session.state.lock();
             take_assignment(&mut state, assignment_id)
         };
         if let Some(assignment) = removed {
-            let (record, entry) = self.mint_result(
-                session,
-                &assignment,
-                ResultStatus::Cancelled,
-                "the assignment's work item was killed by an operator".to_string(),
-            );
-            self.write_through("complete_assignment", |store| {
-                store.complete_assignment(&assignment.id, &record)
-            });
-            self.publish_result(entry);
+            {
+                let (record, minted) = turn.mint(
+                    session,
+                    &assignment,
+                    ResultStatus::Cancelled,
+                    "the assignment's work item was killed by an operator".to_string(),
+                );
+                turn.write("complete_assignment", |store| {
+                    store.complete_assignment(&assignment.id, &record)
+                });
+                turn.publish(minted);
+            }
+            drop(turn);
         }
     }
 }
@@ -1639,7 +1872,7 @@ impl ChatSessions {
     /// carries the revision it was planned at, so a flush that loses the race
     /// to a later pull writes nothing instead of writing something stale.
     fn flush_pending(&self, session_id: &str, pending: Vec<PendingWrite>) {
-        let _budget = crate::runtime::sqlite_pool::BoundedBusyBudget::start();
+        let _budget = BoundedBusyBudget::start();
         for write in pending {
             match write {
                 PendingWrite::RecordPoll {
@@ -1759,6 +1992,11 @@ impl ChatSessions {
         let summary = bounded(summary, "summary", MAX_SUMMARY_LEN)?;
         let assignment_id = assignment_id.trim();
 
+        // Taken before the assignment leaves its queue, not after: a retry of
+        // this same report that finds the queue empty then waits here until
+        // the original is on the feed, and is answered with its sequence
+        // rather than told the assignment is unknown.
+        let turn = PublicationTurn::take(self);
         let assignment = {
             let mut state = session.state.lock();
             state
@@ -1792,22 +2030,28 @@ impl ChatSessions {
             //   on the floor;
             // - this session never held it, which is the refusal it has always
             //   been.
-            return match self.recorded_result(&session.id, assignment_id) {
+            let answer = match self.recorded_result(&session.id, assignment_id) {
                 Some((_, ResultStatus::Cancelled, summary)) => Err(ChatSessionError::AssignmentCancelled { summary }),
                 Some((seq, _, _)) => Ok(seq),
                 None => Err(ChatSessionError::UnknownAssignment),
             };
+            drop(turn);
+            return answer;
         };
 
         // Retirement and result are one commit. Written separately, a failure
         // between them takes the work out of every queue while leaving no
         // record of it, and the reporter cannot recover by retrying because the
         // assignment is no longer anywhere to retry against.
-        let (record, entry) = self.mint_result(&session, &assignment, status, summary);
-        self.write_through("complete_assignment", |store| {
-            store.complete_assignment(&assignment.id, &record)
-        });
-        Ok(self.publish_result(entry))
+        let seq = {
+            let (record, minted) = turn.mint(&session, &assignment, status, summary);
+            turn.write("complete_assignment", |store| {
+                store.complete_assignment(&assignment.id, &record)
+            });
+            turn.publish(minted)
+        };
+        drop(turn);
+        Ok(seq)
     }
 
     /// The result already recorded for this assignment: its sequence, what it
@@ -1829,54 +2073,6 @@ impl ChatSessions {
             .rev()
             .find(|entry| entry.assignment_id == assignment_id && entry.session_id == session_id)
             .map(|entry| (entry.seq, entry.status, entry.summary.clone()))
-    }
-
-    /// Reserve a sequence and build the two forms of one finished assignment:
-    /// the row to persist, and the entry to publish once the store has been
-    /// asked.
-    ///
-    /// Split from [`Self::publish_result`] so the result log's lock is never
-    /// held across a database wait.
-    fn mint_result(
-        &self,
-        session: &Session,
-        assignment: &Assignment,
-        status: ResultStatus,
-        summary: String,
-    ) -> (StoredResult, AssignmentResult) {
-        let seq = self.results.lock().mint();
-        let completed_at_unix_ms = unix_ms();
-        let stored = StoredResult {
-            seq,
-            assignment_id: assignment.id.clone(),
-            session_id: session.id.clone(),
-            session_label: session.label.clone(),
-            disposition: assignment.disposition,
-            status,
-            summary: summary.clone(),
-            completed_at_unix_ms,
-            origin: assignment.origin.clone(),
-        };
-        let live = AssignmentResult {
-            seq,
-            assignment_id: assignment.id.clone(),
-            session_id: session.id.clone(),
-            session_label: session.label.clone(),
-            disposition: assignment.disposition,
-            status,
-            summary,
-            completed_at_unix_ms,
-            origin: assignment.origin.clone(),
-        };
-        (stored, live)
-    }
-
-    /// Put one finished assignment on the live feed. Dropping the assignment
-    /// afterwards retires its registry row.
-    fn publish_result(&self, result: AssignmentResult) -> u64 {
-        let seq = result.seq;
-        self.results.lock().insert(result);
-        seq
     }
 
     fn results_after(&self, after_seq: u64, limit: usize) -> ResultsPage {
@@ -3515,26 +3711,30 @@ mod tests {
         let mut log = ResultLog::new();
         let overflow = u64::try_from(RESULT_LOG_CAPACITY).unwrap_or(u64::MAX) + 2;
         for seq in 1..=overflow {
-            log.insert(entry(seq));
+            assert_eq!(log.insert(entry(seq)), Admission::Added);
         }
         assert_eq!(log.entries.len(), RESULT_LOG_CAPACITY);
         assert_eq!(log.oldest_seq, 3, "the two oldest entries were trimmed");
 
-        log.insert(entry(overflow));
+        assert_eq!(log.insert(entry(overflow)), Admission::Duplicate);
         assert_eq!(
             log.entries.len(),
             RESULT_LOG_CAPACITY,
             "a duplicate sequence is merged, not appended"
         );
 
-        log.insert(entry(1));
+        assert_eq!(
+            log.insert(entry(1)),
+            Admission::BelowFloor,
+            "a refusal below the floor is reported, so a live one can be logged"
+        );
         assert_eq!(
             log.oldest_seq, 3,
             "a sequence the feed already trimmed must not come back below its floor"
         );
         assert_eq!(log.entries.front().map(|first| first.seq), Some(3));
 
-        log.insert(entry(overflow + 5));
+        assert_eq!(log.insert(entry(overflow + 5)), Admission::Added);
         assert!(
             log.entries.iter().map(|held| held.seq).is_sorted(),
             "the feed stays ordered by sequence"
@@ -3542,6 +3742,507 @@ mod tests {
         assert!(
             log.next_seq > overflow + 5,
             "minting must never reuse a sequence it replayed"
+        );
+    }
+
+    /// Every result is on the feed before a later sequence can be minted.
+    ///
+    /// Two reports finishing at once used to publish in whatever order their
+    /// store writes returned. When a later sequence landed first, the feed's
+    /// floor jumped past the earlier one, the earlier result was refused as
+    /// "already trimmed" although its report had succeeded, and its assignment
+    /// row retired anyway: the `chat_assignment` return trip for it ended
+    /// `ResultEvicted` instead of `Delivered` and the correspondent was told
+    /// the answer was lost. A cursor that had read the later entry skipped the
+    /// earlier one for good.
+    ///
+    /// The store write is where the interleaving happened, so this store
+    /// records, from inside each write that carries a result, whether another
+    /// thread could mint a sequence at that moment. It covers all three
+    /// places that mint: a report, an operator kill, and a deregistration.
+    ///
+    /// What this test pins at run time is that the turn is held *during* the
+    /// write. That publishing happens before the turn ends is pinned at
+    /// compile time: a [`Minted`] borrows the [`PublicationTurn`] that minted
+    /// it and only [`PublicationTurn::publish`] consumes it, so carrying a
+    /// result out of its turn and publishing it afterwards does not build.
+    ///
+    /// MUTATION GUARD: write outside the turn on any of the three paths and
+    /// this test goes red; publish after the turn is dropped and the crate
+    /// does not compile (E0505).
+    #[tokio::test]
+    async fn a_result_is_on_the_feed_before_a_later_sequence_can_be_minted() {
+        use std::sync::{OnceLock, Weak};
+
+        #[derive(Default)]
+        struct ObservingStore {
+            sessions: OnceLock<Weak<ChatSessions>>,
+            minting_open: Mutex<Vec<(&'static str, bool)>>,
+        }
+
+        impl ObservingStore {
+            fn observe(&self, path: &'static str) {
+                let open = self
+                    .sessions
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|sessions| sessions.publication.try_lock().is_some());
+                self.minting_open.lock().push((path, open));
+            }
+        }
+
+        impl MailboxStore for ObservingStore {
+            fn hydrate(&self) -> anyhow::Result<StoredState> {
+                Ok(StoredState::default())
+            }
+            fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn record_poll(&self, _: &str, _: u64, _: u64, _: u64) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn move_to_queue(&self, _: &str, _: Queue, _: u32, _: bool, _: u64) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn complete_assignment(&self, _assignment_id: &str, _result: &StoredResult) -> anyhow::Result<()> {
+                self.observe("complete_assignment");
+                Ok(())
+            }
+            fn cascade_session(&self, _session_id: &str, results: &[StoredResult]) -> anyhow::Result<()> {
+                if !results.is_empty() {
+                    self.observe("cascade_session");
+                }
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(ObservingStore::default());
+        let sessions = Arc::new(ChatSessions::new());
+        store
+            .sessions
+            .set(Arc::downgrade(&sessions))
+            .expect("test: the store is observed once");
+        sessions.attach_store(Arc::clone(&store) as Arc<dyn MailboxStore>);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let assign = |task: &str| {
+            sessions
+                .assign(
+                    &operator_policy(),
+                    &AssignPrincipal::operator_plane(),
+                    &registration.session_id,
+                    task,
+                    Disposition::Queue,
+                )
+                .expect("test: assignment accepted")
+        };
+        let reported = assign("report on this one");
+        let killed = assign("this one is killed");
+        let _cascaded = assign("this one goes with the session");
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(3))
+            .expect("test: delivery");
+
+        sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &reported.assignment_id,
+                ResultStatus::Completed,
+                "done",
+            )
+            .expect("test: report accepted");
+        let session = sessions
+            .find(&registration.session_id)
+            .expect("test: the session is registered");
+        sessions.discard(&session, &killed.assignment_id);
+        drop(session);
+        sessions.deregister(&registration.session_id);
+
+        let observed = store.minting_open.lock().clone();
+        assert_eq!(
+            observed,
+            vec![
+                ("complete_assignment", false),
+                ("complete_assignment", false),
+                ("cascade_session", false),
+            ],
+            "while a result is being written, no later sequence may be minted (true = another thread could have minted)"
+        );
+        assert_eq!(
+            sessions
+                .results_after(0, RESULT_LOG_CAPACITY)
+                .results
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "all three results are on the feed, in sequence order"
+        );
+    }
+
+    /// A store write that sits out its whole contention budget, the way one
+    /// does while a foreign process holds the mailbox file lock.
+    struct StuckStore;
+
+    impl MailboxStore for StuckStore {
+        fn hydrate(&self) -> anyhow::Result<StoredState> {
+            Ok(StoredState::default())
+        }
+        fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn record_poll(&self, _: &str, _: u64, _: u64, _: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn move_to_queue(&self, _: &str, _: Queue, _: u32, _: bool, _: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn complete_assignment(&self, _assignment_id: &str, _result: &StoredResult) -> anyhow::Result<()> {
+            std::thread::sleep(crate::runtime::sqlite_pool::bounded_busy_remaining());
+            anyhow::bail!("database is locked")
+        }
+        fn cascade_session(&self, _session_id: &str, _results: &[StoredResult]) -> anyhow::Result<()> {
+            std::thread::sleep(crate::runtime::sqlite_pool::bounded_busy_remaining());
+            anyhow::bail!("database is locked")
+        }
+    }
+
+    /// Reports queued behind a stuck database give up together, within about
+    /// one contention budget, instead of one budget each.
+    ///
+    /// The publication lock serializes result writers. With the budget opened
+    /// only inside the store write, each queued report started a fresh
+    /// [`crate::runtime::sqlite_pool::BOUNDED_BUSY_WAIT`] once it got the
+    /// lock, so the K-th report answered after K budgets. The budget is now
+    /// opened before the lock is taken and bounds the wait for it too: the
+    /// first report spends it on the database, the rest lose durability for
+    /// their result, as the store's own lock timeout would make them, and
+    /// still publish in order.
+    ///
+    /// Four reports: about four budgets before, about one after. The bound
+    /// asserted is two, so only the serial pile-up can cross it.
+    ///
+    /// MUTATION GUARD: open the budget after taking `publication`, or wait
+    /// for `publication` without a bound, and this test goes red.
+    #[test]
+    fn reports_queued_behind_a_stuck_database_give_up_within_one_budget() {
+        use crate::runtime::sqlite_pool::BOUNDED_BUSY_WAIT;
+        const REPORTS: usize = 4;
+
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::new(StuckStore));
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let receipts = (0..REPORTS)
+            .map(|index| {
+                sessions
+                    .assign(
+                        &operator_policy(),
+                        &AssignPrincipal::operator_plane(),
+                        &registration.session_id,
+                        &format!("task {index}"),
+                        Disposition::Queue,
+                    )
+                    .expect("test: assignment accepted")
+            })
+            .collect::<Vec<_>>();
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(REPORTS))
+            .expect("test: delivery");
+
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for receipt in &receipts {
+                let sessions = &sessions;
+                let registration = &registration;
+                scope.spawn(move || {
+                    sessions
+                        .report(
+                            &registration.session_id,
+                            &registration.token,
+                            &receipt.assignment_id,
+                            ResultStatus::Completed,
+                            "done",
+                        )
+                        .expect("test: a report is accepted even when it cannot be made durable")
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < BOUNDED_BUSY_WAIT * 2,
+            "{REPORTS} reports behind a stuck database took {elapsed:?}; the budget is {BOUNDED_BUSY_WAIT:?}"
+        );
+        assert_eq!(
+            sessions
+                .results_after(0, RESULT_LOG_CAPACITY)
+                .results
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>(),
+            (1..=u64::try_from(REPORTS).unwrap_or(u64::MAX)).collect::<Vec<_>>(),
+            "every result still reaches the feed, in sequence order"
+        );
+    }
+
+    /// Queue `reports` behind a publication turn that this thread holds past
+    /// every report's contention budget, then let them go.
+    ///
+    /// Each report signals just before it asks for the turn; the holder waits
+    /// for every signal and then out-waits the whole budget, so every report
+    /// deterministically takes the turn with its budget already spent — the
+    /// path `PublicationTurn::take` calls not durable. Returns each report's
+    /// answer together with the `tracing` output of the thread that made it.
+    fn report_behind_an_expired_turn(
+        sessions: &ChatSessions,
+        registration: &Registration,
+        assignment_ids: &[String],
+    ) -> Vec<(Result<u64, ChatSessionError>, String)> {
+        use crate::runtime::sqlite_pool::log_capture::capturing_logs;
+
+        let turn = sessions.publication.lock();
+        let (ready, queued) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let mut reporters = Vec::with_capacity(assignment_ids.len());
+            for assignment_id in assignment_ids {
+                let ready = ready.clone();
+                reporters.push(scope.spawn(move || {
+                    capturing_logs(|| {
+                        ready.send(()).expect("test: the holder is listening");
+                        sessions.report(
+                            &registration.session_id,
+                            &registration.token,
+                            assignment_id,
+                            ResultStatus::Completed,
+                            "done",
+                        )
+                    })
+                }));
+            }
+            for _ in assignment_ids {
+                queued.recv().expect("test: every reporter starts");
+            }
+            std::thread::sleep(BOUNDED_BUSY_WAIT + Duration::from_millis(500));
+            drop(turn);
+            reporters
+                .into_iter()
+                .map(|reporter| reporter.join().expect("test: a reporter thread finishes"))
+                .collect()
+        })
+    }
+
+    /// R-FLAKEf R1: reports that wait the whole budget out for the turn still
+    /// ask the store, so each one the database refuses is counted.
+    ///
+    /// The pool report's `writes_failed` and `durable` are the operator's only
+    /// view of results a restart will not find. A turn that skipped the store
+    /// after its budget ran out left both untouched: K results lost behind a
+    /// foreign lock read as none, and `durable` stayed true.
+    ///
+    /// MUTATION GUARD: skip the store in `PublicationTurn::write` when the turn
+    /// is not durable and `writes_failed` stays at zero here.
+    #[test]
+    fn reports_that_spent_their_budget_on_the_turn_are_counted_as_failed_writes() {
+        use crate::runtime::registry::PoolStatsSource;
+        const REPORTS: usize = 3;
+
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let store = Arc::new(SqliteMailboxStore::open(&db).expect("test: open the mailbox store"));
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::clone(&store) as Arc<dyn MailboxStore>);
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let assignment_ids = (0..REPORTS)
+            .map(|index| {
+                sessions
+                    .assign(
+                        &operator_policy(),
+                        &AssignPrincipal::operator_plane(),
+                        &registration.session_id,
+                        &format!("task {index}"),
+                        Disposition::Queue,
+                    )
+                    .expect("test: assignment accepted")
+                    .assignment_id
+            })
+            .collect::<Vec<_>>();
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(REPORTS))
+            .expect("test: delivery");
+        let failed = |metrics: &serde_json::Value| metrics.get("writes_failed").and_then(serde_json::Value::as_u64);
+        assert_eq!(failed(&store.pool_metrics()), Some(0), "setup writes all landed");
+
+        let foreign = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        foreign
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("test: hold the write lock as a second process would");
+        let answers = report_behind_an_expired_turn(&sessions, &registration, &assignment_ids);
+        foreign.execute_batch("ROLLBACK").expect("test: release the write lock");
+
+        for (answer, _) in &answers {
+            assert!(
+                answer.is_ok(),
+                "a report is accepted even when it cannot be made durable: {answer:?}"
+            );
+        }
+        let metrics = store.pool_metrics();
+        assert_eq!(
+            failed(&metrics),
+            Some(u64::try_from(REPORTS).unwrap_or(u64::MAX)),
+            "every result the locked database refused is a counted failure: {metrics}"
+        );
+        assert_eq!(
+            metrics.get("durable").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "results a restart will not find must not read as durable: {metrics}"
+        );
+    }
+
+    /// R-FLAKEf R1 and R4: a report whose budget ran out on the turn still
+    /// lands once the database is free, and only a report that owes the store
+    /// a write warns that it may not be durable.
+    ///
+    /// Skipping the store threw away a write that would have succeeded, and the
+    /// warning fired in `take`, before the caller knew it had anything to
+    /// write — so a replayed report, which writes nothing, warned too.
+    ///
+    /// MUTATION GUARD: skip the store when the turn is not durable and the
+    /// fresh result is missing from the file; warn in `take` again and the
+    /// replay's log carries the warning.
+    #[test]
+    fn a_report_that_spent_its_budget_on_the_turn_lands_once_the_store_is_free() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let assignment_ids = ["already reported", "fresh"].map(|task| {
+            sessions
+                .assign(
+                    &operator_policy(),
+                    &AssignPrincipal::operator_plane(),
+                    &registration.session_id,
+                    task,
+                    Disposition::Queue,
+                )
+                .expect("test: assignment accepted")
+                .assignment_id
+        });
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(2))
+            .expect("test: delivery");
+        let [reported_id, _] = &assignment_ids;
+        let replayed_seq = sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                reported_id,
+                ResultStatus::Completed,
+                "done",
+            )
+            .expect("test: first report");
+
+        let [(replay, replay_logs), (fresh, fresh_logs)]: [_; 2] =
+            report_behind_an_expired_turn(&sessions, &registration, &assignment_ids)
+                .try_into()
+                .expect("test: one answer per report");
+        assert_eq!(
+            replay.as_ref().ok(),
+            Some(&replayed_seq),
+            "a replay is answered with the original sequence"
+        );
+        assert!(
+            !replay_logs.contains("durable"),
+            "a replay owes the store nothing and must not warn about durability: {replay_logs}"
+        );
+        assert!(fresh.is_ok(), "the fresh report is accepted: {fresh:?}");
+        assert!(
+            fresh_logs.contains("may not be durable"),
+            "a write made with no budget left says so: {fresh_logs}"
+        );
+
+        let disk = SqliteMailboxStore::open(&db)
+            .expect("test: reopen the mailbox file")
+            .hydrate()
+            .expect("test: read the mailbox file back");
+        let mut persisted = disk
+            .results
+            .iter()
+            .map(|result| result.assignment_id.clone())
+            .collect::<Vec<_>>();
+        persisted.sort();
+        let mut expected = assignment_ids;
+        expected.sort();
+        assert_eq!(
+            persisted, expected,
+            "the late write reached the free database instead of being skipped"
+        );
+    }
+
+    /// An operator kill that has to wait for the publication lock waits on the
+    /// blocking pool, never on an async worker.
+    ///
+    /// The kill watcher is an async task. Recording the cancellation takes the
+    /// publication lock and writes to the store, both blocking; run inline, a
+    /// kill queued behind a slow result write parked the worker thread, and on
+    /// a current-thread runtime nothing else could run until it was let go.
+    ///
+    /// The holder lets go after three seconds at the latest, so the unfixed
+    /// code fails instead of hanging; a 50 ms sleep on the same runtime has to
+    /// finish in under one.
+    ///
+    /// MUTATION GUARD: call `discard` directly from the watcher task and this
+    /// test goes red.
+    #[tokio::test]
+    async fn a_kill_waiting_on_publication_does_not_hold_an_async_worker() {
+        use std::sync::mpsc::sync_channel;
+
+        let sessions = Arc::new(ChatSessions::new());
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let receipt = sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "kill me while a result is being written",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let (held_tx, held_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        let holder = {
+            let sessions = Arc::clone(&sessions);
+            std::thread::spawn(move || {
+                let _held = sessions.publication.lock();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            })
+        };
+        held_rx.recv().expect("test: the holder takes the lock");
+
+        let kill = tokio::spawn(crate::runtime::registry::kill(receipt.work_id, true));
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let slept = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().expect("test: the holder thread");
+        let outcomes = kill.await.expect("test: the kill task");
+
+        assert!(
+            slept < Duration::from_secs(1),
+            "a 50 ms sleep took {slept:?}: the kill parked the runtime's worker"
+        );
+        assert_eq!(
+            outcomes.first().map(|result| result.outcome),
+            Some(KillOutcome::Killed),
+            "the kill still completes once the lock is free"
         );
     }
 

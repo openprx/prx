@@ -3,32 +3,275 @@
 //! WASM storage plugins export functions for storing, recalling, and forgetting
 //! memory entries. The host delegates memory operations to the plugin when it is
 //! configured as the active Memory backend.
+//!
+//! # Trap recovery
+//!
+//! The adapter's store is owned by a [`Supervisor`]: a trapped backend is
+//! rebuilt on a brand-new `Store` by the next operation, rebuilds are budgeted
+//! inside a rolling window, and once the budget is spent the backend is
+//! quarantined until the next plugin generation replaces it. Every failure is
+//! an error: a write is never acknowledged unless the guest completed it, a
+//! read never turns a failure into an empty result, and `health_check` reports
+//! `false`. A rebuilt guest starts with empty linear memory, so a backend that
+//! keeps entries there comes back empty; every storage rebuild is therefore
+//! announced on `prx.plugin.storage_restarted`.
 
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
+use super::recovery::{CallOutcome, CapabilityKind, GuestOp, Respawn, Supervisor};
 use crate::memory::traits::{MemoryCategory, MemoryEntry, validate_memory_write_target};
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline};
 use crate::plugins::manifest::PluginManifest;
+
+const STORAGE_INTERFACE: &str = "prx:plugin/storage-exports@0.1.0";
 
 /// A loaded WASM storage plugin instance.
 #[derive(Clone)]
 pub struct WasmStorage {
     /// The cached storage backend name (returned by `name()` at load time).
     storage_name: String,
-    /// wasmtime store + instance, behind a mutex (Store is not Sync).
-    inner: Arc<Mutex<WasmStorageInner>>,
+    /// The store, its instance and their recovery state.
+    supervisor: Arc<Supervisor>,
     /// Timeout for storage calls (milliseconds).
     timeout_ms: u64,
 }
 
-struct WasmStorageInner {
-    store: wasmtime::Store<HostState>,
-    instance: wasmtime::component::Instance,
+/// Look up one export of the storage interface.
+fn storage_export(
+    store: &mut wasmtime::Store<HostState>,
+    instance: &wasmtime::component::Instance,
+    export: &str,
+) -> Result<wasmtime::component::Func, PluginError> {
+    let iface_idx = instance
+        .get_export_index(store.as_context_mut(), None, STORAGE_INTERFACE)
+        .ok_or_else(|| PluginError::Runtime(format!("plugin does not export {STORAGE_INTERFACE}")))?;
+    let func_idx = instance
+        .get_export_index(store.as_context_mut(), Some(&iface_idx), export)
+        .ok_or_else(|| PluginError::Runtime(format!("{export} not found in storage-exports")))?;
+    instance
+        .get_func(store.as_context_mut(), &func_idx)
+        .ok_or_else(|| PluginError::Runtime(format!("{export} is not a function")))
+}
+
+/// One export of the storage interface: its parameters and how to read its
+/// single result value. Every storage operation reaches the guest through
+/// [`StorageOp`]. Exports own their arguments because the operation runs on a
+/// task of its own, detached from the caller (see `WasmStorage::request`).
+trait StorageExport: Send + 'static {
+    type Output: Send;
+    const EXPORT: &'static str;
+    /// Whether the export answers from stored entries. A read made against a
+    /// store rebuilt by that very call would answer from an empty guest.
+    const READS_ENTRIES: bool;
+
+    fn params(&self) -> Vec<wasmtime::component::Val>;
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<Self::Output>;
+}
+
+/// Adapts one storage export to the supervisor's [`GuestOp`].
+struct StorageOp<T>(T);
+
+impl<T: StorageExport> GuestOp for StorageOp<T> {
+    type Output = T::Output;
+
+    fn operation(&self) -> &'static str {
+        T::EXPORT
+    }
+
+    fn invoke<'a>(
+        self,
+        store: &'a mut wasmtime::Store<HostState>,
+        instance: &'a wasmtime::component::Instance,
+    ) -> futures_util::future::BoxFuture<'a, CallOutcome<T::Output>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            let func = match storage_export(store, instance, T::EXPORT) {
+                Ok(func) => func,
+                Err(error) => return CallOutcome::GuestError(error),
+            };
+            let params = self.0.params();
+            let mut results = [wasmtime::component::Val::Bool(false)];
+            if let Err(e) = func.call_async(store.as_context_mut(), &params, &mut results).await {
+                return super::recovery::unwound(store, &e, || format!("{}() call failed: {e}", T::EXPORT));
+            }
+            let [value] = results;
+            match self.0.parse(&value) {
+                Ok(output) => CallOutcome::Completed(output),
+                Err(error) => CallOutcome::GuestError(error),
+            }
+        })
+    }
+}
+
+/// Turn a guest `result<_, string>` error arm into the adapter's error.
+fn guest_error(storage_name: &str, export: &str, error: Option<&wasmtime::component::Val>) -> PluginError {
+    match error {
+        Some(wasmtime::component::Val::String(e)) => {
+            PluginError::Runtime(format!("WASM storage '{storage_name}' {export} error: {e}"))
+        }
+        _ => PluginError::Runtime(format!("WASM storage '{storage_name}' {export} returned unknown error")),
+    }
+}
+
+fn unexpected(export: &str) -> PluginError {
+    PluginError::Runtime(format!("{export}() returned unexpected value type"))
+}
+
+fn optional_string(value: Option<&str>) -> wasmtime::component::Val {
+    wasmtime::component::Val::Option(value.map(|s| Box::new(wasmtime::component::Val::String(s.into()))))
+}
+
+/// `store-memory(key, content, category, session-id) -> result<_, string>`.
+struct StoreMemoryCall {
+    storage_name: String,
+    key: String,
+    content: String,
+    category: String,
+    session_id: Option<String>,
+}
+
+impl StorageExport for StoreMemoryCall {
+    type Output = ();
+    const EXPORT: &'static str = "store-memory";
+    const READS_ENTRIES: bool = false;
+
+    fn params(&self) -> Vec<wasmtime::component::Val> {
+        vec![
+            wasmtime::component::Val::String(self.key.as_str().into()),
+            wasmtime::component::Val::String(self.content.as_str().into()),
+            wasmtime::component::Val::String(self.category.as_str().into()),
+            optional_string(self.session_id.as_deref()),
+        ]
+    }
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<()> {
+        match value {
+            wasmtime::component::Val::Result(Ok(_)) => Ok(()),
+            wasmtime::component::Val::Result(Err(error)) => {
+                Err(guest_error(&self.storage_name, Self::EXPORT, error.as_deref()))
+            }
+            _ => Err(unexpected(Self::EXPORT)),
+        }
+    }
+}
+
+/// `recall-memory(query, limit, session-id) -> result<list<memory-entry>, string>`.
+struct RecallMemoryCall {
+    storage_name: String,
+    query: String,
+    limit: u32,
+    session_id: Option<String>,
+}
+
+impl StorageExport for RecallMemoryCall {
+    type Output = Vec<MemoryEntry>;
+    const EXPORT: &'static str = "recall-memory";
+    const READS_ENTRIES: bool = true;
+
+    fn params(&self) -> Vec<wasmtime::component::Val> {
+        vec![
+            wasmtime::component::Val::String(self.query.as_str().into()),
+            wasmtime::component::Val::U32(self.limit),
+            optional_string(self.session_id.as_deref()),
+        ]
+    }
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<Vec<MemoryEntry>> {
+        match value {
+            wasmtime::component::Val::Result(Ok(Some(entries))) => WasmStorage::parse_memory_entries(entries),
+            wasmtime::component::Val::Result(Ok(None)) => Ok(Vec::new()),
+            wasmtime::component::Val::Result(Err(error)) => {
+                Err(guest_error(&self.storage_name, Self::EXPORT, error.as_deref()))
+            }
+            _ => Err(unexpected(Self::EXPORT)),
+        }
+    }
+}
+
+/// `forget-memory(key) -> result<bool, string>`.
+struct ForgetMemoryCall {
+    storage_name: String,
+    key: String,
+}
+
+impl StorageExport for ForgetMemoryCall {
+    type Output = bool;
+    const EXPORT: &'static str = "forget-memory";
+    const READS_ENTRIES: bool = false;
+
+    fn params(&self) -> Vec<wasmtime::component::Val> {
+        vec![wasmtime::component::Val::String(self.key.as_str().into())]
+    }
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<bool> {
+        match value {
+            wasmtime::component::Val::Result(Ok(Some(boxed))) => match boxed.as_ref() {
+                wasmtime::component::Val::Bool(b) => Ok(*b),
+                _ => Ok(false),
+            },
+            wasmtime::component::Val::Result(Ok(None)) => Ok(false),
+            wasmtime::component::Val::Result(Err(error)) => {
+                Err(guest_error(&self.storage_name, Self::EXPORT, error.as_deref()))
+            }
+            _ => Err(unexpected(Self::EXPORT)),
+        }
+    }
+}
+
+/// `count-memories() -> result<u32, string>`.
+struct CountMemoriesCall {
+    storage_name: String,
+}
+
+impl StorageExport for CountMemoriesCall {
+    type Output = usize;
+    const EXPORT: &'static str = "count-memories";
+    const READS_ENTRIES: bool = true;
+
+    fn params(&self) -> Vec<wasmtime::component::Val> {
+        Vec::new()
+    }
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<usize> {
+        match value {
+            wasmtime::component::Val::Result(Ok(Some(boxed))) => match boxed.as_ref() {
+                wasmtime::component::Val::U32(n) => Ok(*n as usize),
+                _ => Ok(0),
+            },
+            wasmtime::component::Val::Result(Ok(None)) => Ok(0),
+            wasmtime::component::Val::Result(Err(error)) => {
+                Err(guest_error(&self.storage_name, Self::EXPORT, error.as_deref()))
+            }
+            _ => Err(unexpected(Self::EXPORT)),
+        }
+    }
+}
+
+/// `health-check() -> bool`.
+struct HealthCheckCall;
+
+impl StorageExport for HealthCheckCall {
+    type Output = bool;
+    const EXPORT: &'static str = "health-check";
+    const READS_ENTRIES: bool = false;
+
+    fn params(&self) -> Vec<wasmtime::component::Val> {
+        Vec::new()
+    }
+
+    fn parse(&self, value: &wasmtime::component::Val) -> PluginResult<bool> {
+        match value {
+            wasmtime::component::Val::Bool(b) => Ok(*b),
+            _ => Err(unexpected(Self::EXPORT)),
+        }
+    }
 }
 
 // SAFETY: All results[N] accesses index a Vec that was just constructed with
@@ -53,40 +296,25 @@ impl WasmStorage {
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
-
-        let granted: HashSet<String> = granted_permissions;
-        let optional: HashSet<String> = manifest.permissions.optional.iter().cloned().collect();
-        let mut host_state = HostState::new(
-            manifest.plugin.name.clone(),
-            manifest.config.clone(),
-            granted,
-            optional,
-            manifest.permissions.http_allowlist.clone(),
-            timeout_ms,
-            manifest.resources.max_kv_storage_mb,
+        let respawn = Respawn::new(
+            CapabilityKind::Storage,
+            engine,
+            component,
+            manifest,
+            granted_permissions,
+            None,
+            event_bus,
+            Self::register_host_functions,
         );
-        if let Some(bus) = event_bus {
-            host_state = host_state.with_event_bus(bus);
-        }
+        let mut live = respawn.instantiate().await?;
 
-        let mut store = wasmtime::Store::new(engine, host_state);
-        apply_store_resource_limits(&mut store, manifest.resources.max_memory_mb);
-        store
+        // Cache the storage backend name at load time. The probe gets its own
+        // full fuel budget, like every later call.
+        apply_store_epoch_deadline(&mut live.store, timeout_ms);
+        live.store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
-        apply_store_epoch_deadline(&mut store, timeout_ms);
-
-        let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
-        Self::register_host_functions(&mut linker)?;
-
-        let instance = linker
-            .instantiate_async(&mut store, component)
-            .await
-            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate storage plugin: {e}")))?;
-
-        // Cache the storage backend name at load time.
-        apply_store_epoch_deadline(&mut store, timeout_ms);
-        let storage_name = Self::call_name(&instance, &mut store).await?;
+        let storage_name = Self::call_name(&live.instance, &mut live.store).await?;
 
         tracing::info!(
             plugin = %manifest.plugin.name,
@@ -96,7 +324,11 @@ impl WasmStorage {
 
         Ok(Self {
             storage_name,
-            inner: Arc::new(Mutex::new(WasmStorageInner { store, instance })),
+            supervisor: Arc::new(
+                Supervisor::new(respawn, live)
+                    .with_bounded_lock_wait()
+                    .with_restart_announcements(),
+            ),
             timeout_ms,
         })
     }
@@ -146,302 +378,79 @@ impl WasmStorage {
         }
     }
 
-    /// Internal: call `store-memory` on the WASM plugin.
-    async fn call_store_memory_inner(
+    /// Run one storage operation through the supervisor. Every failure is an
+    /// error: a write is never acknowledged unless the guest completed it and
+    /// a read never turns a failure into an empty answer.
+    async fn request<T: StorageExport>(
         &self,
-        key: &str,
-        content: &str,
-        category: &str,
-        session_id: Option<&str>,
-    ) -> PluginResult<()> {
-        let mut inner = self.inner.lock().await;
-        let WasmStorageInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/storage-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/storage-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "store-memory")
-            .ok_or_else(|| PluginError::Runtime("store-memory not found in storage-exports".to_string()))?;
-
-        let store_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("store-memory is not a function".to_string()))?;
-
-        let session_val = session_id.map_or(wasmtime::component::Val::Option(None), |s| {
-            wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into()))))
-        });
-
-        let params = [
-            wasmtime::component::Val::String(key.into()),
-            wasmtime::component::Val::String(content.into()),
-            wasmtime::component::Val::String(category.into()),
-            session_val,
-        ];
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        store_fn
-            .call_async(store.as_context_mut(), &params, &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("store-memory() call failed: {e}")))?;
-
-        // Parse result<_, string>
-        match &results[0] {
-            wasmtime::component::Val::Result(r) => match r.as_ref() {
-                Ok(_) => Ok(()),
-                Err(Some(inner_err)) => match inner_err.as_ref() {
-                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' store-memory error: {e}",
-                        self.storage_name
-                    ))),
-                    _ => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' store-memory returned unknown error",
-                        self.storage_name
-                    ))),
-                },
-                Err(None) => Err(PluginError::Runtime(format!(
-                    "WASM storage '{}' store-memory returned unknown error",
+        verb: &str,
+        payload_bytes: usize,
+        export: T,
+    ) -> anyhow::Result<T::Output> {
+        if !self.supervisor.admit_payload(T::EXPORT, payload_bytes) {
+            return Err(anyhow::Error::from(PluginError::ResourceLimit(format!(
+                "WASM storage '{}' {verb} of {payload_bytes} bytes exceeds the {}-byte payload cap \
+                     (resources.max_payload_bytes)",
+                self.storage_name,
+                self.supervisor.max_payload_bytes()
+            ))));
+        }
+        // Detached (`Supervisor::call_detached_noting_rebuild`): a caller that
+        // goes away — an aborted turn, another plugin's host call timed out
+        // while it waited on this memory backend, a caller-side deadline — no
+        // longer drops the guest call mid-run, which would poison the store
+        // and, through the rebuild that follows, wipe every entry a
+        // guest-memory backend holds.
+        let (outcome, rebuilt) = self.supervisor.call_detached_noting_rebuild(StorageOp(export)).await;
+        if rebuilt {
+            tracing::warn!(
+                storage = %self.storage_name,
+                plugin = %self.supervisor.plugin_name(),
+                operation = %verb,
+                "WASM storage backend rebuilt on a fresh store; entries the guest kept in its own memory are gone"
+            );
+            // The memory layer has no other way to tell "no memories" from
+            // "the memories were just lost": the first read after a rebuild
+            // says so instead of answering from the empty guest.
+            if T::READS_ENTRIES && outcome.is_ok() {
+                anyhow::bail!(
+                    "WASM storage '{}' was rebuilt on a fresh store before this {verb}: entries the guest kept \
+                     in its own memory are gone and the store only holds what was written since; retry to read \
+                     the rebuilt store",
                     self.storage_name
-                ))),
-            },
-            _ => Err(PluginError::Runtime(
-                "store-memory() returned unexpected value type".to_string(),
-            )),
+                );
+            }
+        }
+        match outcome {
+            Ok(output) => Ok(output),
+            // A guest call that ran past its budget and an operation that could
+            // not get the store within that budget read the same, as they
+            // always have; only the first is charged to the plugin.
+            Err(error @ PluginError::Timeout(_)) => Err(anyhow::Error::from(error).context(format!(
+                "WASM storage '{}' {verb} timed out after {}ms",
+                self.storage_name, self.timeout_ms
+            ))),
+            // Keep the type, so callers such as the reliability layer can
+            // tell a quarantine or a refused payload apart without parsing text.
+            Err(error) => Err(error.into()),
         }
     }
 
-    /// Internal: call `recall-memory` on the WASM plugin.
-    async fn call_recall_memory_inner(
-        &self,
-        query: &str,
-        limit: u32,
-        session_id: Option<&str>,
-    ) -> PluginResult<Vec<MemoryEntry>> {
-        let mut inner = self.inner.lock().await;
-        let WasmStorageInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/storage-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/storage-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "recall-memory")
-            .ok_or_else(|| PluginError::Runtime("recall-memory not found in storage-exports".to_string()))?;
-
-        let recall_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("recall-memory is not a function".to_string()))?;
-
-        let session_val = session_id.map_or(wasmtime::component::Val::Option(None), |s| {
-            wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into()))))
-        });
-
-        let params = [
-            wasmtime::component::Val::String(query.into()),
-            wasmtime::component::Val::U32(limit),
-            session_val,
-        ];
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        recall_fn
-            .call_async(store.as_context_mut(), &params, &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("recall-memory() call failed: {e}")))?;
-
-        // Parse result<list<memory-entry>, string>
-        match &results[0] {
-            wasmtime::component::Val::Result(r) => match r.as_ref() {
-                Ok(Some(inner_val)) => Self::parse_memory_entries(inner_val),
-                Ok(None) => Ok(Vec::new()),
-                Err(Some(inner_err)) => match inner_err.as_ref() {
-                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' recall-memory error: {e}",
-                        self.storage_name
-                    ))),
-                    _ => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' recall-memory returned unknown error",
-                        self.storage_name
-                    ))),
-                },
-                Err(None) => Err(PluginError::Runtime(format!(
-                    "WASM storage '{}' recall-memory returned unknown error",
-                    self.storage_name
-                ))),
-            },
-            _ => Err(PluginError::Runtime(
-                "recall-memory() returned unexpected value type".to_string(),
-            )),
-        }
+    /// Plugin that exports this storage backend.
+    pub fn plugin_name(&self) -> &str {
+        self.supervisor.plugin_name()
     }
 
-    /// Internal: call `forget-memory` on the WASM plugin.
-    async fn call_forget_memory_inner(&self, key: &str) -> PluginResult<bool> {
-        let mut inner = self.inner.lock().await;
-        let WasmStorageInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/storage-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/storage-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "forget-memory")
-            .ok_or_else(|| PluginError::Runtime("forget-memory not found in storage-exports".to_string()))?;
-
-        let forget_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("forget-memory is not a function".to_string()))?;
-
-        let params = [wasmtime::component::Val::String(key.into())];
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        forget_fn
-            .call_async(store.as_context_mut(), &params, &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("forget-memory() call failed: {e}")))?;
-
-        // Parse result<bool, string>
-        match &results[0] {
-            wasmtime::component::Val::Result(r) => match r.as_ref() {
-                Ok(Some(boxed)) => match boxed.as_ref() {
-                    wasmtime::component::Val::Bool(b) => Ok(*b),
-                    _ => Ok(false),
-                },
-                Ok(None) => Ok(false),
-                Err(Some(inner_err)) => match inner_err.as_ref() {
-                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' forget-memory error: {e}",
-                        self.storage_name
-                    ))),
-                    _ => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' forget-memory returned unknown error",
-                        self.storage_name
-                    ))),
-                },
-                Err(None) => Err(PluginError::Runtime(format!(
-                    "WASM storage '{}' forget-memory returned unknown error",
-                    self.storage_name
-                ))),
-            },
-            _ => Err(PluginError::Runtime(
-                "forget-memory() returned unexpected value type".to_string(),
-            )),
-        }
+    /// Per-adapter health for `wasm_plugins_status`.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        self.supervisor.diagnostics(serde_json::json!({
+            "plugin": self.supervisor.plugin_name(),
+            "storage": self.storage_name,
+        }))
     }
 
-    /// Internal: call `count-memories` on the WASM plugin.
-    async fn call_count_memories_inner(&self) -> PluginResult<usize> {
-        let mut inner = self.inner.lock().await;
-        let WasmStorageInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/storage-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/storage-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "count-memories")
-            .ok_or_else(|| PluginError::Runtime("count-memories not found in storage-exports".to_string()))?;
-
-        let count_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("count-memories is not a function".to_string()))?;
-
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        count_fn
-            .call_async(store.as_context_mut(), &[], &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("count-memories() call failed: {e}")))?;
-
-        // Parse result<u32, string>
-        match &results[0] {
-            wasmtime::component::Val::Result(r) => match r.as_ref() {
-                Ok(Some(boxed)) => match boxed.as_ref() {
-                    wasmtime::component::Val::U32(n) => Ok(*n as usize),
-                    _ => Ok(0),
-                },
-                Ok(None) => Ok(0),
-                Err(Some(inner_err)) => match inner_err.as_ref() {
-                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' count-memories error: {e}",
-                        self.storage_name
-                    ))),
-                    _ => Err(PluginError::Runtime(format!(
-                        "WASM storage '{}' count-memories returned unknown error",
-                        self.storage_name
-                    ))),
-                },
-                Err(None) => Err(PluginError::Runtime(format!(
-                    "WASM storage '{}' count-memories returned unknown error",
-                    self.storage_name
-                ))),
-            },
-            _ => Err(PluginError::Runtime(
-                "count-memories() returned unexpected value type".to_string(),
-            )),
-        }
-    }
-
-    /// Internal: call `health-check` on the WASM plugin.
-    async fn call_health_check_inner(&self) -> PluginResult<bool> {
-        let mut inner = self.inner.lock().await;
-        let WasmStorageInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/storage-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/storage-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "health-check")
-            .ok_or_else(|| PluginError::Runtime("health-check not found in storage-exports".to_string()))?;
-
-        let health_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("health-check is not a function".to_string()))?;
-
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        health_fn
-            .call_async(store.as_context_mut(), &[], &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("health-check() call failed: {e}")))?;
-
-        match &results[0] {
-            wasmtime::component::Val::Bool(b) => Ok(*b),
-            _ => Err(PluginError::Runtime(
-                "health-check() returned unexpected value type".to_string(),
-            )),
-        }
+    pub fn is_quarantined(&self) -> bool {
+        self.supervisor.is_quarantined()
     }
 
     /// Parse a `list<memory-entry>` value from the WASM component.
@@ -541,40 +550,39 @@ impl crate::memory::traits::Memory for WasmStorage {
     ) -> anyhow::Result<()> {
         validate_memory_write_target(key, session_id)?;
         let category_str = category.to_string();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_store_memory_inner(key, content, &category_str, session_id),
+        let payload_bytes = key
+            .len()
+            .saturating_add(content.len())
+            .saturating_add(category_str.len())
+            .saturating_add(session_id.map_or(0, str::len));
+        self.request(
+            "store",
+            payload_bytes,
+            StoreMemoryCall {
+                storage_name: self.storage_name.clone(),
+                key: key.to_string(),
+                content: content.to_string(),
+                category: category_str,
+                session_id: session_id.map(str::to_string),
+            },
         )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM storage '{}' store timed out after {}ms",
-                self.storage_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(())) => Ok(()),
-        }
+        .await
     }
 
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         let limit_u32 = limit.min(u32::MAX as usize) as u32;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_recall_memory_inner(query, limit_u32, session_id),
+        let payload_bytes = query.len().saturating_add(session_id.map_or(0, str::len));
+        self.request(
+            "recall",
+            payload_bytes,
+            RecallMemoryCall {
+                storage_name: self.storage_name.clone(),
+                query: query.to_string(),
+                limit: limit_u32,
+                session_id: session_id.map(str::to_string),
+            },
         )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM storage '{}' recall timed out after {}ms",
-                self.storage_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(entries)) => Ok(entries),
-        }
+        .await
     }
 
     /// Get a specific memory by key.
@@ -604,65 +612,39 @@ impl crate::memory::traits::Memory for WasmStorage {
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_forget_memory_inner(key),
+        self.request(
+            "forget",
+            key.len(),
+            ForgetMemoryCall {
+                storage_name: self.storage_name.clone(),
+                key: key.to_string(),
+            },
         )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM storage '{}' forget timed out after {}ms",
-                self.storage_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(b)) => Ok(b),
-        }
+        .await
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_count_memories_inner(),
+        self.request(
+            "count",
+            0,
+            CountMemoriesCall {
+                storage_name: self.storage_name.clone(),
+            },
         )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM storage '{}' count timed out after {}ms",
-                self.storage_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(n)) => Ok(n),
-        }
+        .await
     }
 
     async fn health_check(&self) -> bool {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_health_check_inner(),
-        )
-        .await;
-
-        match result {
-            Err(_) => {
+        match self.request("health-check", 0, HealthCheckCall).await {
+            Ok(healthy) => healthy,
+            Err(error) => {
                 tracing::warn!(
                     storage = %self.storage_name,
-                    "WASM storage health-check timed out"
-                );
-                false
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    storage = %self.storage_name,
-                    error = %e,
+                    error = %error,
                     "WASM storage health-check failed"
                 );
                 false
             }
-            Ok(Ok(b)) => b,
         }
     }
 }
@@ -830,5 +812,94 @@ mod tests {
             let entry = WasmStorage::parse_memory_entry(&record).unwrap();
             assert_eq!(&entry.category, expected_cat, "category {cat_str} mismatch");
         }
+    }
+
+    const MAP_STORAGE_MANIFEST: &str = r#"
+[plugin]
+name = "map-storage"
+version = "0.1.0"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "storage"
+name = "wasm-map"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+"#;
+
+    /// The committed `map-storage` component, which keeps every entry in its
+    /// own linear memory.
+    async fn map_storage() -> WasmStorage {
+        let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasmtime engine");
+        let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/map-storage/plugin.wasm");
+        let bytes = std::fs::read(wasm).expect("test: the committed storage fixture is readable");
+        let component =
+            wasmtime::component::Component::from_binary(&engine, &bytes).expect("test: the fixture is a component");
+        let manifest: PluginManifest = toml::from_str(MAP_STORAGE_MANIFEST).expect("test: fixture manifest parses");
+        WasmStorage::new(&engine, &component, &manifest, HashSet::new(), None)
+            .await
+            .expect("test: the fixture instantiates")
+    }
+
+    /// R-C3X F3: a caller that gives up on a storage operation — an aborted
+    /// turn, a nested host call timed out by another plugin, a caller-side
+    /// deadline — must not decide the operation's fate. The operation runs to
+    /// completion (or to its own host timeout) on its own, so a dropped caller
+    /// can neither poison the store mid-call nor lose a write it had already
+    /// handed over.
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_cancel_a_storage_operation() {
+        use crate::memory::traits::Memory;
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let storage = map_storage().await;
+        {
+            // Queue the write behind a held store lock, then abandon it.
+            let guard = storage.supervisor.lock().await;
+            {
+                let mut write = std::pin::pin!(storage.store("handed-over", "kept", MemoryCategory::Core, None));
+                assert!(
+                    write
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending(),
+                    "the write must be waiting for the store"
+                );
+            }
+            // Let an operation that no longer has a caller reach the store queue.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            drop(guard);
+        }
+
+        let mut entries = 0;
+        for _ in 0..64 {
+            entries = storage.count().await.expect("test: count");
+            if entries == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(entries, 1, "a write whose caller went away must still land");
+        let diagnostics = storage.diagnostics();
+        assert_eq!(
+            diagnostics.get("cancelled_count").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "{diagnostics}"
+        );
+        assert_eq!(
+            diagnostics.get("restart_count").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "{diagnostics}"
+        );
     }
 }

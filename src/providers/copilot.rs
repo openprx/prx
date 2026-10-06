@@ -170,8 +170,8 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     pub fn new(github_token: Option<&str>) -> Self {
-        let token_dir = directories::ProjectDirs::from("", "", "openprx")
-            .map(|dir| dir.config_dir().join("copilot"))
+        let token_dir = crate::config::platform_config_dir()
+            .map(|dir| dir.join("copilot"))
             .unwrap_or_else(|| {
                 // Fall back to a user-specific temp directory to avoid
                 // shared-directory symlink attacks.
@@ -224,20 +224,33 @@ impl CopilotProvider {
         ("Accept", "application/json"),
     ];
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools.map(|items| {
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function",
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect()
-        })
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<Vec<NativeToolSpec>>> {
+        let Some(items) = tools else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut converted = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "copilot".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            converted.push(NativeToolSpec {
+                kind: "function",
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: parameters.into_owned(),
+                },
+            });
+        }
+        Ok(Some(converted))
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<ApiMessage> {
@@ -319,7 +332,7 @@ impl CopilotProvider {
         let (token, endpoint) = self.get_api_key().await?;
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
 
-        let native_tools = Self::convert_tools(tools);
+        let native_tools = self.convert_tools(tools)?;
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
@@ -442,7 +455,7 @@ impl CopilotProvider {
     async fn device_code_login(&self) -> anyhow::Result<String> {
         let response: DeviceCodeResponse = self
             .http_client()
-            .post(GITHUB_DEVICE_CODE_URL)
+            .post(super::token_host(GITHUB_DEVICE_CODE_URL))
             .header("Accept", "application/json")
             .json(&serde_json::json!({
                 "client_id": GITHUB_CLIENT_ID,
@@ -471,7 +484,7 @@ impl CopilotProvider {
 
             let token_response: AccessTokenResponse = self
                 .http_client()
-                .post(GITHUB_ACCESS_TOKEN_URL)
+                .post(super::token_host(GITHUB_ACCESS_TOKEN_URL))
                 .header("Accept", "application/json")
                 .json(&serde_json::json!({
                     "client_id": GITHUB_CLIENT_ID,
@@ -505,7 +518,7 @@ impl CopilotProvider {
 
     /// Exchange a GitHub access token for a Copilot API key.
     async fn exchange_for_api_key(&self, access_token: &str) -> anyhow::Result<ApiKeyInfo> {
-        let mut request = self.http_client().get(GITHUB_API_KEY_URL);
+        let mut request = self.http_client().get(super::token_host(GITHUB_API_KEY_URL));
         for (header, value) in &Self::COPILOT_HEADERS {
             request = request.header(*header, *value);
         }
@@ -515,7 +528,7 @@ impl CopilotProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = super::read_error_body(response).await;
             let sanitized = super::sanitize_api_error(&body);
 
             if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -664,7 +677,15 @@ impl Provider for CopilotProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let messages = Self::convert_messages(messages);
-        let native_tools = Self::convert_tools(options.tools.as_deref());
+        // Lowered before the connection is opened, so a tool this endpoint
+        // cannot be offered ends the turn with the reason, not an upstream 400.
+        let native_tools = match self.convert_tools(options.tools.as_deref()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
@@ -677,7 +698,7 @@ impl Provider for CopilotProvider {
         let this = self.clone_for_stream();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let (token, endpoint) = match this.get_api_key().await {
                 Ok(value) => value,
                 Err(err) => {
@@ -712,12 +733,11 @@ impl Provider for CopilotProvider {
                 return;
             }
 
-            let mut chunks = crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens);
-            while let Some(chunk) = chunks.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
-            }
+            crate::providers::compatible::forward_stream_until_closed(
+                crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens),
+                &tx,
+            )
+            .await;
         });
 
         stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()

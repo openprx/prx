@@ -17,7 +17,9 @@ use super::model::{
     ManagedKind, ManagedSessionView, ManagedStatus, project_run, project_shell, project_shell_status, project_status,
 };
 use super::shell::ShellSession;
-use crate::tools::sessions_spawn::{ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus};
+use crate::tools::sessions_spawn::{
+    ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus, TaskFinalization,
+};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -174,6 +176,8 @@ pub struct ChatSessionsHandle {
     seq_map: Vec<(u64, SessionId)>,
     /// Next sequence number to hand out.
     next_seq: u64,
+    /// Decision aliases share the allocator but never enter the child registry.
+    decision_seqs: Vec<(u64, String, crate::causal_tree::ids::DecisionId)>,
     /// First time this handle observed a PTY as exited. PTY sessions do not
     /// carry `finished_at`, so cleanup ages them from this observation point.
     pty_terminal_seen_at: HashMap<SessionId, DateTime<Utc>>,
@@ -200,6 +204,7 @@ impl ChatSessionsHandle {
             ptys: Arc::new(Mutex::new(Vec::new())),
             seq_map: Vec::new(),
             next_seq: 1,
+            decision_seqs: Vec::new(),
             pty_terminal_seen_at: HashMap::new(),
             reaped_sessions: Vec::new(),
             daemon_requests: super::daemon::new_in_flight_registry(),
@@ -310,6 +315,46 @@ impl ChatSessionsHandle {
         self.next_seq += 1;
         self.seq_map.push((seq, id.clone()));
         seq
+    }
+
+    /// Register an already authenticated pending decision for the current
+    /// chat. Aliases are never reused, including after a session switch.
+    pub(crate) fn register_decision_seq(
+        &mut self,
+        session: &str,
+        decision: crate::causal_tree::ids::DecisionId,
+    ) -> Result<u64> {
+        if let Some((seq, _, _)) = self
+            .decision_seqs
+            .iter()
+            .find(|(_, existing_session, existing)| existing_session == session && *existing == decision)
+        {
+            return Ok(*seq);
+        }
+        anyhow::ensure!(
+            !session.is_empty() && self.decision_seqs.len() < 1024,
+            "decision display sequence unavailable; use the explicit decision UUID"
+        );
+        let seq = self.next_seq;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("display sequence exhausted"))?;
+        self.decision_seqs.push((seq, session.to_owned(), decision));
+        Ok(seq)
+    }
+
+    /// A foreign-chat alias is an error, never a fallback to a child session.
+    pub(crate) fn decision_for_seq(
+        &self,
+        session: &str,
+        seq: u64,
+    ) -> Result<Option<crate::causal_tree::ids::DecisionId>> {
+        let Some((_, owner_session, decision)) = self.decision_seqs.iter().find(|(id, _, _)| *id == seq) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(owner_session == session, "no decision alias in the current chat");
+        Ok(Some(*decision))
     }
 
     /// Resolve a display sequence `#N` to the underlying run UUID.
@@ -638,6 +683,7 @@ impl ChatSessionsHandle {
             .collect::<HashSet<_>>();
         let mut aborted_agents = 0usize;
         let mut process_controls = Vec::new();
+        let mut task_controls = Vec::new();
         {
             let runs = self.runs.write().await;
             for run in runs.iter().filter(|run| snapshot_run_ids.contains(&run.id)) {
@@ -649,10 +695,22 @@ impl ChatSessionsHandle {
                 }
                 if let Some(control) = run.process_control.clone() {
                     process_controls.push(control);
+                } else if let Some(control) = run.task_control.clone() {
+                    task_controls.push(control);
                 } else if let Some(handle) = run.abort_handle.as_ref() {
                     handle.abort();
-                    aborted_agents = aborted_agents.saturating_add(1);
+                    tracing::warn!(run_id = %run.id, "Task termination has no cleanup acknowledgement owner");
                 }
+            }
+        }
+        // Request every task promptly; one pending observer must not defer
+        // sending cancellation to its peers for another full deadline.
+        let task_results =
+            futures_util::future::join_all(task_controls.iter().map(|control| control.request_termination(reason)))
+                .await;
+        for result in task_results {
+            if result == Some(TaskFinalization::Terminated) {
+                aborted_agents = aborted_agents.saturating_add(1);
             }
         }
         for control in process_controls {
@@ -666,10 +724,24 @@ impl ChatSessionsHandle {
             let mut runs = self.runs.write().await;
             runs.retain(|run| {
                 !snapshot_run_ids.contains(&run.id)
-                    || run
-                        .process_control
-                        .as_ref()
-                        .is_some_and(|control| control.finalization().is_none())
+                    || run.process_control.as_ref().is_some_and(|control| {
+                        !matches!(
+                            control.finalization(),
+                            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+                        )
+                    })
+                    || run.task_control.as_ref().is_some_and(|control| {
+                        !matches!(
+                            control.finalization(),
+                            Some(TaskFinalization::Natural | TaskFinalization::Terminated)
+                        )
+                    })
+                    || (run.process_control.is_none()
+                        && run.task_control.is_none()
+                        && matches!(
+                            run.status,
+                            SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
+                        ))
             });
         }
         let shells = self
@@ -713,7 +785,8 @@ impl ChatSessionsHandle {
             self.ptys.lock().retain(|pty| !snapshot_pty_ids.contains(&pty.id));
         }
         self.seq_map.clear();
-        self.next_seq = 1;
+        // Keep the allocator monotonic: outstanding decision aliases and
+        // previously displayed child numbers must never acquire a new target.
         self.pty_terminal_seen_at.clear();
 
         ShutdownReport {
@@ -1039,6 +1112,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::<HistoryEntry>::new())),
             steer_tx: None,
             parent_run_id: None,

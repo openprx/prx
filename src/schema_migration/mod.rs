@@ -559,10 +559,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn configured_postgres_inspection_isolated_from_tokio_runtime() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let schema = format!("prx_schema_inspect_runtime_{}", std::process::id());
         let setup_url = db_url.clone();
         let setup_schema = schema.clone();

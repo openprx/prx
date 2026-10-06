@@ -17,6 +17,8 @@
   import LoginPage from './pages/LoginPage.svelte';
   import OverviewPage from './pages/OverviewPage.svelte';
   import SessionsPage from './pages/SessionsPage.svelte';
+  import DecisionPlanePage from './pages/DecisionPlanePage.svelte';
+  import DecisionInspectPage from './pages/DecisionInspectPage.svelte';
   import ChatPage from './pages/ChatPage.svelte';
   import ChannelsPage from './pages/ChannelsPage.svelte';
   import ConfigPage from './pages/ConfigPage.svelte';
@@ -25,6 +27,10 @@
   import McpPage from './pages/McpPage.svelte';
   import SkillsPage from './pages/SkillsPage.svelte';
   import PluginsPage from './pages/PluginsPage.svelte';
+  import ProvidersPage from './pages/ProvidersPage.svelte';
+  import ModelsPage from './pages/ModelsPage.svelte';
+  import RoutingPage from './pages/RoutingPage.svelte';
+  import ChangesPage from './pages/ChangesPage.svelte';
 
   let path = $state(currentPath());
   let token = $state(getToken());
@@ -251,6 +257,10 @@
         <main class="flex-1 p-4 sm:p-6">
           {#if activePath === '/overview'}
             <OverviewPage />
+          {:else if activePath === '/decision-plane'}
+            <DecisionPlanePage />
+          {:else if activePath === '/decisions'}
+            <DecisionInspectPage />
           {:else if activePath === '/sessions'}
             <SessionsPage />
           {:else if activePath.startsWith('/chat/')}
@@ -265,6 +275,14 @@
             <SkillsPage />
           {:else if activePath === '/plugins'}
             <PluginsPage />
+          {:else if activePath === '/providers'}
+            <ProvidersPage />
+          {:else if activePath === '/models'}
+            <ModelsPage />
+          {:else if activePath === '/routing'}
+            <RoutingPage />
+          {:else if activePath === '/changes'}
+            <ChangesPage />
           {:else if activePath === '/config'}
             <ConfigPage />
           {:else if activePath === '/logs'}

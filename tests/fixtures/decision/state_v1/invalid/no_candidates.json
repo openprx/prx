@@ -1,0 +1,19 @@
+{
+  "schema": "prx.causal.state.v1",
+  "hop": 0,
+  "prior_decision_id": null,
+  "latest_user_turn": "What is the difference between a mutex and a semaphore?",
+  "goal": "Explain the difference between a mutex and a semaphore.",
+  "completed_steps": [],
+  "artifacts": [],
+  "failed_tool_fingerprints": [],
+  "retry_count": 0,
+  "approval_pending": false,
+  "constraints": [],
+  "budgets": {
+    "tokens": "b2",
+    "latency": "b2",
+    "cost": "b1"
+  },
+  "candidates": []
+}

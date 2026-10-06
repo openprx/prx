@@ -15,6 +15,7 @@
 //! These tests run the real `build_runtime_system_prompt`, the real skill
 //! retrieval, and the real router over several turns of one session.
 
+#![cfg(test)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -22,15 +23,17 @@
     clippy::indexing_slicing
 )]
 
-use crate::agent::loop_::{
-    ChatMode, ToolLoopMemory, ToolLoopOutcome, build_runtime_system_prompt, run_tool_call_loop_outcome,
-    select_prompt_skills,
-};
+use crate::agent::runtime_prompt::{build_runtime_system_prompt, select_prompt_skills};
+use crate::agent::turn_contracts::{ChatMode, ToolLoopOutcome};
+use crate::agent::turn_engine::run_turn;
+use crate::agent::turn_request::ToolLoopMemory;
 use crate::config::{Config, ToolTieringConfig};
 use crate::memory::embeddings::LocalHashEmbedding;
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::skills::{SessionSkillExposure, Skill, SkillTool};
-use crate::tools::intent::{SessionToolExposure, SessionToolSurface, UnroutedToolPolicy, resolve_tools_for_intent};
+use crate::tools::legacy_intent_tests::{
+    SessionToolExposure, SessionToolSurface, UnroutedToolPolicy, resolve_tools_for_intent,
+};
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -466,33 +469,44 @@ async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
         ChatMessage::user("what changed in rustls lately"),
     ];
 
-    let (outcome, _trace) = run_tool_call_loop_outcome(
-        &provider,
+    let admission =
+        crate::agent::turn_tests::admission::AdmittedTurn::empty(workspace.path(), "what changed in rustls lately")
+            .await;
+    let (outcome, _trace) = run_turn(
         &mut history,
-        Arc::new(tools),
-        &crate::observability::NoopObserver,
-        &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-        "mock-provider",
-        MODEL,
-        0.0,
-        true,
-        None,
-        "terminal",
-        &crate::config::MultimodalConfig::default(),
-        2,
-        false,
-        Vec::new(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        ToolLoopMemory::none(),
-        ChatMode::default(),
-        None,
-        false,
-        None,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "terminal",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: Arc::new(tools),
+            observer: &crate::observability::NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admission.adapter()),
+            memory: ToolLoopMemory::none(),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
     )
     .await
     .expect("the corrective retry must complete the turn");
@@ -542,7 +556,7 @@ async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
     // labelled and therefore separable from the turn it rides on.
     let (operator_text, aside) = tails[1]
         .trim_start_matches("user:")
-        .split_once(crate::agent::loop_::CORRECTIVE_ASIDE_PREFIX)
+        .split_once(crate::agent::response_guard::CORRECTIVE_ASIDE_PREFIX)
         .expect("the corrective aside must carry its marker");
     assert_eq!(
         operator_text.trim(),

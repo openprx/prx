@@ -237,7 +237,82 @@ impl MeteredTokenUsageRecord {
     }
 }
 
-fn usage_cost_usd(
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum UsagePrice {
+    Missing,
+    Invalid,
+    Priced(f64),
+}
+
+pub(crate) fn usage_cost_resolution(
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    cost_config: &crate::config::schema::CostConfig,
+) -> UsagePrice {
+    let pricing_key = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    // Outcomes are persisted with URL userinfo redacted, and a `[cost].prices`
+    // key may spell the provider as configured, credentials included. The
+    // rule is deterministic: the exact key wins; otherwise the key whose
+    // redacted spelling equals this one. Two credentialed keys for the same
+    // endpoint and model are a configuration error at validation (D-027); if
+    // such a pair is ever reached here anyway, the HIGHEST resulting cost is
+    // charged, so the spend always reaches the budget.
+    let turn_cost = |pricing: &crate::config::schema::ModelPricing| {
+        if !pricing.is_finite_nonnegative() {
+            return None;
+        }
+        let ordinary_prompt_tokens = prompt_tokens
+            .saturating_sub(cache_creation_input_tokens)
+            .saturating_sub(cache_read_input_tokens);
+        let cost = (cache_read_input_tokens as f64).mul_add(
+            pricing.cache_read,
+            (cache_creation_input_tokens as f64).mul_add(
+                pricing.cache_write,
+                (completion_tokens as f64).mul_add(pricing.output, ordinary_prompt_tokens as f64 * pricing.input),
+            ),
+        ) / 1_000_000.0;
+        let has_positive_billed_price = (ordinary_prompt_tokens > 0 && pricing.input > 0.0)
+            || (completion_tokens > 0 && pricing.output > 0.0)
+            || (cache_creation_input_tokens > 0 && pricing.cache_write > 0.0)
+            || (cache_read_input_tokens > 0 && pricing.cache_read > 0.0);
+        (cost.is_finite() && cost >= 0.0 && (cost > 0.0 || !has_positive_billed_price)).then_some(cost)
+    };
+    if let Some(pricing) = cost_config.prices.get(&pricing_key) {
+        return turn_cost(pricing).map_or(UsagePrice::Invalid, UsagePrice::Priced);
+    }
+    let wanted = crate::providers::redact_endpoint_userinfo(&pricing_key);
+    let costs: Option<Vec<f64>> = cost_config
+        .prices
+        .iter()
+        .filter(|(key, _)| key.contains('@') && crate::providers::redact_endpoint_userinfo(key) == wanted)
+        .map(|(_, pricing)| turn_cost(pricing))
+        .collect();
+    let Some(costs) = costs else {
+        return UsagePrice::Invalid;
+    };
+    if costs.len() > 1 {
+        tracing::warn!(
+            price_key = %wanted,
+            candidates = costs.len(),
+            "several [cost].prices keys name this provider and model once their URL userinfo is redacted; \
+             charging the highest. Validation refuses such a configuration; keep one key per endpoint and model."
+        );
+    }
+    costs
+        .into_iter()
+        .reduce(f64::max)
+        .map_or(UsagePrice::Missing, UsagePrice::Priced)
+}
+
+pub(crate) fn usage_cost_usd(
     provider: &str,
     model: &str,
     prompt_tokens: u64,
@@ -246,26 +321,18 @@ fn usage_cost_usd(
     cache_read_input_tokens: u64,
     cost_config: &crate::config::schema::CostConfig,
 ) -> Option<f64> {
-    if provider.eq_ignore_ascii_case("ollama") {
-        return None;
+    match usage_cost_resolution(
+        provider,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        cost_config,
+    ) {
+        UsagePrice::Priced(cost) => Some(cost),
+        UsagePrice::Missing | UsagePrice::Invalid => None,
     }
-    let pricing_key = if model.contains('/') {
-        model.to_string()
-    } else {
-        format!("{provider}/{model}")
-    };
-    let pricing = cost_config.prices.get(&pricing_key)?;
-    let ordinary_prompt_tokens = prompt_tokens
-        .saturating_sub(cache_creation_input_tokens)
-        .saturating_sub(cache_read_input_tokens);
-    let cost = (cache_read_input_tokens as f64).mul_add(
-        pricing.cache_read,
-        (cache_creation_input_tokens as f64).mul_add(
-            pricing.cache_write,
-            (completion_tokens as f64).mul_add(pricing.output, ordinary_prompt_tokens as f64 * pricing.input),
-        ),
-    ) / 1_000_000.0;
-    Some(cost)
 }
 
 impl TokenUsage {
@@ -815,7 +882,12 @@ impl ProviderExecutionOutcome {
         // provider/model switch each add an attempt), when the serving
         // provider/model differs from what the router selected, or when an
         // earlier turn in the same user turn fell back (FIX #2).
-        let provider_differs = final_provider != decision.selected.provider;
+        // The router selects by configured label while a failover chain reports
+        // the label with its URL userinfo redacted, so the two are compared in
+        // that one spelling: a first-attempt success through a
+        // `custom:http://user:pass@host` endpoint is not a provider switch.
+        let provider_differs = crate::providers::redact_endpoint_userinfo(&final_provider)
+            != crate::providers::redact_endpoint_userinfo(&decision.selected.provider);
         let model_differs = final_model != decision.selected.model;
         let this_turn_fallback = attempts.len() > 1 || provider_differs || model_differs;
         let had_fallback = this_turn_fallback || prior_turns_had_fallback;
@@ -852,6 +924,22 @@ impl ProviderExecutionOutcome {
             status,
             fallback_reason,
             tokens_used,
+        }
+    }
+
+    /// Redact URL userinfo in every provider label this outcome names (the
+    /// serving provider and each attempt), before it is persisted.
+    ///
+    /// A failover chain already reports redacted labels; an outcome built from
+    /// a route decision (`success_for_decision`, `failed_for_decision`) names
+    /// the configured label, which may be `custom:http://user:password@host`.
+    pub fn redact_provider_labels(&mut self) {
+        let labels = std::iter::once(&mut self.final_provider)
+            .chain(self.attempts.iter_mut().map(|attempt| &mut attempt.provider));
+        for label in labels {
+            if let std::borrow::Cow::Owned(redacted) = crate::providers::redact_endpoint_userinfo(label) {
+                *label = redacted;
+            }
         }
     }
 
@@ -909,11 +997,13 @@ pub async fn record_route_decision_event(
     scope: MessageEventScope,
     decision: &RouteDecision,
 ) -> anyhow::Result<MessageEvent> {
-    let payload = serde_json::to_string(decision)?;
+    // A provider label may be a URL carrying `user:password@`; the durable
+    // record keeps the endpoint and never the credential.
+    let payload = crate::providers::redact_endpoint_userinfo(&serde_json::to_string(decision)?).into_owned();
     let content = format!(
         "decision_id={} selected={}/{} candidates={}",
         decision.decision_id,
-        decision.selected.provider,
+        crate::providers::redact_endpoint_userinfo(&decision.selected.provider),
         decision.selected.model,
         decision.candidates.len()
     );
@@ -933,10 +1023,13 @@ pub async fn record_provider_outcome_events(
             AttemptStatus::Failed => "provider.attempt_failed",
             AttemptStatus::Skipped => "provider.attempt_skipped",
         };
-        let payload = serde_json::to_string(attempt)?;
+        let payload = crate::providers::redact_endpoint_userinfo(&serde_json::to_string(attempt)?).into_owned();
         let content = format!(
             "decision_id={} seq={} provider={} model={}",
-            outcome.decision_id, attempt.seq, attempt.provider, attempt.model
+            outcome.decision_id,
+            attempt.seq,
+            crate::providers::redact_endpoint_userinfo(&attempt.provider),
+            attempt.model
         );
         fabric
             .record_runtime_event_idempotent(
@@ -948,11 +1041,11 @@ pub async fn record_provider_outcome_events(
             )
             .await?;
     }
-    let payload = serde_json::to_string(outcome)?;
+    let payload = crate::providers::redact_endpoint_userinfo(&serde_json::to_string(outcome)?).into_owned();
     let content = format!(
         "decision_id={} final={}/{} attempts={}",
         outcome.decision_id,
-        outcome.final_provider,
+        crate::providers::redact_endpoint_userinfo(&outcome.final_provider),
         outcome.final_model,
         outcome.attempts.len()
     );
@@ -982,8 +1075,9 @@ pub fn route_event_scope(
     scope.session_key = session_key;
     scope.run_id = run_id;
     scope.agent_id = Some("llm-router".to_string());
-    scope.sender = sender;
-    scope.recipient = recipient;
+    // Callers name the sender or recipient `<provider>/<model>`.
+    scope.sender = sender.map(|sender| crate::providers::redact_endpoint_userinfo(&sender).into_owned());
+    scope.recipient = recipient.map(|recipient| crate::providers::redact_endpoint_userinfo(&recipient).into_owned());
     scope
 }
 
@@ -1069,12 +1163,14 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "openai/gpt-4o-mini".to_string(),
                 api_key: None,
+                credential_ref: None,
             },
             ModelRouteConfig {
                 hint: "reasoning".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4".to_string(),
                 api_key: None,
+                credential_ref: None,
             },
         ];
         let decision = RouteDecision::from_model_routes_for_context(
@@ -1359,6 +1455,71 @@ mod tests {
         assert!(
             (cost - expected).abs() < 0.000_000_1,
             "cache read/write cost should be priced separately: {cost}"
+        );
+    }
+
+    #[test]
+    fn invalid_cost_tariff_cannot_cancel_a_charge_or_escape_through_alias() {
+        let mut config = crate::config::schema::CostConfig::default();
+        config.prices.clear();
+        let provider = "custom:http://[redacted]@example.com/v1";
+        let model = "model";
+        let alias = "custom:http://prx_user:placeholder@example.com/v1/model";
+        let valid = crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        };
+        config.prices.insert(alias.to_string(), valid.clone());
+        assert!(usage_cost_usd(provider, model, 64, 64, 0, 0, &config).is_some());
+        assert!(matches!(
+            usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+            UsagePrice::Priced(_)
+        ));
+
+        let mut invalid = valid;
+        invalid.input = -1.0;
+        config.prices.insert(format!("{provider}/{model}"), invalid.clone());
+        assert_eq!(usage_cost_usd(provider, model, 64, 64, 0, 0, &config), None);
+        assert_eq!(
+            usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+            UsagePrice::Invalid
+        );
+
+        config.prices.remove(&format!("{provider}/{model}"));
+        config.prices.insert(
+            "custom:http://prx_node:placeholder@example.com/v1/model".to_string(),
+            invalid,
+        );
+        assert_eq!(usage_cost_usd(provider, model, 64, 64, 0, 0, &config), None);
+        assert_eq!(
+            usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+            UsagePrice::Invalid
+        );
+        config.prices.clear();
+        assert_eq!(
+            usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+            UsagePrice::Missing
+        );
+    }
+
+    #[test]
+    fn positive_subnormal_tariff_cannot_underflow_to_free_usage() {
+        let mut config = crate::config::schema::CostConfig::default();
+        config.prices.clear();
+        config.prices.insert(
+            "ollama/prx-local-model".to_string(),
+            crate::config::schema::ModelPricing {
+                input: f64::from_bits(1),
+                output: f64::from_bits(1),
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        assert_eq!(
+            usage_cost_resolution("ollama", "prx-local-model", 64, 64, 0, 0, &config),
+            UsagePrice::Invalid
         );
     }
 

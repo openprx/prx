@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::security::policy::ResourceRiskLevel;
+use crate::hooks::HookChange;
 
 const HOOKS_JSON_FILE: &str = "hooks.json";
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
@@ -202,6 +202,17 @@ fn hooks_file_to_items(file: &HooksFile) -> Vec<HookItem> {
     items
 }
 
+/// What an update changes, in the one classification of hooks.json changes
+/// (D-096): a new program, arguments or event is a command change; a
+/// timeout alone only changes a limit.
+const fn update_change(req: &UpdateHookRequest) -> HookChange {
+    if req.command.is_some() || req.args.is_some() || req.event.is_some() {
+        HookChange::Command
+    } else {
+        HookChange::Restriction
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────
 
 pub async fn get_hooks(
@@ -229,7 +240,7 @@ pub async fn create_hook(
         timeout_ms,
         stdin_json: true,
     };
-    super::authorize_resource_mutation(&state, "gateway_api:hooks:create", ResourceRiskLevel::Low)?;
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:create", HookChange::Command.risk())?;
     file.hooks.entry(event.clone()).or_default().push(action);
     write_hooks_file(&state, &file)?;
 
@@ -244,6 +255,8 @@ pub async fn update_hook(
     Path(id): Path<String>,
     Json(req): Json<UpdateHookRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Classified before the request is taken apart below.
+    let change = update_change(&req);
     let mut file = read_hooks_file(&state)?;
 
     // Parse id: either "event" or "event:idx"
@@ -285,7 +298,7 @@ pub async fn update_hook(
         }
     }
 
-    super::authorize_resource_mutation(&state, "gateway_api:hooks:update", ResourceRiskLevel::Low)?;
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:update", change.risk())?;
     write_hooks_file(&state, &file)?;
     Ok(Json(serde_json::json!({"status": "updated", "id": id})))
 }
@@ -316,7 +329,7 @@ pub async fn delete_hook(
         file.hooks.remove(&event_key);
     }
 
-    super::authorize_resource_mutation(&state, "gateway_api:hooks:delete", ResourceRiskLevel::Low)?;
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:delete", HookChange::Restriction.risk())?;
     write_hooks_file(&state, &file)?;
     Ok(Json(serde_json::json!({"status": "deleted", "id": id})))
 }
@@ -328,4 +341,105 @@ fn parse_hook_id(id: &str) -> (String, usize) {
         }
     }
     (id.to_string(), 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{json, serve_config};
+    use super::*;
+    use crate::security::policy::{AutonomyLevel, ResourceRiskLevel};
+
+    const EXISTING: &str = r#"{"hooks":{"turn_complete":[{"command":"/bin/true"}]}}"#;
+
+    fn update(
+        event: Option<&str>,
+        command: Option<&str>,
+        args: Option<Vec<String>>,
+        timeout_ms: Option<u64>,
+    ) -> UpdateHookRequest {
+        UpdateHookRequest {
+            event: event.map(str::to_string),
+            command: command.map(str::to_string),
+            args,
+            timeout_ms,
+        }
+    }
+
+    /// The Gateway classifies a hooks.json change as `hooks_manage` does
+    /// (D-096): a command change is High, a removal or a limit Medium.
+    #[test]
+    fn gateway_hook_changes_share_the_hooks_manage_classification() {
+        assert_eq!(HookChange::of_manage_action("replace"), Some(HookChange::Command));
+        assert_eq!(HookChange::of_manage_action("test"), Some(HookChange::Command));
+        assert_eq!(HookChange::of_manage_action("remove"), Some(HookChange::Restriction));
+        assert_eq!(HookChange::Command.risk(), ResourceRiskLevel::High);
+        assert_eq!(HookChange::Restriction.risk(), ResourceRiskLevel::Medium);
+        for request in [
+            update(None, Some("/bin/echo"), None, None),
+            update(None, None, Some(vec!["x".to_string()]), None),
+            update(Some("agent_start"), None, None, None),
+            update(None, Some("/bin/echo"), None, Some(2_000)),
+        ] {
+            assert_eq!(update_change(&request), HookChange::Command);
+        }
+        assert_eq!(
+            update_change(&update(None, None, None, Some(2_000))),
+            HookChange::Restriction
+        );
+    }
+
+    /// At `supervised` autonomy a Gateway request carries no approval grant,
+    /// so every hooks.json change (now Medium or High) is refused and the file
+    /// is left as it was; at `full` it goes through.
+    #[tokio::test]
+    async fn gateway_hook_writes_need_the_hooks_manage_risk() {
+        let served = serve_config(|config| config.autonomy.level = AutonomyLevel::Supervised).await;
+        let workspace = served.state.config.load_full().workspace_dir.clone();
+        let hooks_json = workspace.join(HOOKS_JSON_FILE);
+        std::fs::write(&hooks_json, EXISTING).expect("test: write hooks.json");
+        for (method, path, body) in [
+            (
+                reqwest::Method::POST,
+                "/api/hooks",
+                Some(serde_json::json!({"event": "turn_complete", "command": "/bin/echo"})),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/hooks/turn_complete:0",
+                Some(serde_json::json!({"command": "/bin/echo"})),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/hooks/turn_complete:0",
+                Some(serde_json::json!({"timeout_ms": 2_000})),
+            ),
+            (reqwest::Method::DELETE, "/api/hooks/turn_complete:0", None),
+        ] {
+            let (status, body) = served.call(method.clone(), path, body).await;
+            assert_eq!(status, 403, "{method} {path} at supervised: {body}");
+            assert!(
+                json(&body)
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .contains("approval"),
+                "{method} {path}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&hooks_json).expect("test: read hooks.json"),
+                EXISTING,
+                "{method} {path} changed hooks.json"
+            );
+        }
+
+        let full = serve_config(|config| config.autonomy.level = AutonomyLevel::Full).await;
+        let (status, body) = full
+            .call(
+                reqwest::Method::POST,
+                "/api/hooks",
+                Some(serde_json::json!({"event": "turn_complete", "command": "/bin/echo"})),
+            )
+            .await;
+        assert_eq!(status, 201, "create at full: {body}");
+    }
 }

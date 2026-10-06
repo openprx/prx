@@ -185,6 +185,13 @@ fn score_bucket(value: f64) -> String {
 #[async_trait]
 pub trait JudgeScoringModel: Send + Sync {
     async fn score(&self, task_description: &str, execution_result: &str, config: &JudgeConfig) -> Result<String>;
+
+    /// Whether this scorer is a stand-in rather than a real judgment (the
+    /// deterministic mock). A degraded verdict never approves, promotes or
+    /// applies a candidate (D-035): callers defer.
+    fn is_degraded(&self) -> bool {
+        false
+    }
 }
 
 /// Mock scoring implementation with deterministic heuristics.
@@ -192,6 +199,10 @@ pub struct MockJudgeModel;
 
 #[async_trait]
 impl JudgeScoringModel for MockJudgeModel {
+    fn is_degraded(&self) -> bool {
+        true
+    }
+
     async fn score(&self, task_description: &str, execution_result: &str, _config: &JudgeConfig) -> Result<String> {
         let text = format!(
             "{} {}",
@@ -222,11 +233,17 @@ impl JudgeScoringModel for MockJudgeModel {
 /// into the memory layer for it.
 pub struct ModelJudge {
     provider: Arc<dyn Provider>,
+    /// The model the provider is asked with: the caller's resolved model,
+    /// never `JudgeConfig::model` (a placeholder for the mock judge).
+    model: String,
 }
 
 impl ModelJudge {
-    pub const fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<dyn Provider>, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
     }
 
     fn build_prompt(task_description: &str, execution_result: &str) -> String {
@@ -255,7 +272,7 @@ impl JudgeScoringModel for ModelJudge {
         let prompt = Self::build_prompt(task_description, execution_result);
         let raw = self
             .provider
-            .simple_chat(&prompt, &config.model, config.temperature)
+            .simple_chat(&prompt, &self.model, config.temperature)
             .await
             .context("model judge provider call failed")?;
         Ok(Self::extract_json(&raw).to_string())
@@ -287,6 +304,12 @@ impl JudgeEngine {
     pub fn with_review_queue(mut self, path: impl Into<PathBuf>) -> Self {
         self.review_queue_path = Some(path.into());
         self
+    }
+
+    /// Whether the verdicts of this engine come from a degraded (mock) scorer
+    /// and therefore defer rather than approve (D-035).
+    pub fn is_degraded(&self) -> bool {
+        self.model.is_degraded()
     }
 
     /// Effective (clamped) pass threshold for downstream rollback decisions.
@@ -540,7 +563,7 @@ mod tests {
     #[test]
     fn model_judge_can_be_instantiated_as_scoring_model() {
         // Construction must yield a usable `Arc<dyn JudgeScoringModel>`.
-        let model: Arc<dyn JudgeScoringModel> = Arc::new(ModelJudge::new(Arc::new(StubProvider)));
+        let model: Arc<dyn JudgeScoringModel> = Arc::new(ModelJudge::new(Arc::new(StubProvider), "stub-model"));
         let _engine = JudgeEngine::new(JudgeConfig::default(), model);
     }
 
@@ -548,7 +571,7 @@ mod tests {
     async fn model_judge_scores_via_provider_and_extracts_json() {
         let engine = JudgeEngine::new(
             JudgeConfig::default(),
-            Arc::new(ModelJudge::new(Arc::new(WrappingProvider))),
+            Arc::new(ModelJudge::new(Arc::new(WrappingProvider), "stub-model")),
         );
         let result = engine.judge_task("e", "t", "desc", "exec").await.unwrap();
         assert!((result.scores.overall() - 0.7).abs() < 1e-9);

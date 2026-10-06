@@ -77,7 +77,6 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code,
     clippy::excessive_nesting,
     clippy::single_option_map,
     clippy::trait_duplication_in_bounds,
@@ -87,7 +86,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use openprx::{
     CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, FitnessCommands,
@@ -101,8 +100,6 @@ use std::{fs, io::Write, path::PathBuf};
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt};
 
-const CONFIG_REDACTION_MASK: &str = "***";
-
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -111,90 +108,15 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     Ok(t)
 }
 
-fn redact_config_show_value(value: &mut toml::Value) {
-    redact_config_show_value_with_key(None, value);
-}
-
-fn redact_config_show_value_with_key(key: Option<&str>, value: &mut toml::Value) {
-    if key.is_some_and(is_config_show_sensitive_key) {
-        redact_config_show_sensitive_value(value);
-        return;
-    }
-
-    match value {
-        toml::Value::Array(items) => {
-            for item in items {
-                redact_config_show_value_with_key(key, item);
-            }
-        }
-        toml::Value::Table(table) => {
-            for (child_key, child_value) in table {
-                redact_config_show_value_with_key(Some(child_key.as_str()), child_value);
-            }
-        }
-        toml::Value::String(_)
-        | toml::Value::Integer(_)
-        | toml::Value::Float(_)
-        | toml::Value::Boolean(_)
-        | toml::Value::Datetime(_) => {}
-    }
-}
-
-fn redact_config_show_sensitive_value(value: &mut toml::Value) {
-    match value {
-        toml::Value::Array(items) => {
-            for item in items {
-                redact_config_show_sensitive_value(item);
-            }
-        }
-        toml::Value::Table(table) => {
-            for (_, item) in table {
-                redact_config_show_sensitive_value(item);
-            }
-        }
-        toml::Value::String(_)
-        | toml::Value::Integer(_)
-        | toml::Value::Float(_)
-        | toml::Value::Boolean(_)
-        | toml::Value::Datetime(_) => *value = toml::Value::String(CONFIG_REDACTION_MASK.to_string()),
-    }
-}
-
-fn is_config_show_sensitive_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key == "api_key"
-        || key == "api_keys"
-        || key == "auth_token"
-        || key == "token"
-        || key == "secret"
-        || key == "password"
-        || key == "paired_tokens"
-        || key == "db_url"
-        || key == "private_key"
-        || key == "access_key"
-        || key == "credential"
-        || key == "credentials"
-        || key == "connection_string"
-        || key == "signing_secret"
-        || key == "webhook_secret"
-        || key == "app_secret"
-        || key.ends_with("_api_key")
-        || key.ends_with("_api_keys")
-        || key.ends_with("_token")
-        || key.ends_with("_secret")
-        || key.ends_with("_password")
-        || key.ends_with("_key")
-        || key.ends_with("_credential")
-        || key.ends_with("_credentials")
-        || key.contains("password")
-        || key.contains("secret")
-        || key.contains("private_key")
-}
-
 // CLI dispatch remains binary-owned; every runtime subsystem it calls is owned
 // and compiled once by the openprx library.
 #[path = "runtime/mode.rs"]
 mod mode;
+
+// `prx providers|models|routes|config` management handlers: binary-owned,
+// every operation calls the library's `config::manage` service in-process.
+#[path = "runtime/manage_cli.rs"]
+mod manage_cli;
 
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
@@ -429,6 +351,19 @@ enum Commands {
         /// Overwrite existing configuration
         #[arg(long)]
         force: bool,
+        /// The decision backend: builtin or compatible_http (a hosted service
+        /// needs a credential: use `prx causal config` or `prx onboard`)
+        #[arg(long, value_enum)]
+        decision_backend: Option<openprx::causal_cli::BackendKindArg>,
+        /// The decision endpoint (compatible_http)
+        #[arg(long, requires = "decision_backend")]
+        decision_endpoint: Option<String>,
+        /// The decision model, one exact version
+        #[arg(long, requires = "decision_backend")]
+        decision_model: Option<String>,
+        /// Also turn the decision plane on
+        #[arg(long, requires = "decision_backend")]
+        decision_enable: bool,
     },
 
     /// Initialize your workspace and configuration
@@ -441,9 +376,18 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive)
+        /// API key (used in quick mode, ignored with --interactive). Deprecated: an
+        /// argument is visible in the process list; use --from-stdin or --from-env
         #[arg(long)]
         api_key: Option<String>,
+
+        /// Read the API key from standard input (quick mode)
+        #[arg(long, conflicts_with_all = ["api_key", "from_env"])]
+        from_stdin: bool,
+
+        /// Read the API key from this environment variable (quick mode)
+        #[arg(long, value_name = "VAR", conflicts_with = "api_key")]
+        from_env: Option<String>,
 
         /// Provider name (used in quick mode, default: openrouter)
         #[arg(long)]
@@ -454,6 +398,19 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+        /// The decision backend (quick mode): builtin or compatible_http; a
+        /// hosted service is chosen with --interactive or `prx causal config`
+        #[arg(long, value_enum)]
+        decision_backend: Option<openprx::causal_cli::BackendKindArg>,
+        /// The decision endpoint (quick mode, compatible_http)
+        #[arg(long, requires = "decision_backend")]
+        decision_endpoint: Option<String>,
+        /// The decision model, one exact version (quick mode)
+        #[arg(long, requires = "decision_backend")]
+        decision_model: Option<String>,
+        /// Also turn the decision plane on (quick mode)
+        #[arg(long, requires = "decision_backend")]
+        decision_enable: bool,
     },
 
     /// Instant start: provide an API key and chat immediately. No config files written.
@@ -474,9 +431,19 @@ Examples:
   prx go                               # use existing auth-profiles
   prx go --message 'Summarize this'    # single-shot mode")]
     Go {
-        /// API key (required on first use, or use existing auth-profiles)
+        /// API key (required on first use, or use existing auth-profiles). Deprecated:
+        /// an argument is visible in the process list; use --from-env
         #[arg(short = 'k', long = "key")]
         api_key: Option<String>,
+
+        /// Read the API key from this environment variable
+        #[arg(long, value_name = "VAR", conflicts_with = "api_key")]
+        from_env: Option<String>,
+
+        /// Read the API key from standard input (then the session reads no further input from
+        /// it; use with --message, or --from-env for an interactive session)
+        #[arg(long, conflicts_with_all = ["api_key", "from_env"])]
+        from_stdin: bool,
 
         /// Provider (auto-detected from key prefix if omitted)
         #[arg(short = 'p', long)]
@@ -754,14 +721,47 @@ Examples:
         xin_command: XinCommands,
     },
 
+    /// Inspect and test the causal decision plane (read-only)
+    Causal {
+        /// Output machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        causal_command: openprx::causal_cli::CausalCommands,
+    },
+
     /// Manage provider model catalogs
     Models {
         #[command(subcommand)]
         model_command: Option<ModelCommands>,
     },
 
-    /// List supported AI providers
-    Providers,
+    /// List, configure and test AI providers and their credentials
+    #[command(long_about = "\
+List, configure and test AI providers and their credentials.
+
+With no subcommand, lists the supported providers and the configured ones. \
+Every change prints its plan first and writes nothing without --yes. \
+A credential is never taken on the command line: it is read from a hidden \
+prompt, standard input (--from-stdin) or an environment variable (--from-env).
+
+Examples:
+  prx providers
+  prx providers show anthropic
+  prx providers add anthropic --fallback --yes
+  prx providers credential status openai   # which key PRX uses today
+  prx auth paste-token --provider openai --from-stdin
+  prx providers test openrouter --live")]
+    Providers {
+        #[command(subcommand)]
+        providers_command: Option<ProvidersCommands>,
+    },
+
+    /// Manage model routes (`hint:<name>` selections)
+    Routes {
+        #[command(subcommand)]
+        routes_command: RoutesCommands,
+    },
 
     /// Manage channels (telegram, discord, slack, wacli)
     #[command(long_about = "\
@@ -956,6 +956,308 @@ enum ConfigCommands {
     },
     /// Merge config.d/*.toml back into a single config.toml
     Merge,
+    /// Show the plan of writing a configuration file; nothing is written
+    Plan {
+        /// The new content of the file
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Which configuration file it replaces (`config.toml` or a `config.d` fragment name)
+        #[arg(long, default_value = "config.toml")]
+        target: String,
+    },
+    /// Write a configuration file through the configuration transaction
+    Apply {
+        /// The new content of the file
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Which configuration file it replaces (`config.toml` or a `config.d` fragment name)
+        #[arg(long, default_value = "config.toml")]
+        target: String,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// List, show or purge the recorded configuration changes
+    History {
+        #[command(subcommand)]
+        history_command: Option<HistoryCommands>,
+    },
+    /// Restore the configuration from before a recorded change
+    Rollback {
+        /// The history record to undo (see `prx config history`)
+        #[arg(required_unless_present = "last", conflicts_with = "last")]
+        id: Option<String>,
+        /// Undo the most recent recorded change
+        #[arg(long)]
+        last: bool,
+        /// Apply the rollback (without it, only what it would do is shown)
+        #[arg(long)]
+        yes: bool,
+        /// Allow restoring a credential the current configuration no longer holds
+        #[arg(long)]
+        restore_credentials: bool,
+        /// Allow a rollback that turns `secrets.encrypt` off
+        #[arg(long)]
+        disable_encryption: bool,
+    },
+    /// Show the configuration revision, the default model's status and pending changes
+    Status,
+    /// Manage the model bindings of delegate agents
+    Agents {
+        #[command(subcommand)]
+        agents_command: AgentsCommands,
+    },
+}
+
+/// How a mutating management command applies its plan.
+#[derive(Args, Debug, Clone, Default)]
+struct ApplyArgs {
+    /// Apply the plan (without it, the plan is shown and nothing is written)
+    #[arg(long)]
+    yes: bool,
+    /// Confirm a high-risk plan; names the revision the plan reported
+    #[arg(long, value_name = "REVISION", requires = "yes")]
+    confirm_high_risk: Option<String>,
+}
+
+/// Which operation a default or a route serves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum OperationArg {
+    #[default]
+    Chat,
+    Embedding,
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryCommands {
+    /// List the recorded changes, newest first
+    List,
+    /// Show one recorded change
+    Show {
+        /// The history record id
+        id: String,
+    },
+    /// Remove every history record (after a leaked credential was rotated)
+    Purge {
+        /// Remove them (required)
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCommands {
+    /// List the delegate agents and their model bindings
+    List,
+    /// Bind an existing agent to a provider and model
+    Set {
+        /// The agent name (`[agents.<name>]`)
+        agent: String,
+        /// The provider
+        provider: String,
+        /// The model
+        model: String,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvidersCommands {
+    /// List the supported providers and the configured ones
+    List,
+    /// Show one provider: identity, roles, uses, declarations and credential status
+    Show {
+        /// The provider (`openai`, `custom:<url>`, ...)
+        provider: String,
+    },
+    /// Add a provider to the configured set in a role; today the only role is the failover chain
+    /// (`--fallback`, `reliability.fallback_providers`)
+    Add {
+        /// The provider (`anthropic`, `custom:<url>`, ...)
+        provider: String,
+        /// Add it to the failover chain (`reliability.fallback_providers`); required, so a later
+        /// role cannot change what an existing script does
+        #[arg(long, required = true)]
+        fallback: bool,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Change the endpoint of the default provider (`api_url`)
+    Update {
+        /// The default provider
+        provider: String,
+        /// The new endpoint URL
+        #[arg(long, conflicts_with = "clear_api_url", required_unless_present = "clear_api_url")]
+        api_url: Option<String>,
+        /// Remove the endpoint override
+        #[arg(long)]
+        clear_api_url: bool,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Remove a provider (refused while any selection still uses it)
+    Remove {
+        /// The provider
+        provider: String,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Check that a provider and model resolve; `--live` also requests the model list once
+    Test {
+        /// The provider (default: the configured default provider)
+        provider: Option<String>,
+        /// The model (default: the configured default model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Also send one model-list request to the provider (never a generation)
+        #[arg(long)]
+        live: bool,
+    },
+    /// Manage the credential references of a provider
+    Credential {
+        #[command(subcommand)]
+        credential_command: CredentialCommands,
+    },
+    /// Report legacy provider configuration (inline route, embedding-route and agent keys, the
+    /// `[[providers.tool_dialects]]` table, unverified selections, tokens stored under an alias).
+    /// With --apply, plan moving the inline keys into credential references and the dialect rows
+    /// into `[[providers.models]]`; --yes writes it through the configuration transaction
+    /// (`prx config rollback` undoes it)
+    Migrate {
+        /// Plan the migration instead of only reporting
+        #[arg(long)]
+        apply: bool,
+        #[command(flatten)]
+        write: ApplyArgs,
+    },
+}
+
+/// Management commands that only read: they load an existing configuration
+/// read-only, so neither loading nor the legacy-secret upgrade writes
+/// anything (D-101 F-5).
+const fn read_only_management_command(command: &Commands) -> bool {
+    match command {
+        Commands::Providers { providers_command } => {
+            matches!(
+                providers_command,
+                None | Some(
+                    ProvidersCommands::List
+                        | ProvidersCommands::Show { .. }
+                        | ProvidersCommands::Test { .. }
+                        | ProvidersCommands::Credential {
+                            credential_command: CredentialCommands::Status { .. },
+                        }
+                )
+            ) || matches!(
+                providers_command,
+                Some(ProvidersCommands::Migrate {
+                    write: ApplyArgs { yes: false, .. },
+                    ..
+                })
+            )
+        }
+        Commands::Config { config_command } => matches!(
+            config_command,
+            ConfigCommands::Status
+                | ConfigCommands::Show { .. }
+                | ConfigCommands::Schema
+                | ConfigCommands::Plan { .. }
+                | ConfigCommands::Agents {
+                    agents_command: AgentsCommands::List,
+                }
+                | ConfigCommands::History {
+                    history_command: None | Some(HistoryCommands::List | HistoryCommands::Show { .. }),
+                }
+        ),
+        Commands::Routes { routes_command } => matches!(routes_command, RoutesCommands::List { .. }),
+        Commands::Models { model_command } => {
+            matches!(
+                model_command,
+                None | Some(ModelCommands::List { .. } | ModelCommands::Show { .. })
+            )
+        }
+        _ => false,
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum CredentialCommands {
+    /// Store a credential reference for a provider; a model route, embedding route or agent of that
+    /// provider uses it when its `credential_ref` names it. Read from a hidden prompt, --from-stdin
+    /// or --from-env; never an argument
+    Set {
+        /// The provider the credential is issued for
+        provider: String,
+        /// The reference name (stored as `cred-<name>`; default: the catalog provider's name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Read the credential from standard input
+        #[arg(long, conflicts_with = "from_env")]
+        from_stdin: bool,
+        /// Read the credential from this environment variable
+        #[arg(long, value_name = "VAR")]
+        from_env: Option<String>,
+    },
+    /// Remove a credential reference (refused while the configuration names it)
+    Remove {
+        /// The reference (`cred-<name>` or `<name>`)
+        reference: String,
+    },
+    /// Show credential status (never a value): every reference, or one provider's credentials
+    Status {
+        /// The provider (default: every credential reference)
+        provider: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RoutesCommands {
+    /// List the routes
+    List {
+        /// Which route table
+        #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
+        operation: OperationArg,
+    },
+    /// Add a route
+    Add {
+        /// The route hint (`hint:<name>` selects it)
+        hint: String,
+        /// The provider
+        provider: String,
+        /// The model
+        model: String,
+        /// Which route table
+        #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
+        operation: OperationArg,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Change a route's provider or model
+    Update {
+        /// The route hint
+        hint: String,
+        /// The new provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// The new model
+        #[arg(long)]
+        model: Option<String>,
+        /// Which route table
+        #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
+        operation: OperationArg,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Remove a route (refused while a selection names it)
+    Remove {
+        /// The route hint
+        hint: String,
+        /// Which route table
+        #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
+        operation: OperationArg,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -998,9 +1300,13 @@ enum AuthCommands {
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
-        /// Token value (if omitted, read interactively)
+        /// Token value (if omitted, read interactively). Deprecated: an argument is
+        /// visible in the process list; use --from-stdin or the prompt
         #[arg(long)]
         token: Option<String>,
+        /// Read the token from standard input
+        #[arg(long, conflicts_with = "token")]
+        from_stdin: bool,
         /// Auth kind override (`authorization` or `api-key`)
         #[arg(long)]
         auth_kind: Option<String>,
@@ -1049,11 +1355,25 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
-    /// List model catalogs
+    /// List model catalogs; with --operation or --executable, every known model with what the
+    /// evidence says it can do
     List {
         /// Provider name (defaults to configured default provider)
         #[arg(long)]
         provider: Option<String>,
+        /// Only models the evidence does not rule out for this operation (`chat`, `embedding`, ...)
+        #[arg(long)]
+        operation: Option<String>,
+        /// Only models the evidence proves can execute the operation (chat when none is named)
+        #[arg(long)]
+        executable: bool,
+    },
+    /// Show what the evidence says one model can do
+    Show {
+        /// The provider
+        provider: String,
+        /// The model
+        model: String,
     },
     /// Refresh and cache provider models
     Refresh {
@@ -1065,6 +1385,96 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Declare what a model can do (`[[providers.models]]`)
+    Add(ModelDeclarationArgs),
+    /// Change a model declaration (only the facts given are replaced)
+    Update(ModelDeclarationArgs),
+    /// Remove a model declaration
+    Remove {
+        /// The provider
+        #[arg(long)]
+        provider: String,
+        /// The model (omit for the provider-wide declaration)
+        #[arg(long)]
+        model: Option<String>,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Show or set the default model of an operation
+    Default {
+        #[command(subcommand)]
+        default_command: DefaultCommands,
+    },
+}
+
+/// A `[[providers.models]]` declaration on the command line.
+#[derive(Args, Debug)]
+struct ModelDeclarationArgs {
+    /// The provider
+    #[arg(long)]
+    provider: String,
+    /// The model (omit to declare every model of the provider)
+    #[arg(long)]
+    model: Option<String>,
+    /// The complete list of operations the model executes (comma-separated)
+    #[arg(long, value_delimiter = ',', value_parser = parse_setting::<config::schema::ModelOperationSetting>)]
+    operations: Option<Vec<config::schema::ModelOperationSetting>>,
+    /// Whether the model accepts native tool calls
+    #[arg(long)]
+    native_tools: Option<bool>,
+    /// Whether the model accepts image input
+    #[arg(long)]
+    vision_input: Option<bool>,
+    /// Whether the model streams responses
+    #[arg(long)]
+    streaming: Option<bool>,
+    /// Whether the model honours a JSON-schema response format
+    #[arg(long)]
+    structured_output: Option<bool>,
+    /// The tool-schema dialect the endpoint accepts (`raw`, `no_root_combinators`)
+    #[arg(long, value_parser = parse_setting::<config::schema::ToolSchemaDialectSetting>)]
+    tool_schema_dialect: Option<config::schema::ToolSchemaDialectSetting>,
+    /// The tool-call grammar the endpoint emits (`native`, `xml_function_tags`)
+    #[arg(long, value_parser = parse_setting::<config::schema::ToolCallDialectSetting>)]
+    tool_call_dialect: Option<config::schema::ToolCallDialectSetting>,
+    /// The context window in tokens
+    #[arg(long)]
+    context_window: Option<u32>,
+    #[command(flatten)]
+    apply: ApplyArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum DefaultCommands {
+    /// Show the default chat and embedding models and how they resolve
+    Show,
+    /// Set the default model of an operation
+    Set {
+        /// The provider
+        provider: String,
+        /// The model
+        model: String,
+        /// Which default
+        #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
+        operation: OperationArg,
+        /// The root connection (`api_key`, `api_url`, `reliability.api_keys`) belongs to the new
+        /// default provider (a high-risk change: the key is sent to it); chat only
+        #[arg(long, conflicts_with = "clear_root_credential")]
+        keep_root_credential: bool,
+        /// Clear the root connection (`api_key`, `api_url`, `reliability.api_keys`) with the switch;
+        /// chat only
+        #[arg(long)]
+        clear_root_credential: bool,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+}
+
+/// Parse a snake_case configuration setting (`no_root_combinators`) the way
+/// the configuration file spells it.
+fn parse_setting<T: serde::de::DeserializeOwned>(text: &str) -> std::result::Result<T, String> {
+    serde_json::from_value(serde_json::Value::String(text.trim().to_ascii_lowercase()))
+        .map_err(|_| format!("'{}' is not one of the accepted values", text.escape_default()))
 }
 
 #[derive(Subcommand, Debug)]
@@ -1148,6 +1558,9 @@ async fn async_main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if let Some(warning) = argv_secret_warning(&cli.command) {
+        eprintln!("{warning}");
+    }
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
@@ -1189,7 +1602,16 @@ async fn async_main() -> Result<()> {
     // is resolved through the shared precedence (`--dir` > `--config-dir` >
     // environment / active workspace > `~/.openprx`) so that a run scoped with
     // `--config-dir` cannot rewrite the default configuration instead.
-    if let Commands::Init { spec, dir, force } = &cli.command {
+    if let Commands::Init {
+        spec,
+        dir,
+        force,
+        decision_backend,
+        decision_endpoint,
+        decision_model,
+        decision_enable,
+    } = &cli.command
+    {
         let target = config::resolve_init_target_dir(dir.as_deref(), cli.config_dir.as_deref()).await?;
         if *force && daemon::live_daemon_uses_config_dir(&target) {
             println!(
@@ -1197,7 +1619,13 @@ async fn async_main() -> Result<()> {
                 target.display()
             );
         }
-        return spec.generate(&target, *force).await;
+        let decision = decision_backend.map(|kind| openprx::causal_cli::DecisionSetup {
+            kind: kind.into(),
+            endpoint: decision_endpoint.clone(),
+            model: decision_model.clone(),
+            enable: *decision_enable,
+        });
+        return spec.generate_with_decision(&target, *force, decision.as_ref()).await;
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
@@ -1210,8 +1638,11 @@ async fn async_main() -> Result<()> {
         Commands::Chat { .. }
             | Commands::Config { .. }
             | Commands::Models { .. }
+            | Commands::Providers { .. }
+            | Commands::Routes { .. }
             | Commands::Integrations { .. }
             | Commands::Audit { .. }
+            | Commands::Causal { .. }
     );
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -1256,21 +1687,50 @@ async fn async_main() -> Result<()> {
     };
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
-    // The onboard wizard uses reqwest::blocking internally, which creates its own
-    // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
-    // not allowed", we run the wizard on a blocking thread via spawn_blocking.
+    // These entry points are awaited directly on this runtime, and that is deliberate: the
+    // wizard is human-paced and awaits internally, so it must not occupy a blocking-pool slot
+    // for the whole session. The wizard owns its own blocking boundary instead — model
+    // discovery goes through runtime::blocking::spawn_blocking and every channel connection
+    // probe runs on a dedicated thread, so no reqwest::blocking runtime is dropped on a
+    // Tokio worker.
     if let Commands::Onboard {
         interactive,
         channels_only,
         api_key,
+        from_stdin,
+        from_env,
         provider,
         model,
         memory,
+        decision_backend,
+        decision_endpoint,
+        decision_model,
+        decision_enable,
     } = &cli.command
     {
         let interactive = *interactive;
+        // The decision flags use the one setup service (CDP-14); they are
+        // quick-mode flags, like --provider.
+        let decision = decision_backend.map(|kind| openprx::causal_cli::DecisionSetup {
+            kind: kind.into(),
+            endpoint: decision_endpoint.clone(),
+            model: decision_model.clone(),
+            enable: *decision_enable,
+        });
+        if decision.is_some() && (interactive || *channels_only) {
+            bail!("--decision-backend is a quick-setup flag; the interactive wizard asks for the decision backend");
+        }
         let channels_only = *channels_only;
-        let api_key = api_key.clone();
+        if channels_only && (*from_stdin || from_env.is_some()) {
+            bail!("--channels-only does not accept --from-stdin or --from-env");
+        }
+        let api_key = manage_cli::secret_from(
+            *from_stdin,
+            from_env.as_deref(),
+            &mut std::io::stdin(),
+            &|name: &str| std::env::var(name).ok(),
+        )?
+        .or_else(|| api_key.clone());
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
@@ -1289,7 +1749,12 @@ async fn async_main() -> Result<()> {
             let (config, autostart) = onboard::wizard::run_wizard(config_dir).await?;
             if autostart { Some(config) } else { None }
         } else {
-            onboard::wizard::run_quick_setup(
+            // Checked before anything is written; applied to the written
+            // configuration as its own transaction.
+            if let Some(decision) = &decision {
+                decision.check()?;
+            }
+            let config = onboard::wizard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
@@ -1297,6 +1762,10 @@ async fn async_main() -> Result<()> {
                 config_dir,
             )
             .await?;
+            if let Some(decision) = &decision {
+                print!("{}", decision.apply(config).await?);
+                println!("Decision backend configured ({}).", decision.kind.as_str());
+            }
             None
         };
         if let Some(config) = autostart_config {
@@ -1311,11 +1780,20 @@ async fn async_main() -> Result<()> {
     // `prx go` — zero-config instant start. No permanent files written.
     if let Commands::Go {
         api_key,
+        from_env,
+        from_stdin,
         provider,
         model,
         message,
     } = &cli.command
     {
+        let api_key = manage_cli::secret_from(
+            *from_stdin,
+            from_env.as_deref(),
+            &mut std::io::stdin(),
+            &|name: &str| std::env::var(name).ok(),
+        )?
+        .or_else(|| api_key.clone());
         let (detected_provider, detected_key, detected_model) = onboard::auto_detect::detect_credentials(
             api_key.as_deref(),
             provider.as_deref(),
@@ -1333,6 +1811,11 @@ async fn async_main() -> Result<()> {
         config.api_key = Some(detected_key);
         config.workspace_dir = tmpdir.path().to_path_buf();
         config.config_path = tmpdir.path().join("config.toml");
+        // `prx go` persists nothing, so the detected model is an invocation,
+        // resolved once where each path builds its provider: the agent entry
+        // for `--message`, chat start-up otherwise. An id-only model runs
+        // with a warning; one that cannot chat is refused before any
+        // provider exists.
 
         if let Some(msg) = message {
             // Non-dispatch direct call (`prx go --message`): no dispatch-level
@@ -1383,9 +1866,24 @@ async fn async_main() -> Result<()> {
                 | MigrateCommands::Plan { .. }
                 | MigrateCommands::Baseline
         }
-    ) || matches!(&cli.command, Commands::Doctor { .. } | Commands::Tasks { .. });
+    ) || matches!(
+        &cli.command,
+        Commands::Doctor { .. } | Commands::Tasks { .. } | Commands::Causal { .. }
+    );
     let config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
+    } else if read_only_management_command(&cli.command) {
+        // Without a configuration yet: the defaults, shown, nothing written
+        // (D-101 F-5).
+        let config = Config::load_existing_or_defaults_read_only(cli.config_dir.as_deref()).await?;
+        if !config.config_path.exists() {
+            eprintln!(
+                "no config yet; showing defaults (nothing is written; {} is created by the first command that \
+                 changes the configuration)",
+                config.config_path.display()
+            );
+        }
+        config
     } else {
         Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?
     };
@@ -1407,6 +1905,31 @@ async fn async_main() -> Result<()> {
     }
 
     mode::dispatch(cli.command, config).await
+}
+
+/// The deprecation warning for a secret given as a command-line argument
+/// (D-018 Q3, SP-PMM E-4). The flag keeps working; the warning names the
+/// alternative that keeps the secret out of the process list and the shell
+/// history. Never contains the secret.
+fn argv_secret_warning(command: &Commands) -> Option<String> {
+    let (flag, alternative) = match command {
+        Commands::Onboard { api_key: Some(_), .. } => (
+            "--api-key",
+            "--from-stdin (pipe the key in: `printf %s \"$KEY\" | prx onboard --from-stdin`) or --from-env VAR",
+        ),
+        Commands::Go { api_key: Some(_), .. } => ("-k/--key", "--from-stdin or --from-env VAR"),
+        Commands::Auth {
+            auth_command: AuthCommands::PasteToken { token: Some(_), .. },
+        } => (
+            "--token",
+            "--from-stdin (pipe the token in), or leave the flag out to be prompted without echo",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "warning: a secret passed with {flag} is visible to other local users in the process list and stays in \
+         your shell history; the flag is deprecated. Use {alternative} instead."
+    ))
 }
 
 /// `prx tasks` — talks to a running process's gateway rather than inspecting
@@ -1624,10 +2147,10 @@ async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyh
         MemoryCommands::Reindex { json } => {
             let memory = memory::create_memory_with_storage_and_routes_with_acl(
                 &config.memory,
-                &config.embedding_routes,
+                &config.embedding_routes_with_references(),
                 Some(&config.storage.provider.config),
                 &config.workspace_dir,
-                config.api_key.as_deref(),
+                memory::EmbeddingRootCredential::from_config(&config),
                 &config.identity_bindings,
                 &config.user_policies,
             )?;
@@ -1960,7 +2483,7 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             Some(Ok(evidence)) => (
                 ControlStatus::Pass,
                 evidence,
-                "Migration 21 and forced RLS policies were verified read-only on all PostgreSQL vector tables."
+                "Migrations 21, 23 and 24 and the exact set of forced, permissive RLS policies were verified read-only on all PostgreSQL vector tables."
                     .to_string(),
             ),
             Some(Err(_)) => (
@@ -2818,12 +3341,15 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             provider,
             profile,
             token,
+            from_stdin,
             auth_kind,
         } => {
             let provider = auth::normalize_provider(&provider)?;
-            let token = match token {
-                Some(token) => token.trim().to_string(),
-                None => read_auth_input("Paste token")?,
+            let piped = manage_cli::secret_from(from_stdin, None, &mut std::io::stdin(), &|_: &str| None)?;
+            let token = match (token, piped) {
+                (_, Some(piped)) => piped.trim().to_string(),
+                (Some(token), None) => token.trim().to_string(),
+                (None, None) => read_auth_input("Paste token")?,
             };
             if token.is_empty() {
                 bail!("Token cannot be empty");
@@ -2952,6 +3478,54 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    /// E-4 (RED before PMM-E): a secret on the command line draws a warning
+    /// that names the alternative and never repeats the secret; the stdin
+    /// and environment alternatives draw none.
+    #[test]
+    fn a_secret_argument_draws_a_warning_naming_the_alternative() {
+        const SENTINEL: &str = "sk-pmme-warning-sentinel";
+        for (args, flag, alternative) in [
+            (
+                vec!["prx", "onboard", "--api-key", SENTINEL],
+                "--api-key",
+                "--from-stdin",
+            ),
+            (vec!["prx", "go", "-k", SENTINEL], "-k/--key", "--from-stdin"),
+            (
+                vec![
+                    "prx",
+                    "auth",
+                    "paste-token",
+                    "--provider",
+                    "anthropic",
+                    "--token",
+                    SENTINEL,
+                ],
+                "--token",
+                "--from-stdin",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            let warning = argv_secret_warning(&cli.command).unwrap_or_else(|| panic!("{args:?}: no warning"));
+            assert!(warning.contains(flag) && warning.contains(alternative), "{warning}");
+            assert!(!warning.contains(SENTINEL), "{warning}");
+        }
+        for args in [
+            vec!["prx", "onboard", "--from-stdin"],
+            vec!["prx", "onboard", "--from-env", "OPENROUTER_API_KEY"],
+            vec!["prx", "go", "--from-env", "ANTHROPIC_API_KEY"],
+            vec!["prx", "go", "--from-stdin", "--message", "hi"],
+            vec!["prx", "auth", "paste-token", "--provider", "anthropic", "--from-stdin"],
+            vec!["prx", "auth", "paste-token", "--provider", "anthropic"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(argv_secret_warning(&cli.command), None, "{args:?}");
+        }
+        // The argument and its alternative are exclusive.
+        assert!(Cli::try_parse_from(["prx", "onboard", "--api-key", SENTINEL, "--from-stdin"]).is_err());
+        assert!(Cli::try_parse_from(["prx", "go", "-k", SENTINEL, "--from-env", "X"]).is_err());
     }
 
     /// `prx tasks send` must repeat the server's outcome, not upgrade it.
@@ -3178,6 +3752,77 @@ mod tests {
     }
 
     #[test]
+    fn prx_causal_status_parses() {
+        let cli = Cli::try_parse_from(["prx", "causal", "status", "--json"]).expect("causal status should parse");
+        match cli.command {
+            Commands::Causal {
+                json: true,
+                causal_command:
+                    openprx::causal_cli::CausalCommands::Read(openprx::causal_cli::CausalReadCommands::Status),
+            } => {}
+            other => panic!("expected causal status, got {other:?}"),
+        }
+        // CDP-14: a live test parses; its confirmation needs --live.
+        assert!(Cli::try_parse_from(["prx", "causal", "test", "--live", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["prx", "causal", "test", "--yes"]).is_err());
+        let cli = Cli::try_parse_from([
+            "prx",
+            "causal",
+            "config",
+            "set",
+            "backend",
+            "--kind",
+            "compatible_http",
+            "--endpoint",
+            "http://127.0.0.1:8900/v1",
+            "--model",
+            "decider-1",
+            "--yes",
+        ])
+        .expect("causal config set backend should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Causal {
+                causal_command: openprx::causal_cli::CausalCommands::Config { .. },
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["prx", "causal", "config", "enable-remote", "--confirm-high-risk", "r"]).is_err(),
+            "a confirmation without --yes"
+        );
+    }
+
+    /// No `prx causal` subcommand takes a secret on the command line (a
+    /// credential is read from stdin or a prompt, CDP-14).
+    #[test]
+    fn no_causal_subcommand_accepts_a_secret_argument() {
+        fn check(command: &clap::Command, path: &str, violations: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                let names = std::iter::once(arg.get_id().as_str().to_string())
+                    .chain(arg.get_long().map(str::to_string))
+                    .map(|name| name.to_ascii_lowercase());
+                for name in names {
+                    if ["key", "token", "secret", "password", "credential", "bearer"]
+                        .iter()
+                        .any(|word| name.contains(word))
+                    {
+                        violations.push(format!("{path} --{name}"));
+                    }
+                }
+            }
+            for sub in command.get_subcommands() {
+                check(sub, &format!("{path} {}", sub.get_name()), violations);
+            }
+        }
+        let root = Cli::command();
+        let causal = root.find_subcommand("causal").expect("prx causal exists");
+        let mut violations = Vec::new();
+        check(causal, "causal", &mut violations);
+        assert!(violations.is_empty(), "secret-shaped arguments: {violations:?}");
+    }
+
+    #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
             let cli = Cli::try_parse_from(["prx", "completions", shell]).expect("completions invocation should parse");
@@ -3354,9 +3999,21 @@ mod tests {
         ));
     }
 
+    /// A default config whose files live in `dir`. The binary's tests link the
+    /// production library, where the default paths name the real
+    /// `~/.openprx`, and the attestation reads the workspace (D-070).
+    fn scratch_config(dir: &std::path::Path) -> Config {
+        Config {
+            config_path: dir.join("config.toml"),
+            workspace_dir: dir.join("workspace"),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn declaration_attestation_respects_operator_classification() {
-        let mut config = Config::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = scratch_config(temp.path());
         let c02_status = |config: &Config| {
             build_eu_ai_act_attestation(config)
                 .checks
@@ -3380,7 +4037,7 @@ mod tests {
     fn incident_attestation_requires_and_verifies_durable_store_for_high_risk() {
         let temp = tempfile::TempDir::new().unwrap();
         let store_path = temp.path().join("article-73.sqlite3");
-        let mut config = Config::default();
+        let mut config = scratch_config(temp.path());
         config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
 
         let m04_status = |config: &Config| {
@@ -3400,7 +4057,8 @@ mod tests {
 
     #[test]
     fn eu_ai_act_attestation_has_required_check_counts() {
-        let attestation = build_eu_ai_act_attestation(&Config::default());
+        let temp = tempfile::TempDir::new().unwrap();
+        let attestation = build_eu_ai_act_attestation(&scratch_config(temp.path()));
 
         assert_eq!(attestation.total_checks, 24);
         assert_eq!(attestation.checks.len(), 24);
@@ -3447,8 +4105,8 @@ mod tests {
         };
         assert_eq!(fail_on, Some(AuditFailOn::Warning));
 
-        let config = Config::default();
-        let attestation = build_eu_ai_act_attestation(&config);
+        let temp = tempfile::TempDir::new().unwrap();
+        let attestation = build_eu_ai_act_attestation(&scratch_config(temp.path()));
         assert!(!attestation_fails_gate(&attestation, AuditFailOn::Fail));
         assert!(attestation_fails_gate(&attestation, AuditFailOn::Warning));
     }
@@ -3497,7 +4155,7 @@ mod tests {
             credential = { username = "user", password = "pass" }
         });
 
-        redact_config_show_value(&mut value);
+        config::secret_paths::redact(&mut value);
 
         let root = value.as_table().expect("redacted value should remain a table");
         assert_eq!(root.get("api_key").and_then(toml::Value::as_str), Some("***"));
@@ -3548,7 +4206,7 @@ mod tests {
             Cli::try_parse_from(["prx", "models", "list", "--provider", "openai"]).expect("models list should parse");
         match cli.command {
             Commands::Models {
-                model_command: Some(ModelCommands::List { provider }),
+                model_command: Some(ModelCommands::List { provider, .. }),
             } => assert_eq!(provider.as_deref(), Some("openai")),
             other => panic!("expected models list command, got {other:?}"),
         }

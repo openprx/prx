@@ -106,6 +106,17 @@ impl MemoryGetTool {
     }
 }
 
+/// Build a read context from the runtime-trusted scope block
+/// (`_zc_scope`, guarded by `_zc_scope_trusted`).
+///
+/// Model- and caller-supplied scope fields never reach here: the execution
+/// service strips every `_zc_*` / `_prx_*` key from the request and re-authors
+/// this block from the authenticated envelope. Blank fields are treated as
+/// absent so a `Some("")` can never stand in for a real anchor.
+///
+/// `require_owner_match` is deliberately **not** read here: the caller sets it
+/// from [`crate::tools::execution::scope_requires_owner_match`] so the bit
+/// survives even a missing or malformed scope block.
 fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     let trusted = args
         .get("_zc_scope_trusted")
@@ -116,39 +127,28 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     }
 
     let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
-
-    let channel = scope
-        .get("channel")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let chat_type = scope
-        .get("chat_type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let chat_id = scope
-        .get("chat_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let sender = scope
-        .get("sender")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let workspace_id = scope
-        .get("workspace_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let owner_id = scope
-        .get("owner_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    let str_field = |key: &str| {
+        scope
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let owner_id = str_field("owner_id");
 
     Some(MemoryWriteContext {
-        workspace_id,
-        channel,
-        chat_type,
-        chat_id,
-        sender_id: owner_id,
-        raw_sender: sender,
+        workspace_id: str_field("workspace_id"),
+        channel: str_field("channel"),
+        chat_type: str_field("chat_type"),
+        chat_id: str_field("chat_id"),
+        // Historical mapping: these tools have always used the scope owner as
+        // the ACL `sender_id` anchor. `owner_id` below is the new, explicit
+        // owner-isolation anchor; both carry the same authenticated value.
+        sender_id: owner_id.clone(),
+        raw_sender: str_field("sender"),
+        owner_id,
+        require_owner_match: false,
     })
 }
 
@@ -227,8 +227,12 @@ impl Tool for MemoryGetTool {
             });
         }
 
-        let scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
-        let mode = if self.acl_enabled {
+        // V02-R5: see `memory_search` — `memory.acl_enabled` may not disable the
+        // owner boundary for an owner-isolated origin.
+        let isolated = crate::tools::execution::scope_requires_owner_match(&args);
+        let mut scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
+        scope_ctx.require_owner_match = isolated;
+        let mode = if self.acl_enabled || isolated {
             MemoryReadMode::Enforce
         } else {
             MemoryReadMode::Observe
@@ -239,7 +243,13 @@ impl Tool for MemoryGetTool {
                 output: render_range(&entry.key, &entry.content, from, requested_lines),
                 error: None,
             }),
-            None if !self.acl_enabled => self.read_fallback_file(path, from, requested_lines),
+            // V02-R5 (disposition OQ-9): the workspace fallback files
+            // (`MEMORY.md`, `memory/*.md`) carry no `owner_id`, so they are
+            // unattributable and cannot be owner-scoped. An owner-isolated
+            // caller is therefore not offered them at all — the same
+            // fail-closed rule `document_get_chunk` applies to an unattributed
+            // chunk. In-process turns keep the fallback exactly as before.
+            None if !self.acl_enabled && !isolated => self.read_fallback_file(path, from, requested_lines),
             None => Ok(ToolResult {
                 success: true,
                 output: format!("No memory entry found for key: '{path}'"),
@@ -602,6 +612,67 @@ mod tests {
         assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
         assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "key"})).is_empty());
         assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"key": "key"})).is_empty());
+    }
+
+    /// Disposition OQ-9, at the tool level: the workspace file fallback is
+    /// offered to an in-process turn with the ACL flag off, and withheld from
+    /// an owner-isolated one — the files carry no `owner_id`, so they cannot be
+    /// owner-scoped and must fail closed.
+    ///
+    /// MUTATION GUARD: restore `None if !self.acl_enabled` and the second half
+    /// goes red while the first stays green.
+    #[tokio::test]
+    async fn the_file_fallback_is_withheld_from_an_owner_isolated_caller() {
+        let tmp = TempDir::new().unwrap();
+        write_file(&tmp.path().join("MEMORY.md"), "root memory file line\n");
+        let tool = test_tool(&tmp, false);
+
+        let in_process = tool
+            .execute(json!({
+                "path": "MEMORY.md",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(in_process.success);
+        assert!(
+            in_process.output.contains("root memory file line"),
+            "the in-process fallback must be unchanged: {}",
+            in_process.output
+        );
+
+        let isolated = tool
+            .execute(json!({
+                "path": "MEMORY.md",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "mcp",
+                    "chat_type": "gateway",
+                    "chat_id": "mcp:shared-subject",
+                    "sender": "shared-subject",
+                    "owner_id": "owner:ws:agent:issuer-a.example:shared-subject",
+                    "owner_isolated": true
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(isolated.success);
+        assert!(
+            !isolated.output.contains("root memory file line"),
+            "an owner-isolated caller must not be served the file: {}",
+            isolated.output
+        );
+        assert!(
+            isolated.output.contains("No memory entry found for key"),
+            "{}",
+            isolated.output
+        );
     }
 
     #[test]

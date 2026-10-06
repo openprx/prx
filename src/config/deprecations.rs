@@ -68,6 +68,10 @@ const REASON_TOKEN_BUDGETED_HISTORY: &str = "prx no longer drops conversation hi
 const REASON_NEVER_ENFORCED: &str = "this limit was never enforced by any code path and has been removed rather than \
                                      left as a false assurance";
 
+/// The key promised a protection no code ever provided.
+const REASON_NEVER_IMPLEMENTED: &str = "audit event signing was never implemented: the setting had no effect and audit \
+                                        records carry no tamper evidence";
+
 /// The staged rollout this key steered has been retired along with its stages.
 const REASON_ROLLOUT_RETIRED: &str = "read-only tool scheduling is no longer staged behind a rollout switch, so there is nothing left to stage or roll \
      back";
@@ -196,6 +200,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         shape: DeprecatedShape::Field,
         reason: REASON_NO_TIMEOUT,
     },
+    // ── [security.audit]: signing that was never implemented (INT-2B) ─────
+    DeprecatedKey {
+        path: &["security", "audit", "sign_events"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_NEVER_IMPLEMENTED,
+    },
     // ── [security.resources]: limits nothing ever applied ─────────────────
     DeprecatedKey {
         path: &["security", "resources"],
@@ -282,6 +292,31 @@ pub(crate) fn strip_deprecated_keys(root: &mut toml::Value, config_path: Option<
     stripped
 }
 
+/// The warning for removed keys a structured write (`POST /api/config`,
+/// `config.patch`) carries in its JSON body, or `None` when it carries none.
+///
+/// A file load drops such a key with a `warn!` naming its line; a structured
+/// write drops it too (the typed configuration has no field for it), and
+/// this makes that visible in the response instead of silent (B2f).
+pub(crate) fn removed_keys_warning(body: &serde_json::Value) -> Option<String> {
+    let found: Vec<String> = DEPRECATED_CONFIG_KEYS
+        .iter()
+        .filter(|key| {
+            key.path
+                .iter()
+                .try_fold(body, |node, segment| node.get(*segment))
+                .is_some()
+        })
+        .map(|key| format!("`{}` ({})", key.path.join("."), key.reason))
+        .collect();
+    (!found.is_empty()).then(|| {
+        format!(
+            "Ignoring removed configuration key(s) {}; they no longer do anything and nothing was stored for them",
+            found.join(", ")
+        )
+    })
+}
+
 /// Take a value out of the tree by path, whether it is a leaf or a whole table.
 fn take_path(root: &mut toml::Value, path: &[&str]) -> Option<toml::Value> {
     let (key, rest) = path.split_first()?;
@@ -301,7 +336,7 @@ fn take_path(root: &mut toml::Value, path: &[&str]) -> Option<toml::Value> {
 /// inline table, an unreadable fragment — the caller falls back to naming the
 /// key alone, which is still enough to `grep` for.
 pub(crate) fn locate(config_path: &Path, key: &DeprecatedKey) -> Option<DeprecatedKeySite> {
-    for file in candidate_files(config_path) {
+    for file in candidate_files(config_path).into_iter().rev() {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -312,22 +347,41 @@ pub(crate) fn locate(config_path: &Path, key: &DeprecatedKey) -> Option<Deprecat
     None
 }
 
-/// The main config file followed by every `config.d/*.toml` fragment.
+/// The file among `config.toml` and its `config.d` fragments that holds the
+/// key at `path` (dotted table path, e.g. `["causal_tree", "w_confidence"]`),
+/// so an error names the file the operator has to edit. Best effort like
+/// [`locate`]: `None` when no readable file holds it.
+pub(crate) fn file_holding(config_path: &Path, path: &[&str]) -> Option<PathBuf> {
+    candidate_files(config_path).into_iter().rev().find(|file| {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .is_some_and(|table| {
+                let mut value: Option<&toml::Value> = None;
+                for (index, key) in path.iter().enumerate() {
+                    value = if index == 0 {
+                        table.get(*key)
+                    } else {
+                        value.and_then(|v| v.get(key))
+                    };
+                }
+                value.is_some()
+            })
+    })
+}
+
+/// Exactly the loader's files in merge order. Callers search in reverse so
+/// diagnostics name the winning declaration, rather than a shadowed base key.
 fn candidate_files(config_path: &Path) -> Vec<PathBuf> {
     let mut files = vec![config_path.to_path_buf()];
-    let Some(parent) = config_path.parent() else {
+    let Ok(fragments) = super::files::list_config_fragment_paths(config_path) else {
         return files;
     };
-    let Ok(entries) = std::fs::read_dir(parent.join("config.d")) else {
-        return files;
-    };
-    let mut fragments: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
-        .collect();
-    fragments.sort();
-    files.extend(fragments);
+    files.extend(fragments.into_iter().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !super::files::should_skip_fragment(name))
+    }));
     files
 }
 
@@ -395,6 +449,19 @@ mod tests {
 
     /// Every listed path must be non-empty and unique; a duplicate would warn
     /// twice and a bare path could strip the whole document.
+    /// B2f: a structured write that carries a removed key names it.
+    #[test]
+    fn a_structured_body_with_a_removed_key_gets_a_warning() {
+        let body = serde_json::json!({"security": {"audit": {"sign_events": true, "max_size_mb": 5}}});
+        let warning = removed_keys_warning(&body).expect("test: sign_events is a removed key");
+        assert!(warning.contains("security.audit.sign_events"), "{warning}");
+        assert!(warning.contains("never implemented"), "{warning}");
+        assert_eq!(
+            removed_keys_warning(&serde_json::json!({"security": {"audit": {"max_size_mb": 5}}})),
+            None
+        );
+    }
+
     #[test]
     fn deprecated_key_table_is_well_formed() {
         let mut seen = std::collections::HashSet::new();

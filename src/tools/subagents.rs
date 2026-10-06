@@ -5,8 +5,10 @@
 //! - kill: terminate a running sub-agent
 //! - steer: send a message to a running sub-agent
 
+use super::sessions_read_model::RunOwnerScope;
 use super::sessions_spawn::{
     KILLED_BY_USER_REASON, ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus,
+    TaskFinalization,
 };
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
@@ -25,6 +27,7 @@ pub struct SubagentsTool {
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     security: Arc<SecurityPolicy>,
     memory: Option<Arc<dyn Memory>>,
+    source_fabric: Option<MemoryFabric>,
     event_recording: MemoryEventRecording,
 }
 
@@ -38,8 +41,15 @@ impl SubagentsTool {
             active_runs,
             security,
             memory: None,
+            source_fabric: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+
+    /// Logical lifecycle storage is independent of execution-memory isolation.
+    pub(crate) fn with_source_fabric(mut self, fabric: MemoryFabric) -> Self {
+        self.source_fabric = Some(fabric);
+        self
     }
 
     pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
@@ -53,9 +63,11 @@ impl SubagentsTool {
     }
 
     fn memory_fabric(&self) -> Option<MemoryFabric> {
-        self.memory.as_ref().map(|memory| {
-            MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
-                .with_event_recording(self.event_recording)
+        self.source_fabric.clone().or_else(|| {
+            self.memory.as_ref().map(|memory| {
+                MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
+                    .with_event_recording(self.event_recording)
+            })
         })
     }
 
@@ -89,10 +101,16 @@ impl SubagentsTool {
         }
     }
 
-    async fn execute_list(&self, status_filter: &str, limit: usize) -> anyhow::Result<ToolResult> {
+    async fn execute_list(
+        &self,
+        status_filter: &str,
+        limit: usize,
+        owner_scope: &RunOwnerScope,
+    ) -> anyhow::Result<ToolResult> {
         let runs = self.active_runs.read().await;
         let filtered: Vec<&SubAgentRun> = runs
             .iter()
+            .filter(|r| owner_scope.admits(r.owner_id.as_deref()))
             .filter(|r| match status_filter {
                 "running" => matches!(r.status, SubAgentStatus::Running),
                 "completed" => matches!(r.status, SubAgentStatus::Completed(_)),
@@ -142,9 +160,17 @@ impl SubagentsTool {
         })
     }
 
-    async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
+    async fn execute_kill(
+        &self,
+        run_id: &str,
+        approval_grant: Option<&ApprovalGrant>,
+        owner_scope: &RunOwnerScope,
+    ) -> anyhow::Result<ToolResult> {
         let mut runs = self.active_runs.write().await;
-        let Some(run) = runs.iter_mut().find(|r| r.id == run_id) else {
+        let Some(run) = runs
+            .iter_mut()
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+        else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -202,6 +228,15 @@ impl SubagentsTool {
                                 )),
                             })
                         }
+                        ProcessTerminationRequestResult::Finalized(ProcessFinalization::Unconfirmed) => {
+                            Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "Subagent `{run_id}` cleanup and settlement remain unconfirmed."
+                                )),
+                            })
+                        }
                         ProcessTerminationRequestResult::Pending => Ok(ToolResult {
                             success: false,
                             output: String::new(),
@@ -211,16 +246,42 @@ impl SubagentsTool {
                         }),
                     };
                 }
-                if let Some(ref abort_handle) = run.abort_handle {
-                    abort_handle.abort();
-                }
-                // Same shared constant as the process path above, for the
-                // same reason: `join` tells a kill from a failure by this
-                // string and nothing else.
-                run.status = SubAgentStatus::Failed(KILLED_BY_USER_REASON.into());
-                run.steer_tx = None;
-                let event_run = run.clone();
+                let control = run.task_control.clone();
                 drop(runs);
+                let Some(control) = control else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Task termination owner is unavailable; completion is unconfirmed".to_owned()),
+                    });
+                };
+                match control.request_termination(KILLED_BY_USER_REASON).await {
+                    Some(TaskFinalization::Terminated) => {}
+                    Some(TaskFinalization::Natural) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Subagent `{run_id}` finalized before termination was confirmed."
+                            )),
+                        });
+                    }
+                    Some(TaskFinalization::Unconfirmed) | None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Termination for subagent `{run_id}` remains unconfirmed.")),
+                        });
+                    }
+                }
+                let event_run = self
+                    .active_runs
+                    .read()
+                    .await
+                    .iter()
+                    .find(|run| run.id == run_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("terminated task row is unavailable"))?;
                 self.record_run_task_event(&event_run, "task.killed", json!({ "operation": "subagents.kill" }))
                     .await;
 
@@ -239,7 +300,11 @@ impl SubagentsTool {
                 let was_terminated = run
                     .process_control
                     .as_ref()
-                    .is_some_and(|control| control.finalization() == Some(ProcessFinalization::Terminated));
+                    .is_some_and(|control| control.finalization() == Some(ProcessFinalization::Terminated))
+                    || run
+                        .task_control
+                        .as_ref()
+                        .is_some_and(|control| control.finalization() == Some(TaskFinalization::Terminated));
                 Ok(ToolResult {
                     success: was_terminated,
                     output: if was_terminated {
@@ -258,6 +323,7 @@ impl SubagentsTool {
         run_id: &str,
         message: &str,
         approval_grant: Option<&ApprovalGrant>,
+        owner_scope: &RunOwnerScope,
     ) -> anyhow::Result<ToolResult> {
         // The sender is cloned out and the registry guard dropped before the
         // send: the steer channel is bounded, so a send can park until the
@@ -265,7 +331,10 @@ impl SubagentsTool {
         // deadlock against the receiving loop's own registry writes.
         let (steer_tx, steered_run) = {
             let runs = self.active_runs.read().await;
-            let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            let Some(run) = runs
+                .iter()
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            else {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -412,6 +481,10 @@ impl Tool for SubagentsTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        // OWNER-VIS: list, kill and steer reach only the runs this caller's
+        // owner started; the local-process operator reaches them all. A run
+        // outside the scope answers exactly like a missing one.
+        let owner_scope = RunOwnerScope::from_args(&args);
         match action {
             "list" => {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
@@ -419,7 +492,7 @@ impl Tool for SubagentsTool {
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
-                self.execute_list(status, limit).await
+                self.execute_list(status, limit, &owner_scope).await
             }
             "kill" => {
                 let run_id = args
@@ -428,7 +501,7 @@ impl Tool for SubagentsTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
-                self.execute_kill(run_id, approval_grant.as_ref()).await
+                self.execute_kill(run_id, approval_grant.as_ref(), &owner_scope).await
             }
             "steer" => {
                 let run_id = args
@@ -443,7 +516,8 @@ impl Tool for SubagentsTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
-                self.execute_steer(run_id, message, approval_grant.as_ref()).await
+                self.execute_steer(run_id, message, approval_grant.as_ref(), &owner_scope)
+                    .await
             }
             _ => Ok(ToolResult {
                 success: false,
@@ -502,6 +576,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -849,6 +924,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
             parent_run_id: None,
@@ -886,6 +962,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
             parent_run_id: Some("parent-b".to_string()),
@@ -1147,5 +1224,115 @@ mod tests {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(result.output.contains("failed: oom"));
+    }
+
+    // ── OWNER-VIS: list, kill and steer reach only the caller owner's runs ──
+
+    const OV_WORKSPACE: &str = "ws-owner-vis";
+
+    /// The context a gateway webhook turn runs its tools under (see
+    /// `agent_tool_execution_context` in `src/agent/execution_policy.rs`), or the
+    /// terminal UI's.
+    fn ov_context(sender: &str, operator: bool) -> crate::tools::ToolExecutionContext {
+        let (channel, chat_type, chat_id) = if operator {
+            ("terminal", "private", "terminal:user".to_string())
+        } else {
+            ("webhook", "gateway", format!("gateway:webhook:{sender}"))
+        };
+        crate::tools::ToolExecutionContext::new(
+            crate::runtime::envelope::RuntimeEnvelope::chat_terminal(
+                OV_WORKSPACE,
+                chat_id.clone(),
+                crate::memory::MemoryVisibility::Workspace,
+            )
+            .with_sender(sender)
+            .with_channel(channel),
+            chat_type,
+        )
+        .with_chat_id(chat_id)
+    }
+
+    async fn ov_run(
+        runs: &Arc<RwLock<Vec<SubAgentRun>>>,
+        context: crate::tools::ToolExecutionContext,
+        args: serde_json::Value,
+    ) -> (bool, String) {
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(SubagentsTool::new(Arc::clone(runs)))]);
+        let service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+            registry,
+            Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::new(
+                SecurityPolicy::default(),
+            ))),
+            Arc::new(crate::tools::DenyApprovalStrategy),
+            Arc::new(crate::tools::AdapterOwnedPreparation),
+            Arc::new(crate::tools::TracingToolExecutionAudit),
+        );
+        let outcome = service
+            .execute(
+                crate::tools::ToolExecutionCommand::new("subagents", args),
+                context,
+                None,
+            )
+            .await;
+        match outcome.result {
+            Some(result) if result.success => (false, result.output),
+            Some(result) => (true, result.error.unwrap_or(result.output)),
+            None => (true, outcome.error.unwrap_or(outcome.model_content)),
+        }
+    }
+
+    /// SP-MCP OWNER-VIS tests 2 and 3 for `subagents`: a webhook client used to
+    /// list, kill and steer another client's run. Each refusal reads exactly
+    /// like a missing run, and the run is left running with nothing injected.
+    ///
+    /// MUTATION GUARD: drop the `owner_scope.admits` filter from
+    /// `execute_list`, `execute_kill` or `execute_steer` and this goes red.
+    #[tokio::test]
+    async fn a_webhook_caller_cannot_list_kill_or_steer_another_owners_run() {
+        let alice_owner = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(OV_WORKSPACE, "session", "run")
+            .with_channel("webhook")
+            .with_sender("alice")
+            .resolved_owner_id();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(4);
+        let mut run = make_run("run-alice", SubAgentStatus::Running);
+        run.task = "alice private sub-agent task".to_string();
+        run.owner_id = Some(alice_owner);
+        run.steer_tx = Some(steer_tx);
+        let runs = Arc::new(RwLock::new(vec![run]));
+
+        let (_, listed) = ov_run(&runs, ov_context("mallory", false), json!({"action": "list"})).await;
+        assert!(
+            !listed.contains("run-alice") && !listed.contains("alice private sub-agent task"),
+            "{listed}"
+        );
+        for (action, extra) in [("kill", json!({})), ("steer", json!({"message": "leak it"}))] {
+            let mut on_run = json!({"action": action, "run_id": "run-alice"});
+            let mut on_missing = json!({"action": action, "run_id": "run-missing"});
+            for args in [&mut on_run, &mut on_missing] {
+                if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                    args.extend(extra.clone());
+                }
+            }
+            let (refused_error, refused) = ov_run(&runs, ov_context("mallory", false), on_run).await;
+            let (_, absent) = ov_run(&runs, ov_context("mallory", false), on_missing).await;
+            assert!(refused_error, "{action}: {refused}");
+            assert_eq!(refused.replace("run-alice", "run-missing"), absent, "{action}");
+        }
+        assert!(
+            matches!(runs.read().await[0].status, SubAgentStatus::Running),
+            "mallory's kill must not land"
+        );
+        assert!(steer_rx.try_recv().is_err(), "mallory's steer must not be injected");
+
+        // Controls: the terminal operator sees the run; its owner can kill it.
+        let (_, operator) = ov_run(&runs, ov_context("user", true), json!({"action": "list"})).await;
+        assert!(operator.contains("run-alice"), "{operator}");
+        let (kill_error, killed) = ov_run(
+            &runs,
+            ov_context("alice", false),
+            json!({"action": "kill", "run_id": "run-alice"}),
+        )
+        .await;
+        assert!(!kill_error, "the owner must still kill its own run: {killed}");
     }
 }

@@ -55,6 +55,28 @@ pub struct WildcardSubscription {
     pub sender: mpsc::Sender<EventMessage>,
 }
 
+/// A subscription whose deliveries are pumped into a plugin's event sink.
+/// Kept so a repeated subscription from the same sink resolves to the
+/// existing one; the sink is held weakly so the registry never keeps a
+/// plugin's delivery channel open.
+#[cfg(feature = "wasm-plugins")]
+#[derive(Debug)]
+struct PumpSubscription {
+    id: u64,
+    plugin_name: String,
+    pattern: String,
+    sink: mpsc::WeakSender<EventMessage>,
+}
+
+#[cfg(feature = "wasm-plugins")]
+impl PumpSubscription {
+    fn matches(&self, plugin_name: &str, pattern: &str, sink: &mpsc::Sender<EventMessage>) -> bool {
+        self.plugin_name == plugin_name
+            && self.pattern == pattern
+            && self.sink.upgrade().is_some_and(|live| live.same_channel(sink))
+    }
+}
+
 /// An event message delivered to a subscriber.
 #[cfg(feature = "wasm-plugins")]
 #[derive(Clone, Debug)]
@@ -75,6 +97,8 @@ pub struct EventBus {
     /// Monotonically increasing subscription ID counter.
     next_id: AtomicU64,
     active_subscriptions: AtomicUsize,
+    /// Pump subscriptions by plugin, pattern and sink; see `subscribe_pump`.
+    pumps: tokio::sync::Mutex<Vec<PumpSubscription>>,
 }
 
 #[cfg(feature = "wasm-plugins")]
@@ -86,6 +110,7 @@ impl EventBus {
             wildcard_subscriptions: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(1),
             active_subscriptions: AtomicUsize::new(0),
+            pumps: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -179,7 +204,7 @@ impl EventBus {
             }
         }
         for id in closed {
-            let _ = self.unsubscribe(id).await;
+            let _ = self.remove_subscription(id, None).await;
         }
 
         Ok(())
@@ -249,13 +274,41 @@ impl EventBus {
 
     /// Register a subscription whose receiver is continuously consumed by a
     /// bounded subscriber pump. The subscription is removed when the sink closes.
+    ///
+    /// Subscribing is idempotent per plugin, pattern and sink: a repeated
+    /// subscription resolves to the existing one. A WASM hook's stores all
+    /// deliver into one sink and survive a trap rebuild, but the guest's own
+    /// memory of having subscribed does not, so a guest that subscribes
+    /// lazily subscribes again after every rebuild; without this every
+    /// matching event would be delivered once more per rebuild.
     pub async fn subscribe_pump(
         self: &std::sync::Arc<Self>,
         plugin_name: &str,
         topic_pattern: &str,
         sink: mpsc::Sender<EventMessage>,
     ) -> Result<u64, String> {
+        let mut pumps = self.pumps.lock().await;
+        pumps.retain(|pump| pump.sink.upgrade().is_some());
+        if let Some(existing) = pumps
+            .iter()
+            .find(|pump| pump.matches(plugin_name, topic_pattern, &sink))
+        {
+            tracing::debug!(
+                plugin = %plugin_name,
+                pattern = %topic_pattern,
+                subscription_id = existing.id,
+                "event bus: repeated pump subscription resolved to the existing one"
+            );
+            return Ok(existing.id);
+        }
         let (id, mut receiver) = self.subscribe(plugin_name, topic_pattern).await?;
+        pumps.push(PumpSubscription {
+            id,
+            plugin_name: plugin_name.to_string(),
+            pattern: topic_pattern.to_string(),
+            sink: sink.downgrade(),
+        });
+        drop(pumps);
         let bus = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
@@ -263,46 +316,56 @@ impl EventBus {
                     break;
                 }
             }
-            let _ = bus.unsubscribe(id).await;
+            let _ = bus.remove_subscription(id, None).await;
         });
         Ok(id)
     }
 
-    /// Remove a subscription by ID.
+    /// Remove one of `plugin_name`'s own subscriptions by ID.
     ///
-    /// Returns an error if the ID was not found.
-    pub async fn unsubscribe(&self, subscription_id: u64) -> Result<(), String> {
-        tracing::debug!(subscription_id, "event bus: unsubscribe");
+    /// Subscription ids are small sequential integers, so any plugin with the
+    /// `events` permission can name another plugin's; only the plugin that
+    /// subscribed may remove it. An id that exists but belongs to another
+    /// plugin is refused with the same error as one that does not exist, so
+    /// the answer does not reveal other plugins' subscriptions.
+    pub async fn unsubscribe(&self, plugin_name: &str, subscription_id: u64) -> Result<(), String> {
+        tracing::debug!(plugin = %plugin_name, subscription_id, "event bus: unsubscribe");
+        self.remove_subscription(subscription_id, Some(plugin_name)).await
+    }
+
+    /// Remove a subscription by ID: any owner's when `owner` is `None` (the
+    /// bus's own cleanup of closed receivers and ended pumps), otherwise only
+    /// that owner's.
+    async fn remove_subscription(&self, subscription_id: u64, owner: Option<&str>) -> Result<(), String> {
+        let owned_by = |plugin_name: &str| owner.is_none_or(|owner| owner == plugin_name);
 
         // Check exact subscriptions.
+        let mut found = false;
         {
             let mut subs = self.subscriptions.write().await;
-            let mut found = false;
             for list in subs.values_mut() {
                 let before = list.len();
-                list.retain(|s| s.id != subscription_id);
+                list.retain(|s| s.id != subscription_id || !owned_by(&s.plugin_name));
                 if list.len() < before {
                     found = true;
                 }
             }
-            if found {
-                self.active_subscriptions.fetch_sub(1, Ordering::AcqRel);
-                return Ok(());
-            }
         }
 
         // Check wildcard subscriptions.
-        {
+        if !found {
             let mut wildcards = self.wildcard_subscriptions.write().await;
             let before = wildcards.len();
-            wildcards.retain(|w| w.id != subscription_id);
-            if wildcards.len() < before {
-                self.active_subscriptions.fetch_sub(1, Ordering::AcqRel);
-                return Ok(());
-            }
+            wildcards.retain(|w| w.id != subscription_id || !owned_by(&w.plugin_name));
+            found = wildcards.len() < before;
         }
 
-        Err(format!("event bus: subscription ID {subscription_id} not found"))
+        if !found {
+            return Err(format!("event bus: subscription ID {subscription_id} not found"));
+        }
+        self.active_subscriptions.fetch_sub(1, Ordering::AcqRel);
+        self.pumps.lock().await.retain(|pump| pump.id != subscription_id);
+        Ok(())
     }
 
     /// Returns the number of active subscriptions (exact + wildcard).
@@ -397,7 +460,7 @@ mod tests {
         assert_eq!(msg.payload, "first");
 
         // Unsubscribe.
-        bus.unsubscribe(sub_id).await.unwrap();
+        bus.unsubscribe("plugin-c", sub_id).await.unwrap();
 
         // Second publish — should NOT arrive.
         bus.publish("data.ready", "second").await.unwrap();
@@ -521,18 +584,48 @@ mod tests {
         let (id2, _rx2) = bus.subscribe("p2", "topic.*").await.unwrap();
         assert_eq!(bus.subscription_count(), 2);
 
-        bus.unsubscribe(id1).await.unwrap();
+        bus.unsubscribe("p1", id1).await.unwrap();
         assert_eq!(bus.subscription_count(), 1);
 
-        bus.unsubscribe(id2).await.unwrap();
+        bus.unsubscribe("p2", id2).await.unwrap();
         assert_eq!(bus.subscription_count(), 0);
+    }
+
+    /// R-C3Xf N5: subscription ids are small sequential integers, so any
+    /// plugin with the `events` permission can name another plugin's. Only
+    /// the plugin that subscribed may remove a subscription, and the refusal
+    /// reads like an unknown id.
+    #[tokio::test]
+    async fn a_plugin_cannot_unsubscribe_another_plugins_subscription() {
+        let bus = Arc::new(EventBus::new());
+        let (exact_id, mut exact_rx) = bus.subscribe("victim", "data.ready").await.unwrap();
+        let (wildcard_id, mut wildcard_rx) = bus.subscribe("victim", "data.*").await.unwrap();
+
+        assert!(
+            bus.unsubscribe("attacker", exact_id).await.is_err(),
+            "another plugin's exact subscription"
+        );
+        assert!(
+            bus.unsubscribe("attacker", wildcard_id).await.is_err(),
+            "another plugin's wildcard subscription"
+        );
+        assert_eq!(bus.subscription_count(), 2);
+
+        bus.publish("data.ready", "still delivered").await.unwrap();
+        for rx in [&mut exact_rx, &mut wildcard_rx] {
+            let message = recv_one(rx).await.expect("the victim still receives");
+            assert_eq!(message.payload, "still delivered");
+        }
+
+        bus.unsubscribe("victim", exact_id).await.unwrap();
+        assert_eq!(bus.subscription_count(), 1, "the owner can still unsubscribe");
     }
 
     // 11. Unsubscribe with unknown ID returns error.
     #[tokio::test]
     async fn unsubscribe_unknown_id_returns_error() {
         let bus = EventBus::new();
-        let result = bus.unsubscribe(99999).await;
+        let result = bus.unsubscribe("any-plugin", 99999).await;
         assert!(result.is_err(), "unknown subscription ID should return error");
     }
 
@@ -559,6 +652,42 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(bus.unsubscribe(id).await.is_err());
+        assert!(bus.unsubscribe("hook-plugin", id).await.is_err());
+    }
+
+    /// R-C3X F5: a hook guest that subscribes lazily, behind a flag in its own
+    /// memory, subscribes again after every rebuild, and all of its adapter's
+    /// stores share one delivery sink. Each duplicate used to get its own pump,
+    /// so every matching event was delivered once more per rebuild.
+    #[tokio::test]
+    async fn a_repeated_pump_subscription_from_one_sink_is_registered_once() {
+        let bus = Arc::new(EventBus::new());
+        let (sink, _deliveries) = mpsc::channel(8);
+        let first = bus
+            .subscribe_pump("audit-hook", "prx.lifecycle.*", sink.clone())
+            .await
+            .expect("test: first subscription");
+        let again = bus
+            .subscribe_pump("audit-hook", "prx.lifecycle.*", sink.clone())
+            .await
+            .expect("test: repeated subscription");
+        assert_eq!(
+            first, again,
+            "the repeated subscription must resolve to the existing one"
+        );
+        assert_eq!(bus.subscription_count(), 1);
+
+        let (other_sink, _other_deliveries) = mpsc::channel(8);
+        bus.subscribe_pump("audit-hook", "prx.lifecycle.*", other_sink)
+            .await
+            .expect("test: a different adapter's sink");
+        bus.subscribe_pump("audit-hook", "prx.plugin.*", sink)
+            .await
+            .expect("test: a different pattern");
+        assert_eq!(
+            bus.subscription_count(),
+            3,
+            "a different sink or pattern is a different subscription"
+        );
     }
 }

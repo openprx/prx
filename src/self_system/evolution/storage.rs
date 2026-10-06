@@ -150,6 +150,14 @@ impl AsyncJsonlWriter {
 
     /// Flush all buffered lines to disk.
     pub async fn flush(&self) -> Result<()> {
+        self.flush_lines().await?;
+        self.enforce_retention().await
+    }
+
+    /// Write every buffered line to disk, without the retention pass, so a
+    /// caller can tell "the lines are on disk" from "retention failed"
+    /// (R-PMMCj G-6).
+    pub async fn flush_lines(&self) -> Result<()> {
         let pending = {
             let mut state = self.state.lock().await;
             if state.buffered_lines == 0 {
@@ -162,7 +170,7 @@ impl AsyncJsonlWriter {
         for (path, lines) in pending {
             self.write_lines(&path, &lines).await?;
         }
-        self.enforce_retention().await
+        Ok(())
     }
 
     /// Enforce tiered retention policy:
@@ -190,7 +198,12 @@ impl AsyncJsonlWriter {
         };
 
         if should_flush {
-            self.flush().await?;
+            self.flush_lines().await?;
+            // The lines are on disk; a retention failure is not a failed
+            // append (R-PMMCj G-6).
+            if let Err(err) = self.enforce_retention().await {
+                tracing::warn!(target: "self_system", error = %err, "evolution log retention failed");
+            }
         }
         Ok(())
     }
@@ -237,6 +250,7 @@ impl AsyncJsonlWriter {
         F: Fn(&T) -> &str,
     {
         let mut output = Vec::new();
+        let mut unreadable_files = 0u32;
         for tier in [RetentionTier::Hot, RetentionTier::Warm, RetentionTier::Cold] {
             let dir = self.tier_dir(kind, tier);
             if !path_exists(&dir).await? {
@@ -249,7 +263,21 @@ impl AsyncJsonlWriter {
                 if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let raw = fs::read_to_string(&path).await?;
+                // One entry that cannot be read (a directory with a `.jsonl`
+                // name, an I/O error, bytes that are not UTF-8) is skipped
+                // like a malformed line: it must not fail every other file.
+                let raw = match fs::read_to_string(&path).await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        unreadable_files = unreadable_files.saturating_add(1);
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "skipped an unreadable jsonl file while reading logs"
+                        );
+                        continue;
+                    }
+                };
                 let mut malformed_lines = 0u32;
                 let mut invalid_timestamps = 0u32;
                 for line in raw.lines().filter(|line| !line.trim().is_empty()) {
@@ -274,6 +302,13 @@ impl AsyncJsonlWriter {
                     );
                 }
             }
+        }
+        if unreadable_files > 0 {
+            tracing::warn!(
+                kind = kind.as_dir_name(),
+                unreadable_files,
+                "read logs without the jsonl files that could not be read"
+            );
         }
         Ok(output)
     }
@@ -618,6 +653,111 @@ mod tests {
         let items = writer.read_memory_access_since(since).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].memory_id, "m-new");
+    }
+
+    /// EVO-JSONL (R-PMMCk K3): one `*.jsonl` entry that cannot be read (here
+    /// a directory with that name, and a file that is not UTF-8) used to fail
+    /// the whole read with `Is a directory`. It is skipped with a warning and
+    /// the readable files still answer.
+    #[tokio::test]
+    async fn read_since_skips_an_unreadable_jsonl_entry() {
+        let dir = tempdir().unwrap();
+        let writer = AsyncJsonlWriter::new(
+            JsonlStoragePaths::new(dir.path().to_path_buf()),
+            JsonlRetentionPolicy::default(),
+            1,
+        )
+        .await
+        .unwrap();
+        writer
+            .append_memory_access(&MemoryAccessLog {
+                timestamp: Utc::now().to_rfc3339(),
+                experiment_id: "exp-ok".into(),
+                trace_id: "trace-ok".into(),
+                action: MemoryAction::Read,
+                memory_id: "m-readable".into(),
+                task_context: "ctx".into(),
+                task_type: TaskType::Chat,
+                actor: Actor::Agent,
+                was_useful: None,
+                useful_annotation_source: None,
+                annotation_confidence: None,
+                tokens_consumed: 1,
+            })
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let hot = writer.tier_dir(LogKind::MemoryAccess, RetentionTier::Hot);
+        fs::create_dir_all(hot.join("2026-01-01.jsonl")).await.unwrap();
+        fs::write(hot.join("2026-01-02.jsonl"), [0xff_u8, 0xfe, b'\n'])
+            .await
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::days(1);
+        let items = writer
+            .read_memory_access_since(since)
+            .await
+            .expect("test: an unreadable entry must not fail the whole read");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].memory_id, "m-readable");
+    }
+
+    /// EVO-JSONL (D-060 L-5): the skipped files are counted, next to the
+    /// per-file warnings, so one line says how much of the log a read missed.
+    #[tokio::test]
+    async fn read_since_counts_the_skipped_jsonl_files() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let writer = AsyncJsonlWriter::new(
+            JsonlStoragePaths::new(dir.path().to_path_buf()),
+            JsonlRetentionPolicy::default(),
+            1,
+        )
+        .await
+        .unwrap();
+        let hot = writer.tier_dir(LogKind::MemoryAccess, RetentionTier::Hot);
+        fs::create_dir_all(hot.join("2026-01-01.jsonl")).await.unwrap();
+        fs::write(hot.join("2026-01-02.jsonl"), [0xff_u8, 0xfe, b'\n'])
+            .await
+            .unwrap();
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let items = writer
+            .read_memory_access_since(Utc::now() - chrono::Duration::days(1))
+            .await
+            .expect("test: an unreadable entry must not fail the whole read");
+        assert!(items.is_empty());
+
+        let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+        assert!(
+            logs.contains("unreadable_files=2"),
+            "the two skipped files are counted: {logs}"
+        );
     }
 
     #[tokio::test]

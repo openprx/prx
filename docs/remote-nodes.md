@@ -53,6 +53,13 @@ tls_cert = "/etc/prx-node/tls.crt"
 tls_key = "/etc/prx-node/tls.key"
 ```
 
+With `secrets.encrypt = true` (the default), `prx` stores `bearer_token` and
+`hmac_secret` of both sections as `enc2:` ciphertext. `prx-node --config`
+pointed at the PRX configuration decrypts `nodes.server` only, with the
+`.secret_key` in the same directory, and never creates that file; a copy on
+another host needs the key file as well, or the values in plaintext. A standalone node file with a top-level `[server]`
+section is read as written.
+
 `max_output_bytes` caps retained command stdout/stderr and each file read/write
 payload. The RPC request and response bodies also have fixed upper bounds.
 Command pipes are continuously drained, but bytes beyond the retention limit

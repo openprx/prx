@@ -19,8 +19,22 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
-const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
+/// Composio's API origin.
+const COMPOSIO_API_ORIGIN: &str = "https://backend.composio.dev";
+
+/// The origin API requests go to.
+#[cfg(not(test))]
+const fn api_origin() -> &'static str {
+    COMPOSIO_API_ORIGIN
+}
+
+/// The origin API requests go to in a test build: a loopback port nothing
+/// listens on (still https, so the scheme check holds). No test reaches
+/// Composio (D-081).
+#[cfg(test)]
+const fn api_origin() -> &'static str {
+    "https://127.0.0.1:9"
+}
 const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
@@ -109,7 +123,7 @@ impl ComposioTool {
     }
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/tools");
+        let url = format!("{origin}/api/v3/tools", origin = api_origin());
         let req = self
             .client()
             .get(&url)
@@ -130,7 +144,7 @@ impl ComposioTool {
     }
 
     async fn list_actions_v2(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
-        let mut url = format!("{COMPOSIO_API_BASE_V2}/actions");
+        let mut url = format!("{origin}/api/v2/actions", origin = api_origin());
         if let Some(app) = app_name {
             url = format!("{url}?appNames={app}");
         }
@@ -160,7 +174,7 @@ impl ComposioTool {
         app_name: Option<&str>,
         entity_id: Option<&str>,
     ) -> anyhow::Result<Vec<ComposioConnectedAccount>> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts");
+        let url = format!("{origin}/api/v3/connected_accounts", origin = api_origin());
         let mut req = self.client().get(&url).header("x-api-key", self.api_key.expose());
 
         req = req.query(&[
@@ -315,7 +329,7 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> (String, serde_json::Value) {
-        let url = format!("{COMPOSIO_API_BASE_V3}/tools/execute/{tool_slug}");
+        let url = format!("{origin}/api/v3/tools/execute/{tool_slug}", origin = api_origin());
         let account_ref = connected_account_ref.and_then(|candidate| {
             let trimmed_candidate = candidate.trim();
             (!trimmed_candidate.is_empty()).then_some(trimmed_candidate)
@@ -377,7 +391,7 @@ impl ComposioTool {
         params: serde_json::Value,
         entity_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/actions/{action_name}/execute");
+        let url = format!("{origin}/api/v2/actions/{action_name}/execute", origin = api_origin());
 
         let mut body = json!({
             "input": params,
@@ -448,7 +462,7 @@ impl ComposioTool {
             }
         };
 
-        let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts/link");
+        let url = format!("{origin}/api/v3/connected_accounts/link", origin = api_origin());
         let body = json!({
             "auth_config_id": auth_config_id,
             "user_id": entity_id,
@@ -480,7 +494,7 @@ impl ComposioTool {
     }
 
     async fn get_connection_url_v2(&self, app_name: &str, entity_id: &str) -> anyhow::Result<ComposioConnectionLink> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
+        let url = format!("{origin}/api/v2/connectedAccounts", origin = api_origin());
 
         let body = json!({
             "integrationId": app_name,
@@ -513,7 +527,7 @@ impl ComposioTool {
     }
 
     async fn resolve_auth_config_id(&self, app_name: &str) -> anyhow::Result<String> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
+        let url = format!("{origin}/api/v3/auth_configs", origin = api_origin());
 
         let resp = self
             .client()
@@ -1541,7 +1555,9 @@ mod tests {
 
     #[test]
     fn composio_api_base_url_is_v3() {
-        assert_eq!(COMPOSIO_API_BASE_V3, "https://backend.composio.dev/api/v3");
+        assert_eq!(COMPOSIO_API_ORIGIN, "https://backend.composio.dev");
+        // A test build never reaches Composio (D-081).
+        assert!(api_origin().starts_with("https://127.0.0.1:"));
     }
 
     #[test]
@@ -1553,10 +1569,7 @@ mod tests {
             Some("account-42"),
         );
 
-        assert_eq!(
-            url,
-            "https://backend.composio.dev/api/v3/tools/execute/gmail-send-email"
-        );
+        assert_eq!(url, format!("{}/api/v3/tools/execute/gmail-send-email", api_origin()));
         assert_eq!(body["arguments"]["to"], json!("test@example.com"));
         assert_eq!(body["version"], json!(COMPOSIO_TOOL_VERSION_LATEST));
         assert_eq!(body["user_id"], json!("workspace-user"));
@@ -1692,10 +1705,7 @@ mod tests {
         let (url, body) =
             ComposioTool::build_execute_action_v3_request("github-list-repos", json!({}), None, Some("   "));
 
-        assert_eq!(
-            url,
-            "https://backend.composio.dev/api/v3/tools/execute/github-list-repos"
-        );
+        assert_eq!(url, format!("{}/api/v3/tools/execute/github-list-repos", api_origin()));
         assert_eq!(body["arguments"], json!({}));
         assert_eq!(body["version"], json!(COMPOSIO_TOOL_VERSION_LATEST));
         assert!(body.get("connected_account_id").is_none());

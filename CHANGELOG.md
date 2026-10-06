@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Decision-plane candidate under local development, **not accepted or released**.
+The source default-on cutover is prepared for adoption with its init template;
+this does not change an installed service or real configuration. See the
+[candidate notes](docs/release-notes-decision-plane-candidate-2026-10-04.md)
+for integration, validation and rollback limits.
+
+### Changed
+
+- `[causal_tree]` has a new schema (the decision plane). A configuration
+  written by an earlier release is mapped on load and written in the new form
+  on the next save, with `schema_version = 1`. Keys left at their old default
+  take the new default. Other values move to their new home, for example
+  `policy.max_branches` to `policy.max_candidates` and
+  `policy.rehearsal_timeout_ms` to `rehearsal.timeout_ms`. Under D-073/D-074,
+  versioned `schema_version = 1` plus `enabled = false` stays disabled, including
+  an init-default sidecar that also records false. Only recognized unversioned
+  legacy-default signatures, including the old bare false template, treat that
+  false as unset; unversioned false with modern non-legacy settings stays
+  explicit. Loading alone does not rewrite the file. The load
+  refuses a legacy value that has no equivalent or does not fit its new key,
+  naming the file and key and never the value. Each refusal, its exact
+  error and the fix:
+  - `w_confidence` other than `0.5`: `<file>: causal_tree.w_confidence holds a
+    non-default value with no equivalent in this release; the single
+    confidence weight is retired; set the weights in
+    [causal_tree.scoring.weights] and remove the key`. Fix: remove the key and
+    set `[causal_tree.scoring.weights]` if you need other weights.
+  - `policy.default_side_effect_mode` other than `"ReadOnly"`: `... holds a
+    non-default value with no equivalent in this release; rehearsal is
+    read-only (CDP 9.3); remove the key`. Fix: remove the key.
+  - A legacy key and its replacement both set: `... is set together with
+    causal_tree.<new key> (in <file>), the key that replaces it; keep only
+    causal_tree.<new key>`. Fix: delete the legacy key.
+  - `policy.max_branches` above 255, or a negative or oversized
+    `policy.rehearsal_timeout_ms` or `policy.circuit_breaker_*`: `... holds a
+    value causal_tree.<new key>, the key that replaces it, cannot hold; set
+    causal_tree.<new key> within its documented range and remove the key`.
+  - A moved value outside the new range: `policy.max_branches` above 32,
+    `policy.rehearsal_timeout_ms` above `policy.extra_latency_budget_ms`
+    (500 unless set), `policy.circuit_breaker_threshold` above 100, or
+    `policy.circuit_breaker_cooldown_secs` above 3600. These fail validation
+    with `causal_tree.<new key> must be <range>`, for example
+    `causal_tree.rehearsal.timeout_ms must be at most
+    causal_tree.policy.extra_latency_budget_ms`. This happens even with
+    `enabled = false`. Fix: set the new key within its documented range and
+    the existing approved budget; this candidate does not relax performance
+    or admission budgets.
+  - A remote `https` decision endpoint now needs
+    `causal_tree.backend.remote_enabled = true`. A literal loopback endpoint
+    does not.
+
+- Turns use source-bound decision authority, selected retrieval and constrained
+  capabilities. Recovery retains authenticated input/decision/terminal evidence
+  and owned backend work; interrupted or uncertain execution is not relabeled
+  successful or automatically resent. Child replay separates logical lineage
+  from the actual durable store namespace.
+- The local Router candidate adds bounded KNN with a concrete local hash
+  embedder, purpose-bound history reads and dependent model readmission. Learning
+  uses actual serving and terminal evidence; newly constructed embedded Agents
+  do not inherit an earlier session's statistics. New authenticated Router
+  projections require readers that understand them.
+- Separately billed embedding, premium AutoMix escalation and auxiliary Channel
+  vision summaries remain blocked by `BudgetUnproven`. Vision summaries are
+  unavailable in this candidate; ordinary chat authority does not permit that
+  additional send. Full behavior, restart, performance and independent acceptance
+  remain pending.
+
 ## [0.8.162] - 19 September 2026
 
 ### Fixed

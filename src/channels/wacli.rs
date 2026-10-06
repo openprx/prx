@@ -1936,7 +1936,7 @@ impl Channel for WacliChannel {
         let local = listener.local_addr().unwrap_or(bind);
         tracing::info!("wacli: webhook server listening on http://{local}{path}");
 
-        axum::serve(listener, app)
+        super::webhook_server::serve_until_dropped(listener, app)
             .await
             .context("wacli webhook server stopped unexpectedly")?;
         Ok(())

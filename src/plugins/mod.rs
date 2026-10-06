@@ -400,8 +400,26 @@ impl PluginManager {
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginAdapterBuild<Vec<Box<dyn Tool>>> {
+        let build = self.create_wasm_tool_adapters(memory, event_bus).await;
+        PluginAdapterBuild {
+            value: build
+                .value
+                .into_iter()
+                .map(|adapter| Box::new(adapter) as Box<dyn Tool>)
+                .collect(),
+            errors: build.errors,
+        }
+    }
+
+    /// Create the concrete tool adapters, so a runtime can read each one's
+    /// health as well as call it.
+    pub async fn create_wasm_tool_adapters(
+        &self,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> PluginAdapterBuild<Vec<capabilities::tool::WasmToolAdapter>> {
         let plugins = self.registry.list().await;
-        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut tools = Vec::new();
         let mut errors = Vec::new();
 
         for info in &plugins {
@@ -456,7 +474,7 @@ impl PluginManager {
                         tool = %adapter.name(),
                         "WASM tool adapter created"
                     );
-                    tools.push(Box::new(adapter));
+                    tools.push(adapter);
                 }
                 Err(error) => {
                     errors.push(format!("plugin '{}' tool adapter failed: {error}", info.name));

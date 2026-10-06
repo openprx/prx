@@ -1,0 +1,145 @@
+{
+  "schema": "prx.causal.state.v1",
+  "hop": 0,
+  "prior_decision_id": null,
+  "latest_user_turn": "What is the difference between a mutex and a semaphore?",
+  "goal": "Explain the difference between a mutex and a semaphore.",
+  "completed_steps": [],
+  "artifacts": [
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    },
+    {
+      "kind": "memory",
+      "age_ms": 1,
+      "summary": "s"
+    }
+  ],
+  "failed_tool_fingerprints": [],
+  "retry_count": 0,
+  "approval_pending": false,
+  "constraints": [],
+  "budgets": {
+    "tokens": "b2",
+    "latency": "b2",
+    "cost": "b1"
+  },
+  "candidates": [
+    {
+      "id": "answer-none",
+      "action": "answer",
+      "target": "none",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b1",
+      "latency_bucket": "b1",
+      "summary": "Answer from the conversation without tools.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    },
+    {
+      "id": "clarify-none",
+      "action": "clarify",
+      "target": "none",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b0",
+      "latency_bucket": "b0",
+      "summary": "Ask the user one clarifying question.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    },
+    {
+      "id": "refuse-none",
+      "action": "refuse",
+      "target": "none",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b0",
+      "latency_bucket": "b0",
+      "summary": "Decline with a stable policy reason.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    }
+  ]
+}

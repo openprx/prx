@@ -17,10 +17,15 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+pub(crate) mod attempt_accounting;
 pub mod bedrock;
+pub mod catalog;
 pub mod compatible;
+pub mod connection_test;
 pub mod copilot;
+pub mod credentials;
 pub mod gemini;
+mod identity;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -28,24 +33,46 @@ pub mod openrouter;
 pub mod rate_limit;
 pub mod reliable;
 pub mod router;
+pub mod selection;
 pub mod traits;
 pub mod utf8_stream;
 
+#[cfg(test)]
+pub(crate) mod credential_probe;
+#[cfg(test)]
+pub(crate) mod label_redaction_tests;
+#[cfg(test)]
+mod tool_dialect_config_tests;
+#[cfg(test)]
+pub(crate) mod tool_schema_refusal_tests;
+
+pub use attempt_accounting::AccountingTargets;
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilities,
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
+pub(crate) use identity::canonical_auth_profile_provider;
+pub(crate) use identity::{
+    ByoDialect, ProviderConnection, ProviderIdentity, byo_dialect_of, canonical_provider_key, classify_provider,
+    configured_connection_for, credential_for_provider_identity, scoped_reliability,
+};
+pub use identity::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId, ProviderNamespace};
+use identity::{split_byo_provider, without_rotation_keys};
+
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
+
+/// How many characters of a refused, model-supplied provider string the
+/// refusal warning prints.
+const REFUSED_PROVIDER_LOG_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
@@ -191,6 +218,38 @@ pub(crate) fn is_vllm_alias(name: &str) -> bool {
     matches!(name, "vllm" | "v-llm")
 }
 
+/// The base URL provider construction addresses for the catalog provider
+/// spelled `name` when its connection carries `api_url`: `Some` for the
+/// adapters that honour a configured endpoint (`openai`, `ollama`,
+/// llama.cpp, the Qwen OAuth aliases, LiteLLM, vLLM), `None` for the ones
+/// that always use their own fixed endpoint. Everything that sends this
+/// provider's key somewhere other than a generation — the live connection
+/// test, `prx models refresh` — takes its host from here, so it addresses
+/// exactly the host the provider itself does (D-095 M-1, D-078 T-7).
+pub(crate) fn honoured_base_url<'a>(name: &str, api_url: Option<&'a str>) -> Option<&'a str> {
+    let api_url = api_url.map(str::trim).filter(|url| !url.is_empty())?;
+    let name = name.trim().to_ascii_lowercase();
+    let honours = matches!(name.as_str(), "openai" | "ollama" | "llamacpp" | "llama.cpp")
+        || is_qwen_oauth_alias(&name)
+        || is_litellm_alias(&name)
+        || is_vllm_alias(&name);
+    honours.then_some(api_url)
+}
+
+/// `base` with `suffix` appended to its path, keeping its query and
+/// dropping its fragment (`https://h/v1?sig=x` + `/models` =
+/// `https://h/v1/models?sig=x`, D-095 L-4). A path already ending in
+/// `suffix` is kept. `None` when `base` is not a URL.
+pub(crate) fn endpoint_url(base: &str, suffix: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(base.trim()).ok()?;
+    let path = url.path().trim_end_matches('/').to_string();
+    if !path.ends_with(suffix) {
+        url.set_path(&format!("{path}{suffix}"));
+    }
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
 pub(crate) fn is_huggingface_alias(name: &str) -> bool {
     matches!(name, "huggingface" | "hf" | "hf-inference")
 }
@@ -313,6 +372,8 @@ struct ClaudeCodeProviderContext {
     credential: Option<String>,
     refresh_token: Option<String>,
     expires_at: Option<i64>,
+    /// A refresh was due and [`OauthRefresh::Never`] withheld it.
+    refresh_withheld: bool,
 }
 
 impl std::fmt::Debug for ClaudeCodeProviderContext {
@@ -321,6 +382,7 @@ impl std::fmt::Debug for ClaudeCodeProviderContext {
             .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_at", &self.expires_at)
+            .field("refresh_withheld", &self.refresh_withheld)
             .finish()
     }
 }
@@ -329,6 +391,8 @@ impl std::fmt::Debug for ClaudeCodeProviderContext {
 struct QwenOauthProviderContext {
     credential: Option<String>,
     base_url: Option<String>,
+    /// A refresh was due and [`OauthRefresh::Never`] withheld it.
+    refresh_withheld: bool,
 }
 
 impl std::fmt::Debug for QwenOauthProviderContext {
@@ -336,6 +400,7 @@ impl std::fmt::Debug for QwenOauthProviderContext {
         f.debug_struct("QwenOauthProviderContext")
             .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
             .field("base_url", &self.base_url)
+            .field("refresh_withheld", &self.refresh_withheld)
             .finish()
     }
 }
@@ -378,17 +443,11 @@ fn qwen_oauth_client_id() -> String {
 }
 
 fn qwen_oauth_credentials_file_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .map(|home| home.join(QWEN_OAUTH_CREDENTIAL_FILE))
+    oauth_credentials_home().map(|home| home.join(QWEN_OAUTH_CREDENTIAL_FILE))
 }
 
 fn claude_code_credentials_file_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .map(|home| home.join(CLAUDE_CODE_CREDENTIAL_FILE))
+    oauth_credentials_home().map(|home| home.join(CLAUDE_CODE_CREDENTIAL_FILE))
 }
 
 fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
@@ -597,7 +656,7 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(oauth_token_endpoint(OauthTokenEndpoint::Qwen))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -668,6 +727,82 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
+/// An external token endpoint as a request sees it.
+#[cfg(not(test))]
+pub(crate) const fn token_host(url: &'static str) -> &'static str {
+    url
+}
+
+/// An external token endpoint as a request sees it in a test build: a closed
+/// loopback port with the same path, so no test reaches the real host
+/// (D-081).
+#[cfg(test)]
+pub(crate) fn token_host(url: &'static str) -> String {
+    format!("http://127.0.0.1:9/{}", url.trim_start_matches("https://"))
+}
+
+/// An OAuth token endpoint PRX refreshes a provider credential at.
+#[derive(Clone, Copy)]
+enum OauthTokenEndpoint {
+    ClaudeCode,
+    Qwen,
+    Minimax(MinimaxOauthRegion),
+}
+
+impl OauthTokenEndpoint {
+    const fn real(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT,
+            Self::Qwen => QWEN_OAUTH_TOKEN_ENDPOINT,
+            Self::Minimax(region) => region.token_endpoint(),
+        }
+    }
+}
+
+/// Where a credential is refreshed.
+#[cfg(not(test))]
+const fn oauth_token_endpoint(endpoint: OauthTokenEndpoint) -> &'static str {
+    endpoint.real()
+}
+
+/// Where a credential is refreshed in a test build: the local listener a test
+/// installed, else a closed loopback port. No test reaches a real token
+/// endpoint (D-081).
+#[cfg(test)]
+fn oauth_token_endpoint(endpoint: OauthTokenEndpoint) -> String {
+    let installed = OAUTH_TEST_OVERRIDES.read().token_endpoint.clone();
+    installed.unwrap_or_else(|| token_host(endpoint.real()))
+}
+
+/// The home the Claude Code and Qwen credential files are under.
+#[cfg(not(test))]
+fn oauth_credentials_home() -> Option<PathBuf> {
+    crate::config::user_home_dir()
+}
+
+/// The home the Claude Code and Qwen credential files are under: a test
+/// installs its own, independent of the process-wide test home other modules
+/// change concurrently.
+#[cfg(test)]
+fn oauth_credentials_home() -> Option<PathBuf> {
+    let installed = OAUTH_TEST_OVERRIDES.read().home.clone();
+    installed.or_else(crate::config::user_home_dir)
+}
+
+/// What a test installed for the OAuth credential lookups and refreshes.
+#[cfg(test)]
+#[derive(Default)]
+struct OauthTestOverrides {
+    home: Option<PathBuf>,
+    token_endpoint: Option<String>,
+}
+
+#[cfg(test)]
+static OAUTH_TEST_OVERRIDES: parking_lot::RwLock<OauthTestOverrides> = parking_lot::RwLock::new(OauthTestOverrides {
+    home: None,
+    token_endpoint: None,
+});
+
 pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -677,7 +812,7 @@ pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::R
 
     // TODO: Verify this endpoint against official Anthropic OAuth docs/source if it changes.
     let response = client
-        .post(CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT)
+        .post(oauth_token_endpoint(OauthTokenEndpoint::ClaudeCode))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -747,7 +882,7 @@ pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::R
     })
 }
 
-fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
+fn resolve_qwen_oauth_context(credential_override: Option<&str>, refresh: OauthRefresh) -> QwenOauthProviderContext {
     let override_value = credential_override.map(str::trim).filter(|value| !value.is_empty());
     let placeholder_requested = override_value
         .map(|value| value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
@@ -758,6 +893,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
             return QwenOauthProviderContext {
                 credential: Some(explicit.to_string()),
                 base_url: None,
+                refresh_withheld: false,
             };
         }
     }
@@ -767,6 +903,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     let env_token = read_non_empty_env(QWEN_OAUTH_TOKEN_ENV);
     let env_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV);
     let env_resource_url = read_non_empty_env(QWEN_OAUTH_RESOURCE_URL_ENV);
+    let mut refresh_withheld = false;
 
     if env_token.is_none() {
         let refresh_token = env_refresh_token.or_else(|| {
@@ -781,7 +918,8 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
                 .and_then(|credentials| credentials.access_token.as_deref())
                 .is_none_or(|value| value.trim().is_empty());
 
-        if should_refresh {
+        refresh_withheld = should_refresh && refresh_token.is_some() && refresh == OauthRefresh::Never;
+        if should_refresh && !refresh_withheld {
             if let Some(refresh_token) = refresh_token.as_deref() {
                 match refresh_qwen_oauth_access_token(refresh_token) {
                     Ok(refreshed) => {
@@ -816,14 +954,29 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
                 .and_then(normalize_qwen_oauth_base_url)
         });
 
-    QwenOauthProviderContext { credential, base_url }
+    QwenOauthProviderContext {
+        credential,
+        base_url,
+        refresh_withheld,
+    }
 }
 
 fn is_claude_code_oauth_placeholder(value: &str) -> bool {
     is_claude_code_alias(value)
 }
 
-fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeProviderContext {
+/// Whether construction interprets a configured key as an instruction to
+/// obtain different credential material (and possibly a different endpoint).
+/// Such a key cannot attest to wire material through the configured
+/// credential slot alone, whether Root or a model route.
+pub(crate) fn credential_override_is_runtime_indirection(provider: &str, value: &str) -> bool {
+    let value = value.trim();
+    (is_qwen_oauth_alias(provider) && value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
+        || (is_minimax_alias(provider) && is_minimax_oauth_placeholder(value))
+        || ((is_claude_code_alias(provider) || provider == "anthropic") && is_claude_code_oauth_placeholder(value))
+}
+
+fn resolve_claude_code_context(credential_override: Option<&str>, refresh: OauthRefresh) -> ClaudeCodeProviderContext {
     let override_value = credential_override.map(str::trim).filter(|value| !value.is_empty());
     let placeholder_requested = override_value.map(is_claude_code_oauth_placeholder).unwrap_or(false);
 
@@ -833,6 +986,7 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
                 credential: Some(explicit.to_string()),
                 refresh_token: None,
                 expires_at: None,
+                refresh_withheld: false,
             };
         }
     }
@@ -848,8 +1002,9 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
             .as_ref()
             .and_then(|credentials| credentials.access_token.as_deref())
             .is_none_or(|token| token.trim().is_empty());
+    let refresh_withheld = should_refresh && refresh_token.is_some() && refresh == OauthRefresh::Never;
 
-    if should_refresh {
+    if should_refresh && !refresh_withheld {
         if let Some(refresh_token) = refresh_token.as_deref() {
             match refresh_claude_code_access_token(refresh_token) {
                 Ok(mut refreshed) => {
@@ -890,12 +1045,12 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
         credential,
         refresh_token,
         expires_at,
+        refresh_withheld,
     }
 }
 
 fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
-    let region = minimax_oauth_region(name);
-    let endpoint = region.token_endpoint();
+    let endpoint = oauth_token_endpoint(OauthTokenEndpoint::Minimax(minimax_oauth_region(name)));
     let client_id = minimax_oauth_client_id();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1049,6 +1204,82 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The regional endpoint a provider name selects, for the vendors whose
+/// aliases share one catalog row while addressing different servers.
+///
+/// A credential issued for one region is not a credential for another, so the
+/// identity the credential resolvers compare has to carry the endpoint as well
+/// as the vendor. These are the same pure selectors the factory dispatches on,
+/// so the identity cannot disagree with the URL the provider is built with.
+/// The argument is the trimmed, lowercased name.
+fn regional_endpoint_for(name: &str) -> Option<&'static str> {
+    qwen_base_url(name)
+        .or_else(|| qwen_coding_base_url(name))
+        .or_else(|| glm_base_url(name))
+        .or_else(|| moonshot_base_url(name))
+        .or_else(|| minimax_base_url(name))
+        .or_else(|| zai_base_url(name))
+}
+
+/// One operator declaration of what an endpoint accepts in a tool schema.
+///
+/// PRX cannot know what an arbitrary `custom:<url>` endpoint will accept, and a
+/// URL is not evidence, so an undeclared endpoint keeps
+/// [`ToolSchemaDialect::Raw`](crate::tools::ToolSchemaDialect::Raw) — the
+/// strongest enforcement contract — and the first transport rejection carries
+/// the diagnostic that says which declaration would fix it.
+///
+/// Filled from `[[providers.tool_dialects]]` by
+/// [`provider_runtime_options_from_config`]. The declaration belongs to the
+/// per-(provider, model) capability descriptor, and that descriptor replaces
+/// this struct when it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSchemaDialectDeclaration {
+    /// The provider it applies to. Compared through
+    /// [`canonical_provider_key`], so every spelling of one provider identity
+    /// shares the declaration.
+    pub provider: String,
+    /// The model the declaration applies to, or every model of that provider.
+    pub model: Option<String>,
+    /// What that endpoint accepts.
+    pub dialect: crate::tools::ToolSchemaDialect,
+}
+
+/// Which tool-call grammars an endpoint was declared to emit.
+///
+/// A model served behind an OpenAI-compatible API answers a tool request in
+/// the provider's native `tool_calls` array. Some chat templates *also* emit a
+/// textual grammar in the content — `<function=NAME>…</function>` is the
+/// Qwen/Llama spelling — and reading it is a capability, not a courtesy: it
+/// decides whether prose an endpoint produced becomes an executed tool call.
+/// So it is declared, and the default is that nothing textual is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ToolCallDialect {
+    /// Only the provider's native `tool_calls` array is a tool call.
+    #[default]
+    Native,
+    /// Additionally read `<function=NAME>{json}</function>` from the content.
+    ///
+    /// The tool name must be one this request registered and the body must
+    /// parse as JSON; a block failing either is reported, never executed.
+    XmlFunctionTags,
+}
+
+/// One operator declaration of a textual tool-call grammar an endpoint emits.
+///
+/// Like [`ToolSchemaDialectDeclaration`], this is filled from
+/// `[[providers.tool_dialects]]` and is replaced by the per-(provider, model)
+/// capability descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallDialectDeclaration {
+    /// The provider it applies to, compared through [`canonical_provider_key`].
+    pub provider: String,
+    /// The model the declaration applies to, or every model of that provider.
+    pub model: Option<String>,
+    /// What that endpoint emits.
+    pub dialect: ToolCallDialect,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
@@ -1061,6 +1292,51 @@ pub struct ProviderRuntimeOptions {
     pub codex_reasoning_effort: Option<String>,
     pub ollama_num_ctx: Option<usize>,
     pub ollama_model_num_ctx: Vec<(String, usize)>,
+    /// What each declared endpoint accepts in a tool schema. Empty means every
+    /// endpoint is offered the published document unchanged.
+    pub tool_schema_dialects: Vec<ToolSchemaDialectDeclaration>,
+    /// Which textual tool-call grammar each declared endpoint emits. Empty
+    /// means only native `tool_calls` are read, anywhere.
+    pub tool_call_dialects: Vec<ToolCallDialectDeclaration>,
+}
+
+impl ProviderRuntimeOptions {
+    /// The `(model, dialect)` declarations that apply to `provider`.
+    ///
+    /// Matched by provider identity, not by spelling: a padded, differently
+    /// cased or trailing-slash label is the provider C1's identity says it is,
+    /// and a different URL path is a different endpoint.
+    #[must_use]
+    pub fn declared_tool_schema_dialects(
+        &self,
+        provider: &str,
+    ) -> Vec<(Option<String>, crate::tools::ToolSchemaDialect)> {
+        if self.tool_schema_dialects.is_empty() {
+            return Vec::new();
+        }
+        let id = ProviderId::of(provider);
+        self.tool_schema_dialects
+            .iter()
+            .filter(|declaration| ProviderId::of(&declaration.provider) == id)
+            .map(|declaration| (declaration.model.clone(), declaration.dialect))
+            .collect()
+    }
+
+    /// The `(model, dialect)` textual tool-call declarations for `provider`,
+    /// matched by provider identity like
+    /// [`declared_tool_schema_dialects`](Self::declared_tool_schema_dialects).
+    #[must_use]
+    pub fn declared_tool_call_dialects(&self, provider: &str) -> Vec<(Option<String>, ToolCallDialect)> {
+        if self.tool_call_dialects.is_empty() {
+            return Vec::new();
+        }
+        let id = ProviderId::of(provider);
+        self.tool_call_dialects
+            .iter()
+            .filter(|declaration| ProviderId::of(&declaration.provider) == id)
+            .map(|declaration| (declaration.model.clone(), declaration.dialect))
+            .collect()
+    }
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -1076,6 +1352,8 @@ impl Default for ProviderRuntimeOptions {
             codex_reasoning_effort: None,
             ollama_num_ctx: None,
             ollama_model_num_ctx: Vec::new(),
+            tool_schema_dialects: Vec::new(),
+            tool_call_dialects: Vec::new(),
         }
     }
 }
@@ -1093,6 +1371,134 @@ pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> P
         codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
         ollama_num_ctx: config.providers.ollama.num_ctx,
         ollama_model_num_ctx: ollama_model_num_ctx_from_router(&config.router),
+        // `[[providers.tool_dialects]]`. An endpoint with no entry keeps the
+        // published document (`Raw`) and native tool calls only; nothing is
+        // inferred from its URL.
+        tool_schema_dialects: tool_schema_dialects_from_config(&config.providers),
+        tool_call_dialects: tool_call_dialects_from_config(&config.providers),
+    }
+}
+
+/// The schema dialects declared in `[[providers.tool_dialects]]` and
+/// `[[providers.models]]`. The loader refuses a `(provider, model)` that
+/// declares one in both tables, so the two lists never disagree.
+fn tool_schema_dialects_from_config(providers: &crate::config::ProvidersConfig) -> Vec<ToolSchemaDialectDeclaration> {
+    let from_key = providers
+        .tool_dialects
+        .iter()
+        .filter_map(|entry| Some((entry.provider.as_str(), entry.model.as_deref(), entry.tool_schema?)));
+    let from_models = providers.models.iter().filter_map(|entry| {
+        Some((
+            entry.provider.as_str(),
+            entry.model.as_deref(),
+            entry.tool_schema_dialect?,
+        ))
+    });
+    from_key
+        .chain(from_models)
+        .map(|(provider, model, setting)| ToolSchemaDialectDeclaration {
+            provider: provider.trim().to_string(),
+            model: declared_model(model),
+            dialect: tool_schema_dialect_setting(setting),
+        })
+        .collect()
+}
+
+/// The textual tool-call grammars declared in `[[providers.tool_dialects]]`
+/// and `[[providers.models]]`.
+fn tool_call_dialects_from_config(providers: &crate::config::ProvidersConfig) -> Vec<ToolCallDialectDeclaration> {
+    let from_key = providers
+        .tool_dialects
+        .iter()
+        .filter_map(|entry| Some((entry.provider.as_str(), entry.model.as_deref(), entry.tool_call?)));
+    let from_models = providers.models.iter().filter_map(|entry| {
+        Some((
+            entry.provider.as_str(),
+            entry.model.as_deref(),
+            entry.tool_call_dialect?,
+        ))
+    });
+    from_key
+        .chain(from_models)
+        .map(|(provider, model, setting)| ToolCallDialectDeclaration {
+            provider: provider.trim().to_string(),
+            model: declared_model(model),
+            dialect: tool_call_dialect_setting(setting),
+        })
+        .collect()
+}
+
+/// The tool-schema dialect a configuration setting names.
+pub(crate) const fn tool_schema_dialect_setting(
+    setting: crate::config::schema::ToolSchemaDialectSetting,
+) -> crate::tools::ToolSchemaDialect {
+    match setting {
+        crate::config::schema::ToolSchemaDialectSetting::Raw => crate::tools::ToolSchemaDialect::Raw,
+        crate::config::schema::ToolSchemaDialectSetting::NoRootCombinators => {
+            crate::tools::ToolSchemaDialect::NoRootCombinators
+        }
+    }
+}
+
+/// The tool-call grammar a configuration setting names.
+pub(crate) const fn tool_call_dialect_setting(
+    setting: crate::config::schema::ToolCallDialectSetting,
+) -> ToolCallDialect {
+    match setting {
+        crate::config::schema::ToolCallDialectSetting::Native => ToolCallDialect::Native,
+        crate::config::schema::ToolCallDialectSetting::XmlFunctionTags => ToolCallDialect::XmlFunctionTags,
+    }
+}
+
+fn declared_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+}
+
+/// The indices of `[[providers.tool_dialects]]` entries whose provider is none
+/// of the providers the configuration uses: the default, the fallbacks, the
+/// model routes, the agents and the router's candidate models.
+///
+/// Such an entry is harmless, but it is usually a typo'd port or path, and the
+/// endpoint the operator meant then keeps failing with its own HTTP 400.
+pub(crate) fn unused_tool_dialect_entries(config: &crate::config::Config) -> Vec<usize> {
+    if config.providers.tool_dialects.is_empty() {
+        return Vec::new();
+    }
+    let used = ConfiguredProviders::from_config(config)
+        .with_providers(config.router.models.iter().map(|model| model.provider.as_str()));
+    config
+        .providers
+        .tool_dialects
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !used.permits(&entry.provider))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The catalog entries whose constructor builds an `OpenAiCompatibleProvider`
+/// against a server the operator runs, and therefore reads
+/// `[[providers.tool_dialects]]` (D-020 Q3). Canonical catalog names.
+pub(crate) const TOOL_DIALECT_DECLARABLE_CATALOG: [&str; 4] = ["vllm", "llamacpp", "lmstudio", "litellm"];
+
+/// Whether the constructor `name` selects reads a tool-dialect declaration.
+///
+/// A `custom:<url>` endpoint with a URL that parses, and the catalog entries
+/// in [`TOOL_DIALECT_DECLARABLE_CATALOG`] under any of their spellings. Every
+/// other provider either has a fixed dialect (`gemini`, `anthropic`,
+/// `anthropic-custom:`) or is a hosted catalog vendor whose constructor
+/// ignores declarations, so accepting one would be a silently ignored key.
+pub(crate) fn accepts_tool_dialect_declarations(name: &str) -> bool {
+    match classify_provider(name) {
+        ProviderIdentity::ByoEndpoint {
+            dialect: ByoDialect::OpenAiCompatible,
+            ..
+        } => true,
+        ProviderIdentity::Catalog(canonical) => TOOL_DIALECT_DECLARABLE_CATALOG.contains(&canonical),
+        _ => false,
     }
 }
 
@@ -1110,58 +1516,83 @@ fn ollama_model_num_ctx_from_router(router: &crate::config::RouterConfig) -> Vec
         .collect()
 }
 
-const fn is_secret_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
+/// How much of an error text [`sanitize_api_error`] scrubs. It prints only
+/// [`MAX_API_ERROR_CHARS`] characters, and no credential that starts within
+/// them is this long, so scrubbing more would only cost time on a large or
+/// crafted upstream body (R-C2BUj J-1).
+const MAX_SCRUBBED_ERROR_BYTES: usize = 16 * 1024;
+
+/// How much of an upstream error response body PRX reads into memory. Error
+/// bodies are shown sanitized and truncated, so the rest is never needed.
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// How long PRX waits for an upstream error body. The streaming client has no
+/// whole-request deadline, so without this bound an upstream that sends an
+/// error status and then drips (or withholds) its body held the turn until
+/// the body reached [`MAX_ERROR_BODY_BYTES`] or ended (R-C2BUk K-7).
+pub(crate) const ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of an error response body, lossily
+/// decoded, for at most [`ERROR_BODY_READ_TIMEOUT`]: when the time is up, what
+/// was read is used. A body that cannot be read at all yields a fixed
+/// placeholder.
+pub(crate) async fn read_error_body(response: reqwest::Response) -> String {
+    read_error_body_within(response, ERROR_BODY_READ_TIMEOUT).await
 }
 
-fn token_end(input: &str, from: usize) -> usize {
-    let mut end = from;
-    for (i, c) in input[from..].char_indices() {
-        if is_secret_char(c) {
-            end = from + i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    end
-}
-
-/// Scrub known secret-like token prefixes from provider error strings.
-///
-/// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
-pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = ["sk-", "xoxb-", "xoxp-", "ghp_", "gho_", "ghu_", "github_pat_"];
-
-    let mut scrubbed = input.to_string();
-
-    for prefix in PREFIXES {
-        let mut search_from = 0;
-        while let Some(rel) = scrubbed[search_from..].find(prefix) {
-            let start = search_from + rel;
-            let content_start = start + prefix.len();
-            let end = token_end(&scrubbed, content_start);
-
-            // Bare prefixes like "sk-" should not stop future scans.
-            if end == content_start {
-                search_from = content_start;
-                continue;
+/// [`read_error_body`] with its time bound given: a provider that carries its
+/// own bound (the default is [`ERROR_BODY_READ_TIMEOUT`]) passes it here.
+pub(crate) async fn read_error_body_within(mut response: reqwest::Response, bound: std::time::Duration) -> String {
+    let mut body: Vec<u8> = Vec::new();
+    let mut failed = false;
+    let read = async {
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+                    body.extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+                    if body.len() >= MAX_ERROR_BODY_BYTES {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
             }
-
-            scrubbed.replace_range(start..end, "[REDACTED]");
-            search_from = start + "[REDACTED]".len();
         }
+    };
+    if tokio::time::timeout(bound, read).await.is_err() {
+        tracing::warn!(
+            timeout_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            "upstream error body did not finish in time; using what was read"
+        );
     }
-
-    scrubbed
+    if failed && body.is_empty() {
+        return "<failed to read provider error body>".to_string();
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
+///
+/// Only the first [`MAX_SCRUBBED_ERROR_BYTES`] are scrubbed; the result is
+/// truncated to [`MAX_API_ERROR_CHARS`] characters anyway.
 pub fn sanitize_api_error(input: &str) -> String {
-    let scrubbed = scrub_secret_patterns(input);
+    let mut prefix_end = input.len().min(MAX_SCRUBBED_ERROR_BYTES);
+    while !input.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let scrubbed = crate::security::redaction::redact_secrets(input.get(..prefix_end).unwrap_or_default());
 
     if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
-        return scrubbed;
+        // A scrubbed prefix of a longer text is still marked as cut.
+        return if prefix_end < input.len() {
+            format!("{scrubbed}...")
+        } else {
+            scrubbed
+        };
     }
 
     let mut end = MAX_API_ERROR_CHARS;
@@ -1185,10 +1616,7 @@ pub fn sanitize_api_error(input: &str) -> String {
 pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
     let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
+    let body = read_error_body(response).await;
     let sanitized = sanitize_api_error(&body);
     let message = format!("{provider} API error ({status}): {sanitized}");
     match retry_after_ms {
@@ -1213,10 +1641,7 @@ pub async fn stream_api_error(provider: &str, response: reqwest::Response) -> tr
     let status = response.status();
     let code = status.as_u16();
     let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
+    let body = read_error_body(response).await;
     let sanitized = sanitize_api_error(&body);
     if code == 429 || code == 503 {
         StreamError::RateLimited {
@@ -1279,6 +1704,8 @@ struct ResolvedProviderCredentials {
     qwen_base_url: Option<String>,
     claude_refresh_token: Option<String>,
     claude_expires_at: Option<i64>,
+    /// An OAuth refresh was due and [`OauthRefresh::Never`] withheld it.
+    refresh_withheld: bool,
 }
 
 impl ResolvedProviderCredentials {
@@ -1295,6 +1722,17 @@ impl ResolvedProviderCredentials {
     }
 }
 
+/// Whether a credential lookup may refresh a due OAuth token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OauthRefresh {
+    /// Construction: a due token is refreshed (a request to the provider's
+    /// token endpoint; for Claude Code, a rewrite of its credential file).
+    Allowed,
+    /// A probe: nothing is refreshed and nothing is written; a due refresh
+    /// is reported instead (D-080 T-7b).
+    Never,
+}
+
 /// Sole provider credential resolver used by construction and availability.
 /// It preserves provider-specific OAuth metadata while applying the common
 /// explicit/config-profile precedence exactly once.
@@ -1303,11 +1741,36 @@ fn resolve_provider_credentials(
     credential_override: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> ResolvedProviderCredentials {
+    resolve_provider_credentials_with(name, credential_override, options, OauthRefresh::Allowed)
+}
+
+/// [`resolve_provider_credentials`] under an explicit refresh policy.
+fn resolve_provider_credentials_with(
+    name: &str,
+    credential_override: Option<&str>,
+    options: &ProviderRuntimeOptions,
+    refresh: OauthRefresh,
+) -> ResolvedProviderCredentials {
     if is_qwen_oauth_alias(name) {
-        let context = resolve_qwen_oauth_context(credential_override);
+        let context = resolve_qwen_oauth_context(credential_override, refresh);
         return ResolvedProviderCredentials {
             credential: context.credential,
             qwen_base_url: context.base_url,
+            refresh_withheld: context.refresh_withheld,
+            ..ResolvedProviderCredentials::default()
+        };
+    }
+
+    // A MiniMax OAuth placeholder is exchanged for an access token on every
+    // construction: that exchange is a refresh.
+    if refresh == OauthRefresh::Never
+        && is_minimax_alias(name)
+        && credential_override
+            .map(str::trim)
+            .is_some_and(is_minimax_oauth_placeholder)
+    {
+        return ResolvedProviderCredentials {
+            refresh_withheld: read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV).is_some(),
             ..ResolvedProviderCredentials::default()
         };
     }
@@ -1316,7 +1779,7 @@ fn resolve_provider_credentials(
         .map(str::trim)
         .is_some_and(is_claude_code_oauth_placeholder);
     if is_claude_code_alias(name) || (name == "anthropic" && (credential_override.is_none() || placeholder_requested)) {
-        let context = resolve_claude_code_context(credential_override);
+        let context = resolve_claude_code_context(credential_override, refresh);
         let fallback_override = (!placeholder_requested).then_some(credential_override).flatten();
         let fallback_name = if is_claude_code_alias(name) { "anthropic" } else { name };
         return ResolvedProviderCredentials {
@@ -1325,6 +1788,7 @@ fn resolve_provider_credentials(
                 .or_else(|| resolve_provider_credential_with_options(fallback_name, fallback_override, options)),
             claude_refresh_token: context.refresh_token,
             claude_expires_at: context.expires_at,
+            refresh_withheld: context.refresh_withheld,
             ..ResolvedProviderCredentials::default()
         };
     }
@@ -1335,12 +1799,41 @@ fn resolve_provider_credentials(
     }
 }
 
+/// What a connection test may present for a provider.
+pub(crate) enum ProbeCredential {
+    /// The credential construction would present (`None`: it has none).
+    Ready(Option<String>),
+    /// Only an OAuth refresh would produce the credential construction
+    /// presents, and a probe does not refresh.
+    RefreshDue,
+}
+
+/// The credential provider construction presents for `name` (the explicit,
+/// resolver-released credential, else the provider's own store lookup, with
+/// every provider-specific OAuth context), looked up without side effects:
+/// no OAuth token is refreshed and no credential file is written (D-078 T-7,
+/// D-080 T-7b). It reads files and takes the auth-profile lock, so it
+/// blocks: call it off the async runtime.
+pub(crate) fn probe_credential(
+    name: &str,
+    credential_override: Option<&str>,
+    options: &ProviderRuntimeOptions,
+) -> ProbeCredential {
+    let resolved = resolve_provider_credentials_with(name, credential_override, options, OauthRefresh::Never);
+    if resolved.refresh_withheld {
+        ProbeCredential::RefreshDue
+    } else {
+        ProbeCredential::Ready(resolved.credential)
+    }
+}
+
 fn resolve_auth_profile_credential(name: &str, options: &ProviderRuntimeOptions) -> Option<String> {
     let openprx_dir = options.openprx_dir.as_ref()?;
-    let provider = canonical_auth_profile_provider(name);
     let store = AuthProfilesStore::new(openprx_dir, options.secrets_encrypt);
-    let data = store.load().ok()?;
-    let profile_id = select_profile_id(&data, provider.as_str(), options.auth_profile_override.as_deref())?;
+    let data = store.load_read_only().ok()?;
+    let profile_id = auth_profile_keys(name)
+        .iter()
+        .find_map(|provider| select_profile_id(&data, provider, options.auth_profile_override.as_deref()))?;
     let profile = data.profiles.get(&profile_id)?;
     profile
         .token
@@ -1351,16 +1844,759 @@ fn resolve_auth_profile_credential(name: &str, options: &ProviderRuntimeOptions)
         .map(ToOwned::to_owned)
 }
 
-fn canonical_auth_profile_provider(name: &str) -> String {
-    let lowered = name.trim().to_ascii_lowercase();
-    for info in list_providers() {
-        if info.name == lowered || info.aliases.iter().any(|alias| *alias == lowered) {
-            return info.name.to_string();
+/// The auth-profile provider keys a provider's own credential is read under,
+/// in order. A `custom:`, `anthropic-custom:` or `wasm:` identity is
+/// case-sensitive, so its token is stored under the `ProviderId` key
+/// (`auth::normalize_provider`); a token stored lowercased before that is
+/// still read, but only when lowercasing the spelling does not change its
+/// identity, so another path's or plugin's token is never read.
+fn auth_profile_keys(name: &str) -> Vec<String> {
+    let identity = ProviderId::of(name);
+    match identity.namespace() {
+        ProviderNamespace::Custom | ProviderNamespace::AnthropicCustom | ProviderNamespace::Wasm => {
+            let legacy = name.trim().to_ascii_lowercase();
+            let mut keys = vec![identity.as_str().to_string()];
+            if ProviderId::of(&legacy) == identity && legacy != identity.as_str() {
+                keys.push(legacy);
+            }
+            keys
+        }
+        ProviderNamespace::DecisionService => vec![identity.as_str().to_string()],
+        ProviderNamespace::Catalog | ProviderNamespace::Unknown => vec![canonical_auth_profile_provider(name)],
+    }
+}
+
+/// A request refused before transport because the endpoint's declared
+/// tool-schema dialect cannot carry some of the tools it offered.
+///
+/// The rendering keeps the `provider_capability_error … capability=tool_schema_dialect`
+/// shape every capability refusal has, so a text-only consumer (a stream
+/// error) still recognises it by its start ([`is_tool_schema_refusal_text`]);
+/// typed consumers downcast to this type instead of matching text. It is
+/// deterministic: the same request is refused the same way every time, so the
+/// reliability layer never retries it against the same provider.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("provider_capability_error provider={provider} capability=tool_schema_dialect message={refusals}")]
+pub struct ToolSchemaRefusalError {
+    /// The provider implementation that refused (its display name).
+    pub provider: String,
+    /// Every refused tool and why.
+    pub refusals: crate::tools::ToolSchemaRefusals,
+}
+
+/// How every rendered capability refusal starts (see [`ToolSchemaRefusalError`]).
+const CAPABILITY_REFUSAL_PREFIX: &str = "provider_capability_error provider=";
+
+/// How a stream error renders a provider message (`StreamError::Provider`),
+/// the one form in which a refusal crosses the streaming boundary.
+const STREAM_PROVIDER_ERROR_PREFIX: &str = "Provider error: ";
+
+/// Whether `text` is a rendered [`ToolSchemaRefusalError`], as the streaming
+/// boundary carries it: the text *starts with* the refusal's own header
+/// (optionally inside a stream error's `Provider error: ` rendering), and that
+/// header names the tool-schema capability.
+///
+/// Text that merely contains `capability=tool_schema_dialect` is not a refusal:
+/// an upstream error body is rendered after `… API error (NNN): `, and a
+/// hostile or confused upstream can quote the marker there (SP-INT2 a51).
+#[must_use]
+pub fn is_tool_schema_refusal_text(text: &str) -> bool {
+    let text = text.strip_prefix(STREAM_PROVIDER_ERROR_PREFIX).unwrap_or(text);
+    text.strip_prefix(CAPABILITY_REFUSAL_PREFIX)
+        .and_then(|rest| rest.split_once(" capability="))
+        .is_some_and(|(_, capability)| capability.starts_with("tool_schema_dialect message="))
+}
+
+/// The refused tools, if a tool-schema refusal ended the request `error`
+/// reports.
+///
+/// Typed first: the leaf refusal, or a failover chain whose last candidate
+/// was refused, anywhere in the cause chain. A boundary that carries errors
+/// as text (the streaming path) loses the type, so a cause whose text *is* a
+/// rendered refusal ([`is_tool_schema_refusal_text`]) is the fallback; text
+/// that only quotes one is not.
+#[must_use]
+pub fn tool_schema_refused_tools(error: &anyhow::Error) -> Option<Vec<String>> {
+    for cause in error.chain() {
+        if let Some(refusal) = cause.downcast_ref::<ToolSchemaRefusalError>() {
+            return Some(refusal.refusals.tool_names().map(str::to_string).collect());
+        }
+        if let Some(refusal) = cause
+            .downcast_ref::<reliable::ProviderChainFailure>()
+            .and_then(reliable::ProviderChainFailure::tool_schema_refusal)
+        {
+            return Some(refusal.refusals.tool_names().map(str::to_string).collect());
         }
     }
-    canonical_china_provider_name(&lowered)
-        .unwrap_or(lowered.as_str())
-        .to_string()
+    error
+        .chain()
+        .map(ToString::to_string)
+        .find(|text| is_tool_schema_refusal_text(text))
+        .and_then(|text| crate::tools::ToolSchemaRefusals::tool_names_in(&text))
+}
+
+/// A provider string as it is safe to echo back.
+///
+/// A bring-your-own endpoint is named by its URL, and a URL may carry
+/// userinfo, which is a credential. The scheme, host and port are what an
+/// operator needs to recognise the endpoint; the userinfo must not reach
+/// terminal output or an error chain.
+///
+/// The input may be a bare label or free text that quotes labels (an error
+/// chain, a failover summary): every URL authority in it that carries
+/// userinfo is rewritten to `scheme://[redacted]@host`. The rewrite is
+/// idempotent, so text redacted once can pass through here again unchanged.
+///
+/// The authority is delimited the way the WHATWG URL parser behind
+/// `reqwest::Url` delimits it, so whatever the transport would send as
+/// userinfo is what is redacted: a special scheme's separator may be written
+/// with any number of `/` or `\`; the authority ends at the first `/`, `?`
+/// or `#` (and `\` for a special scheme); the userinfo ends at the last `@`
+/// inside it, but never reaches into a later URL that carries its own
+/// userinfo. Quotes, spaces, backticks, angle brackets and non-ASCII
+/// characters do not end it: the parser accepts them in a password. A `//`
+/// authority that does not parse (a password holding a literal `/`) is
+/// redacted conservatively, through the last `@` before the next URL that
+/// carries its own userinfo. No input can make this function panic: every
+/// slice goes through `get` at a char boundary. It runs in time linear in
+/// the text (see [`TextIndex`]), so an adversarial upstream body cannot
+/// stall the caller.
+///
+/// `docs/providers.md` lists what the tests prove and the known limits.
+#[must_use]
+pub fn redact_endpoint_userinfo(provider: &str) -> std::borrow::Cow<'_, str> {
+    if !provider.contains('@') {
+        return std::borrow::Cow::Borrowed(provider);
+    }
+    // First pass: a bare label is decided by the parser itself, so the two
+    // can never disagree about whether the transport would send userinfo.
+    // It is only a first pass: text that merely *begins* with a URL also
+    // parses as one URL (the rest becomes its path), so the free-text scan
+    // always runs over the result and redacts every later userinfo. The scan
+    // leaves `[redacted]@` alone, so running it again is safe.
+    match redact_parsed_label(provider) {
+        Some(std::borrow::Cow::Owned(first)) => match redact_free_text(&first) {
+            std::borrow::Cow::Owned(both) => std::borrow::Cow::Owned(both),
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Owned(first),
+        },
+        Some(std::borrow::Cow::Borrowed(_)) | None => redact_free_text(provider),
+    }
+}
+
+/// Redact the userinfo of every URL authority in free text (see
+/// [`redact_endpoint_userinfo`]).
+///
+/// Every index below is a char boundary: it is either a position `find` or
+/// `rfind` returned for an ASCII character (`:`, `@`, a separator or a
+/// terminator), or a position advanced past a whole character with
+/// `len_utf8`. Slices go through `get`, so even a broken invariant ends the
+/// scan instead of panicking.
+///
+/// The cost is linear in the text (R-C2BUj J-1): the positions of `@` and of
+/// every authority terminator are indexed once ([`TextIndex`]), so an
+/// authority's end, whether it holds an `@`, and the next credentialed URL
+/// are each a binary search, never a rescan of the rest of the text.
+fn redact_free_text(provider: &str) -> std::borrow::Cow<'_, str> {
+    let index = TextIndex::new(provider);
+    let mut output = String::new();
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(found) = next_url_authority(provider, search_from) {
+        let authority_end = index.authority_end(found.authority_start, found.special);
+        let authority_len = authority_end - found.authority_start;
+        // The userinfo ends at the last `@` of the authority, but never
+        // reaches into a later URL that carries its own userinfo: a
+        // non-special authority does not end at `\`, so without this bound it
+        // could swallow `ws:\\x@h` on one pass but not on the next. The bound
+        // can only matter when the authority holds an `@` at all.
+        let userinfo_end = if index.has_at(found.authority_start, authority_end) {
+            let bound = found.authority_start
+                + authority_len.min(index.userinfo_bound_after(found.authority_start, found.authority_start));
+            index.last_at(found.authority_start, bound)
+        } else if found.separators >= 2 {
+            // The conservative fallback is for a `//` authority that a
+            // literal `/` in the password cut short; a spelling with fewer
+            // separators is matched only where the parser itself reads it as
+            // an authority.
+            conservative_userinfo_end(provider, &index, &found, authority_end)
+        } else {
+            None
+        };
+        let Some(at) = userinfo_end else {
+            search_from = found.authority_start;
+            continue;
+        };
+        let userinfo = provider.get(found.authority_start..at).unwrap_or_default();
+        // Already redacted, or the placeholder a pasteable declaration prints.
+        if !matches!(userinfo, REDACTED_USERINFO | USERINFO_PLACEHOLDER) {
+            output.push_str(provider.get(copied..found.authority_start).unwrap_or_default());
+            output.push_str(REDACTED_USERINFO);
+            copied = at;
+        }
+        search_from = at + 1;
+    }
+    if copied == 0 {
+        return std::borrow::Cow::Borrowed(provider);
+    }
+    output.push_str(provider.get(copied..).unwrap_or_default());
+    std::borrow::Cow::Owned(output)
+}
+
+// Bytes the userinfo redactor examined on this thread: a deterministic work
+// count, so a test can prove the scan linear without a clock (R-C2BUk K-4).
+// Every scan step records what it reads; a test resets it, redacts, and
+// compares the count across input sizes.
+#[cfg(test)]
+thread_local! {
+    static USERINFO_SCAN_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_userinfo_scan_work(bytes: usize) {
+    USERINFO_SCAN_WORK.with(|work| work.set(work.get().saturating_add(bytes)));
+}
+
+/// The bytes [`redact_endpoint_userinfo`] examines for `text`, counted on this
+/// thread.
+#[cfg(test)]
+pub(crate) fn userinfo_scan_work(text: &str) -> usize {
+    USERINFO_SCAN_WORK.with(|work| work.set(0));
+    std::hint::black_box(redact_endpoint_userinfo(text).len());
+    USERINFO_SCAN_WORK.with(std::cell::Cell::get)
+}
+
+/// The positions the scan asks about, found once per text, so every question
+/// is a binary search: where an authority ends, whether a span holds an `@`,
+/// the last `@` in a span, and the next URL whose own authority carries an
+/// `@`.
+struct TextIndex<'a> {
+    text: &'a str,
+    /// Positions of every `@`.
+    ats: Vec<usize>,
+    /// Positions of `/`, `\`, `?` and `#`: where a special authority ends.
+    special_ends: Vec<usize>,
+    /// Positions of `/`, `?` and `#`: where a non-special authority ends
+    /// (the parser keeps `\` in a non-special userinfo).
+    plain_ends: Vec<usize>,
+    /// Every URL written with at least two separators whose authority holds
+    /// an `@`, as `(colon, scheme start)`, in text order. Built lazily.
+    credentialed: std::cell::OnceCell<Vec<(usize, usize)>>,
+    text_len: usize,
+}
+
+impl<'a> TextIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        #[cfg(test)]
+        record_userinfo_scan_work(text.len());
+        let mut ats = Vec::new();
+        let mut special_ends = Vec::new();
+        let mut plain_ends = Vec::new();
+        for (position, byte) in text.bytes().enumerate() {
+            match byte {
+                b'@' => ats.push(position),
+                b'\\' => special_ends.push(position),
+                b'/' | b'?' | b'#' => {
+                    special_ends.push(position);
+                    plain_ends.push(position);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            text,
+            ats,
+            special_ends,
+            plain_ends,
+            credentialed: std::cell::OnceCell::new(),
+            text_len: text.len(),
+        }
+    }
+
+    /// Every URL written with at least two separators whose own authority
+    /// holds an `@`, as `(colon, scheme start)`, from one pass over the text.
+    fn scan_credentialed(&self) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some(url) = next_url_authority(self.text, from) {
+            if url.separators >= 2
+                && self.has_at(
+                    url.authority_start,
+                    self.authority_end(url.authority_start, url.special),
+                )
+            {
+                found.push((url.colon, url.scheme_start));
+            }
+            from = url.authority_start;
+        }
+        found
+    }
+
+    /// Where the authority starting at `start` ends: the first `/`, `?` or
+    /// `#` at or after it (and `\` for a special scheme), or the end.
+    fn authority_end(&self, start: usize, special: bool) -> usize {
+        let ends = if special { &self.special_ends } else { &self.plain_ends };
+        let index = ends.partition_point(|&position| position < start);
+        ends.get(index).copied().unwrap_or(self.text_len)
+    }
+
+    /// Whether `[start, end)` holds an `@`.
+    fn has_at(&self, start: usize, end: usize) -> bool {
+        let index = self.ats.partition_point(|&position| position < start);
+        self.ats.get(index).is_some_and(|&position| position < end)
+    }
+
+    /// The last `@` in `[start, end)`.
+    fn last_at(&self, start: usize, end: usize) -> Option<usize> {
+        let index = self.ats.partition_point(|&position| position < end);
+        index
+            .checked_sub(1)
+            .and_then(|last| self.ats.get(last).copied())
+            .filter(|&position| position >= start)
+    }
+
+    /// The offset from `authority_start` of the first URL whose colon is at
+    /// or after `from`, written with at least two separators, whose own
+    /// authority holds an `@`; or the rest of the text. A userinfo never
+    /// reaches into such a URL: that `@` belongs to it.
+    ///
+    /// Only a `//` (or, for a special scheme, `\\`) URL counts: a special
+    /// scheme word with a colon and no separators (`k9-wss:Q`) inside a
+    /// password is part of that password to the parser (R-C2BUj J-2).
+    fn userinfo_bound_after(&self, authority_start: usize, from: usize) -> usize {
+        let whole = self.text_len.saturating_sub(authority_start);
+        let credentialed = self.credentialed.get_or_init(|| self.scan_credentialed());
+        let index = credentialed.partition_point(|&(colon, _)| colon < from);
+        credentialed.get(index).map_or(whole, |&(_, scheme_start)| {
+            scheme_start.max(from).saturating_sub(authority_start).min(whole)
+        })
+    }
+}
+
+/// A redacted provider label as it can be pasted into a declaration: the
+/// `[redacted]` userinfo is replaced by `<user>:<password>` placeholders, and
+/// the second value says whether that happened, so the caller can tell the
+/// operator to fill them in. A declaration matches by provider identity,
+/// which keeps userinfo, so a pasted `[redacted]` would match nothing (and
+/// the configuration API reads it as a mask).
+#[must_use]
+pub fn pasteable_provider_label(label: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    // After whatever separator the label was spelled with (`//`, `\\`, `/`,
+    // none): the marker is what the redactor leaves in place of userinfo.
+    const MARKER: &str = "[redacted]@";
+    if label.contains(MARKER) {
+        (
+            std::borrow::Cow::Owned(label.replace(MARKER, "<user>:<password>@")),
+            true,
+        )
+    } else {
+        (std::borrow::Cow::Borrowed(label), false)
+    }
+}
+
+/// The marker a redacted userinfo leaves behind, without its `@`.
+const REDACTED_USERINFO: &str = "[redacted]";
+
+/// The userinfo placeholder of [`pasteable_provider_label`]; it names no
+/// credential, so it is printed as is.
+const USERINFO_PLACEHOLDER: &str = "<user>:<password>";
+
+/// Schemes the URL parser treats as special: after the colon it accepts any
+/// number of `/` or `\`, none included, before the authority.
+const SPECIAL_URL_SCHEMES: [&str; 5] = ["http", "https", "ws", "wss", "ftp"];
+
+/// Whether `c` is one of the characters the URL parser removes from its whole
+/// input before parsing (ASCII tab, LF, CR).
+const fn is_url_ignored(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r')
+}
+
+/// The scanner's view of one URL.
+struct UrlAuthority {
+    scheme_start: usize,
+    colon: usize,
+    authority_start: usize,
+    separators: usize,
+    special: bool,
+}
+
+/// How far back from a colon the scheme search looks. A special scheme has
+/// at most five characters; a longer non-special scheme is still found, only
+/// reported with a shorter scheme. Without this cap, a long run of scheme
+/// characters (`1a1a…:`, `a\ta\t…:`) makes every colon cost the whole run
+/// (R-C2BUj J-1).
+const MAX_SCHEME_SPAN: usize = 64;
+
+/// The next URL authority at or after `from`.
+///
+/// The scheme is `[A-Za-z][A-Za-z0-9+.-]*` before a colon; tab, LF and CR
+/// anywhere in the scheme or the separator are skipped, as the parser skips
+/// them. A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) takes any
+/// number of `/` or `\` after the colon, none included, and whatever follows
+/// (whitespace too: the parser reads `http: alice:pw@h` as userinfo, so prose
+/// such as `https: see a@b` is redacted, the safe direction). Any other
+/// scheme needs `//`: the parser gives it an authority only after two `/`,
+/// and keeps a `\` as part of that authority.
+///
+/// Candidate scheme starts, tried in order: the widest run of scheme
+/// characters (plus tab, LF, CR) before the colon, at most
+/// [`MAX_SCHEME_SPAN`] bytes back, as the parser reads `ht\ntp://`; then each
+/// start just after a tab, LF or CR inside it (a URL at the start of a line
+/// or a cell); then each letter that follows a digit, `+`, `-` or `.` (a
+/// scheme glued to `502`, `1.`, `--`). Nothing before `from` is ever part of
+/// a candidate.
+fn next_url_authority(text: &str, from: usize) -> Option<UrlAuthority> {
+    let mut index = from;
+    while index < text.len() {
+        let colon = index + text.get(index..)?.find(':')?;
+        #[cfg(test)]
+        record_userinfo_scan_work(colon + 1 - index);
+        index = colon + 1;
+        let rest = text.get(colon + 1..)?;
+        // Special schemes read any mix of `/` and `\`; others only `/`.
+        let special_run = rest
+            .find(|c: char| !matches!(c, '/' | '\\') && !is_url_ignored(c))
+            .unwrap_or(rest.len());
+        let special_separators = rest
+            .get(..special_run)?
+            .chars()
+            .filter(|c| matches!(c, '/' | '\\'))
+            .count();
+        let plain_run = rest
+            .find(|c: char| c != '/' && !is_url_ignored(c))
+            .unwrap_or(rest.len());
+        let plain_separators = rest.get(..plain_run)?.chars().filter(|c| *c == '/').count();
+        #[cfg(test)]
+        record_userinfo_scan_work(special_run + plain_run + 2);
+        let before = text.get(from..colon)?;
+        // Advance past the whole character the search stopped at: it may be
+        // multibyte (`é:`, `€:`, NBSP, East-Asian text), and one byte past its
+        // start is not a char boundary (R-C2BUi I-1).
+        let widest = from
+            + before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') || is_url_ignored(*c)))
+                .map_or(0, |(position, c)| position + c.len_utf8());
+        #[cfg(test)]
+        record_userinfo_scan_work(colon - widest);
+        // Every character between `widest` and the colon is ASCII, so any
+        // byte offset in that span is a char boundary.
+        let widest = widest.max(colon.saturating_sub(MAX_SCHEME_SPAN));
+        let span = text.get(widest..colon)?;
+        #[cfg(test)]
+        record_userinfo_scan_work(span.len());
+        let mut previous: Option<char> = None;
+        let mut inner = Vec::new();
+        for (offset, c) in span.char_indices() {
+            if is_url_ignored(c) {
+                inner.push(widest + offset + c.len_utf8());
+            }
+            if c.is_ascii_alphabetic() && previous.is_some_and(|p| p.is_ascii_digit() || matches!(p, '+' | '-' | '.')) {
+                inner.push(widest + offset);
+            }
+            if !is_url_ignored(c) {
+                previous = Some(c);
+            }
+        }
+        for scheme_start in std::iter::once(widest).chain(inner) {
+            #[cfg(test)]
+            record_userinfo_scan_work(colon - scheme_start);
+            let scheme: String = text
+                .get(scheme_start..colon)?
+                .chars()
+                .filter(|c| !is_url_ignored(*c))
+                .collect();
+            if !scheme.chars().next().is_some_and(|first| first.is_ascii_alphabetic()) {
+                continue;
+            }
+            let special = SPECIAL_URL_SCHEMES.iter().any(|name| scheme.eq_ignore_ascii_case(name));
+            let (run, separators) = if special {
+                (special_run, special_separators)
+            } else {
+                (plain_run, plain_separators)
+            };
+            if separators >= 2 || special {
+                return Some(UrlAuthority {
+                    scheme_start,
+                    colon,
+                    authority_start: colon + 1 + run,
+                    separators,
+                    special,
+                });
+            }
+        }
+        // Every candidate read as a non-special scheme without two `/`. A
+        // special scheme glued to a preceding letter (`xhttps:\\u:pw@h`,
+        // `completionshTTp\nS:\\u:pw@h`) is such a longer word, for which `\`
+        // is no separator, but the URL it ends is what a reader copies (and
+        // what the parser reads once the glued prefix is gone). When the
+        // separators include two `/` or `\`, that trailing special scheme is
+        // taken as the start (R-C2BUk K-1).
+        if special_separators >= 2
+            && let Some(scheme_start) = glued_special_scheme_start(span, widest)
+        {
+            return Some(UrlAuthority {
+                scheme_start,
+                colon,
+                authority_start: colon + 1 + special_run,
+                separators: special_separators,
+                special: true,
+            });
+        }
+    }
+    None
+}
+
+/// Where a special scheme glued to the end of `span` starts, as a byte offset
+/// into the text (`span` starts at `span_start`): `https` in `xhttps`, and in
+/// `hTTp\nS`, since tab, LF and CR inside a scheme are skipped, as the parser
+/// skips them. The longest special name wins (`wss` over `ss`). `None` when
+/// the span does not end with one.
+fn glued_special_scheme_start(span: &str, span_start: usize) -> Option<usize> {
+    /// The longest special scheme name.
+    const MAX_SPECIAL_SCHEME_LEN: usize = 5;
+    #[cfg(test)]
+    record_userinfo_scan_work(span.len());
+    let mut letters = 0usize;
+    let mut start = None;
+    for (offset, c) in span.char_indices().rev() {
+        if is_url_ignored(c) {
+            continue;
+        }
+        letters += 1;
+        if letters > MAX_SPECIAL_SCHEME_LEN {
+            break;
+        }
+        let name: String = span.get(offset..)?.chars().filter(|c| !is_url_ignored(*c)).collect();
+        if SPECIAL_URL_SCHEMES
+            .iter()
+            .any(|special| name.eq_ignore_ascii_case(special))
+        {
+            start = Some(span_start + offset);
+        }
+    }
+    start
+}
+
+/// For a bare provider label (optionally prefixed `custom:` or
+/// `anthropic-custom:`) that the URL parser reads with a user name or a
+/// password, the label with that userinfo redacted, measured on the raw
+/// string: after the scheme colon and every separator (`/`, `\`, tab, LF,
+/// CR), through the last `@` before the first `/`, `?` or `#` (and `\` for a
+/// special scheme). `None` when the input is not such a label.
+fn redact_parsed_label(label: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let trimmed = label.trim_end();
+    let url_start = split_byo_provider(trimmed).map_or_else(
+        || trimmed.len() - trimmed.trim_start().len(),
+        |(_, raw)| trimmed.len() - raw.len(),
+    );
+    let raw = trimmed.get(url_start..)?;
+    #[cfg(test)]
+    record_userinfo_scan_work(raw.len());
+    let parsed = reqwest::Url::parse(raw).ok()?;
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return None;
+    }
+    let special = SPECIAL_URL_SCHEMES.contains(&parsed.scheme());
+    let colon = raw.find(':')?;
+    let after = raw.get(colon + 1..)?;
+    let run = after
+        .find(|c: char| !(if special { matches!(c, '/' | '\\') } else { c == '/' }) && !is_url_ignored(c))
+        .unwrap_or(after.len());
+    let authority_start = url_start + colon + 1 + run;
+    let index = TextIndex::new(label);
+    // Bounded like the free-text scan, so the two passes agree.
+    let authority_end = index.authority_end(authority_start, special);
+    let bound = authority_start
+        + (authority_end - authority_start).min(index.userinfo_bound_after(authority_start, authority_start));
+    let at = index.last_at(authority_start, bound)?;
+    if matches!(
+        label.get(authority_start..at)?,
+        REDACTED_USERINFO | USERINFO_PLACEHOLDER
+    ) {
+        return Some(std::borrow::Cow::Borrowed(label));
+    }
+    Some(std::borrow::Cow::Owned(format!(
+        "{}{REDACTED_USERINFO}{}",
+        label.get(..authority_start)?,
+        label.get(at..)?
+    )))
+}
+
+/// An authority longer than this is not handed to the URL parser by the
+/// conservative fallback: no real host is that long, and parsing a long
+/// authority for every URL of a crafted text would cost quadratic time. It is
+/// treated as unparseable, which only ever redacts more.
+const MAX_PARSED_AUTHORITY: usize = 1024;
+
+/// For an authority with no `@` of its own: when `scheme://authority` does not
+/// parse, the password may hold a literal `/` that ended the authority early,
+/// so everything through the last `@` before the next URL that carries its
+/// own userinfo (or the end of the text) is treated as userinfo. Tab, LF and
+/// CR do not end it, since the parser ignores them. `None` when the authority
+/// parses, or there is no such `@`.
+fn conservative_userinfo_end(
+    text: &str,
+    index: &TextIndex<'_>,
+    found: &UrlAuthority,
+    authority_end: usize,
+) -> Option<usize> {
+    // No `@` after the authority: nothing to find, and nothing to parse.
+    index.last_at(authority_end, text.len())?;
+    #[cfg(test)]
+    if authority_end - found.authority_start <= MAX_PARSED_AUTHORITY {
+        record_userinfo_scan_work(authority_end - found.scheme_start);
+    }
+    if authority_end - found.authority_start <= MAX_PARSED_AUTHORITY
+        && reqwest::Url::parse(text.get(found.scheme_start..authority_end)?).is_ok()
+    {
+        return None;
+    }
+    // Stop at the next URL whose own authority holds an `@`: that `@` belongs
+    // to it (R-C2BUi I-3). A URL nested in this password (`a:b://c@h`) starts
+    // before this authority ends and is not searched for.
+    let bound = found.authority_start + index.userinfo_bound_after(found.authority_start, authority_end);
+    index.last_at(found.authority_start, bound)
+}
+
+/// The provider identities the operator configured.
+///
+/// A model may name a provider per call (`delegate`, `sessions_spawn`), and it
+/// may name only one of these: the default provider, the fallback providers,
+/// the `model_routes` providers and the named agents' providers. A
+/// model-supplied `custom:<url>` that is none of them is refused before any
+/// provider is built, so a prompt cannot direct a request, or a credential, to
+/// a host the operator never chose. Membership is by provider identity
+/// (`canonical_provider_key`), so every spelling of a configured provider is
+/// that provider.
+#[derive(Debug, Clone, Default)]
+pub struct ConfiguredProviders {
+    names: Vec<String>,
+}
+
+impl ConfiguredProviders {
+    /// Every provider the operator configured in `config`.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let default_provider = config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET);
+        Self::default()
+            .with_providers(std::iter::once(default_provider))
+            .with_providers(config.reliability.fallback_providers.iter().map(String::as_str))
+            .with_providers(config.model_routes.iter().map(|route| route.provider.as_str()))
+            .with_providers(config.agents.values().map(|agent| agent.provider.as_str()))
+    }
+
+    /// Add more configured providers; blank names are ignored.
+    #[must_use]
+    pub fn with_providers<'a>(mut self, names: impl IntoIterator<Item = &'a str>) -> Self {
+        for name in names {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !self.permits(trimmed) {
+                self.names.push(trimmed.to_string());
+            }
+        }
+        self
+    }
+
+    /// The union of two configured sets.
+    #[must_use]
+    pub fn union(self, other: &Self) -> Self {
+        self.with_providers(other.names.iter().map(String::as_str))
+    }
+
+    /// Whether `name` is one of the configured provider identities.
+    #[must_use]
+    pub fn permits(&self, name: &str) -> bool {
+        let key = canonical_provider_key(name);
+        self.names
+            .iter()
+            .any(|configured| canonical_provider_key(configured) == key)
+    }
+
+    /// Refuse a per-call provider the operator did not configure.
+    ///
+    /// The message is returned to the model, so it names provider identities
+    /// only: catalog names, and a count of the operator's own endpoints. No
+    /// URL, host or port of a configured endpoint, or of the refused one,
+    /// reaches the model. The full configured list (userinfo redacted) is
+    /// logged for the operator.
+    pub fn ensure_permits(&self, requested: &str) -> anyhow::Result<()> {
+        use std::fmt::Write as _;
+        if self.permits(requested) {
+            return Ok(());
+        }
+        let mut catalog: Vec<&str> = Vec::new();
+        let mut endpoints = 0usize;
+        for name in &self.names {
+            match classify_provider(name) {
+                ProviderIdentity::Catalog(canonical) => {
+                    if !catalog.contains(&canonical) {
+                        catalog.push(canonical);
+                    }
+                }
+                _ => endpoints += 1,
+            }
+        }
+        catalog.sort_unstable();
+        let redacted: Vec<String> = self
+            .names
+            .iter()
+            .map(|name| redact_endpoint_userinfo(name).into_owned())
+            .collect();
+        // The requested string is model-controlled: `Debug` escapes a newline
+        // that would otherwise start a forged log line, and the length is
+        // bounded (SP-INT2 a35). Redacted first, so a cut never exposes
+        // userinfo.
+        tracing::warn!(
+            requested = ?crate::util::truncate_with_ellipsis(
+                &redact_endpoint_userinfo(requested.trim()),
+                REFUSED_PROVIDER_LOG_CHARS
+            ),
+            configured = ?redacted,
+            "refused a per-call provider the operator did not configure"
+        );
+        let mut allowed = catalog.join(", ");
+        if endpoints > 0 {
+            if !allowed.is_empty() {
+                allowed.push_str(", ");
+            }
+            let _ = write!(allowed, "{endpoints} operator-configured endpoint(s)");
+        }
+        if allowed.is_empty() {
+            allowed.push_str("(none)");
+        }
+        anyhow::bail!(
+            "{} is not configured by the operator; a per-call provider must be one of: {allowed}. \
+             Only the operator can make another provider selectable",
+            refusal_label(requested)
+        )
+    }
+}
+
+/// How a refused provider is named to the model: its catalog identity, or
+/// only the kind of provider it is. A URL, host or port never appears.
+fn refusal_label(requested: &str) -> String {
+    match classify_provider(requested) {
+        ProviderIdentity::Catalog(canonical) => format!("provider '{canonical}'"),
+        ProviderIdentity::ByoEndpoint { dialect, .. } => format!("the requested {} endpoint", dialect.prefix()),
+        #[cfg(feature = "wasm-plugins")]
+        ProviderIdentity::WasmPlugin => "the requested WASM provider".to_string(),
+        // A plain name is echoed so the model can see what it asked for; any
+        // string that could carry an address (`:`, `/`, `.`, `@`) is not.
+        ProviderIdentity::Unknown => {
+            let trimmed = requested.trim();
+            if !trimmed.is_empty()
+                && trimmed.len() <= 64
+                && trimmed
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            {
+                format!("provider '{trimmed}'")
+            } else {
+                "the requested provider".to_string()
+            }
+        }
+    }
 }
 
 fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &str) -> anyhow::Result<String> {
@@ -1437,6 +2673,31 @@ fn create_provider_with_url_and_options(
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
+
+    // ── Bring Your Own Provider (custom URL) ───────────
+    // Format: "custom:https://your-api.com", "custom:http://localhost:1234",
+    //         "anthropic-custom:https://your-api.com".
+    // Both dialects are recognized by the same splitter the classifier uses,
+    // so the factory and model validation cannot disagree about what a BYO
+    // endpoint is. The URL is parsed here rather than read off
+    // `classify_provider` so an unparseable one keeps its own diagnostic
+    // instead of collapsing into the generic "Unknown provider" message.
+    if let Some((dialect, raw_url)) = split_byo_provider(name) {
+        let base_url = parse_custom_provider_url(raw_url, dialect.label(), dialect.format_hint())?;
+        return match dialect {
+            ByoDialect::OpenAiCompatible => Ok(Box::new(
+                OpenAiCompatibleProvider::new_optional_credential("Custom", &base_url, key, AuthStyle::Bearer)
+                    // A bring-your-own endpoint is the one case PRX knows
+                    // nothing about, so it is the one that needs a declaration.
+                    .with_declared_tool_dialects(name, options),
+            )),
+            ByoDialect::AnthropicCompatible => Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
+                key,
+                Some(&base_url),
+            ))),
+        };
+    }
+
     match name {
         // ── Test-only providers (gated by `test-mock` feature) ─────
         // Allows PTY E2E tests (tests/chat_pty_e2e.rs) to drive
@@ -1665,12 +2926,15 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "LM Studio",
-                "http://localhost:1234/v1",
-                Some(lm_studio_key),
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new(
+                    "LM Studio",
+                    "http://localhost:1234/v1",
+                    Some(lm_studio_key),
+                    AuthStyle::Bearer,
+                )
+                .with_declared_tool_dialects(name, options),
+            ))
         }
         "llamacpp" | "llama.cpp" => {
             let base_url = api_url
@@ -1681,36 +2945,30 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("llama.cpp", base_url, Some(llama_cpp_key), AuthStyle::Bearer)
+                    .with_declared_tool_dialects(name, options),
+            ))
         }
         name if is_litellm_alias(name) => {
             let base = api_url
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:4000");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "LiteLLM",
-                base,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("LiteLLM", base, key, AuthStyle::Bearer)
+                    .with_declared_tool_dialects(name, options),
+            ))
         }
         name if is_vllm_alias(name) => {
             let base = api_url
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8000/v1");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "vLLM",
-                base,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("vLLM", base, key, AuthStyle::Bearer)
+                    .with_declared_tool_dialects(name, options),
+            ))
         }
         name if is_huggingface_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Hugging Face",
@@ -1739,40 +2997,12 @@ fn create_provider_with_url_and_options(
             key,
         ))),
 
-        // ── Bring Your Own Provider (custom URL) ───────────
-        // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
-        name if name.starts_with("custom:") => {
-            let base_url = parse_custom_provider_url(
-                name.strip_prefix("custom:").unwrap_or(""),
-                "Custom provider",
-                "custom:https://your-api.com",
-            )?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "Custom",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
-
-        // ── Anthropic-compatible custom endpoints ───────────
-        // Format: "anthropic-custom:https://your-api.com"
-        name if name.starts_with("anthropic-custom:") => {
-            let base_url = parse_custom_provider_url(
-                name.strip_prefix("anthropic-custom:").unwrap_or(""),
-                "Anthropic-custom provider",
-                "anthropic-custom:https://your-api.com",
-            )?;
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            )))
-        }
-
         _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\
+            "Unknown provider: {}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
-             Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
+             Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints.",
+            // The label may be a URL with `user:password@` (USERINFO-3).
+            redact_endpoint_userinfo(name)
         ),
     }
 }
@@ -1800,6 +3030,135 @@ fn extra_api_keys<'a>(reliability: &'a crate::config::ReliabilityConfig, primary
         seen.push(trimmed);
     }
     seen
+}
+
+/// Build the provider chain for a model the resolver released.
+///
+/// Everything the chain may use comes from `resolved`: the provider spelling,
+/// the owner-bound credential (key, base URL and rotation keys as one unit —
+/// a withheld credential leaves `reliability.api_keys` empty), and the
+/// dialects resolved for this model. The declarations `options` holds for
+/// this provider are replaced by model-scoped ones for exactly the models the
+/// chain serves, so the constructed provider reports their dialect instead of
+/// the endpoint's widest (C2af-01); declarations for other providers, such as
+/// `fallback_providers`, stay.
+///
+/// The chain serves [`catalog::ResolvedModel::model`] and its
+/// `reliability.model_fallbacks` on the same provider, each described from
+/// `catalog` on its own and held to the primary's requirement and policy. A
+/// fallback model is also refused when it speaks a different dialect than the
+/// primary: one provider object enforces one tool-schema contract, so a
+/// sibling can never be served — or enforced — in a dialect declared for
+/// another model. Every `fallback_providers` member is described for the
+/// primary and each model fallback the same way. Fallback entries for other
+/// primaries are dropped.
+///
+/// # Errors
+///
+/// When a model fallback is refused, or the factory cannot construct the
+/// provider.
+pub fn create_provider_for(
+    resolved: &catalog::ResolvedModel,
+    catalog: &catalog::CatalogView,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let label = resolved.provider_label();
+    let shown = redact_endpoint_userinfo(label);
+    let primary = resolved.model();
+    let dialects = resolved.dialects();
+    let siblings: Vec<String> = reliability
+        .model_fallbacks
+        .get(primary)
+        .map(|models| {
+            models
+                .iter()
+                .map(|model| model.trim())
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for sibling in &siblings {
+        let described = catalog.describe(resolved.provider(), sibling);
+        catalog::resolver::check_descriptor(&described, &shown, sibling, resolved.requirement(), resolved.policy())
+            .map_err(|refusal| anyhow::anyhow!("model fallback '{sibling}' of '{primary}' is refused: {refusal}"))?;
+        if described.dialects != dialects {
+            anyhow::bail!(
+                "model fallback '{sibling}' of '{primary}' on provider '{shown}' speaks tool-schema dialect '{}' \
+                 and tool-call dialect '{:?}', but '{primary}' speaks '{}' and '{:?}'; one provider chain \
+                 enforces one tool contract, so declare the same dialects for both or remove the fallback",
+                described.dialects.tool_schema.as_str(),
+                described.dialects.tool_call,
+                dialects.tool_schema.as_str(),
+                dialects.tool_call
+            );
+        }
+    }
+    // Every `fallback_providers` member may serve the primary and each model
+    // fallback: each pair is described on its own and held to the primary's
+    // requirement and policy. A member's dialect may differ; the chain then
+    // enforces per member (`tool_schema_dialect_for`).
+    for member in &reliability.fallback_providers {
+        let member_id = ProviderId::of(member);
+        let member_shown = redact_endpoint_userinfo(member);
+        if !member_id.is_resolvable() {
+            anyhow::bail!(
+                "fallback provider '{member_shown}' is not one PRX can construct; use a name from `prx providers` or \
+                 `custom:<url>`"
+            );
+        }
+        for model in std::iter::once(primary).chain(siblings.iter().map(String::as_str)) {
+            let described = catalog.describe(&member_id, model);
+            catalog::resolver::check_descriptor(
+                &described,
+                &member_shown,
+                model,
+                resolved.requirement(),
+                resolved.policy(),
+            )
+            .map_err(|refusal| anyhow::anyhow!("fallback provider '{member_shown}' is refused: {refusal}"))?;
+        }
+    }
+    let mut model_fallbacks = std::collections::HashMap::new();
+    if !siblings.is_empty() {
+        model_fallbacks.insert(primary.to_string(), siblings.clone());
+    }
+    let reliability = crate::config::ReliabilityConfig {
+        api_keys: resolved.credential().rotation_keys().to_vec(),
+        model_fallbacks,
+        ..reliability.clone()
+    };
+    let mut scoped = options.clone();
+    if accepts_tool_dialect_declarations(label) {
+        scoped
+            .tool_schema_dialects
+            .retain(|declaration| ProviderId::of(&declaration.provider) != *resolved.provider());
+        scoped
+            .tool_call_dialects
+            .retain(|declaration| ProviderId::of(&declaration.provider) != *resolved.provider());
+        if dialects.tool_schema != crate::tools::ToolSchemaDialect::Raw {
+            for model in std::iter::once(primary).chain(siblings.iter().map(String::as_str)) {
+                scoped.tool_schema_dialects.push(ToolSchemaDialectDeclaration {
+                    provider: label.to_string(),
+                    model: Some(model.to_string()),
+                    dialect: dialects.tool_schema,
+                });
+            }
+        }
+        // The response parser cannot tell models apart, so the grammar is
+        // provider-wide; every model this chain serves shares it (checked
+        // above).
+        if dialects.tool_call != ToolCallDialect::Native {
+            scoped.tool_call_dialects.push(ToolCallDialectDeclaration {
+                provider: label.to_string(),
+                model: None,
+                dialect: dialects.tool_call,
+            });
+        }
+    }
+    let credential = resolved.credential();
+    create_resilient_provider_with_options(label, credential.api_key(), credential.api_url(), &reliability, &scoped)
 }
 
 /// Create provider chain with retry and fallback behavior.
@@ -1870,8 +3229,9 @@ pub fn create_resilient_provider_with_options(
                             Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
                             Err(error) => {
                                 tracing::warn!(
-                                    provider = primary_name,
-                                    "Ignoring extra api_keys[] rotation credential that failed to initialize: {error}"
+                                    provider = %redact_endpoint_userinfo(primary_name),
+                                    "Ignoring extra api_keys[] rotation credential that failed to initialize: {}",
+                                    redact_endpoint_userinfo(&error.to_string())
                                 );
                             }
                         }
@@ -1881,9 +3241,16 @@ pub fn create_resilient_provider_with_options(
             Err(error) => {
                 let reason = format!("failed to initialize: {error}");
                 if provider_name == primary_name {
-                    anyhow::bail!("Primary provider \"{provider_name}\" unavailable: {reason}");
+                    anyhow::bail!(
+                        "Primary provider \"{}\" unavailable: {}",
+                        redact_endpoint_userinfo(provider_name),
+                        redact_endpoint_userinfo(&reason)
+                    );
                 }
-                tracing::warn!(provider = provider_name, "Ignoring unavailable fallback provider");
+                tracing::warn!(
+                    provider = %redact_endpoint_userinfo(provider_name),
+                    "Ignoring unavailable fallback provider"
+                );
                 unavailable.push((provider_name.clone(), reason));
             }
         }
@@ -1892,7 +3259,13 @@ pub fn create_resilient_provider_with_options(
     if providers.is_empty() {
         let reasons = unavailable
             .iter()
-            .map(|(name, reason)| format!("{name}: {reason}"))
+            .map(|(name, reason)| {
+                format!(
+                    "{}: {}",
+                    redact_endpoint_userinfo(name),
+                    redact_endpoint_userinfo(reason)
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         if reasons.is_empty() {
@@ -1955,6 +3328,9 @@ pub fn create_routed_provider_with_options(
         }
     }
 
+    // Rotation keys are extra credentials for the primary's root key. A route
+    // to a different provider identity gets the same retry settings without
+    // them, so one vendor's keys are never replayed against another.
     // Create each provider (with its own resilience wrapper)
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     for name in &needed {
@@ -1964,20 +3340,17 @@ pub fn create_routed_provider_with_options(
                 (!trimmed_key.is_empty()).then_some(trimmed_key)
             })
         });
-        // A route-specific provider must never inherit the primary provider's
-        // secret. Its own explicit key or canonical profile/OAuth resolver is
-        // the only valid source.
-        let key = select_routed_credential(name, primary_name, routed_credential, api_key);
-        // Only use api_url for the primary provider
-        let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider_with_options(name, key, url, reliability, options) {
+        let (connection, chain_reliability) =
+            routed_connection(name, primary_name, routed_credential, api_key, api_url, reliability);
+        let (key, url) = (connection.api_key, connection.api_url);
+        match create_resilient_provider_with_options(name, key, url, &chain_reliability, options) {
             Ok(provider) => providers.push((name.clone(), provider)),
             Err(e) => {
                 if name == primary_name {
                     return Err(e);
                 }
                 tracing::warn!(
-                    provider = name.as_str(),
+                    provider = %redact_endpoint_userinfo(name),
                     "Ignoring routed provider that failed to initialize"
                 );
             }
@@ -2003,6 +3376,48 @@ pub fn create_routed_provider_with_options(
         routes,
         default_model.to_string(),
     )))
+}
+
+/// The connection and reliability a routed provider's chain is built with.
+///
+/// Key, base URL and rotation keys are decided together, so no route ever
+/// receives one of them without the others.
+fn routed_connection<'a, 'r>(
+    name: &str,
+    primary_name: &str,
+    routed_credential: Option<&'a str>,
+    api_key: Option<&'a str>,
+    api_url: Option<&'a str>,
+    reliability: &'r crate::config::ReliabilityConfig,
+) -> (
+    ProviderConnection<'a>,
+    std::borrow::Cow<'r, crate::config::ReliabilityConfig>,
+) {
+    // The exact primary keeps its historical connection: a route entry for it
+    // may override its key, and it keeps the root URL and rotation keys.
+    if name == primary_name {
+        let connection = ProviderConnection {
+            api_key: select_routed_credential(name, primary_name, routed_credential, api_key),
+            api_url,
+            released: true,
+        };
+        return (connection, std::borrow::Cow::Borrowed(reliability));
+    }
+    // A route's own key is that route's credential: presented alone, with
+    // neither the root URL nor the root rotation keys.
+    if let Some(route_key) = routed_credential {
+        let connection = ProviderConnection {
+            api_key: Some(route_key),
+            api_url: None,
+            released: false,
+        };
+        return (connection, std::borrow::Cow::Owned(without_rotation_keys(reliability)));
+    }
+    // Any other spelling gets the root connection (key, URL and rotation keys)
+    // as one unit on a provider-identity match, and nothing otherwise.
+    let connection = configured_connection_for(name, primary_name, api_key, api_url);
+    let chain_reliability = scoped_reliability(reliability, &connection);
+    (connection, chain_reliability)
 }
 
 fn select_routed_credential<'a>(
@@ -2044,18 +3459,28 @@ fn provider_requires_explicit_credential(name: &str) -> bool {
         return false;
     }
 
-    let lowered = name.trim().to_ascii_lowercase();
-    let mut local_names: HashSet<String> = HashSet::new();
-    for info in list_providers() {
-        if info.local {
-            local_names.insert(info.name.to_string());
-            for alias in info.aliases {
-                local_names.insert((*alias).to_string());
-            }
+    match classify_provider(name) {
+        // A `custom:<url>` endpoint is an OpenAI-compatible server the
+        // operator runs. Many need no credential at all, exactly like the
+        // `local: true` catalog entries, and they cannot carry that flag
+        // because they are not catalog rows. The exemption stops at that
+        // dialect: `AnthropicProvider` has no keyless mode, so exempting
+        // `anthropic-custom:<url>` would only move the refusal from this gate
+        // to the first turn, and would advertise a fallback that can never
+        // serve one. An unparseable BYO string classifies `Unknown` and keeps
+        // the requirement.
+        ProviderIdentity::ByoEndpoint {
+            dialect: ByoDialect::OpenAiCompatible,
+            ..
+        } => false,
+        // A catalog provider needs a credential unless its row is a local
+        // runtime. Aliases fold to the row, so one pass over the catalog
+        // answers for every spelling.
+        ProviderIdentity::Catalog(canonical) => {
+            !list_providers().iter().any(|info| info.local && info.name == canonical)
         }
+        _ => true,
     }
-
-    !local_names.contains(&lowered)
 }
 
 fn is_openai_codex_alias(name: &str) -> bool {
@@ -2066,7 +3491,7 @@ fn is_openai_codex_alias(name: &str) -> bool {
 }
 
 fn default_openprx_state_dir() -> PathBuf {
-    directories::UserDirs::new().map_or_else(|| PathBuf::from(".openprx"), |dirs| dirs.home_dir().join(".openprx"))
+    crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx"))
 }
 
 fn openai_codex_auth_profile_available_for_state_dir(state_dir: &std::path::Path) -> bool {
@@ -2123,6 +3548,19 @@ pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
         return true;
     }
 
+    // A bring-your-own endpoint publishes its own model catalog, so PRX has
+    // nothing to check an `org/model` id against and the endpoint is the
+    // authority. This arm sits behind the `hint:` guard and the slash guard,
+    // so neither of those is widened, and behind the catalog comparison for
+    // every other identity, which is unchanged.
+    if matches!(classify_provider(&provider_name), ProviderIdentity::ByoEndpoint { .. }) {
+        return true;
+    }
+    // A decision service publishes its own model ids, like a BYO endpoint.
+    if ProviderId::of(&provider_name).namespace() == ProviderNamespace::DecisionService {
+        return true;
+    }
+
     for info in list_providers() {
         if info.name.eq_ignore_ascii_case(&provider_name)
             || info
@@ -2147,6 +3585,60 @@ pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
     }
 
     false
+}
+
+/// Providers that serve whatever model the operator loaded into them, named by
+/// its Hugging Face `org/model` repository (`llama-server -hf …`). The
+/// organisation says nothing about which provider serves it
+/// (`google/gemma-…-GGUF` is a llama.cpp repository).
+const SELF_HOSTED_MODEL_SERVERS: &[&str] = &["llamacpp"];
+
+/// Whether `provider_name` is a self-hosted model server (llama.cpp),
+/// under its name or an alias.
+pub fn is_self_hosted_model_server(provider_name: &str) -> bool {
+    canonical_provider_info(provider_name).is_some_and(|info| SELF_HOSTED_MODEL_SERVERS.contains(&info.name))
+}
+
+/// Whether `provider_name` can serve `model` when the model is configured for
+/// it (the default model, an onboarding choice, `/model`). A self-hosted model
+/// server serves any repository it is configured for; every other provider
+/// keeps [`provider_matches_model_prefix`]. Which provider answers a route is
+/// decided by the route's provider identity, not by the model's organisation
+/// (see `ReliableProvider`, D-075).
+pub fn provider_serves_configured_model(provider_name: &str, model: &str) -> bool {
+    if is_self_hosted_model_server(provider_name) {
+        return !model.trim().starts_with("hint:");
+    }
+    provider_matches_model_prefix(provider_name, model)
+}
+
+/// Whether `model` explicitly names a model repository (`org/repository`)
+/// that is not routed to another provider: bare ids go to the route's own
+/// provider, and an organisation written as a PRX provider name or alias
+/// (`anthropic/…`, `openai/…`) is that provider's model by PRX's
+/// `<provider>/<model>` convention. A self-hosted model server serves such a
+/// `model_fallbacks` entry as a fallback member (D-076 N-1).
+pub fn names_model_repository(model: &str) -> bool {
+    let model = model.trim();
+    if model.starts_with("hint:") {
+        return false;
+    }
+    let Some((organisation, repository)) = model.split_once('/') else {
+        return false;
+    };
+    // Normalised as provider matching does elsewhere: trimmed, any case
+    // (`OpenAI/gpt-4o` and `openai /gpt-4o` are OpenAI's; D-076 N-10).
+    let organisation = organisation.trim();
+    if organisation.is_empty() || repository.trim().is_empty() {
+        return false;
+    }
+    !list_providers().iter().any(|provider| {
+        provider.name.eq_ignore_ascii_case(organisation)
+            || provider
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(organisation))
+    })
 }
 
 fn canonical_provider_info(provider_name: &str) -> Option<ProviderInfo> {
@@ -2174,7 +3666,7 @@ pub fn validate_provider_model(provider_name: &str, model: &str) -> anyhow::Resu
         return Ok(());
     }
 
-    if !provider_matches_model_prefix(provider_name, model) {
+    if !provider_serves_configured_model(provider_name, model) {
         anyhow::bail!("model '{model}' is not compatible with provider '{provider_name}'");
     }
 
@@ -2478,6 +3970,9 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "llama.cpp server",
             aliases: &["llama.cpp"],
             local: true,
+            // Not an aggregator: a fallback llama.cpp member never answers for
+            // another provider family's model. The model it is configured for
+            // is accepted by `provider_serves_configured_model` (D-072 L-9).
             accepts_any_model: false,
         },
         ProviderInfo {
@@ -2633,6 +4128,9 @@ Connection: close\r\n\
         #[allow(unsafe_code)]
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
+            if key == "HOME" {
+                crate::config::schema::follow_test_home_env(value.map(std::ffi::OsStr::new));
+            }
             // SAFETY: test-only, single-threaded test runner
             unsafe {
                 match value {
@@ -2648,6 +4146,9 @@ Connection: close\r\n\
     impl Drop for EnvGuard {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
+            if self.key == "HOME" {
+                crate::config::schema::follow_test_home_env(self.original.as_deref().map(std::ffi::OsStr::new));
+            }
             // SAFETY: test-only, single-threaded test runner
             unsafe {
                 if let Some(original) = self.original.as_deref() {
@@ -2764,11 +4265,11 @@ Connection: close\r\n\
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
         let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, Some("coding-intl.dashscope.aliyuncs.com"));
 
-        let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
+        let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "), OauthRefresh::Allowed);
 
         assert_eq!(context.credential.as_deref(), Some("explicit-qwen-token"));
         assert!(context.base_url.is_none());
@@ -2778,13 +4279,13 @@ Connection: close\r\n\
     fn resolve_qwen_oauth_context_uses_env_token_and_resource_url() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}-env", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
         let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, Some("coding-intl.dashscope.aliyuncs.com"));
         let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
 
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
 
         assert_eq!(context.credential.as_deref(), Some("oauth-token"));
         assert_eq!(
@@ -2806,13 +4307,13 @@ Connection: close\r\n\
         )
         .unwrap();
 
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
         let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
         let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", None);
 
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
 
         assert_eq!(context.credential.as_deref(), Some("cached-token"));
         assert_eq!(context.base_url.as_deref(), Some("https://resource.example.com/v1"));
@@ -2822,20 +4323,20 @@ Connection: close\r\n\
     fn resolve_qwen_oauth_context_placeholder_does_not_use_dashscope_fallback() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}-placeholder", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
         let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
         let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
 
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
 
         assert!(context.credential.is_none());
     }
 
     #[test]
     fn resolve_claude_code_context_prefers_explicit_override() {
-        let context = resolve_claude_code_context(Some("  explicit-claude-token  "));
+        let context = resolve_claude_code_context(Some("  explicit-claude-token  "), OauthRefresh::Allowed);
         assert_eq!(context.credential.as_deref(), Some("explicit-claude-token"));
     }
 
@@ -2852,9 +4353,9 @@ Connection: close\r\n\
         )
         .unwrap();
 
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
 
-        let context = resolve_claude_code_context(Some("claude-code"));
+        let context = resolve_claude_code_context(Some("claude-code"), OauthRefresh::Allowed);
 
         assert_eq!(context.credential.as_deref(), Some("cached-token"));
     }
@@ -2863,11 +4364,291 @@ Connection: close\r\n\
     fn resolve_claude_code_context_placeholder_without_file_returns_none() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-placeholder", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = OauthTestHome::set(std::path::Path::new(&fake_home), "http://127.0.0.1:9/unused");
 
-        let context = resolve_claude_code_context(Some("claude-code"));
+        let context = resolve_claude_code_context(Some("claude-code"), OauthRefresh::Allowed);
 
         assert!(context.credential.is_none());
+    }
+
+    /// Installs a home and a refresh endpoint for the OAuth credential
+    /// lookups for one test; hold [`env_lock`] while it lives.
+    struct OauthTestHome;
+
+    impl OauthTestHome {
+        fn set(home: &std::path::Path, token_endpoint: &str) -> Self {
+            *OAUTH_TEST_OVERRIDES.write() = OauthTestOverrides {
+                home: Some(home.to_path_buf()),
+                token_endpoint: Some(token_endpoint.to_string()),
+            };
+            Self
+        }
+    }
+
+    impl Drop for OauthTestHome {
+        fn drop(&mut self) {
+            *OAUTH_TEST_OVERRIDES.write() = OauthTestOverrides::default();
+        }
+    }
+
+    /// A loopback listener that counts the connections it accepts and
+    /// answers each with a 400.
+    struct LoopbackCounter {
+        addr: std::net::SocketAddr,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LoopbackCounter {
+        fn start() -> Self {
+            use std::io::{Read as _, Write as _};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test: bind");
+            listener.set_nonblocking(true).expect("test: non-blocking");
+            let addr = listener.local_addr().expect("test: addr");
+            let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (counted, stopped) = (std::sync::Arc::clone(&connections), std::sync::Arc::clone(&stop));
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            let _ = socket.set_nonblocking(false);
+                            let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                            let mut buffer = [0_u8; 4096];
+                            let _ = socket.read(&mut buffer);
+                            let _ = socket.write_all(
+                                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            );
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    }
+                }
+            });
+            Self {
+                addr,
+                connections,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/v1/oauth/token", self.addr)
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for LoopbackCounter {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// RED before PMMDtail-g (D-080 T-7b): the live probe looked the
+    /// credential up on the async task with construction's lookup, which
+    /// refreshes an expired Claude Code token: a blocking HTTP client inside
+    /// the runtime (a panic), a second request to another host and a rewrite
+    /// of the operator's credential file. The probe now looks up off the
+    /// runtime with a lookup that never refreshes and never writes; it
+    /// reports that the token needs a refresh and sends nothing.
+    ///
+    /// Loopback only: the refresh endpoint is a local listener, the lookup
+    /// is first checked to see the expired token (so the probe stops at the
+    /// credential and the anthropic model-list request is never sent), and
+    /// the test home is the OAuth lookups' own override, not the process-wide
+    /// test home other modules change concurrently.
+    #[test]
+    fn the_live_probe_never_refreshes_an_oauth_token() {
+        let _env_lock = env_lock();
+        let home = tempfile::TempDir::new().expect("test: temp home");
+        let creds_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&creds_dir).expect("test: .claude");
+        let creds_path = creds_dir.join(".credentials.json");
+        let creds: &[u8] = br#"{"claudeAiOauth":{"accessToken":"sentinel-expired-access","refreshToken":"sentinel-refresh","expiresAt":1000,"subscriptionType":"max","scopes":["user:inference"]}}"#;
+        std::fs::write(&creds_path, creds).expect("test: credentials");
+        let token_endpoint = LoopbackCounter::start();
+        let _home = OauthTestHome::set(home.path(), &token_endpoint.url());
+        let config = crate::config::Config {
+            config_path: home.path().join("prx").join("config.toml"),
+            workspace_dir: home.path().join("prx").join("workspace"),
+            default_provider: Some("anthropic".into()),
+            default_model: Some("claude-sonnet-4".into()),
+            api_key: None,
+            ..crate::config::Config::default()
+        };
+        // Loopback only: nothing is sent unless the lookup finds the expired
+        // token, so check that first, without the runtime.
+        assert!(
+            matches!(
+                probe_credential("anthropic", None, &provider_runtime_options_from_config(&config)),
+                ProbeCredential::RefreshDue
+            ),
+            "precondition: the lookup must see the expired token in the test home"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test: runtime");
+
+        let outcome = runtime.block_on(async move {
+            tokio::spawn(async move {
+                super::connection_test::test_connection(&config, None, None, super::connection_test::ProbeMode::Live)
+                    .await
+            })
+            .await
+        });
+
+        let report = outcome.expect("the live probe must not panic");
+        assert!(report.local.resolved, "{report}");
+        let live = report.live.expect("test: a live result");
+        assert!(!live.reachable, "nothing may be sent: {live:?}");
+        assert!(
+            live.error.as_deref().is_some_and(|error| error.contains("refresh")),
+            "{live:?}"
+        );
+        assert_eq!(token_endpoint.connections(), 0, "the probe must not refresh the token");
+        assert_eq!(
+            std::fs::read(&creds_path).expect("test: read back"),
+            creds,
+            "the credential file must be untouched"
+        );
+        // The listener does stand in for the refresh host: construction's
+        // own lookup refreshes through it (and, refused, writes nothing).
+        let _ = resolve_claude_code_context(Some("claude-code"), OauthRefresh::Allowed);
+        assert_eq!(token_endpoint.connections(), 1, "the loopback endpoint was not used");
+        assert_eq!(std::fs::read(&creds_path).expect("test: read back"), creds);
+    }
+
+    /// D-081: the connection test's lookup never refreshes a Qwen OAuth
+    /// token. An expired cached token with a refresh token is reported as
+    /// due, with no request, and the cache file is untouched; construction's
+    /// own lookup does refresh, through the same loopback endpoint.
+    #[test]
+    fn the_probe_lookup_never_refreshes_a_qwen_token() {
+        let _env_lock = env_lock();
+        let home = tempfile::TempDir::new().expect("test: temp home");
+        let creds_dir = home.path().join(".qwen");
+        std::fs::create_dir_all(&creds_dir).expect("test: .qwen");
+        let creds_path = creds_dir.join("oauth_creds.json");
+        let creds: &[u8] =
+            br#"{"access_token":"sentinel-expired-qwen","refresh_token":"sentinel-qwen-refresh","expiry_date":1000}"#;
+        std::fs::write(&creds_path, creds).expect("test: credentials");
+        let _token = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
+        let _refresh = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _resource = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
+        let _dashscope = EnvGuard::set("DASHSCOPE_API_KEY", None);
+        let token_endpoint = LoopbackCounter::start();
+        let _home = OauthTestHome::set(home.path(), &token_endpoint.url());
+
+        let probed = probe_credential(
+            "qwen-code",
+            Some(QWEN_OAUTH_PLACEHOLDER),
+            &ProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            matches!(probed, ProbeCredential::RefreshDue),
+            "a due refresh must be reported"
+        );
+        assert_eq!(token_endpoint.connections(), 0, "the probe must not refresh the token");
+        assert_eq!(std::fs::read(&creds_path).expect("test: read back"), creds);
+        let _ = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
+        assert_eq!(token_endpoint.connections(), 1, "the loopback endpoint was not used");
+    }
+
+    /// D-081: the connection test's lookup never exchanges a MiniMax OAuth
+    /// refresh token (every construction does); it reports the exchange as
+    /// due and sends nothing.
+    #[test]
+    fn the_probe_lookup_never_refreshes_a_minimax_token() {
+        let _env_lock = env_lock();
+        let _refresh = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, Some("sentinel-minimax-refresh"));
+        let _region = EnvGuard::set(MINIMAX_OAUTH_REGION_ENV, None);
+        let home = tempfile::TempDir::new().expect("test: temp home");
+        let token_endpoint = LoopbackCounter::start();
+        let _home = OauthTestHome::set(home.path(), &token_endpoint.url());
+        let options = ProviderRuntimeOptions::default();
+
+        let probed = probe_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER), &options);
+
+        assert!(
+            matches!(probed, ProbeCredential::RefreshDue),
+            "a due exchange must be reported"
+        );
+        assert_eq!(token_endpoint.connections(), 0, "the probe must not exchange the token");
+        assert!(
+            resolve_provider_credential_with_options("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER), &options).is_none()
+        );
+        assert_eq!(token_endpoint.connections(), 1, "the loopback endpoint was not used");
+    }
+
+    /// D-081: in a test build every OAuth token endpoint is local unless a
+    /// test installs one, so no test can reach a real token host.
+    #[test]
+    fn a_test_build_never_targets_a_real_token_endpoint() {
+        let _env_lock = env_lock();
+        for endpoint in [
+            OauthTokenEndpoint::ClaudeCode,
+            OauthTokenEndpoint::Qwen,
+            OauthTokenEndpoint::Minimax(MinimaxOauthRegion::Global),
+            OauthTokenEndpoint::Minimax(MinimaxOauthRegion::Cn),
+        ] {
+            let url = oauth_token_endpoint(endpoint);
+            assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        }
+    }
+
+    /// RED before PMMDtail-i (D-083 C-4): the connection test's credential
+    /// lookup went through a profile load that migrates a legacy `enc:`
+    /// value and rewrites auth-profiles.json. A probe writes no credential
+    /// file.
+    #[test]
+    fn the_probe_lookup_never_rewrites_the_profiles_file() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let store = crate::auth::profiles::AuthProfilesStore::new(dir.path(), true);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token("moonshot", "default", "sentinel-moonshot".into()),
+                true,
+            )
+            .expect("test: profile");
+        let legacy = crate::security::secrets::SecretStore::new(dir.path(), true)
+            .legacy_xor_value("sentinel-moonshot")
+            .expect("test: legacy value");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).expect("test: read")).expect("test: json");
+        for profile in raw["profiles"].as_object_mut().expect("test: profiles").values_mut() {
+            profile["token"] = serde_json::json!(legacy);
+        }
+        std::fs::write(store.path(), serde_json::to_vec_pretty(&raw).expect("test: json")).expect("test: write");
+        let before = std::fs::read_to_string(store.path()).expect("test: read back");
+        let options = ProviderRuntimeOptions {
+            openprx_dir: Some(dir.path().to_path_buf()),
+            secrets_encrypt: true,
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let probed = probe_credential("moonshot", None, &options);
+
+        assert!(
+            matches!(&probed, ProbeCredential::Ready(Some(key)) if key == "sentinel-moonshot"),
+            "the legacy value is still read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.path()).expect("test: read back"),
+            before,
+            "the probe rewrote the file"
+        );
     }
 
     #[test]
@@ -3010,12 +4791,12 @@ Connection: close\r\n\
         assert!(create_provider("gemini", None).is_ok());
     }
 
-    /// `ToolSchemaDialect::for_provider` decides which schema document
-    /// `ToolExecutionService` validates a tool call against. It maps provider
-    /// *labels*, while the rewriting happens inside each provider
-    /// *implementation*; this pins the two together so a provider that starts
-    /// (or stops) cleaning its schemas cannot silently leave the validator
-    /// enforcing a contract the model was never shown.
+    /// The validator asks the constructed provider which schema document it
+    /// put on the wire (`tool_schema_dialect`/`tool_schema_dialect_for`); the
+    /// rewriting happens inside each provider implementation. This pins what
+    /// each label builds, so a provider that starts (or stops) cleaning its
+    /// schemas is a visible change. (PMM-C-L deleted the label-keyed map this
+    /// test used to compare against.)
     #[test]
     fn provider_aliases_agree_with_the_declared_schema_dialect() {
         for alias in [
@@ -3030,33 +4811,317 @@ Connection: close\r\n\
             "openrouter",
             "venice",
             "groq",
+            // Bring-your-own endpoints. The label carries a URL, so a map keyed
+            // on the whole string cannot match it; `anthropic-custom:` builds an
+            // `AnthropicProvider` that strips `$ref`/`$defs` on the wire, and a
+            // label resolving to `Raw` would put the validator back on the
+            // unstripped document.
+            "custom:https://endpoint.invalid/v1",
+            "anthropic-custom:https://endpoint.invalid/v1",
         ] {
             let provider = create_provider(alias, Some("test-key"))
                 .unwrap_or_else(|error| panic!("test: provider {alias} constructs: {error}"));
+            let expected = match alias {
+                "gemini" | "google" | "google-gemini" => crate::tools::ToolSchemaDialect::Gemini,
+                "anthropic" | "claude-code" | "claude-cli" | "anthropic-custom:https://endpoint.invalid/v1" => {
+                    crate::tools::ToolSchemaDialect::Anthropic
+                }
+                _ => crate::tools::ToolSchemaDialect::Raw,
+            };
             assert_eq!(
                 provider.tool_schema_dialect(),
-                crate::tools::ToolSchemaDialect::for_provider(alias),
-                "provider label '{alias}' maps to a different schema dialect than the provider itself declares"
+                expected,
+                "provider label '{alias}' builds a provider with a different schema dialect"
             );
         }
+    }
+
+    /// The provider factory recognizes a bring-your-own label through one
+    /// splitter, so every spelling it accepts — any ASCII case, surrounding
+    /// whitespace — builds the provider that splitter's dialect names, and a
+    /// label the splitter rejects is not bring-your-own.
+    #[test]
+    fn byo_label_spellings_resolve_the_dialect_the_constructed_provider_declares() {
+        use ByoDialect::{AnthropicCompatible, OpenAiCompatible};
+        for (label, dialect) in [
+            ("custom:https://endpoint.invalid/v1", OpenAiCompatible),
+            ("CUSTOM:https://endpoint.invalid/v1", OpenAiCompatible),
+            ("  Custom:https://endpoint.invalid/v1  ", OpenAiCompatible),
+            ("anthropic-custom:https://endpoint.invalid/v1", AnthropicCompatible),
+            ("Anthropic-Custom:https://endpoint.invalid/v1", AnthropicCompatible),
+            ("  ANTHROPIC-CUSTOM:https://endpoint.invalid/v1 ", AnthropicCompatible),
+            ("\tAnthropic-Custom:https://endpoint.invalid/v1", AnthropicCompatible),
+        ] {
+            // The splitter is asserted on its own, not only through the
+            // provider it leads to (SP-INT2 a31).
+            assert_eq!(
+                byo_dialect_of(label),
+                Some(dialect),
+                "test: '{label}' is a bring-your-own label of that dialect"
+            );
+            assert!(
+                matches!(classify_provider(label), ProviderIdentity::ByoEndpoint { .. }),
+                "test: '{label}' is a bring-your-own label"
+            );
+            let provider = create_provider(label, Some("test-key"))
+                .unwrap_or_else(|error| panic!("test: provider {label} constructs: {error}"));
+            let expected = match byo_dialect_of(label) {
+                Some(ByoDialect::AnthropicCompatible) => crate::tools::ToolSchemaDialect::Anthropic,
+                Some(ByoDialect::OpenAiCompatible) => crate::tools::ToolSchemaDialect::Raw,
+                None => panic!("test: '{label}' is a bring-your-own label"),
+            };
+            assert_eq!(
+                provider.tool_schema_dialect(),
+                expected,
+                "the splitter and the constructed provider disagree on '{label}'"
+            );
+        }
+        // A prefix with no URL, or a URL the factory refuses, is still that
+        // dialect's label: the splitter decides the prefix, the URL check
+        // comes after it.
+        for (label, dialect) in [
+            ("custom:", OpenAiCompatible),
+            ("anthropic-custom:", AnthropicCompatible),
+            ("\tAnthropic-Custom:x", AnthropicCompatible),
+        ] {
+            assert_eq!(
+                byo_dialect_of(label),
+                Some(dialect),
+                "test: '{label:?}' is a bring-your-own label of that dialect"
+            );
+        }
+        for label in ["custom", "xcustom:https://endpoint.invalid/v1", "anthropic-customs"] {
+            assert_eq!(
+                byo_dialect_of(label),
+                None,
+                "test: '{label}' is not a bring-your-own label"
+            );
+        }
+    }
+
+    /// A wrapper is what the dispatcher holds, so the dialect it declares is the
+    /// one the validator uses. `ReliableProvider` and `RouterProvider` wrap a
+    /// concrete provider; without a forwarding override they inherit the trait
+    /// default `Raw`, and every Gemini turn behind a failover chain is then
+    /// validated against keywords Gemini never saw.
+    #[test]
+    fn wrapper_providers_forward_the_wrapped_schema_dialect() {
+        let wrapped = create_provider("gemini", Some("test-key")).expect("test: gemini constructs");
+        let reliable = reliable::ReliableProvider::new(vec![("gemini".to_string(), wrapped)], 1, 50);
+        assert_eq!(
+            reliable.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Gemini,
+            "ReliableProvider must declare the dialect of the provider it wraps"
+        );
+
+        let wrapped = create_provider("gemini", Some("test-key")).expect("test: gemini constructs");
+        let router = router::RouterProvider::new(
+            vec![("gemini".to_string(), wrapped)],
+            Vec::new(),
+            "gemini-2.0-flash".to_string(),
+        );
+        assert_eq!(
+            router.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Gemini,
+            "RouterProvider must declare the dialect of the provider it routes to"
+        );
+    }
+
+    /// PMM-C-L: a mixed chain answers `Raw` model-less, but the member that
+    /// served a turn (`ChatTrace::final_provider`) answers its own dialect,
+    /// through a router too, so the agent loop validates a fallback against
+    /// the document that fallback put on the wire.
+    #[test]
+    fn a_chain_answers_the_dialect_of_the_member_that_served() {
+        let chain = || {
+            reliable::ReliableProvider::new(
+                vec![
+                    (
+                        "gemini".to_string(),
+                        create_provider("gemini", Some("test-key")).expect("test: gemini constructs"),
+                    ),
+                    (
+                        "openai".to_string(),
+                        create_provider("openai", Some("test-key")).expect("test: openai constructs"),
+                    ),
+                ],
+                1,
+                50,
+            )
+        };
+        let reliable = chain();
+        assert_eq!(reliable.tool_schema_dialect(), crate::tools::ToolSchemaDialect::Raw);
+        assert_eq!(
+            reliable.tool_schema_dialect_of_member("gemini", "gemini-2.0-flash"),
+            Some(crate::tools::ToolSchemaDialect::Gemini)
+        );
+        assert_eq!(
+            reliable.tool_schema_dialect_of_member("openai", "gpt-4o"),
+            Some(crate::tools::ToolSchemaDialect::Raw)
+        );
+        assert_eq!(reliable.tool_schema_dialect_of_member("anthropic", "x"), None);
+
+        let router = router::RouterProvider::new(
+            vec![("gemini".to_string(), Box::new(chain()) as Box<dyn Provider>)],
+            Vec::new(),
+            "gemini-2.0-flash".to_string(),
+        );
+        assert_eq!(
+            router.tool_schema_dialect_of_member("gemini", "gemini-2.0-flash"),
+            Some(crate::tools::ToolSchemaDialect::Gemini)
+        );
+        assert_eq!(router.tool_schema_dialect_of_member("mistral", "x"), None);
+    }
+
+    /// A chain whose members all belong to one family resolves to that family:
+    /// whichever member serves the turn produced the same wire document, so
+    /// enforcing that family's document is exact.
+    #[test]
+    fn a_single_family_chain_declares_that_family() {
+        let chain = reliable::ReliableProvider::new(
+            vec![
+                (
+                    "gemini".to_string(),
+                    create_provider("gemini", Some("test-key")).expect("test: gemini constructs"),
+                ),
+                (
+                    "google".to_string(),
+                    create_provider("google", Some("test-key")).expect("test: google constructs"),
+                ),
+            ],
+            1,
+            50,
+        );
+        assert_eq!(
+            chain.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Gemini,
+            "a chain of one family must declare that family"
+        );
+    }
+
+    /// A chain that can land on either of two *different* families has no one
+    /// answer, and the rewrites are not comparable: `Gemini` strips keywords,
+    /// `NoRootCombinators` restructures the root, and neither subsumes the
+    /// other. Ranking them and picking the "widest" makes enforcement looser
+    /// than the wire on every turn the other member serves — the model is shown
+    /// `additionalProperties: false` and then not held to it. A mixed chain
+    /// therefore resolves to `Raw`: the published document, which is the
+    /// strongest contract and the one no member can be shown less than.
+    #[test]
+    fn a_mixed_family_chain_declares_raw_rather_than_the_widest_rewrite() {
+        let chain = reliable::ReliableProvider::new(
+            vec![
+                (
+                    "gemini".to_string(),
+                    create_provider("gemini", Some("test-key")).expect("test: gemini constructs"),
+                ),
+                (
+                    "openai".to_string(),
+                    create_provider("openai", Some("test-key")).expect("test: openai constructs"),
+                ),
+            ],
+            1,
+            50,
+        );
+        assert_eq!(
+            chain.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Raw,
+            "a mixed-family chain must not enforce one member's rewrite on the other member's turns"
+        );
+
+        let routed = router::RouterProvider::new(
+            vec![
+                (
+                    "gemini".to_string(),
+                    create_provider("gemini", Some("test-key")).expect("test: gemini constructs"),
+                ),
+                (
+                    "openai".to_string(),
+                    create_provider("openai", Some("test-key")).expect("test: openai constructs"),
+                ),
+            ],
+            Vec::new(),
+            "gemini-2.0-flash".to_string(),
+        );
+        assert_eq!(
+            routed.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Raw,
+            "a mixed-family router must not enforce one destination's rewrite on another's turns"
+        );
+    }
+
+    /// `Anthropic` and `NoRootCombinators` are the pair the rank ordering got
+    /// most wrong: it declared the structural rewrite for a chain that may be
+    /// served by a provider which never restructures anything. Resolving to
+    /// `Raw` must not manufacture a refusal either — `Raw` puts the published
+    /// document on the wire and enforces the same document.
+    #[test]
+    fn a_mixed_chain_of_anthropic_and_no_root_combinators_resolves_raw_without_refusing() {
+        let declared = "custom:https://endpoint.invalid/v1";
+        let options = ProviderRuntimeOptions {
+            tool_schema_dialects: vec![ToolSchemaDialectDeclaration {
+                provider: declared.to_string(),
+                model: None,
+                dialect: crate::tools::ToolSchemaDialect::NoRootCombinators,
+            }],
+            ..ProviderRuntimeOptions::default()
+        };
+        let lowering = create_provider_with_options(declared, Some("test-key"), &options)
+            .expect("test: a declared custom endpoint constructs");
+        assert_eq!(
+            lowering.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::NoRootCombinators,
+            "the declaration did not reach the constructed provider"
+        );
+
+        let chain = reliable::ReliableProvider::new(
+            vec![
+                (
+                    "anthropic".to_string(),
+                    create_provider("anthropic", Some("test-key")).expect("test: anthropic constructs"),
+                ),
+                (declared.to_string(), lowering),
+            ],
+            1,
+            50,
+        );
+        let resolved = chain.tool_schema_dialect();
+        assert_eq!(
+            resolved,
+            crate::tools::ToolSchemaDialect::Raw,
+            "a chain mixing a keyword-stripping and a structural rewrite must fall back to the published document"
+        );
+
+        // A contract the structural rewrite refuses must still be offered under
+        // the resolved dialect: resolution may not turn an available tool into
+        // a refused one.
+        let conditional = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "key": {"type": "string"}},
+            "anyOf": [{"required": ["path"]}, {"required": ["key"]}]
+        });
+        let wire = resolved
+            .wire_schema("fixture_alternatives", &conditional)
+            .expect("test: resolving a mixed chain must not manufacture a refusal");
+        assert_eq!(
+            &*wire, &conditional,
+            "the resolved dialect changed the published document"
+        );
+        assert_eq!(&*resolved.enforceable_schema(&conditional), &conditional);
     }
 
     /// The two labels that do rewrite their schemas must not decay to `Raw`,
     /// which would put the validator back on the published document.
     #[test]
     fn cleaning_providers_declare_a_non_raw_dialect() {
-        assert_eq!(
-            crate::tools::ToolSchemaDialect::for_provider("gemini"),
-            crate::tools::ToolSchemaDialect::Gemini
-        );
-        assert_eq!(
-            crate::tools::ToolSchemaDialect::for_provider("anthropic"),
-            crate::tools::ToolSchemaDialect::Anthropic
-        );
-        assert_eq!(
-            crate::tools::ToolSchemaDialect::for_provider("openai"),
-            crate::tools::ToolSchemaDialect::Raw
-        );
+        let dialect = |label: &str| {
+            create_provider(label, Some("test-key"))
+                .unwrap_or_else(|error| panic!("test: provider {label} constructs: {error}"))
+                .tool_schema_dialect()
+        };
+        assert_eq!(dialect("gemini"), crate::tools::ToolSchemaDialect::Gemini);
+        assert_eq!(dialect("anthropic"), crate::tools::ToolSchemaDialect::Anthropic);
+        assert_eq!(dialect("openai"), crate::tools::ToolSchemaDialect::Raw);
     }
 
     // ── OpenAI-compatible providers ──────────────────────────
@@ -3601,6 +5666,18 @@ Connection: close\r\n\
         assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
     }
 
+    /// A decision service publishes its own model ids, like a BYO endpoint,
+    /// so no model id is refused as foreign to it (CDP-02).
+    #[test]
+    fn a_decision_service_accepts_its_own_model_ids() {
+        for provider in ["typesafe", "decision:typesafe"] {
+            for model in ["jev-1.13.0", "vendor/decider-2026-09"] {
+                assert!(provider_matches_model_prefix(provider, model), "{provider} {model}");
+                validate_provider_model(provider, model).expect("test: compatible");
+            }
+        }
+    }
+
     // d04 §9.2 hint-injection hardening regression: a raw "hint:<name>" prefix is
     // an UNRESOLVED routing hint and MUST NOT bypass the provider prefix check.
     // The previous wildcard early-return (`if model.starts_with("hint:") { return
@@ -3632,6 +5709,58 @@ Connection: close\r\n\
         assert!(provider_matches_model_prefix("anthropic", "anthropic/claude-3-opus"));
         // Empty model still means "provider default" and matches.
         assert!(provider_matches_model_prefix("openai", ""));
+    }
+
+    #[test]
+    fn a_self_hosted_server_serves_any_repository_it_is_configured_for() {
+        for repository in [
+            "ggml-org/gpt-oss-20b-GGUF",
+            "bartowski/Llama-3.3-70B-Instruct-GGUF",
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            "google/gemma-3-27b-it-GGUF",
+            "plain-model-name",
+        ] {
+            assert!(provider_serves_configured_model("llamacpp", repository), "{repository}");
+            assert!(validate_provider_model("llama.cpp", repository).is_ok(), "{repository}");
+        }
+        assert!(is_self_hosted_model_server("llama.cpp"));
+        assert!(!is_self_hosted_model_server("anthropic"));
+        // An unresolved routing hint is never served.
+        assert!(!provider_serves_configured_model("llamacpp", "hint:fast"));
+        // Other providers are unchanged.
+        assert!(!provider_serves_configured_model("anthropic", "openai/gpt-5"));
+        assert!(provider_serves_configured_model("openrouter", "openai/gpt-5"));
+    }
+
+    #[test]
+    fn a_model_repository_is_named_explicitly() {
+        for repository in [
+            "ggml-org/gpt-oss-20b-GGUF",
+            "unsloth/gemma-3-27b-it-GGUF",
+            "bartowski/Llama-3.3-70B-Instruct-GGUF",
+            " ggml-org /gpt-oss-20b-GGUF",
+        ] {
+            assert!(names_model_repository(repository), "{repository}");
+        }
+        for routed_elsewhere in [
+            "gpt-5",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-4o",
+            "kimi/k2",
+            // D-076 N-10: any case, surrounding space ignored.
+            "OpenAI/gpt-4o",
+            "Anthropic/claude-sonnet-5",
+            "openai /gpt-4o",
+            " OPENAI/gpt-4o",
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            "google/gemma-3-27b-it-GGUF",
+            "hint:fast",
+            "org/",
+            "/repo",
+            " /repo",
+        ] {
+            assert!(!names_model_repository(routed_elsewhere), "{routed_elsewhere}");
+        }
     }
 
     #[test]
@@ -3953,28 +6082,28 @@ Connection: close\r\n\
     #[test]
     fn scrub_github_personal_access_token() {
         let input = "auth failed with token ghp_abc123def456";
-        let result = scrub_secret_patterns(input);
+        let result = crate::security::redaction::redact_secrets(input);
         assert_eq!(result, "auth failed with token [REDACTED]");
     }
 
     #[test]
     fn scrub_github_oauth_token() {
         let input = "Bearer gho_1234567890abcdef";
-        let result = scrub_secret_patterns(input);
+        let result = crate::security::redaction::redact_secrets(input);
         assert_eq!(result, "Bearer [REDACTED]");
     }
 
     #[test]
     fn scrub_github_user_token() {
         let input = "token ghu_sessiontoken123";
-        let result = scrub_secret_patterns(input);
+        let result = crate::security::redaction::redact_secrets(input);
         assert_eq!(result, "token [REDACTED]");
     }
 
     #[test]
     fn scrub_github_fine_grained_pat() {
         let input = "failed: github_pat_11AABBC_xyzzy789";
-        let result = scrub_secret_patterns(input);
+        let result = crate::security::redaction::redact_secrets(input);
         assert_eq!(result, "failed: [REDACTED]");
     }
 
@@ -4029,6 +6158,1114 @@ Connection: close\r\n\
             provider.is_ok(),
             "resilient provider with rotation keys should build: {:?}",
             provider.err()
+        );
+    }
+
+    // ── Bring-your-own endpoints: identity, model validation, credentials ──
+    //
+    // A `custom:<url>` / `anthropic-custom:<url>` selection names an endpoint
+    // the operator runs, not a catalog vendor. It therefore owns its own model
+    // catalog and may legitimately be configured without a credential. Every
+    // catalog identity keeps the behaviour it has today.
+
+    /// A credential-shaped sentinel. Not a real secret.
+    const BYO_SENTINEL_KEY: &str = "byo-secret";
+    /// A BYO endpoint name with a fixed port, used only for string-level
+    /// identity assertions: nothing connects to it.
+    const BYO_ENDPOINT_NAME: &str = "custom:http://127.0.0.1:18086/v1";
+    /// A bare model alias, the shape a BYO endpoint advertises.
+    const BYO_BARE_MODEL: &str = "byo-test-model";
+    /// A slash-qualified model id whose org prefix is not the provider name.
+    const BYO_SLASH_MODEL: &str = "exampleorg/byo-test-model";
+    /// The canned assistant reply the loopback endpoint returns.
+    const BYO_LOOPBACK_REPLY: &str = "byo-loopback-ok";
+
+    fn byo_reliability_without_fallbacks() -> crate::config::ReliabilityConfig {
+        crate::config::ReliabilityConfig {
+            provider_retries: 0,
+            provider_backoff_ms: 0,
+            fallback_providers: Vec::new(),
+            acknowledge_single_provider_risk: false,
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        }
+    }
+
+    /// Runtime options rooted in a fresh temp directory, so credential
+    /// resolution reads an empty auth-profile store and never touches the
+    /// operator's real configuration.
+    fn byo_isolated_options(temp: &TempDir) -> ProviderRuntimeOptions {
+        ProviderRuntimeOptions {
+            auth_profile_override: None,
+            openprx_dir: Some(temp.path().to_path_buf()),
+            secrets_encrypt: false,
+            codex_auth_json_path: Some(temp.path().join("absent-codex-auth.json")),
+            codex_auth_json_auto_import: false,
+            reasoning_enabled: None,
+            codex_stream_idle_timeout_secs: None,
+            codex_reasoning_effort: None,
+            ollama_num_ctx: None,
+            ollama_model_num_ctx: Vec::new(),
+            // No declarations: a BYO endpoint keeps the undeclared defaults
+            // (`Raw` schemas, native tool calls only) these tests assume.
+            tool_schema_dialects: Vec::new(),
+            tool_call_dialects: Vec::new(),
+        }
+    }
+
+    /// A loopback OpenAI-compatible endpoint owned by the test. It requires no
+    /// authentication and records the headers of every request it answers.
+    struct ByoLoopbackEndpoint {
+        addr: std::net::SocketAddr,
+        recorded: std::sync::Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ByoLoopbackEndpoint {
+        fn provider_name(&self) -> String {
+            format!("custom:http://{}/v1", self.addr)
+        }
+
+        fn requests(&self) -> Vec<Vec<(String, String)>> {
+            self.recorded
+                .lock()
+                .map_or_else(|poisoned| poisoned.into_inner().clone(), |guard| guard.clone())
+        }
+
+        fn shutdown(self) {
+            self.server.abort();
+        }
+    }
+
+    async fn spawn_byo_loopback() -> ByoLoopbackEndpoint {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let body = format!(
+            r#"{{"id":"chatcmpl-byo","object":"chat.completion","created":1,"model":"{BYO_BARE_MODEL}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{BYO_LOOPBACK_REPLY}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
+        );
+        let sse_body = format!(
+            "data: {{\"id\":\"chatcmpl-byo\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"{BYO_BARE_MODEL}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{BYO_LOOPBACK_REPLY}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback address");
+        let recorded: std::sync::Arc<Mutex<Vec<Vec<(String, String)>>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let sink = std::sync::Arc::clone(&sink);
+                let body = body.clone();
+                let sse_body = sse_body.clone();
+                tokio::spawn(async move {
+                    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+                    let mut chunk = [0_u8; 2048];
+                    let head_end = loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                            break position + 4;
+                        }
+                        if buffer.len() > 262_144 {
+                            return;
+                        }
+                    };
+
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+                    let mut headers: Vec<(String, String)> = Vec::new();
+                    let mut content_length: usize = 0;
+                    for line in head.split("\r\n").skip(1) {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            let name = name.trim().to_ascii_lowercase();
+                            let value = value.trim().to_string();
+                            if name == "content-length" {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name, value));
+                        }
+                    }
+
+                    let mut body_read = buffer.len().saturating_sub(head_end);
+                    while body_read < content_length {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => body_read += read,
+                        }
+                    }
+
+                    let streaming = headers
+                        .iter()
+                        .any(|(name, value)| name == "accept" && value.contains("text/event-stream"));
+
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.push(headers);
+                    }
+
+                    let (content_type, payload) = if streaming {
+                        ("text/event-stream", sse_body.as_str())
+                    } else {
+                        ("application/json", body.as_str())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        ByoLoopbackEndpoint { addr, recorded, server }
+    }
+
+    // ── Root connection containment (PMM P0-A) ───────────────────────────
+
+    /// A credential-shaped sentinel configured for one provider. Not a real
+    /// secret.
+    const ROOT_SENTINEL_KEY: &str = "root-secret";
+
+    /// The root connection is configured for one provider. Another provider
+    /// gets nothing at all — neither the credential nor the base URL — so one
+    /// vendor's secret can never be presented to another.
+    #[test]
+    fn root_connection_is_not_released_to_a_different_provider() {
+        let connection = configured_connection_for(
+            "anthropic",
+            "openai",
+            Some(ROOT_SENTINEL_KEY),
+            Some("https://api.openai.com/v1"),
+        );
+        assert_eq!(connection.api_key, None);
+        assert_eq!(connection.api_url, None);
+    }
+
+    #[test]
+    fn default_provider_keeps_its_connection() {
+        let connection = configured_connection_for(
+            "openai",
+            "openai",
+            Some(ROOT_SENTINEL_KEY),
+            Some("https://api.openai.com/v1"),
+        );
+        assert_eq!(connection.api_key, Some(ROOT_SENTINEL_KEY));
+        assert_eq!(connection.api_url, Some("https://api.openai.com/v1"));
+    }
+
+    /// Alias canonicalization is the reason this resolver exists rather than a
+    /// plain case-insensitive string comparison: `claude-code` and `anthropic`
+    /// are one provider, and withholding a credential from its own alias is a
+    /// usability defect the four existing precedents all carry.
+    #[test]
+    fn an_alias_of_the_default_provider_keeps_its_connection() {
+        let same = configured_connection_for("claude-code", "anthropic", Some(ROOT_SENTINEL_KEY), None);
+        assert_eq!(same.api_key, Some(ROOT_SENTINEL_KEY));
+
+        let other = configured_connection_for("claude-code", "openai", Some(ROOT_SENTINEL_KEY), None);
+        assert_eq!(other.api_key, None);
+    }
+
+    /// A bring-your-own endpoint is identified by the endpoint it addresses,
+    /// so a different port is a different provider and gets nothing.
+    #[test]
+    fn byo_endpoints_compare_by_endpoint_identity() {
+        let same = configured_connection_for(
+            "CUSTOM:http://127.0.0.1:18086/v1",
+            BYO_ENDPOINT_NAME,
+            Some(BYO_SENTINEL_KEY),
+            None,
+        );
+        assert_eq!(same.api_key, Some(BYO_SENTINEL_KEY));
+
+        let other = configured_connection_for(
+            "custom:http://127.0.0.1:19999/v1",
+            BYO_ENDPOINT_NAME,
+            Some(BYO_SENTINEL_KEY),
+            None,
+        );
+        assert_eq!(other.api_key, None, "a different endpoint is a different provider");
+
+        // The two dialects are not interchangeable either, even on one URL.
+        let crossed = configured_connection_for(
+            "anthropic-custom:http://127.0.0.1:18086/v1",
+            BYO_ENDPOINT_NAME,
+            Some(BYO_SENTINEL_KEY),
+            None,
+        );
+        assert_eq!(crossed.api_key, None);
+    }
+
+    /// The classifier is the single source of provider identity. Aliases
+    /// collapse to the canonical catalog name, both BYO dialects resolve to
+    /// their endpoint, and anything unresolvable — including a BYO prefix
+    /// whose URL is rejected — is `Unknown`.
+    #[test]
+    fn classify_provider_separates_catalog_entries_from_byo_endpoints() {
+        assert_eq!(classify_provider("openai"), ProviderIdentity::Catalog("openai"));
+        assert_eq!(classify_provider("claude-code"), ProviderIdentity::Catalog("anthropic"));
+        assert_eq!(
+            classify_provider("  OpenRouter "),
+            ProviderIdentity::Catalog("openrouter")
+        );
+        assert_eq!(
+            classify_provider(BYO_ENDPOINT_NAME),
+            ProviderIdentity::ByoEndpoint {
+                dialect: ByoDialect::OpenAiCompatible,
+                base_url: "http://127.0.0.1:18086/v1".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_provider("anthropic-custom:https://api.example.com"),
+            ProviderIdentity::ByoEndpoint {
+                dialect: ByoDialect::AnthropicCompatible,
+                base_url: "https://api.example.com".to_string(),
+            }
+        );
+        assert_eq!(classify_provider("custom:not-a-url"), ProviderIdentity::Unknown);
+        assert_eq!(classify_provider("custom:ftp://example.com"), ProviderIdentity::Unknown);
+        assert_eq!(classify_provider("custom:"), ProviderIdentity::Unknown);
+        assert_eq!(classify_provider("nonexistent"), ProviderIdentity::Unknown);
+    }
+
+    /// SPLASH F1. A BYO endpoint owns its own model catalog, so PRX cannot
+    /// reject an `org/model` id the endpoint advertises. Every other identity
+    /// keeps the catalog comparison it has today, including the `hint:`
+    /// hardening and the Kimi Code allowlist.
+    ///
+    /// RED at `ae3ca634`: the first three assertions fail with
+    /// `model '<id>' is not compatible with provider '<name>'`.
+    #[test]
+    fn custom_endpoint_accepts_slash_qualified_model_id() {
+        assert!(validate_provider_model(BYO_ENDPOINT_NAME, BYO_SLASH_MODEL).is_ok());
+        assert!(validate_provider_model("anthropic-custom:https://api.example.com", BYO_SLASH_MODEL).is_ok());
+        // A bare alias was already accepted and must stay accepted.
+        assert!(validate_provider_model(BYO_ENDPOINT_NAME, BYO_BARE_MODEL).is_ok());
+
+        // Known constrained providers keep strict validation.
+        assert!(validate_provider_model("anthropic", BYO_SLASH_MODEL).is_err());
+        assert!(validate_provider_model("openai", "mistralai/mistral-7b").is_err());
+        assert!(validate_provider_model("kimi-code", "k3").is_ok());
+        assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-for-coding-highspeed").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_err());
+        assert!(validate_provider_model("kimi-code", "definitely-not-a-real-model").is_err());
+
+        // d04 §9.2: an unresolved hint stays a non-match in front of the new
+        // BYO arm, not behind it.
+        assert!(!provider_matches_model_prefix(BYO_ENDPOINT_NAME, "hint:anything"));
+
+        // An unparseable BYO string is not silently promoted to "accepts
+        // anything": it has no endpoint identity at all.
+        assert!(validate_provider_model("custom:not-a-url", BYO_SLASH_MODEL).is_err());
+    }
+
+    /// SPLASH F5, S4 case A. A keyless BYO endpoint configured as the default
+    /// provider must start. The refusal it replaces was pre-transport, so the
+    /// endpoint must still see no request before the first turn.
+    ///
+    /// RED at `ae3ca634`: `Err(... missing credential/api key)`.
+    #[tokio::test]
+    async fn keyless_byo_endpoint_starts_without_a_credential() {
+        let endpoint = spawn_byo_loopback().await;
+        let temp = TempDir::new().expect("test: temp config dir");
+        let options = byo_isolated_options(&temp);
+        let reliability = byo_reliability_without_fallbacks();
+        let provider_name = endpoint.provider_name();
+
+        let outcome = create_routed_provider_with_options(
+            &provider_name,
+            None,
+            None,
+            &reliability,
+            &[],
+            BYO_BARE_MODEL,
+            &options,
+        );
+
+        assert!(
+            reliability.fallback_providers.is_empty(),
+            "an available fallback would mask the primary's refusal"
+        );
+        assert!(
+            outcome.is_ok(),
+            "a keyless BYO endpoint must start: {:?}",
+            outcome.err().map(|error| format!("{error:#}"))
+        );
+        assert_eq!(
+            endpoint.requests().len(),
+            0,
+            "provider construction must not touch the endpoint"
+        );
+        endpoint.shutdown();
+    }
+
+    /// SPLASH F5 second order, decision D-012 (S1 Q3). The relaxation is
+    /// symmetric with `ollama`: a keyless BYO endpoint listed as a fallback
+    /// becomes available too. The credential gate itself must stay intact for
+    /// catalog providers, which the `mistral` control pins.
+    ///
+    /// RED at `ae3ca634`: the BYO fallback is reported
+    /// `missing credential/api key`.
+    #[tokio::test]
+    async fn keyless_byo_fallback_becomes_available_while_the_gate_stays_intact() {
+        let endpoint = spawn_byo_loopback().await;
+        let temp = TempDir::new().expect("test: temp config dir");
+        let options = byo_isolated_options(&temp);
+        let provider_name = endpoint.provider_name();
+
+        let mut reliability = byo_reliability_without_fallbacks();
+        reliability.fallback_providers = vec![provider_name.clone()];
+
+        let summary = summarize_provider_availability("ollama", None, &reliability, &options);
+        assert!(
+            summary.available.iter().any(|name| name == &provider_name),
+            "keyless BYO fallback must be available: {:?}",
+            summary.unavailable
+        );
+
+        // Control: a catalog provider with no credential is still refused, and
+        // an empty fallback list cannot mask that refusal.
+        let gate = byo_reliability_without_fallbacks();
+        let catalog = summarize_provider_availability("mistral", None, &gate, &options);
+        assert!(catalog.available.is_empty(), "{:?}", catalog.available);
+        assert!(
+            catalog
+                .unavailable
+                .iter()
+                .any(|(name, reason)| name == "mistral" && reason == "missing credential/api key"),
+            "{:?}",
+            catalog.unavailable
+        );
+        endpoint.shutdown();
+    }
+
+    /// R-C1 F-1. `AnthropicProvider` has no keyless mode, so an
+    /// `anthropic-custom:<url>` configured without a credential can never
+    /// serve a turn. The credential exemption therefore covers the
+    /// OpenAI-compatible dialect only: the Anthropic dialect is refused at the
+    /// startup gate, where the diagnostic is accurate and no transport exists,
+    /// instead of at the first turn — and it does not join a fallback chain it
+    /// could never serve.
+    ///
+    /// RED at `c7d3fead`: the keyless Anthropic-dialect endpoint is reported
+    /// available, as primary and as fallback.
+    #[tokio::test]
+    async fn keyless_anthropic_dialect_endpoint_is_refused_at_the_credential_gate() {
+        const ANTHROPIC_DIALECT_ENDPOINT: &str = "anthropic-custom:http://127.0.0.1:18086/v1";
+        let temp = TempDir::new().expect("test: temp config dir");
+        let options = byo_isolated_options(&temp);
+        let reliability = byo_reliability_without_fallbacks();
+
+        assert!(
+            provider_requires_explicit_credential(ANTHROPIC_DIALECT_ENDPOINT),
+            "the Anthropic dialect has no keyless mode and must keep the requirement"
+        );
+        assert!(
+            !provider_requires_explicit_credential(BYO_ENDPOINT_NAME),
+            "the OpenAI-compatible dialect keeps its exemption"
+        );
+
+        let summary = summarize_provider_availability(ANTHROPIC_DIALECT_ENDPOINT, None, &reliability, &options);
+        assert!(summary.available.is_empty(), "{:?}", summary.available);
+        assert!(
+            summary
+                .unavailable
+                .iter()
+                .any(|(name, reason)| name == ANTHROPIC_DIALECT_ENDPOINT && reason == "missing credential/api key"),
+            "{:?}",
+            summary.unavailable
+        );
+
+        // With a credential of its own it is available, exactly as before.
+        let keyed = summarize_provider_availability(
+            ANTHROPIC_DIALECT_ENDPOINT,
+            Some(BYO_SENTINEL_KEY),
+            &reliability,
+            &options,
+        );
+        assert!(
+            keyed.available.iter().any(|name| name == ANTHROPIC_DIALECT_ENDPOINT),
+            "{:?}",
+            keyed.unavailable
+        );
+
+        // And a keyless one is not marked available as a fallback either.
+        let mut with_fallback = byo_reliability_without_fallbacks();
+        with_fallback.fallback_providers = vec![ANTHROPIC_DIALECT_ENDPOINT.to_string()];
+        let chained = summarize_provider_availability("ollama", None, &with_fallback, &options);
+        assert!(
+            !chained.available.iter().any(|name| name == ANTHROPIC_DIALECT_ENDPOINT),
+            "{:?}",
+            chained.available
+        );
+    }
+
+    /// R-C1 F-4. This module folds a provider name in two places: the
+    /// classifier, which decides identity for credential release, and the
+    /// auth-profile canonicalizer, which decides where the credential is
+    /// stored. A name that folds one way in one and another way in the other
+    /// withholds a key its own store says is shared. Guard test: it pins the
+    /// agreement across both tables rather than a behavior of its own.
+    ///
+    /// RED at `c7d3fead`: the regional aliases the catalog does not list as
+    /// rows (`bigmodel`, `glm-cn`, `kimi-intl`, `zai-cn`, …) classify
+    /// `Unknown` while the credential store folds them onto their vendor.
+    #[test]
+    fn provider_identity_agrees_with_auth_profile_canonicalization() {
+        /// Every alias the regional tables recognise but `list_providers()`
+        /// does not carry as a name or alias.
+        const REGIONAL_ALIASES: &[&str] = &[
+            "minimax-oauth-global",
+            "minimax-portal-global",
+            "glm-cn",
+            "zhipu-cn",
+            "bigmodel",
+            "glm-global",
+            "zhipu-global",
+            "moonshot-intl",
+            "moonshot-global",
+            "kimi-intl",
+            "kimi-global",
+            "moonshot-cn",
+            "kimi-cn",
+            "qwen-cn",
+            "dashscope-cn",
+            "qwen-international",
+            "dashscope-international",
+            "dashscope-coding",
+            "qwen-coding",
+            "dashscope-coding-intl",
+            "qwen-coding-intl",
+            "zai-global",
+            "z.ai-global",
+            "zai-cn",
+            "z.ai-cn",
+        ];
+
+        let mut names: Vec<String> = Vec::new();
+        for info in list_providers() {
+            names.push(info.name.to_string());
+            names.extend(info.aliases.iter().map(|alias| (*alias).to_string()));
+        }
+        names.extend(REGIONAL_ALIASES.iter().map(|alias| (*alias).to_string()));
+
+        for name in names {
+            match classify_provider(&name) {
+                ProviderIdentity::Catalog(canonical) => assert_eq!(
+                    canonical_auth_profile_provider(&name),
+                    canonical,
+                    "`{name}` folds to two different providers"
+                ),
+                other => panic!("test: `{name}` must classify as a catalog provider, got {other:?}"),
+            }
+        }
+    }
+
+    /// R-C1 F-3. `qwen`, `qwen-intl` and `qwen-us` share one catalog row but
+    /// address three different servers, and so do `minimax` / `minimax-cn`,
+    /// `glm` / `bigmodel`, `moonshot` / `kimi-intl` and `zai` / `zai-cn`. A
+    /// credential issued for one region is not a credential for another, so
+    /// the identity the resolvers compare carries the endpoint the name
+    /// selects. Spellings of one region stay one identity.
+    ///
+    /// RED at `c7d3fead`: the regional spellings collapse onto the catalog row
+    /// and a key bound to one region is released to the other.
+    #[test]
+    fn regional_aliases_of_one_catalog_row_keep_their_own_endpoint_identity() {
+        assert_ne!(canonical_provider_key("qwen"), canonical_provider_key("qwen-us"));
+        assert_ne!(canonical_provider_key("qwen"), canonical_provider_key("qwen-intl"));
+        assert_ne!(canonical_provider_key("qwen"), canonical_provider_key("qwen-coding"));
+        assert_ne!(canonical_provider_key("minimax"), canonical_provider_key("minimax-cn"));
+        assert_ne!(canonical_provider_key("glm"), canonical_provider_key("bigmodel"));
+        assert_ne!(canonical_provider_key("moonshot"), canonical_provider_key("kimi-intl"));
+        assert_ne!(canonical_provider_key("zai"), canonical_provider_key("zai-cn"));
+
+        assert_eq!(canonical_provider_key("qwen"), canonical_provider_key("dashscope"));
+        assert_eq!(
+            canonical_provider_key("qwen-us"),
+            canonical_provider_key("dashscope-us")
+        );
+        assert_eq!(canonical_provider_key("minimax-cn"), canonical_provider_key("minimaxi"));
+        assert_eq!(canonical_provider_key("glm"), canonical_provider_key("zhipu"));
+        assert_eq!(canonical_provider_key("zai"), canonical_provider_key("z.ai"));
+
+        // The root connection follows that identity: the same region keeps it,
+        // another region gets nothing.
+        assert_eq!(
+            configured_connection_for("dashscope", "qwen", Some(ROOT_SENTINEL_KEY), None).api_key,
+            Some(ROOT_SENTINEL_KEY)
+        );
+        assert_eq!(
+            configured_connection_for("qwen-us", "qwen", Some(ROOT_SENTINEL_KEY), None).api_key,
+            None,
+            "a key bound to one region must not be released to another"
+        );
+    }
+
+    /// S4 case E. An unparseable BYO string has no endpoint identity: it is
+    /// refused with the message `parse_custom_provider_url` already produces,
+    /// before any transport exists, and it is not treated as credential-free.
+    #[tokio::test]
+    async fn unparseable_byo_endpoint_is_refused_before_any_transport() {
+        let endpoint = spawn_byo_loopback().await;
+        let temp = TempDir::new().expect("test: temp config dir");
+        let options = byo_isolated_options(&temp);
+        let reliability = byo_reliability_without_fallbacks();
+
+        let error = create_routed_provider_with_options(
+            "custom:not-a-url",
+            None,
+            None,
+            &reliability,
+            &[],
+            BYO_BARE_MODEL,
+            &options,
+        )
+        .err()
+        .map(|error| format!("{error:#}"))
+        .expect("test: an unparseable BYO URL must be refused");
+
+        assert!(error.contains("requires a valid URL"), "unexpected error: {error}");
+        assert!(
+            provider_requires_explicit_credential("custom:not-a-url"),
+            "an unparseable BYO string must not inherit the credential-free arm"
+        );
+        assert_eq!(endpoint.requests().len(), 0, "a refusal must be pre-transport");
+        endpoint.shutdown();
+    }
+
+    /// SPLASH F5 second refusal layer, S4 case P6 inverted. A keyless BYO
+    /// endpoint must reach its endpoint with no `Authorization` header at all
+    /// — never with a placeholder credential — on every request surface, not
+    /// only the one the first turn happens to use.
+    ///
+    /// RED at `ae3ca634`: every surface fails with `Custom API key not set`
+    /// and zero requests reach the endpoint.
+    #[tokio::test]
+    async fn keyless_byo_endpoint_sends_no_authorization_header_on_any_surface() {
+        use futures::StreamExt;
+
+        let endpoint = spawn_byo_loopback().await;
+        let provider =
+            create_provider(&endpoint.provider_name(), None).expect("test: keyless BYO construction is valid");
+        let history = [ChatMessage::user("ping")];
+        let stream_options = traits::StreamOptions::new(true);
+
+        let metered = provider
+            .chat(
+                ChatRequest {
+                    messages: &history,
+                    tools: None,
+                },
+                BYO_BARE_MODEL,
+                0.0,
+            )
+            .await;
+        let with_system = provider.chat_with_system(None, "ping", BYO_BARE_MODEL, 0.0).await;
+        let with_history = provider.chat_with_history(&history, BYO_BARE_MODEL, 0.0).await;
+        let with_tools = provider.chat_with_tools(&history, &[], BYO_BARE_MODEL, 0.0).await;
+        let streamed_system: Vec<_> = provider
+            .stream_chat_with_system(None, "ping", BYO_BARE_MODEL, 0.0, stream_options.clone())
+            .collect()
+            .await;
+        let streamed_history: Vec<_> = provider
+            .stream_chat_with_history(&history, BYO_BARE_MODEL, 0.0, stream_options)
+            .collect()
+            .await;
+
+        assert_eq!(
+            metered.map(|response| response.text).ok().flatten().as_deref(),
+            Some(BYO_LOOPBACK_REPLY)
+        );
+        assert_eq!(with_system.as_deref().ok(), Some(BYO_LOOPBACK_REPLY));
+        assert_eq!(with_history.as_deref().ok(), Some(BYO_LOOPBACK_REPLY));
+        assert_eq!(
+            with_tools.map(|response| response.text).ok().flatten().as_deref(),
+            Some(BYO_LOOPBACK_REPLY)
+        );
+        for chunks in [&streamed_system, &streamed_history] {
+            assert!(
+                chunks.iter().all(std::result::Result::is_ok),
+                "a keyless stream must not be refused: {:?}",
+                chunks
+                    .iter()
+                    .filter_map(|chunk| chunk.as_ref().err())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let requests = endpoint.requests();
+        assert_eq!(requests.len(), 6, "every surface must reach the endpoint");
+        for headers in &requests {
+            assert!(
+                !headers.iter().any(|(name, _)| name == "authorization"),
+                "a keyless endpoint must receive no authorization header: {:?}",
+                headers.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            );
+        }
+        endpoint.shutdown();
+    }
+
+    /// The keyless relaxation is scoped to the absence of a credential: a BYO
+    /// endpoint that does have one still presents it.
+    #[tokio::test]
+    async fn keyed_byo_endpoint_still_presents_its_own_credential() {
+        let endpoint = spawn_byo_loopback().await;
+        let provider = create_provider(&endpoint.provider_name(), Some(BYO_SENTINEL_KEY))
+            .expect("test: keyed BYO construction is valid");
+
+        let reply = provider.simple_chat("ping", BYO_BARE_MODEL, 0.0).await;
+
+        let requests = endpoint.requests();
+        assert_eq!(reply.as_deref().ok(), Some(BYO_LOOPBACK_REPLY));
+        assert_eq!(requests.len(), 1);
+        let authorization = requests
+            .first()
+            .and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(name, _)| name == "authorization")
+                    .map(|(_, value)| value.clone())
+            })
+            .expect("test: a keyed endpoint receives an authorization header");
+        assert_eq!(authorization, format!("Bearer {BYO_SENTINEL_KEY}"));
+        endpoint.shutdown();
+    }
+}
+
+/// Credential containment across provider identities: the root connection and
+/// its rotation keys (`reliability.api_keys`) reach only the provider they were
+/// configured for, whatever path builds the chain.
+#[cfg(test)]
+mod credential_containment_tests {
+    use super::credential_probe::{CredentialProbe, PROBE_MODEL};
+    use super::*;
+
+    /// Sentinels only; none of these is a real secret.
+    const ROOT_SENTINEL: &str = "C0-ROOT-SENTINEL";
+    const ROTATION_SENTINEL: &str = "C0-ROTATION-SENTINEL";
+
+    fn isolated_options(temp: &tempfile::TempDir) -> ProviderRuntimeOptions {
+        ProviderRuntimeOptions {
+            openprx_dir: Some(temp.path().to_path_buf()),
+            codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),
+            codex_auth_json_auto_import: false,
+            ..ProviderRuntimeOptions::default()
+        }
+    }
+
+    fn rotating_reliability() -> crate::config::ReliabilityConfig {
+        crate::config::ReliabilityConfig {
+            provider_retries: 0,
+            provider_backoff_ms: 0,
+            fallback_providers: Vec::new(),
+            api_keys: vec![ROTATION_SENTINEL.to_string()],
+            ..crate::config::ReliabilityConfig::default()
+        }
+    }
+
+    /// T7: a `model_routes` entry for another provider must not inherit the
+    /// root's rotation keys. The loopback answers 429 first, which is exactly
+    /// what makes the chain rotate to its next member.
+    #[tokio::test]
+    async fn a_routed_provider_never_receives_the_root_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "probe".to_string(),
+            provider: probe.custom_provider(),
+            model: PROBE_MODEL.to_string(),
+            api_key: None,
+            credential_ref: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            "openai",
+            Some(ROOT_SENTINEL),
+            None,
+            &rotating_reliability(),
+            &routes,
+            "gpt-4o",
+            &isolated_options(&temp),
+        )
+        .expect("test: routed chain builds");
+
+        let _reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
+
+        let requests = probe.requests();
+        assert!(!requests.is_empty(), "the route must reach the loopback");
+        assert!(
+            !probe.saw(ROTATION_SENTINEL),
+            "the root rotation key reached a routed provider it was not issued for"
+        );
+        assert!(!probe.saw(ROOT_SENTINEL), "the root key reached a routed provider");
+        assert!(
+            requests.iter().all(|request| request.authorization().is_none()),
+            "a keyless routed endpoint must receive no Authorization header"
+        );
+    }
+
+    /// Guard: the primary provider keeps its rotation keys when routing is on.
+    /// Its first member is throttled, so the rotated member presents the key.
+    #[tokio::test]
+    async fn the_routed_primary_keeps_its_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "probe".to_string(),
+            provider: probe.custom_provider(),
+            model: PROBE_MODEL.to_string(),
+            api_key: None,
+            credential_ref: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            &probe.custom_provider(),
+            Some(ROOT_SENTINEL),
+            None,
+            &rotating_reliability(),
+            &routes,
+            PROBE_MODEL,
+            &isolated_options(&temp),
+        )
+        .expect("test: routed chain builds");
+
+        let reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
+
+        assert!(reply.is_ok(), "the rotated member must answer: {reply:?}");
+        let requests = probe.requests();
+        assert_eq!(requests.len(), 2, "one throttled attempt, one rotated attempt");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == "POST" && request.path.ends_with("/chat/completions"))
+        );
+        assert_eq!(
+            requests.first().and_then(|request| request.authorization()),
+            Some(format!("Bearer {ROOT_SENTINEL}").as_str())
+        );
+        assert_eq!(
+            requests.get(1).and_then(|request| request.authorization()),
+            Some(format!("Bearer {ROTATION_SENTINEL}").as_str())
+        );
+    }
+
+    /// A route's own key is that route's credential and is still presented.
+    #[tokio::test]
+    async fn a_route_with_its_own_key_still_presents_it() {
+        const ROUTE_SENTINEL: &str = "C0-ROUTE-SENTINEL";
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start().await;
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "probe".to_string(),
+            provider: probe.custom_provider(),
+            model: PROBE_MODEL.to_string(),
+            api_key: Some(ROUTE_SENTINEL.to_string()),
+            credential_ref: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            "openai",
+            Some(ROOT_SENTINEL),
+            None,
+            &rotating_reliability(),
+            &routes,
+            "gpt-4o",
+            &isolated_options(&temp),
+        )
+        .expect("test: routed chain builds");
+
+        let reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
+
+        assert!(reply.is_ok(), "the route answers with its own key: {reply:?}");
+        assert_eq!(probe.wait_for_requests(1, std::time::Duration::from_secs(5)).await, 1);
+        assert!(probe.saw(ROUTE_SENTINEL));
+        assert!(!probe.saw(ROOT_SENTINEL) && !probe.saw(ROTATION_SENTINEL));
+    }
+
+    #[test]
+    fn rotation_keys_follow_the_root_connection() {
+        let reliability = rotating_reliability();
+
+        let released = configured_connection_for("OpenAI", "openai", Some(ROOT_SENTINEL), None);
+        let scoped = scoped_reliability(&reliability, &released);
+        assert!(released.released);
+        assert!(matches!(scoped, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(scoped.api_keys, vec![ROTATION_SENTINEL.to_string()]);
+
+        let withheld = configured_connection_for("custom:http://127.0.0.1:9/v1", "openai", Some(ROOT_SENTINEL), None);
+        let scoped = scoped_reliability(&reliability, &withheld);
+        assert!(!withheld.released);
+        assert!(
+            scoped.api_keys.is_empty(),
+            "a withheld connection carries no rotation keys"
+        );
+        assert_eq!(scoped.provider_retries, reliability.provider_retries);
+        assert_eq!(scoped.provider_backoff_ms, reliability.provider_backoff_ms);
+        assert_eq!(scoped.fallback_providers, reliability.fallback_providers);
+    }
+
+    /// The factory-level shape of P0-B: a withheld connection plus the scoped
+    /// reliability sends neither the root key nor a rotation key.
+    #[tokio::test]
+    async fn a_withheld_connection_builds_a_chain_without_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let reliability = rotating_reliability();
+        let selected = probe.custom_provider();
+        let connection = configured_connection_for(&selected, "openai", Some(ROOT_SENTINEL), None);
+        let scoped = scoped_reliability(&reliability, &connection);
+
+        let provider = create_resilient_provider_with_options(
+            &selected,
+            connection.api_key,
+            connection.api_url,
+            &scoped,
+            &isolated_options(&temp),
+        )
+        .expect("test: keyless BYO chain builds");
+        let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
+
+        assert_eq!(probe.requests().len(), 1, "one member, no rotated member");
+        assert!(!probe.saw(ROOT_SENTINEL) && !probe.saw(ROTATION_SENTINEL));
+    }
+
+    #[test]
+    fn configured_providers_are_every_provider_the_operator_named() {
+        let mut config = crate::config::Config::default();
+        config.default_provider = None;
+        config.reliability.fallback_providers = vec!["anthropic".to_string()];
+        config.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "custom:http://127.0.0.1:8080/v1".to_string(),
+            model: "m".to_string(),
+            api_key: None,
+            credential_ref: None,
+        }];
+        config.agents = std::collections::HashMap::from([(
+            "coder".to_string(),
+            crate::config::DelegateAgentConfig {
+                provider: "groq".to_string(),
+                model: "m".to_string(),
+                system_prompt: None,
+                api_key: None,
+                credential_ref: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        )]);
+
+        let configured = ConfiguredProviders::from_config(&config);
+
+        for permitted in [
+            "openrouter",
+            "anthropic",
+            "claude-code",
+            "groq",
+            "custom:http://127.0.0.1:8080/v1/",
+            "CUSTOM:http://127.0.0.1:8080/v1",
+        ] {
+            assert!(configured.permits(permitted), "{permitted}");
+        }
+        for refused in [
+            "openai",
+            "custom:http://127.0.0.1:8081/v1",
+            "custom:https://attacker.example/v1",
+        ] {
+            assert!(!configured.permits(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_refused_provider_is_named_without_its_userinfo() {
+        let configured = ConfiguredProviders::default()
+            .with_providers(["custom:http://operator-secret@127.0.0.1:8080/v1", "openai"]);
+
+        let error = configured
+            .ensure_permits("custom:https://model-secret@attacker.example/v1")
+            .expect_err("an unconfigured endpoint is refused")
+            .to_string();
+
+        assert!(error.contains("not configured"), "{error}");
+        assert!(
+            !error.contains("model-secret") && !error.contains("operator-secret"),
+            "{error}"
+        );
+        assert!(configured.ensure_permits("OpenAI").is_ok());
+    }
+
+    /// C0-f F-3: the refusal goes back to the model, so it names provider
+    /// identities only: never a configured endpoint's URL, host or port, and
+    /// never the refused one's.
+    #[test]
+    fn a_refusal_names_identities_but_no_endpoint() {
+        let configured = ConfiguredProviders::default().with_providers([
+            "custom:http://internal-llm.corp.example:8443/v1",
+            "anthropic-custom:https://10.1.2.3/anthropic",
+            "openai",
+        ]);
+
+        let error = configured
+            .ensure_permits("custom:https://attacker.example:9999/v1")
+            .expect_err("an unconfigured endpoint is refused")
+            .to_string();
+
+        for leaked in [
+            "internal-llm",
+            "corp.example",
+            "8443",
+            "10.1.2.3",
+            "attacker.example",
+            "9999",
+            "http",
+        ] {
+            assert!(!error.contains(leaked), "the refusal leaked `{leaked}`: {error}");
+        }
+        assert!(error.contains("not configured"), "{error}");
+        assert!(error.contains("openai"), "catalog identities stay nameable: {error}");
+    }
+
+    #[test]
+    fn a_credential_is_released_only_to_its_own_provider_identity() {
+        let owned = [
+            (Some("groq"), Some(" agent-key ")),
+            (Some("custom:http://127.0.0.1:8080/v1"), Some("root-key")),
+            (None, Some("ownerless-key")),
+        ];
+        assert_eq!(credential_for_provider_identity("GROQ", &owned), Some("agent-key"));
+        assert_eq!(
+            credential_for_provider_identity("custom:http://127.0.0.1:8080/v1/", &owned),
+            Some("root-key")
+        );
+        assert_eq!(
+            credential_for_provider_identity("custom:https://attacker.example/v1", &owned),
+            None
+        );
+        assert_eq!(credential_for_provider_identity("openai", &owned), None);
+        assert_eq!(
+            credential_for_provider_identity("groq", &[(Some("groq"), Some("  "))]),
+            None
+        );
+    }
+
+    // ── C0-f F-4: a route gets key, URL and rotation keys as one unit ─────
+
+    #[test]
+    fn a_respelled_primary_route_gets_the_root_connection_as_a_unit() {
+        let reliability = rotating_reliability();
+        let (connection, chain) = routed_connection(
+            "OpenAI",
+            "openai",
+            None,
+            Some(ROOT_SENTINEL),
+            Some("https://gateway.corp.example/v1"),
+            &reliability,
+        );
+        assert_eq!(connection.api_key, Some(ROOT_SENTINEL));
+        assert_eq!(connection.api_url, Some("https://gateway.corp.example/v1"));
+        assert_eq!(chain.api_keys, vec![ROTATION_SENTINEL.to_string()]);
+    }
+
+    #[test]
+    fn a_route_with_its_own_key_gets_neither_root_url_nor_rotation_keys() {
+        let reliability = rotating_reliability();
+        let (connection, chain) = routed_connection(
+            "OpenAI",
+            "openai",
+            Some("route-own-key"),
+            Some(ROOT_SENTINEL),
+            Some("https://gateway.corp.example/v1"),
+            &reliability,
+        );
+        assert_eq!(connection.api_key, Some("route-own-key"));
+        assert_eq!(connection.api_url, None);
+        assert!(
+            chain.api_keys.is_empty(),
+            "the root's rotation keys are not the route's"
+        );
+    }
+
+    #[test]
+    fn the_exact_primary_and_foreign_routes_are_unchanged() {
+        let reliability = rotating_reliability();
+        let (primary, chain) = routed_connection(
+            "openai",
+            "openai",
+            None,
+            Some(ROOT_SENTINEL),
+            Some("https://gw/v1"),
+            &reliability,
+        );
+        assert_eq!(
+            (primary.api_key, primary.api_url),
+            (Some(ROOT_SENTINEL), Some("https://gw/v1"))
+        );
+        assert_eq!(chain.api_keys.len(), 1);
+
+        let (foreign, chain) = routed_connection(
+            "groq",
+            "openai",
+            None,
+            Some(ROOT_SENTINEL),
+            Some("https://gw/v1"),
+            &reliability,
+        );
+        assert_eq!((foreign.api_key, foreign.api_url), (None, None));
+        assert!(chain.api_keys.is_empty());
+    }
+
+    /// On the wire: a route spelling the primary endpoint differently is
+    /// served with the root key first, not only with a rotation key.
+    #[tokio::test]
+    async fn a_respelled_primary_route_presents_the_root_key_with_its_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let primary = probe.custom_provider();
+        let respelled = format!("{primary}/");
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "probe".to_string(),
+            provider: respelled,
+            model: PROBE_MODEL.to_string(),
+            api_key: None,
+            credential_ref: None,
+        }];
+
+        let provider = create_routed_provider_with_options(
+            &primary,
+            Some(ROOT_SENTINEL),
+            None,
+            &rotating_reliability(),
+            &routes,
+            PROBE_MODEL,
+            &isolated_options(&temp),
+        )
+        .expect("test: routed chain builds");
+        let _reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
+
+        let requests = probe.requests();
+        assert_eq!(
+            requests.first().and_then(|request| request.authorization()),
+            Some(format!("Bearer {ROOT_SENTINEL}").as_str()),
+            "the respelled route must present the root key, not a rotation key alone"
         );
     }
 }

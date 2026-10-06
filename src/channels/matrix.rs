@@ -180,6 +180,93 @@ impl MatrixChannel {
         Self::is_sender_allowed(&self.allowed_users, sender)
     }
 
+    /// Registers the handler that forwards the target room's messages to
+    /// `tx` for one listener. The handler is removed when the returned guard
+    /// drops.
+    fn register_room_message_handler(
+        client: &MatrixSdkClient,
+        tx: mpsc::Sender<ChannelMessage>,
+        target_room: OwnedRoomId,
+        my_user_id: OwnedUserId,
+        allowed_users: Vec<String>,
+    ) -> matrix_sdk::event_handler::EventHandlerDropGuard {
+        let recent_event_cache = Arc::new(Mutex::new((
+            std::collections::VecDeque::new(),
+            std::collections::HashSet::new(),
+        )));
+
+        let tx_handler = tx;
+        let target_room_for_handler = target_room;
+        let my_user_id_for_handler = my_user_id;
+        let allowed_users_for_handler = allowed_users;
+        let dedupe_for_handler = recent_event_cache;
+
+        let handle = client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
+            let tx = tx_handler.clone();
+            let target_room = target_room_for_handler.clone();
+            let my_user_id = my_user_id_for_handler.clone();
+            let allowed_users = allowed_users_for_handler.clone();
+            let dedupe = Arc::clone(&dedupe_for_handler);
+
+            async move {
+                if room.room_id().as_str() != target_room.as_str() {
+                    return;
+                }
+
+                if event.sender == my_user_id {
+                    return;
+                }
+
+                let sender = event.sender.to_string();
+                if !Self::is_sender_allowed(&allowed_users, &sender) {
+                    return;
+                }
+
+                let body = match &event.content.msgtype {
+                    MessageType::Text(content) => content.body.clone(),
+                    MessageType::Notice(content) => content.body.clone(),
+                    _ => return,
+                };
+
+                if !Self::has_non_empty_body(&body) {
+                    return;
+                }
+
+                let event_id = event.event_id.to_string();
+                {
+                    let mut guard = dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    if Self::cache_event_id(&event_id, recent_order, recent_lookup) {
+                        return;
+                    }
+                }
+
+                let msg = ChannelMessage {
+                    id: event_id,
+                    sender: sender.clone(),
+                    reply_target: sender,
+                    content: body,
+                    channel: "matrix".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: None,
+                    chat_kind: crate::channels::traits::ChatKind::Dm,
+                    chat_title: None,
+                    sender_display: None,
+                    mentioned_uuids: vec![],
+                    mentioned: false,
+                    is_group_hint: false,
+                    sender_is_bot: false,
+                };
+
+                let _ = tx.send(msg).await;
+            }
+        });
+        client.event_handler_drop_guard(handle)
+    }
+
     fn is_sender_allowed(allowed_users: &[String], sender: &str) -> bool {
         if allowed_users.iter().any(|u| u == "*") {
             return true;
@@ -557,80 +644,16 @@ impl Channel for MatrixChannel {
             self.room_id
         );
 
-        let recent_event_cache = Arc::new(Mutex::new((
-            std::collections::VecDeque::new(),
-            std::collections::HashSet::new(),
-        )));
-
-        let tx_handler = tx.clone();
-        let target_room_for_handler = target_room.clone();
-        let my_user_id_for_handler = my_user_id.clone();
-        let allowed_users_for_handler = self.allowed_users.clone();
-        let dedupe_for_handler = Arc::clone(&recent_event_cache);
-
-        client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
-            let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
-            let my_user_id = my_user_id_for_handler.clone();
-            let allowed_users = allowed_users_for_handler.clone();
-            let dedupe = Arc::clone(&dedupe_for_handler);
-
-            async move {
-                if room.room_id().as_str() != target_room.as_str() {
-                    return;
-                }
-
-                if event.sender == my_user_id {
-                    return;
-                }
-
-                let sender = event.sender.to_string();
-                if !Self::is_sender_allowed(&allowed_users, &sender) {
-                    return;
-                }
-
-                let body = match &event.content.msgtype {
-                    MessageType::Text(content) => content.body.clone(),
-                    MessageType::Notice(content) => content.body.clone(),
-                    _ => return,
-                };
-
-                if !Self::has_non_empty_body(&body) {
-                    return;
-                }
-
-                let event_id = event.event_id.to_string();
-                {
-                    let mut guard = dedupe.lock().await;
-                    let (recent_order, recent_lookup) = &mut *guard;
-                    if Self::cache_event_id(&event_id, recent_order, recent_lookup) {
-                        return;
-                    }
-                }
-
-                let msg = ChannelMessage {
-                    id: event_id,
-                    sender: sender.clone(),
-                    reply_target: sender,
-                    content: body,
-                    channel: "matrix".to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    thread_ts: None,
-                    chat_kind: crate::channels::traits::ChatKind::Dm,
-                    chat_title: None,
-                    sender_display: None,
-                    mentioned_uuids: vec![],
-                    mentioned: false,
-                    is_group_hint: false,
-                    sender_is_bot: false,
-                };
-
-                let _ = tx.send(msg).await;
-            }
-        });
+        // Removed when this listener ends: the client outlives a listener,
+        // and a handler left behind by a restarted listener delivered every
+        // message once more per restart (D-072 M-2).
+        let _room_handler = Self::register_room_message_handler(
+            &client,
+            tx.clone(),
+            target_room,
+            my_user_id,
+            self.allowed_users.clone(),
+        );
 
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(MATRIX_SYNC_TIMEOUT_SECS));
         client
@@ -675,6 +698,91 @@ impl Channel for MatrixChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback homeserver: every `/sync` returns one text message from
+    /// `@alice:localhost` in `!room:localhost`; the other endpoints the SDK
+    /// calls get a minimal valid answer.
+    async fn loopback_homeserver() -> String {
+        async fn answer(uri: axum::http::Uri) -> axum::Json<serde_json::Value> {
+            let path = uri.path();
+            axum::Json(if path.ends_with("/versions") {
+                serde_json::json!({"versions": ["v1.1", "v1.11"], "unstable_features": {}})
+            } else if path.ends_with("/sync") {
+                serde_json::json!({
+                    "next_batch": "batch-1",
+                    "rooms": {"join": {"!room:localhost": {"timeline": {"limited": false, "events": [{
+                        "type": "m.room.message",
+                        "event_id": "$event-1",
+                        "sender": "@alice:localhost",
+                        "origin_server_ts": 1,
+                        "content": {"msgtype": "m.text", "body": "hello from the room"}
+                    }]}}}}
+                })
+            } else if path.ends_with("/keys/upload") {
+                serde_json::json!({"one_time_key_counts": {"signed_curve25519": 50}})
+            } else if path.ends_with("/keys/query") {
+                serde_json::json!({"device_keys": {}, "failures": {}})
+            } else {
+                serde_json::json!({})
+            })
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let address = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(answer)).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// D-072 M-2, RED before: each listener start added a room handler to the
+    /// shared SDK client and none was ever removed, so after a restart every
+    /// room message was delivered once per listener generation. After: the
+    /// handler of a listener that ended is removed; a message arrives once.
+    #[tokio::test]
+    async fn a_restarted_listener_delivers_each_room_message_once() {
+        let homeserver = loopback_homeserver().await;
+        let client = MatrixSdkClient::builder()
+            .homeserver_url(&homeserver)
+            .build()
+            .await
+            .expect("test: client");
+        client
+            .restore_session(MatrixSession {
+                meta: SessionMeta {
+                    user_id: "@prx:localhost".parse().expect("test: user id"),
+                    device_id: "PRXTESTDEVICE".into(),
+                },
+                tokens: SessionTokens {
+                    access_token: "loopback-token".to_string(),
+                    refresh_token: None,
+                },
+            })
+            .await
+            .expect("test: session");
+        let room: OwnedRoomId = "!room:localhost".parse().expect("test: room id");
+        let me: OwnedUserId = "@prx:localhost".parse().expect("test: user id");
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let first_listener = MatrixChannel::register_room_message_handler(
+            &client,
+            tx.clone(),
+            room.clone(),
+            me.clone(),
+            vec!["*".to_string()],
+        );
+        // The listener is restarted: the first one ends, a second one starts.
+        drop(first_listener);
+        let _second_listener =
+            MatrixChannel::register_room_message_handler(&client, tx, room, me, vec!["*".to_string()]);
+
+        // Event handlers run to completion inside the sync.
+        client.sync_once(SyncSettings::new()).await.expect("test: sync");
+        let mut delivered = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            delivered.push(message.content);
+        }
+        assert_eq!(delivered, vec!["hello from the room".to_string()]);
+    }
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(

@@ -1,14 +1,14 @@
-use crate::memory::{Memory, MemoryCategory};
+use crate::memory::{Memory, MemoryCategory, MemoryEntry};
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, SharedEvolutionConfig};
-use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
+use crate::self_system::evolution::engine::{
+    CycleResult, EngineCycleInput, EvolutionEngine, FileChange, PendingChange,
+};
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, MockJudgeModel};
 use crate::self_system::evolution::memory_compressor::{EmbeddingSimilarityDetector, MemoryCompressor};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::rollback::RollbackManager;
-use crate::self_system::evolution::safety_utils::atomic_write;
-use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
     EvolutionValidation, RiskLevel, ValidationStatus,
@@ -19,7 +19,6 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs;
 use uuid::Uuid;
 
 const MUTATION_RATIO: f64 = 0.10;
@@ -41,18 +40,13 @@ pub struct MemoryEvolutionEngine {
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
     config_path: PathBuf,
-    writer: Option<Arc<AsyncJsonlWriter>>,
     judge: JudgeEngine,
     rollback: RollbackManager,
     memory: Option<Arc<dyn Memory>>,
 }
 
 impl MemoryEvolutionEngine {
-    pub fn new(
-        shared_config: SharedEvolutionConfig,
-        config_path: impl AsRef<Path>,
-        writer: Option<Arc<AsyncJsonlWriter>>,
-    ) -> Result<Self> {
+    pub fn new(shared_config: SharedEvolutionConfig, config_path: impl AsRef<Path>) -> Result<Self> {
         let config_path = config_path.as_ref().to_path_buf();
         let workspace_root = config_path.parent().unwrap_or_else(|| Path::new("."));
         let rollback_dir = config_path
@@ -65,7 +59,6 @@ impl MemoryEvolutionEngine {
             shared_config,
             workspace_root: workspace_root.to_path_buf(),
             config_path: config_path.clone(),
-            writer,
             judge: JudgeEngine::new(JudgeConfig::default(), std::sync::Arc::new(MockJudgeModel)),
             rollback: RollbackManager::new(workspace_root, &config_path, rollback_dir, max_versions)?,
             memory: None,
@@ -167,114 +160,6 @@ impl MemoryEvolutionEngine {
             _ => {}
         }
     }
-
-    async fn prune_redundant_conversation_memories(&self) -> Result<u32> {
-        let Some(memory) = self.memory.as_ref() else {
-            return Ok(0);
-        };
-        let entries = memory.list(Some(&MemoryCategory::Conversation), None).await?;
-        if entries.len() < 2 {
-            return Ok(0);
-        }
-
-        let compressor = MemoryCompressor::new(EmbeddingSimilarityDetector::default());
-        let redundant_ids = compressor.detect_redundancy(&entries).await?;
-        if redundant_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let key_by_id = entries
-            .into_iter()
-            .map(|entry| (entry.id, entry.key))
-            .collect::<HashMap<_, _>>();
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
-        let mut removed = 0u32;
-        for redundant_id in redundant_ids {
-            let Some(key) = key_by_id.get(&redundant_id) else {
-                continue;
-            };
-            // FIX-P1-11: Auto mode must NOT physically delete. Produce an
-            // EvolutionProposalDraft recording the forget intent, then soft-delete
-            // into trash with a 14-day grace window so the change is reversible
-            // and auditable instead of an irreversible `forget`.
-            if let Err(error) = self
-                .record_forget_proposal(memory.as_ref(), &workspace_id, key, redundant_id)
-                .await
-            {
-                tracing::warn!(
-                    target: "self_system",
-                    key = %key,
-                    "failed to record forget proposal; skipping trash to stay reversible: {error}"
-                );
-                continue;
-            }
-            match memory
-                .move_to_trash(key, "redundant conversation memory", PRUNE_GRACE_DAYS)
-                .await
-            {
-                Ok(Some(_)) => removed = removed.saturating_add(1),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        target: "self_system",
-                        key = %key,
-                        "move_to_trash failed: {error}"
-                    );
-                }
-            }
-        }
-
-        Ok(removed)
-    }
-
-    /// Build and persist an `EvolutionProposalDraft` for an L1 memory-forget
-    /// candidate (FIX-P1-11). Uses the typed CRUD path (FIX-P0-03) rather than
-    /// raw SQL so the proposal is type-checked and auditable.
-    async fn record_forget_proposal(
-        &self,
-        memory: &dyn Memory,
-        workspace_id: &str,
-        memory_key: &str,
-        memory_event_id: String,
-    ) -> Result<()> {
-        use crate::self_system::evolution::proposal::{
-            EvolutionProposalDraft, EvolutionTargetResource, ProposedChange, RiskLevel as ProposalRiskLevel,
-        };
-
-        use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::default();
-        hasher.update(memory_key.as_bytes());
-        let evidence_hash = format!("{:x}", hasher.finalize());
-
-        let draft = EvolutionProposalDraft {
-            draft_id: format!("evo-{}", Uuid::now_v7()),
-            owner_id: "self_system".to_string(),
-            principal_id: "self_system:l1".to_string(),
-            workspace_id: workspace_id.to_string(),
-            topic_id: None,
-            task_id: None,
-            source_message_event_ids: Vec::new(),
-            source_memory_event_ids: Vec::new(),
-            evidence_hashes: vec![evidence_hash],
-            target_resource: EvolutionTargetResource::SemanticMemory {
-                memory_id: memory_key.to_string(),
-                scope: "workspace".to_string(),
-            },
-            proposed_change: ProposedChange::MemoryForget {
-                reason: format!("redundant conversation memory (candidate id {memory_event_id})"),
-            },
-            risk_level: ProposalRiskLevel::Low,
-            mode: EvolutionMode::Auto,
-            created_at: Utc::now(),
-            created_by_runtime: "self_system:l1".to_string(),
-            judge_verdict: None,
-            applied_at: None,
-            applied_by: None,
-            rollback_anchor: None,
-        };
-        memory.create_evolution_proposal(draft).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -298,7 +183,6 @@ impl EvolutionEngine for MemoryEvolutionEngine {
 
         let current = self.shared_config.load_full();
         let mode = current.runtime.mode.clone();
-        let mut deduplicated_conversation_memories = 0u32;
         let candidate = self
             .select_candidate(&input.analyzer_candidates)
             .unwrap_or_else(default_candidate);
@@ -341,56 +225,44 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         let gate = EvolutionGate::from_evolution_config(current.as_ref());
         let gate_result = gate.evaluate(&candidate, &gate_metrics);
 
-        let mut applied = false;
+        let mut pending: Option<Arc<dyn PendingChange>> = None;
         let mut outcome = CycleOutcome::NoAction;
         let mut notes = "shadow mode: recommendation only".to_string();
 
         match mode {
             EvolutionMode::DraftOnly | EvolutionMode::Shadow => {}
+            // A refused gate is a refusal whatever judged it.
+            EvolutionMode::Auto if !matches!(gate_result, GateResult::Passed) => {
+                outcome = CycleOutcome::Failed;
+                notes = "gate rejected mutation".to_string();
+            }
+            // D-035: the engine's verdict comes from a degraded (mock) judge,
+            // which never applies a config write: the mutation is deferred.
+            EvolutionMode::Auto if self.judge.is_degraded() => {
+                notes = "judge degraded (mock scorer): mutation deferred, config not written".to_string();
+            }
             EvolutionMode::Auto => {
-                if matches!(gate_result, GateResult::Passed) {
-                    deduplicated_conversation_memories = match self.prune_redundant_conversation_memories().await {
-                        Ok(count) => count,
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "self_system",
-                                "memory redundancy cleanup skipped: {error}"
-                            );
-                            0
-                        }
-                    };
-                    self.rollback.backup_current_version().await?;
-                    if let Some(parent) = self.config_path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            fs::create_dir_all(parent).await?;
-                        }
-                    }
-                    atomic_write(&self.workspace_root, &self.config_path, serialized.as_bytes()).await?;
-                    self.shared_config.store(Arc::new(next_cfg));
-                    applied = true;
-                    outcome = CycleOutcome::Applied;
-                    notes = "gate passed and config persisted".to_string();
-                } else {
-                    outcome = CycleOutcome::Failed;
-                    notes = "gate rejected mutation".to_string();
-                }
+                // D-046: proposed only; the pipeline prunes, writes and
+                // installs it after an accepted verdict.
+                pending = Some(Arc::new(MemoryConfigChange {
+                    file: FileChange::new(
+                        self.workspace_root.clone(),
+                        self.config_path.clone(),
+                        serialized.clone(),
+                        self.rollback.clone(),
+                    ),
+                    memory: self.memory.clone(),
+                    workspace_root: self.workspace_root.clone(),
+                    shared_config: Arc::clone(&self.shared_config),
+                    next: Arc::new(next_cfg),
+                }));
+                notes = "gate passed; config written only after an accepted verdict".to_string();
             }
         }
-        if deduplicated_conversation_memories > 0 {
-            notes.push_str(&format!(
-                "; deduplicated {} conversation memories",
-                deduplicated_conversation_memories
-            ));
-        }
-
-        let mut key_metrics = HashMap::from([
+        let key_metrics = HashMap::from([
             ("average_improvement".to_string(), gate_metrics.average_improvement),
             ("token_degradation".to_string(), gate_metrics.token_degradation),
         ]);
-        key_metrics.insert(
-            "deduplicated_conversation_memories".to_string(),
-            f64::from(deduplicated_conversation_memories),
-        );
 
         let evolution_log = EvolutionLog {
             experiment_id: proposal.id.clone(),
@@ -406,18 +278,14 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                 key_metrics,
                 patterns_found: vec![candidate.current_value.clone()],
             },
-            result: if applied {
-                None
-            } else if matches!(gate_result, GateResult::Passed) {
+            result: if matches!(gate_result, GateResult::Passed) {
                 Some(EvolutionResult::Neutral)
             } else {
                 Some(EvolutionResult::Rejected)
             },
         };
 
-        if let Some(writer) = &self.writer {
-            writer.append_evolution(&evolution_log).await?;
-        }
+        // The pipeline records the cycle, once, under its experiment id.
 
         let cycle = EvolutionCycle {
             id: cycle_id,
@@ -456,7 +324,173 @@ impl EvolutionEngine for MemoryEvolutionEngine {
             evolution_log: Some(evolution_log),
             needs_human_approval: false,
             shadow_mode: mode.is_draft_like(),
+            pending,
         })
+    }
+}
+
+/// Build and persist an `EvolutionProposalDraft` for an L1 memory-forget
+/// candidate (FIX-P1-11). Uses the typed CRUD path (FIX-P0-03) rather than
+/// raw SQL so the proposal is type-checked and auditable.
+async fn record_forget_proposal(
+    memory: &dyn Memory,
+    workspace_id: &str,
+    memory_key: &str,
+    memory_event_id: String,
+) -> Result<()> {
+    use crate::self_system::evolution::proposal::{
+        EvolutionProposalDraft, EvolutionTargetResource, ProposedChange, RiskLevel as ProposalRiskLevel,
+    };
+
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::default();
+    hasher.update(memory_key.as_bytes());
+    let evidence_hash = format!("{:x}", hasher.finalize());
+
+    let draft = EvolutionProposalDraft {
+        draft_id: format!("evo-{}", Uuid::now_v7()),
+        owner_id: "self_system".to_string(),
+        principal_id: "self_system:l1".to_string(),
+        workspace_id: workspace_id.to_string(),
+        topic_id: None,
+        task_id: None,
+        source_message_event_ids: Vec::new(),
+        source_memory_event_ids: Vec::new(),
+        evidence_hashes: vec![evidence_hash],
+        target_resource: EvolutionTargetResource::SemanticMemory {
+            memory_id: memory_key.to_string(),
+            scope: "workspace".to_string(),
+        },
+        proposed_change: ProposedChange::MemoryForget {
+            reason: format!("redundant conversation memory (candidate id {memory_event_id})"),
+        },
+        risk_level: ProposalRiskLevel::Low,
+        mode: EvolutionMode::Auto,
+        created_at: Utc::now(),
+        created_by_runtime: "self_system:l1".to_string(),
+        judge_verdict: None,
+        applied_at: None,
+        applied_by: None,
+        rollback_anchor: None,
+    };
+    memory.create_evolution_proposal(draft).await?;
+    Ok(())
+}
+
+async fn prune_redundant_conversation_memories(memory: &dyn Memory, workspace_root: &Path) -> Result<u32> {
+    let entries = memory.list(Some(&MemoryCategory::Conversation), None).await?;
+    if entries.len() < 2 {
+        return Ok(0);
+    }
+
+    // Near-duplicates are compared only within one owner: two callers who
+    // wrote the same thing each keep their own row, and one owner's row is
+    // never trashed as a copy of another's. A row whose owner the backend
+    // cannot report — written after the owner lookup — waits for the next
+    // cycle rather than join any owner's group.
+    let owners = memory.list_owner_ids(&MemoryCategory::Conversation).await?;
+    let key_by_id = entries
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.key.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut groups: HashMap<Option<String>, Vec<MemoryEntry>> = HashMap::new();
+    for entry in entries {
+        let owner = match &owners {
+            None => None,
+            Some(owners) => match owners.get(&entry.id) {
+                Some(owner) => owner.clone(),
+                None => continue,
+            },
+        };
+        groups.entry(owner).or_default().push(entry);
+    }
+
+    let compressor = MemoryCompressor::new(EmbeddingSimilarityDetector::default());
+    let mut redundant_ids = Vec::new();
+    for group in groups.values().filter(|group| group.len() >= 2) {
+        redundant_ids.extend(compressor.detect_redundancy(group).await?);
+    }
+    if redundant_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let workspace_id = workspace_root.to_string_lossy().to_string();
+    let mut removed = 0u32;
+    for redundant_id in redundant_ids {
+        let Some(key) = key_by_id.get(&redundant_id) else {
+            continue;
+        };
+        // FIX-P1-11: Auto mode must NOT physically delete. Produce an
+        // EvolutionProposalDraft recording the forget intent, then soft-delete
+        // into trash with a 14-day grace window so the change is reversible
+        // and auditable instead of an irreversible `forget`.
+        if let Err(error) = record_forget_proposal(memory, &workspace_id, key, redundant_id).await {
+            tracing::warn!(
+                target: "self_system",
+                key = %key,
+                "failed to record forget proposal; skipping trash to stay reversible: {error}"
+            );
+            continue;
+        }
+        match memory
+            .move_to_trash(key, "redundant conversation memory", PRUNE_GRACE_DAYS)
+            .await
+        {
+            Ok(Some(_)) => removed = removed.saturating_add(1),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "self_system",
+                    key = %key,
+                    "move_to_trash failed: {error}"
+                );
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// The memory layer's pending change (D-046): write the tuned evolution
+/// config, install it, then move redundant conversation memories to trash,
+/// only after an accepted verdict.
+struct MemoryConfigChange {
+    file: FileChange,
+    memory: Option<Arc<dyn Memory>>,
+    workspace_root: PathBuf,
+    shared_config: SharedEvolutionConfig,
+    next: Arc<EvolutionConfig>,
+}
+
+impl std::fmt::Debug for MemoryConfigChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryConfigChange")
+            .field("file", &self.file)
+            .field("prunes_memory", &self.memory.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PendingChange for MemoryConfigChange {
+    async fn apply(&self) -> Result<()> {
+        // R-PMMCj G-3: write and install the config first; memories are moved
+        // to trash only once the change itself is in place. A failed prune
+        // is a warning, never a failed change.
+        self.file.apply().await?;
+        self.shared_config.store(Arc::clone(&self.next));
+        if let Some(memory) = self.memory.as_ref() {
+            match prune_redundant_conversation_memories(memory.as_ref(), &self.workspace_root).await {
+                Ok(count) if count > 0 => tracing::info!(
+                    target: "self_system",
+                    deduplicated_conversation_memories = count,
+                    "memory evolution moved redundant conversation memories to trash"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(target: "self_system", "memory redundancy cleanup skipped: {error}"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -495,6 +529,7 @@ mod tests {
     use super::*;
     use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use tempfile::tempdir;
+    use tokio::fs;
 
     #[tokio::test]
     async fn memory_engine_shadow_mode_only_records() {
@@ -505,7 +540,7 @@ mod tests {
         fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).await.unwrap();
 
         let shared = new_shared_evolution_config(cfg);
-        let mut engine = MemoryEvolutionEngine::new(shared, &path, None).unwrap();
+        let mut engine = MemoryEvolutionEngine::new(shared, &path).unwrap();
         let result = engine
             .run_cycle(EngineCycleInput {
                 cycle_id: "c1".to_string(),
@@ -519,16 +554,19 @@ mod tests {
         assert!(!matches!(result.cycle.outcome, CycleOutcome::Applied));
     }
 
+    /// D-035 / R-PMMCf §4: the engine's own judge is the mock, so a passing
+    /// gate on its verdict must not write the config in Auto mode.
     #[tokio::test]
-    async fn memory_engine_auto_applies_when_gate_passes() {
+    async fn memory_engine_auto_defers_on_a_mock_verdict() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("evolution_config.toml");
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.mode = EvolutionMode::Auto;
-        fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).await.unwrap();
+        let original = toml::to_string_pretty(&cfg).unwrap();
+        fs::write(&path, &original).await.unwrap();
 
         let shared = new_shared_evolution_config(cfg);
-        let mut engine = MemoryEvolutionEngine::new(shared.clone(), &path, None).unwrap();
+        let mut engine = MemoryEvolutionEngine::new(shared.clone(), &path).unwrap();
         let result = engine
             .run_cycle(EngineCycleInput {
                 cycle_id: "c2".to_string(),
@@ -538,10 +576,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
-            result.cycle.outcome,
-            CycleOutcome::Applied | CycleOutcome::Failed
-        ));
+        assert!(
+            !matches!(result.cycle.outcome, CycleOutcome::Applied),
+            "the memory engine applied on its own mock verdict"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).await.unwrap(),
+            original,
+            "the config file changed"
+        );
+        assert!(
+            result.cycle.validation.notes.contains("judge"),
+            "{}",
+            result.cycle.validation.notes
+        );
     }
 
     #[test]
@@ -560,5 +608,125 @@ mod tests {
             .1;
         assert!(scheduler_builder.contains("create_memory_with_storage_and_routes_with_acl"));
         assert!(scheduler_builder.contains("with_memory(evolution_memory)"));
+    }
+
+    /// R-PMMCj G-3: when the config write fails, no memory has been moved to
+    /// trash: the change is either applied (write, then prune) or not at all.
+    #[tokio::test]
+    async fn a_failed_config_write_trashes_no_memory() {
+        let dir = tempdir().unwrap();
+        let memory = Arc::new(crate::memory::sqlite::SqliteMemory::new(dir.path()).unwrap());
+        let text = "The deploy window for the payments service is Tuesday at 14:00 UTC.";
+        for key in ["note-one", "note-two"] {
+            let context = crate::memory::MemoryWriteContext {
+                channel: Some("webhook".to_string()),
+                sender_id: Some("alice".to_string()),
+                ..crate::memory::MemoryWriteContext::default()
+            };
+            memory
+                .store_with_context(key, text, MemoryCategory::Conversation, None, Some(&context))
+                .await
+                .unwrap();
+        }
+        // The config path is a directory, so the write fails.
+        let config_path = dir.path().join("evolution_config.toml");
+        fs::create_dir_all(&config_path).await.unwrap();
+        let shared = new_shared_evolution_config(EvolutionConfig::default());
+        let change = MemoryConfigChange {
+            file: FileChange::new(
+                dir.path().to_path_buf(),
+                config_path.clone(),
+                "tuned = true\n".to_string(),
+                RollbackManager::new(
+                    dir.path(),
+                    &config_path,
+                    dir.path().join(".evolution/rollback/memory"),
+                    5,
+                )
+                .unwrap(),
+            ),
+            memory: Some(memory.clone() as Arc<dyn Memory>),
+            workspace_root: dir.path().to_path_buf(),
+            shared_config: Arc::clone(&shared),
+            next: Arc::new(EvolutionConfig::default()),
+        };
+        assert!(change.apply().await.is_err(), "the write fails");
+        // The prune records a forget proposal before each trash move.
+        let system = crate::memory::MemoryPrincipal {
+            require_owner_match: false,
+            workspace_id: dir.path().to_string_lossy().to_string(),
+            agent_id: Some("self_system".to_string()),
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: Some("self_system".to_string()),
+            legacy_session_key: None,
+        };
+        let forgets = memory
+            .list_evolution_proposals(
+                &system,
+                crate::self_system::evolution::ProposalFilter {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            forgets.is_empty(),
+            "a memory was trashed although the change was not applied: {forgets:?}"
+        );
+        // Sanity: the same memories are pruned once the change can apply.
+        assert_eq!(
+            prune_redundant_conversation_memories(memory.as_ref(), dir.path())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// R-MCPBh §4 residual: a non-isolated network caller's `conversation`
+    /// rows carry its owner, and deduplication compared them workspace-wide,
+    /// so one owner's row was trashed as a near-copy of another's. Within one
+    /// owner the near-copy is still pruned.
+    #[tokio::test]
+    async fn conversation_memories_are_deduplicated_only_within_one_owner() {
+        let dir = tempdir().unwrap();
+        let memory = Arc::new(crate::memory::sqlite::SqliteMemory::new(dir.path()).unwrap());
+        let text = "The deploy window for the payments service is Tuesday at 14:00 UTC.";
+        let store = |key: &'static str, owner: &'static str| {
+            let memory = Arc::clone(&memory);
+            async move {
+                let context = crate::memory::MemoryWriteContext {
+                    channel: Some("webhook".to_string()),
+                    sender_id: Some(owner.to_string()),
+                    ..crate::memory::MemoryWriteContext::default()
+                };
+                memory
+                    .store_with_context(key, text, MemoryCategory::Conversation, None, Some(&context))
+                    .await
+                    .unwrap();
+            }
+        };
+        store("alice-note", "alice").await;
+        store("bob-note", "bob").await;
+
+        assert_eq!(
+            prune_redundant_conversation_memories(memory.as_ref(), dir.path())
+                .await
+                .unwrap(),
+            0,
+            "two owners' identical rows are not duplicates of each other"
+        );
+
+        store("bob-copy", "bob").await;
+        assert_eq!(
+            prune_redundant_conversation_memories(memory.as_ref(), dir.path())
+                .await
+                .unwrap(),
+            1,
+            "bob's own near-copy is still pruned"
+        );
     }
 }

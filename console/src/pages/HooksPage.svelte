@@ -1,5 +1,6 @@
 <script>
   import { api } from '../lib/api';
+  import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
 
   const HOOK_EVENTS = [
@@ -14,27 +15,26 @@
   ];
 
   let hooks = $state([]);
-  let hooksEnabled = $state(true);
   let loading = $state(true);
-  let errorMessage = $state('');
-  let actionError = $state('');
+  // A refusal is kept whole, so the page shows the gateway's reason too
+  // (a 403 at `supervised` autonomy explains that a Medium or High write
+  // needs an approval grant a Gateway request cannot carry).
+  let loadError = $state(null);
+  let actionError = $state(null);
   let editing = $state(null);
   let showAddForm = $state(false);
   let saving = $state(false);
   let deletingId = $state('');
-  let togglingId = $state('');
   let addFormPrefix = $state('hook-add');
 
   let formEvent = $state(HOOK_EVENTS[0]);
   let formCommand = $state('');
   let formTimeout = $state(30000);
-  let formEnabled = $state(true);
 
   function resetForm() {
     formEvent = HOOK_EVENTS[0];
     formCommand = '';
     formTimeout = 30000;
-    formEnabled = true;
   }
 
   function fieldId(prefix, name) {
@@ -74,13 +74,11 @@
     try {
       const response = await api.getHooks();
       hooks = Array.isArray(response?.hooks) ? response.hooks : [];
-      hooksEnabled = response?.enabled !== false;
-      errorMessage = '';
-      actionError = '';
+      loadError = null;
+      actionError = null;
     } catch (error) {
       hooks = [];
-      hooksEnabled = true;
-      errorMessage = error instanceof Error ? error.message : t('hooks.loadFailed');
+      loadError = error instanceof Error ? error : t('hooks.loadFailed');
     } finally {
       loading = false;
     }
@@ -88,16 +86,15 @@
 
   function startEdit(hook) {
     editing = hook.id;
-    actionError = '';
+    actionError = null;
     formEvent = hook.event;
     formCommand = hook.command;
     formTimeout = hook.timeout_ms;
-    formEnabled = hook.enabled;
   }
 
   function cancelEdit() {
     editing = null;
-    actionError = '';
+    actionError = null;
     resetForm();
   }
 
@@ -105,7 +102,7 @@
     if (!validateForm()) return;
 
     saving = true;
-    actionError = '';
+    actionError = null;
 
     try {
       await api.updateHook(hookId, {
@@ -117,7 +114,7 @@
       resetForm();
       await loadHooks();
     } catch (error) {
-      actionError = error instanceof Error ? error.message : t('hooks.saveFailed');
+      actionError = error instanceof Error ? error : t('hooks.saveFailed');
     } finally {
       saving = false;
     }
@@ -127,7 +124,7 @@
     if (!validateForm()) return;
 
     saving = true;
-    actionError = '';
+    actionError = null;
 
     try {
       await api.createHook({
@@ -139,7 +136,7 @@
       resetForm();
       await loadHooks();
     } catch (error) {
-      actionError = error instanceof Error ? error.message : t('hooks.saveFailed');
+      actionError = error instanceof Error ? error : t('hooks.saveFailed');
     } finally {
       saving = false;
     }
@@ -147,7 +144,7 @@
 
   async function deleteHook(hookId) {
     deletingId = hookId;
-    actionError = '';
+    actionError = null;
 
     try {
       await api.deleteHook(hookId);
@@ -156,23 +153,9 @@
       }
       await loadHooks();
     } catch (error) {
-      actionError = error instanceof Error ? error.message : t('hooks.deleteFailed');
+      actionError = error instanceof Error ? error : t('hooks.deleteFailed');
     } finally {
       deletingId = '';
-    }
-  }
-
-  async function toggleHook(hookId) {
-    togglingId = hookId;
-    actionError = '';
-
-    try {
-      await api.toggleHook(hookId);
-      await loadHooks();
-    } catch (error) {
-      actionError = error instanceof Error ? error.message : t('hooks.toggleFailed');
-    } finally {
-      togglingId = '';
     }
   }
 
@@ -188,27 +171,13 @@
       type="button"
       onclick={() => {
         showAddForm = !showAddForm;
-        actionError = '';
+        actionError = null;
         if (showAddForm) resetForm();
       }}
       class="rounded-lg bg-sky-600 px-3 py-2 text-sm font-medium text-white hover:bg-sky-500"
     >
       {showAddForm ? t('hooks.cancelAdd') : t('hooks.addHook')}
     </button>
-  </div>
-
-  <div class="flex items-center gap-3 rounded-xl border border-gray-200 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-800">
-    <span class="text-sm font-medium text-gray-700 dark:text-gray-200">{t('hooks.globalStatus')}</span>
-    <button
-      type="button"
-      onclick={() => toggleHook(hooks[0]?.id ?? '')}
-      disabled={hooks.length === 0 || togglingId !== ''}
-      aria-label={hooksEnabled ? t('common.disabled') : t('common.enabled')}
-      class={`relative inline-flex h-5 w-9 items-center rounded-full transition ${hooksEnabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}`}
-    >
-      <span class={`inline-block h-3.5 w-3.5 rounded-full bg-white transition ${hooksEnabled ? 'translate-x-4' : 'translate-x-1'}`}></span>
-    </button>
-    <span class="text-xs text-gray-500 dark:text-gray-400">{t('hooks.globalToggleHint')}</span>
   </div>
 
   {#if showAddForm}
@@ -244,32 +213,16 @@
             class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
           />
         </div>
-        <div class="flex items-center gap-2">
-          <span class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('hooks.enabled')}</span>
-          <button
-            type="button"
-            disabled
-            aria-label={t('hooks.enabled')}
-            class={`relative inline-flex h-5 w-9 items-center rounded-full transition ${formEnabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}`}
-          >
-            <span class={`inline-block h-3.5 w-3.5 rounded-full bg-white transition ${formEnabled ? 'translate-x-4' : 'translate-x-1'}`}></span>
-          </button>
-          <span class="text-xs text-gray-400 dark:text-gray-500">{t('hooks.globalToggleHint')}</span>
-        </div>
       </div>
 
-      {#if actionError}
-        <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-          {actionError}
-        </p>
-      {/if}
+      <ErrorNotice error={actionError} />
 
       <div class="flex justify-end gap-2 pt-2">
         <button
           type="button"
           onclick={() => {
             showAddForm = false;
-            actionError = '';
+            actionError = null;
             resetForm();
           }}
           class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
@@ -290,20 +243,14 @@
 
   {#if loading}
     <p class="text-sm text-gray-500 dark:text-gray-400">{t('hooks.loading')}</p>
-  {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-      {errorMessage}
-    </p>
+  {:else if loadError}
+    <ErrorNotice error={loadError} />
   {:else if hooks.length === 0}
     <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
       {t('hooks.noHooks')}
     </p>
   {:else}
-    {#if actionError}
-      <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-        {actionError}
-      </p>
-    {/if}
+    <ErrorNotice error={actionError} />
 
     <div class="space-y-3">
       {#each hooks as hook (hook.id)}
@@ -339,25 +286,9 @@
                     class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                   />
                 </div>
-                <div class="flex items-center gap-2">
-                  <span class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('hooks.enabled')}</span>
-                  <button
-                    type="button"
-                    disabled
-                    aria-label={t('hooks.enabled')}
-                    class={`relative inline-flex h-5 w-9 items-center rounded-full transition ${formEnabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}`}
-                  >
-                    <span class={`inline-block h-3.5 w-3.5 rounded-full bg-white transition ${formEnabled ? 'translate-x-4' : 'translate-x-1'}`}></span>
-                  </button>
-                  <span class="text-xs text-gray-400 dark:text-gray-500">{t('hooks.globalToggleHint')}</span>
-                </div>
               </div>
 
-              {#if actionError}
-                <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-                  {actionError}
-                </p>
-              {/if}
+              <ErrorNotice error={actionError} />
 
               <div class="flex justify-end gap-2">
                 <button
@@ -382,15 +313,6 @@
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-3">
                   <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{humanizeEvent(hook.event)}</h3>
-                  <span
-                    class={`rounded-full px-2 py-1 text-xs font-medium ${
-                      hooksEnabled
-                        ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
-                        : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
-                    }`}
-                  >
-                    {hooksEnabled ? t('common.enabled') : t('common.disabled')}
-                  </span>
                 </div>
                 <p class="mt-2 font-mono text-sm text-gray-500 dark:text-gray-400">{hook.command}</p>
                 <p class="mt-1 text-xs text-gray-400 dark:text-gray-500">{t('hooks.timeout')}: {hook.timeout_ms}ms</p>

@@ -43,9 +43,9 @@
 //!    trait in the codebase for this reason.)
 //!
 //! What `chat` **does** reuse is the unified agent-loop core — tools, memory,
-//! routing, security, hooks — via [`crate::agent::loop_::run_tool_call_loop`],
-//! [`crate::agent::loop_::build_context_with_shared_events_and_scope`], and the
-//! same `RuntimeEnvelope`-derived [`MemoryPrincipal`]/`MessageEventScope`
+//! routing, security, hooks — via [`crate::agent::turn_engine::run_turn`],
+//! decision-owned retrieval, and the
+//! same `RuntimeEnvelope`-derived [`MemoryPrincipal`](crate::memory::MemoryPrincipal)/`MessageEventScope`
 //! (see [`chat_runtime_envelope`]). Only the presentation/streaming stack stays
 //! independent; the runtime semantics are shared with every other mode.
 // Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
@@ -53,6 +53,7 @@
 
 pub mod action;
 pub mod commands;
+pub(crate) mod decision_source;
 pub mod diff_apply;
 pub mod dispatcher;
 pub mod error;
@@ -73,12 +74,13 @@ pub mod renderer;
 #[cfg(feature = "terminal-tui")]
 pub mod tui;
 
-use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, ToolCallNotification, apply_compaction_patch_exact,
-    build_configurable_compaction_patch_with_source_history, build_context_with_shared_events_and_scope,
-    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, measure_history_tokens,
-    run_tool_call_loop_traced, select_prompt_skills,
-};
+use crate::agent::compaction::{apply_compaction_patch_exact, build_configurable_compaction_patch_with_source_history};
+use crate::agent::context_budget::measure_history_tokens;
+use crate::agent::context_recall::increment_recalled_useful_counts;
+use crate::agent::document_ingest::DocumentIngestRuntime;
+use crate::agent::runtime_prompt::build_runtime_system_prompt;
+use crate::agent::turn_contracts::{ScopeContext, ToolCallNotification, is_tool_loop_cancelled};
+use crate::agent::turn_engine::run_turn;
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
 use crate::channels::{
@@ -88,19 +90,20 @@ use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, payload_error};
 use crate::llm::route_decision::{
-    ProviderExecutionOutcome, RouteDecision, record_provider_outcome_events as record_raw_provider_outcome_events,
-    record_route_decision_event as record_raw_route_decision_event, route_event_scope,
+    ProviderExecutionOutcome, RouteDecision, record_route_decision_event as record_raw_route_decision_event,
+    route_event_scope,
 };
+#[cfg(test)]
+use crate::memory::MemoryPrincipal;
 use crate::memory::{
-    self, CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata,
-    MemoryVisibility, MessageEventScope,
+    CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryStoreMetadata, MemoryVisibility, MessageEventScope,
 };
 use crate::observability::ObserverEvent;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "terminal-tui")]
 use std::collections::VecDeque;
 use std::io::{IsTerminal as _, Write as _};
@@ -165,14 +168,12 @@ struct DequeuedInputMessage {
 #[derive(Debug, Clone)]
 struct ProviderTurnCompletionEvent {
     task_id: crate::chat::turn_scheduler::TurnTaskId,
+    // Only the TUI completion waiter fills these and only the TUI finalizer
+    // reads them.
+    #[cfg(feature = "terminal-tui")]
     outcome: Option<dispatcher::TurnOutcomeKind>,
+    #[cfg(feature = "terminal-tui")]
     usage: crate::llm::route_decision::TokenUsage,
-}
-
-#[derive(Debug)]
-enum ProviderTurnCompletionRoute {
-    Current(ProviderTurnCompletionEvent),
-    Pending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,8 @@ struct ProviderTurnCompletionContext {
 
 #[cfg(feature = "terminal-tui")]
 struct PerTurnContext {
+    cancellation: CancellationToken,
+    turn_binding: Option<Arc<decision_source::ChatTurnBinding>>,
     task_id: crate::chat::turn_scheduler::TurnTaskId,
     draft_id: String,
     delta_tx: Option<mpsc::Sender<String>>,
@@ -215,12 +218,14 @@ struct PendingOrderedProviderTurnCommit {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "terminal-tui")]
 struct ResolvedProviderTurnCompletion {
     outcome: Option<dispatcher::TurnOutcomeKind>,
     usage: crate::llm::route_decision::TokenUsage,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "terminal-tui")]
 enum ProviderTurnTerminalPlan {
     Completed {
         final_text: String,
@@ -243,6 +248,7 @@ enum ProviderTurnTerminalPlan {
     },
 }
 
+#[cfg(feature = "terminal-tui")]
 #[derive(Debug, Clone)]
 struct ProviderTurnFinalizerEvent {
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -250,6 +256,7 @@ struct ProviderTurnFinalizerEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "terminal-tui")]
 struct ProviderTurnFinalizerResult {
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     terminal_status: &'static str,
@@ -265,6 +272,7 @@ struct ProviderTurnVisibleAdmission {
     can_start_visible: bool,
 }
 
+#[cfg(feature = "terminal-tui")]
 enum ProviderTurnTerminalGate<'a> {
     Completed {
         history_commit_len: usize,
@@ -538,12 +546,14 @@ fn copy_success_message(selection: &CopySelection) -> String {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn mouse_capture_disabled_by_env(value: Option<&str>) -> bool {
     value
         .map(str::trim)
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
+#[cfg(feature = "terminal-tui")]
 fn mouse_capture_enabled_by_env(disable_value: Option<&str>) -> bool {
     if mouse_capture_disabled_by_env(disable_value) {
         return false;
@@ -679,10 +689,10 @@ fn manual_compact_below_trigger_threshold(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> bool {
-    !crate::agent::loop_::plan_context_budget(
+    !crate::agent::context_budget::plan_context_budget(
         history,
         compaction_config,
-        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
     )
     .over_hard_limit
 }
@@ -715,11 +725,13 @@ fn format_compact_feedback_after_history(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "terminal-tui")]
 struct TuiContextBudgetStatus {
     used_context_tokens: usize,
     max_context_tokens: usize,
 }
 
+#[cfg(feature = "terminal-tui")]
 fn context_budget_status_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
@@ -728,10 +740,10 @@ fn context_budget_status_for_tui(
     if !terminal_tui_enabled {
         return None;
     }
-    let budget = crate::agent::loop_::plan_context_budget(
+    let budget = crate::agent::context_budget::plan_context_budget(
         history,
         compaction_config,
-        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
     );
     Some(TuiContextBudgetStatus {
         used_context_tokens: budget.used_tokens,
@@ -774,7 +786,7 @@ async fn build_chat_compaction_patch(
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
-) -> Option<crate::agent::loop_::CompactionPatch> {
+) -> Option<crate::agent::turn_contracts::CompactionPatch> {
     match build_configurable_compaction_patch_with_source_history(
         budget_history,
         source_history,
@@ -797,7 +809,7 @@ async fn build_chat_compaction_patch(
 fn apply_chat_compaction_patch_and_sync(
     history: &mut Vec<ChatMessage>,
     patch_source_history: Option<&[ChatMessage]>,
-    patch: crate::agent::loop_::CompactionPatch,
+    patch: crate::agent::turn_contracts::CompactionPatch,
     config: &crate::config::AgentCompactionConfig,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
@@ -810,14 +822,18 @@ fn apply_chat_compaction_patch_and_sync(
     } else {
         apply_compaction_patch_exact(history, &patch);
     }
-    let budget =
-        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    let budget = crate::agent::context_budget::plan_context_budget(
+        history,
+        config,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+    );
     if budget.over_hard_limit {
-        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-            history,
-            config,
-            replacement_len,
-        );
+        let trimmed =
+            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                history,
+                config,
+                replacement_len,
+            );
         tracing::warn!(
             used_tokens = budget.used_tokens,
             hard_limit = budget.available_input_tokens,
@@ -938,7 +954,7 @@ async fn persist_legacy_chat_compaction_audit(
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
     let source_message_count = source_history.len();
-    let provenance = match crate::agent::loop_::resolve_compaction_event_provenance(
+    let provenance = match crate::agent::compaction::resolve_compaction_event_provenance(
         mem,
         envelope.memory_principal(),
         source_history,
@@ -1265,7 +1281,9 @@ async fn kill_local_session(
             #[cfg(feature = "terminal-tui")]
             {
                 return match chat_sessions.kill_pty(seq).await {
-                    Ok(()) => format!("Killed interactive PTY session #{seq} (process group terminated)."),
+                    Ok(()) => {
+                        format!("Killed interactive PTY session #{seq} (process group terminated).")
+                    }
                     Err(e) => format!("Kill failed: {e}"),
                 };
             }
@@ -1660,6 +1678,7 @@ mod session_cleanup_tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -1863,7 +1882,7 @@ fn surface_session_message(dispatcher: &dispatcher::ChatDispatcher, redraw_tx: O
     }
 }
 
-#[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
+#[cfg(feature = "terminal-tui")]
 fn surface_active_turn_message(
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
@@ -1904,7 +1923,7 @@ fn spawn_daemon_session_request(
     let guard =
         crate::chat::sessions::daemon::register_in_flight(in_flight, &request, endpoint.base_url(), cancel.clone());
     // Built before `request` is consumed by the call below.
-    let cancelled = crate::chat::sessions::daemon::cancelled_notice(&request, endpoint.base_url());
+    let cancelled = crate::chat::sessions::daemon::cancelled_notice(&request, &endpoint.shown_url());
     let dispatcher = dispatcher.clone();
     let redraw_tx = redraw_tx.cloned();
     tokio::spawn(async move {
@@ -1985,7 +2004,7 @@ fn start_daemon_session_command(
         _ => return None,
     };
     let endpoint = crate::chat::sessions::daemon::endpoint(control.config);
-    let notice = crate::chat::sessions::daemon::pending_notice(&request, endpoint.base_url());
+    let notice = crate::chat::sessions::daemon::pending_notice(&request, &endpoint.shown_url());
     spawn_daemon_session_request(
         request,
         endpoint,
@@ -2129,6 +2148,7 @@ async fn withdraw_assignment_enrolment(
 }
 
 /// Whether an action is one of the three `--daemon`-scoped variants.
+#[cfg(feature = "terminal-tui")]
 const fn is_daemon_session_command(action: &crate::chat::sessions::SessionCommand) -> bool {
     matches!(
         action,
@@ -2388,6 +2408,45 @@ mod runtime_display_tests {
         );
     }
 
+    /// A user turn that opens with one of the loop's reserved markers enters the
+    /// provider history as the user's text, never as a loop note: both the
+    /// current turn and a stored earlier turn come out defused (no longer
+    /// opening with the marker) and with the user's words intact.
+    ///
+    /// Red before the reserved-marker hardening: both kept the marker at the
+    /// start, so the recall query and the preflight floor skipped them.
+    #[test]
+    fn a_user_turn_opening_with_a_reserved_marker_enters_history_defused() {
+        for marker in [
+            "[Tool results]",
+            "[Post-compaction context refresh]",
+            "[Recalled context from earlier in this session]",
+        ] {
+            let earlier = format!("{marker} an earlier question");
+            let current = format!("{marker} what about X?");
+            let mut session = session::ChatSession::new("provider", "model");
+            session.add_user_turn(&earlier);
+            session.add_assistant_turn("an answer", Vec::new());
+            let history = persisted_history_for_current_turn(&session, "system", &current);
+            let users: Vec<&str> = history
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+                .collect();
+            assert_eq!(users.len(), 2, "{marker}: {users:?}");
+            for (content, text) in users.iter().zip([&earlier, &current]) {
+                assert!(
+                    !content.starts_with(marker),
+                    "{marker}: `{content}` still reads as a loop note"
+                );
+                assert!(
+                    content.ends_with(text.as_str()),
+                    "{marker}: `{content}` lost the user's words"
+                );
+            }
+        }
+    }
+
     #[test]
     fn copy_command_selects_latest_and_numbered_assistant_turns() {
         let mut session = session::ChatSession::new("provider", "model");
@@ -2435,6 +2494,7 @@ mod runtime_display_tests {
         );
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn mouse_capture_disable_env_parser_is_explicit() {
         for enabled in ["1", "true", "TRUE", "yes", "on", " on "] {
@@ -2937,11 +2997,11 @@ mod compact_command_tests {
         .expect("budget-overflowing enriched history should produce a persisted-source patch");
 
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&persisted_history, &patch.guard),
+            crate::agent::compaction::compaction_patch_guard_matches(&persisted_history, &patch.guard),
             "patch guard must match the persisted reducer mirror"
         );
         assert!(
-            !crate::agent::loop_::compaction_patch_guard_matches(&enriched_history, &patch.guard),
+            !crate::agent::compaction::compaction_patch_guard_matches(&enriched_history, &patch.guard),
             "pre-fix enriched guard source would miss once tool/internal messages exist"
         );
 
@@ -3002,10 +3062,12 @@ mod compact_command_tests {
 /// Off/Both/Redux staged-rollout modes were retired once v0.4.0 was accepted; `PRX_CHAT_REDUX` is
 /// still read once to warn, but it no longer changes the run path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "terminal-tui")]
 pub(crate) enum ReduxMode {
     Pure,
 }
 
+#[cfg(feature = "terminal-tui")]
 impl ReduxMode {
     /// Read the retired `PRX_CHAT_REDUX` env only to warn operators when a
     /// stale deployment still tries to select a legacy mode.
@@ -3020,199 +3082,6 @@ impl ReduxMode {
             }
         }
         Self::Pure
-    }
-
-    #[must_use]
-    pub(crate) const fn is_pure(self) -> bool {
-        true
-    }
-}
-
-/// Routing result for an LLM turn of the chat::run main loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // With Off / the TUI disabled, not every variant is necessarily referenced
-pub(crate) enum TurnRoute {
-    /// Non-TUI fallback still uses the shared agent loop.
-    LegacyToolLoop,
-    /// Terminal TUI uses reducer/driver single route.
-    ReduxDriver,
-}
-
-#[cfg(feature = "terminal-tui")]
-#[must_use]
-pub(crate) const fn route_turn(_mode: ReduxMode) -> TurnRoute {
-    TurnRoute::ReduxDriver
-}
-
-#[cfg(not(feature = "terminal-tui"))]
-#[must_use]
-#[allow(dead_code)]
-pub(crate) const fn route_turn(_mode: ()) -> TurnRoute {
-    TurnRoute::LegacyToolLoop
-}
-
-/// P1-2: cumulative difference counter for Both mode.
-///
-/// Incremented every time `log_redux_key_diff` detects a semantic difference between the old-path
-/// dispatch and the new-path Effect. Tests can read it through [`redux_diff_count`] to assert that
-/// both paths behaved identically during the dual-write period (expected 0).
-#[cfg(feature = "terminal-tui")]
-static REDUX_DIFF_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Read the cumulative number of reconciliation differences in Both mode (for test assertions).
-#[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
-pub fn redux_diff_count() -> u64 {
-    REDUX_DIFF_COUNT.load(Ordering::Relaxed)
-}
-
-/// Reset the reconciliation difference counter (for isolation between tests).
-#[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
-pub fn reset_redux_diff_count() {
-    REDUX_DIFF_COUNT.store(0, Ordering::Relaxed);
-}
-
-/// In Both mode, log the differences between the old-path dispatch and the reducer Effect list
-/// (tracing::debug + counter).
-///
-/// Used for Step 2 dual-write reconciliation: if a key control flow (Quit / Submit) produces
-/// different output on the two sides, this log highlights it in the PTY test logs and
-/// `REDUX_DIFF_COUNT` += 1 for test assertions. Removed once Step 5 deletes the old path.
-///
-/// P2-5: adds field-level comparison — detecting Quit semantic differences (old path Exit vs new
-/// path Quit) and Submitted semantic differences (old path Submitted vs new path containing
-/// LogTrace).
-#[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
-fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
-    use state::Effect;
-    let old_kind = match old {
-        tui::KeyDispatch::Submitted(_) => "Submitted",
-        tui::KeyDispatch::Exit => "Exit",
-        tui::KeyDispatch::InterruptTurn => "InterruptTurn",
-        tui::KeyDispatch::Cancelled => "Cancelled",
-        tui::KeyDispatch::Consumed => "Consumed",
-        tui::KeyDispatch::Ignored => "Ignored",
-        // v1.1b switcher/focus control flow — treated as consumed-equivalent for
-        // the legacy redux-diff comparison (they neither submit nor quit).
-        tui::KeyDispatch::SwitcherOpened { .. } => "SwitcherOpened",
-        tui::KeyDispatch::SwitcherMoved { .. } => "SwitcherMoved",
-        tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
-        tui::KeyDispatch::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
-        tui::KeyDispatch::SavedSessionPickerClosed => "SavedSessionPickerClosed",
-        tui::KeyDispatch::ResumeSavedSession { .. } => "ResumeSavedSession",
-        tui::KeyDispatch::AttachSession { .. } => "AttachSession",
-        tui::KeyDispatch::RequestDetach => "RequestDetach",
-        tui::KeyDispatch::ScrollTranscriptUp => "ScrollTranscriptUp",
-        tui::KeyDispatch::ScrollTranscriptDown => "ScrollTranscriptDown",
-        tui::KeyDispatch::PageTranscriptUp => "PageTranscriptUp",
-        tui::KeyDispatch::PageTranscriptDown => "PageTranscriptDown",
-        tui::KeyDispatch::TranscriptHome => "TranscriptHome",
-        tui::KeyDispatch::TranscriptEnd => "TranscriptEnd",
-        tui::KeyDispatch::ScrollSessionUp => "ScrollSessionUp",
-        tui::KeyDispatch::ScrollSessionDown => "ScrollSessionDown",
-        tui::KeyDispatch::PageSessionUp => "PageSessionUp",
-        tui::KeyDispatch::PageSessionDown => "PageSessionDown",
-        tui::KeyDispatch::SessionHome => "SessionHome",
-        tui::KeyDispatch::SessionEnd => "SessionEnd",
-        tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
-        tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
-        tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
-        tui::KeyDispatch::OpenProviderWorkerView { .. } => "OpenProviderWorkerView",
-        tui::KeyDispatch::CloseProviderWorkerView => "CloseProviderWorkerView",
-        tui::KeyDispatch::CloseDiffViewer => "CloseDiffViewer",
-        tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
-        tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
-        tui::KeyDispatch::ModeChanged(_) => "ModeChanged",
-    };
-    let new_kinds: Vec<&'static str> = new_effects
-        .iter()
-        .map(|e| match e {
-            Effect::Quit => "Quit",
-            Effect::RequestRedraw => "RequestRedraw",
-            Effect::LogTrace { .. } => "LogTrace",
-            Effect::StartTurn { .. } => "StartTurn",
-            Effect::SaveSession(_) => "SaveSession",
-            Effect::SendDraftFinalize { .. } => "SendDraftFinalize",
-            Effect::CancelDraft(_) => "CancelDraft",
-            Effect::CancelToken(_) => "CancelToken",
-            Effect::EmitChannelMessage(_) => "EmitChannelMessage",
-            Effect::PersistToMemory { .. } => "PersistToMemory",
-            Effect::NotifyHook { .. } => "NotifyHook",
-            Effect::DisplayMedia { .. } => "DisplayMedia",
-            Effect::AutoTitleSession(_) => "AutoTitleSession",
-            Effect::RequestApproval { .. } => "RequestApproval",
-            Effect::ResolveApproval { .. } => "ResolveApproval",
-            Effect::SurfaceNotice { .. } => "SurfaceNotice",
-        })
-        .collect();
-
-    // P1-2 + P2-5: field-level semantic difference detection — compare whether the key control-flow
-    // classifications agree.
-    // Differences are defined as:
-    //   1. old path Exit (Ctrl+D on an empty buffer) but the new path has no Quit
-    //   2. old path has no Exit, but the new path has Quit (the reducer detected a double Ctrl+C or
-    //      Ctrl+D)
-    //   3. old path Submitted, but the new path has no LogTrace (the InputSubmitted path did not fire)
-    let new_has_quit = new_effects.iter().any(|e| matches!(e, Effect::Quit));
-    let new_has_log_trace = new_effects.iter().any(|e| matches!(e, Effect::LogTrace { .. }));
-
-    let is_diff = match old {
-        tui::KeyDispatch::Exit => !new_has_quit,
-        tui::KeyDispatch::Submitted(_) => !new_has_log_trace,
-        // Ctrl+C → InterruptTurn in old path; new path either returns [] or Quit.
-        // Only count it as a difference when the new path unexpectedly produces Quit while the old
-        // path has no Exit semantics.
-        tui::KeyDispatch::InterruptTurn
-        | tui::KeyDispatch::Cancelled
-        | tui::KeyDispatch::Consumed
-        | tui::KeyDispatch::Ignored
-        | tui::KeyDispatch::SwitcherOpened { .. }
-        | tui::KeyDispatch::SwitcherMoved { .. }
-        | tui::KeyDispatch::SwitcherClosed
-        | tui::KeyDispatch::SavedSessionPickerMoved { .. }
-        | tui::KeyDispatch::SavedSessionPickerClosed
-        | tui::KeyDispatch::ResumeSavedSession { .. }
-        | tui::KeyDispatch::AttachSession { .. }
-        | tui::KeyDispatch::RequestDetach
-        | tui::KeyDispatch::ScrollTranscriptUp
-        | tui::KeyDispatch::ScrollTranscriptDown
-        | tui::KeyDispatch::PageTranscriptUp
-        | tui::KeyDispatch::PageTranscriptDown
-        | tui::KeyDispatch::TranscriptHome
-        | tui::KeyDispatch::TranscriptEnd
-        | tui::KeyDispatch::ScrollSessionUp
-        | tui::KeyDispatch::ScrollSessionDown
-        | tui::KeyDispatch::PageSessionUp
-        | tui::KeyDispatch::PageSessionDown
-        | tui::KeyDispatch::SessionHome
-        | tui::KeyDispatch::SessionEnd
-        | tui::KeyDispatch::SwitchSession { .. }
-        | tui::KeyDispatch::OpenTranscriptViewer
-        | tui::KeyDispatch::CloseTranscriptViewer
-        | tui::KeyDispatch::OpenProviderWorkerView { .. }
-        | tui::KeyDispatch::CloseProviderWorkerView
-        | tui::KeyDispatch::CloseDiffViewer
-        | tui::KeyDispatch::ExternalEditorRequested
-        | tui::KeyDispatch::ToolApprovalDecision { .. }
-        | tui::KeyDispatch::ModeChanged(_) => new_has_quit,
-    };
-
-    if is_diff {
-        REDUX_DIFF_COUNT.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
-            old_dispatch = old_kind,
-            new_effects = ?new_kinds,
-            diff_count = REDUX_DIFF_COUNT.load(Ordering::Relaxed),
-            "redux:both SEMANTIC DIFF detected"
-        );
-    } else {
-        tracing::debug!(
-            old_dispatch = old_kind,
-            new_effects = ?new_kinds,
-            "redux:both ok"
-        );
     }
 }
 
@@ -3244,13 +3113,14 @@ fn chat_session_id_from_key(chat_session_key: &str) -> &str {
 /// it does not feed the durable `session_key`. The legacy `chat:{id}` key is
 /// carried for read-merge so pre-cutover history stays visible.
 fn chat_message_event_scope(
+    workspace_id: &str,
     chat_session_key: &str,
     chat_run_id: &str,
     provider_name: &str,
     model_name: &str,
 ) -> MessageEventScope {
     let chat_session_id = chat_session_id_from_key(chat_session_key);
-    RuntimeEnvelope::chat_canonical("workspace", chat_session_id, MemoryVisibility::Workspace)
+    RuntimeEnvelope::chat_canonical(workspace_id, chat_session_id, MemoryVisibility::Workspace)
         .with_recipient(format!("{provider_name}/{model_name}"))
         .with_run_id(chat_run_id.to_string())
         .message_scope()
@@ -3265,14 +3135,7 @@ fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeE
         .with_recipient("terminal:user")
 }
 
-fn chat_runtime_write_context(envelope: &RuntimeEnvelope) -> crate::memory::principal::MemoryWriteContext {
-    envelope.memory_write_context("private")
-}
-
-fn chat_runtime_principal(envelope: &RuntimeEnvelope) -> MemoryPrincipal {
-    envelope.memory_principal()
-}
-
+#[cfg(test)]
 async fn record_chat_user_message_event(
     memory_fabric: &MemoryFabric,
     chat_session: &session::ChatSession,
@@ -3283,30 +3146,49 @@ async fn record_chat_user_message_event(
     turn_seq: u64,
     user_input: &str,
 ) -> anyhow::Result<crate::memory::MessageEvent> {
-    memory_fabric
-        .record_inbound_user_message(
-            chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name),
-            sanitize::sanitize_for_persistence(user_input),
-            Some(format!("chat:{}:{chat_run_id}:{turn_seq}:user", chat_session.id)),
-            None,
-        )
-        .await
+    record_chat_user_message_event_in_generation(
+        memory_fabric,
+        chat_session,
+        chat_session_key,
+        chat_run_id,
+        provider_name,
+        model_name,
+        turn_seq,
+        user_input,
+        None,
+    )
+    .await
 }
 
-async fn record_chat_assistant_message_event(
+#[cfg(test)]
+async fn record_chat_user_message_event_in_generation(
     memory_fabric: &MemoryFabric,
+    chat_session: &session::ChatSession,
     chat_session_key: &str,
     chat_run_id: &str,
     provider_name: &str,
     model_name: &str,
-    response: &str,
+    turn_seq: u64,
+    user_input: &str,
+    generation: Option<&crate::config::ConfigGeneration>,
 ) -> anyhow::Result<crate::memory::MessageEvent> {
+    let mut scope = chat_message_event_scope(
+        memory_fabric.workspace_id(),
+        chat_session_key,
+        chat_run_id,
+        provider_name,
+        model_name,
+    );
+    if let Some(generation) = generation {
+        scope.config_generation_id = Some(generation.id.0);
+        scope.config_source_revision = Some(generation.source_revision.fingerprint_sha256.clone());
+    }
     memory_fabric
-        .record_assistant_message(
-            chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name)
-                .with_sender(format!("{provider_name}/{model_name}"))
-                .with_recipient("local-user"),
-            sanitize::sanitize_for_persistence(response),
+        .record_inbound_user_message(
+            scope,
+            sanitize::sanitize_for_persistence(user_input),
+            Some(format!("chat:{}:{chat_run_id}:{turn_seq}:user", chat_session.id)),
+            None,
         )
         .await
 }
@@ -3320,23 +3202,15 @@ async fn record_route_decision_event(
     record_raw_route_decision_event(fabric, scope, &sanitized).await
 }
 
-async fn record_provider_outcome_events(
-    fabric: &MemoryFabric,
-    scope: MessageEventScope,
-    outcome: &ProviderExecutionOutcome,
-) -> anyhow::Result<()> {
-    let sanitized = sanitize::sanitize_json_structure(outcome)?;
-    record_raw_provider_outcome_events(fabric, scope, &sanitized).await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn finalize_chat_success_turn(
+    turn_binding: Option<&decision_source::ChatTurnBinding>,
     fabric: &MemoryFabric,
-    chat_session_key: &str,
+    _chat_session_key: &str,
     chat_run_id: &str,
     provider_name: &str,
     model_name: &str,
-    route_scope: MessageEventScope,
+    _route_scope: MessageEventScope,
     provider_outcome: ProviderExecutionOutcome,
     recorded_response: Option<String>,
     history_commit_len: usize,
@@ -3344,76 +3218,108 @@ async fn finalize_chat_success_turn(
     cost_config: &crate::config::schema::CostConfig,
     workspace_dir: &std::path::Path,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+    let binding = turn_binding.context("chat terminal binding is missing")?;
+    let decision = binding
+        .settlement_ref(chat_run_id)?
+        .context("chat terminal decision has not been issued")?;
+    let route_scope = binding.envelope().message_scope();
+
+    // `finalize_turn` redacts the reply and the provider outcome before it
+    // persists them, for chat as for every other surface.
     let history = recorded_response.map(|assistant_content| crate::agent::terminal::TurnHistoryProjection {
         assistant_content,
         history_commit_len,
     });
     let history_scope = history.as_ref().map(|_| {
-        chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name)
+        route_scope
+            .clone()
             .with_sender(format!("{provider_name}/{model_name}"))
             .with_recipient("local-user")
     });
-    crate::agent::terminal::finalize_turn(
-        fabric,
-        crate::agent::terminal::TurnTerminalCommit {
-            terminal_id: chat_run_id.to_string(),
-            scope: route_scope,
-            status: crate::agent::terminal::TurnTerminalStatus::Completed,
-            history,
-            history_scope,
-            provider_outcome: Some(provider_outcome.clone()),
-            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                summary: summary.to_string(),
-                started_at: provider_outcome.started_at,
-                finished_at: provider_outcome.finished_at,
+    let receipt = binding
+        .commit_terminal(
+            fabric,
+            crate::agent::terminal::TurnTerminalDraft {
+                decision: Some(decision),
+                terminal_id: chat_run_id.to_string(),
+                scope: route_scope,
+                status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                history,
+                history_scope,
+                provider_outcome: Some(provider_outcome.clone()),
+                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                    summary: summary.to_string(),
+                    started_at: provider_outcome.started_at,
+                    finished_at: provider_outcome.finished_at,
+                },
+                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                    target: "terminal:local-user".to_string(),
+                },
             },
-            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
-                target: "terminal:local-user".to_string(),
-            },
-        },
-        cost_config,
-        workspace_dir,
-    )
-    .await
+            cost_config,
+            workspace_dir,
+        )
+        .await?;
+    binding.rejoin_terminal(chat_run_id).await?;
+    Ok(receipt)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn finalize_chat_non_success_turn(
+    turn_binding: Option<&decision_source::ChatTurnBinding>,
     fabric: &MemoryFabric,
     chat_run_id: &str,
-    route_scope: MessageEventScope,
+    _route_scope: MessageEventScope,
     status: crate::agent::terminal::TurnTerminalStatus,
     provider_outcome: Option<ProviderExecutionOutcome>,
     started_at: chrono::DateTime<chrono::Utc>,
     summary: &str,
     cost_config: &crate::config::schema::CostConfig,
     workspace_dir: &std::path::Path,
-) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+) -> anyhow::Result<()> {
+    let binding = turn_binding.context("chat terminal binding is missing")?;
+    let Some(decision) = binding.settlement_ref(chat_run_id)? else {
+        anyhow::ensure!(
+            provider_outcome.is_none(),
+            "pre-decision failure cannot settle a provider outcome"
+        );
+        return binding
+            .record_predecision_failure(fabric, chat_run_id, status, summary)
+            .await;
+    };
+    let route_scope = binding.envelope().message_scope();
+
+    // `finalize_turn` redacts the provider outcome (with its error text)
+    // before it persists it.
     let finished_at = provider_outcome
         .as_ref()
         .map_or_else(chrono::Utc::now, |outcome| outcome.finished_at);
-    crate::agent::terminal::finalize_turn(
-        fabric,
-        crate::agent::terminal::TurnTerminalCommit {
-            terminal_id: chat_run_id.to_string(),
-            scope: route_scope,
-            status,
-            history: None,
-            history_scope: None,
-            provider_outcome,
-            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                summary: summary.to_string(),
-                started_at,
-                finished_at,
+    binding
+        .commit_terminal(
+            fabric,
+            crate::agent::terminal::TurnTerminalDraft {
+                decision: Some(decision),
+                terminal_id: chat_run_id.to_string(),
+                scope: route_scope,
+                status,
+                history: None,
+                history_scope: None,
+                provider_outcome,
+                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                    summary: summary.to_string(),
+                    started_at,
+                    finished_at,
+                },
+                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress {
+                    reason: summary.to_string(),
+                },
             },
-            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress {
-                reason: summary.to_string(),
-            },
-        },
-        cost_config,
-        workspace_dir,
-    )
-    .await
+            cost_config,
+            workspace_dir,
+        )
+        .await?;
+    binding.rejoin_terminal(chat_run_id).await?;
+    Ok(())
 }
 
 fn sanitize_chat_semantic_memory_content(content: &str) -> String {
@@ -3423,7 +3329,7 @@ fn sanitize_chat_semantic_memory_content(content: &str) -> String {
 /// Aggregate the model's reasoning/thinking content from the turn's history
 /// slice. The agent loop encodes assistant turns that carried reasoning as a
 /// JSON object containing `{"reasoning_content": "..."}` (see
-/// `build_native_assistant_history` in `agent/loop_.rs`). We pull those out
+/// `build_native_assistant_history` in `agent/history.rs`). We pull those out
 /// and join them with blank-line separators so the TUI can render a single
 /// foldable card per turn.
 ///
@@ -3457,6 +3363,7 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 // ── P3-2 / alt-screen Phase 0: TerminalGuard RAII + panic restore ────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "terminal-tui")]
 struct ChatTuiSelection {
     enabled: bool,
 }
@@ -3477,6 +3384,7 @@ struct TerminalGuardState {
 }
 
 impl TerminalGuardState {
+    #[cfg(feature = "terminal-tui")]
     const fn inactive() -> Self {
         Self {
             raw_mode_active: false,
@@ -3489,15 +3397,21 @@ impl TerminalGuardState {
 }
 
 trait TerminalModeOps {
+    #[cfg(feature = "terminal-tui")]
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn disable_raw_mode(&mut self) -> std::io::Result<()>;
+    #[cfg(feature = "terminal-tui")]
     fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool>;
+    #[cfg(feature = "terminal-tui")]
     fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
     fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
+    #[cfg(feature = "terminal-tui")]
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    #[cfg(feature = "terminal-tui")]
     fn enable_mouse_capture(&mut self) -> std::io::Result<()>;
     fn disable_mouse_capture(&mut self) -> std::io::Result<()>;
+    #[cfg(feature = "terminal-tui")]
     fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
     fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
     fn show_cursor(&mut self) -> std::io::Result<()>;
@@ -3505,6 +3419,7 @@ trait TerminalModeOps {
 
 struct CrosstermTerminalModeOps;
 
+#[cfg(feature = "terminal-tui")]
 fn chat_keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
     // Crossterm 0.29 does not expose kitty's REPORT_ASSOCIATED_TEXT flag.
     // REPORT_ALL_KEYS_AS_ESCAPE_CODES without associated text causes IME
@@ -3517,6 +3432,7 @@ fn chat_keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFla
 }
 
 impl TerminalModeOps for CrosstermTerminalModeOps {
+    #[cfg(feature = "terminal-tui")]
     fn enable_raw_mode(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()
     }
@@ -3525,10 +3441,12 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
         crossterm::terminal::disable_raw_mode()
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool> {
         crossterm::terminal::supports_keyboard_enhancement()
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
         let flags = chat_keyboard_enhancement_flags();
         crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(flags)).map(|_| ())
@@ -3538,6 +3456,7 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
         crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags).map(|_| ())
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).map(|_| ())
     }
@@ -3546,6 +3465,7 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste).map(|_| ())
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn enable_mouse_capture(&mut self) -> std::io::Result<()> {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).map(|_| ())
     }
@@ -3554,6 +3474,7 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture).map(|_| ())
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen).map(|_| ())
     }
@@ -3570,11 +3491,13 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_MOUSE_CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "terminal-tui")]
 fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
     let mouse_enabled = mouse_capture_enabled_by_env(std::env::var("PRX_TUI_DISABLE_MOUSE").ok().as_deref());
     enter_terminal_state_with_ops_inner(ops, mouse_enabled)
 }
 
+#[cfg(feature = "terminal-tui")]
 fn enter_terminal_state_with_ops_inner(
     ops: &mut impl TerminalModeOps,
     mouse_enabled: bool,
@@ -3707,6 +3630,7 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    #[cfg(feature = "terminal-tui")]
     pub(crate) fn enter() -> Result<Self> {
         let mut ops = CrosstermTerminalModeOps;
         let state = enter_terminal_state_with_ops(&mut ops)
@@ -3868,13 +3792,7 @@ impl Drop for TracingChatGuard {
 
 /// Compute `~/.openprx/` (or `$HOME/.openprx/`) for the chat log directory.
 fn resolve_chat_log_dir() -> Result<std::path::PathBuf> {
-    if let Some(dirs) = directories::UserDirs::new() {
-        return Ok(dirs.home_dir().join(".openprx"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(std::path::PathBuf::from(home).join(".openprx"));
-    }
-    anyhow::bail!("cannot determine home directory for chat.log")
+    crate::config::default_openprx_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory for chat.log"))
 }
 
 /// Redirect the global `tracing` writer to `~/.openprx/chat.log` so
@@ -3946,26 +3864,190 @@ fn initial_chat_dispatcher_state(
     state
 }
 
-/// Return the root credential and URL only when the selected provider is the
-/// provider those values were configured for. A CLI provider override must
-/// resolve its own auth profile instead of inheriting the default provider's
-/// secret (or a local provider's placeholder credential).
-const fn configured_provider_connection<'a>(
-    selected_provider: &str,
-    configured_provider: &str,
-    api_key: Option<&'a str>,
-    api_url: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
-    if selected_provider.eq_ignore_ascii_case(configured_provider) {
-        (api_key, api_url)
-    } else {
-        (None, None)
-    }
+/// Check a `/model <name>` switch on the current provider: resolved for chat
+/// through the one selection check, so a model that cannot chat is refused
+/// before the next turn uses it; an id-only model switches with a warning.
+fn chat_model_switch(config: &Config, provider_name: &str, model_name: &str) -> Result<()> {
+    providers::selection::check(
+        config,
+        provider_name,
+        model_name,
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    Ok(())
+}
+
+/// Build the chat provider chain for `provider_name`.
+///
+/// Shared by startup and `/provider`. The selection and every model route
+/// are resolved for chat first, so a model that cannot chat is refused before
+/// any provider exists. The root credential and base URL are released only
+/// when the selection is the configured provider's identity (any spelling of
+/// it, `providers::configured_connection_for`), and the rotation keys in
+/// `reliability.api_keys` follow them, because they are extra credentials for
+/// that same root key.
+fn chat_provider_chain<'a>(
+    config: &'a Config,
+    provider_name: &str,
+    configured_provider_name: &str,
+    model_name: &str,
+    options: &providers::ProviderRuntimeOptions,
+) -> Result<(providers::ProviderConnection<'a>, Box<dyn Provider>)> {
+    let catalog = providers::selection::catalog_for(config);
+    providers::selection::check_with(
+        config,
+        &catalog,
+        provider_name,
+        model_name,
+        providers::selection::credential_for(config, provider_name),
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    providers::selection::check_routes(config, &catalog, providers::catalog::UnknownPolicy::Invocation)?;
+    let connection = providers::configured_connection_for(
+        provider_name,
+        configured_provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+    );
+    let reliability = providers::scoped_reliability(&config.reliability, &connection);
+    let provider = providers::create_routed_provider_with_options(
+        provider_name,
+        connection.api_key,
+        connection.api_url,
+        &reliability,
+        &config.model_routes_with_references(),
+        model_name,
+        options,
+    )?;
+    Ok((connection, provider))
 }
 
 #[cfg(test)]
 mod provider_connection_tests {
-    use super::configured_provider_connection;
+    use super::{chat_model_switch, chat_provider_chain};
+    use crate::config::Config;
+    use crate::providers::configured_connection_for as configured_provider_connection;
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    const ROOT_SENTINEL: &str = "C0-CHAT-ROOT-SENTINEL";
+    const ROTATION_SENTINEL: &str = "C0-CHAT-ROTATION-SENTINEL";
+
+    fn isolated_config(temp: &tempfile::TempDir) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.default_provider = Some("openai".to_string());
+        config.api_key = Some(ROOT_SENTINEL.to_string());
+        config.api_url = None;
+        config.model_routes = Vec::new();
+        config.reliability.fallback_providers = Vec::new();
+        config.reliability.api_keys = vec![ROTATION_SENTINEL.to_string()];
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        config.auth.codex_auth_json_auto_import = false;
+        config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+        config
+    }
+
+    fn declare_decision_only(config: &mut Config, provider: &str) {
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = \"{provider}\"\nmodel = \"jev-decision-test\"\noperations = [\"decision_endpoint\"]\n"
+            ))
+            .expect("test: declaration"),
+        );
+    }
+
+    /// PMM-C: an alias of the configured provider is that provider, so it
+    /// keeps the root key (chat used to compare spellings).
+    #[test]
+    fn an_alias_of_the_configured_provider_keeps_its_connection() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let mut config = isolated_config(&temp);
+        config.default_provider = Some("anthropic".to_string());
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+        let (connection, _provider) =
+            chat_provider_chain(&config, "claude-code", "anthropic", "claude-sonnet-4", &options)
+                .expect("test: the alias builds");
+        assert!(connection.released, "claude-code is anthropic");
+        assert_eq!(connection.api_key, Some(ROOT_SENTINEL));
+    }
+
+    /// PMM-C: `prx chat -p` and `/provider` refuse a model that cannot chat
+    /// before any provider exists, and `/model` refuses it on the current
+    /// provider.
+    #[tokio::test]
+    async fn a_decision_only_model_is_refused_by_every_chat_switch() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start().await;
+        let mut config = isolated_config(&temp);
+        declare_decision_only(&mut config, &probe.custom_provider());
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+        let Err(error) = chat_provider_chain(
+            &config,
+            &probe.custom_provider(),
+            "openai",
+            "jev-decision-test",
+            &options,
+        ) else {
+            panic!("a decision-only model built the chat chain");
+        };
+        assert!(format!("{error:#}").contains("cannot be used for chat"), "{error:#}");
+        let error = chat_model_switch(&config, &probe.custom_provider(), "jev-decision-test")
+            .expect_err("`/model` accepted a decision-only model");
+        assert!(format!("{error:#}").contains("cannot be used for chat"), "{error:#}");
+        assert!(probe.requests().is_empty(), "nothing is sent");
+        chat_model_switch(&config, &probe.custom_provider(), "a-chat-model").expect("an id-only model still switches");
+    }
+
+    /// `prx chat -p <other>` and `/provider <other>`: the rotation keys stay
+    /// with the configured provider. The endpoint throttles its first request,
+    /// which is when a chain rotates to its next keyed member.
+    #[tokio::test]
+    async fn a_chat_provider_override_does_not_receive_the_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let config = isolated_config(&temp);
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+
+        let (connection, provider) =
+            chat_provider_chain(&config, &probe.custom_provider(), "openai", PROBE_MODEL, &options)
+                .expect("test: a keyless custom endpoint builds");
+        let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
+
+        assert_eq!(connection.api_key, None);
+        assert!(
+            !connection.released,
+            "an override cannot grant root connection provenance"
+        );
+        assert!(!probe.requests().is_empty());
+        assert!(
+            !probe.saw(ROTATION_SENTINEL),
+            "a rotation key reached a chat provider override"
+        );
+        assert!(!probe.saw(ROOT_SENTINEL));
+    }
+
+    /// Guard: the configured provider keeps its key and its rotation keys.
+    #[tokio::test]
+    async fn the_configured_chat_provider_keeps_its_rotation_keys() {
+        let temp = tempfile::tempdir().expect("test: temp config dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429]).await;
+        let mut config = isolated_config(&temp);
+        let configured = probe.custom_provider();
+        config.default_provider = Some(configured.clone());
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+
+        let (_connection, provider) = chat_provider_chain(&config, &configured, &configured, PROBE_MODEL, &options)
+            .expect("test: the configured endpoint builds");
+        let reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
+
+        assert!(reply.is_ok(), "the rotated member answers: {reply:?}");
+        assert!(probe.saw(ROOT_SENTINEL));
+        assert!(probe.saw(ROTATION_SENTINEL));
+    }
 
     #[test]
     fn cli_provider_override_does_not_inherit_default_provider_connection() {
@@ -3976,7 +4058,11 @@ mod provider_connection_tests {
                 Some("local-placeholder"),
                 Some("http://127.0.0.1:18083/v1"),
             ),
-            (None, None)
+            crate::providers::ProviderConnection {
+                api_key: None,
+                api_url: None,
+                released: false,
+            }
         );
     }
 
@@ -3989,9 +4075,25 @@ mod provider_connection_tests {
                 Some("local-placeholder"),
                 Some("http://127.0.0.1:18083/v1"),
             ),
-            (Some("local-placeholder"), Some("http://127.0.0.1:18083/v1"))
+            crate::providers::ProviderConnection {
+                api_key: Some("local-placeholder"),
+                api_url: Some("http://127.0.0.1:18083/v1"),
+                released: true,
+            }
         );
     }
+}
+
+/// The one-line banner every chat session opens with:
+/// `prx <version> · provider/model`. A `custom:` URL may carry
+/// `user:password@`, so the provider is printed through the one redaction
+/// helper.
+fn startup_banner(provider_name: &str, model_name: &str) -> String {
+    format!(
+        "prx {} \u{00B7} {}/{model_name}",
+        env!("CARGO_PKG_VERSION"),
+        providers::redact_endpoint_userinfo(provider_name)
+    )
 }
 
 /// Run the interactive chat session with rich terminal UI.
@@ -4086,32 +4188,25 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("chat base tool registry was already taken"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
-    let configured_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let configured_provider_name = providers::selection::default_provider(&config);
     let provider_name = provider_override.as_deref().unwrap_or(configured_provider_name);
 
     let model_name = model_override
         .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
-    providers::validate_provider_model(provider_name, model_name)?;
+        .unwrap_or_else(|| providers::selection::default_model(&config));
 
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
-    let (startup_api_key, startup_api_url) = configured_provider_connection(
+    let (startup_connection, startup_provider) = chat_provider_chain(
+        &config,
         provider_name,
         configured_provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-    );
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
-        provider_name,
-        startup_api_key,
-        startup_api_url,
-        &config.reliability,
-        &config.model_routes,
         model_name,
         &provider_runtime_options,
-    )?);
+    )?;
+    let provider: Arc<dyn Provider> = Arc::from(startup_provider);
+    let mut provider_binding =
+        decision_source::ChatProviderBinding::capture(&ctx.config_generation, &provider, provider_name, model_name)?;
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -4128,10 +4223,15 @@ pub async fn run(
         .await;
 
     // ── Skills ────────────────────────────────────────────────────
-    let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
-    let skills =
-        crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
+    // Computed once, at startup, for the mode the chat TUI streams in. The
+    // agent loop recomputes the same question per turn at the mode that turn
+    // actually runs in, and the two can disagree — a failover chain whose
+    // members are all non-streaming advertises no native tools here and native
+    // tools there. So this flag selects prompt *wording* only; nothing that
+    // depends on the per-turn mode, tool-call syntax above all, may be decided
+    // from it. `TaskSection` is written to that rule.
     let native_tools = provider
         .capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::Streaming)
         .native_tool_calling;
@@ -4194,8 +4294,11 @@ pub async fn run(
         config.workspace_dir.clone(),
         config.multimodal.clone(),
         config.agent.compaction.clone(),
-        config.agents.clone(),
-        config.api_key.clone(),
+        config.agents_with_references().into_owned(),
+        // The spawn fallback is paired with `provider_name` (the `-p` override
+        // when one is given), so it must be the credential released to that
+        // provider, never the configured default's root key.
+        startup_connection.api_key.map(str::to_string),
         provider_runtime_options.clone(),
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
@@ -4207,10 +4310,15 @@ pub async fn run(
     ))
     .with_cost_config(config.cost.clone())
     .with_reliability(config.reliability.clone())
+    .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
+    .with_model_catalog(providers::selection::catalog_for(&config))
+    .with_hint_config(&config)
+    .with_fallback_root_connection(startup_connection.released)
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
-    .with_approval_resolver_factory(approval_resolver_factory);
+    .with_approval_resolver_factory(approval_resolver_factory)
+    .with_process_recovery(config.causal_tree.enabled)?;
     let spawn_tools_handle = spawn_tool.tools_handle();
     let scheduled_input_handle = crate::chat::scheduled_input::ScheduledInputHandle::default();
 
@@ -4262,11 +4370,28 @@ pub async fn run(
     // here means the handle was already set (the spawn tool's tool table never got
     // this full registry) — spawned sub-agents would then run with an incomplete
     // tool set, so surface it instead of swallowing silently.
-    if spawn_tools_handle.set(Arc::clone(&tools_registry)).is_err() {
+    if !spawn_tools_handle.set(&tools_registry) {
         tracing::warn!(
             "sessions_spawn tools registry was already initialized; spawned sub-agents may have an incomplete tool set"
         );
     }
+
+    let turn_decisions = ctx
+        .publish_turn_decisions(
+            Arc::clone(&tools_registry),
+            crate::causal_tree::state::TurnSurfaceKind::Interactive,
+        )
+        .await?;
+    // Keep the publisher alive through every chat task and drain it even when
+    // session setup or an ingress operation returns an error.
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
+        crate::runtime::turn_cleanup::current_tracker().as_ref(),
+        CancellationToken::new(),
+    )?;
+    let chat_result = cleanup.run(async {
+    let child_cleanup = crate::runtime::turn_cleanup::current_tracker()
+        .context("chat cleanup owner missing")?;
+    child_cleanup.retain_service(Arc::clone(&turn_decisions));
 
     // v3a: coordination handle for interactive PTY terminal handoff. Shared with
     // the unified TUI render loop (which parks while a PTY is attached) and the
@@ -4345,10 +4470,7 @@ pub async fn run(
     // The previous multi-line "PRX Chat — ... \n Type /help for commands"
     // hint has moved to the persistent footer instead. `chat_session` is no
     // longer queried for the banner but stays in scope for downstream use.
-    let banner = format!(
-        "prx {} \u{00B7} {provider_name}/{model_name}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let banner = startup_banner(provider_name, model_name);
 
     // ── Conversation history ─────────────────────────────────────
     let mut history = history_for_session_with_system(&chat_session, &config, model_name, &skills, native_tools);
@@ -4397,7 +4519,7 @@ pub async fn run(
     // what makes it go through the ordinary turn machinery rather than a
     // parallel path with its own bugs.
     let assignment_input_tx = input_tx.clone();
-    let (control_tx, mut control_rx) = mpsc::channel(CHAT_CONTROL_CHANNEL_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel::<ChatControlEvent>(CHAT_CONTROL_CHANNEL_CAPACITY);
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &control_tx;
 
@@ -4424,15 +4546,19 @@ pub async fn run(
     // chunks + tool events + signals) while merging deltas through [`StreamChunkCoalescer`] under
     // backpressure, so it cannot grow without bound and OOM.
     let (chat_dispatcher, chat_action_rx) = dispatcher::ChatDispatcher::new();
-    let mut dispatcher_shadow_state =
+    let dispatcher_shadow_state =
         initial_chat_dispatcher_state(provider_name, model_name, shutdown.clone(), &chat_session);
+    // The TUI fields exist only with `terminal-tui`; without it the state is
+    // used as built (no `mut` binding, so feature-less builds do not warn).
     #[cfg(feature = "terminal-tui")]
-    {
-        dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
-        dispatcher_shadow_state.ui.autonomy_level = config.autonomy.level;
-        dispatcher_shadow_state.ui.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
-        dispatcher_shadow_state.ui.saved_sessions_cache = initial_saved_session_entries.clone();
-    }
+    let dispatcher_shadow_state = {
+        let mut state = dispatcher_shadow_state;
+        state.ui.chat_mode = chat_session.mode;
+        state.ui.autonomy_level = config.autonomy.level;
+        state.ui.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
+        state.ui.saved_sessions_cache = initial_saved_session_entries.clone();
+        state
+    };
 
     // Shared dual-write guard (raised by the EffectExecutor in Both/Redux mode; the old path checks
     // the guard to decide whether to skip persistence. It is built even in Off mode, where the old
@@ -4464,15 +4590,6 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &provider_turn_lifecycle_tx;
 
-    // Session-scoped exposure ledgers. Both feed the provider's cacheable
-    // request prefix (the skill section of the system prompt and the `tools`
-    // array), so both are unions over the session rather than per-turn
-    // decisions: the prefix then moves only when the session genuinely reaches
-    // a new capability, not when the user rephrases. `/new` and `/clear` reset
-    // them, because those are the points where the prefix restarts anyway.
-    let session_tool_exposure = crate::tools::intent::SessionToolExposure::new();
-    let mut session_skill_exposure = crate::skills::SessionSkillExposure::new();
-
     // Pick the EffectExecutor mode from the redux mode (TUI feature only)
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
@@ -4496,17 +4613,16 @@ pub async fn run(
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
             tool_tiering: config.tool_tiering.clone(),
-            exposed_tools: session_tool_exposure.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
-        dispatcher::EffectExecutor::new_with_deps(deps)
+        dispatcher::EffectExecutor::new_with_deps(deps).with_cleanup_owner(Arc::clone(&child_cleanup))
     };
     #[cfg(not(feature = "terminal-tui"))]
     let effect_executor = dispatcher::EffectExecutor::new_shadow();
 
     // P0-2 fix: take the redraw_slot Arc up front so redraw_tx can be injected after TUI
-    // initialization completes. The EffectExecutor is consumed by
-    // spawn_dispatcher_task_with_executor, but the Arc is cloned before the spawn, so the real sender
+    // initialization completes. The EffectExecutor is consumed by the dispatcher
+    // spawn (`spawn_dispatcher_task_full`), but the Arc is cloned before the spawn, so the real sender
     // can still be filled in afterwards through this Arc and RequestRedraw really executes.
     #[cfg(feature = "terminal-tui")]
     let executor_redraw_slot = effect_executor.redraw_handle();
@@ -4534,7 +4650,8 @@ pub async fn run(
     // turn completion in the chat::run main loop. After the dispatcher task consumes a terminal action
     // (StreamCompleted/Failed/Cancelled) it calls notify_waiters to wake the waiter.
     // The Off / legacy paths do not read the signal, and building it is very cheap (Arc<Notify>).
-    let turn_signal = dispatcher::TurnCompletionSignal::new();
+    let turn_signal = dispatcher::TurnCompletionSignal::with_turn_cancellation(shutdown.child_token());
+    let _turn_cancellation_guard = turn_signal.cancel_turns_on_exit();
 
     // S4-A Commit 3: build the watch::channel<Arc<UiSnapshot>>; the dispatcher pushes a new snapshot
     // whenever ui_dirty=true. TUI render and child views consume
@@ -4834,10 +4951,10 @@ pub async fn run(
     // Bug #3: the currently effective provider name (owned, mutable). An online `/provider <name>`
     // switch rewrites this value; the top of each loop iteration borrows it as
     // `provider_name: &str`, covering every later use of the provider in the turn (system prompt /
-    // fabric events / snapshot / legacy run_tool_call_loop). Its initial value matches the
+    // fabric events / snapshot / the legacy tool-loop path's run_turn call). Its initial value matches the
     // `provider_name` resolved at startup.
     let mut current_provider_owned: String = provider_name.to_string();
-    // Bug #3: the provider handle (the legacy path's run_tool_call_loop calls `provider.as_ref()`
+    // Bug #3: the provider handle (the legacy tool-loop path's run_turn call uses `provider.as_ref()`
     // directly). On `/provider <name>` this Arc is rebuilt and replaced with the new provider, which
     // is also set into provider_slot (the Redux path).
     let mut provider = provider;
@@ -4880,6 +4997,7 @@ pub async fn run(
     let (provider_completion_tx, mut provider_completion_rx) = mpsc::channel::<ProviderTurnCompletionEvent>(64);
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &provider_completion_tx;
+    #[cfg(feature = "terminal-tui")]
     let mut provider_turn_finalizer_events: std::collections::VecDeque<ProviderTurnFinalizerEvent> =
         std::collections::VecDeque::new();
     let mut pending_provider_completion_events: std::collections::HashMap<
@@ -4971,6 +5089,8 @@ pub async fn run(
     // shutdown). On a tick we poll the registry and surface results via the
     // dispatcher (single source, reaches both render paths), then keep waiting.
     while let Some(input) = loop {
+        turn_signal.ensure_history_commits_healthy()?;
+        #[cfg(feature = "terminal-tui")]
         macro_rules! handle_resume_saved_session_control {
             ($id:expr) => {{
                 let provider_name = current_provider_owned.as_str();
@@ -5002,7 +5122,6 @@ pub async fn run(
                         model_name,
                         skills: &skills,
                         native_tools,
-                        tools_registry: &tools_registry,
                         #[cfg(feature = "terminal-tui")]
                         chat_mirror: &chat_mirror,
                     },
@@ -5057,6 +5176,7 @@ pub async fn run(
             #[cfg(not(feature = "terminal-tui"))]
             break None;
         }
+        #[cfg(feature = "terminal-tui")]
         if !provider_turn_finalizer_events.is_empty() {
             let results = drain_provider_turn_finalizer_events_and_publish(
                 &mut turn_scheduler,
@@ -5281,6 +5401,7 @@ pub async fn run(
                     continue;
                 };
                 match control {
+                    #[cfg(feature = "terminal-tui")]
                     ChatControlEvent::ResumeSavedSession { id } => {
                         #[cfg(feature = "terminal-tui")]
                         if defer_resume_saved_session_if_provider_turn_pending(
@@ -5294,9 +5415,9 @@ pub async fn run(
                             continue;
                         }
                         handle_resume_saved_session_control!(id);
+                        continue;
                     }
                 }
-                continue;
             }
             rewind_approval = async {
                 match pending_chat_rewind.as_mut() {
@@ -5348,7 +5469,6 @@ pub async fn run(
                             model_name,
                             skills: &skills,
                             native_tools,
-                            tools_registry: &tools_registry,
                             #[cfg(feature = "terminal-tui")]
                             chat_mirror: &chat_mirror,
                         }, pending.target_session).await;
@@ -5650,10 +5770,12 @@ pub async fn run(
             }
         }
     } {
+        turn_signal.ensure_history_commits_healthy()?;
         let provider_queue_task_id = input.turn_task_id;
         let input_priority = input.priority;
         let msg = input.msg;
-        let user_input = msg.content.clone();
+        let mut user_input = msg.content.clone();
+        let mut resume_decision = false;
         let synthetic_ui_command = is_synthetic_ui_command(&msg);
         // Armed here, at the top, because the turn body has many exits — a
         // slash command short-circuits it, a cancellation unwinds it, `/quit`
@@ -5672,7 +5794,7 @@ pub async fn run(
         // value). The `/provider <name>` interception rewrites `current_provider_owned` and the
         // `provider` Arc, so on the next iteration this shadow points at the new provider name and
         // covers every later use of `provider_name` (including `/model` validation / system prompt /
-        // fabric / legacy run_tool_call_loop).
+        // fabric / the legacy tool-loop path's run_turn call).
         let provider_name: &str = current_provider_owned.as_str();
 
         // Step 5b dual write: every user input enters the dispatcher (shadow observation of the
@@ -5764,6 +5886,7 @@ pub async fn run(
 
         if is_workers_command(&user_input) {
             if let Some((output, signal_cancel)) = provider_workers_cancel_output_for_input(
+                &msg,
                 &user_input,
                 &mut turn_scheduler,
                 &mut provider_turn_workers,
@@ -5794,8 +5917,14 @@ pub async fn run(
                 emit_chat_output("Usage: /model <name>");
                 continue;
             }
-            match providers::validate_provider_model(provider_name, new_model) {
-                Ok(()) => {
+            let next_binding = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
+                decision_source::ChatProviderBinding::capture(
+                    &ctx.config_generation, &provider, provider_name, new_model,
+                )
+            });
+            match next_binding {
+                Ok(binding) => {
+                    provider_binding = binding;
                     current_model_owned = new_model.to_string();
                     #[cfg(feature = "terminal-tui")]
                     if let Some(slot) = model_slot.as_ref() {
@@ -5814,7 +5943,8 @@ pub async fn run(
                     // emit_chat_output already nudges the renderer (try_send on
                     // the TUI redraw channel) so the status bar repaints.
                     emit_chat_output(&format!(
-                        "Switched model to {new_model} (provider {provider_name}). Applies from the next turn."
+                        "Switched model to {new_model} (provider {}). Applies from the next turn.",
+                        providers::redact_endpoint_userinfo(&provider_name)
                     ));
                 }
                 Err(e) => {
@@ -5829,7 +5959,7 @@ pub async fn run(
         // Like `/model`, it is intercepted before commands::dispatch, because taking effect requires
         // the main loop to rebuild the provider instance and rewrite several pieces of runtime state:
         //   (a) rebuild the `Arc<dyn Provider>` from the new provider's auth/base/protocol, replacing
-        //       the `provider` handle held directly by the legacy `run_tool_call_loop`;
+        //       the `provider` handle the legacy tool-loop path's `run_turn` call uses;
         //   (b) `set()` it into `provider_slot` (so the Redux driver subtask reads the new provider on
         //       its next turn);
         //   (c) rewrite `current_provider_owned` (which affects the system prompt / events / snapshot
@@ -5853,33 +5983,37 @@ pub async fn run(
             // Decide the model effective after the switch: prefer the one given explicitly on the
             // command, otherwise keep the current model (if compatible).
             let candidate_model = requested_model.unwrap_or_else(|| current_model_owned.clone());
-            if let Err(e) = providers::validate_provider_model(&new_provider, &candidate_model) {
+            if let Err(e) = chat_model_switch(&config, &new_provider, &candidate_model) {
+                let shown = providers::redact_endpoint_userinfo(&new_provider);
                 emit_chat_output(&format!(
-                    "Cannot switch to provider '{new_provider}': model '{candidate_model}' is incompatible ({e}). \
-Retry with a compatible model: /provider {new_provider} <model>"
+                    "Cannot switch to provider '{shown}': model '{candidate_model}' is incompatible ({}). \
+Retry with a compatible model: /provider {shown} <model>",
+                    providers::redact_endpoint_userinfo(&e.to_string())
                 ));
                 continue;
             }
             // When switching to a provider other than the configured primary, do not carry over the
             // primary's explicit credentials/URL; let the new provider resolve its own (so provider
             // A's key is never fed to provider B).
-            let (switch_api_key, switch_api_url) = configured_provider_connection(
+            match chat_provider_chain(
+                &config,
                 &new_provider,
                 configured_provider_name,
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-            );
-            match providers::create_routed_provider_with_options(
-                &new_provider,
-                switch_api_key,
-                switch_api_url,
-                &config.reliability,
-                &config.model_routes,
                 &candidate_model,
                 &provider_runtime_options,
             ) {
-                Ok(built) => {
+                Ok((_switch_connection, built)) => {
                     let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
+                    let next_binding = match decision_source::ChatProviderBinding::capture(
+                        &ctx.config_generation, &new_provider_arc, &new_provider, &candidate_model,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            emit_chat_output(&format!("Cannot bind provider selection: {}", providers::sanitize_api_error(&error.to_string())));
+                            continue;
+                        }
+                    };
+                    provider_binding = next_binding;
                     // (a) the legacy path handle
                     provider = Arc::clone(&new_provider_arc);
                     // (b) Redux driver slot
@@ -5924,11 +6058,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         String::new()
                     };
                     emit_chat_output(&format!(
-                        "Switched provider to {new_provider}{model_note}. Applies from the next turn."
+                        "Switched provider to {}{model_note}. Applies from the next turn.",
+                        providers::redact_endpoint_userinfo(&new_provider)
                     ));
                 }
                 Err(e) => {
-                    emit_chat_output(&format!("Cannot switch to provider '{new_provider}': {e}"));
+                    emit_chat_output(&format!(
+                        "Cannot switch to provider '{}': {}",
+                        providers::redact_endpoint_userinfo(&new_provider),
+                        providers::redact_endpoint_userinfo(&e.to_string())
+                    ));
                 }
             }
             continue;
@@ -5990,10 +6129,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // session-scoped UI/model ledger. It must not share `/clear` semantics,
         // otherwise the old title, turns, and token usage survive indefinitely.
         if user_input == "/new" {
-            // A new session identity restarts the provider prefix from scratch,
-            // so the exposure unions must not survive it.
-            session_tool_exposure.reset();
-            session_skill_exposure.reset();
             match start_new_chat_session(
                 mem.as_ref(),
                 ChatSwitchCtx {
@@ -6020,7 +6155,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     model_name,
                     skills: &skills,
                     native_tools,
-                    tools_registry: &tools_registry,
                     #[cfg(feature = "terminal-tui")]
                     chat_mirror: &chat_mirror,
                 },
@@ -6036,10 +6170,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // Handle /clear separately (needs mutable history). This intentionally
         // keeps the current session identity and accounting ledger.
         if user_input == "/clear" {
-            // Same reasoning as `/new`: the conversation the prefix was built
-            // over is gone, so the exposure unions start over too.
-            session_tool_exposure.reset();
-            session_skill_exposure.reset();
             history.clear();
             // S2-C Step 4: dual-write HistoryCleared to the reducer. The reducer's semantics are
             // "drain every non-system message, keep system" — legacy first clears and may then push a
@@ -6180,7 +6310,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 commands::CommandResult::Quit => break,
                 commands::CommandResult::SetMode(mode) => {
                     // Pure skips the legacy chat_session.set_mode; in legacy mode
-                    // run_tool_call_loop still reads it.
+                    // run_turn still reads it.
                     let _ = chat_dispatcher
                         .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
                     #[cfg(feature = "terminal-tui")]
@@ -6276,7 +6406,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     model_name,
                                     skills: &skills,
                                     native_tools,
-                                    tools_registry: &tools_registry,
                                     #[cfg(feature = "terminal-tui")]
                                     chat_mirror: &chat_mirror,
                                 },
@@ -6364,7 +6493,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     model_name,
                                     skills: &skills,
                                     native_tools,
-                                    tools_registry: &tools_registry,
                                     #[cfg(feature = "terminal-tui")]
                                     chat_mirror: &chat_mirror,
                                 },
@@ -6450,7 +6578,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     model_name,
                                     skills: &skills,
                                     native_tools,
-                                    tools_registry: &tools_registry,
                                     #[cfg(feature = "terminal-tui")]
                                     chat_mirror: &chat_mirror,
                                 },
@@ -6593,6 +6720,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 commands::CommandResult::SessionAction(action) => {
                     use crate::chat::sessions::SessionCommand;
+                    // Shared parsing must not turn mailbox/model input into
+                    // local operator authority for a child or approval action.
+                    if action.requires_local_operator() && !is_local_operator_input(&msg) {
+                        emit_chat_output("This session command requires local terminal operator input.");
+                        if let Some(guard) = assignment_guard.as_mut() {
+                            guard.failed("Assigned task cannot issue local operator session commands.");
+                        }
+                        continue;
+                    }
                     match action {
                         SessionCommand::Bg { task } => {
                             // Spawn a background agent via sessions_spawn, passing
@@ -6601,11 +6737,23 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             // so a hot switch is honoured (plan §C.0 blocker 3).
                             match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
                                 Some(tool) => {
-                                    let mut args = serde_json::json!({
-                                        "task": task,
-                                        "provider": current_provider_owned,
-                                        "model": current_model_owned,
-                                    });
+                                    let command = provider_binding.as_ref()
+                                        .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))
+                                        .and_then(|binding| decision_source::ChatOperatorSpawn::capture(
+                                            &msg, &task, binding, &ctx.config_generation, &provider,
+                                            &current_provider_owned, &current_model_owned,
+                                        ));
+                                    let command = match command {
+                                        Ok(command) => command,
+                                        Err(error) => {
+                                            emit_chat_output(&format!("Cannot admit background command: {error}"));
+                                            continue;
+                                        }
+                                    };
+                                    let (mut args, operator_source) = match command.admit(Arc::clone(&mem), &chat_session_key, Arc::clone(&ctx.security), Arc::clone(&turn_decisions)).await {
+                                        Ok(admitted) => admitted,
+                                        Err(error) => { emit_chat_output(&format!("Cannot record background command source: {error}")); continue; }
+                                    };
                                     // Spawning is a Medium-risk side effect; under
                                     // supervised autonomy the gate requires a grant
                                     // bound to `sessions_spawn:spawn`. The operator
@@ -6635,7 +6783,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             );
                                         }
                                     }
-                                    match tool.execute_named("sessions_spawn", args).await {
+                                    match operator_source.scope(tool.execute_named("sessions_spawn", args)).await {
                                         Ok(result) => {
                                             let out = if result.output.is_empty() {
                                                 result
@@ -7084,6 +7232,78 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
+                        SessionCommand::ResumeDecision { decision_id } => {
+                            if !config.causal_tree.enabled {
+                                emit_chat_output("Decision resume is unavailable while the decision plane is disabled.");
+                                continue;
+                            }
+                            // Only this explicit command selects resume mode. The
+                            // fresh source event records the exact canonical request.
+                            user_input = serde_json::json!({ "decision_id": decision_id.hyphenated().to_string() }).to_string();
+                            resume_decision = true;
+                        }
+                        SessionCommand::InspectDecision { decision_id } => {
+                            if !config.causal_tree.enabled {
+                                emit_chat_output("Decision inspection is unavailable while the decision plane is disabled.");
+                                continue;
+                            }
+                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
+                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
+                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            let inspected = turn_decisions.inspect_pending_decision_approval(
+                                &envelope.resolved_owner_id(), &envelope.session_key, id,
+                            ).await.and_then(|view| serde_json::to_string_pretty(&view).map_err(Into::into));
+                            match inspected {
+                                Ok(view) => {
+                                    match chat_sessions.register_decision_seq(&chat_session_key, id) {
+                                        Ok(seq) => emit_chat_output(&format!("Pending decision #{seq}: {id}. Review with /approve {seq} or /deny {seq}.")),
+                                        Err(_) => emit_chat_output("A display number is unavailable; use the explicit decision UUID."),
+                                    }
+                                    emit_chat_output("Recorded approval details (arguments may be redacted; output may be truncated):");
+                                    emit_chat_output(&sanitize::truncate_large_output(&view));
+                                }
+                                Err(_) => emit_chat_output("No inspectable pending decision is available for this chat."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::RevokeDecision { decision_id } => {
+                            if !config.causal_tree.enabled {
+                                emit_chat_output("Decision revocation is unavailable while the decision plane is disabled.");
+                                continue;
+                            }
+                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
+                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
+                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            match turn_decisions.revoke_pending_decision_approval(
+                                &envelope.resolved_owner_id(), &envelope.session_key, id,
+                            ).await {
+                                Ok(_) => emit_chat_output("Decision grant revocation recorded. This does not undo an operation that already ran."),
+                                Err(_) => emit_chat_output("Decision revocation could not be confirmed for this chat. No automatic retry was made."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::ReviewDecision { decision_id, approved } => {
+                            if !config.causal_tree.enabled {
+                                emit_chat_output("Decision review is unavailable while the decision plane is disabled.");
+                                continue;
+                            }
+                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
+                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
+                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            match turn_decisions.review_pending_decision_approval(
+                                &envelope.resolved_owner_id(), &envelope.session_key, id, approved,
+                            ).await {
+                                Ok(_) => emit_chat_output(if approved {
+                                    "Decision approval recorded. The operation has not run; explicit resume is required."
+                                } else {
+                                    "Decision rejected. The operation has not run."
+                                }),
+                                Err(_) => emit_chat_output(
+                                    "Decision review could not be confirmed for this chat. No automatic retry was made."
+                                ),
+                            }
+                            continue;
+                        }
                         SessionCommand::Approve { seq } | SessionCommand::Deny { seq } => {
                             // NeedsInput: deliver an approval decision to a
                             // background sub-agent suspended on the supervised
@@ -7091,6 +7311,30 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             // (Grant) so the gated tool can pass the gate; `/deny`
                             // reports the tool as denied to the sub-agent.
                             let approve = matches!(action, SessionCommand::Approve { .. });
+                            match chat_sessions.decision_for_seq(&chat_session_key, seq) {
+                                Ok(Some(id)) => {
+                                    if !config.causal_tree.enabled {
+                                        emit_chat_output("Decision review is unavailable while the decision plane is disabled.");
+                                        continue;
+                                    }
+                                    let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
+                                    let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
+                                    match turn_decisions.review_pending_decision_approval(
+                                        &envelope.resolved_owner_id(), &envelope.session_key, id, approve,
+                                    ).await {
+                                        Ok(_) => emit_chat_output(if approve {
+                                            "Decision approval recorded. The operation has not run; explicit resume is required."
+                                        } else { "Decision rejected. The operation has not run." }),
+                                        Err(_) => emit_chat_output("Decision review could not be confirmed for this chat. No automatic retry was made."),
+                                    }
+                                    continue;
+                                }
+                                Err(_) => {
+                                    emit_chat_output("No decision alias is available in this chat.");
+                                    continue;
+                                }
+                                Ok(None) => {}
+                            }
                             let run_id = match chat_sessions.resolve_run_id(seq).await {
                                 Ok(id) => id,
                                 Err(e) => {
@@ -7102,9 +7346,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 }
                             };
                             let decision = if approve {
-                                crate::agent::loop_::ApprovalDecision::Grant
+                                crate::agent::turn_contracts::ApprovalDecision::Grant
                             } else {
-                                crate::agent::loop_::ApprovalDecision::Deny
+                                crate::agent::turn_contracts::ApprovalDecision::Deny
                             };
                             if pending_approvals.resolve(&run_id, decision) {
                                 emit_chat_output(&format!(
@@ -7166,6 +7410,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // We never auto-switch focus — only an explicit /attach or the
                     // switcher changes the routing target.
                     if let Some(sid) = attached_follow.clone() {
+                        if !is_local_operator_input(&msg) {
+                            emit_chat_output("Steering an attached session requires local terminal operator input.");
+                            if let Some(guard) = assignment_guard.as_mut() {
+                                guard.failed("Assigned task cannot steer the operator's attached session.");
+                            }
+                            continue;
+                        }
                         let run_id = sid.as_str().to_string();
                         match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
                             Some(tool) => {
@@ -7224,39 +7475,116 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
         }
 
-        let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await;
-        if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
-            emit_chat_output(note);
+        // This is the concrete TerminalChannel: send_draft always returns
+        // Some(id), including when its UI receiver has closed. Capacity can
+        // therefore be selected before creating the durable source. The local
+        // worker registry is inserted into only by this main loop; awaits below
+        // cannot consume another slot. Explicit approval resume stays foreground.
+        #[cfg(feature = "terminal-tui")]
+        let reducer_driver_turn_active = !resume_decision;
+        #[cfg(feature = "terminal-tui")]
+        let provider_worker_kind = if reducer_driver_turn_active {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached
+        } else {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
+        };
+        #[cfg(not(feature = "terminal-tui"))]
+        let provider_worker_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
+        let provider_admission_max = match provider_worker_kind {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => 1,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => max_concurrent_visible_turns,
+        };
+        let provider_admission =
+            provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
+        if !provider_admission.can_start_visible {
+            tracing::warn!(
+                active_workers = provider_admission.active_workers,
+                foreground_active = provider_admission.foreground_active,
+                detached_active = provider_admission.detached_active,
+                effective_max_visible_turns = provider_admission.effective_max_visible_turns,
+                target_kind = ?provider_worker_kind,
+                "visible provider turn capacity unavailable before source admission; queueing input"
+            );
+            // No durable input or decision exists yet. Keep the original
+            // assignment and queue identity for its first actual admission.
+            if let Some(guard) = assignment_guard.as_mut() {
+                guard.disarm();
+            }
+            requeue_post_route_admission_rejected_input(
+                &mut input_backlog,
+                &mut defer_visible_input_pop_once,
+                DequeuedInputMessage {
+                    priority: input_priority,
+                    turn_task_id: provider_queue_task_id,
+                    msg,
+                },
+            );
+            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+            continue;
         }
-        let user_input_for_prompt = file_mention_enrichment.prompt;
-
         fabric_turn_seq += 1;
         // D8-2: one run_id per turn, generated at the turn entry and reused by
         // every run_id consumer within this loop iteration (user event, route
         // scope, assistant event). No parent_run_id is set (turns are not a spawn
         // lineage; session relation is via chat_session_key).
         let turn_run_id = uuid::Uuid::new_v4().to_string();
-        let chat_user_event = match record_chat_user_message_event(
-            &memory_fabric,
-            &chat_session,
-            &chat_session_key,
-            &turn_run_id,
-            provider_name,
-            model_name,
-            fabric_turn_seq,
-            &user_input,
-        )
-        .await
-        {
-            Ok(event) => Some(event),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to append chat user message event");
-                None
-            }
+        let current_provider_binding = provider_binding.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))?;
+        current_provider_binding.verify(&ctx.config_generation, &provider, provider_name, model_name)?;
+        let cancellation = turn_signal.new_turn_cancellation();
+        let mut input_scope = chat_message_event_scope(
+            memory_fabric.workspace_id(), &chat_session_key, &turn_run_id, provider_name, model_name,
+        );
+        input_scope.config_generation_id = Some(ctx.config_generation.id.0);
+        input_scope.config_source_revision = Some(ctx.config_generation.source_revision.fingerprint_sha256.clone());
+        // The TUI mirror is updated synchronously by /mode; its legacy session
+        // deliberately stops tracking mode when the reducer owns UI state.
+        #[cfg(feature = "terminal-tui")]
+        let admitted_chat_mode = chat_mirror.lock().chat_mode;
+        #[cfg(not(feature = "terminal-tui"))]
+        let admitted_chat_mode = chat_session.mode;
+        let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded(
+            memory_fabric.clone(), (input_scope, &chat_session_key, decision_source::ChatAdmissionMode::Model(admitted_chat_mode)), &user_input,
+            format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
+            child_cleanup.register(cancellation.clone())?,
+        ).await?;
+        let admission = if resume_decision {
+            admitted_binding.decide_resume(&turn_decisions, &cancellation).await
+        } else {
+            admitted_binding.decide(&turn_decisions, &cancellation).await
         };
+        if let Err(error) = admission {
+            if let Err(record_error) = admission_guard.finish_failure(
+                cancellation.is_cancelled(), &format!("decision admission failed: {error}"),
+            ).await {
+                return Err(error.context(format!("Chat admission failure persistence is unconfirmed: {record_error}")));
+            }
+            return Err(error);
+        }
+        admission_guard.handoff_terminal()?;
+        let chat_turn_binding = Some(Arc::clone(&admitted_binding));
+        if let Some(id) = chat_turn_binding.as_ref().and_then(|binding| binding.pending_decision_id()) {
+            match chat_sessions.register_decision_seq(&chat_session_key, id) {
+                Ok(seq) => emit_chat_output(&format!("Pending decision #{seq}: {id}. Inspect with /approval --decision {id}; review with /approve {seq} or /deny {seq}.")),
+                Err(_) => emit_chat_output("A display number is unavailable; use the explicit decision UUID."),
+            }
+        }
+        let fixed_reply = admitted_binding.fixed_reply()?;
+
+        let collection_turn = admitted_binding.is_approval_collection()?;
+        let direct_decision_turn = resume_decision || fixed_reply.is_some() || collection_turn;
+        let file_mention_enrichment = if direct_decision_turn {
+            FileMentionEnrichment { prompt: user_input.clone(), visible_note: None }
+        } else {
+            enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await
+        };
+        if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
+            emit_chat_output(note);
+        }
+        let user_input_for_prompt = file_mention_enrichment.prompt;
 
         // Auto-save user message to memory
-        if config.memory.should_auto_promote_user_message(&user_input) {
+        if !direct_decision_turn && config.memory.should_auto_promote_user_message(&user_input) {
             let user_key = autosave_memory_key("user_msg");
             let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
             let _ = memory_fabric
@@ -7273,9 +7601,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         // Inject memory context
-        let runtime_envelope = chat_runtime_envelope(memory_fabric.workspace_id(), &chat_session_key)
-            .with_config_generation(&ctx.config_generation);
-        let memory_runtime = crate::agent::loop_::ToolLoopMemory::new(
+        let runtime_envelope = admitted_binding.envelope().clone();
+        let memory_runtime = crate::agent::turn_request::ToolLoopMemory::new(
             &mem,
             &config.workspace_dir,
             Some(
@@ -7284,21 +7611,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
             ),
         )
         .with_event_fabric(memory_fabric.clone())
-        .with_request_event_scope({
-            let mut scope = chat_message_event_scope(&chat_session_key, &turn_run_id, provider_name, model_name);
-            scope.causation_event_id = chat_user_event.as_ref().map(|event| event.event_id.clone());
-            scope
-        })
-        .with_routing_input(user_input_for_prompt.clone());
-        let semantic_scope = chat_runtime_write_context(&runtime_envelope);
-        let mem_context = build_context_with_shared_events_and_scope(
-            mem.as_ref(),
-            chat_runtime_principal(&runtime_envelope),
-            &user_input,
-            config.memory.min_relevance_score,
-            Some(&semantic_scope),
-        )
-        .await;
+        .with_request_event_scope(
+            runtime_envelope.message_scope().with_recipient(format!("{provider_name}/{model_name}")),
+        );
+        // The TUI handoff retains the original source input, before enrichment.
+        #[cfg(feature = "terminal-tui")]
+        let routing_input = admitted_binding.routing_input().to_owned();
+        let mem_context = if direct_decision_turn {
+            crate::agent::context_recall::RecalledMemoryContext { preamble: String::new(), ids: Vec::new() }
+        } else {
+            admitted_binding.recalled_context()?
+        };
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             user_input_for_prompt.clone()
@@ -7307,13 +7630,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         };
 
         // Build system prompt with skill selection
-        let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
-        // Retrieval decides which skills this session ever sees; the session
-        // union decides what the prompt says. Without it the section is
-        // re-ranked against every rephrasing, and because it sits ahead of the
-        // identity and tool sections, each re-rank invalidates the provider's
-        // prefix cache for the entire conversation.
-        let selected_skills = session_skill_exposure.absorb(&skills, &selected_skills);
+        let selected_skills = if direct_decision_turn {
+            Vec::new()
+        } else {
+            admitted_binding.prompt_skills()?
+        };
+        // Publish only this turn's selected metadata. Previous turns do not
+        // grant continued Skill exposure; the prompt builder orders entries.
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
         upsert_leading_system_prompt(&mut history, system_prompt.clone());
@@ -7328,9 +7651,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
             "chat.system_prompt_per_turn",
         );
         let history_len_before_user_turn = history.len();
-        let history_user_message = ChatMessage::user(&enriched);
-        let mut history_for_provider = history.clone();
-        history_for_provider.push(history_user_message.clone());
+        let history_user_message = crate::agent::turn_contracts::inbound_user_message(&enriched);
+        // The provider-side copy is read only by the TUI reducer driver.
+        #[cfg(feature = "terminal-tui")]
+        let history_for_provider = {
+            let mut history_for_provider = history.clone();
+            history_for_provider.push(history_user_message.clone());
+            history_for_provider
+        };
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in tools_registry.iter() {
@@ -7351,7 +7679,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // tool-call loop persists reasoning into conversation history through
         // `build_native_assistant_history`; the live stream below renders text
         // only, so the user never sees the model's internal monologue.
-        let cancellation = CancellationToken::new();
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
 
         // Start a streaming draft on the terminal
@@ -7362,6 +7689,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 None
             }
         };
+
+        #[cfg(feature = "terminal-tui")]
+        anyhow::ensure!(
+            !reducer_driver_turn_active || draft_id.is_some(),
+            "admitted detached chat turn requires its terminal draft; execution was not requeued"
+        );
 
         // Step 5b dual write: announce that a new LLM inference turn starts (only when a draft
         // exists). In shadow mode the reducer sets stream.draft + control.generating=true, with no
@@ -7530,13 +7863,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
             config_source_revision: runtime_envelope.config_source_revision.as_deref(),
         };
 
-        let effective_compaction = crate::router::resolve_effective_compaction_config(
+        let mut effective_compaction = crate::router::resolve_effective_compaction_config(
             &config.agent.compaction,
             provider_name,
             model_name,
             &config.router,
             &config.model_routes,
         );
+        effective_compaction.config = admitted_binding.main_compaction()
+            .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
         #[cfg(feature = "terminal-tui")]
         refresh_context_budget_for_tui(
@@ -7595,7 +7930,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // FIX-P0-30/31: carry the loop's provider-attribution trace so the
             // success path can record the *real* serving model/attempts instead
             // of the routed `decision.selected.model`.
-            Success(String, crate::agent::loop_::ToolLoopTrace),
+            Success(String),
             /// User-initiated cancel (Ctrl+C) or `is_tool_loop_cancelled` from
             /// the inner loop. Reducer side maps to `StreamCancelled`.
             Cancelled,
@@ -7608,69 +7943,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
             },
         }
 
-        // Route between the Redux driver and the legacy tool loop; see route_turn for the decision
-        // matrix.
+        // The terminal TUI always routes a turn to the reducer driver; without
+        // the TUI the shared agent loop runs it (the driver branch is cfg'd out).
         #[cfg(feature = "terminal-tui")]
-        let turn_route = {
-            let mode = top_redux_mode;
-            let route = route_turn(mode);
-            tracing::info!(
-                redux_mode = ?mode,
-                tools_count = tools_registry.len(),
-                route = ?route,
-                "chat::run turn route decision"
-            );
-            route
-        };
-        #[cfg(feature = "terminal-tui")]
-        let reducer_driver_turn_active = matches!(turn_route, TurnRoute::ReduxDriver) && draft_id.is_some();
-        #[cfg(feature = "terminal-tui")]
-        let provider_worker_kind = if reducer_driver_turn_active {
-            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached
-        } else {
-            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
-        };
-        // Without the TUI feature turn_route takes no part in the control flow (the driver branch is
-        // cfg'd out); the variable is kept only so chat::run shares the same routing contract under
-        // both feature configurations.
-        #[cfg(not(feature = "terminal-tui"))]
-        let _ = TurnRoute::LegacyToolLoop;
-        #[cfg(not(feature = "terminal-tui"))]
-        let provider_worker_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
-        let provider_admission_max = match provider_worker_kind {
-            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => 1,
-            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => max_concurrent_visible_turns,
-        };
-        let provider_admission =
-            provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
-        if !provider_admission.can_start_visible {
-            tracing::warn!(
-                active_workers = provider_admission.active_workers,
-                foreground_active = provider_admission.foreground_active,
-                detached_active = provider_admission.detached_active,
-                effective_max_visible_turns = provider_admission.effective_max_visible_turns,
-                target_kind = ?provider_worker_kind,
-                "visible provider turn admission rejected after route decision; requeueing input"
-            );
-            // The input goes back on the backlog and will run later, so this
-            // attempt owes the daemon nothing: reporting here would answer for
-            // a turn that has not happened, and the real report would then be
-            // refused as unknown.
-            if let Some(guard) = assignment_guard.as_mut() {
-                guard.disarm();
-            }
-            requeue_post_route_admission_rejected_input(
-                &mut input_backlog,
-                &mut defer_visible_input_pop_once,
-                DequeuedInputMessage {
-                    priority: input_priority,
-                    turn_task_id: provider_queue_task_id,
-                    msg,
-                },
-            );
-            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
-            continue;
-        }
+        tracing::info!(
+            redux_mode = ?top_redux_mode,
+            // Registry roots before routing, refresh and alias expansion;
+            // the wire count is the compiled-request event's
+            // `tool_snapshot.count`.
+            registry_root_tools = tools_registry.len(),
+            route = "ReduxDriver",
+            "chat::run turn route decision"
+        );
         let provider_history_len_before_assistant;
         #[cfg(feature = "terminal-tui")]
         {
@@ -7701,6 +7985,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
             &user_input,
             history_len_before_user_turn,
         );
+        anyhow::ensure!(
+            !chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) || provider_turn_task_id.is_some(),
+            "decision-owned Chat turn could not acquire a scheduler task"
+        );
         register_provider_history_commit_task(&mut history_commit_coordinator, &turn_scheduler, provider_turn_task_id);
         record_provider_turn_completion_context(
             &mut provider_turn_completion_contexts,
@@ -7716,6 +8004,64 @@ Retry with a compatible model: /provider {new_provider} <model>"
         publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
         publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
 
+        // Foreground fixed closes have no older visible worker to wait for.
+        // Keep the same task-scoped persistence acknowledgement as detached
+        // replies, including builds without the terminal TUI.
+        if provider_worker_kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
+            && let Some(binding) = chat_turn_binding.as_ref()
+            && (resume_decision || binding.fixed_reply()?.is_some())
+        {
+            anyhow::ensure!(history_commit_coordinator.pending_tasks() == 1,
+                "foreground Chat close has an earlier uncommitted turn");
+            let task_id = provider_turn_task_id.context("Chat close has no scheduler task")?;
+            drop(delta_tx);
+            drop(tool_event_tx);
+            if let Some(handle) = draft_updater { let _ = handle.await; }
+            let _ = tool_event_forwarder.await;
+            let close_draft_id = draft_id.clone().unwrap_or_else(|| format!("decision-close:{turn_run_id}"));
+            if draft_id.is_none() {
+                anyhow::ensure!(matches!(chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::TurnStarted {
+                        draft_id: close_draft_id.clone(), cancel: cancellation.clone(),
+                    }, "chat.fixed_close_started"), dispatcher::DispatchResult::Sent),
+                    "Chat close draft could not be registered");
+            }
+            let commit_len = history.len().saturating_add(1);
+            let (reply, succeeded) = if let Some(reply) = binding.fixed_reply()? {
+                binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
+                (reply, true)
+            } else {
+                binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?
+            };
+            dispatch_ordered_provider_turn_commit_and_wait(
+                &chat_dispatcher, &turn_signal, task_id, &close_draft_id,
+                &user_input, &reply, "", false, false,
+            ).await.map_err(anyhow::Error::msg)?;
+            history.push(ChatMessage::assistant(reply.to_owned()));
+            chat_session.add_user_turn(&user_input);
+            chat_session.add_assistant_turn(&reply, Vec::new());
+            gate_completed_provider_turn_finalization(
+                &mut turn_scheduler, &mut history_commit_coordinator, &mut provider_turn_workers,
+                Some(task_id), commit_len, reply.chars().count(), reply.chars().count(),
+                &crate::llm::route_decision::TokenUsage::default(), "chat decision closed",
+            );
+            take_provider_turn_completion_history_len(&mut provider_turn_completion_contexts,
+                Some(task_id), commit_len);
+            if let Some(id) = draft_id.as_ref() {
+                terminal.finalize_draft("user", id, &reply).await?;
+            } else {
+                terminal.send(&SendMessage::new(&reply, "user")).await?;
+            }
+            if let Some(guard) = assignment_guard.as_mut() {
+                if succeeded { guard.completed(&reply); } else { guard.failed(&reply); }
+            }
+            #[cfg(not(feature = "terminal-tui"))]
+            { *active_cancel.lock() = None; }
+            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+            publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+            continue;
+        }
+
         // ── Redux driver switched-over path (Step 5a-4) ────────────
         //
         // Entered only when routing selects ReduxDriver. dispatch Action::StartLLMTurn →
@@ -7724,7 +8070,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // action_tx → the dispatcher task reduces them and calls turn_signal.record_and_notify →
         // this code awaits the outcome.
         //
-        // This branch does **not** call run_tool_call_loop; the old path does not run at all:
+        // This branch does **not** call run_turn; the old path does not run at all:
         //   * no duplicate hooks (the old path's hooks.emit does not run; only the reducer's
         //     NotifyHook(Error) writes)
         //   * no duplicate history writes (the reducer writes once through RecordAssistantTurn)
@@ -7762,7 +8108,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // context for this turn and hand it to the driver via StartLLMTurn →
             // Effect::StartTurn. This is the redux mirror of the legacy
             // `SPAWN_EXECUTION_CONTEXT.scope(seed_turn_context(turn_run_id, ..))`
-            // wrapper applied below at the legacy `run_tool_call_loop_traced` call
+            // wrapper applied below at the legacy tool-loop path's `run_turn` call
             // — the redux path `continue`s before reaching it, so the seed must
             // travel with the effect. Same `turn_run_id` + `chat_session_key`
             // source as the legacy path (single source of truth) so a sub-agent
@@ -7795,7 +8141,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // already carries the memory preamble and the
                     // `[Recent shared workspace events]` block, and routing on
                     // that let injected text widen the published tool surface.
-                    routing_input: Some(user_input_for_prompt.clone()),
+                    routing_input: Some(routing_input.clone()),
+                    turn_binding: chat_turn_binding.clone(),
                 },
                 "chat.start_llm_turn",
             );
@@ -7851,6 +8198,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     .insert(
                         task_id,
                         PerTurnContext {
+                            cancellation: cancellation.clone(),
+                            turn_binding: chat_turn_binding.clone(),
                             task_id,
                             draft_id: d_id.clone(),
                             delta_tx: Some(delta_tx),
@@ -7897,7 +8246,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             let Some(completion) = completion else {
                                 break;
                             };
-                            match route_provider_completion_event_and_publish(
+                            // the completion of the current turn; `None`: retained as pending
+                            if let Some(completion) = route_provider_completion_event_and_publish(
                                 &mut provider_turn_lifecycle_rx,
                                 &mut provider_turn_lifecycle_events_open,
                                 &mut provider_turn_workers,
@@ -7906,11 +8256,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 completion,
                                 &chat_dispatcher,
                             ) {
-                                ProviderTurnCompletionRoute::Current(completion) => {
-                                    provider_completion_event = Some(completion);
-                                    break;
-                                }
-                                ProviderTurnCompletionRoute::Pending => {}
+                                provider_completion_event = Some(completion);
+                                break;
                             }
                         }
                         lifecycle = provider_turn_lifecycle_rx.recv(), if provider_turn_lifecycle_events_open => {
@@ -8022,11 +8369,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     ..
                 } => {
                     if empty_response {
-                        let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-                            &route_decision,
-                            provider_started_at,
-                            redux_tokens_used.clone(),
-                        );
+                        let provider_outcome = if let Some(binding) = chat_turn_binding.as_ref() {
+                            binding.provider_outcome(&route_decision, provider_started_at)?
+                        } else { ProviderExecutionOutcome::success_for_decision_with_usage(
+                            &route_decision, provider_started_at, redux_tokens_used.clone(),
+                        ) };
                         if !finalizer_result.finalized {
                             if let Err(e) = terminal.cancel_draft("user", &d_id).await {
                                 tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
@@ -8039,6 +8386,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
                         }
                         let terminal_usage = match finalize_chat_success_turn(
+                            chat_turn_binding.as_deref(),
                             &memory_fabric,
                             &chat_session_key,
                             &turn_run_id,
@@ -8056,8 +8404,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         {
                             Ok(receipt) => receipt.usage_settlement,
                             Err(error) => {
-                                tracing::warn!(error = %error, "Failed to commit shared empty Chat terminal event");
-                                crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                                return Err(error);
                             }
                         };
                         chat_session.add_user_turn(&user_input);
@@ -8093,11 +8440,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                         continue;
                     }
-                    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-                        &route_decision,
-                        provider_started_at,
-                        redux_tokens_used.clone(),
-                    );
+                    let provider_outcome = if let Some(binding) = chat_turn_binding.as_ref() {
+                        binding.provider_outcome(&route_decision, provider_started_at)?
+                    } else { ProviderExecutionOutcome::success_for_decision_with_usage(
+                        &route_decision, provider_started_at, redux_tokens_used.clone(),
+                    ) };
                     if !finalizer_result.finalized {
                         if let Err(e) = terminal.cancel_draft("user", &d_id).await {
                             tracing::debug!(error = %e, "Redux driver: cancel commit-gated draft failed");
@@ -8117,6 +8464,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
                     }
                     let terminal_usage = match finalize_chat_success_turn(
+                        chat_turn_binding.as_deref(),
                         &memory_fabric,
                         &chat_session_key,
                         &turn_run_id,
@@ -8134,8 +8482,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     {
                         Ok(receipt) => receipt.usage_settlement,
                         Err(error) => {
-                            tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
-                            crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                            return Err(error);
                         }
                     };
                     let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
@@ -8193,17 +8540,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     let _ = final_text;
                 }
                 ProviderTurnTerminalPlan::Failed { err, .. } => {
-                    let failed_outcome = ProviderExecutionOutcome::failed_for_decision(
-                        &route_decision,
-                        provider_started_at,
-                        &anyhow::anyhow!(err.clone()),
-                    );
                     if let Err(error) = finalize_chat_non_success_turn(
+                        chat_turn_binding.as_deref(),
                         &memory_fabric,
                         &turn_run_id,
                         route_scope.clone(),
                         crate::agent::terminal::TurnTerminalStatus::Failed,
-                        Some(failed_outcome),
+                        None,
                         provider_started_at,
                         &format!("redux driver failed: {err}"),
                         &config.cost,
@@ -8211,6 +8554,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     )
                     .await
                     {
+                        if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
                         tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
                     }
                     // The reducer's NotifyHook(Error) has already been sent; do not hooks.emit here
@@ -8241,6 +8585,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 ProviderTurnTerminalPlan::Cancelled { .. } => {
                     if let Err(error) = finalize_chat_non_success_turn(
+                        chat_turn_binding.as_deref(),
                         &memory_fabric,
                         &turn_run_id,
                         route_scope.clone(),
@@ -8253,6 +8598,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     )
                     .await
                     {
+                        if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
                         tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
                     }
                     if let Some(ref id) = draft_id {
@@ -8267,12 +8613,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
-        let preflight_budget = crate::agent::loop_::plan_context_budget(
+        let preflight_budget = crate::agent::context_budget::plan_context_budget(
             &history,
             &effective_compaction.config,
-            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
-        if preflight_budget.over_hard_limit {
+        if preflight_budget.over_hard_limit && !collection_turn {
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
@@ -8340,7 +8686,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
             Arc::clone(&terminal) as Arc<dyn Channel>,
         );
 
-        let turn_outcome = loop {
+        // Keep the large trace inline outside the small outcome discriminator.
+        let (turn_outcome, successful_trace) = loop {
             #[cfg(feature = "terminal-tui")]
             {
                 history_len_before_tools = history.len();
@@ -8349,40 +8696,59 @@ Retry with a compatible model: /provider {new_provider} <model>"
             let result = crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
                 .scope(
                     turn_message_send_ctx.clone(),
-                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
-                        turn_spawn_ctx.clone(),
-                        run_tool_call_loop_traced(
-                            provider.as_ref(),
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(turn_spawn_ctx.clone(), async {
+                        run_turn(
                             &mut history,
-                            Arc::clone(&tools_registry),
-                            observer.as_ref(),
-                            &hooks,
-                            provider_name,
-                            model_name,
-                            temperature,
-                            false,
-                            Some(Arc::clone(&approval_manager)),
-                            "terminal",
-                            &config.multimodal,
-                            config.agent.read_only_tool_concurrency_window,
-                            config.agent.priority_scheduling_enabled,
-                            config.agent.low_priority_tools.clone(),
-                            Some(&effective_compaction.config),
-                            Some(cancellation.clone()),
-                            Some(delta_tx.clone()),
-                            Some(&scope_ctx),
-                            Some(tool_event_tx.clone()),
-                            Some(&config.tool_tiering),
-                            memory_runtime.clone(),
-                            chat_session.mode,
-                        ),
-                    ),
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "terminal",
+                                scope: Some(&scope_ctx),
+                                mode: admitted_binding.admitted_model_mode()?,
+                                silent: false,
+                                expose_stay_silent: false,
+                                multimodal: &config.multimodal,
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
+                                    priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
+                                    low_priority_tool_names: config.agent.low_priority_tools.clone(),
+                                },
+                                compaction: Some(&effective_compaction.config),
+                                decision: admitted_binding.decision_routing()
+                                    .ok_or_else(|| anyhow::anyhow!("chat runtime turn requires an admitted decision"))?,
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider.as_ref(),
+                                provider_name,
+                                model: model_name,
+                                temperature,
+                                tools_registry: Arc::clone(&tools_registry),
+                                observer: observer.as_ref(),
+                                hooks: &hooks,
+                                approval: Some(Arc::clone(&approval_manager)),
+                                approval_resolver: None,
+                                runtime_adapter: chat_turn_binding.as_ref().map(|binding| crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                                    provider_trace: binding.retained_provider_trace(),
+                                    events: None, stream_provider: false, tool_execution_service: None,
+                                    tool_execution_context: crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private")
+                                        .with_chat_id("terminal:user"),
+                                    allowed_tool_names: None,
+                                }),
+                                memory: memory_runtime.clone(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: Some(cancellation.clone()),
+                                on_delta: Some(delta_tx.clone()),
+                                on_tool_call: Some(tool_event_tx.clone()),
+                            },
+                        )
+                        .await
+                        .map(|(outcome, trace)| (outcome.into_text(), trace))
+                    }),
                 )
                 .await;
 
             match result {
                 // ── Success ───────────────────────────────────────
-                Ok((resp, trace)) => break TurnOutcome::Success(resp, trace),
+                Ok((resp, trace)) => break (TurnOutcome::Success(resp), Some(trace)),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
                 Err(ref e) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
@@ -8391,7 +8757,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // S2-A: user-driven cancel — distinguished from real
                     // failures so the reducer emits `StreamCancelled` (no
                     // Error hook fan-out) instead of `StreamFailed`.
-                    break TurnOutcome::Cancelled;
+                    break (TurnOutcome::Cancelled, None);
                 }
                 // ── Context window overflow → compact + retry ─────
                 Err(ref e) if is_context_window_overflow_error(e) => {
@@ -8490,10 +8856,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             .await;
                     }
                     // No-progress overflow is non-retryable.
-                    break TurnOutcome::FailedWithError {
+                    break (TurnOutcome::FailedWithError {
                         err: "context-overflow-no-progress".to_string(),
                         retryable: false,
-                    };
+                    }, None);
                 }
                 // ── Other errors ──────────────────────────────────
                 Err(e) => {
@@ -8514,10 +8880,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // S2-A: generic provider/loop error — retryable hint is
                     // false (the caller already chose to surface and continue;
                     // retry policy is owned by upstream once tooling lands).
-                    break TurnOutcome::FailedWithError {
+                    break (TurnOutcome::FailedWithError {
                         err: err_text,
                         retryable: false,
-                    };
+                    }, None);
                 }
             }
         };
@@ -8567,6 +8933,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     );
                 }
                 if let Err(error) = finalize_chat_non_success_turn(
+                    chat_turn_binding.as_deref(),
                     &memory_fabric,
                     &turn_run_id,
                     route_scope.clone(),
@@ -8579,6 +8946,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 )
                 .await
                 {
+                    if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
                     tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
                 }
             }
@@ -8593,25 +8961,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         "chat.stream_failed",
                     );
                 }
-                // FIX-P1-15 (#27): the success path below records a
-                // `ProviderExecutionOutcome` + control-ladder trace, but a
-                // failed turn (timeout / context-overflow-no-progress / provider
-                // error) used to `continue` without emitting any provider
-                // outcome, leaving the routing/provider timeline blind to
-                // failed turns. Record a `failed_for_decision` outcome here so
-                // the `decision_id` join still has a `provider.final_outcome` /
-                // control-ladder trace for the failed attempt. Cancellation is
-                // a user-driven abort, not a provider failure, so the
-                // `Cancelled` arm above intentionally records nothing.
-                let failure = anyhow::anyhow!("{err}");
-                let failed_outcome =
-                    ProviderExecutionOutcome::failed_for_decision(&route_decision, provider_started_at, &failure);
+                // The terminal records the loop failure. Decided turns retain
+                // only observed provider attempts in their owning trace.
                 if let Err(error) = finalize_chat_non_success_turn(
+                    chat_turn_binding.as_deref(),
                     &memory_fabric,
                     &turn_run_id,
                     route_scope.clone(),
                     crate::agent::terminal::TurnTerminalStatus::Failed,
-                    Some(failed_outcome.clone()),
+                    None,
                     provider_started_at,
                     &format!("legacy tool loop failed: {err}"),
                     &config.cost,
@@ -8619,30 +8977,22 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 )
                 .await
                 {
+                    if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
                     tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
                 }
                 surface_turn_elapsed_message(
                     &chat_dispatcher,
                     sessions_redraw_handle.as_ref(),
                     "failed",
-                    failed_outcome.started_at,
-                    failed_outcome.finished_at,
-                );
-                let attempts_count = u8::try_from(failed_outcome.attempts.len()).unwrap_or(u8::MAX);
-                crate::runtime::control_ladder::append_provider_outcome_trace(
-                    std::path::Path::new(&config.workspace_dir),
-                    &failed_outcome.decision_id,
-                    &failed_outcome.final_provider,
-                    &failed_outcome.final_model,
-                    attempts_count,
-                    "all_failed",
+                    provider_started_at,
+                    chrono::Utc::now(),
                 );
             }
         }
 
         // If the turn failed or was cancelled, skip response processing
         let (response, turn_trace) = match turn_outcome {
-            TurnOutcome::Success(resp, trace) => (resp, trace),
+            TurnOutcome::Success(resp) => (resp, successful_trace.context("successful Chat outcome has no serving trace")?),
             TurnOutcome::Cancelled => {
                 rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
                 gate_cancelled_provider_turn_finalization(
@@ -8670,6 +9020,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 continue;
             }
         };
+        if let Some(binding) = chat_turn_binding.as_ref() {
+            binding.capture_trace(&turn_trace)?;
+        }
         // FIX-P0-30/31: build the provider outcome from the loop's real
         // attribution trace. When the trace carries the actual serving
         // provider/model + attempts (the `ReliableProvider` path), use them so a
@@ -8763,8 +9116,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // ── Sanitize response: strip tool-call XML/JSON artifacts ──
         let response = sanitize_channel_response(&response, &tools_registry);
 
-        if crate::agent::loop_::is_empty_assistant_response(&response, false) {
+        if crate::agent::response_guard::is_empty_assistant_response(&response, false) {
             let terminal_usage = match finalize_chat_success_turn(
+                chat_turn_binding.as_deref(),
                 &memory_fabric,
                 &chat_session_key,
                 &turn_run_id,
@@ -8782,8 +9136,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             {
                 Ok(receipt) => receipt.usage_settlement,
                 Err(error) => {
-                    tracing::warn!(error = %error, "Failed to commit shared empty Chat terminal event");
-                    crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                    return Err(error);
                 }
             };
             if let Some(ref d_id) = draft_id {
@@ -8802,7 +9155,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             surface_session_message(
                 &chat_dispatcher,
                 sessions_redraw_handle.as_ref(),
-                crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+                crate::agent::response_guard::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
             );
 
             chat_session.add_user_turn(&user_input);
@@ -8856,6 +9209,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         let terminal_usage = match finalize_chat_success_turn(
+            chat_turn_binding.as_deref(),
             &memory_fabric,
             &chat_session_key,
             &turn_run_id,
@@ -8873,8 +9227,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         {
             Ok(receipt) => receipt.usage_settlement,
             Err(error) => {
-                tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
-                crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                return Err(error);
             }
         };
 
@@ -9127,6 +9480,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
         anyhow::bail!("one or more chat turns failed");
     }
     Ok(())
+    }).await;
+    turn_decisions
+        .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    chat_result
 }
 
 // ── Response rendering ───────────────────────────────────────────────────
@@ -9525,6 +9883,10 @@ fn send_synthetic_command(
     input_tx.blocking_send(msg).map_err(|_| ())
 }
 
+fn is_local_operator_input(msg: &crate::channels::traits::ChannelMessage) -> bool {
+    msg.channel == "terminal" && msg.sender == "user"
+}
+
 fn is_synthetic_ui_command(msg: &crate::channels::traits::ChannelMessage) -> bool {
     msg.sender == SYNTHETIC_UI_COMMAND_SENDER && msg.channel == "terminal"
 }
@@ -9608,12 +9970,6 @@ fn enqueue_input_message(
     let _ = enqueue_input_message_and_return_priority(backlog, msg);
 }
 
-fn pop_next_input_message(
-    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
-) -> Option<crate::channels::traits::ChannelMessage> {
-    pop_next_queued_input_message(backlog).map(|queued| queued.msg)
-}
-
 fn pop_next_queued_input_message(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
 ) -> Option<QueuedInputMessage> {
@@ -9631,23 +9987,6 @@ fn next_queued_input_index(backlog: &std::collections::VecDeque<QueuedInputMessa
         }
     }
     best_idx
-}
-
-fn pop_next_input_message_with_scheduler(
-    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
-    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
-) -> Option<crate::channels::traits::ChannelMessage> {
-    let queued = pop_next_queued_input_message(backlog)?;
-    if let Some(id) = queued.turn_task_id
-        && let Err(error) = scheduler.mark_legacy_dispatched(id)
-    {
-        tracing::warn!(
-            task_id = id.get(),
-            error = ?error,
-            "TurnScheduler legacy dispatch mirror failed"
-        );
-    }
-    Some(queued.msg)
 }
 
 fn pop_next_input_task_with_scheduler(
@@ -9724,18 +10063,6 @@ fn requeue_post_route_admission_rejected_input(
         msg: input.msg,
     });
     *defer_visible_input_pop_once = true;
-}
-
-fn input_backlog_status(
-    backlog: &std::collections::VecDeque<QueuedInputMessage>,
-) -> crate::chat::action::MainQueueStatus {
-    crate::chat::action::MainQueueStatus {
-        queued: backlog.len(),
-        priority: backlog
-            .iter()
-            .filter(|queued| queued.priority == InputQueuePriority::Priority)
-            .count(),
-    }
 }
 
 fn publish_main_queue_status(
@@ -9951,7 +10278,7 @@ fn route_provider_completion_event(
     pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
     current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     completion: ProviderTurnCompletionEvent,
-) -> ProviderTurnCompletionRoute {
+) -> Option<ProviderTurnCompletionEvent> {
     if drain_provider_turn_lifecycle_events(lifecycle_rx, lifecycle_events_open, workers) {
         tracing::trace!(
             task_id = completion.task_id.get(),
@@ -9961,7 +10288,7 @@ fn route_provider_completion_event(
     let task_id = completion.task_id;
     record_provider_turn_completion_ready(workers, task_id);
     if Some(task_id) == current_task_id {
-        return ProviderTurnCompletionRoute::Current(completion);
+        return Some(completion);
     }
     if pending.insert(task_id, completion).is_some() {
         tracing::warn!(
@@ -9969,7 +10296,7 @@ fn route_provider_completion_event(
             "replaced duplicate pending provider completion event"
         );
     }
-    ProviderTurnCompletionRoute::Pending
+    None
 }
 
 fn route_provider_completion_event_and_publish(
@@ -9980,7 +10307,7 @@ fn route_provider_completion_event_and_publish(
     current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     completion: ProviderTurnCompletionEvent,
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
-) -> ProviderTurnCompletionRoute {
+) -> Option<ProviderTurnCompletionEvent> {
     let route = route_provider_completion_event(
         lifecycle_rx,
         lifecycle_events_open,
@@ -10111,6 +10438,7 @@ fn gate_cancelled_provider_turn_finalization(
 }
 
 #[allow(clippy::option_if_let_else)]
+#[cfg(feature = "terminal-tui")]
 fn resolve_provider_turn_completion(
     turn_signal: &dispatcher::TurnCompletionSignal,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -10147,6 +10475,7 @@ fn resolve_provider_turn_completion(
     ResolvedProviderTurnCompletion { outcome, usage }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn provider_turn_terminal_plan_from_completion(
     resolved: ResolvedProviderTurnCompletion,
     history_len: usize,
@@ -10159,7 +10488,7 @@ fn provider_turn_terminal_plan_from_completion(
                 let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
                 usage = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
             }
-            if crate::agent::loop_::is_empty_assistant_response(&final_text, false) {
+            if crate::agent::response_guard::is_empty_assistant_response(&final_text, false) {
                 ProviderTurnTerminalPlan::Completed {
                     final_text,
                     reasoning: String::new(),
@@ -10199,6 +10528,7 @@ fn provider_turn_terminal_plan_from_completion(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn gate_provider_turn_terminal_finalization(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
@@ -10234,6 +10564,7 @@ fn gate_provider_turn_terminal_finalization(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn finalize_provider_turn_from_event(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
@@ -10297,6 +10628,7 @@ fn finalize_provider_turn_from_event(
         .collect()
 }
 
+#[cfg(feature = "terminal-tui")]
 const fn provider_turn_finalizer_result_from_commit_decision(
     decision: &crate::chat::history_commit::HistoryCommitDecision,
 ) -> ProviderTurnFinalizerResult {
@@ -10320,6 +10652,7 @@ const fn provider_turn_finalizer_result_from_commit_decision(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn enqueue_provider_turn_finalizer_event(
     queue: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -10328,7 +10661,6 @@ fn enqueue_provider_turn_finalizer_event(
     queue.push_back(ProviderTurnFinalizerEvent { task_id, plan });
 }
 
-#[cfg(feature = "terminal-tui")]
 fn dispatch_ordered_provider_turn_commit(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     task_id: crate::chat::turn_scheduler::TurnTaskId,
@@ -10337,21 +10669,30 @@ fn dispatch_ordered_provider_turn_commit(
     final_text: &str,
     reasoning: &str,
     empty_response: bool,
-) {
-    let _ = chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::RecordUserTurn(user_input.to_string()),
-        "chat.ordered_record_user_turn",
-    );
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    if record_user {
+        let result = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordUserTurn(user_input.to_string()),
+            "chat.ordered_record_user_turn",
+        );
+        if !matches!(result, dispatcher::DispatchResult::Sent) {
+            return Err(format!("ordered history dispatch failed: {result:?}"));
+        }
+    }
     if !empty_response {
-        let _ = chat_dispatcher.dispatch_or_log(
+        let result = chat_dispatcher.dispatch_or_log(
             crate::chat::action::Action::RecordAssistantTurn {
                 task_id: Some(task_id),
                 content: final_text.to_string(),
             },
             "chat.ordered_record_assistant_turn",
         );
+        if !matches!(result, dispatcher::DispatchResult::Sent) {
+            return Err(format!("ordered history dispatch failed: {result:?}"));
+        }
     }
-    let _ = chat_dispatcher.dispatch_or_log(
+    let result = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::StreamCompleted {
             draft_id: draft_id.to_string(),
             final_text: final_text.to_string(),
@@ -10359,9 +10700,12 @@ fn dispatch_ordered_provider_turn_commit(
         },
         "chat.ordered_stream_completed",
     );
+    if !matches!(result, dispatcher::DispatchResult::Sent) {
+        return Err(format!("ordered history dispatch failed: {result:?}"));
+    }
+    Ok(())
 }
 
-#[cfg(feature = "terminal-tui")]
 async fn dispatch_ordered_provider_turn_commit_and_wait(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     turn_signal: &dispatcher::TurnCompletionSignal,
@@ -10371,6 +10715,7 @@ async fn dispatch_ordered_provider_turn_commit_and_wait(
     final_text: &str,
     reasoning: &str,
     empty_response: bool,
+    record_user: bool,
 ) -> std::result::Result<(), String> {
     // The first task-scoped notification means the provider produced its
     // terminal payload. The ordered StreamCompleted below is a distinct phase:
@@ -10383,9 +10728,10 @@ async fn dispatch_ordered_provider_turn_commit_and_wait(
     turn_signal.register_turn(task_id, draft_id.to_string());
     let Some(persistence_committed) = turn_signal.notified_for(task_id) else {
         tracing::error!(task_id = task_id.get(), "missing task-scoped persistence waiter");
+        turn_signal.fail_history_commit("missing task-scoped persistence waiter");
         return Err("missing task-scoped persistence waiter".to_string());
     };
-    dispatch_ordered_provider_turn_commit(
+    if let Err(error) = dispatch_ordered_provider_turn_commit(
         chat_dispatcher,
         task_id,
         draft_id,
@@ -10393,8 +10739,13 @@ async fn dispatch_ordered_provider_turn_commit_and_wait(
         final_text,
         reasoning,
         empty_response,
-    );
-    match tokio::time::timeout(Duration::from_secs(30), persistence_committed).await {
+        record_user,
+    ) {
+        turn_signal.unregister_turn(task_id);
+        turn_signal.fail_history_commit(error.clone());
+        return Err(error);
+    }
+    let result = match tokio::time::timeout(Duration::from_secs(30), persistence_committed).await {
         Ok(()) => {
             // Consume the second terminal outcome so a later waiter cannot
             // mistake this persistence acknowledgement for a provider result.
@@ -10417,7 +10768,11 @@ async fn dispatch_ordered_provider_turn_commit_and_wait(
             turn_signal.unregister_turn(task_id);
             Err("timed out waiting for ordered session persistence".to_string())
         }
+    };
+    if let Err(error) = &result {
+        turn_signal.fail_history_commit(error.clone());
     }
+    result
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -10456,50 +10811,90 @@ async fn commit_completed_provider_turn(
         return false;
     };
 
-    // The reply is the answer to whatever assigned this turn. Recorded here,
-    // sent when `pending` drops at the end of this call — an empty response is
-    // reported as such rather than as a completion with nothing in it.
-    if let Some(guard) = pending.assignment.as_mut() {
-        if empty_response {
-            guard.failed("The turn this chat ran for the assignment finished without any reply text.");
-        } else {
-            guard.completed(&recorded_response);
-        }
-    }
-
     let provider_turn_task_id = Some(pending.task_id);
-    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-        &pending.route_decision,
-        pending.provider_started_at,
-        redux_tokens_used.clone(),
-    );
-    let terminal_usage = match finalize_chat_success_turn(
-        memory_fabric,
-        chat_session_key,
-        &pending.turn_run_id,
-        &pending.provider_name,
-        &pending.model_name,
-        pending.route_scope.clone(),
-        provider_outcome.clone(),
-        (!empty_response).then(|| recorded_response.clone()),
-        history_commit_len,
-        if empty_response {
-            "redux driver completed with empty response"
-        } else {
-            "redux driver completed"
-        },
-        &config.cost,
-        &config.workspace_dir,
-    )
-    .await
+    let fixed_reply = match pending
+        .turn_binding
+        .as_ref()
+        .map(|binding| binding.fixed_reply())
+        .transpose()
     {
-        Ok(receipt) => receipt.usage_settlement,
+        Ok(reply) => reply.flatten(),
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
-            crate::agent::terminal::usage_settlement(&pending.turn_run_id, &provider_outcome, &config.cost)
+            tracing::error!(error = %error, "Chat directive is unavailable");
+            return false;
         }
     };
-    history.push(pending.history_user_message.clone());
+    let (provider_outcome, terminal_usage) = if let Some(reply) = fixed_reply {
+        if empty_response || final_text != reply || recorded_response != reply || !reasoning.is_empty() {
+            tracing::error!("Chat fixed reply differs from its decision");
+            return false;
+        }
+        let Some(binding) = pending.turn_binding.as_ref() else {
+            return false;
+        };
+        match binding
+            .close(
+                memory_fabric,
+                history_commit_len,
+                pending.provider_started_at,
+                &pending.cancellation,
+            )
+            .await
+        {
+            Ok(receipt) => (None, receipt.usage_settlement),
+            Err(error) => {
+                tracing::error!(error = %error, "Chat fixed terminal commit failed");
+                return false;
+            }
+        }
+    } else {
+        let provider_outcome = if let Some(binding) = pending.turn_binding.as_ref() {
+            match binding.provider_outcome(&pending.route_decision, pending.provider_started_at) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(error = %error, "Chat completion has no authenticated provider trace");
+                    return false;
+                }
+            }
+        } else {
+            ProviderExecutionOutcome::success_for_decision_with_usage(
+                &pending.route_decision,
+                pending.provider_started_at,
+                redux_tokens_used.clone(),
+            )
+        };
+        let terminal_usage = match finalize_chat_success_turn(
+            pending.turn_binding.as_deref(),
+            memory_fabric,
+            chat_session_key,
+            &pending.turn_run_id,
+            &pending.provider_name,
+            &pending.model_name,
+            pending.route_scope.clone(),
+            provider_outcome.clone(),
+            (!empty_response).then(|| recorded_response.clone()),
+            history_commit_len,
+            if empty_response {
+                "redux driver completed with empty response"
+            } else {
+                "redux driver completed"
+            },
+            &config.cost,
+            &config.workspace_dir,
+        )
+        .await
+        {
+            Ok(receipt) => receipt.usage_settlement,
+            Err(error) => {
+                tracing::error!(error = %error, "Chat terminal persistence is unconfirmed");
+                return false;
+            }
+        };
+        (Some(provider_outcome), terminal_usage)
+    };
+    let finished_at = provider_outcome
+        .as_ref()
+        .map_or_else(chrono::Utc::now, |outcome| outcome.finished_at);
     if empty_response {
         if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
             tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
@@ -10513,6 +10908,7 @@ async fn commit_completed_provider_turn(
             &final_text,
             &reasoning,
             empty_response,
+            true,
         )
         .await;
         if let Err(error) = persistence_result {
@@ -10523,6 +10919,10 @@ async fn commit_completed_provider_turn(
             );
             return false;
         }
+        if let Some(guard) = pending.assignment.as_mut() {
+            guard.failed("The turn finished without reply text.");
+        }
+        history.push(pending.history_user_message.clone());
         chat_session.add_user_turn(&pending.user_input);
         if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
             record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
@@ -10543,18 +10943,14 @@ async fn commit_completed_provider_turn(
             chat_dispatcher,
             sessions_redraw_handle,
             "completed",
-            provider_outcome.started_at,
-            provider_outcome.finished_at,
+            pending.provider_started_at,
+            finished_at,
         );
         publish_main_queue_status(chat_dispatcher, turn_scheduler);
         publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
         return true;
     }
 
-    history.push(ChatMessage::assistant(final_text.clone()));
-    if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
-        tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
-    }
     let persistence_result = dispatch_ordered_provider_turn_commit_and_wait(
         chat_dispatcher,
         turn_signal,
@@ -10564,6 +10960,7 @@ async fn commit_completed_provider_turn(
         &final_text,
         &reasoning,
         empty_response,
+        true,
     )
     .await;
     if let Err(error) = persistence_result {
@@ -10574,17 +10971,27 @@ async fn commit_completed_provider_turn(
         );
         return false;
     }
-    let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
-    crate::runtime::control_ladder::append_provider_outcome_trace(
-        std::path::Path::new(&config.workspace_dir),
-        &provider_outcome.decision_id,
-        &provider_outcome.final_provider,
-        &provider_outcome.final_model,
-        attempts_count,
-        "success",
-    );
+    history.push(pending.history_user_message.clone());
+    history.push(ChatMessage::assistant(final_text.clone()));
+    if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
+        tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
+    }
+    if let Some(provider_outcome) = provider_outcome.as_ref() {
+        let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
+        crate::runtime::control_ladder::append_provider_outcome_trace(
+            std::path::Path::new(&config.workspace_dir),
+            &provider_outcome.decision_id,
+            &provider_outcome.final_provider,
+            &provider_outcome.final_model,
+            attempts_count,
+            "success",
+        );
+    }
     chat_session.add_user_turn(&pending.user_input);
     chat_session.add_assistant_turn(&recorded_response, Vec::new());
+    if let Some(guard) = pending.assignment.as_mut() {
+        guard.completed(&recorded_response);
+    }
     if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
         record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
         chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
@@ -10604,8 +11011,8 @@ async fn commit_completed_provider_turn(
         chat_dispatcher,
         sessions_redraw_handle,
         "completed",
-        provider_outcome.started_at,
-        provider_outcome.finished_at,
+        pending.provider_started_at,
+        finished_at,
     );
     publish_main_queue_status(chat_dispatcher, turn_scheduler);
     publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
@@ -10638,6 +11045,9 @@ async fn apply_ready_ordered_provider_turn_commits(
 ) -> bool {
     let mut applied = false;
     for result in results {
+        if turn_signal.ensure_history_commits_healthy().is_err() {
+            break;
+        }
         if !result.finalized || result.terminal_status != "completed" {
             continue;
         }
@@ -10668,8 +11078,12 @@ async fn apply_ready_ordered_provider_turn_commits(
             turn_signal,
         )
         .await;
-        if !committed && plain_mode {
-            *plain_mode_turn_failed = true;
+        if !committed {
+            turn_signal.fail_history_commit(format!("ordered turn {} was not committed", task_id.get()));
+            if plain_mode {
+                *plain_mode_turn_failed = true;
+            }
+            break;
         }
         applied = true;
     }
@@ -10721,7 +11135,7 @@ async fn finalize_per_turn_context(
         task_id = pending.task_id.get(),
         draft_id = %pending.draft_id,
         turn_run_id = %pending.turn_run_id,
-        provider_name = %pending.provider_name,
+        provider_name = %crate::providers::redact_endpoint_userinfo(&pending.provider_name),
         model_name = %pending.model_name,
         history_len_before_user_turn = pending.history_len_before_user_turn,
         "finalizing provider turn context"
@@ -10771,17 +11185,13 @@ async fn finalize_per_turn_context(
             if let Some(guard) = pending.assignment.as_mut() {
                 guard.failed(&format!("The turn this chat ran for the assignment failed: {err}"));
             }
-            let failed_outcome = ProviderExecutionOutcome::failed_for_decision(
-                &pending.route_decision,
-                pending.provider_started_at,
-                &anyhow::anyhow!(err.clone()),
-            );
             if let Err(error) = finalize_chat_non_success_turn(
+                pending.turn_binding.as_deref(),
                 memory_fabric,
                 &pending.turn_run_id,
                 pending.route_scope.clone(),
                 crate::agent::terminal::TurnTerminalStatus::Failed,
-                Some(failed_outcome),
+                None,
                 pending.provider_started_at,
                 &format!("redux driver failed: {err}"),
                 &config.cost,
@@ -10789,6 +11199,13 @@ async fn finalize_per_turn_context(
             )
             .await
             {
+                if pending
+                    .turn_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.is_decided())
+                {
+                    *plain_mode_turn_failed = true;
+                }
                 tracing::warn!(error = %error, "Failed to commit ordered failed Chat terminal event");
             }
             let interactive_tui_active = redraw_tx_for_main.is_some();
@@ -10814,6 +11231,7 @@ async fn finalize_per_turn_context(
             // turn ended before it answered, which is exactly what happened —
             // and `cancelled` is the daemon's verdict, not a client's to claim.
             if let Err(error) = finalize_chat_non_success_turn(
+                pending.turn_binding.as_deref(),
                 memory_fabric,
                 &pending.turn_run_id,
                 pending.route_scope.clone(),
@@ -10826,6 +11244,13 @@ async fn finalize_per_turn_context(
             )
             .await
             {
+                if pending
+                    .turn_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.is_decided())
+                {
+                    *plain_mode_turn_failed = true;
+                }
                 tracing::warn!(error = %error, "Failed to commit ordered cancelled Chat terminal event");
             }
             let _ = terminal.cancel_draft("user", &pending.draft_id).await;
@@ -10900,6 +11325,9 @@ async fn finalize_ready_per_turn_contexts(
         return false;
     }
     for task_id in ready_task_ids {
+        if turn_signal.ensure_history_commits_healthy().is_err() {
+            break;
+        }
         let Some(pending) = per_turn_contexts.remove(&task_id) else {
             continue;
         };
@@ -10994,6 +11422,7 @@ async fn finalize_all_per_turn_contexts_as_cancelled(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn drain_provider_turn_finalizer_events(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
@@ -11012,6 +11441,7 @@ fn drain_provider_turn_finalizer_events(
     results
 }
 
+#[cfg(feature = "terminal-tui")]
 fn drain_provider_turn_finalizer_events_and_publish(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
@@ -11350,6 +11780,7 @@ fn is_queue_command(input: &str) -> bool {
     matches!(input.trim(), "/queue" | "/queue status")
 }
 
+#[cfg(feature = "terminal-tui")]
 fn is_cost_command(input: &str) -> bool {
     input.trim() == "/cost"
 }
@@ -11362,6 +11793,7 @@ fn is_workers_command(input: &str) -> bool {
         )
 }
 
+#[cfg(feature = "terminal-tui")]
 fn is_active_turn_local_command(input: &str) -> bool {
     let (_priority, content) = input_priority_from_text(input);
     is_queue_command(&content)
@@ -11370,6 +11802,7 @@ fn is_active_turn_local_command(input: &str) -> bool {
         || local_session_command(&content).is_some()
 }
 
+#[cfg(feature = "terminal-tui")]
 fn format_active_turn_local_notice(input: &str) -> String {
     let (_priority, content) = input_priority_from_text(input);
     let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -11377,6 +11810,7 @@ fn format_active_turn_local_notice(input: &str) -> String {
     format!("local > {preview}")
 }
 
+#[cfg(feature = "terminal-tui")]
 async fn active_turn_local_command_output(
     msg: &crate::channels::traits::ChannelMessage,
     backlog: &std::collections::VecDeque<QueuedInputMessage>,
@@ -11403,6 +11837,9 @@ async fn active_turn_local_command_output(
         )));
     }
     if let Some(action) = local_session_command(&content) {
+        if action.requires_local_operator() && !is_local_operator_input(msg) {
+            return Some("This session command requires local terminal operator input.".to_owned());
+        }
         if is_daemon_session_command(&action) {
             let local_fallback = if matches!(action, crate::chat::sessions::SessionCommand::DaemonSessions) {
                 handle_local_session_command(
@@ -11433,6 +11870,7 @@ async fn active_turn_local_command_output(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "terminal-tui")]
 async fn process_active_turn_input_message(
     msg: crate::channels::traits::ChannelMessage,
     emit_chat_output: &mut impl FnMut(&str),
@@ -11501,6 +11939,7 @@ async fn process_active_turn_input_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "terminal-tui")]
 async fn process_active_turn_input_batch(
     msg: crate::channels::traits::ChannelMessage,
     emit_chat_output: &mut impl FnMut(&str),
@@ -11612,6 +12051,7 @@ fn parse_provider_worker_sequence(target: &str) -> Result<u64, String> {
     Ok(sequence)
 }
 
+#[cfg(feature = "terminal-tui")]
 fn active_turn_workers_cancel_output(
     msg: &crate::channels::traits::ChannelMessage,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
@@ -11619,10 +12059,11 @@ fn active_turn_workers_cancel_output(
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
 ) -> Option<(String, Option<ProviderWorkerCancelSignal>)> {
     let (_priority, content) = classify_input_priority(msg);
-    provider_workers_cancel_output_for_input(&content, scheduler, workers, provider_turn_task_id)
+    provider_workers_cancel_output_for_input(msg, &content, scheduler, workers, provider_turn_task_id)
 }
 
 fn provider_workers_cancel_output_for_input(
+    source: &crate::channels::traits::ChannelMessage,
     input: &str,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
@@ -11635,6 +12076,12 @@ fn provider_workers_cancel_output_for_input(
             None,
         )),
         ProviderWorkerCancelCommand::Cancel { sequence } => {
+            if !is_local_operator_input(source) {
+                return Some((
+                    "Cancelling a provider worker requires local terminal operator input.".to_owned(),
+                    None,
+                ));
+            }
             let Some(worker) = workers
                 .snapshot()
                 .into_iter()
@@ -11810,6 +12257,7 @@ fn format_worker_tokens_compact(tokens: u64) -> String {
 /// they were reached for. They cost the loop nothing — each one hands its
 /// request to a task and returns the acceptance line (see
 /// [`start_daemon_session_command`]).
+#[cfg(feature = "terminal-tui")]
 fn local_session_command(input: &str) -> Option<crate::chat::sessions::SessionCommand> {
     let action = crate::chat::sessions::parse_session_command(input)?;
     match action {
@@ -11869,6 +12317,7 @@ fn drain_available_input_messages(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 fn format_queued_input_notice(input: &str, priority: InputQueuePriority) -> String {
     let (_, text) = input_priority_from_text(input);
     let label = match priority {
@@ -12234,7 +12683,7 @@ impl DiffViewSource {
 }
 
 fn diff_command_args(cached: bool) -> Vec<&'static str> {
-    let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"];
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3"];
     if cached {
         args.push("--cached");
     }
@@ -12301,9 +12750,14 @@ async fn run_git_diff_bounded(workspace_dir: &std::path::Path, cached: bool) -> 
     use tokio::io::AsyncReadExt as _;
 
     let args = diff_command_args(cached);
-    let mut child = tokio::process::Command::new("git")
+    // The hardened git launch (GIT-ENV): the workspace's `.git/config` must
+    // not run a program (fsmonitor, filters, ...) with PRX's environment.
+    let mut command =
+        crate::security::git_launch::git_command(crate::security::git_launch::GitScope::Repository(workspace_dir))
+            .await
+            .map_err(|err| format!("diff unavailable: {err}"))?;
+    let mut child = command
         .args(&args)
-        .current_dir(workspace_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -14010,9 +14464,13 @@ fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> 
         .turns
         .iter()
         .filter(|turn| turn.role == "user" || turn.role == "assistant")
-        .map(|turn| ChatMessage {
-            role: turn.role.clone(),
-            content: turn.content.clone(),
+        // A stored user turn re-enters a history here: one saved before
+        // inbound text was neutralised could still open with a reserved marker.
+        .map(|turn| {
+            crate::agent::turn_contracts::stored_turn_message(
+                turn.role.clone(),
+                turn.content.clone(),
+            )
         })
         .collect()
 }
@@ -14025,7 +14483,7 @@ fn persisted_history_for_current_turn(
     let mut history = Vec::with_capacity(session.turns.len().saturating_add(2));
     history.push(ChatMessage::system(system_prompt.to_string()));
     history.extend(session_turns_to_history(session));
-    history.push(ChatMessage::user(user_input.to_string()));
+    history.push(crate::agent::turn_contracts::inbound_user_message(user_input));
     history
 }
 
@@ -14189,6 +14647,7 @@ fn safe_branch_session_id() -> String {
     id
 }
 
+#[cfg(feature = "terminal-tui")]
 fn rewound_chat_session_from(current: &session::ChatSession, keep_turns: usize) -> session::ChatSession {
     let mut rewound = current.clone();
     rewound.turns.truncate(keep_turns);
@@ -14238,7 +14697,6 @@ struct ChatSwitchCtx<'a> {
     model_name: &'a str,
     skills: &'a [crate::skills::Skill],
     native_tools: bool,
-    tools_registry: &'a [Box<dyn Tool>],
     #[cfg(feature = "terminal-tui")]
     chat_mirror: &'a Arc<parking_lot::Mutex<tui::TuiState>>,
 }
@@ -14372,8 +14830,12 @@ fn request_diff_apply_approval(
     })
 }
 
+/// Out-of-band control requests from the TUI key handler to the chat loop.
+/// Only the TUI sends them, so without `terminal-tui` the channel carries
+/// nothing and the enum has no variants.
 #[derive(Debug)]
 enum ChatControlEvent {
+    #[cfg(feature = "terminal-tui")]
     ResumeSavedSession { id: String },
 }
 
@@ -14407,7 +14869,9 @@ async fn resume_saved_session_by_id(mem: &dyn Memory, target_id: &str, ctx: Chat
         match load_session_by_id_with_message_events(mem, workspace_id.as_ref(), target_id, &ctx.config.cost).await {
             Ok(Some(session)) => session,
             Ok(None) => anyhow::bail!("Saved chat session '{target_id}' not found."),
-            Err(e) => anyhow::bail!("Resume aborted: failed to load saved chat session '{target_id}': {e}"),
+            Err(e) => {
+                anyhow::bail!("Resume aborted: failed to load saved chat session '{target_id}': {e}")
+            }
         };
     let loaded_id = loaded_session.id.clone();
     let loaded_turns = loaded_session.turn_count();
@@ -14873,32 +15337,38 @@ mod session_runtime_binding_tests {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
-        let session = session::ChatSession::new("mock", "mock-model");
+        let session = session::ChatSession::new("ollama", "prx-local-model");
         let session_key = format!("chat:{}", session.id);
         let run_id = "chat-run-test";
 
-        let user_event = record_chat_user_message_event(
+        let (binding, service, user_event) = decision_source::admission_failure_tests::decided_binding_for_input(
             &fabric,
-            &session,
             &session_key,
             run_id,
-            "mock",
-            "mock-model",
-            1,
             "hello from chat",
         )
-        .await
-        .unwrap();
-        record_chat_assistant_message_event(
+        .await;
+        let route = RouteDecision::single_candidate("ollama", "prx-local-model");
+        finalize_chat_success_turn(
+            Some(binding.as_ref()),
             &fabric,
             &session_key,
             run_id,
-            "mock",
-            "mock-model",
-            "hello from assistant",
+            "ollama",
+            "prx-local-model",
+            binding.envelope().message_scope(),
+            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
+            Some("hello from assistant".to_string()),
+            1,
+            "test reply",
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
         )
         .await
         .unwrap();
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
 
         // D4 C6: the durable session_key is now the stable canonical derived from
         // the session id (NOT legacy chat:{id}, NOT {provider}/{model}). Recall by
@@ -14923,6 +15393,12 @@ mod session_runtime_binding_tests {
             )
             .await
             .unwrap();
+        // the production reply commit also records the provider and terminal
+        // events on this key; the user and assistant turns are the messages
+        let events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.event_type == "message.created")
+            .collect();
 
         assert_eq!(events.len(), 2);
         // The durable session_key truly changed to canonical (not just recipient).
@@ -14949,7 +15425,7 @@ mod session_runtime_binding_tests {
         assert_eq!(assistant_recorded.map(|event| event.role.as_str()), Some("assistant"));
         assert_eq!(
             assistant_recorded.and_then(|event| event.sender.as_deref()),
-            Some("mock/mock-model")
+            Some("ollama/prx-local-model")
         );
         assert_eq!(
             assistant_recorded.and_then(|event| event.recipient.as_deref()),
@@ -15079,42 +15555,35 @@ mod chat_message_event_projection_tests {
         save_session(memory.as_ref(), &snapshot).await.unwrap();
 
         let session_key = format!("chat:{}", snapshot.id);
-        record_chat_user_message_event(
+        let (binding, service, _) = decision_source::admission_failure_tests::decided_binding_for_provider(
             &fabric,
-            &snapshot,
             &session_key,
             "turn-1",
-            "anthropic",
-            "claude-sonnet-4",
-            1,
             "hello from the blob",
+            "anthropic",
+            "claude-sonnet-4",
         )
-        .await
-        .unwrap();
-        record_provider_outcome_events(
-            &fabric,
-            route_event_scope(
-                "chat",
-                None,
-                Some(session_key.clone()),
-                Some("turn-1".to_string()),
-                Some("local-user".to_string()),
-                Some("anthropic/claude-sonnet-4".to_string()),
-            ),
-            &outcome,
-        )
-        .await
-        .unwrap();
-        record_chat_assistant_message_event(
+        .await;
+        finalize_chat_success_turn(
+            Some(binding.as_ref()),
             &fabric,
             &session_key,
             "turn-1",
             "anthropic",
             "claude-sonnet-4",
-            "hello from the event log",
+            binding.envelope().message_scope(),
+            outcome.clone(),
+            Some("hello from the event log".to_string()),
+            1,
+            "test reply",
+            &cost_config,
+            tmp.path(),
         )
         .await
         .unwrap();
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
 
         // Workspace-visible noise from another chat must never enter this projection.
         let noise = session::ChatSession::new("other", "model");
@@ -15545,28 +16014,36 @@ mod legacy_chat_compaction_audit_tests {
         // Two turns, each with its own freshly generated run_id (mirroring the
         // per-turn generation at the turn-loop entry).
         let turn1_run_id = uuid::Uuid::new_v4().to_string();
-        let user1 = record_chat_user_message_event(
+        let (binding, service, user1) = decision_source::admission_failure_tests::decided_binding_for_input(
             &fabric,
-            &session,
             &session_key,
             &turn1_run_id,
-            "test-provider",
-            "test-model",
-            1,
             "first turn",
         )
-        .await
-        .unwrap();
-        let asst1 = record_chat_assistant_message_event(
+        .await;
+        let route = RouteDecision::single_candidate("ollama", "prx-local-model");
+        let asst1 = finalize_chat_success_turn(
+            Some(binding.as_ref()),
             &fabric,
             &session_key,
             &turn1_run_id,
-            "test-provider",
-            "test-model",
-            "first reply",
+            "ollama",
+            "prx-local-model",
+            binding.envelope().message_scope(),
+            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
+            Some("first reply".to_string()),
+            1,
+            "test reply",
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
         )
         .await
+        .unwrap()
+        .assistant_event
         .unwrap();
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
 
         let turn2_run_id = uuid::Uuid::new_v4().to_string();
         let user2 = record_chat_user_message_event(
@@ -15614,28 +16091,36 @@ mod legacy_chat_compaction_audit_tests {
         assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
 
         let session_key = format!("chat:{}", session.id);
-        let user_event = record_chat_user_message_event(
+        let (binding, service, user_event) = decision_source::admission_failure_tests::decided_binding_for_input(
             &fabric,
-            &session,
             &session_key,
             "run-secret",
-            "mock",
-            "model",
-            1,
             &format!("user {secret} {non_ascii}"),
         )
-        .await
-        .unwrap();
-        let assistant_event = record_chat_assistant_message_event(
+        .await;
+        let route = RouteDecision::single_candidate("ollama", "prx-local-model");
+        let assistant_event = finalize_chat_success_turn(
+            Some(binding.as_ref()),
             &fabric,
             &session_key,
             "run-secret",
-            "mock",
-            "model",
-            &format!("assistant {secret} 🌍"),
+            "ollama",
+            "prx-local-model",
+            binding.envelope().message_scope(),
+            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
+            Some(format!("assistant {secret} 🌍")),
+            1,
+            "test reply",
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
         )
         .await
+        .unwrap()
+        .assistant_event
         .unwrap();
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
         assert!(!user_event.content.contains(secret));
         assert!(!assistant_event.content.contains(secret));
         assert!(user_event.content.contains(non_ascii));
@@ -15663,6 +16148,144 @@ mod legacy_chat_compaction_audit_tests {
     }
 
     #[tokio::test]
+    async fn chat_terminal_without_binding_rejects_before_persistence() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
+        let scope = route_event_scope(
+            "chat",
+            None,
+            Some("prx_session".to_string()),
+            Some("prx_turn".to_string()),
+            Some("local-user".to_string()),
+            None,
+        );
+        let route = RouteDecision::single_candidate("provider", "model");
+        let cost = crate::config::schema::CostConfig::default();
+        let success = finalize_chat_success_turn(
+            None,
+            &fabric,
+            "prx_session",
+            "prx_turn",
+            "provider",
+            "model",
+            scope.clone(),
+            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
+            Some("prx reply".to_string()),
+            1,
+            "completed",
+            &cost,
+            tmp.path(),
+        )
+        .await;
+        assert!(success.err().unwrap().to_string().contains("binding is missing"));
+        for status in [
+            crate::agent::terminal::TurnTerminalStatus::Failed,
+            crate::agent::terminal::TurnTerminalStatus::Cancelled,
+        ] {
+            let result = finalize_chat_non_success_turn(
+                None,
+                &fabric,
+                "prx_turn",
+                scope.clone(),
+                status,
+                None,
+                chrono::Utc::now(),
+                "interrupted",
+                &cost,
+                tmp.path(),
+            )
+            .await;
+            assert!(result.err().unwrap().to_string().contains("binding is missing"));
+        }
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    require_owner_match: false,
+                    workspace_id: fabric.workspace_id().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("prx_session".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "unbound terminals must not persist history or markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_persists_no_secret_from_a_reply_or_a_provider_error() {
+        // D-053 / REDACT-TURN probe: a chat reply committed through the production
+        // success finalizer, and a failed chat turn whose provider error and
+        // summary carry the secret committed through the production failure
+        // finalizer, leave the secret in no file of the workspace. Fails before
+        // REDACT-TURN moved chat's redaction into `finalize_turn`.
+        use crate::agent::terminal::persistence_probe::{PROBE_SECRET, assert_nothing_under_persists_the_probe_secret};
+        let tmp = TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
+        let (reply_binding, reply_service) =
+            decision_source::admission_failure_tests::decided_binding(&fabric, "chat-probe", "chat-probe-reply").await;
+        let decision = RouteDecision::single_candidate("ollama", "prx-local-model");
+        let reply = finalize_chat_success_turn(
+            Some(reply_binding.as_ref()),
+            &fabric,
+            "chat-probe",
+            "chat-probe-reply",
+            "ollama",
+            "prx-local-model",
+            reply_binding.envelope().message_scope(),
+            ProviderExecutionOutcome::success_for_decision(&decision, chrono::Utc::now()),
+            Some(format!("Here is the key {PROBE_SECRET} you asked for")),
+            1,
+            "test reply",
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
+        )
+        .await
+        .expect("test: commit the chat reply")
+        .assistant_event
+        .unwrap();
+        assert!(reply.content.contains("[REDACTED]"), "{}", reply.content);
+        let (failed_binding, failed_service) =
+            decision_source::admission_failure_tests::decided_binding(&fabric, "chat-probe", "chat-probe-failed").await;
+        let error = anyhow::anyhow!("upstream rejected key {PROBE_SECRET}");
+        finalize_chat_non_success_turn(
+            Some(failed_binding.as_ref()),
+            &fabric,
+            "chat-probe-failed",
+            failed_binding.envelope().message_scope(),
+            crate::agent::terminal::TurnTerminalStatus::Failed,
+            Some(ProviderExecutionOutcome::failed_for_decision(
+                &decision,
+                chrono::Utc::now(),
+                &error,
+            )),
+            chrono::Utc::now(),
+            &format!("redux driver failed: {error}"),
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
+        )
+        .await
+        .expect("test: commit the failed chat turn");
+        assert_nothing_under_persists_the_probe_secret(tmp.path());
+        for service in [reply_service, failed_service] {
+            service
+                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await;
+        }
+    }
+
+    #[tokio::test]
     async fn chat_route_payloads_remain_valid_json_and_redact_nested_secrets() {
         let secret = "AKIAABCDEFGHIJKLMNOP";
         let bearer = "Authorization: Bearer abcdefghijklmnop";
@@ -15670,15 +16293,10 @@ mod legacy_chat_compaction_audit_tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
         let session_key = "chat-route-sanitize".to_string();
-        let scope = route_event_scope(
-            "chat",
-            None,
-            Some(session_key.clone()),
-            Some("route-run".to_string()),
-            Some("local-user".to_string()),
-            None,
-        );
-        let mut decision = RouteDecision::single_candidate("provider", "model");
+        let (binding, service) =
+            decision_source::admission_failure_tests::decided_binding(&fabric, &session_key, "route-run").await;
+        let scope = binding.envelope().message_scope();
+        let mut decision = RouteDecision::single_candidate("ollama", "prx-local-model");
         decision.user_hint = Some(format!("hint {secret}"));
         decision
             .filtered_out
@@ -15698,31 +16316,37 @@ mod legacy_chat_compaction_audit_tests {
 
         let error = anyhow::anyhow!("provider failed: {bearer}; aws={secret}");
         let outcome = ProviderExecutionOutcome::failed_for_decision(&decision, chrono::Utc::now(), &error);
-        record_provider_outcome_events(&fabric, scope, &outcome).await.unwrap();
+        // the production failure commit of a chat turn, whose summary (and so
+        // its suppression reason) carries the error text, as `run()` passes it
+        // (R-LOOPD5 G-1)
+        finalize_chat_non_success_turn(
+            Some(binding.as_ref()),
+            &fabric,
+            "route-run",
+            scope,
+            crate::agent::terminal::TurnTerminalStatus::Failed,
+            Some(outcome),
+            chrono::Utc::now(),
+            &format!("redux driver failed: {error}"),
+            &crate::config::schema::CostConfig::default(),
+            tmp.path(),
+        )
+        .await
+        .unwrap();
         let events = memory
-            .list_message_events_since(
-                &MemoryPrincipal {
-                    require_owner_match: false,
-                    workspace_id: tmp.path().to_string_lossy().to_string(),
-                    agent_id: None,
-                    persona_id: None,
-                    session_key: Some(session_key),
-                    channel: Some("runtime".to_string()),
-                    sender: Some("local-user".to_string()),
-                    owner_id: None,
-                    legacy_session_key: None,
-                },
-                0,
-                20,
-            )
+            .list_message_events_since(&binding.envelope().memory_principal(), 0, 20)
             .await
             .unwrap();
         assert!(!events.is_empty());
+        assert!(events.iter().any(|event| event.event_type == "turn.finalized"));
         for payload in events.iter().filter_map(|event| event.raw_payload_json.as_deref()) {
             assert!(serde_json::from_str::<serde_json::Value>(payload).is_ok());
             assert!(!payload.contains(secret));
             assert!(!payload.contains("abcdefghijklmnop"));
         }
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
     }
 }
 
@@ -16227,6 +16851,7 @@ mod reasoning_extraction_tests {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
 #[cfg(test)]
 mod terminal_guard_tests {
     //! Tests for P3-2: `TerminalGuard` RAII + strengthened panic hook.
@@ -16644,8 +17269,11 @@ mod terminal_guard_tests {
             ChatMessage::system("sys"),
             ChatMessage::user("context pressure ".repeat(400)),
         ];
-        let budget =
-            crate::agent::loop_::plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+        let budget = crate::agent::context_budget::plan_context_budget(
+            &history,
+            &config,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+        );
         assert!(budget.used_tokens > 0, "fixture must produce context usage");
         let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
         assert!(
@@ -16853,25 +17481,6 @@ mod tracing_redirect_tests {
     }
 }
 
-// ─── v0.4.1: Pure-only chat route contract ──────────────────────────────────
-
-#[cfg(test)]
-#[cfg(feature = "terminal-tui")]
-mod redux_mode_tests {
-    use super::*;
-
-    #[test]
-    fn mode_is_pure_only() {
-        let mode = ReduxMode::Pure;
-        assert!(mode.is_pure());
-    }
-
-    #[test]
-    fn route_pure_always_driver() {
-        assert!(matches!(route_turn(ReduxMode::Pure), TurnRoute::ReduxDriver));
-    }
-}
-
 // ─── S4-A Commit 4: RenderSource enum dual paths ─────────────────────────────
 
 #[cfg(test)]
@@ -17000,6 +17609,7 @@ mod s4_a_4 {
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
             routing_input: None,
+            turn_binding: None,
         });
         let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
             provider_turn_task_id: None,
@@ -17012,6 +17622,7 @@ mod s4_a_4 {
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
             routing_input: None,
+            turn_binding: None,
         });
         let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
             draft_id: "draft-a".to_string(),
@@ -17293,7 +17904,13 @@ mod p6c2_diff_tests {
     #[test]
     fn diff_command_args_include_no_ext_diff_and_cached_flag() {
         let workspace = diff_command_args(false);
-        assert_eq!(workspace, vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"]);
+        assert_eq!(
+            workspace,
+            vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3"]
+        );
+        for flag in crate::security::git_launch::DIFF_SAFETY_ARGS {
+            assert!(workspace.contains(&flag), "{flag}");
+        }
         assert!(
             workspace.contains(&"--no-ext-diff"),
             "git diff viewer must disable diff.external"
@@ -17332,6 +17949,7 @@ mod p6c2_diff_tests {
 
     #[tokio::test]
     async fn collect_workspace_diff_git_failure_is_soft() {
+        crate::security::git_launch::hermetic_git_for_tests();
         let temp = tempfile::TempDir::new().expect("tempdir");
         let source = collect_workspace_diff(temp.path(), false).await;
         assert_eq!(source.title, "workspace diff");
@@ -17738,18 +18356,22 @@ mod p3_directional_switch_tests {
         let priority = enqueue_input_message_and_return_priority(&mut backlog, input_msg("/now inspect status"));
 
         assert_eq!(priority, InputQueuePriority::Priority);
-        let msg = pop_next_input_message(&mut backlog).expect("queued priority message");
+        let msg = pop_next_queued_input_message(&mut backlog)
+            .map(|queued| queued.msg)
+            .expect("queued priority message");
         assert_eq!(msg.content, "inspect status");
     }
 
     #[test]
     fn input_backlog_status_counts_priority_messages() {
         let mut backlog = std::collections::VecDeque::new();
-        enqueue_input_message(&mut backlog, input_msg("normal one"));
-        enqueue_input_message(&mut backlog, input_msg("/priority urgent two"));
-        enqueue_input_message(&mut backlog, input_msg("normal three"));
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 3);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 3);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal three"), 3);
 
-        let status = input_backlog_status(&backlog);
+        // the production status source: the scheduler the queue mirrors into
+        let status = scheduler.status().main_queue_status();
 
         assert_eq!(status.queued, 3);
         assert_eq!(status.priority, 1);
@@ -17763,7 +18385,7 @@ mod p3_directional_switch_tests {
         enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 5);
         enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 5);
 
-        assert_eq!(input_backlog_status(&backlog), scheduler.status().main_queue_status());
+        assert_eq!(backlog.len(), scheduler.status().main_queue_status().queued);
         assert_eq!(scheduler.status().main_queue_status().queued, 2);
         assert_eq!(scheduler.status().main_queue_status().priority, 1);
     }
@@ -17777,9 +18399,15 @@ mod p3_directional_switch_tests {
         enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 7);
         enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal three"), 7);
 
-        let first = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("priority first");
-        let second = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("normal one second");
-        let third = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("normal three third");
+        let first = pop_next_input_task_with_scheduler(&mut backlog, &mut scheduler)
+            .map(|task| task.msg)
+            .expect("priority first");
+        let second = pop_next_input_task_with_scheduler(&mut backlog, &mut scheduler)
+            .map(|task| task.msg)
+            .expect("normal one second");
+        let third = pop_next_input_task_with_scheduler(&mut backlog, &mut scheduler)
+            .map(|task| task.msg)
+            .expect("normal three third");
 
         assert_eq!(first.content, "urgent two");
         assert_eq!(second.content, "normal one");
@@ -18127,6 +18755,7 @@ mod p3_directional_switch_tests {
             .expect("second worker starts");
 
         let (output, signal_cancel) = provider_workers_cancel_output_for_input(
+            &input_msg("/workers cancel w#2"),
             "/workers cancel w#2",
             &mut scheduler,
             &mut provider_turn_workers,
@@ -18730,7 +19359,7 @@ mod p3_directional_switch_tests {
             completion,
         );
 
-        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+        assert!(route.is_none(), "a non-current completion is retained as pending");
         assert!(
             pending.contains_key(&second),
             "non-current completion should be retained"
@@ -18796,13 +19425,9 @@ mod p3_directional_switch_tests {
             completion,
         );
 
-        match route {
-            ProviderTurnCompletionRoute::Current(completion) => {
-                assert_eq!(completion.task_id, task_id);
-                assert_eq!(completion.usage.total_tokens, Some(43));
-            }
-            ProviderTurnCompletionRoute::Pending => panic!("current completion must not be retained as pending"),
-        }
+        let completion = route.expect("current completion must not be retained as pending");
+        assert_eq!(completion.task_id, task_id);
+        assert_eq!(completion.usage.total_tokens, Some(43));
         assert!(pending.is_empty(), "current completion should bypass pending map");
         assert!(
             workers
@@ -18857,7 +19482,7 @@ mod p3_directional_switch_tests {
             &chat_dispatcher,
         );
 
-        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+        assert!(route.is_none(), "a non-current completion is retained as pending");
         let retained = pending.get(&task_id).expect("outer completion retained by task id");
         assert_eq!(retained.usage.total_tokens, Some(9));
         assert!(
@@ -18919,7 +19544,7 @@ mod p3_directional_switch_tests {
             },
             &chat_dispatcher,
         );
-        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+        assert!(route.is_none(), "a non-current completion is retained as pending");
 
         let completion = pending
             .remove(&task_id)
@@ -18986,6 +19611,7 @@ mod p3_directional_switch_tests {
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
             routing_input: None,
+            turn_binding: None,
         });
 
         let ready_effects = state.reduce(Action::ProviderTurnReadyForCommit {
@@ -19008,7 +19634,9 @@ mod p3_directional_switch_tests {
             "answer",
             "reason",
             false,
-        );
+            true,
+        )
+        .expect("ordered history dispatch");
 
         let user = rx.try_recv().expect("ordered RecordUserTurn action");
         match user {
@@ -20406,6 +21034,8 @@ mod p3_directional_switch_tests {
         ) -> PendingOrderedProviderTurnCommit {
             PendingOrderedProviderTurnCommit {
                 context: PerTurnContext {
+                    cancellation: CancellationToken::new(),
+                    turn_binding: None,
                     task_id,
                     draft_id: draft_id.to_string(),
                     delta_tx: None,
@@ -20461,7 +21091,9 @@ mod p3_directional_switch_tests {
                     &final_text,
                     &reasoning,
                     empty_response,
-                );
+                    true,
+                )
+                .expect("ordered history dispatch");
             }
         }
 
@@ -21158,9 +21790,15 @@ mod p3_directional_switch_tests {
         enqueue_input_message(&mut backlog, input_msg("/priority urgent two"));
         enqueue_input_message(&mut backlog, input_msg("normal three"));
 
-        let first = pop_next_input_message(&mut backlog).expect("priority first");
-        let second = pop_next_input_message(&mut backlog).expect("normal one second");
-        let third = pop_next_input_message(&mut backlog).expect("normal three third");
+        let first = pop_next_queued_input_message(&mut backlog)
+            .map(|queued| queued.msg)
+            .expect("priority first");
+        let second = pop_next_queued_input_message(&mut backlog)
+            .map(|queued| queued.msg)
+            .expect("normal one second");
+        let third = pop_next_queued_input_message(&mut backlog)
+            .map(|queued| queued.msg)
+            .expect("normal three third");
 
         assert_eq!(first.content, "urgent two");
         assert_eq!(second.content, "normal one");
@@ -21306,6 +21944,7 @@ mod p7a_resume_tests {
 mod p7b_branch_rewind_tests {
     use super::*;
 
+    #[cfg(feature = "terminal-tui")]
     fn turn(role: &str, content: &str) -> session::ChatTurn {
         session::ChatTurn {
             role: role.to_string(),
@@ -21315,6 +21954,7 @@ mod p7b_branch_rewind_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn child_summary(id: &str) -> crate::chat::sessions::PersistedSessionSummary {
         crate::chat::sessions::PersistedSessionSummary {
             id: id.to_string(),
@@ -21329,6 +21969,7 @@ mod p7b_branch_rewind_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn sample_session() -> session::ChatSession {
         let mut s = session::ChatSession::new("kimi-code", "kimi2.6");
         s.title = "source".to_string();
@@ -21351,6 +21992,7 @@ mod p7b_branch_rewind_tests {
         assert!(parse_turn_boundary("4", 3, "rewind").is_err());
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn branch_and_rewind_prefixes_are_exact_and_ordered() {
         let source = sample_session();
@@ -21377,6 +22019,7 @@ mod p7b_branch_rewind_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn child_summaries_survive_only_at_full_length_boundary() {
         let source = sample_session();
@@ -21391,6 +22034,7 @@ mod p7b_branch_rewind_tests {
         assert!(short_rewind.background_sessions.is_empty());
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn assert_same_turns(left: &session::ChatSession, right: &session::ChatSession) {
         assert_eq!(left.turns.len(), right.turns.len());
         for (left_turn, right_turn) in left.turns.iter().zip(right.turns.iter()) {
@@ -21399,6 +22043,7 @@ mod p7b_branch_rewind_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn rewind_denied_approval_does_not_apply_trimmed_session() {
         let source = sample_session();
@@ -21426,6 +22071,7 @@ mod p7b_branch_rewind_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn rewind_dropped_approval_channel_does_not_apply_trimmed_session() {
         let source = sample_session();
@@ -21518,7 +22164,6 @@ mod regfix_approval_switch_tests {
         let mut attached_follow_seq = Some(7);
         let config = Config::default();
         let skills: Vec<crate::skills::Skill> = Vec::new();
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let chat_mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
         {
             let mut mirror = chat_mirror.lock();
@@ -21562,7 +22207,6 @@ mod regfix_approval_switch_tests {
                 model_name: "m",
                 skills: &skills,
                 native_tools: false,
-                tools_registry: &tools_registry,
                 chat_mirror: &chat_mirror,
             },
             loaded_session,
@@ -21884,5 +22528,20 @@ mod v4_reload_recap_tests {
             out.contains("#2 [model] completed — model task"),
             "model line is tagged: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod userinfo_display_tests {
+    /// USERINFO-2: the chat banner is the first line of every session; a
+    /// `custom:` URL may carry `user:password@`.
+    #[test]
+    fn the_banner_names_the_provider_without_url_userinfo() {
+        let banner = super::startup_banner("custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1", "fixture-model");
+        assert!(
+            banner.contains("custom:http://[redacted]@127.0.0.1:1/v1/fixture-model"),
+            "{banner}"
+        );
+        assert!(!banner.contains("SECRET-fixture-pw"), "{banner}");
     }
 }

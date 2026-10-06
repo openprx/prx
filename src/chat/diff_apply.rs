@@ -26,6 +26,7 @@ impl DiffApplyPlan {
         self.files.len()
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[must_use]
     pub(crate) fn summary(&self) -> String {
         let mut out = format!(
@@ -48,6 +49,7 @@ impl DiffApplyPlan {
         out
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[must_use]
     pub(crate) fn approval_args_json(&self) -> String {
         serde_json::json!({
@@ -68,10 +70,12 @@ impl DiffApplyPlan {
         .to_string()
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn additions(&self) -> usize {
         self.files.iter().map(|file| file.additions).sum()
     }
 
+    #[cfg(feature = "terminal-tui")]
     fn deletions(&self) -> usize {
         self.files.iter().map(|file| file.deletions).sum()
     }
@@ -132,7 +136,6 @@ impl HunkLine {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DiffApplyError {
-    MissingFencedDiff,
     Oversized,
     Malformed(String),
     Unsupported(String),
@@ -144,7 +147,6 @@ pub(crate) enum DiffApplyError {
 impl std::fmt::Display for DiffApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingFencedDiff => write!(f, "no applicable fenced diff block found"),
             Self::Oversized => write!(f, "diff is too large to apply safely"),
             Self::Malformed(msg) => write!(f, "malformed diff: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported diff: {msg}"),

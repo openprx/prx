@@ -790,13 +790,23 @@ impl AssignmentTurnGuard {
     }
 
     /// Record the reply this turn produced.
+    ///
+    /// The daemon stores the report as the assignment's result, so the reply
+    /// is redacted like the terminal commit first (D-053).
     pub fn completed(&mut self, reply: &str) {
-        self.outcome = Some((ResultStatus::Completed, bound_summary(reply)));
+        self.outcome = Some((
+            ResultStatus::Completed,
+            bound_summary(&crate::agent::terminal::redact_persisted_text(reply)),
+        ));
     }
 
-    /// Record that the turn ran and failed, with the reason.
+    /// Record that the turn ran and failed, with the reason (redacted like
+    /// the reply).
     pub fn failed(&mut self, reason: &str) {
-        self.outcome = Some((ResultStatus::Failed, bound_summary(reason)));
+        self.outcome = Some((
+            ResultStatus::Failed,
+            bound_summary(&crate::agent::terminal::redact_persisted_text(reason)),
+        ));
     }
 
     /// Give up the report because this assignment has not actually run yet.
@@ -1539,6 +1549,39 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].1, ResultStatus::Completed);
         assert_eq!(reports[0].2, "37 TODOs");
+    }
+
+    /// D-053 / REDACT-TURN: the daemon stores an assignment report as the
+    /// assignment's result, so the reply and the failure reason are redacted
+    /// before they leave the chat. Fails before REDACT-TURN.
+    #[tokio::test]
+    async fn an_assignment_report_carries_no_secret_from_the_reply_or_the_failure() {
+        use crate::agent::terminal::persistence_probe::PROBE_SECRET;
+        let mailbox = RecordingMailbox::new(vec![]);
+        let registry = super::super::daemon::new_in_flight_registry();
+        {
+            let mut completed = AssignmentTurnGuard::new(
+                Arc::clone(&mailbox) as Arc<dyn AssignmentMailbox>,
+                Arc::clone(&registry),
+                silent(),
+                "a-secret-1".to_string(),
+            );
+            completed.completed(&format!("Here is the key {PROBE_SECRET} you asked for"));
+            let mut failed = AssignmentTurnGuard::new(
+                Arc::clone(&mailbox) as Arc<dyn AssignmentMailbox>,
+                Arc::clone(&registry),
+                silent(),
+                "a-secret-2".to_string(),
+            );
+            failed.failed(&format!("redux driver failed: upstream rejected key {PROBE_SECRET}"));
+        }
+        tokio::task::yield_now().await;
+        let reports = mailbox.reports.lock().clone();
+        assert_eq!(reports.len(), 2, "both turns report");
+        for report in &reports {
+            assert!(!report.2.contains(PROBE_SECRET), "{report:?}");
+            assert!(report.2.contains("[REDACTED]"), "{report:?}");
+        }
     }
 
     #[tokio::test]

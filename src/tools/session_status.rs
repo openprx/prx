@@ -38,9 +38,13 @@ impl SessionStatusTool {
         model: impl Into<String>,
         channels: Vec<String>,
     ) -> Self {
+        // The model reads this label; a `custom:` URL may carry
+        // `user:password@`, which it must not see.
+        let provider_name = provider_name.into();
+        let provider_name = crate::providers::redact_endpoint_userinfo(&provider_name).into_owned();
         Self {
             active_runs,
-            provider_name: provider_name.into(),
+            provider_name,
             model: model.into(),
             channels,
             started_at: Instant::now(),
@@ -233,6 +237,41 @@ mod tests {
         assert!(result.output.contains("0 total"));
     }
 
+    /// R-C0f N-2: the model reads this output, and a `custom:` provider URL
+    /// may carry `user:password@`. The endpoint stays recognisable; the
+    /// userinfo does not reach the model.
+    #[tokio::test]
+    async fn the_provider_is_shown_to_the_model_without_url_userinfo() {
+        let tool = SessionStatusTool::new(
+            Arc::new(RwLock::new(vec![])),
+            "custom:https://alice:SECRET-fixture-pw@internal.invalid:8443/v1",
+            "fixture-model",
+            vec![],
+        );
+        let result = tool.execute(json!({})).await.expect("test: status renders");
+        assert!(
+            result
+                .output
+                .contains("custom:https://[redacted]@internal.invalid:8443/v1"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("SECRET-fixture-pw"), "{}", result.output);
+        assert!(!result.output.contains("alice"), "{}", result.output);
+    }
+
+    /// R-C2BU F-1: every password form the old tokenising redactor split
+    /// apart stays out of the output the model reads.
+    #[tokio::test]
+    async fn hostile_passwords_are_not_shown_to_the_model() {
+        for (label, secret) in crate::providers::label_redaction_tests::HOSTILE_USERINFO {
+            let tool = SessionStatusTool::new(Arc::new(RwLock::new(vec![])), *label, "fixture-model", vec![]);
+            let output = tool.execute(json!({})).await.expect("test: status renders").output;
+            assert!(!output.contains(secret), "{label:?}: {output}");
+            assert!(!output.contains("alice"), "{label:?}: {output}");
+        }
+    }
+
     fn owned_running_run(id: &str, owner_id: Option<&str>) -> SubAgentRun {
         SubAgentRun {
             progress: crate::agent::idle::child_beat(),
@@ -249,6 +288,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(vec![])),
             steer_tx: None,
             parent_run_id: None,
@@ -342,6 +382,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
                 parent_run_id: None,
@@ -364,6 +405,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
                 parent_run_id: None,
@@ -386,6 +428,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
                 parent_run_id: None,

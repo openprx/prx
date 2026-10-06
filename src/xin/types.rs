@@ -3,6 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use crate::tools::execution::JobOrigin;
+
 /// Task lifecycle: Pending → Running → Completed | Failed | Stale | Cancelled.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -167,6 +169,10 @@ pub struct XinTask {
     pub enabled: bool,
     /// Runtime-created approval grant for delayed shell execution.
     pub approval_grant_json: Option<String>,
+    /// Who created this task, and so whose authority an agent run of it
+    /// executes under (CRON-ORIGIN). Fixed at creation.
+    #[serde(default)]
+    pub origin: JobOrigin,
 }
 
 /// Input for creating a new task.
@@ -200,6 +206,12 @@ pub struct XinTaskPatch {
     pub max_failures: Option<u32>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
+    /// Which surface rewrote the payload (D-107 amendment), set only by the
+    /// runtime. A payload change records it, and `None` records
+    /// `agent_tool`: an agent tool that rewrites an operator task's command
+    /// makes it an agent task.
+    #[serde(skip)]
+    pub created_via: Option<crate::cron::JobCreator>,
 }
 
 /// Append-only execution and lifecycle event for a Xin task.
@@ -342,6 +354,10 @@ pub struct XinGoal {
     /// Final output summary on success.
     pub final_output: Option<String>,
     pub enabled: bool,
+    /// Who created this goal; every step of it runs under this origin
+    /// (CRON-ORIGIN). Fixed at creation.
+    #[serde(default)]
+    pub origin: JobOrigin,
 }
 
 /// A single execution step inside a `XinGoal`. Supports lease + checkpoint +

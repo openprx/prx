@@ -24,6 +24,9 @@ pub struct OllamaProvider {
     reasoning_enabled: Option<bool>,
     num_ctx: Option<usize>,
     model_num_ctx: HashMap<String, usize>,
+    /// How long an error response's body is read for
+    /// ([`super::ERROR_BODY_READ_TIMEOUT`] unless a test shortens it).
+    error_body_timeout: std::time::Duration,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -155,7 +158,33 @@ impl OllamaProvider {
             reasoning_enabled,
             num_ctx,
             model_num_ctx,
+            error_body_timeout: super::ERROR_BODY_READ_TIMEOUT,
         }
+    }
+
+    /// A provider whose error bodies are read for at most `bound`, so a
+    /// wiring test can prove the bound on real time without waiting the
+    /// production 15 s.
+    #[cfg(test)]
+    const fn with_error_body_timeout(mut self, bound: std::time::Duration) -> Self {
+        self.error_body_timeout = bound;
+        self
+    }
+
+    /// The error for a failed Ollama response: its body read capped and
+    /// time-bounded, like every other provider's error body (an upstream that
+    /// answers an error and then stalls must not hold the call for the
+    /// client's whole timeout; R-C2BUk K-7, DC-6), then sanitized.
+    async fn api_error(response: reqwest::Response, bound: std::time::Duration) -> anyhow::Error {
+        let status = response.status();
+        let raw = super::read_error_body_within(response, bound).await;
+        let sanitized = super::sanitize_api_error(&raw);
+        tracing::error!("Ollama error response: status={} body_excerpt={}", status, sanitized);
+        anyhow::anyhow!(
+            "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
+            status,
+            sanitized
+        )
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -187,7 +216,7 @@ impl OllamaProvider {
 
         if requests_cloud && self.api_key.is_none() {
             anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+                "Model '{}' requested cloud routing, but no API key is configured. Set `api_key` in config.toml or run `prx auth paste-token --provider ollama`.",
                 model
             );
         }
@@ -244,26 +273,37 @@ impl OllamaProvider {
         }
     }
 
-    fn convert_stream_tools(tools: Option<&[crate::tools::ToolSpec]>) -> Option<Vec<serde_json::Value>> {
-        let tools = tools?;
-        if tools.is_empty() {
-            return None;
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn convert_stream_tools(
+        &self,
+        tools: Option<&[crate::tools::ToolSpec]>,
+    ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+        let items = tools.filter(|items| !items.is_empty());
+        let Some(items) = items else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut converted = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "ollama".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            converted.push(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": parameters,
+                }
+            }));
         }
-        Some(
-            tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    })
-                })
-                .collect(),
-        )
+        Ok(Some(converted))
     }
 
     fn usage_from_eval_counts(
@@ -371,7 +411,7 @@ impl OllamaProvider {
     ) -> anyhow::Result<(ChatResponse, TokenUsage)> {
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
         let api_messages = self.convert_messages(request.messages);
-        let tool_values = Self::convert_stream_tools(request.tools);
+        let tool_values = self.convert_stream_tools(request.tools)?;
         let response = self
             .send_request(
                 api_messages,
@@ -414,7 +454,7 @@ impl OllamaProvider {
 
     /// Convert internal chat history format to Ollama's native tool-call message schema.
     ///
-    /// `run_tool_call_loop` stores native assistant/tool entries as JSON strings in
+    /// `run_turn` stores native assistant/tool entries as JSON strings in
     /// `ChatMessage.content`. We decode those payloads here so follow-up requests send
     /// structured `assistant.tool_calls` and `tool.tool_name`, as expected by Ollama.
     fn convert_messages(&self, messages: &[ChatMessage]) -> Vec<Message> {
@@ -544,19 +584,12 @@ impl OllamaProvider {
         let status = response.status();
         tracing::debug!("Ollama response status: {}", status);
 
+        if !status.is_success() {
+            return Err(Self::api_error(response, self.error_body_timeout).await);
+        }
+
         let body = response.bytes().await?;
         tracing::debug!("Ollama response body length: {} bytes", body.len());
-
-        if !status.is_success() {
-            let raw = String::from_utf8_lossy(&body);
-            let sanitized = super::sanitize_api_error(&raw);
-            tracing::error!("Ollama error response: status={} body_excerpt={}", status, sanitized);
-            anyhow::bail!(
-                "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
-                status,
-                sanitized
-            );
-        }
 
         let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {
             Ok(r) => r,
@@ -574,7 +607,7 @@ impl OllamaProvider {
         Ok(chat_response)
     }
 
-    /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in loop_.rs
+    /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in agent/tool_call_parser.rs
     ///
     /// Handles quirky model behavior where tool calls are wrapped:
     /// - `{"name": "tool_call", "arguments": {"name": "shell", "arguments": {...}}}`
@@ -702,7 +735,7 @@ impl Provider for OllamaProvider {
             .send_request(messages, &normalized_model, temperature, should_auth, None)
             .await?;
 
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
+        // If model returned tool calls, format them for tool_call_parser.rs's parse_tool_calls
         if !response.message.tool_calls.is_empty() {
             tracing::debug!(
                 "Ollama returned {} tool call(s), formatting for loop parser",
@@ -754,7 +787,7 @@ impl Provider for OllamaProvider {
             .send_request(api_messages, &normalized_model, temperature, should_auth, None)
             .await?;
 
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
+        // If model returned tool calls, format them for tool_call_parser.rs's parse_tool_calls
         if !response.message.tool_calls.is_empty() {
             tracing::debug!(
                 "Ollama returned {} tool call(s), formatting for loop parser",
@@ -806,7 +839,7 @@ impl Provider for OllamaProvider {
         let api_messages = self.convert_messages(messages);
 
         // Tools arrive pre-formatted in OpenAI/Ollama-compatible JSON from
-        // tools_to_openai_format() in loop_.rs — pass them through directly.
+        // the agent's tool specs — pass them through directly.
         let tools_opt = if tools.is_empty() { None } else { Some(tools) };
 
         let response = self
@@ -914,6 +947,7 @@ impl Provider for OllamaProvider {
             }],
             final_provider: "ollama".to_string(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used,
         })
     }
@@ -942,12 +976,21 @@ impl Provider for OllamaProvider {
                 return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed();
             }
         };
+        // Lowered before the connection is opened, so a tool this endpoint
+        // cannot be offered ends the turn with the reason, not an upstream 400.
+        let tool_values = match self.convert_stream_tools(options.tools.as_deref()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let request = self.build_chat_request(
             self.convert_messages(messages),
             &normalized_model,
             temperature,
             true,
-            Self::convert_stream_tools(options.tools.as_deref()).as_deref(),
+            tool_values.as_deref(),
         );
         let url = format!("{}/api/chat", self.base_url);
         let client = self.http_client();
@@ -1642,5 +1685,96 @@ mod tests {
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    /// A loopback endpoint that answers every request with a 500 whose
+    /// declared body is far longer than what it sends: the status line,
+    /// headers and `model exploded` go out in one write, then the connection
+    /// stays open, silent, until the returned sender is used or dropped.
+    async fn spawn_stalling_500() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback address");
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100000\r\n\r\nmodel exploded")
+                .await;
+            let _ = socket.flush().await;
+            let _ = hold.await;
+        });
+        (addr, release, server)
+    }
+
+    /// R-C2BUk K-7 / DC-6: Ollama reads an error body through the capped,
+    /// time-bounded reader. It read the whole body with `bytes()`, so an
+    /// upstream that answered 500 and then stalled held the call for the
+    /// client's 300 s timeout.
+    ///
+    /// The bound itself is tested on a response whose headers have already
+    /// arrived, with the clock paused from there on (like the companion
+    /// `read_error_body` test): everything the stub sends is then in the
+    /// socket, so only the bound can end the read, and the paused clock
+    /// reaches it at once. Pausing any earlier (while the connection or the
+    /// headers were still in flight) let the clock's auto-advance fire the
+    /// outer timeout first (R-INT2BB3 G-1).
+    #[tokio::test]
+    async fn an_ollama_error_body_that_stalls_is_read_for_a_bounded_time() {
+        let (addr, release, server) = spawn_stalling_500().await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/chat"))
+            .send()
+            .await
+            .expect("test: loopback responds");
+        assert_eq!(response.status().as_u16(), 500);
+        tokio::time::pause();
+        let outcome = tokio::time::timeout(
+            super::super::ERROR_BODY_READ_TIMEOUT * 2,
+            OllamaProvider::api_error(response, super::super::ERROR_BODY_READ_TIMEOUT),
+        )
+        .await;
+        tokio::time::resume();
+        let _ = release.send(());
+        server.abort();
+        let error = outcome
+            .expect("the error body read must end within its own bound")
+            .to_string();
+        assert!(error.contains("500"), "{error}");
+        assert!(error.contains("model exploded"), "what was read is used: {error}");
+    }
+
+    /// The wiring, on real time: an Ollama call against an endpoint that
+    /// answers 500 and stalls ends with the error once the provider's error
+    /// body bound (shortened here to 200 ms) is up, not at the client's
+    /// timeout. The outer bound is 50 times the read bound.
+    #[tokio::test]
+    async fn an_ollama_call_to_a_stalling_error_endpoint_ends_at_the_error_body_bound() {
+        let (addr, release, server) = spawn_stalling_500().await;
+        let provider = OllamaProvider::new(Some(&format!("http://{addr}")), None)
+            .with_error_body_timeout(std::time::Duration::from_millis(200));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.chat_with_system(None, "hi", "llama3", 0.0),
+        )
+        .await;
+        let _ = release.send(());
+        server.abort();
+        let error = outcome
+            .expect("the call must end at the error body bound, well before the client's timeout")
+            .expect_err("a 500 is an error")
+            .to_string();
+        assert!(error.contains("500"), "{error}");
+        assert!(error.contains("model exploded"), "{error}");
     }
 }

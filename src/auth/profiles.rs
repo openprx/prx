@@ -148,6 +148,15 @@ impl AuthProfilesStore {
         self.load_locked()
     }
 
+    /// Load without writing the profiles file: a legacy `enc:` value is
+    /// decrypted in memory, not migrated on disk. For read-only lookups (a
+    /// provider's own credential, a credential reference's status), which
+    /// write no credential file (D-080, D-083 C-4).
+    pub fn load_read_only(&self) -> Result<AuthProfilesData> {
+        let _lock = self.acquire_lock()?;
+        self.read_locked(false)
+    }
+
     pub fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
         let _lock = self.acquire_lock()?;
         let mut data = self.load_locked()?;
@@ -166,6 +175,31 @@ impl AuthProfilesStore {
         data.updated_at = Utc::now();
 
         self.save_locked(&data)
+    }
+
+    /// Insert or replace `profile` only when `accept` agrees, given the
+    /// profile currently stored under its id (`None`: there is none). The
+    /// check and the write happen under the store lock. Returns whether the
+    /// profile was written; it is never made the provider's active profile.
+    pub fn upsert_profile_checked(
+        &self,
+        mut profile: AuthProfile,
+        accept: impl FnOnce(Option<&AuthProfile>) -> bool,
+    ) -> Result<bool> {
+        let _lock = self.acquire_lock()?;
+        let mut data = self.load_locked()?;
+        let existing = data.profiles.get(&profile.id);
+        if !accept(existing) {
+            return Ok(false);
+        }
+        profile.updated_at = Utc::now();
+        if let Some(existing) = existing {
+            profile.created_at = existing.created_at;
+        }
+        data.profiles.insert(profile.id.clone(), profile);
+        data.updated_at = Utc::now();
+        self.save_locked(&data)?;
+        Ok(true)
     }
 
     pub fn remove_profile(&self, profile_id: &str) -> Result<bool> {
@@ -226,6 +260,12 @@ impl AuthProfilesStore {
     }
 
     fn load_locked(&self) -> Result<AuthProfilesData> {
+        self.read_locked(true)
+    }
+
+    /// Read the profiles; with `persist_migration`, write a legacy `enc:`
+    /// value back migrated to `enc2:`.
+    fn read_locked(&self, persist_migration: bool) -> Result<AuthProfilesData> {
         let mut persisted = self.read_persisted_locked()?;
         let mut migrated = false;
 
@@ -288,7 +328,7 @@ impl AuthProfilesStore {
             );
         }
 
-        if migrated {
+        if migrated && persist_migration {
             self.write_persisted_locked(&persisted)?;
         }
 
@@ -394,11 +434,25 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json)
-            .with_context(|| format!("Failed to write temporary auth profile file at {}", tmp_path.display()))?;
-
-        fs::rename(&tmp_path, &self.path)
-            .with_context(|| format!("Failed to replace auth profile store at {}", self.path.display()))?;
+        // The temporary file holds every (possibly plaintext) credential: it
+        // is created owner-only, flushed to disk before the rename, and
+        // removed if anything fails (PMM-D-6).
+        let written = Self::write_private(&tmp_path, &json).and_then(|()| {
+            fs::rename(&tmp_path, &self.path)
+                .with_context(|| format!("Failed to replace auth profile store at {}", self.path.display()))
+        });
+        if let Err(error) = written {
+            if let Err(cleanup) = fs::remove_file(&tmp_path) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %tmp_path.display(),
+                        error = %cleanup,
+                        "Failed to remove a temporary auth profile file"
+                    );
+                }
+            }
+            return Err(error);
+        }
 
         #[cfg(unix)]
         {
@@ -408,8 +462,32 @@ impl AuthProfilesStore {
             fs::set_permissions(&self.path, permissions)
                 .with_context(|| format!("Failed to chmod {} to 0o600", self.path.display()))?;
         }
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("Failed to fsync {}", parent.display()))?;
+        }
 
         Ok(())
+    }
+
+    /// Create `path` owner-only (never through an existing file), write
+    /// `bytes` and fsync it.
+    fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("Failed to create temporary auth profile file at {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to write temporary auth profile file at {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to fsync temporary auth profile file at {}", path.display()))
     }
 
     fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>> {
@@ -569,6 +647,33 @@ pub fn profile_id(provider: &str, profile_name: &str) -> String {
     format!("{}:{}", provider.trim(), profile_name.trim())
 }
 
+/// Test support: an auth-profiles store in `dir` whose one token profile for
+/// `provider` holds `token` in the legacy `enc:` format. Returns the
+/// profiles file's path.
+#[cfg(test)]
+pub(crate) fn write_legacy_token_profile(dir: &Path, provider: &str, token: &str) -> PathBuf {
+    let store = AuthProfilesStore::new(dir, true);
+    store
+        .upsert_profile(AuthProfile::new_token(provider, "default", token.to_string()), true)
+        .expect("test: profile");
+    let legacy = crate::security::secrets::SecretStore::new(dir, true)
+        .legacy_xor_value(token)
+        .expect("test: legacy value");
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store.path()).expect("test: read")).expect("test: json");
+    let profiles = raw
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("test: profiles");
+    for profile in profiles.values_mut() {
+        if let Some(profile) = profile.as_object_mut() {
+            profile.insert("token".into(), serde_json::json!(legacy));
+        }
+    }
+    std::fs::write(store.path(), serde_json::to_vec_pretty(&raw).expect("test: json")).expect("test: write");
+    store.path().to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +758,56 @@ mod tests {
         );
     }
 
+    /// D-083 C-4: a read-only load decrypts a legacy `enc:` value in memory
+    /// and does not rewrite the file; a normal load migrates it.
+    #[test]
+    fn a_read_only_load_never_migrates_the_file() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let store = AuthProfilesStore::new(tmp.path(), true);
+        store
+            .upsert_profile(
+                AuthProfile::new_token("moonshot", "default", "moonshot-token-123".into()),
+                true,
+            )
+            .expect("test: upsert");
+        let legacy = crate::security::secrets::SecretStore::new(tmp.path(), true)
+            .legacy_xor_value("moonshot-token-123")
+            .expect("test: legacy value");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).expect("test: read")).expect("test: json");
+        let profiles = raw
+            .get_mut("profiles")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test: profiles");
+        for profile in profiles.values_mut() {
+            if let Some(profile) = profile.as_object_mut() {
+                profile.insert("token".into(), serde_json::json!(legacy));
+            }
+        }
+        std::fs::write(store.path(), serde_json::to_vec_pretty(&raw).expect("test: json")).expect("test: write");
+        let before = std::fs::read(store.path()).expect("test: read back");
+
+        let data = store.load_read_only().expect("test: read-only load");
+
+        assert!(
+            data.profiles
+                .values()
+                .all(|profile| profile.token.as_deref() == Some("moonshot-token-123")),
+            "the legacy value is decrypted"
+        );
+        assert_eq!(
+            std::fs::read(store.path()).expect("test: read back"),
+            before,
+            "no write"
+        );
+        store.load().expect("test: load");
+        let migrated = std::fs::read_to_string(store.path()).expect("test: read back");
+        assert!(
+            migrated.contains("enc2:") && !migrated.contains("\"enc:"),
+            "a normal load migrates"
+        );
+    }
+
     #[tokio::test]
     async fn atomic_write_replaces_file() {
         let tmp = TempDir::new().unwrap();
@@ -681,5 +836,50 @@ mod tests {
 
         let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "auth-profiles.json must be 0o600, got {mode:o}");
+    }
+
+    /// PMM-D-6: the temporary file the store writes is created owner-only
+    /// (never through an existing path) and flushed; after a write, only the
+    /// 0600 store file remains. The old code wrote the temporary file with
+    /// the process umask (typically 0644) and chmodded only the final file;
+    /// no rename failure is reachable from a test to observe that window
+    /// (a directory at the store path already fails the load), so this is a
+    /// guard of the new helper.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("auth-profiles.json.tmp.test");
+
+        AuthProfilesStore::write_private(&path, b"{}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            AuthProfilesStore::write_private(&path, b"{}").is_err(),
+            "an existing path is never written through"
+        );
+
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                AuthProfile::new_token("openai", "default", "pmmd6-temp-sentinel".into()),
+                false,
+            )
+            .unwrap();
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp.") && name != "auth-profiles.json.tmp.test"
+            })
+            .count();
+        assert_eq!(leftovers, 0, "a temporary file was left behind");
+        assert_eq!(
+            std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

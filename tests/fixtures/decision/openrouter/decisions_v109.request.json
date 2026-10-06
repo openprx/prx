@@ -1,0 +1,30 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": {
+    "message": "I was charged twice. Please refund the duplicate today."
+  },
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle the customer message?",
+      "criteria": {
+        "billing": "Charges, payments, and refunds",
+        "technical": "Software faults",
+        "other": "Anything else"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How soon does the customer ask for action?",
+      "criteria": [
+        "No deadline",
+        "Within a week",
+        "Today"
+      ]
+    },
+    "refund_requested": {
+      "type": "noul",
+      "instructions": "Does the customer explicitly request a refund?"
+    }
+  }
+}

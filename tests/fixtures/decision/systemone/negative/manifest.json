@@ -1,0 +1,940 @@
+{
+  "generated": "2026-09-24",
+  "task": "CDP-00B",
+  "copied_by": "CDP-01 (D-042 C-6, D-043)",
+  "files": [
+    {
+      "file": "negative/base.request.json",
+      "sha256": "7c53a8f6f43e0a7a1767e01206cc208fb58e9628aada68cd62f05dc9e7c77fbb",
+      "sources": [
+        "S14:fixtures/structured.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "role": "request for every response mutation below",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "negative/base.response.json",
+      "sha256": "77725c687838140f50b8d49ce9176085c5ea2d1b30431b8c61511ca70caf7751",
+      "sources": [
+        "S14:fixtures/structured.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "role": "valid under both the current CDP constants and the recommended rules",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "negative/01_answer_missing.response.json",
+      "sha256": "6841607c0877efd62f598ea8767e58c230bb89e8c1e0617d808a60003cb677b8",
+      "base": "negative/base.response.json",
+      "mutation": "answer_missing",
+      "expected_rule": "AnswerMissing",
+      "expected_error": "DecisionError::InvalidResponse(AnswerMissing)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/02_answer_extra.response.json",
+      "sha256": "7f3ed03ae16328a30a94bb21228ff0f7261fb6542dbe71f9d51921a1266486cd",
+      "base": "negative/base.response.json",
+      "mutation": "answer_extra",
+      "expected_rule": "AnswerExtra",
+      "expected_error": "DecisionError::InvalidResponse(AnswerExtra)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/03_wrong_primitive.response.json",
+      "sha256": "4e78a26c4c9548314950b22e1cf40c713125ab563e403d970520120b5276793f",
+      "base": "negative/base.response.json",
+      "mutation": "wrong_primitive",
+      "expected_rule": "WrongPrimitive",
+      "expected_error": "DecisionError::InvalidResponse(WrongPrimitive)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/04_unknown_answer_type.response.json",
+      "sha256": "6f8faec2c914981edc6a545b191f62ea0a24c6423c7f0b0c093692726372dc23",
+      "base": "negative/base.response.json",
+      "mutation": "type tag outside {noul,choice,score}; the SDKs drop it with a warning (forward compat) but CDP must reject the whole response",
+      "expected_rule": "WrongPrimitive",
+      "expected_error": "DecisionError::InvalidResponse(WrongPrimitive)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/05_choice_out_of_criteria.response.json",
+      "sha256": "ac9db61ec1a72a4055fda84560f1ea2b008190d6b5789bbacbfecf03de19b6dd",
+      "base": "negative/base.response.json",
+      "mutation": "choice_out_of_criteria",
+      "expected_rule": "UnknownOption",
+      "expected_error": "DecisionError::InvalidResponse(UnknownOption)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/06_probability_key_out_of_criteria.response.json",
+      "sha256": "0f29fd4674f1da80f1fd9143a8c64350500f67f61f5b02bd5deaf5a968ba173c",
+      "base": "negative/base.response.json",
+      "mutation": "probability_key_out_of_criteria",
+      "expected_rule": "UnknownOption",
+      "expected_error": "DecisionError::InvalidResponse(UnknownOption)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/07_probability_missing.response.json",
+      "sha256": "7480dad7186f81e9a1750362dc59bb614848a4ec53adb18d833434c57e10c1ba",
+      "base": "negative/base.response.json",
+      "mutation": "probability_missing",
+      "expected_rule": "ProbabilityMissing",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityMissing)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/08_probability_above_one.response.json",
+      "sha256": "ddba7bd1698d6a62c75ad3994ac7496fd78823f9326881d1ea3aae12215c7e2d",
+      "base": "negative/base.response.json",
+      "mutation": "probability_above_one",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/09_probability_negative.response.json",
+      "sha256": "f42c3ca1509e9d0d670208430c3bd43159477a3cfaeca4ed1a851a6c15d00ee1",
+      "base": "negative/base.response.json",
+      "mutation": "probability_negative",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/10_noul_above_one.response.json",
+      "sha256": "ddc886bfd6a2b988ed03f4775e117630fddacbeb661119ae7ce6d90f115c7511",
+      "base": "negative/base.response.json",
+      "mutation": "noul_above_one",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/11_noul_negative.response.json",
+      "sha256": "b51d9b7200120108dad5b094d7b394e626a7a658cdbf09d012d647c98feaaf45",
+      "base": "negative/base.response.json",
+      "mutation": "noul_negative",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/12_confidence_above_one.response.json",
+      "sha256": "000cd5580b5cd25952ac1db91d9b2c063ca90b0d92859758f88677a5a0cd9a71",
+      "base": "negative/base.response.json",
+      "mutation": "confidence_above_one",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/13_confidence_negative.response.json",
+      "sha256": "08e28c4dd8be22907337ab8a3e901d01c939bff1e361565ebf0886ee84cd31c1",
+      "base": "negative/base.response.json",
+      "mutation": "confidence_negative",
+      "expected_rule": "ProbabilityRange",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilityRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/14_choice_sum_low_rounded.response.json",
+      "sha256": "d78d9a31ceaa7d6d43e17771f09553a493e236eec1604db2331039f1819866ed",
+      "base": "negative/base.response.json",
+      "mutation": "hundredths, n=3, sum 0.90: outside both 1e-3 and the rounding bound min(n*0.005,0.02)=0.015",
+      "expected_rule": "ProbabilitySum",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilitySum)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/15_score_sum_high_rounded.response.json",
+      "sha256": "f47a0a897eb09d9e9811dc6e97efe506b395b4b52449453c683d03a77b95f318",
+      "base": "negative/base.response.json",
+      "mutation": "hundredths, n=3, sum 1.20",
+      "expected_rule": "ProbabilitySum",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilitySum)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/16_choice_sum_off_unrounded.response.json",
+      "sha256": "c447051491bc2523fdfa7fc860fd51c38314f7b69681c6a54d07fd739f7ad248",
+      "base": "negative/base.response.json",
+      "mutation": "values not on hundredths, sum 1.0015: outside the 1e-3 tolerance that applies to unrounded values",
+      "expected_rule": "ProbabilitySum",
+      "expected_error": "DecisionError::InvalidResponse(ProbabilitySum)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/17_legend_text_mismatch.response.json",
+      "sha256": "a81f87b3db65ae6a709aa385b9cc69ec0944ccb8c20716695fb220c42e056fd0",
+      "base": "negative/base.response.json",
+      "mutation": "legend_text_mismatch",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/18_legend_count_mismatch.response.json",
+      "sha256": "1b278808634549872635a1217edbf46170ccca58270a7c7c371c67d063adf64a",
+      "base": "negative/base.response.json",
+      "mutation": "legend_count_mismatch",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/19_legend_keys_shifted.response.json",
+      "sha256": "1a3c84654968afafd405a7161889b9b35f3764c38413a513639654b24135ff7c",
+      "base": "negative/base.response.json",
+      "mutation": "legend keys 1..3 instead of 0..2",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/20_legend_structure_flattened.response.json",
+      "sha256": "c0b686b8e296049ed19cf01d821dafb2288345949b506afa77f2331965c1c37b",
+      "base": "negative/base.response.json",
+      "mutation": "object level {deadline:none} echoed as the string 'none': legend must equal the request level as JSON, not as display text",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/21_legend_order_swapped.response.json",
+      "sha256": "0427180bc6b87a08d2e892b77cec93997d79a029a746af6e9962a3de035aeafc",
+      "base": "negative/base.response.json",
+      "mutation": "legend_order_swapped",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/22_score_probability_keys_mismatch.response.json",
+      "sha256": "5a5728cee56e83d3852d3eeecdbe28e88739898cfb735a0dfbd1e09bd24476cf",
+      "base": "negative/base.response.json",
+      "mutation": "score probabilities keyed 1..3; CDP may classify as LegendMismatch or UnknownOption, but it must be one fixed rule",
+      "expected_rule": "LegendMismatch",
+      "expected_error": "DecisionError::InvalidResponse(LegendMismatch)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/23_score_out_of_range.response.json",
+      "sha256": "f0c2ce756cdfd59cfddbf8e7e08e9b6ab8f3c519f86a9a3533e409e3e2146101",
+      "base": "negative/base.response.json",
+      "mutation": "score_out_of_range",
+      "expected_rule": "ExpectedOutOfRange",
+      "expected_error": "DecisionError::InvalidResponse(ExpectedOutOfRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/24_score_not_weighted_mean.response.json",
+      "sha256": "6361293002ee724ce89722258242812a7082e0931a75bd0c931a18714a6ec653",
+      "base": "negative/base.response.json",
+      "mutation": "score 1.0 while sum(i*p)=2.0",
+      "expected_rule": "ExpectedOutOfRange",
+      "expected_error": "DecisionError::InvalidResponse(ExpectedOutOfRange)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/25_choice_not_modal.response.json",
+      "sha256": "9819d1bb6e256d62fc23fd021ebba1dc608baec910a60302d1bfdf8604634f30",
+      "base": "negative/base.response.json",
+      "mutation": "documented: choice is the highest-probability option",
+      "expected_rule": "ChosenNotModal",
+      "expected_error": "DecisionError::InvalidResponse(ChosenNotModal)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/26_model_missing.response.json",
+      "sha256": "65a93d63bc7a2025bce0fe65854cd2901216eb67f89702ff2630ce64a0a8544b",
+      "base": "negative/base.response.json",
+      "mutation": "model is required on the wire; CDP rule IdentityMissing (a decoder may fail earlier as Malformed; either way the whole response is rejected)",
+      "expected_rule": "IdentityMissing",
+      "expected_error": "DecisionError::InvalidResponse(IdentityMissing)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/27_model_empty.response.json",
+      "sha256": "1c1e908974558b99b8887830e4daa47ec7a53d9b8be96fe00665cdfabf5f3073",
+      "base": "negative/base.response.json",
+      "mutation": "model_empty",
+      "expected_rule": "IdentityMissing",
+      "expected_error": "DecisionError::InvalidResponse(IdentityMissing)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/28_model_pinned_mismatch.response.json",
+      "sha256": "b61b05abc2eefb85fa6c0f0329713465857e9f6105c118c6d19559f6953cc898",
+      "base": "negative/base.response.json",
+      "mutation": "request pinned jev-1.13.0; response claims jev-1.14.0",
+      "expected_rule": "ModelVersion",
+      "expected_error": "DecisionError::ModelVersionMismatch",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "validation_context": {
+        "version_policy": {
+          "ExactPinned": "jev-1.13.0"
+        }
+      },
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/29_model_alias_under_pin.response.json",
+      "sha256": "f9375f12b102f36f419f7f209bde3f3a5309900b9cc7219c6d8a34fd9afb1055",
+      "base": "negative/base.response.json",
+      "mutation": "an alias echoed back under an exact pin is a mismatch (OpenAPI example shows an alias in the response model field)",
+      "expected_rule": "ModelVersion",
+      "expected_error": "DecisionError::ModelVersionMismatch",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "validation_context": {
+        "version_policy": {
+          "ExactPinned": "jev-1.13.0"
+        }
+      },
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/30_score_probabilities_as_array.response.json",
+      "sha256": "dcaa16aacf8b3f499efc3f7ae8215da5316639ec6a3319ce588ce0d51dd2882b",
+      "base": "negative/base.response.json",
+      "mutation": "wire carries a map keyed by level index; an array (CDP Vec shape) is not the wire format",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/31_answer_type_tag_missing.response.json",
+      "sha256": "873bb5ab65bf0fed0d9bf0738c2e5ef9c449e2be199d448110cab2216af295f4",
+      "base": "negative/base.response.json",
+      "mutation": "every answer carries type",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic mutation"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/40_answer_duplicated.response.json",
+      "sha256": "1411368cdeb62ef60587fce2bd550d2fed4025151fd3eb274bbc3072a691082c",
+      "base": "negative/base.response.json",
+      "mutation": "second 'refund_requested' key with a different value; serde_json's default map keeps the last one silently",
+      "expected_rule": "AnswerDuplicated",
+      "expected_error": "DecisionError::InvalidResponse(AnswerDuplicated)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/41_probability_key_duplicated.response.json",
+      "sha256": "e860b001b2fba360dd4c72808ba32c5339cf35814956556fca43490463ec08a1",
+      "base": "negative/base.response.json",
+      "mutation": "duplicate 'billing' inside Choice probabilities (duplicate-rejecting visitor applies to every nested map)",
+      "expected_rule": "AnswerDuplicated",
+      "expected_error": "DecisionError::InvalidResponse(AnswerDuplicated)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/42_legend_key_duplicated.response.json",
+      "sha256": "b9d1bc413f5ceb809fa7db2385260c58e4a84bd6327c91a4ca6d5995d8069028",
+      "base": "negative/base.response.json",
+      "mutation": "duplicate legend key '0'",
+      "expected_rule": "AnswerDuplicated",
+      "expected_error": "DecisionError::InvalidResponse(AnswerDuplicated)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/50_nan_bare_token.response.json",
+      "sha256": "76412328de93a915d17be00890124f5f6d5965dfa0dbeff309e4c9272ad0ae12",
+      "base": "negative/base.response.json",
+      "mutation": "bare NaN token (Python json.dumps default); not RFC 8259 JSON. Expected: whole response rejected at decode (serde_json refuses the token / null / string / out-of-range literal as f64). A lenient decoder would reach ProbabilityRange instead; either is acceptable, acceptance or repair is not",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "the documented wire (JSON numbers) cannot carry NaN; these are the encodings a non-conforming server could emit (INFERRED)"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/51_nan_null.response.json",
+      "sha256": "3e6d6a9ac8ce691736de20ff02e8f4c2e9de589ff010acc60de20e5e1e5c1060",
+      "base": "negative/base.response.json",
+      "mutation": "NaN serialized as null (pydantic/JS JSON.stringify behaviour). Expected: whole response rejected at decode (serde_json refuses the token / null / string / out-of-range literal as f64). A lenient decoder would reach ProbabilityRange instead; either is acceptable, acceptance or repair is not",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "the documented wire (JSON numbers) cannot carry NaN; these are the encodings a non-conforming server could emit (INFERRED)"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/52_nan_string.response.json",
+      "sha256": "b287bbd6fff7dfe982cb0fc5bb4d035efd911a65c85ff786acf3554aa741bfb1",
+      "base": "negative/base.response.json",
+      "mutation": "NaN as a string. Expected: whole response rejected at decode (serde_json refuses the token / null / string / out-of-range literal as f64). A lenient decoder would reach ProbabilityRange instead; either is acceptable, acceptance or repair is not",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "the documented wire (JSON numbers) cannot carry NaN; these are the encodings a non-conforming server could emit (INFERRED)"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/53_infinity_bare_token.response.json",
+      "sha256": "94c25ac2967004bc5ba91d7353c7ac374af5a38593b748ef875cd0b1dd58aeea",
+      "base": "negative/base.response.json",
+      "mutation": "bare Infinity token; not RFC 8259 JSON. Expected: whole response rejected at decode (serde_json refuses the token / null / string / out-of-range literal as f64). A lenient decoder would reach ProbabilityRange instead; either is acceptable, acceptance or repair is not",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "the documented wire (JSON numbers) cannot carry NaN; these are the encodings a non-conforming server could emit (INFERRED)"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/54_infinity_overflow_literal.response.json",
+      "sha256": "2b4c956adbab9f2d648aa5d228cc60d747ae803abbe126d67dac1973b66ee83e",
+      "base": "negative/base.response.json",
+      "mutation": "a finite-looking literal that overflows f64 to +inf. Expected: whole response rejected at decode (serde_json refuses the token / null / string / out-of-range literal as f64). A lenient decoder would reach ProbabilityRange instead; either is acceptable, acceptance or repair is not",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "the documented wire (JSON numbers) cannot carry NaN; these are the encodings a non-conforming server could emit (INFERRED)"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/55_confidence_nan_bare_token.response.json",
+      "sha256": "6cf76bc12636f5291f50d4629da560090c1aa16a9d6a845476e6f283fa0d2fda",
+      "base": "negative/base.response.json",
+      "mutation": "NaN confidence on the Choice answer",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "INFERRED encoding, as above"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/56_score_nan_bare_token.response.json",
+      "sha256": "322233fec24a400f0c0d1ed2364a29fa1b2b4c2a6526b6516b269dcc632eaad8",
+      "base": "negative/base.response.json",
+      "mutation": "NaN Score value",
+      "expected_rule": "Malformed",
+      "expected_error": "DecisionError::InvalidResponse(Malformed)",
+      "sources": [
+        "S14:fixtures/structured.json (base)",
+        "CDP section 8"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "INFERRED encoding, as above"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/tolerance/valid_score_rounded_mean.response.json",
+      "sha256": "ac60232eaab1b5cbb31177c2014f9c1c4b3bdf7e95e01682a8f1fa9b00d6f6b3",
+      "request": "multi_array_instructions.request.json",
+      "expect": "VALID",
+      "valid_under_current_cdp": false,
+      "fails_current_cdp_rule": "ExpectedOutOfRange (|0.97-0.98| > 1e-3*(3-1))",
+      "sources": [
+        "S16 fixture"
+      ],
+      "license": "Apache-2.0 (OpenAgentsInc/openagents)",
+      "inferred": [],
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "negative/tolerance/valid_sum_099_rounded.response.json",
+      "sha256": "aa667f2266c3ac1266883e693b57dd5386cb1af3dc12ca9fde9438c51e62f242",
+      "request": "multi_rounded.request.json",
+      "expect": "VALID",
+      "valid_under_current_cdp": false,
+      "fails_current_cdp_rule": "ProbabilitySum (a0_progress sums to 0.99 > 1e-3) and ExpectedOutOfRange (1.83 vs 1.81)",
+      "sources": [
+        "S14 fixtures/rounded.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "inferred": [],
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "negative/tolerance/invalid_sum_096_rounded.response.json",
+      "sha256": "ec0c5006ac7feb70f6917fad5c910f7751ba83b646869e43fe8cecd462ec0e6a",
+      "request": "multi_rounded.request.json",
+      "expect": "INVALID ProbabilitySum",
+      "note": "n=4 hundredths, sum 0.96 is outside min(4*0.005,0.02)=0.02",
+      "sources": [
+        "S14 fixtures/rounded.json (base)"
+      ],
+      "license": "base MIT (rig, Playgrounds Analytics Inc.); mutation PRX-authored",
+      "inferred": [
+        "synthetic"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/tolerance/invalid_score_far_from_mean.response.json",
+      "sha256": "7ba001af6176cb22af505194408252ead9a3be91dd692e165053a8104ba4d74a",
+      "request": "multi_array_instructions.request.json",
+      "expect": "INVALID ExpectedOutOfRange",
+      "note": "sum(i*p)=0.98; recommended bound = sum(|i-mean|*0.005)+0.005 = 0.0072; 1.05 is 0.07 away",
+      "sources": [
+        "S16 fixture (base)"
+      ],
+      "license": "base Apache-2.0 (OpenAgentsInc/openagents); mutation PRX-authored",
+      "inferred": [
+        "synthetic"
+      ],
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/choice_256_options.request.json",
+      "sha256": "d0d354a95cc273240d51740873e842e80cf4228dc52efac97f2d594441aa033c",
+      "expected_rule": "MaxChoiceOptions",
+      "note": "documented maximum is 255",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(MaxChoiceOptions) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/score_11_levels.request.json",
+      "sha256": "84fdbe4a20a0b7f01177bb2bddece9699f3d3e7563e028181ed86facdaf97c31",
+      "expected_rule": "MaxScoreLevels",
+      "note": "documented maximum is 10; current CDP MAX_SCORE_LEVELS=11 would let this through",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(MaxScoreLevels) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/score_1_level.request.json",
+      "sha256": "9d8f1ebd8ba974f04d50f4059311a14c43595211f6f37289e25994f8098412fb",
+      "expected_rule": "MinScoreLevels",
+      "note": "docs: 'should have at least two'; OpenAPI minItems=1; JS SDK, Rig and jev reject <2. Recommend reject.",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(MinScoreLevels) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/choice_1_option.request.json",
+      "sha256": "1b9d645aa516bd7f0102fa2857221bd80ebec0ea06e2c836e538f812da2d7f2d",
+      "expected_rule": "MinChoiceOptions",
+      "note": "docs silent; Rig requires 2..=255. Recommend reject.",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(MinChoiceOptions) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/questions_empty.request.json",
+      "sha256": "7df16bd67707c8a4628f76f0f949d4ad2e01a99b24ae38a82f0ebce731f323c1",
+      "expected_rule": "NoQuestions",
+      "note": "OpenAPI questions minProperties=1",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(NoQuestions) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/model_missing.request.json",
+      "sha256": "c940332e47f4697aab0e260c72167234a6e799d55061567cfd731fe88dfed9fe",
+      "expected_rule": "ModelRequired",
+      "note": "model is required on the wire",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(ModelRequired) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/noul_criteria_extra_key.request.json",
+      "sha256": "895354b44fa240eee318c6293940eb2f0f4d256314ddb62e641301e79099871b",
+      "expected_rule": "NoulCriteriaShape",
+      "note": "NoulCriteria has only 'true' and 'false' (Python SDK TypedDict closed; Rig requires exactly both)",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(NoulCriteriaShape) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "negative/request/state_null.request.json",
+      "sha256": "0f4721d63a572bc30bf6a731d1b5f3bf49b2f60a3b351ca0b82b57fa223915b5",
+      "expected_rule": "StateShape",
+      "note": "state must be string|object|array (OpenAPI; Rig rejects null)",
+      "sources": [
+        "S01",
+        "S11",
+        "S13",
+        "S14:questions.rs"
+      ],
+      "license": "PRX-authored synthetic",
+      "inferred": [
+        "content synthetic; only the limit is documented"
+      ],
+      "expected_error": "DecisionError::InvalidRequest(StateShape) before any transport",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    }
+  ]
+}

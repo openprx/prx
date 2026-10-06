@@ -35,6 +35,9 @@ pub enum PluginError {
     #[error("execution timeout after {0}ms")]
     Timeout(u64),
 
+    #[error("plugin '{plugin}' is quarantined: {reason}")]
+    Quarantined { plugin: String, reason: String },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

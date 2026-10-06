@@ -102,12 +102,6 @@ pub struct ShellSession {
     status: Arc<Mutex<ShellStatus>>,
     /// Cancellation token tripped by `kill`; the reader/reaper tasks observe it.
     cancel: CancellationToken,
-    /// Process-group id (== child pid on Unix, since the child leads a new
-    /// group). `None` until the process is spawned, on non-Unix, or after the
-    /// reaper has reaped the child — clearing it once the process is gone
-    /// prevents a later `kill` from signalling a *reused* pgid (PID recycling).
-    /// `parking_lot` (synchronous, never held across `.await`).
-    pgid: Arc<Mutex<Option<i32>>>,
     /// Reaper task handle. `kill()` awaits it so the caller observes a fully
     /// terminated session (signalled, drained, marker emitted) on return.
     /// `tokio::sync::Mutex` because it is held across `.await`. The `Option` is
@@ -382,7 +376,7 @@ pub fn spawn_shell_with_origin(
         status: Arc::clone(&status),
         finished_at: Arc::clone(&finished_at),
         cancel: cancel.clone(),
-        pgid: Arc::clone(&pgid_cell),
+        pgid: pgid_cell,
         delta_tx,
         output: Arc::clone(&output_buffer),
         output_truncated: Arc::clone(&output_truncated),
@@ -398,7 +392,6 @@ pub fn spawn_shell_with_origin(
         finished_at,
         status,
         cancel,
-        pgid: pgid_cell,
         reaper: Arc::new(tokio::sync::Mutex::new(Some(reaper))),
         output: output_buffer,
         output_truncated,
@@ -501,8 +494,10 @@ struct ReaperCtx {
 /// - Fix 1③: on cancel the status is set `Cancelled` only **after** the signal
 ///   path returns success; if the signal fails the status is left untouched so
 ///   the UI never shows "cancelled" for a process that is still running.
-/// - Fix 1②: once the child has been reaped the recorded `pgid` is cleared, so a
-///   later `kill` cannot signal a recycled pgid.
+/// - Fix 1②: the recorded `pgid` has one reader, this reaper, which signals the
+///   group (through `terminate`) only on the cancel path and only before it
+///   reaps the child. Nothing signals the group after the reap, so a recycled
+///   pgid is never signalled; the cell is cleared at the reap all the same.
 /// - Fix 2: on non-Unix (no `killpg`) the cancel path calls `child.start_kill`
 ///   so the direct child is actually terminated, not merely marked cancelled.
 /// - Fix 3: the terminal marker is sent only **after** both readers have drained
@@ -529,10 +524,10 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 // Operator/`exit`-driven termination. Perform the actual kill,
                 // then mark Cancelled only on a successful signal (fix 1③).
                 let signalled = terminate(&pgid, &mut child).await;
-                // Reap the child so it does not linger as a zombie; this also
-                // lets us clear the pgid afterwards (fix 1②). A successful
-                // wait is what allows the registry row to be retired rather than
-                // reported as an unreaped child.
+                // Reap the child so it does not linger as a zombie, then clear
+                // the pgid cell (fix 1②). A successful wait is what allows the
+                // registry row to be retired rather than reported as an
+                // unreaped child.
                 if child.wait().await.is_ok() {
                     registration.mark_reaped();
                 }
@@ -549,8 +544,8 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 }
             }
             exited = child.wait() => {
-                // Natural exit: the process is already gone, so clear the pgid
-                // immediately (fix 1②) before any later `kill` can read it.
+                // Natural exit: the process is already gone and this reaper will
+                // not signal it; clear the pgid cell (fix 1②).
                 *pgid.lock() = None;
                 if exited.is_ok() {
                     registration.mark_reaped();
@@ -777,25 +772,6 @@ mod tests {
         // Cancelled (the guard returns before tripping the token / signalling).
         session.kill().await.expect("test: kill terminal no-op");
         assert_eq!(session.status(), ShellStatus::Completed, "terminal status preserved");
-    }
-
-    /// Fix 1②: after a session has been reaped, its recorded pgid is cleared so a
-    /// later `kill` cannot signal a recycled process group.
-    #[tokio::test]
-    async fn pgid_cleared_after_natural_exit() {
-        let (sink, _rx) = SessionEventSink::channel();
-        let sec = auto_security();
-        let session = spawn_shell("exit 0", &sec, &sink).expect("test: spawn exit 0");
-        for _ in 0..100 {
-            if session.is_terminal() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(session.status(), ShellStatus::Completed);
-        // Give the reaper a beat past the status set to clear the pgid + drain.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(session.pgid.lock().is_none(), "pgid cleared once child is reaped");
     }
 
     /// Fix 3: the terminal marker must arrive *after* the command's final output

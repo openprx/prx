@@ -202,6 +202,11 @@ fn requested_channel(args: &serde_json::Value) -> Option<&str> {
 /// each implementation publishes only the operations it can execute.
 pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
 
+fn message_send_operation(channel: &str, recipient: &str) -> String {
+    let recipient_ref = op_id::ref_for_channel_recipient(channel, recipient);
+    op_id::op_id(MESSAGE_SEND_TOOL_NAME, "send", &[channel, &recipient_ref])
+}
+
 /// Tool-list summary for the channel-owned `message_send`. Kept beside the
 /// schema, and out of the trait method, so the contract test can hold it to the
 /// same standard without standing up a channel.
@@ -425,6 +430,32 @@ impl MessageSendTool {
         *self.default_recipient.write().await = recipient;
     }
 
+    /// Resolve routing without performing outbound authorization or I/O.
+    async fn routing_defaults(&self, args: &serde_json::Value) -> (Arc<dyn Channel>, Option<String>) {
+        let turn_context = current_message_send_execution_context();
+
+        // Resolve the active channel. In-turn calls use task-local routing;
+        // outside a turn, fall back to the construction/update-time slot.
+        let channel = match turn_context.as_ref() {
+            Some(context) => Arc::clone(&context.active_channel),
+            None => self.active_channel.read().await.clone(),
+        };
+
+        // Resolve recipient: explicit arg takes priority, then the task-local
+        // turn default. Only non-turn calls fall back to the legacy slot.
+        let default = match turn_context {
+            Some(context) => context.default_recipient,
+            None => self.default_recipient.read().await.clone(),
+        };
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or(default);
+
+        (channel, target)
+    }
+
     /// Channel names this tool can address, for the "unknown channel" error.
     ///
     /// The turn's own channel is always addressable even when no registry was
@@ -576,7 +607,7 @@ impl MessageSendTool {
             return Ok(());
         }
         let recipient_ref = op_id::ref_for_channel_recipient(dst_channel, recipient);
-        Err(crate::security::audit::redact_secrets(&format!(
+        Err(crate::security::redaction::redact_secrets(&format!(
             "Security policy: outbound messaging to recipient {recipient_ref} on channel \
              '{dst_channel}' is not permitted by the configured scope rules"
         )))
@@ -624,6 +655,37 @@ impl Tool for MessageSendTool {
         channel_message_send_parameters_schema()
     }
 
+    async fn resolve_approval_operation(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
+        if args.get("action").and_then(serde_json::Value::as_str).unwrap_or("send") != "send" {
+            return Ok(None);
+        }
+        // An implicit recipient must come from this task's turn. Mutable
+        // legacy defaults cannot establish another turn's approval scope.
+        anyhow::ensure!(
+            current_message_send_execution_context().is_some()
+                || (requested_channel(args).is_some()
+                    && args
+                        .get("target")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())),
+            "message approval requires turn-owned routing or explicit channel and target"
+        );
+        let (current, target) = self.routing_defaults(args).await;
+        let recipient = target
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("message approval recipient missing"))?;
+        let destination = self
+            .resolve_outbound_route(args, &current)
+            .map_err(anyhow::Error::msg)?;
+        Ok(Some((
+            message_send_operation(destination.name(), &recipient),
+            crate::acl::approval_grant::RiskLevel::Medium,
+        )))
+    }
+
     async fn set_active_recipient(&self, recipient: &str) {
         *self.default_recipient.write().await = Some(recipient.to_string());
     }
@@ -643,26 +705,7 @@ impl Tool for MessageSendTool {
         }
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
 
-        let turn_context = current_message_send_execution_context();
-
-        // Resolve the active channel. In-turn calls use task-local routing;
-        // outside a turn, fall back to the construction/update-time slot.
-        let channel = match turn_context.as_ref() {
-            Some(context) => Arc::clone(&context.active_channel),
-            None => self.active_channel.read().await.clone(),
-        };
-
-        // Resolve recipient: explicit arg takes priority, then the task-local
-        // turn default. Only non-turn calls fall back to the legacy slot.
-        let default = match turn_context {
-            Some(context) => context.default_recipient,
-            None => self.default_recipient.read().await.clone(),
-        };
-        let target = args
-            .get("target")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .or(default);
+        let (channel, target) = self.routing_defaults(&args).await;
 
         match action {
             "send" => {
@@ -690,8 +733,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let recipient_ref = op_id::ref_for_channel_recipient(destination.name(), &recipient);
-                let operation_name = op_id::op_id(self.name(), "send", &[destination.name(), &recipient_ref]);
+                let operation_name = message_send_operation(destination.name(), &recipient);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
                     self.name(),
@@ -1046,12 +1088,10 @@ impl Tool for MessageSendTool {
 /// objects, is asked to send. The tool name stays stable, while its schema is
 /// narrowed to the operation and context actually available in this process.
 ///
-/// It performs **no** policy decision of its own beyond the local autonomy
-/// check every tool honours. Destination resolution, outbound authorization and
-/// the media refusal all happen in the daemon, against the daemon's
-/// configuration, and their verdicts are surfaced here verbatim. This is the
-/// point: there is exactly one implementation of those gates, and it is the one
-/// next to the channels.
+/// The local side-effect gate checks the exact requested channel and recipient
+/// before an HTTP request. Destination resolution, outbound authorization and
+/// media restrictions remain owned by the daemon under its own configuration.
+/// A local approval cannot replace or bypass those destination-side checks.
 pub struct DaemonMessageSendTool {
     endpoint: TasksEndpoint,
     security: Arc<SecurityPolicy>,
@@ -1109,6 +1149,27 @@ impl Tool for DaemonMessageSendTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         daemon_message_send_parameters_schema()
+    }
+
+    async fn resolve_approval_operation(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
+        if args.get("action").and_then(serde_json::Value::as_str).unwrap_or("send") != "send" {
+            return Ok(None);
+        }
+        let channel = requested_channel(args).ok_or_else(|| anyhow::anyhow!("message approval channel missing"))?;
+        let recipient = args
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("message approval recipient missing"))?;
+        Self::reject_uncarried_arguments(args).map_err(anyhow::Error::msg)?;
+        Ok(Some((
+            message_send_operation(channel, recipient),
+            crate::acl::approval_grant::RiskLevel::Medium,
+        )))
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1169,6 +1230,17 @@ impl Tool for DaemonMessageSendTool {
             .get("as_voice")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+
+        let operation = message_send_operation(channel, recipient);
+        let approval = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+            self.name(),
+            &operation,
+            ResourceRiskLevel::Medium,
+            approval.as_ref(),
+        ) {
+            return refuse(error);
+        }
 
         match request_channel_send(&self.endpoint, channel, recipient, message, as_voice).await {
             Ok(report) => Ok(ToolResult {

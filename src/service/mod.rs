@@ -879,10 +879,7 @@ async fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
         }
     }
 
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .map(preferred_user_config_dir)
+    crate::config::user_home_dir().map(preferred_user_config_dir)
 }
 
 async fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
@@ -1189,9 +1186,7 @@ fn generate_windows_wrapper(exe: &Path, config_dir: &Path, stdout_log: &Path, st
 }
 
 fn macos_service_file() -> Result<PathBuf> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
     Ok(home
         .join("Library")
         .join("LaunchAgents")
@@ -1199,9 +1194,7 @@ fn macos_service_file() -> Result<PathBuf> {
 }
 
 fn linux_service_file(config: &Config) -> Result<PathBuf> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
     let _ = config;
     Ok(home.join(".config").join("systemd").join("user").join("prx.service"))
 }
@@ -1227,20 +1220,6 @@ async fn run_checked(command: &mut Command) -> Result<()> {
         );
     }
     Ok(())
-}
-
-async fn run_capture(command: &mut Command) -> Result<String> {
-    let output = run_capture_status(command).await?;
-    if !output.success {
-        bail!(
-            "Command failed (exit={}): {}",
-            output
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
-            output.detail()
-        );
-    }
-    Ok(output.detail())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1304,18 +1283,20 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn run_capture_reads_stdout() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
+        let out = run_capture_status(Command::new("sh").args(["-lc", "echo hello"]))
             .await
-            .expect("stdout capture should succeed");
+            .expect("stdout capture should succeed")
+            .detail();
         assert_eq!(out.trim(), "hello");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn run_capture_falls_back_to_stderr() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
+        let out = run_capture_status(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
             .await
-            .expect("stderr capture should succeed");
+            .expect("stderr capture should succeed")
+            .detail();
         assert_eq!(out.trim(), "warn");
     }
 
@@ -1449,16 +1430,6 @@ mod tests {
         assert_eq!(classify_systemd_state(false, "garbled\n", true), ServiceState::Unknown);
     }
 
-    #[cfg(not(target_os = "windows"))]
-    #[tokio::test]
-    async fn run_capture_rejects_non_zero_status() {
-        let result = run_capture(Command::new("sh").args(["-lc", "echo inactive; exit 3"])).await;
-        assert!(
-            result.is_err(),
-            "nonzero service status must not be reported as success"
-        );
-    }
-
     #[test]
     fn windows_task_name_is_constant() {
         assert_eq!(windows_task_name(), "PRX Daemon");
@@ -1467,9 +1438,10 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn run_capture_reads_stdout_windows() {
-        let out = run_capture(Command::new("cmd").args(["/C", "echo hello"]))
+        let out = run_capture_status(Command::new("cmd").args(["/C", "echo hello"]))
             .await
-            .expect("stdout capture should succeed");
+            .expect("stdout capture should succeed")
+            .detail();
         assert_eq!(out.trim(), "hello");
     }
 

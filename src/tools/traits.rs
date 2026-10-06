@@ -73,6 +73,21 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Only audited native file tools opt in to source-bound private storage.
+    fn supports_owner_filesystem(&self) -> bool {
+        false
+    }
+
+    /// Resolve an exact approval operation using read-only runtime state.
+    /// This must not execute, send, reserve, create files, or grant authority.
+    /// Unsupported operations return None and cannot obtain a scoped grant.
+    async fn resolve_approval_operation(
+        &self,
+        _args: &serde_json::Value,
+    ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
+        Ok(None)
+    }
+
     /// Execute the tool with an optional cancellation token.
     ///
     /// The default implementation races the existing `execute` future against
@@ -135,6 +150,38 @@ pub trait Tool: Send + Sync {
         vec![self.spec()]
     }
 
+    /// Resolve a current exact public spec. Dynamic backends may expose more
+    /// executable names than fit in the provider-facing `specs()` window.
+    fn spec_for_name(&self, name: &str) -> Option<ToolSpec> {
+        self.specs().into_iter().find(|spec| spec.name == name)
+    }
+
+    /// Full read-only executable inventory, including dynamic aliases that
+    /// the provider-facing `specs` window intentionally omits.
+    fn catalog_specs(&self) -> Vec<ToolSpec> {
+        self.specs()
+    }
+
+    /// Borrow a complete immutable executable inventory when the tool can
+    /// prove that names, aliases, descriptions and schemas cannot change for
+    /// this object's lifetime. The default keeps dynamic tools fully live.
+    /// Availability and binding identity are always read separately.
+    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+        None
+    }
+
+    /// One coherent live metadata publication. None retains the legacy live path.
+    /// Unlike immutable_catalog_specs, a fresh read may return a new publication.
+    fn shared_catalog_snapshot(&self) -> Option<super::SharedToolCatalogSnapshot> {
+        None
+    }
+
+    /// Exact read-only identity of a synthetic Skill or Node dispatch target.
+    /// A root that cannot prove the target remains unbound to the catalog.
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        std::collections::BTreeMap::new()
+    }
+
     /// Tool tier for intelligent context management. Default: Standard.
     fn tier(&self) -> ToolTier {
         ToolTier::Standard
@@ -151,6 +198,15 @@ pub trait Tool: Send + Sync {
             "executable native backend '{}' is registered",
             self.name()
         ))
+    }
+
+    /// Fresh availability projection used by catalog parity. An override
+    /// must equal the configured-level or legacy empty-reason result of
+    /// `availability()` on the same live state; schema validity is separate.
+    fn catalog_availability_is_configured(&self) -> bool {
+        let availability = self.availability();
+        availability.level >= crate::capability::CapabilityAvailabilityLevel::Configured
+            || availability.reason.trim().is_empty()
     }
 
     /// Execute by public tool name. Default maps to `execute`.

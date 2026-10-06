@@ -137,15 +137,15 @@ impl SkillReadTool {
     }
 
     fn resolve_target(&self, name: &str, resource_path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf, bool)> {
-        let skills = crate::skills::load_skills_with_config(&self.workspace_dir, &self.config);
+        // Resolve through the same metadata-only selection used by capability
+        // publication; the legacy process cache can retain an old community
+        // target after a workspace shadow is installed.
+        let skills = crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config);
         let skill = skills
             .iter()
             .find(|skill| skill.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| anyhow::anyhow!("Unknown skill '{name}'. Use skills_list to inspect the catalog."))?;
-        let location = skill
-            .location
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Skill '{name}' has no readable local location"))?;
+        let location = &skill.location;
         let skill_root = if location.is_dir() {
             location.clone()
         } else {
@@ -186,6 +186,13 @@ impl SkillReadTool {
 impl Tool for SkillReadTool {
     fn name(&self) -> &str {
         "skill_read"
+    }
+
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
+            .into_iter()
+            .map(|skill| (skill.name.clone(), crate::skills::catalog_skill_binding_digest(&skill)))
+            .collect()
     }
 
     fn description(&self) -> &str {
@@ -655,6 +662,7 @@ impl SkillExecuteTool {
                 workspace_dir: root,
                 timeout: None,
                 cancellation,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
         match outcome {
@@ -856,6 +864,29 @@ mod tests {
             .await
             .expect_err("resource escape must fail");
         assert!(error.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn skill_read_target_tracks_workspace_shadow_even_with_legacy_cache_primed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let community = temp.path().join("community");
+        let openclaw = temp.path().join("openclaw");
+        std::fs::create_dir_all(&community).unwrap();
+        std::fs::write(community.join("prx_skill.md"), "# Community\nCommunity body\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.skills.open_skills_dir = Some(community.to_string_lossy().to_string());
+        config.skills.openclaw_skills_dir = Some(openclaw.to_string_lossy().to_string());
+        let _legacy = crate::skills::load_skills_with_config(&workspace, &config);
+        let workspace_skill = workspace.join("skills/prx_skill/SKILL.md");
+        std::fs::create_dir_all(workspace_skill.parent().unwrap()).unwrap();
+        std::fs::write(&workspace_skill, "# Workspace\nWorkspace body\n").unwrap();
+        let reader = SkillReadTool::new(workspace.clone(), config.clone());
+        let (target, _, _) = reader.resolve_target("prx_skill", None).unwrap();
+        assert_eq!(target, std::fs::canonicalize(&workspace_skill).unwrap());
+        let selected = crate::skills::catalog_skill_metadata(&workspace, &config);
+        assert_eq!(selected.first().unwrap().location, workspace_skill);
     }
 
     #[tokio::test]

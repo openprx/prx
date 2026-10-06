@@ -1,0 +1,65 @@
+{
+  "model": "jev-latest",
+  "state": {
+    "message": "I was charged twice. Please refund the duplicate today."
+  },
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": {
+        "question": "Which team should handle this request?",
+        "focus": "Use the customer message"
+      },
+      "criteria": {
+        "billing": {
+          "description": "Charges and refunds",
+          "examples": [
+            "duplicate charge"
+          ]
+        },
+        "technical": {
+          "description": "Software faults",
+          "examples": [
+            "page crashes"
+          ]
+        },
+        "other": null
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How soon does the customer ask for action?",
+      "criteria": [
+        {
+          "deadline": "none"
+        },
+        {
+          "deadline": "within a week"
+        },
+        {
+          "deadline": "today"
+        }
+      ]
+    },
+    "refund_requested": {
+      "type": "noul",
+      "instructions": {
+        "question": "Does the customer explicitly request a refund?"
+      },
+      "criteria": {
+        "true": {
+          "description": "Explicit refund request",
+          "examples": [
+            "please refund"
+          ]
+        },
+        "false": {
+          "description": "No explicit refund request",
+          "examples": [
+            "explain this charge"
+          ]
+        }
+      }
+    }
+  }
+}

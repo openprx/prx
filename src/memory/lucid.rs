@@ -1,14 +1,16 @@
 use super::sqlite::SqliteMemory;
 use super::traits::{
-    CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult,
-    Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal,
-    MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
+    CompactionRun, CompactionRunInput, DecisionMemoryHit, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
+    DocumentSearchResult, Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink,
+    MemoryLinkInput, MemoryPrincipal, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput,
+    SessionContextQuery, SharedContextQuery,
 };
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -275,6 +277,11 @@ impl Memory for LucidMemory {
         "lucid"
     }
 
+    async fn mirror_operator_write(&self, key: &str, content: &str, category: &MemoryCategory) -> anyhow::Result<()> {
+        // The local SQLite store owns the workspace Markdown mirror.
+        self.local.mirror_operator_write(key, content, category).await
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -284,6 +291,68 @@ impl Memory for LucidMemory {
     ) -> anyhow::Result<()> {
         self.local.store(key, content, category.clone(), session_id).await?;
         self.sync_to_lucid_async(key, content, &category).await;
+        Ok(())
+    }
+
+    /// Context-bearing writes go to the local SQLite store with their context,
+    /// exactly as reads do (`recall_with_context`). The trait default called
+    /// `store`, which dropped the context: every network caller's row landed
+    /// with no owner or channel and was exported to `MEMORY_SNAPSHOT.md` as an
+    /// operator row (D-026 N-1, R-INT2A F2).
+    ///
+    /// An owner-isolated write is not copied to the Lucid service, which keeps
+    /// no per-row owner and would hand the text to every other caller's
+    /// recall; the local store remains authoritative for it.
+    async fn store_with_context(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&crate::memory::principal::MemoryWriteContext>,
+    ) -> anyhow::Result<()> {
+        self.local
+            .store_with_context(key, content, category.clone(), session_id, context)
+            .await?;
+        if !context.is_some_and(|context| context.require_owner_match) {
+            self.sync_to_lucid_async(key, content, &category).await;
+        }
+        Ok(())
+    }
+
+    /// Metadata-bearing writes (a plugin's origin, for one) reach the local
+    /// store with their metadata; see `store_with_context`.
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        metadata: crate::memory::traits::MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.local
+            .store_with_metadata(key, content, category.clone(), session_id, metadata)
+            .await?;
+        self.sync_to_lucid_async(key, content, &category).await;
+        Ok(())
+    }
+
+    /// Both together; see `store_with_context`.
+    async fn store_with_context_and_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&crate::memory::principal::MemoryWriteContext>,
+        metadata: crate::memory::traits::MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.local
+            .store_with_context_and_metadata(key, content, category.clone(), session_id, context, metadata)
+            .await?;
+        if !context.is_some_and(|context| context.require_owner_match) {
+            self.sync_to_lucid_async(key, content, &category).await;
+        }
         Ok(())
     }
 
@@ -318,8 +387,97 @@ impl Memory for LucidMemory {
         }
     }
 
+    async fn count_rehearsal_hits(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &crate::memory::principal::MemoryWriteContext,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u32> {
+        self.local.count_rehearsal_hits(query, limit, context, deadline).await
+    }
+
+    async fn retrieve_decision_memory(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &super::principal::MemoryWriteContext,
+        session_id: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<DecisionMemoryHit>> {
+        self.local
+            .retrieve_decision_memory(query, limit, context, session_id, deadline)
+            .await
+    }
+
+    async fn retrieve_decision_documents(
+        &self,
+        query: &str,
+        limit: u8,
+        principal: &super::traits::MemoryPrincipal,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<super::traits::DecisionDocumentHit>> {
+        self.local
+            .retrieve_decision_documents(query, limit, principal, deadline)
+            .await
+    }
+
+    async fn retrieve_decision_session(
+        &self,
+        principal: &super::traits::MemoryPrincipal,
+        before_event_id: &str,
+        limit: u8,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<super::traits::DecisionSessionHit>> {
+        self.local
+            .retrieve_decision_session(principal, before_event_id, limit, deadline)
+            .await
+    }
+
+    /// Owner-isolated recall is answered by the local SQLite store alone.
+    ///
+    /// This backend is a wrapper, not a leaf: its rows live in a real
+    /// `SqliteMemory` and do carry `owner_id`. Forwarding only the
+    /// context-free methods left the trait's fail-closed default to answer for
+    /// it, so an owner-isolated caller reached none of its **own** rows here.
+    /// The local store can scope the read, so it gets the context.
+    ///
+    /// The Lucid service half is deliberately not consulted under isolation: it
+    /// returns unattributed context with no per-row owner, which is exactly the
+    /// case the fail-closed default exists for. A caller that is not
+    /// owner-isolated takes the historical path below, byte for byte —
+    /// local hit, threshold, cooldown and merge included.
+    async fn recall_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&crate::memory::principal::MemoryWriteContext>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if context.is_some_and(|context| context.require_owner_match) {
+            return self.local.recall_with_context(query, limit, session_id, context).await;
+        }
+        self.recall(query, limit, session_id).await
+    }
+
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         self.local.get(key).await
+    }
+
+    /// The keyed twin of `recall_with_context`, for the same reason.
+    ///
+    /// The `*_with_context_mode` variants need no override: an owner-isolated
+    /// context is forced to `Enforce` before the mode is consulted, so they
+    /// route through this method and `recall_with_context` above.
+    async fn get_with_context(
+        &self,
+        key: &str,
+        context: Option<&crate::memory::principal::MemoryWriteContext>,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        if context.is_some_and(|context| context.require_owner_match) {
+            return self.local.get_with_context(key, context).await;
+        }
+        self.get(key).await
     }
 
     async fn list(
@@ -330,8 +488,35 @@ impl Memory for LucidMemory {
         self.local.list(category, session_id).await
     }
 
+    async fn list_owner_ids(
+        &self,
+        category: &MemoryCategory,
+    ) -> anyhow::Result<Option<std::collections::HashMap<String, Option<String>>>> {
+        self.local.list_owner_ids(category).await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.local.forget(key).await
+    }
+
+    /// An owner-isolated forget is answered by the local store, which deletes
+    /// the caller's own row and no other owner's.
+    ///
+    /// Owner-isolated writes land only in the local store (see
+    /// `store_with_context`), so that is where they are forgotten; the Lucid
+    /// service never held them. Without this override the trait's
+    /// fail-closed default answered `false` and the caller could store a row
+    /// it could never remove. A caller that is not owner-isolated keeps the
+    /// historical path, which is the trait default's: `forget`.
+    async fn forget_with_context(
+        &self,
+        key: &str,
+        context: Option<&crate::memory::principal::MemoryWriteContext>,
+    ) -> anyhow::Result<bool> {
+        if context.is_some_and(|context| context.require_owner_match) {
+            return self.local.forget_with_context(key, context).await;
+        }
+        self.forget(key).await
     }
 
     async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
@@ -350,6 +535,113 @@ impl Memory for LucidMemory {
         self.local.reindex().await
     }
 
+    // Scoped Router authority is verified by the authoritative local store.
+    // These operations must never invoke the external Lucid recall/sync path.
+    async fn read_router_history(
+        &self,
+        evidence: super::RouterHistoryReadEvidence,
+        deadline: Instant,
+    ) -> anyhow::Result<super::RouterHistoryRead> {
+        self.local.read_router_history(evidence, deadline).await
+    }
+
+    async fn commit_router_history(
+        &self,
+        evidence: &super::RouterHistoryWriteEvidence,
+        deadline: Instant,
+    ) -> anyhow::Result<super::RouterHistoryCommitReceipt> {
+        self.local.commit_router_history(evidence, deadline).await
+    }
+
+    async fn read_router_learning(
+        &self,
+        evidence: &super::traits::RouterLearningEvidence,
+        deadline: Instant,
+    ) -> anyhow::Result<super::traits::RouterLearningRead> {
+        self.local.read_router_learning(evidence, deadline).await
+    }
+
+    async fn commit_router_learning(
+        &self,
+        evidence: &super::traits::RouterLearningEvidence,
+        expected_version: i64,
+        next: &super::traits::RouterLearningSnapshot,
+        deadline: Instant,
+    ) -> anyhow::Result<super::traits::RouterLearningCommit> {
+        self.local
+            .commit_router_learning(evidence, expected_version, next, deadline)
+            .await
+    }
+
+    async fn acquire_ingress_lifetime(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Arc<dyn crate::memory::ingress_recovery::IngressLifetime>> {
+        self.local.acquire_ingress_lifetime(workspace_id, token, deadline).await
+    }
+    async fn append_ingress_input(
+        &self,
+        input: MessageEventInput,
+        capsule: crate::memory::ingress_recovery::IngressCapsule,
+        lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
+        self.local
+            .append_ingress_input(input, capsule, lifetime, deadline)
+            .await
+    }
+    async fn list_ingress_recovery_candidates(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        current: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        phase: crate::memory::ingress_recovery::IngressRecoveryScan,
+        after_id: i64,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::ingress_recovery::IngressRecoveryCandidate>> {
+        self.local
+            .list_ingress_recovery_candidates(scope, current, phase, after_id, limit, deadline)
+            .await
+    }
+    async fn read_ingress_event(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        lookup: &crate::memory::ingress_recovery::IngressEventLookup,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.local.read_ingress_event(scope, lookup, deadline).await
+    }
+    async fn claim_ingress_recovery(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<crate::memory::ingress_recovery::IngressRecoveryClaim>> {
+        self.local.claim_ingress_recovery(workspace_id, token, deadline).await
+    }
+    async fn commit_ingress_recovery(
+        &self,
+        commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        self.local.commit_ingress_recovery(commit).await
+    }
+    async fn append_message_event_until(
+        &self,
+        input: MessageEventInput,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<MessageEvent> {
+        self.local.append_message_event_until(input, deadline).await
+    }
+    async fn project_console_message_until(
+        &self,
+        event: &MessageEvent,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.local.project_console_message_until(event, deadline).await
+    }
+
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         self.local.append_message_event(input).await
     }
@@ -361,6 +653,67 @@ impl Memory for LucidMemory {
     ) -> anyhow::Result<Option<MessageEvent>> {
         self.local
             .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+            .await
+    }
+
+    async fn list_console_conversation_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<crate::memory::ConversationTurn>> {
+        self.local
+            .list_console_conversation_turns(principal, session_key, limit, offset)
+            .await
+    }
+
+    async fn list_console_terminal_events(
+        &self,
+        workspace_id: &str,
+        session_key: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local
+            .list_console_terminal_events(workspace_id, session_key, after_id, limit)
+            .await
+    }
+
+    async fn project_console_message(&self, event: &MessageEvent) -> anyhow::Result<()> {
+        self.local.project_console_message(event).await
+    }
+
+    async fn list_worker_launch_events(
+        &self,
+        workspace_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local
+            .list_worker_launch_events(workspace_id, after_id, limit)
+            .await
+    }
+
+    async fn find_owned_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.local
+            .find_owned_message_event_by_idempotency_key(workspace_id, owner_id, idempotency_key)
+            .await
+    }
+
+    async fn find_owned_message_event(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_id: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.local
+            .find_owned_message_event(workspace_id, owner_id, event_id)
             .await
     }
 
@@ -505,6 +858,7 @@ mod tests {
         clippy::literal_string_with_formatting_args
     )]
     use super::*;
+    use crate::memory::traits::MemoryReadMode;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -552,7 +906,7 @@ if [[ "${1:-}" == "store" ]]; then
 fi
 
 if [[ "${1:-}" == "context" ]]; then
-  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
+  # Simulate a cold start: the answer arrives late, and recall still waits for it.
   sleep 0.2
   cat <<'EOF'
 <lucid-context>
@@ -607,6 +961,16 @@ exit 1
         script_path.display().to_string()
     }
 
+    /// A recall budget no fake script can plausibly exhaust.
+    ///
+    /// The fakes are `bash` scripts, and starting one under a parallel test run
+    /// has been measured at well over two seconds. A test that wants to see
+    /// what Lucid answered must not race process start-up against the clock:
+    /// when it loses, the recall times out, the answer is silently the local
+    /// one, and the assertion blames the merge. None of these tests is about
+    /// the timeout, so the budget is only a guard against a script that hangs.
+    const HANG_GUARD: Duration = Duration::from_mins(1);
+
     fn test_memory(workspace: &Path, cmd: String) -> LucidMemory {
         let sqlite = SqliteMemory::new(workspace).unwrap();
         LucidMemory::with_options(
@@ -615,10 +979,114 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_secs(2),
+            HANG_GUARD,
             Duration::from_millis(400),
             Duration::from_secs(2),
         )
+    }
+
+    #[tokio::test]
+    async fn decision_memory_reads_use_local_sqlite_without_lucid_process() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("context_calls.log");
+        let cmd = write_probe_lucid_script(tmp.path(), &marker);
+        let memory = test_memory(tmp.path(), cmd);
+        let context = crate::memory::principal::MemoryWriteContext {
+            workspace_id: Some(tmp.path().to_string_lossy().into_owned()),
+            channel: Some("cli".into()),
+            chat_type: Some("private".into()),
+            chat_id: Some("agent:prx_run".into()),
+            raw_sender: Some("prx_user".into()),
+            ..Default::default()
+        };
+        memory
+            .local
+            .store_with_context(
+                "prx_rehearsal_note",
+                "prx_rehearsal_keyword scoped note",
+                MemoryCategory::Conversation,
+                None,
+                Some(&context),
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            memory
+                .count_rehearsal_hits("prx_rehearsal_keyword", 5, &context, deadline)
+                .await
+                .unwrap(),
+            1
+        );
+        let hits = memory
+            .retrieve_decision_memory("prx_rehearsal_keyword", 5, &context, None, deadline)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "prx_rehearsal_keyword scoped note");
+        assert!(
+            !marker.exists(),
+            "decision Memory reads must not call the Lucid service"
+        );
+    }
+
+    fn snapshot_text(workspace: &Path) -> String {
+        crate::memory::snapshot::export_snapshot(workspace).unwrap();
+        fs::read_to_string(workspace.join(crate::memory::snapshot::SNAPSHOT_FILENAME)).unwrap_or_default()
+    }
+
+    /// R-INT2A F2: a network caller's write on Lucid keeps its origin and
+    /// owner in the local store, so it stays out of the operator snapshot
+    /// (D-026 N-1). Lucid used the trait default, which calls `store` and
+    /// drops the context: the row landed ownerless and was exported.
+    #[tokio::test]
+    async fn a_network_callers_write_on_lucid_keeps_its_owner_and_stays_out_of_the_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), "nonexistent-lucid-binary".to_string());
+        let context = crate::memory::MemoryWriteContext {
+            channel: Some("webhook".to_string()),
+            sender_id: Some("webhook-owner".to_string()),
+            ..crate::memory::MemoryWriteContext::default()
+        };
+        memory
+            .store_with_context(
+                "net-note",
+                "webhook caller text",
+                MemoryCategory::Core,
+                None,
+                Some(&context),
+            )
+            .await
+            .unwrap();
+        let owners = memory
+            .list_owner_ids(&MemoryCategory::Core)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            owners.values().cloned().collect::<Vec<_>>(),
+            vec![Some("webhook-owner".to_string())],
+            "the row keeps its owner"
+        );
+        drop(memory);
+        let snapshot = snapshot_text(tmp.path());
+        assert!(!snapshot.contains("webhook caller text"), "{snapshot}");
+    }
+
+    /// R-INT2A F2 for plugin rows: the metadata a plugin write carries
+    /// reaches the local store, so the row stays out of the snapshot on
+    /// Lucid as it does on SQLite.
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn a_plugin_write_on_lucid_stays_out_of_the_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), "nonexistent-lucid-binary".to_string());
+        crate::plugins::capabilities::common::store_plugin_memory(&memory, "sample-plugin", "plugin text", "core")
+            .await
+            .unwrap();
+        drop(memory);
+        let snapshot = snapshot_text(tmp.path());
+        assert!(!snapshot.contains("plugin text"), "{snapshot}");
     }
 
     #[tokio::test]
@@ -766,6 +1234,15 @@ exit 1
         script_path.display().to_string()
     }
 
+    /// A failed Lucid call puts recall into cooldown, so the next recall does
+    /// not start the command again.
+    ///
+    /// The failure has to be the script's own `exit 1`, reached after it has
+    /// recorded the call. With a 500 ms recall budget a slow `bash` start under
+    /// a parallel run timed out first and was killed before writing the
+    /// marker, so the count read 0 although the cooldown worked. The budget is
+    /// now [`HANG_GUARD`] and the cooldown an hour, so neither clock can decide
+    /// the outcome: the two recalls run back to back.
     #[tokio::test]
     async fn failure_cooldown_avoids_repeated_lucid_calls() {
         let tmp = TempDir::new().unwrap();
@@ -779,9 +1256,9 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
+            HANG_GUARD,
             Duration::from_millis(400),
-            Duration::from_secs(5),
+            Duration::from_hours(1),
         );
 
         let first = memory.recall("auth", 5, None).await.unwrap();
@@ -792,5 +1269,262 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
+    }
+
+    const LUCID_WORKSPACE: &str = "ws-lucid";
+    const LUCID_OWNER: &str = "owner:ws-lucid:agent:issuer-a.example:shared-subject";
+    const LUCID_OTHER_OWNER: &str = "owner:ws-lucid:agent:issuer-b.example:shared-subject";
+    const LUCID_KEY: &str = "first-owner-note";
+    const LUCID_CONTENT: &str = "alpha rollout note authored by the first owner";
+    const LUCID_QUERY: &str = "rollout";
+
+    fn lucid_owner_context(owner_id: &str, isolated: bool) -> crate::memory::principal::MemoryWriteContext {
+        crate::memory::principal::MemoryWriteContext {
+            workspace_id: Some(LUCID_WORKSPACE.to_string()),
+            channel: Some("mcp".to_string()),
+            chat_type: Some("gateway".to_string()),
+            chat_id: Some("mcp:shared-subject".to_string()),
+            sender_id: Some(owner_id.to_string()),
+            raw_sender: Some("shared-subject".to_string()),
+            owner_id: Some(owner_id.to_string()),
+            require_owner_match: isolated,
+        }
+    }
+
+    /// `lucid` wraps a real `SqliteMemory` whose rows do carry `owner_id`, but
+    /// it forwarded only the context-free methods, so the trait's fail-closed
+    /// default answered for it and an owner-isolated caller reached none of its
+    /// **own** rows either. The two context reads are now forwarded to the
+    /// local store, which can scope them.
+    ///
+    /// MUTATION GUARD: delete the `recall_with_context` / `get_with_context`
+    /// overrides and the first two assertions go red; forward without passing
+    /// the context and the last two do.
+    #[tokio::test]
+    async fn owner_isolated_reads_reach_the_callers_own_rows_in_the_local_store() {
+        let tmp = TempDir::new().unwrap();
+        let writer = lucid_owner_context(LUCID_OWNER, false);
+        {
+            let seeder = SqliteMemory::new(tmp.path()).unwrap();
+            seeder
+                .store_with_context_and_metadata(
+                    LUCID_KEY,
+                    LUCID_CONTENT,
+                    MemoryCategory::Core,
+                    None,
+                    Some(&writer),
+                    crate::memory::traits::MemoryStoreMetadata {
+                        workspace_id: Some(LUCID_WORKSPACE.to_string()),
+                        owner_id: Some(LUCID_OWNER.to_string()),
+                        channel: Some("mcp".to_string()),
+                        ..crate::memory::traits::MemoryStoreMetadata::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let memory = LucidMemory::with_options(
+            tmp.path(),
+            SqliteMemory::new(tmp.path()).unwrap(),
+            write_fake_lucid_script(tmp.path()),
+            200,
+            1,
+            Duration::from_millis(500),
+            Duration::from_millis(400),
+            Duration::from_secs(2),
+        );
+
+        let owner = lucid_owner_context(LUCID_OWNER, true);
+        let recalled = memory
+            .recall_with_context(LUCID_QUERY, 10, None, Some(&owner))
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().any(|entry| entry.key == LUCID_KEY),
+            "an owner-isolated caller must still read its own rows on the lucid backend: {:?}",
+            recalled.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            memory
+                .get_with_context(LUCID_KEY, Some(&owner))
+                .await
+                .unwrap()
+                .is_some(),
+            "and by exact key too"
+        );
+
+        let other = lucid_owner_context(LUCID_OTHER_OWNER, true);
+        assert!(
+            memory
+                .recall_with_context(LUCID_QUERY, 10, None, Some(&other))
+                .await
+                .unwrap()
+                .is_empty(),
+            "forwarding must not reopen the boundary for a different owner"
+        );
+        assert!(
+            memory
+                .get_with_context(LUCID_KEY, Some(&other))
+                .await
+                .unwrap()
+                .is_none(),
+            "nor for its exact-key read"
+        );
+
+        // The two `_mode` entry points route through the overrides above,
+        // because an owner-isolated context is forced to `Enforce` before the
+        // mode is consulted. An `Observe` request therefore cannot reopen the
+        // boundary here either.
+        assert!(
+            memory
+                .recall_with_context_mode(LUCID_QUERY, 10, None, Some(&other), MemoryReadMode::Observe)
+                .await
+                .unwrap()
+                .is_empty(),
+            "Observe must not reopen the owner boundary on the lucid backend"
+        );
+        assert!(
+            memory
+                .get_with_context_mode(LUCID_KEY, Some(&other), MemoryReadMode::Observe)
+                .await
+                .unwrap()
+                .is_none(),
+            "nor for the keyed read"
+        );
+        assert!(
+            memory
+                .recall_with_context_mode(LUCID_QUERY, 10, None, Some(&owner), MemoryReadMode::Observe)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.key == LUCID_KEY),
+            "and the owner still reads its own row through the mode variant"
+        );
+    }
+
+    /// The non-isolated path is untouched: a context-carrying read with no
+    /// isolation bit answers exactly what `LucidMemory::recall` /
+    /// `LucidMemory::get` answer, which is the historical behaviour of the
+    /// trait default it replaces.
+    ///
+    /// The equivalence is asserted rather than the Lucid process being
+    /// observed: whether the service half is reached depends on the local hit
+    /// threshold and a wall-clock timeout, and a test must not depend on
+    /// either. The *isolated* path is a different answer by construction and is
+    /// pinned by the test above.
+    ///
+    /// Both reads do reach the fake here, so the recall budget is
+    /// [`HANG_GUARD`] and the cooldown an hour: with a 2 s budget a slow `bash`
+    /// start could time out one read and not the other, and the two answers
+    /// would differ for a reason that has nothing to do with the path.
+    #[tokio::test]
+    async fn a_non_isolated_context_read_keeps_the_historical_lucid_path() {
+        let tmp = TempDir::new().unwrap();
+        let memory = LucidMemory::with_options(
+            tmp.path(),
+            SqliteMemory::new(tmp.path()).unwrap(),
+            write_fake_lucid_script(tmp.path()),
+            200,
+            99,
+            HANG_GUARD,
+            Duration::from_secs(2),
+            Duration::from_hours(1),
+        );
+        memory
+            .store(LUCID_KEY, LUCID_CONTENT, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let reader = lucid_owner_context(LUCID_OWNER, false);
+        let with_context = memory
+            .recall_with_context(LUCID_QUERY, 5, None, Some(&reader))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect::<Vec<_>>();
+        let historical = memory
+            .recall(LUCID_QUERY, 5, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect::<Vec<_>>();
+        assert!(
+            historical.iter().any(|content| content.contains(LUCID_CONTENT)),
+            "sanity: the historical answer is not empty, or the equality below is vacuous: {historical:?}"
+        );
+        assert_eq!(
+            with_context, historical,
+            "a non-isolated context read must answer exactly what the context-free recall answers"
+        );
+
+        assert_eq!(
+            memory
+                .get_with_context(LUCID_KEY, Some(&reader))
+                .await
+                .unwrap()
+                .map(|entry| entry.content),
+            memory.get(LUCID_KEY).await.unwrap().map(|entry| entry.content),
+            "and the keyed read likewise"
+        );
+    }
+
+    /// N1-LUCID (R-INT2Af N1): an owner-isolated caller could store on
+    /// `lucid` (the local store keeps the owner) but never forget, because
+    /// `forget_with_context` fell to the trait's fail-closed default and
+    /// answered `false` with the row still there. It now reaches the local
+    /// store with the context, which deletes the caller's own row and nobody
+    /// else's.
+    #[tokio::test]
+    async fn an_owner_isolated_caller_forgets_its_own_row_and_only_that() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+        let owner = lucid_owner_context(LUCID_OWNER, true);
+        let other = lucid_owner_context(LUCID_OTHER_OWNER, true);
+        memory
+            .store_with_context(LUCID_KEY, LUCID_CONTENT, MemoryCategory::Core, None, Some(&owner))
+            .await
+            .unwrap();
+        memory
+            .store_with_context(
+                "second-owner-note",
+                "beta note",
+                MemoryCategory::Core,
+                None,
+                Some(&other),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !memory
+                .forget_with_context("second-owner-note", Some(&owner))
+                .await
+                .unwrap(),
+            "an isolated caller must not delete another owner's row"
+        );
+        assert!(
+            memory
+                .get_with_context("second-owner-note", Some(&other))
+                .await
+                .unwrap()
+                .is_some(),
+            "the other owner's row survives"
+        );
+
+        assert!(
+            memory.forget_with_context(LUCID_KEY, Some(&owner)).await.unwrap(),
+            "an isolated caller forgets its own row on lucid"
+        );
+        assert!(
+            memory
+                .get_with_context(LUCID_KEY, Some(&owner))
+                .await
+                .unwrap()
+                .is_none(),
+            "and the row is gone"
+        );
     }
 }

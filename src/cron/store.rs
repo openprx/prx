@@ -20,8 +20,8 @@
 use crate::config::Config;
 use crate::cron::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    DeliveryPrincipal, JobType, Schedule, SessionTarget, next_run_for_schedule, schedule_cron_expression,
-    validate_schedule,
+    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget, next_run_for_schedule,
+    schedule_cron_expression, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
@@ -114,6 +114,8 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
     let parent_task_id = lineage.parent_task_id.clone();
     let source_message_event_id = lineage.source_message_event_id;
     let delivery_principal = lineage.delivery_principal;
+    let origin = lineage.origin.to_stored()?;
+    let created_via = lineage.created_via.as_str();
 
     with_connection(config, |conn| {
         conn.execute(
@@ -121,9 +123,9 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                creator_sender, creator_channel, creator_chat_type
+                creator_sender, creator_channel, creator_chat_type, origin, created_via
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17)",
+                       ?15, ?16, ?17, ?18, ?19)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -142,6 +144,8 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 delivery_principal.sender.as_deref(),
                 delivery_principal.channel.as_deref(),
                 delivery_principal.chat_type.as_deref(),
+                origin.as_str(),
+                created_via,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -236,6 +240,7 @@ pub fn add_agent_job_with_lineage(
     let parent_task_id = lineage.parent_task_id.clone();
     let source_message_event_id = lineage.source_message_event_id;
     let delivery_principal = lineage.delivery_principal;
+    let origin = lineage.origin.to_stored()?;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -243,9 +248,9 @@ pub fn add_agent_job_with_lineage(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                creator_sender, creator_channel, creator_chat_type
+                creator_sender, creator_channel, creator_chat_type, origin
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL,
-                       ?16, ?17, ?18)",
+                       ?16, ?17, ?18, ?19)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -265,6 +270,7 @@ pub fn add_agent_job_with_lineage(
                 delivery_principal.sender.as_deref(),
                 delivery_principal.channel.as_deref(),
                 delivery_principal.chat_type.as_deref(),
+                origin.as_str(),
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -309,7 +315,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type
+                    creator_sender, creator_channel, creator_chat_type, origin
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -333,7 +339,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type
+                    creator_sender, creator_channel, creator_chat_type, origin
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -343,6 +349,57 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         } else {
             anyhow::bail!("Cron job '{job_id}' not found")
         }
+    })
+}
+
+/// Which surface created the job (D-107 amendment); NULL is `agent_tool`.
+pub fn job_created_via(config: &Config, job_id: &str) -> Result<JobCreator> {
+    if let Some(store) = pg_store(config)? {
+        return store.job_created_via(job_id);
+    }
+    with_connection(config, |conn| {
+        let value = conn
+            .query_row(
+                "SELECT created_via FROM cron_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .with_context(|| format!("Cron job '{job_id}' not found"))?;
+        Ok(JobCreator::from_stored(value.as_deref()))
+    })
+}
+
+/// Record that the operator vouches for a job as their own (`prx cron
+/// mark-operator`): its shell command may then run git, hardened.
+pub fn mark_job_operator(config: &Config, job_id: &str) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.mark_job_operator(job_id);
+    }
+    let changed = with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET created_via = 'operator_cli' WHERE id = ?1",
+            params![job_id],
+        )
+        .context("Failed to mark cron job as the operator's")
+    })?;
+    if changed == 0 {
+        anyhow::bail!("Cron job '{job_id}' not found");
+    }
+    Ok(())
+}
+
+/// Shell jobs stored before the creator was recorded (NULL `created_via`),
+/// as `(id, command)`: they count as `agent_tool` until marked.
+pub fn unmarked_shell_jobs(config: &Config) -> Result<Vec<(String, String)>> {
+    if let Some(store) = pg_store(config)? {
+        return store.unmarked_shell_jobs();
+    }
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' AND created_via IS NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     })
 }
 
@@ -834,7 +891,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type
+                    creator_sender, creator_channel, creator_chat_type, origin
              FROM cron_jobs
              WHERE enabled = 1 AND terminal_state IS NULL AND next_run <= ?1
                AND (
@@ -893,6 +950,10 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
     } else {
         None
     };
+    let command_created_via = patch
+        .command
+        .as_ref()
+        .map(|_| patch.created_via.unwrap_or_default().as_str());
     if let Some(command) = patch.command {
         job.command = command;
         job.approval_grant_json = approval_grant_json;
@@ -946,7 +1007,8 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                  next_run = ?12, last_run = ?13, last_status = ?14, last_output = ?15,
                  terminal_state = ?16, approval_grant_json = ?17,
                  claim_owner = ?18, attempt_id = ?19, claimed_at = ?20, claim_expires_at = ?21,
-                 creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33
+                 creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33,
+                 created_via = COALESCE(?34, created_via)
              WHERE id = ?22 AND next_run = ?23
                AND (schedule = ?24 OR (schedule IS NULL AND expression = ?25))
                AND last_status IS ?26
@@ -985,6 +1047,7 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                     job.delivery_principal.sender.as_deref(),
                     job.delivery_principal.channel.as_deref(),
                     job.delivery_principal.chat_type.as_deref(),
+                    command_created_via,
                 ],
             )
             .context("Failed to update cron job")?;
@@ -1032,7 +1095,7 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
     let status = if success { "ok" } else { "error" };
-    let bounded_output = truncate_cron_output(output);
+    let bounded_output = stored_cron_output(output);
 
     with_connection(config, |conn| {
         conn.execute(
@@ -1191,7 +1254,7 @@ fn finish_claimed_run_with_schedule(
     } else {
         "cron.job.failed"
     };
-    let bounded_output = truncate_cron_output(output);
+    let bounded_output = stored_cron_output(output);
     let keep = i64::from(config.cron.max_run_history.max(1));
     let schedule_json = serde_json::to_string(&job.schedule)?;
     with_connection(config, |conn| {
@@ -1301,7 +1364,7 @@ fn finish_sqlite_recurring_claimed_run(
     advance_schedule: bool,
 ) -> Result<bool> {
     let status = if success { "ok" } else { "error" };
-    let bounded_output = truncate_cron_output(output);
+    let bounded_output = stored_cron_output(output);
     let next_run = if advance_schedule {
         next_run_for_schedule(&job.schedule, finished_at)?
     } else {
@@ -1444,7 +1507,7 @@ pub fn record_terminal_manual_run(
         );
     }
     let status = if success { "ok" } else { "error" };
-    let bounded_output = truncate_cron_output(output);
+    let bounded_output = stored_cron_output(output);
     let keep = i64::from(config.cron.max_run_history.max(1));
     let schedule_json = serde_json::to_string(&job.schedule)?;
     with_connection(config, |conn| {
@@ -1539,7 +1602,7 @@ pub fn record_run(
             config.cron.max_run_history,
         );
     }
-    let bounded_output = output.map(truncate_cron_output);
+    let bounded_output = output.map(stored_cron_output);
     with_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
@@ -1598,7 +1661,13 @@ pub fn record_run(
     })
 }
 
-pub(crate) fn truncate_cron_output(output: &str) -> String {
+/// Redact and bound a job's output before a store persists it.
+///
+/// An agent job's output is the agent turn's reply (or its error), so it is
+/// redacted like the terminal commit (D-053) before it is capped.
+pub(crate) fn stored_cron_output(output: &str) -> String {
+    let redacted = crate::agent::terminal::redact_persisted_text(output);
+    let output = redacted.as_str();
     if output.len() <= MAX_CRON_OUTPUT_BYTES {
         return output.to_string();
     }
@@ -1724,6 +1793,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         approval_grant_json: row.get(22)?,
         claim: decode_sqlite_claim(row, 23)?,
         delivery_principal: DeliveryPrincipal::new(row.get(27)?, row.get(28)?, row.get(29)?),
+        origin: JobOrigin::from_stored(row.get::<_, Option<String>>(30)?.as_deref()),
     })
 }
 
@@ -1915,7 +1985,7 @@ fn deliver_pending_cron_event_outbox(conn: &Connection) -> Result<usize> {
                     "UPDATE cron_event_outbox
                      SET attempt_count = attempt_count + 1, last_error = ?1
                      WHERE event_id = ?2 AND delivered_at IS NULL",
-                    params![truncate_cron_output(&error.to_string()), event_id],
+                    params![stored_cron_output(&error.to_string()), event_id],
                 )?;
                 tracing::warn!(job_id, event_type, "failed to deliver Cron event outbox row: {error}");
             }
@@ -2078,7 +2148,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
             claim_expires_at TEXT,
             creator_sender   TEXT,
             creator_channel  TEXT,
-            creator_chat_type TEXT
+            creator_chat_type TEXT,
+            origin           TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -2163,6 +2234,15 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     add_column_if_missing(&conn, "cron_jobs", "creator_sender", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "creator_channel", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "creator_chat_type", "TEXT")?;
+    // CRON-ORIGIN: nullable with no backfill. A row stored before this column
+    // existed has no provable creator and reads as `JobOrigin::Unattributed`,
+    // so it never runs with operator authority; no path wrote agent jobs that
+    // only a local operator could reach (the `prx cron` CLI writes shell jobs).
+    add_column_if_missing(&conn, "cron_jobs", "origin", "TEXT")?;
+    // D-107 amendment: which surface created the job. Nullable with no
+    // backfill: a row stored before the column existed reads as
+    // `agent_tool` (its git is refused) until the operator marks it.
+    add_column_if_missing(&conn, "cron_jobs", "created_via", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "worker_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
@@ -2551,6 +2631,8 @@ mod tests {
             jobs[0].delivery_principal.is_anonymous(),
             "test: a legacy row must migrate to an anonymous principal, not a fabricated one"
         );
+        // CRON-ORIGIN: and to no creator at all — never the local operator.
+        assert_eq!(jobs[0].origin, JobOrigin::Unattributed);
 
         with_connection(&config, |conn| {
             let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
@@ -2567,6 +2649,7 @@ mod tests {
                 "creator_sender",
                 "creator_channel",
                 "creator_chat_type",
+                "origin",
             ] {
                 assert!(names.iter().any(|existing| existing == name), "missing {name}");
             }
@@ -3651,6 +3734,34 @@ mod tests {
         assert!(stored.len() <= MAX_CRON_OUTPUT_BYTES);
     }
 
+    /// D-053 / REDACT-TURN: an agent job's output is the agent turn's reply or
+    /// error, so the run output and the job's last output are stored with
+    /// secrets redacted, like the terminal commit. Fails before REDACT-TURN.
+    #[test]
+    fn cron_output_is_stored_with_secrets_redacted() {
+        use crate::agent::terminal::persistence_probe::{PROBE_SECRET, assert_nothing_under_persists_the_probe_secret};
+        let tmp = TempDir::new().expect("test: tempdir");
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo probe").expect("test: add job");
+        let output = format!("agent job failed: upstream rejected key {PROBE_SECRET}");
+
+        record_run(&config, &job.id, Utc::now(), Utc::now(), "error", Some(&output), 1).expect("test: record run");
+        reschedule_after_run(&config, &job, false, &output).expect("test: reschedule");
+
+        let runs = list_runs(&config, &job.id, 1).expect("test: list runs");
+        let stored = runs[0].output.as_deref().unwrap_or_default();
+        assert!(
+            stored.contains("[REDACTED]"),
+            "the run output is kept, redacted: {stored}"
+        );
+        let last_output = get_job(&config, &job.id)
+            .expect("test: get job")
+            .last_output
+            .unwrap_or_default();
+        assert!(!last_output.contains(PROBE_SECRET), "{last_output}");
+        assert_nothing_under_persists_the_probe_secret(tmp.path());
+    }
+
     #[test]
     fn reschedule_after_run_truncates_last_output() {
         let tmp = TempDir::new().unwrap();
@@ -3664,5 +3775,35 @@ mod tests {
         let last_output = stored.last_output.as_deref().unwrap_or_default();
         assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
         assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn rewriting_an_operator_shell_command_downgrades_its_creator() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo initial",
+        )
+        .unwrap();
+        mark_job_operator(&config, &job.id).unwrap();
+        assert_eq!(job_created_via(&config, &job.id).unwrap(), JobCreator::OperatorCli);
+
+        let updated = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                command: Some("git status".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.command, "git status");
+        assert_eq!(job_created_via(&config, &job.id).unwrap(), JobCreator::AgentTool);
     }
 }

@@ -6,15 +6,25 @@
 //!
 //! Streaming is intentionally not supported for WASM providers (WASM components
 //! cannot hold open an async stream to the host).
+//!
+//! # Trap recovery
+//!
+//! The adapter's store is owned by a [`Supervisor`]: a trapped provider is
+//! rebuilt on a brand-new `Store` by the next request, rebuilds are budgeted
+//! inside a rolling window, and once the budget is spent the provider is
+//! quarantined until the next plugin generation replaces it. Every failure —
+//! a trap, a timeout, a quarantine refusal, a request too large for the guest —
+//! is returned as an error for the caller's reliability and fallback layer to
+//! act on; the adapter never fabricates or truncates a response.
 
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
+use super::recovery::{CallOutcome, CapabilityKind, GuestOp, Respawn, Supervisor};
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline};
 use crate::plugins::manifest::PluginManifest;
 use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 
@@ -23,15 +33,129 @@ use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 pub struct WasmProvider {
     /// The cached provider name (returned by `name()` at load time).
     provider_name: String,
-    /// wasmtime store + instance, behind a mutex (Store is not Sync).
-    inner: Arc<Mutex<WasmProviderInner>>,
+    /// The store, its instance and their recovery state.
+    supervisor: Arc<Supervisor>,
     /// Timeout for `chat` calls (milliseconds).
     timeout_ms: u64,
 }
 
-struct WasmProviderInner {
-    store: wasmtime::Store<HostState>,
-    instance: wasmtime::component::Instance,
+/// One call of the guest's `chat` export.
+struct ChatCall {
+    provider_name: String,
+    messages: Vec<ChatMessage>,
+    model: String,
+    temperature: f64,
+}
+
+impl GuestOp for ChatCall {
+    type Output = ChatResponse;
+
+    fn operation(&self) -> &'static str {
+        "chat"
+    }
+
+    fn invoke<'a>(
+        self,
+        store: &'a mut wasmtime::Store<HostState>,
+        instance: &'a wasmtime::component::Instance,
+    ) -> futures_util::future::BoxFuture<'a, CallOutcome<ChatResponse>>
+    where
+        Self: 'a,
+    {
+        Box::pin(self.run(store, instance))
+    }
+}
+
+impl ChatCall {
+    async fn run(
+        self,
+        store: &mut wasmtime::Store<HostState>,
+        instance: &wasmtime::component::Instance,
+    ) -> CallOutcome<ChatResponse> {
+        let provider_name = self.provider_name;
+        // Navigate to prx:plugin/provider-exports@0.1.0 → chat
+        let Some(iface_idx) =
+            instance.get_export_index(store.as_context_mut(), None, "prx:plugin/provider-exports@0.1.0")
+        else {
+            return CallOutcome::GuestError(PluginError::Runtime(
+                "plugin does not export prx:plugin/provider-exports@0.1.0".to_string(),
+            ));
+        };
+
+        let Some(func_idx) = instance.get_export_index(store.as_context_mut(), Some(&iface_idx), "chat") else {
+            return CallOutcome::GuestError(PluginError::Runtime("chat not found in provider-exports".to_string()));
+        };
+
+        let Some(chat_fn) = instance.get_func(store.as_context_mut(), &func_idx) else {
+            return CallOutcome::GuestError(PluginError::Runtime("chat is not a function".to_string()));
+        };
+
+        // Build the list<chat-message> parameter.
+        let wasm_messages: Vec<wasmtime::component::Val> = self
+            .messages
+            .iter()
+            .map(|m| {
+                wasmtime::component::Val::Record(vec![
+                    ("role".to_string(), wasmtime::component::Val::String(m.role.clone())),
+                    (
+                        "content".to_string(),
+                        wasmtime::component::Val::String(m.content.clone()),
+                    ),
+                ])
+            })
+            .collect();
+
+        let params = [
+            wasmtime::component::Val::List(wasm_messages),
+            wasmtime::component::Val::String(self.model.as_str().into()),
+            wasmtime::component::Val::Float64(self.temperature),
+        ];
+        let mut results = [wasmtime::component::Val::Bool(false)];
+
+        if let Err(e) = chat_fn.call_async(store.as_context_mut(), &params, &mut results).await {
+            return super::recovery::unwound(store, &e, || format!("chat() call failed: {e}"));
+        }
+
+        // Parse result<chat-response, string>
+        let parsed = match results.first() {
+            Some(wasmtime::component::Val::Result(r)) => match r.as_ref() {
+                Ok(Some(inner_val)) => WasmProvider::parse_chat_response(inner_val),
+                Ok(None) => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                }),
+                Err(Some(inner_err)) => match inner_err.as_ref() {
+                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
+                        "WASM provider '{provider_name}' returned error: {e}"
+                    ))),
+                    _ => Err(PluginError::Runtime(format!(
+                        "WASM provider '{provider_name}' returned unknown error variant"
+                    ))),
+                },
+                Err(None) => Err(PluginError::Runtime(format!(
+                    "WASM provider '{provider_name}' returned unknown error"
+                ))),
+            },
+            _ => Err(PluginError::Runtime(
+                "chat() returned unexpected value type".to_string(),
+            )),
+        };
+        match parsed {
+            Ok(response) => CallOutcome::Completed(response),
+            Err(error) => CallOutcome::GuestError(error),
+        }
+    }
+}
+
+/// Bytes of a chat request the guest has to hold: every role and content
+/// string plus the model name.
+fn chat_payload_bytes(messages: &[ChatMessage], model: &str) -> usize {
+    messages.iter().fold(model.len(), |total, message| {
+        total
+            .saturating_add(message.role.len())
+            .saturating_add(message.content.len())
+    })
 }
 
 // SAFETY: All results[N] accesses index a Vec that was just constructed with
@@ -55,40 +179,25 @@ impl WasmProvider {
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
-
-        let granted: HashSet<String> = granted_permissions;
-        let optional: HashSet<String> = manifest.permissions.optional.iter().cloned().collect();
-        let mut host_state = HostState::new(
-            manifest.plugin.name.clone(),
-            manifest.config.clone(),
-            granted,
-            optional,
-            manifest.permissions.http_allowlist.clone(),
-            timeout_ms,
-            manifest.resources.max_kv_storage_mb,
+        let respawn = Respawn::new(
+            CapabilityKind::Provider,
+            engine,
+            component,
+            manifest,
+            granted_permissions,
+            None,
+            event_bus,
+            Self::register_host_functions,
         );
-        if let Some(bus) = event_bus {
-            host_state = host_state.with_event_bus(bus);
-        }
+        let mut live = respawn.instantiate().await?;
 
-        let mut store = wasmtime::Store::new(engine, host_state);
-        apply_store_resource_limits(&mut store, manifest.resources.max_memory_mb);
-        store
+        // Cache the provider name at load time. The probe gets its own full
+        // fuel budget, like every later call.
+        apply_store_epoch_deadline(&mut live.store, timeout_ms);
+        live.store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
-        apply_store_epoch_deadline(&mut store, timeout_ms);
-
-        let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
-        Self::register_host_functions(&mut linker)?;
-
-        let instance = linker
-            .instantiate_async(&mut store, component)
-            .await
-            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate provider: {e}")))?;
-
-        // Cache the provider name at load time.
-        apply_store_epoch_deadline(&mut store, timeout_ms);
-        let provider_name = Self::call_name(&instance, &mut store).await?;
+        let provider_name = Self::call_name(&live.instance, &mut live.store).await?;
 
         tracing::info!(
             plugin = %manifest.plugin.name,
@@ -98,7 +207,7 @@ impl WasmProvider {
 
         Ok(Self {
             provider_name,
-            inner: Arc::new(Mutex::new(WasmProviderInner { store, instance })),
+            supervisor: Arc::new(Supervisor::new(respawn, live).with_bounded_lock_wait()),
             timeout_ms,
         })
     }
@@ -148,89 +257,61 @@ impl WasmProvider {
         }
     }
 
-    /// Internal: call the `chat` export with a message list.
-    async fn call_chat_inner(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> PluginResult<ChatResponse> {
-        let mut inner = self.inner.lock().await;
-        let WasmProviderInner {
-            ref mut store,
-            ref instance,
-        } = *inner;
-
-        // Navigate to prx:plugin/provider-exports@0.1.0 → chat
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/provider-exports@0.1.0")
-            .ok_or_else(|| {
-                PluginError::Runtime("plugin does not export prx:plugin/provider-exports@0.1.0".to_string())
-            })?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "chat")
-            .ok_or_else(|| PluginError::Runtime("chat not found in provider-exports".to_string()))?;
-
-        let chat_fn = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("chat is not a function".to_string()))?;
-
-        // Build the list<chat-message> parameter.
-        let wasm_messages: Vec<wasmtime::component::Val> = messages
-            .iter()
-            .map(|m| {
-                wasmtime::component::Val::Record(vec![
-                    ("role".to_string(), wasmtime::component::Val::String(m.role.clone())),
-                    (
-                        "content".to_string(),
-                        wasmtime::component::Val::String(m.content.clone()),
-                    ),
-                ])
-            })
-            .collect();
-
-        let params = [
-            wasmtime::component::Val::List(wasm_messages),
-            wasmtime::component::Val::String(model.into()),
-            wasmtime::component::Val::Float64(temperature),
-        ];
-        let mut results = vec![wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        chat_fn
-            .call_async(store.as_context_mut(), &params, &mut results)
-            .await
-            .map_err(|e| PluginError::Runtime(format!("chat() call failed: {e}")))?;
-
-        // Parse result<chat-response, string>
-        match &results[0] {
-            wasmtime::component::Val::Result(r) => match r.as_ref() {
-                Ok(Some(inner_val)) => Self::parse_chat_response(inner_val),
-                Ok(None) => Ok(ChatResponse {
-                    text: None,
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                }),
-                Err(Some(inner_err)) => match inner_err.as_ref() {
-                    wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                        "WASM provider '{}' returned error: {e}",
-                        self.provider_name
-                    ))),
-                    _ => Err(PluginError::Runtime(format!(
-                        "WASM provider '{}' returned unknown error variant",
-                        self.provider_name
-                    ))),
-                },
-                Err(None) => Err(PluginError::Runtime(format!(
-                    "WASM provider '{}' returned unknown error",
-                    self.provider_name
-                ))),
-            },
-            _ => Err(PluginError::Runtime(
-                "chat() returned unexpected value type".to_string(),
-            )),
+    /// Run one chat request through the supervisor. Every failure is an
+    /// error for the caller's reliability layer; nothing is fabricated or
+    /// truncated.
+    async fn call_chat(&self, messages: &[ChatMessage], model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
+        let payload_bytes = chat_payload_bytes(messages, model);
+        if !self.supervisor.admit_payload("chat", payload_bytes) {
+            return Err(anyhow::Error::from(PluginError::ResourceLimit(format!(
+                "WASM provider '{}' request of {payload_bytes} bytes exceeds the {}-byte payload cap \
+                     (resources.max_payload_bytes)",
+                self.provider_name,
+                self.supervisor.max_payload_bytes()
+            ))));
         }
+        // Detached: a caller that gives up — a stopped turn, a caller-side
+        // deadline shorter than the plugin's — cannot drop the request
+        // mid-guest-call. A guest that hangs is charged by its own timeout.
+        match self
+            .supervisor
+            .call_detached(ChatCall {
+                provider_name: self.provider_name.clone(),
+                messages: messages.to_vec(),
+                model: model.to_string(),
+                temperature,
+            })
+            .await
+        {
+            Ok(response) => Ok(response),
+            // A guest call that ran past its budget and a request that could
+            // not get the store within that budget read the same, as they
+            // always have; only the first is charged to the plugin.
+            Err(error @ PluginError::Timeout(_)) => Err(anyhow::Error::from(error).context(format!(
+                "WASM provider '{}' timed out after {}ms",
+                self.provider_name, self.timeout_ms
+            ))),
+            // Keep the type, so callers such as the reliability layer can
+            // tell a quarantine or a refused payload apart without parsing text.
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Plugin that exports this provider.
+    pub fn plugin_name(&self) -> &str {
+        self.supervisor.plugin_name()
+    }
+
+    /// Per-adapter health for `wasm_plugins_status`.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        self.supervisor.diagnostics(serde_json::json!({
+            "plugin": self.supervisor.plugin_name(),
+            "provider": self.provider_name,
+        }))
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.supervisor.is_quarantined()
     }
 
     /// Parse a `chat-response` record value into a Rust `ChatResponse`.
@@ -313,20 +394,7 @@ impl Provider for WasmProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_chat_inner(request.messages, model, temperature),
-        )
-        .await;
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM provider '{}' timed out after {}ms",
-                self.provider_name,
-                self.timeout_ms
-            ),
-            Ok(Err(error)) => anyhow::bail!("{error}"),
-            Ok(Ok(response)) => Ok(response),
-        }
+        self.call_chat(request.messages, model, temperature).await
     }
 
     /// Execute a chat completion via the WASM plugin.
@@ -346,21 +414,8 @@ impl Provider for WasmProvider {
         }
         messages.push(ChatMessage::user(message));
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_chat_inner(&messages, model, temperature),
-        )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM provider '{}' timed out after {}ms",
-                self.provider_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(resp)) => Ok(resp.text.unwrap_or_default()),
-        }
+        let response = self.call_chat(&messages, model, temperature).await?;
+        Ok(response.text.unwrap_or_default())
     }
 
     /// Pass the full message history to the WASM plugin.
@@ -370,21 +425,8 @@ impl Provider for WasmProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            self.call_chat_inner(messages, model, temperature),
-        )
-        .await;
-
-        match result {
-            Err(_) => anyhow::bail!(
-                "WASM provider '{}' timed out after {}ms",
-                self.provider_name,
-                self.timeout_ms
-            ),
-            Ok(Err(e)) => anyhow::bail!("{e}"),
-            Ok(Ok(resp)) => Ok(resp.text.unwrap_or_default()),
-        }
+        let response = self.call_chat(messages, model, temperature).await?;
+        Ok(response.text.unwrap_or_default())
     }
 }
 
@@ -515,5 +557,86 @@ mod tests {
         let resp = WasmProvider::parse_chat_response(&record).expect("should parse gracefully");
         assert_eq!(resp.text, Some("hi".to_string()));
         assert!(resp.tool_calls.is_empty());
+    }
+
+    const TRAPPING_ECHO_MANIFEST: &str = r#"
+[plugin]
+name = "echo-provider"
+version = "0.1.0"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "provider"
+name = "wasm-echo"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608
+"#;
+
+    /// D-023: a caller whose deadline is shorter than the plugin's (the 5 s
+    /// pre-gate classifier, a stopped turn) gives up on a request. The request
+    /// still runs to its own outcome, so a guest that traps or hangs is charged
+    /// for it by its own failure or timeout — not excused as the caller's
+    /// cancellation.
+    #[tokio::test]
+    async fn an_abandoned_provider_request_is_still_charged_for_its_own_failure() {
+        use crate::providers::traits::ChatRequest;
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasmtime engine");
+        let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/echo-provider/plugin.wasm");
+        let bytes = std::fs::read(wasm).expect("test: the committed provider fixture is readable");
+        let component =
+            wasmtime::component::Component::from_binary(&engine, &bytes).expect("test: the fixture is a component");
+        let manifest: PluginManifest = toml::from_str(TRAPPING_ECHO_MANIFEST).expect("test: manifest parses");
+        let provider = WasmProvider::new(&engine, &component, &manifest, HashSet::new(), None)
+            .await
+            .expect("test: the fixture instantiates");
+
+        // Four megabytes of message trap an 8 MB guest.
+        let trapping = [ChatMessage::user("x".repeat(4 * 1024 * 1024))];
+        {
+            let guard = provider.supervisor.lock().await;
+            {
+                let request = ChatRequest {
+                    messages: &trapping,
+                    tools: None,
+                };
+                let mut chat = std::pin::pin!(provider.chat(request, "fixture-model", 0.0));
+                assert!(
+                    chat.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                    "the request must be waiting for the store"
+                );
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            drop(guard);
+        }
+
+        let reply = provider
+            .chat_with_system(None, "probe", "fixture-model", 0.0)
+            .await
+            .expect("test: the next request runs on a rebuilt store");
+        assert_eq!(reply, "wasm-echo/fixture-model: probe");
+        let diagnostics = provider.diagnostics();
+        assert_eq!(
+            diagnostics.get("failure_count").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the abandoned request must have run and been charged for its trap: {diagnostics}"
+        );
+        assert_eq!(
+            diagnostics.get("restart_count").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "{diagnostics}"
+        );
     }
 }

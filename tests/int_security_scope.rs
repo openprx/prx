@@ -163,7 +163,7 @@ async fn scope_policy_multi_rule_layered_evaluation() {
 // the single source of truth every injection site reuses (`normalize_arguments`
 // in tools/execution.rs, `inject_trusted_scope` in gateway/compat.rs,
 // `Agent::execute_tool_call` in agent/agent.rs, `execute_one_tool` in
-// agent/loop_.rs, and the third-party forward in tools/mcp.rs).
+// agent/execution_policy.rs, and the third-party forward in tools/mcp.rs).
 //
 // The earlier version of this block re-implemented the removals inside the test
 // and asserted against its own copy, which proved nothing about production code.

@@ -62,6 +62,17 @@ fn parse_min_score(args: &serde_json::Value) -> f64 {
         .map_or(0.0, |score| score.clamp(0.0, 1.0))
 }
 
+/// Build a read context from the runtime-trusted scope block
+/// (`_zc_scope`, guarded by `_zc_scope_trusted`).
+///
+/// Model- and caller-supplied scope fields never reach here: the execution
+/// service strips every `_zc_*` / `_prx_*` key from the request and re-authors
+/// this block from the authenticated envelope. Blank fields are treated as
+/// absent so a `Some("")` can never stand in for a real anchor.
+///
+/// `require_owner_match` is deliberately **not** read here: the caller sets it
+/// from [`crate::tools::execution::scope_requires_owner_match`] so the bit
+/// survives even a missing or malformed scope block.
 fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     let trusted = args
         .get("_zc_scope_trusted")
@@ -72,39 +83,28 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     }
 
     let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
-
-    let channel = scope
-        .get("channel")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let chat_type = scope
-        .get("chat_type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let chat_id = scope
-        .get("chat_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let sender = scope
-        .get("sender")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let workspace_id = scope
-        .get("workspace_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let owner_id = scope
-        .get("owner_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    let str_field = |key: &str| {
+        scope
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let owner_id = str_field("owner_id");
 
     Some(MemoryWriteContext {
-        workspace_id,
-        channel,
-        chat_type,
-        chat_id,
-        sender_id: owner_id,
-        raw_sender: sender,
+        workspace_id: str_field("workspace_id"),
+        channel: str_field("channel"),
+        chat_type: str_field("chat_type"),
+        chat_id: str_field("chat_id"),
+        // Historical mapping: these tools have always used the scope owner as
+        // the ACL `sender_id` anchor. `owner_id` below is the new, explicit
+        // owner-isolation anchor; both carry the same authenticated value.
+        sender_id: owner_id.clone(),
+        raw_sender: str_field("sender"),
+        owner_id,
+        require_owner_match: false,
     })
 }
 
@@ -167,8 +167,15 @@ impl Tool for MemorySearchTool {
         let max_results = parse_max_results(&args);
         let min_score = parse_min_score(&args);
 
-        let scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
-        let mode = if self.acl_enabled {
+        // V02-R5: the owner boundary of an externally authenticated origin is
+        // not a rollout decision. `memory.acl_enabled` chooses Enforce/Observe
+        // for non-isolated, in-process turns only; an owner-isolated origin is
+        // enforced unconditionally, and the bit comes solely from the
+        // service-authored `_zc_scope.owner_isolated` marker.
+        let isolated = crate::tools::execution::scope_requires_owner_match(&args);
+        let mut scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
+        scope_ctx.require_owner_match = isolated;
+        let mode = if self.acl_enabled || isolated {
             MemoryReadMode::Enforce
         } else {
             MemoryReadMode::Observe
@@ -739,6 +746,92 @@ mod tests {
         assert_eq!(schema["properties"]["maxResults"]["maximum"], MAX_RESULTS_LIMIT);
         assert_eq!(schema["properties"]["minScore"]["minimum"], 0.0);
         assert_eq!(schema["properties"]["minScore"]["maximum"], 1.0);
+    }
+
+    /// V02-R5 anti-over-correction lock: an in-process turn carries a trusted
+    /// scope **without** `owner_isolated`, so with the ACL flag off it keeps
+    /// Observe mode and still returns the would-deny row. Isolation is a
+    /// property of the origin, not of the trust flag.
+    #[tokio::test]
+    async fn in_process_turn_without_the_isolation_marker_keeps_observe_mode() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("open", "topic summary", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'member_a', 'telegram', 'sender-a', '2026-02-23T00:00:00Z', 'system')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('member_a', 'member', '[]', 'private', '[\"summary\"]', '2026-02-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, false);
+        let result = tool
+            .execute(json!({
+                "query": "summary",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-a",
+                    "owner_id": "owner:ws:telegram:sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("key: open"), "{}", result.output);
+    }
+
+    /// The same turn *with* the service-authored isolation marker is enforced,
+    /// with the ACL flag still off.
+    ///
+    /// MUTATION GUARD: drop `|| isolated` from the mode selection and this goes
+    /// red while the test above stays green.
+    #[tokio::test]
+    async fn an_owner_isolated_turn_is_enforced_with_the_acl_flag_off() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("open", "topic summary", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp, false);
+        let result = tool
+            .execute(json!({
+                "query": "summary",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "mcp",
+                    "chat_type": "gateway",
+                    "chat_id": "mcp:shared-subject",
+                    "sender": "shared-subject",
+                    "owner_id": "owner:ws:agent:issuer-a.example:shared-subject",
+                    "owner_isolated": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("No matches found for query"),
+            "an unattributed row must not reach an owner-isolated caller: {}",
+            result.output
+        );
     }
 
     #[test]

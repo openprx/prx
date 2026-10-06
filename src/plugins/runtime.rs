@@ -19,6 +19,7 @@ use super::capabilities::hook::WasmHookExecutor;
 use super::capabilities::middleware::MiddlewareChain;
 use super::capabilities::provider::WasmProvider;
 use super::capabilities::storage::WasmStorage;
+use super::capabilities::tool::WasmToolAdapter;
 use super::error::{PluginError, PluginResult};
 use super::event_bus::EventBus;
 use super::manifest::PluginManifest;
@@ -35,6 +36,8 @@ struct PluginGeneration {
     id: u64,
     manager: Arc<PluginManager>,
     tools: Vec<Arc<dyn Tool>>,
+    /// The same adapters as `tools`, typed, so their health can be read.
+    wasm_tools: Vec<Arc<WasmToolAdapter>>,
     middleware: Arc<MiddlewareChain>,
     hooks: Arc<WasmHookExecutor>,
     cron: Arc<WasmCronManager>,
@@ -54,7 +57,7 @@ impl PluginGeneration {
         manager.load_all().await?;
 
         let tools_build = manager
-            .create_tool_adapters_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
+            .create_wasm_tool_adapters(memory.clone(), Some(Arc::clone(&event_bus)))
             .await;
         let middleware_build = manager
             .create_middleware_chain_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
@@ -67,7 +70,11 @@ impl PluginGeneration {
             .await;
         let provider_build = manager.create_provider_adapters(Some(Arc::clone(&event_bus))).await;
         let storage_build = manager.create_storage_adapters(Some(event_bus)).await;
-        let tools = tools_build.value.into_iter().map(Arc::<dyn Tool>::from).collect();
+        let wasm_tools: Vec<Arc<WasmToolAdapter>> = tools_build.value.into_iter().map(Arc::new).collect();
+        let tools = wasm_tools
+            .iter()
+            .map(|tool| Arc::clone(tool) as Arc<dyn Tool>)
+            .collect();
         let middleware = Arc::new(middleware_build.value);
         let hooks = Arc::new(hooks_build.value);
         let cron = Arc::new(cron_build.value);
@@ -99,6 +106,7 @@ impl PluginGeneration {
             id,
             manager,
             tools,
+            wasm_tools,
             middleware,
             hooks,
             cron,
@@ -197,6 +205,69 @@ impl PluginRuntime {
         self.generation.load().middleware.adapters()
     }
 
+    /// Middleware adapters the current generation stopped calling after they
+    /// spent their restart budget on repeated store-poisoning outcomes.
+    pub fn quarantined_middleware(&self) -> Vec<String> {
+        self.generation.load().middleware.quarantined_plugins()
+    }
+
+    /// Per-adapter health of the current generation's WASM tools.
+    pub fn tool_diagnostics(&self) -> Vec<serde_json::Value> {
+        self.generation
+            .load()
+            .wasm_tools
+            .iter()
+            .map(|tool| tool.diagnostics())
+            .collect()
+    }
+
+    /// Every adapter of the current generation that spent its restart budget
+    /// and is refused until the next generation, as `kind:plugin`.
+    pub fn quarantined_adapters(&self) -> Vec<String> {
+        let generation = self.generation.load();
+        let middleware = generation
+            .middleware
+            .quarantined_plugins()
+            .into_iter()
+            .map(|plugin| format!("middleware:{plugin}"));
+        let tools = generation
+            .wasm_tools
+            .iter()
+            .filter(|tool| tool.is_quarantined())
+            .map(|tool| format!("tool:{}", tool.plugin_name()));
+        let hooks = generation
+            .hooks
+            .quarantined_plugins()
+            .into_iter()
+            .map(|plugin| format!("hook:{plugin}"));
+        let cron = generation
+            .cron
+            .quarantined_plugins()
+            .into_iter()
+            .map(|plugin| format!("cron:{plugin}"));
+        let mut providers = generation
+            .providers
+            .values()
+            .filter(|provider| provider.is_quarantined())
+            .map(|provider| format!("provider:{}", provider.plugin_name()))
+            .collect::<Vec<_>>();
+        providers.sort();
+        let mut storages = generation
+            .storages
+            .values()
+            .filter(|storage| storage.is_quarantined())
+            .map(|storage| format!("storage:{}", storage.plugin_name()))
+            .collect::<Vec<_>>();
+        storages.sort();
+        middleware
+            .chain(tools)
+            .chain(hooks)
+            .chain(cron)
+            .chain(providers)
+            .chain(storages)
+            .collect()
+    }
+
     pub fn cron_diagnostics(&self) -> Vec<serde_json::Value> {
         self.generation.load().cron.adapters()
     }
@@ -216,6 +287,27 @@ impl PluginRuntime {
         let mut names = self.generation.load().providers.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    /// Per-adapter health of the current generation's WASM providers, in
+    /// provider-name order.
+    pub fn provider_diagnostics(&self) -> Vec<serde_json::Value> {
+        let generation = self.generation.load();
+        let mut providers = generation.providers.iter().collect::<Vec<_>>();
+        providers.sort_by(|left, right| left.0.cmp(right.0));
+        providers
+            .into_iter()
+            .map(|(_, provider)| provider.diagnostics())
+            .collect()
+    }
+
+    /// Per-adapter health of the current generation's WASM storage backends,
+    /// in storage-name order.
+    pub fn storage_diagnostics(&self) -> Vec<serde_json::Value> {
+        let generation = self.generation.load();
+        let mut storages = generation.storages.iter().collect::<Vec<_>>();
+        storages.sort_by(|left, right| left.0.cmp(right.0));
+        storages.into_iter().map(|(_, storage)| storage.diagnostics()).collect()
     }
 
     /// Names exported by storage adapters in the current generation.
@@ -547,10 +639,13 @@ impl Tool for PluginStatusTool {
                 "count": plugins.len(),
                 "plugins": plugins,
                 "hook_adapters": hook_adapters,
+                "tool_adapters": self.runtime.tool_diagnostics(),
                 "middleware_adapters": self.runtime.middleware_diagnostics(),
                 "cron_adapters": self.runtime.cron_diagnostics(),
                 "provider_adapters": self.runtime.provider_names(),
+                "provider_adapter_status": self.runtime.provider_diagnostics(),
                 "storage_adapters": self.runtime.storage_names(),
+                "storage_adapter_status": self.runtime.storage_diagnostics(),
                 "errors": errors,
             }))?,
             error: None,
@@ -566,9 +661,18 @@ impl Tool for PluginStatusTool {
     }
 
     fn availability(&self) -> crate::capability::CapabilityAvailability {
-        crate::capability::CapabilityAvailability::healthy(format!(
-            "WASM runtime generation {} is published",
-            self.runtime.generation_id()
+        let generation = self.runtime.generation_id();
+        let quarantined = self.runtime.quarantined_adapters();
+        if quarantined.is_empty() {
+            return crate::capability::CapabilityAvailability::healthy(format!(
+                "WASM runtime generation {generation} is published"
+            ));
+        }
+        // The generation is still published and every other adapter still runs,
+        // so the capability is selectable but no longer probe-healthy.
+        crate::capability::CapabilityAvailability::ready(format!(
+            "WASM runtime generation {generation} is published; quarantined adapters: {}",
+            quarantined.join(", ")
         ))
     }
 }
@@ -1145,10 +1249,13 @@ impl Tool for PluginManageTool {
                 "active": self.active_inventory().await?,
                 "disabled": self.disabled_plugins()?,
                 "hook_adapters": self.runtime.hook_diagnostics(),
+                "tool_adapters": self.runtime.tool_diagnostics(),
                 "middleware_adapters": self.runtime.middleware_diagnostics(),
                 "cron_adapters": self.runtime.cron_diagnostics(),
                 "provider_adapters": self.runtime.provider_names(),
+                "provider_adapter_status": self.runtime.provider_diagnostics(),
                 "storage_adapters": self.runtime.storage_names(),
+                "storage_adapter_status": self.runtime.storage_diagnostics(),
                 "errors": self.runtime.adapter_errors(),
             })),
             "get" => {
@@ -1368,10 +1475,26 @@ impl Tool for PluginToolRouter {
 
     fn availability(&self) -> crate::capability::CapabilityAvailability {
         let generation = self.runtime.generation.load();
-        crate::capability::CapabilityAvailability::healthy(format!(
-            "WASM generation {} exposes {} executable tool backend(s)",
+        let quarantined = generation
+            .wasm_tools
+            .iter()
+            .filter(|tool| tool.is_quarantined())
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        if quarantined.is_empty() {
+            return crate::capability::CapabilityAvailability::healthy(format!(
+                "WASM generation {} exposes {} executable tool backend(s)",
+                generation.id,
+                generation.tools.len()
+            ));
+        }
+        // Quarantined tools stay listed and answer with an explicit tool
+        // error, so the router is still selectable but no longer healthy.
+        crate::capability::CapabilityAvailability::ready(format!(
+            "WASM generation {} exposes {} executable tool backend(s); quarantined: {}",
             generation.id,
-            generation.tools.len()
+            generation.tools.len(),
+            quarantined.join(", ")
         ))
     }
 
@@ -1747,14 +1870,19 @@ optional = []
             Some("outbound")
         );
 
-        assert_eq!(
-            runtime.cron().run_job("counter-cron").await.unwrap(),
-            "counter-cron-run-1"
-        );
-        assert_eq!(
-            runtime.cron().run_job("counter-cron").await.unwrap(),
-            "counter-cron-run-2"
-        );
+        // The committed fixture is scheduled every 30 s and is due at start-up,
+        // so the runtime's own scheduler may run it between these manual runs
+        // (every run is its own task and yields); the counter still has to
+        // advance strictly from one manual run to the next.
+        let run_number = |output: String| -> u64 {
+            output
+                .strip_prefix("counter-cron-run-")
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected cron output: {output}"))
+        };
+        let first = run_number(runtime.cron().run_job("counter-cron").await.unwrap());
+        let second = run_number(runtime.cron().run_job("counter-cron").await.unwrap());
+        assert!(second > first, "run {second} must follow run {first}");
 
         let provider = runtime.provider("wasm-echo").unwrap();
         let response = provider
@@ -1856,5 +1984,1307 @@ optional = []
 
         assert_eq!(calls, 1_000);
         assert_eq!(storage.count().await.unwrap(), 200);
+    }
+
+    /// The committed `pipeline-middleware` component is reused verbatim; only
+    /// its `[resources]` table changes, so no WASM guest has to be rebuilt to
+    /// drive a store-poisoning trap.
+    const MIDDLEWARE_RECOVERY_STAGE: super::super::capabilities::middleware::MiddlewareStage =
+        super::super::capabilities::middleware::MiddlewareStage::Outbound;
+
+    /// Keeps the fixture healthy for ordinary envelopes while leaving one
+    /// deterministic trap reachable: the guest DOM-parses the whole envelope, so
+    /// a multi-megabyte envelope cannot fit an 8 MB linear memory and
+    /// `trap_on_grow_failure` turns the failed `memory.grow` into a trap.
+    /// `max_payload_bytes` is the largest value `validate()` accepts for an 8 MB
+    /// guest, which keeps this trap reachable past the host-side oversize guard
+    /// so the trap, not the guard, stays the subject of these tests.
+    const TRAPPING_MIDDLEWARE_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608";
+
+    /// Same guest memory and timeout, host-side oversize guard left at its
+    /// derived default (`max_memory_mb` / 8 = 1 MiB here).
+    const GUARDED_MIDDLEWARE_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000";
+
+    /// Tuned once against the committed fixture: instantiating the component
+    /// costs roughly 48 000 fuel units and one `process` call roughly 10 400, so
+    /// 62 000 funds exactly one call while fuel is a store-lifetime budget and
+    /// comfortably funds every call once fuel is metered per invocation.
+    const ONE_CALL_FUEL: u64 = 62_000;
+
+    /// Measured boundary for the committed fixture: instantiation alone costs
+    /// more than this, which `the_per_invocation_fuel_bound_stays_discriminating`
+    /// asserts. It measured under 50 000 fuel units, but nothing here asserts
+    /// that; the upper side is pinned only as `ONE_CALL_FUEL`, by
+    /// `middleware_fuel_is_metered_per_invocation`, whose adapter fails to load
+    /// if instantiation costs more than that.
+    const BELOW_INSTANTIATION_FUEL: u64 = 48_000;
+
+    /// `ONE_CALL_FUEL` carries a lower bound (it must fund a call once fuel is
+    /// per invocation) and an upper bound (it must not fund instantiation plus
+    /// several calls, or `middleware_fuel_is_metered_per_invocation` would pass
+    /// without discriminating). Only the lower bound is visible in that test, so
+    /// the upper bound is pinned here: instantiation alone eats more than
+    /// 48 000 of the 62 000 budget, leaving under 14 000 for a call that costs
+    /// roughly 10 000 — one call under a store-lifetime budget, never three.
+    /// A fixture or wasmtime change that cheapens instantiation therefore fails
+    /// this assertion instead of turning the other test green for the wrong
+    /// reason.
+    #[tokio::test]
+    async fn the_per_invocation_fuel_bound_stays_discriminating() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(
+            temp.path(),
+            &format!("max_fuel = {BELOW_INSTANTIATION_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let starved = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(
+            starved.middleware_diagnostics().is_empty(),
+            "instantiating the fixture must still cost more than {BELOW_INSTANTIATION_FUEL} fuel, \
+             otherwise ONE_CALL_FUEL would fund instantiation plus several calls and the \
+             per-invocation regression would stop discriminating: {:?}",
+            starved.middleware_diagnostics()
+        );
+        assert!(
+            starved
+                .adapter_errors()
+                .iter()
+                .any(|error| error.contains("all fuel consumed")),
+            "the adapter must be missing because the budget ran out, not for another reason: {:?}",
+            starved.adapter_errors()
+        );
+    }
+
+    fn install_middleware_fixture_with_resources(workspace: &Path, resources: &str) {
+        let plugin_dir = workspace.join("plugins").join("pipeline-middleware");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            format!(
+                r#"[plugin]
+name = "pipeline-middleware"
+version = "0.1.0"
+description = "middleware recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "middleware"
+name = "pipeline-marker"
+priority = 10
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+{resources}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Four megabytes of envelope: three live copies inside the guest (argument,
+    /// parsed value, serialized result) cannot fit an 8 MB linear memory.
+    fn oversized_middleware_envelope() -> String {
+        serde_json::json!({"text": "hello", "filler": "x".repeat(4 * 1024 * 1024)}).to_string()
+    }
+
+    fn middleware_adapter_status(runtime: &PluginRuntime) -> serde_json::Value {
+        let mut adapters = runtime.middleware_diagnostics();
+        assert_eq!(adapters.len(), 1, "{adapters:?}");
+        adapters.remove(0)
+    }
+
+    fn adapter_counter(adapter: &serde_json::Value, field: &str) -> u64 {
+        adapter
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("adapter status must publish '{field}': {adapter}"))
+    }
+
+    fn adapter_text(adapter: &serde_json::Value, field: &str) -> String {
+        adapter
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("adapter status must publish '{field}': {adapter}"))
+            .to_string()
+    }
+
+    fn transformed_middleware_text(output: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(output)
+            .ok()?
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    }
+
+    #[tokio::test]
+    async fn middleware_recovers_on_a_fresh_store_after_a_guest_trap() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(temp.path(), TRAPPING_MIDDLEWARE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let trapping = oversized_middleware_envelope();
+        let trapped = runtime.middleware().process(MIDDLEWARE_RECOVERY_STAGE, &trapping).await;
+        assert!(
+            !trapped.contains("middleware_probe"),
+            "the oversized envelope must trap the guest"
+        );
+
+        let recovered = runtime
+            .middleware()
+            .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+            .await;
+        assert_eq!(
+            transformed_middleware_text(&recovered).as_deref(),
+            Some("[wasm-middleware] hello"),
+            "{recovered}"
+        );
+
+        let adapter = middleware_adapter_status(&runtime);
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 1, "{adapter}");
+        assert_eq!(
+            adapter_counter(&adapter, "failure_count"),
+            1,
+            "the healthy call must not have entered the poisoned store: {adapter}"
+        );
+        let last_error = adapter_text(&adapter, "last_error");
+        assert!(
+            !last_error.contains("cannot enter component instance"),
+            "the recorded reason must be the first trap, not a re-entry refusal: {last_error}"
+        );
+        assert!(
+            adapter
+                .get("last_error_at")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "{adapter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_quarantines_after_the_restart_budget_is_spent() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(temp.path(), TRAPPING_MIDDLEWARE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let trapping = oversized_middleware_envelope();
+        for _ in 0..5 {
+            let output = runtime.middleware().process(MIDDLEWARE_RECOVERY_STAGE, &trapping).await;
+            assert_eq!(output.len(), trapping.len(), "every trapping call must fail open");
+        }
+
+        let adapter = middleware_adapter_status(&runtime);
+        assert_eq!(adapter_text(&adapter, "state"), "quarantined", "{adapter}");
+        assert!(!adapter_text(&adapter, "last_error").is_empty(), "{adapter}");
+        assert_eq!(
+            adapter_counter(&adapter, "restart_count"),
+            3,
+            "quarantine must follow a spent budget, not a shortcut around it: {adapter}"
+        );
+        let failures = adapter_counter(&adapter, "failure_count");
+        let skipped = adapter_counter(&adapter, "skipped_quarantined");
+
+        let refused = runtime
+            .middleware()
+            .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+            .await;
+        assert_eq!(refused, r#"{"text":"hello"}"#, "a quarantined adapter still fails open");
+        let after = middleware_adapter_status(&runtime);
+        assert_eq!(adapter_text(&after, "state"), "quarantined", "{after}");
+        assert_eq!(
+            adapter_counter(&after, "failure_count"),
+            failures,
+            "a refused call must not be counted as a new guest failure: {after}"
+        );
+        assert_eq!(
+            adapter_counter(&after, "skipped_quarantined"),
+            skipped + 1,
+            "a refused call must be visible as a quarantined skip: {after}"
+        );
+
+        let status = runtime.status_tool();
+        assert_ne!(
+            status.availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy,
+            "availability must degrade while an adapter is quarantined"
+        );
+        let reported = status.execute(serde_json::json!({})).await.unwrap();
+        assert!(reported.output.contains("\"quarantined\""), "{}", reported.output);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_middleware_waiter_never_enters_a_poisoned_store() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(temp.path(), TRAPPING_MIDDLEWARE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let chain = runtime.middleware();
+        let trapping = oversized_middleware_envelope();
+        // The waiter has to queue behind the trapping caller for this test to
+        // exercise anything, so the trapping task announces that it is running
+        // before it takes the store lock.
+        let (entered, has_entered) = tokio::sync::oneshot::channel();
+        let trapping_call = tokio::spawn({
+            let chain = Arc::clone(&chain);
+            async move {
+                let _ = entered.send(());
+                chain.process(MIDDLEWARE_RECOVERY_STAGE, &trapping).await
+            }
+        });
+        has_entered.await.unwrap();
+        // `MiddlewareChain::process` copies the envelope before it takes the
+        // store lock, so the trapping caller carries a four-megabyte copy (well
+        // under a millisecond) that the healthy caller does not. The delay only
+        // has to cover that copy: landing late is harmless, because a waiter
+        // that arrives after the trap has already been recorded still finds the
+        // adapter dead and still performs exactly one rebuild.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let healthy_call = tokio::spawn({
+            let chain = Arc::clone(&chain);
+            async move { chain.process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#).await }
+        });
+
+        let trapped = trapping_call.await.unwrap();
+        let healthy = healthy_call.await.unwrap();
+        assert!(
+            !trapped.contains("middleware_probe"),
+            "the oversized envelope must trap"
+        );
+        assert_eq!(
+            transformed_middleware_text(&healthy).as_deref(),
+            Some("[wasm-middleware] hello"),
+            "the queued waiter must run against a live store: {healthy}"
+        );
+
+        let adapter = middleware_adapter_status(&runtime);
+        assert_eq!(
+            adapter_counter(&adapter, "failure_count"),
+            1,
+            "only the trapping caller may record a failure: {adapter}"
+        );
+        // Exactly one: the waiter found the store dead and rebuilt it. Zero
+        // would mean the healthy caller won the lock and nothing ever queued,
+        // which is the ordering this test exists to rule out.
+        assert_eq!(
+            adapter_counter(&adapter, "restart_count"),
+            1,
+            "the waiter must have queued behind the trapping caller and rebuilt once: {adapter}"
+        );
+        assert!(
+            !adapter_text(&adapter, "last_error").contains("cannot enter component instance"),
+            "{adapter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_skips_a_payload_that_cannot_fit_the_guest() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(temp.path(), GUARDED_MIDDLEWARE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let oversize = oversized_middleware_envelope();
+        let passed_through = runtime.middleware().process(MIDDLEWARE_RECOVERY_STAGE, &oversize).await;
+        assert_eq!(passed_through, oversize, "an over-cap payload passes through unchanged");
+
+        let adapter = middleware_adapter_status(&runtime);
+        assert_eq!(adapter_counter(&adapter, "skipped_oversize"), 1, "{adapter}");
+        assert_eq!(
+            adapter_counter(&adapter, "skipped_quarantined"),
+            0,
+            "an oversize skip is not a quarantine: {adapter}"
+        );
+        assert_eq!(
+            adapter_counter(&adapter, "failure_count"),
+            0,
+            "an over-cap payload must never reach the guest: {adapter}"
+        );
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter.get("last_error"), Some(&serde_json::Value::Null), "{adapter}");
+
+        let next = runtime
+            .middleware()
+            .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+            .await;
+        assert_eq!(
+            transformed_middleware_text(&next).as_deref(),
+            Some("[wasm-middleware] hello"),
+            "{next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(
+            temp.path(),
+            &format!("max_fuel = {ONE_CALL_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        for call in 1..=3 {
+            let output = runtime
+                .middleware()
+                .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+                .await;
+            assert_eq!(
+                transformed_middleware_text(&output).as_deref(),
+                Some("[wasm-middleware] hello"),
+                "call {call} exhausted a store-lifetime fuel budget: {output}"
+            );
+        }
+
+        let adapter = middleware_adapter_status(&runtime);
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+    }
+
+    /// Install `fixture/plugin.wasm` under `plugins/<name>` with a test-written
+    /// manifest, so a committed component can be driven into a trap by its
+    /// `[resources]` table alone.
+    fn install_fixture_with_manifest(workspace: &Path, name: &str, fixture: &str, manifest: &str) {
+        let plugin_dir = workspace.join("plugins").join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        std::fs::copy(source.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+        std::fs::write(plugin_dir.join("plugin.toml"), manifest).unwrap();
+    }
+
+    /// `adapter_key` of `wasm_plugins_status`, which is where operators and the
+    /// model read adapter health.
+    async fn status_adapters(runtime: &Arc<PluginRuntime>, adapter_key: &str) -> Vec<serde_json::Value> {
+        let status = runtime.status_tool().execute(serde_json::json!({})).await.unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
+        status
+            .get(adapter_key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| panic!("wasm_plugins_status must publish '{adapter_key}': {status}"))
+    }
+
+    async fn single_status_adapter(runtime: &Arc<PluginRuntime>, adapter_key: &str) -> serde_json::Value {
+        let mut adapters = status_adapters(runtime, adapter_key).await;
+        assert_eq!(adapters.len(), 1, "{adapters:?}");
+        adapters.remove(0)
+    }
+
+    fn voice_tool_manifest(resources: &str) -> String {
+        format!(
+            r#"[plugin]
+name = "voice-talk-realtime"
+version = "0.1.0"
+description = "tool recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "voice_session"
+
+[permissions]
+required = ["log", "config", "kv"]
+optional = []
+
+[resources]
+{resources}
+"#
+        )
+    }
+
+    fn install_voice_tool(workspace: &Path, resources: &str) {
+        install_fixture_with_manifest(
+            workspace,
+            "voice-talk-realtime",
+            "plugins/voice-talk-realtime",
+            &voice_tool_manifest(resources),
+        );
+    }
+
+    /// The guest parses its arguments into a DOM and echoes `instructions`
+    /// into its result, so four megabytes of instructions cannot fit an 8 MB
+    /// linear memory. `max_payload_bytes` keeps the call past the host-side
+    /// guard so the trap stays the subject of the test.
+    const TRAPPING_TOOL_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608";
+
+    /// Same guest memory, host-side guard at its derived default (1 MiB here).
+    const GUARDED_TOOL_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000";
+
+    fn trapping_tool_args() -> serde_json::Value {
+        serde_json::json!({"provider": "openai", "instructions": "x".repeat(4 * 1024 * 1024)})
+    }
+
+    async fn call_voice_tool(runtime: &Arc<PluginRuntime>, args: serde_json::Value) -> ToolResult {
+        runtime
+            .tool_router()
+            .execute_named("voice_session", args)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_voice_tool_healthy(runtime: &Arc<PluginRuntime>, context: &str) {
+        let result = call_voice_tool(runtime, serde_json::json!({"provider": "openai"})).await;
+        assert!(result.success, "{context}: {:?}", result.error);
+        assert!(
+            result.output.contains("wss://api.openai.com"),
+            "{context}: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_recovers_on_a_fresh_store_after_a_guest_trap() {
+        let temp = TempDir::new().unwrap();
+        install_voice_tool(temp.path(), TRAPPING_TOOL_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        assert_voice_tool_healthy(&runtime, "before the trap").await;
+
+        let trapped = call_voice_tool(&runtime, trapping_tool_args()).await;
+        assert!(!trapped.success, "four megabytes of instructions must trap the guest");
+
+        assert_voice_tool_healthy(&runtime, "the call after the trap").await;
+
+        let adapter = single_status_adapter(&runtime, "tool_adapters").await;
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_text(&adapter, "tool"), "voice_session", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 1, "{adapter}");
+        assert!(
+            !adapter_text(&adapter, "last_error").contains("cannot enter component instance"),
+            "the recorded reason must be the trap, not a re-entry refusal: {adapter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_quarantines_after_the_restart_budget_is_spent() {
+        let temp = TempDir::new().unwrap();
+        install_voice_tool(temp.path(), TRAPPING_TOOL_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let (_, mut quarantined_events) = runtime
+            .event_bus()
+            .subscribe("tool-recovery-test", "prx.plugin.tool_quarantined")
+            .await
+            .unwrap();
+
+        for call in 1..=5 {
+            let result = call_voice_tool(&runtime, trapping_tool_args()).await;
+            assert!(!result.success, "trapping call {call} must fail, never report success");
+        }
+
+        let adapter = single_status_adapter(&runtime, "tool_adapters").await;
+        assert_eq!(adapter_text(&adapter, "state"), "quarantined", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 3, "{adapter}");
+        let skipped = adapter_counter(&adapter, "skipped_quarantined");
+
+        let refused = call_voice_tool(&runtime, serde_json::json!({"provider": "openai"})).await;
+        assert!(!refused.success, "a quarantined tool must return a tool error");
+        assert!(
+            refused.error.as_deref().unwrap_or_default().contains("quarantined"),
+            "{refused:?}"
+        );
+        let after = single_status_adapter(&runtime, "tool_adapters").await;
+        assert_eq!(adapter_counter(&after, "skipped_quarantined"), skipped + 1, "{after}");
+
+        let event = quarantined_events
+            .try_recv()
+            .expect("test: one quarantine event must have been published");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            payload.get("capability").and_then(serde_json::Value::as_str),
+            Some("tool")
+        );
+        assert_eq!(
+            payload.get("plugin").and_then(serde_json::Value::as_str),
+            Some("voice-talk-realtime")
+        );
+
+        assert!(
+            runtime.tool_router().supports_name("voice_session"),
+            "a quarantined tool stays listed so the model is told why it fails"
+        );
+        assert_ne!(
+            runtime.tool_router().availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy
+        );
+        assert_ne!(
+            runtime.status_tool().availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_refuses_arguments_that_cannot_fit_the_guest() {
+        let temp = TempDir::new().unwrap();
+        install_voice_tool(temp.path(), GUARDED_TOOL_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let refused = call_voice_tool(&runtime, trapping_tool_args()).await;
+        assert!(!refused.success, "an over-cap call is a tool error, not a success");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max_payload_bytes"),
+            "{refused:?}"
+        );
+
+        let adapter = single_status_adapter(&runtime, "tool_adapters").await;
+        assert_eq!(adapter_counter(&adapter, "skipped_oversize"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_voice_tool_healthy(&runtime, "the call after an oversize refusal").await;
+    }
+
+    /// Measured against the committed `voice-talk-realtime` component with a
+    /// store-lifetime budget: instantiation plus `get-spec` fits in 100 000
+    /// fuel units with no call left, 150 000 and 200 000 fund exactly one
+    /// `execute`, and each further call costs roughly 50 000. 175 000 sits in
+    /// the middle of the one-call band.
+    const ONE_TOOL_CALL_FUEL: u64 = 175_000;
+
+    #[tokio::test]
+    async fn tool_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_voice_tool(
+            temp.path(),
+            &format!("max_fuel = {ONE_TOOL_CALL_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        for call in 1..=3 {
+            assert_voice_tool_healthy(&runtime, &format!("call {call} under a per-call fuel budget")).await;
+        }
+    }
+
+    fn audit_hook_manifest(resources: &str) -> String {
+        format!(
+            r#"[plugin]
+name = "audit-hook"
+version = "0.1.0"
+description = "hook recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "hook"
+name = "audit"
+
+[[capabilities.events]]
+pattern = "prx.lifecycle.*"
+
+[permissions]
+required = ["log", "kv", "events"]
+optional = []
+
+[resources]
+{resources}
+"#
+        )
+    }
+
+    /// `audit-hook` needs `events`, which is not auto-granted, so the fixture
+    /// is installed as a managed plugin like the documented-hook test does.
+    fn install_audit_hook(workspace: &Path, resources: &str) {
+        install_fixture_with_manifest(
+            workspace,
+            "audit-hook",
+            "pdk/rust/examples/audit-hook",
+            &audit_hook_manifest(resources),
+        );
+        std::fs::write(workspace.join("plugins/audit-hook/.prx-managed"), "test fixture\n").unwrap();
+    }
+
+    /// The guest JSON-parses the payload of `tool_call` events into a DOM, so
+    /// four megabytes of payload cannot fit an 8 MB linear memory.
+    /// `max_payload_bytes` keeps the delivery past the host-side guard.
+    const TRAPPING_HOOK_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608";
+
+    const GUARDED_HOOK_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000";
+
+    const TRAPPING_HOOK_EVENT: &str = "prx.lifecycle.tool_call";
+    const HEALTHY_HOOK_EVENT: &str = "prx.lifecycle.turn_complete";
+
+    fn trapping_hook_payload() -> String {
+        serde_json::json!({"tool": "shell", "filler": "x".repeat(4 * 1024 * 1024)}).to_string()
+    }
+
+    #[tokio::test]
+    async fn hook_recovers_on_a_fresh_store_after_a_guest_trap() {
+        let temp = TempDir::new().unwrap();
+        install_audit_hook(temp.path(), TRAPPING_HOOK_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        runtime.emit_hook(TRAPPING_HOOK_EVENT, &trapping_hook_payload()).await;
+        runtime
+            .emit_hook(HEALTHY_HOOK_EVENT, r#"{"source":"recovery-test"}"#)
+            .await;
+
+        let adapter = single_status_adapter(&runtime, "hook_adapters").await;
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "invocation_count"), 2, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 1, "{adapter}");
+        assert_eq!(
+            adapter_counter(&adapter, "failure_count"),
+            1,
+            "only the trapping delivery may fail: {adapter}"
+        );
+        assert!(
+            !adapter_text(&adapter, "last_error").contains("cannot enter component instance"),
+            "the recorded reason must be the trap, not a re-entry refusal: {adapter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_quarantines_after_the_restart_budget_is_spent() {
+        let temp = TempDir::new().unwrap();
+        install_audit_hook(temp.path(), TRAPPING_HOOK_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let (_, mut quarantined_events) = runtime
+            .event_bus()
+            .subscribe("hook-recovery-test", "prx.plugin.hook_quarantined")
+            .await
+            .unwrap();
+
+        let payload = trapping_hook_payload();
+        for _ in 0..5 {
+            runtime.emit_hook(TRAPPING_HOOK_EVENT, &payload).await;
+        }
+
+        let adapter = single_status_adapter(&runtime, "hook_adapters").await;
+        assert_eq!(adapter_text(&adapter, "state"), "quarantined", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 3, "{adapter}");
+        let skipped = adapter_counter(&adapter, "skipped_quarantined");
+
+        runtime.emit_hook(HEALTHY_HOOK_EVENT, "{}").await;
+        let after = single_status_adapter(&runtime, "hook_adapters").await;
+        assert_eq!(adapter_counter(&after, "skipped_quarantined"), skipped + 1, "{after}");
+
+        let event = quarantined_events
+            .try_recv()
+            .expect("test: one quarantine event must have been published");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            payload.get("capability").and_then(serde_json::Value::as_str),
+            Some("hook")
+        );
+        assert_ne!(
+            runtime.status_tool().availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_skips_a_payload_that_cannot_fit_the_guest() {
+        let temp = TempDir::new().unwrap();
+        install_audit_hook(temp.path(), GUARDED_HOOK_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        runtime.emit_hook(TRAPPING_HOOK_EVENT, &trapping_hook_payload()).await;
+        let adapter = single_status_adapter(&runtime, "hook_adapters").await;
+        assert_eq!(adapter_counter(&adapter, "skipped_oversize"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+
+        runtime.emit_hook(HEALTHY_HOOK_EVENT, "{}").await;
+        let after = single_status_adapter(&runtime, "hook_adapters").await;
+        assert_eq!(adapter_text(&after, "state"), "live", "{after}");
+        assert_eq!(adapter_counter(&after, "failure_count"), 0, "{after}");
+        assert_eq!(
+            after.get("last_event").and_then(serde_json::Value::as_str),
+            Some(HEALTHY_HOOK_EVENT),
+            "{after}"
+        );
+    }
+
+    /// Measured against the committed `audit-hook` component with a
+    /// store-lifetime budget: instantiation costs roughly 40 000 fuel units and
+    /// one delivery roughly 5 000, so 50 000 funds exactly two deliveries.
+    const TWO_HOOK_DELIVERIES_FUEL: u64 = 50_000;
+
+    #[tokio::test]
+    async fn hook_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_audit_hook(
+            temp.path(),
+            &format!("max_fuel = {TWO_HOOK_DELIVERIES_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        for delivery in 1..=4 {
+            runtime.emit_hook(HEALTHY_HOOK_EVENT, "{}").await;
+            let hook = runtime.hook_diagnostics().remove(0);
+            assert!(
+                hook.last_error.is_none(),
+                "delivery {delivery} exhausted a store-lifetime fuel budget: {:?}",
+                hook.last_error
+            );
+        }
+    }
+
+    /// Once a year, at midnight on 1 January: never due while a test runs, so
+    /// the runtime's own scheduler cannot take a run from under the test.
+    const QUIET_CRON_SCHEDULE: &str = "0 0 0 1 1 *";
+
+    fn counter_cron_manifest(resources: &str) -> String {
+        let schedule = QUIET_CRON_SCHEDULE;
+        format!(
+            r#"[plugin]
+name = "counter-cron"
+version = "0.1.0"
+description = "cron recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "cron"
+name = "counter"
+schedule = "{schedule}"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+{resources}
+"#
+        )
+    }
+
+    fn install_counter_cron(workspace: &Path, resources: &str) {
+        install_fixture_with_manifest(
+            workspace,
+            "counter-cron",
+            "pdk/rust/examples/counter-cron",
+            &counter_cron_manifest(resources),
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_status_publishes_recovery_health() {
+        let temp = TempDir::new().unwrap();
+        install_counter_cron(
+            temp.path(),
+            "max_fuel = 1000000000\nmax_memory_mb = 8\nmax_execution_time_ms = 30000",
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        assert_eq!(
+            runtime.cron().run_job("counter-cron").await.unwrap(),
+            "counter-cron-run-1"
+        );
+
+        let adapter = single_status_adapter(&runtime, "cron_adapters").await;
+        assert_eq!(adapter_text(&adapter, "schedule"), QUIET_CRON_SCHEDULE, "{adapter}");
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+    }
+
+    /// Measured against the committed `counter-cron` component with a
+    /// store-lifetime budget: 16 000 fuel units cannot instantiate it, 17 000
+    /// instantiates it with no run left, and each run costs roughly 1 000, so
+    /// 18 500 funds at most two runs.
+    const FEW_CRON_RUNS_FUEL: u64 = 18_500;
+
+    #[tokio::test]
+    async fn cron_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_counter_cron(
+            temp.path(),
+            &format!("max_fuel = {FEW_CRON_RUNS_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        for run in 1..=4 {
+            let output = runtime.cron().run_job("counter-cron").await;
+            assert_eq!(
+                output.as_deref().ok(),
+                Some(format!("counter-cron-run-{run}").as_str()),
+                "run {run} exhausted a store-lifetime fuel budget: {output:?}"
+            );
+        }
+    }
+
+    fn echo_provider_manifest(resources: &str) -> String {
+        format!(
+            r#"[plugin]
+name = "echo-provider"
+version = "0.1.0"
+description = "provider recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "provider"
+name = "wasm-echo"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+{resources}
+"#
+        )
+    }
+
+    fn install_echo_provider(workspace: &Path, resources: &str) {
+        install_fixture_with_manifest(
+            workspace,
+            "echo-provider",
+            "pdk/rust/examples/echo-provider",
+            &echo_provider_manifest(resources),
+        );
+    }
+
+    /// The guest copies the last user message into its reply, so four
+    /// megabytes of message (argument copy plus formatted reply) cannot fit
+    /// an 8 MB linear memory. `max_payload_bytes` keeps the request past the
+    /// host-side guard so the trap stays the subject of the test.
+    const TRAPPING_PROVIDER_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608";
+
+    const GUARDED_PROVIDER_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000";
+
+    fn trapping_provider_message() -> String {
+        "x".repeat(4 * 1024 * 1024)
+    }
+
+    async fn echo_chat(
+        provider: &dyn crate::providers::traits::Provider,
+        message: &str,
+    ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
+        provider
+            .chat(
+                crate::providers::traits::ChatRequest {
+                    messages: &[crate::providers::traits::ChatMessage::user(message)],
+                    tools: None,
+                },
+                "fixture-model",
+                0.0,
+            )
+            .await
+    }
+
+    async fn assert_echo_healthy(provider: &dyn crate::providers::traits::Provider, context: &str) {
+        let response = echo_chat(provider, "probe")
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(
+            response.text.as_deref(),
+            Some("wasm-echo/fixture-model: probe"),
+            "{context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_recovers_on_a_fresh_store_after_a_guest_trap() {
+        let temp = TempDir::new().unwrap();
+        install_echo_provider(temp.path(), TRAPPING_PROVIDER_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let provider = runtime.provider("wasm-echo").unwrap();
+
+        let trapped = echo_chat(provider.as_ref(), &trapping_provider_message()).await;
+        assert!(trapped.is_err(), "the oversized request must trap and surface an error");
+        assert_echo_healthy(provider.as_ref(), "the request after the trap").await;
+
+        let adapter = single_status_adapter(&runtime, "provider_adapter_status").await;
+        assert_eq!(adapter_text(&adapter, "provider"), "wasm-echo", "{adapter}");
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 1, "{adapter}");
+        assert!(
+            !adapter_text(&adapter, "last_error").contains("cannot enter component instance"),
+            "{adapter}"
+        );
+        assert_eq!(
+            runtime.provider_names(),
+            vec!["wasm-echo"],
+            "the name list is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_quarantines_after_the_restart_budget_is_spent() {
+        let temp = TempDir::new().unwrap();
+        install_echo_provider(temp.path(), TRAPPING_PROVIDER_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let (_, mut quarantined_events) = runtime
+            .event_bus()
+            .subscribe("provider-recovery-test", "prx.plugin.provider_quarantined")
+            .await
+            .unwrap();
+        let provider = runtime.provider("wasm-echo").unwrap();
+
+        let message = trapping_provider_message();
+        for request in 1..=5 {
+            assert!(
+                echo_chat(provider.as_ref(), &message).await.is_err(),
+                "trapping request {request} must surface an error, never a response"
+            );
+        }
+
+        let adapter = single_status_adapter(&runtime, "provider_adapter_status").await;
+        assert_eq!(adapter_text(&adapter, "state"), "quarantined", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 3, "{adapter}");
+
+        let refused = echo_chat(provider.as_ref(), "probe").await;
+        let error = refused.expect_err("a quarantined provider must return an error");
+        assert!(error.to_string().contains("quarantined"), "{error}");
+
+        let event = quarantined_events
+            .try_recv()
+            .expect("test: one quarantine event must have been published");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            payload.get("capability").and_then(serde_json::Value::as_str),
+            Some("provider")
+        );
+        assert_ne!(
+            runtime.status_tool().availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_refuses_a_request_that_cannot_fit_the_guest() {
+        let temp = TempDir::new().unwrap();
+        install_echo_provider(temp.path(), GUARDED_PROVIDER_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let provider = runtime.provider("wasm-echo").unwrap();
+
+        let error = echo_chat(provider.as_ref(), &trapping_provider_message())
+            .await
+            .expect_err("an over-cap request is an error, never a truncated response");
+        assert!(error.to_string().contains("max_payload_bytes"), "{error}");
+
+        let adapter = single_status_adapter(&runtime, "provider_adapter_status").await;
+        assert_eq!(adapter_counter(&adapter, "skipped_oversize"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_echo_healthy(provider.as_ref(), "the request after an oversize refusal").await;
+    }
+
+    /// Measured against the committed `echo-provider` component with a
+    /// store-lifetime budget: 20 000 fuel units instantiate it and answer
+    /// `name()` with no chat left, 30 000 fund four chats and 40 000 six, so
+    /// 25 000 cannot fund six chats unless fuel is re-armed per call.
+    const FEW_PROVIDER_CHATS_FUEL: u64 = 25_000;
+
+    #[tokio::test]
+    async fn provider_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_echo_provider(
+            temp.path(),
+            &format!("max_fuel = {FEW_PROVIDER_CHATS_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let provider = runtime.provider("wasm-echo").unwrap();
+        for chat in 1..=6 {
+            assert_echo_healthy(provider.as_ref(), &format!("chat {chat} under a per-call fuel budget")).await;
+        }
+    }
+
+    fn map_storage_manifest(resources: &str) -> String {
+        format!(
+            r#"[plugin]
+name = "map-storage"
+version = "0.1.0"
+description = "storage recovery regression fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "storage"
+name = "wasm-map"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+{resources}
+"#
+        )
+    }
+
+    fn install_map_storage(workspace: &Path, resources: &str) {
+        install_fixture_with_manifest(
+            workspace,
+            "map-storage",
+            "pdk/rust/examples/map-storage",
+            &map_storage_manifest(resources),
+        );
+    }
+
+    /// The guest keeps every entry in its own linear memory, so a few
+    /// four-megabyte entries cannot fit an 8 MB guest. `max_payload_bytes`
+    /// keeps the writes past the host-side guard.
+    const TRAPPING_STORAGE_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+max_payload_bytes = 8388608";
+
+    const GUARDED_STORAGE_RESOURCES: &str = "max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000";
+
+    fn large_memory_content() -> String {
+        "x".repeat(4 * 1024 * 1024)
+    }
+
+    async fn store_entry(storage: &Arc<dyn Memory>, key: &str, content: &str) -> anyhow::Result<()> {
+        storage
+            .store(key, content, crate::memory::traits::MemoryCategory::Core, None)
+            .await
+    }
+
+    /// Write large entries until the guest traps; returns the key whose write
+    /// failed.
+    async fn store_until_trap(storage: &Arc<dyn Memory>, prefix: &str) -> String {
+        let content = large_memory_content();
+        for attempt in 1..=4 {
+            let key = format!("{prefix}-{attempt}");
+            if store_entry(storage, &key, &content).await.is_err() {
+                return key;
+            }
+        }
+        panic!("four-megabyte entries must exhaust an 8 MB guest within four writes");
+    }
+
+    #[tokio::test]
+    async fn storage_recovers_on_a_fresh_store_and_announces_the_reset() {
+        let temp = TempDir::new().unwrap();
+        install_map_storage(temp.path(), TRAPPING_STORAGE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let (_, mut restarted_events) = runtime
+            .event_bus()
+            .subscribe("storage-recovery-test", "prx.plugin.storage_restarted")
+            .await
+            .unwrap();
+        let storage = runtime.storage("wasm-map").unwrap();
+
+        store_entry(&storage, "before", "kept in guest memory").await.unwrap();
+        let failed_key = store_until_trap(&storage, "large").await;
+
+        store_entry(&storage, "after", "written after the rebuild")
+            .await
+            .expect("test: the write after the trap runs on a fresh store");
+        assert!(
+            storage.get(&failed_key).await.unwrap().is_none(),
+            "a write that failed must not be reported present"
+        );
+        assert_eq!(
+            storage.count().await.unwrap(),
+            1,
+            "the rebuilt guest starts empty: only the post-rebuild entry exists"
+        );
+        assert!(storage.health_check().await);
+
+        let adapter = single_status_adapter(&runtime, "storage_adapter_status").await;
+        assert_eq!(adapter_text(&adapter, "storage"), "wasm-map", "{adapter}");
+        assert_eq!(adapter_text(&adapter, "state"), "live", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 1, "{adapter}");
+        assert!(
+            !adapter_text(&adapter, "last_error").contains("cannot enter component instance"),
+            "{adapter}"
+        );
+        assert_eq!(runtime.storage_names(), vec!["wasm-map"], "the name list is unchanged");
+
+        let event = restarted_events
+            .try_recv()
+            .expect("test: a storage rebuild must be announced");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            payload.get("capability").and_then(serde_json::Value::as_str),
+            Some("storage")
+        );
+        assert_eq!(
+            payload.get("restart_count").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_quarantines_after_the_restart_budget_is_spent() {
+        let temp = TempDir::new().unwrap();
+        install_map_storage(temp.path(), TRAPPING_STORAGE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let (_, mut quarantined_events) = runtime
+            .event_bus()
+            .subscribe("storage-recovery-test", "prx.plugin.storage_quarantined")
+            .await
+            .unwrap();
+        let storage = runtime.storage("wasm-map").unwrap();
+
+        for round in 1..=4 {
+            store_until_trap(&storage, &format!("round-{round}")).await;
+        }
+
+        // The first call after the fourth trap finds the budget spent and
+        // quarantines the backend; every operation is refused from then on.
+        for (operation, failed) in [
+            ("store", store_entry(&storage, "refused", "x").await.is_err()),
+            ("recall", storage.recall("", 10, None).await.is_err()),
+            ("count", storage.count().await.is_err()),
+            ("forget", storage.forget("refused").await.is_err()),
+        ] {
+            assert!(failed, "a quarantined backend must fail '{operation}', never answer it");
+        }
+        assert!(!storage.health_check().await, "a quarantined backend is not healthy");
+
+        let adapter = single_status_adapter(&runtime, "storage_adapter_status").await;
+        assert_eq!(adapter_text(&adapter, "state"), "quarantined", "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 3, "{adapter}");
+
+        let event = quarantined_events
+            .try_recv()
+            .expect("test: one quarantine event must have been published");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            payload.get("capability").and_then(serde_json::Value::as_str),
+            Some("storage")
+        );
+        assert_ne!(
+            runtime.status_tool().availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_refuses_a_write_that_cannot_fit_the_guest() {
+        let temp = TempDir::new().unwrap();
+        install_map_storage(temp.path(), GUARDED_STORAGE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let storage = runtime.storage("wasm-map").unwrap();
+
+        store_entry(&storage, "small", "fits").await.unwrap();
+        let error = store_entry(&storage, "large", &large_memory_content())
+            .await
+            .expect_err("an over-cap write is an error, never a silent drop");
+        assert!(error.to_string().contains("max_payload_bytes"), "{error}");
+
+        let adapter = single_status_adapter(&runtime, "storage_adapter_status").await;
+        assert_eq!(adapter_counter(&adapter, "skipped_oversize"), 1, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "failure_count"), 0, "{adapter}");
+        assert_eq!(adapter_counter(&adapter, "restart_count"), 0, "{adapter}");
+        assert_eq!(storage.count().await.unwrap(), 1, "the earlier entry is intact");
+    }
+
+    /// Measured against the committed `map-storage` component with a
+    /// store-lifetime budget: 10 000 fuel units cannot instantiate it and
+    /// answer `name()`, 20 000 fund three writes and 30 000 six, so 20 000
+    /// cannot fund six writes unless fuel is re-armed per call.
+    const FEW_STORAGE_WRITES_FUEL: u64 = 20_000;
+
+    #[tokio::test]
+    async fn storage_fuel_is_metered_per_invocation() {
+        let temp = TempDir::new().unwrap();
+        install_map_storage(
+            temp.path(),
+            &format!("max_fuel = {FEW_STORAGE_WRITES_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let storage = runtime.storage("wasm-map").unwrap();
+        for write in 1..=6 {
+            store_entry(&storage, &format!("entry-{write}"), "value")
+                .await
+                .unwrap_or_else(|error| panic!("write {write} exhausted a store-lifetime fuel budget: {error}"));
+        }
+        assert_eq!(storage.count().await.unwrap(), 6);
+    }
+
+    /// R-C3X F4: the operation that rebuilds a storage backend runs against a
+    /// fresh, empty guest. A read answering from it would look like "no
+    /// memories" to the memory layer, so the first read after a rebuild is an
+    /// error naming the reset; the next read answers from the rebuilt store.
+    #[tokio::test]
+    async fn storage_reports_its_reset_on_the_first_read_after_a_rebuild() {
+        let temp = TempDir::new().unwrap();
+        install_map_storage(temp.path(), TRAPPING_STORAGE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let storage = runtime.storage("wasm-map").unwrap();
+
+        store_entry(&storage, "before", "kept in guest memory").await.unwrap();
+        store_until_trap(&storage, "large").await;
+
+        let first = storage.count().await;
+        let error = first.expect_err("the read that rebuilt the backend must not answer from the empty store");
+        assert!(error.to_string().contains("rebuilt"), "{error}");
+        assert_eq!(
+            storage.count().await.unwrap(),
+            0,
+            "the next read answers from the rebuilt, empty store"
+        );
+    }
+
+    /// R-C3X F8: provider and storage failures reach callers as `anyhow`
+    /// errors. They must keep their `PluginError` so the reliability layer can
+    /// tell a quarantine, a timeout or a refused payload apart by type, not by
+    /// matching message text.
+    #[tokio::test]
+    async fn provider_and_storage_errors_keep_their_plugin_error_type() {
+        let temp = TempDir::new().unwrap();
+        install_echo_provider(temp.path(), GUARDED_PROVIDER_RESOURCES);
+        install_map_storage(temp.path(), GUARDED_STORAGE_RESOURCES);
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+
+        let provider = runtime.provider("wasm-echo").unwrap();
+        let error = echo_chat(provider.as_ref(), &trapping_provider_message())
+            .await
+            .expect_err("test: an over-cap request is refused");
+        assert!(
+            matches!(error.downcast_ref::<PluginError>(), Some(PluginError::ResourceLimit(_))),
+            "{error:?}"
+        );
+
+        let storage = runtime.storage("wasm-map").unwrap();
+        let error = store_entry(&storage, "large", &large_memory_content())
+            .await
+            .expect_err("test: an over-cap write is refused");
+        assert!(
+            matches!(error.downcast_ref::<PluginError>(), Some(PluginError::ResourceLimit(_))),
+            "{error:?}"
+        );
     }
 }

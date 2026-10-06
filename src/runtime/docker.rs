@@ -1,6 +1,7 @@
 use super::traits::RuntimeAdapter;
 use crate::config::DockerRuntimeConfig;
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Docker runtime with lightweight container isolation.
@@ -48,6 +49,63 @@ impl DockerRuntime {
 
         Ok(resolved)
     }
+
+    fn build_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> Result<tokio::process::Command> {
+        let mut process = tokio::process::Command::new("docker");
+        process.arg("run").arg("--rm").arg("--init").arg("--interactive");
+
+        let network = self.config.network.trim();
+        if !network.is_empty() {
+            process.arg("--network").arg(network);
+        }
+
+        if let Some(memory_limit_mb) = self.config.memory_limit_mb.filter(|mb| *mb > 0) {
+            process.arg("--memory").arg(format!("{memory_limit_mb}m"));
+        }
+
+        if let Some(cpu_limit) = self.config.cpu_limit.filter(|cpus| *cpus > 0.0) {
+            process.arg("--cpus").arg(cpu_limit.to_string());
+        }
+
+        if self.config.read_only_rootfs {
+            process.arg("--read-only");
+        }
+
+        if self.config.mount_workspace {
+            let host_workspace = self
+                .workspace_mount_path(workspace_dir)
+                .with_context(|| format!("Failed to validate workspace mount path {}", workspace_dir.display()))?;
+
+            process
+                .arg("--volume")
+                .arg(format!("{}:/workspace:rw", host_workspace.display()))
+                .arg("--workdir")
+                .arg("/workspace");
+        }
+
+        for (key, value) in environment {
+            let name = key.to_str().filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            });
+            let Some(name) = name else {
+                anyhow::bail!("Docker shell environment key must be an uppercase ASCII name");
+            };
+            // A bare name makes Docker copy the value from its client's
+            // environment, so values never appear in process arguments.
+            process.arg("--env").arg(name).env(key, value);
+        }
+        process.arg(self.config.image.trim()).arg("sh").arg("-c").arg(command);
+        process.kill_on_drop(true);
+        Ok(process)
+    }
 }
 
 impl RuntimeAdapter for DockerRuntime {
@@ -82,42 +140,16 @@ impl RuntimeAdapter for DockerRuntime {
     }
 
     fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("docker");
-        process.arg("run").arg("--rm").arg("--init").arg("--interactive");
+        self.build_command(command, workspace_dir, &[])
+    }
 
-        let network = self.config.network.trim();
-        if !network.is_empty() {
-            process.arg("--network").arg(network);
-        }
-
-        if let Some(memory_limit_mb) = self.config.memory_limit_mb.filter(|mb| *mb > 0) {
-            process.arg("--memory").arg(format!("{memory_limit_mb}m"));
-        }
-
-        if let Some(cpu_limit) = self.config.cpu_limit.filter(|cpus| *cpus > 0.0) {
-            process.arg("--cpus").arg(cpu_limit.to_string());
-        }
-
-        if self.config.read_only_rootfs {
-            process.arg("--read-only");
-        }
-
-        if self.config.mount_workspace {
-            let host_workspace = self
-                .workspace_mount_path(workspace_dir)
-                .with_context(|| format!("Failed to validate workspace mount path {}", workspace_dir.display()))?;
-
-            process
-                .arg("--volume")
-                .arg(format!("{}:/workspace:rw", host_workspace.display()))
-                .arg("--workdir")
-                .arg("/workspace");
-        }
-
-        process.arg(self.config.image.trim()).arg("sh").arg("-c").arg(command);
-        process.kill_on_drop(true);
-
-        Ok(process)
+    fn build_shell_command_with_env(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_command(command, workspace_dir, environment)
     }
 }
 
@@ -244,5 +276,41 @@ mod tests {
             !debug.contains("--memory"),
             "should not include --memory when not configured"
         );
+    }
+
+    #[test]
+    fn docker_forwards_git_hardening_into_the_container_without_argument_values() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let environment = vec![
+            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_KEY_0"), OsString::from("core.hooksPath")),
+            (OsString::from("GIT_CONFIG_VALUE_0"), OsString::from("/dev/null")),
+            (OsString::from("GIT_NO_LAZY_FETCH"), OsString::from("1")),
+        ];
+        let command = runtime
+            .build_shell_command_with_env("git status", &std::env::temp_dir(), &environment)
+            .expect("test: docker command");
+        let arguments = command.as_std().get_args().collect::<Vec<_>>();
+        for (key, value) in &environment {
+            assert!(
+                arguments.windows(2).any(|pair| pair
+                    .iter()
+                    .copied()
+                    .eq([std::ffi::OsStr::new("--env"), key.as_os_str()])),
+                "the container needs each Git environment variable"
+            );
+            if value != "1" {
+                assert!(
+                    !arguments.iter().any(|argument| *argument == value),
+                    "environment values must not appear in Docker arguments"
+                );
+            }
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, passed)| name == key && passed == Some(value.as_os_str()))
+            );
+        }
     }
 }

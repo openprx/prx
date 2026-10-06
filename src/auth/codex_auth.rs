@@ -1,12 +1,14 @@
 use crate::auth::openai_oauth::extract_expiry_from_jwt;
 use crate::auth::profiles::TokenSet;
 use anyhow::{Context, Result};
-use directories::UserDirs;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_CODEX_AUTH_JSON: &str = ".codex/auth.json";
+/// The default Codex `auth.json`, relative to the home directory. It is
+/// stored in this form (never the expanded absolute path, CONSOLE-OBS-2) and
+/// expanded when the file is read.
+const DEFAULT_CODEX_AUTH_JSON: &str = "~/.codex/auth.json";
 
 #[derive(Debug, Clone)]
 pub struct ImportedOpenAiCodexProfile {
@@ -28,15 +30,15 @@ struct CodexAuthTokens {
     account_id: String,
 }
 
+/// The default `auth.codex_auth_json_path`: `~/.codex/auth.json`, unexpanded,
+/// so a saved configuration names no user's home directory. Every reader
+/// expands it with [`expand_codex_auth_json_path`].
 pub fn default_codex_auth_json_path() -> PathBuf {
-    UserDirs::new().map_or_else(
-        || PathBuf::from(DEFAULT_CODEX_AUTH_JSON),
-        |dirs| dirs.home_dir().join(DEFAULT_CODEX_AUTH_JSON),
-    )
+    PathBuf::from(DEFAULT_CODEX_AUTH_JSON)
 }
 
 pub fn expand_codex_auth_json_path(path: &Path) -> PathBuf {
-    PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned())
+    crate::config::expand_home(path)
 }
 
 pub fn load_openai_codex_profile_from_auth_json(path: &Path) -> Result<ImportedOpenAiCodexProfile> {
@@ -195,5 +197,17 @@ mod tests {
             imported.token_set.expires_at.map(|ts| ts.timestamp()),
             Some(1_900_000_123)
         );
+    }
+
+    /// CONSOLE-OBS-2: the default is stored unexpanded and read expanded.
+    #[test]
+    fn the_default_path_is_home_relative_and_expanded_when_read() {
+        let default = default_codex_auth_json_path();
+        assert_eq!(default, PathBuf::from("~/.codex/auth.json"));
+        let expanded = expand_codex_auth_json_path(&default);
+        assert!(expanded.ends_with(".codex/auth.json"), "{}", expanded.display());
+        if let Some(home) = crate::config::user_home_dir() {
+            assert_eq!(expanded, home.join(".codex/auth.json"));
+        }
     }
 }

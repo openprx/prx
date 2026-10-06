@@ -871,3 +871,696 @@ fn the_sweep_accounts_for_the_whole_static_public_inventory() {
         openprx::tools::STATIC_PUBLIC_TOOL_NAMES.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The no-root-combinator dialect.
+//
+// An endpoint of this class rejects a tool whose schema carries `allOf`,
+// `anyOf` or `oneOf` at the top level. PRX authors exactly those keywords from
+// five shared helpers in `src/tools/schema.rs`, and forwards an MCP server's
+// `inputSchema` verbatim, so the set of affected tools is open-ended and the
+// answer has to be a runtime pass over the compiled surface.
+//
+// The contract asserted here has three halves. Nothing is dropped: every
+// published contract comes back either lowered or refused, and the two sets
+// together account for all of them. A refusal is precise: it names the tool,
+// the keyword, the dialect and a remediation, and the keyword it names really
+// is at the root of that contract. And a lowering is lossless in the direction
+// that matters: it keeps every property and every unconditional requirement
+// the published document had.
+// ---------------------------------------------------------------------------
+
+use openprx::tools::ToolSchemaDialect;
+use openprx::tools::schema::{
+    ActionRequirement, ToolSchemaLoweringError, with_action_alternatives, with_action_exclusive_alternatives,
+    with_action_requirements, with_default_action_requirements, with_required_alternatives,
+};
+use std::borrow::Cow;
+
+/// Published contracts this fixture builds whose root combinator has no
+/// lossless lowering, so a no-root-combinator endpoint is told which tool it
+/// cannot have and why.
+///
+/// Every name here encodes a rule that a single object cannot express: a
+/// requirement conditional on the `action` discriminator, or a choice between
+/// alternative required sets. Merging them would either require every branch's
+/// fields at once or require none of them; both are a different contract from
+/// the published one, and inventing one to obtain an HTTP 200 is what this
+/// refusal exists to prevent.
+///
+/// A name leaving this list means a tool stopped publishing a root combinator.
+/// A name joining it means a tool started publishing one and is now unavailable
+/// on this class of endpoint — a finding either way, never a silent change.
+const REFUSED_UNDER_NO_ROOT_COMBINATORS: &[&str] = &[
+    "chat_profile_update",
+    "composio",
+    "cron",
+    "document_get_chunk",
+    "document_ingest",
+    "gateway",
+    "git_operations",
+    "mcp_call",
+    "memory_get",
+    "nodes",
+    "proxy_config",
+    "skills_manage",
+    "subagents",
+    "xin",
+];
+
+/// The root combinator keywords a contract may publish.
+const ROOT_COMBINATORS: [&str; 3] = ["allOf", "anyOf", "oneOf"];
+
+/// Whether `schema` carries any combinator at its own root.
+fn has_root_combinator(schema: &Value) -> bool {
+    ROOT_COMBINATORS.iter().any(|keyword| schema.get(keyword).is_some())
+}
+
+/// Assert that `error` is actionable on its own: it must name the tool, the
+/// keyword it refused, the dialect that refused it, where the dialect came
+/// from, and what an operator can do about it.
+fn assert_refusal_is_actionable(error: &ToolSchemaLoweringError, tool: &str, schema: &Value) {
+    assert_eq!(error.tool, tool, "a refusal named the wrong tool");
+    assert!(
+        ROOT_COMBINATORS.contains(&error.keyword),
+        "{tool}: refused on '{}', which is not a root combinator",
+        error.keyword
+    );
+    assert!(
+        schema.get(error.keyword).is_some(),
+        "{tool}: refused on '{}', which is not at the root of its published contract",
+        error.keyword
+    );
+    assert!(
+        !error.descriptor_source.is_empty(),
+        "{tool}: a refusal must say where the dialect was declared"
+    );
+    assert!(
+        !error.remediation.is_empty(),
+        "{tool}: a refusal must say what would fix it"
+    );
+    let rendered = error.to_string();
+    for fragment in [tool, error.keyword, "no_root_combinators"] {
+        assert!(
+            rendered.contains(fragment),
+            "{tool}: the rendered refusal does not name '{fragment}': {rendered}"
+        );
+    }
+}
+
+/// Assert that `lowered` kept everything the published document said
+/// unconditionally.
+fn assert_lowering_kept_the_contract(tool: &str, published: &Value, lowered: &Value) {
+    assert!(
+        !has_root_combinator(lowered),
+        "{tool}: the lowered document still carries a root combinator"
+    );
+    if let Some(properties) = published.get("properties").and_then(Value::as_object) {
+        let kept = lowered
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for name in properties.keys() {
+            assert!(kept.contains_key(name), "{tool}: lowering dropped property '{name}'");
+        }
+    }
+    for name in published
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let kept = lowered
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|names| names.iter().any(|value| value.as_str() == Some(name)));
+        assert!(kept, "{tool}: lowering dropped the requirement on '{name}'");
+    }
+    match published.get("type") {
+        Some(published_type) => assert_eq!(
+            Some(published_type),
+            lowered.get("type"),
+            "{tool}: lowering changed the root type"
+        ),
+        // A root that declared no type may only gain the `"object"` a merged
+        // fragment declared; anything else would be a type nobody published.
+        None => assert!(
+            lowered.get("type").is_none_or(|kind| kind == "object"),
+            "{tool}: lowering invented a root type the published contract did not carry"
+        ),
+    }
+    // `additionalProperties` is scoped to the object that carries it. A merge
+    // that unions `properties` and keeps a narrower `additionalProperties` from
+    // some other scope admits members the published contract forbade, and
+    // `enforceable_schema` reruns the same merge — so the enforced document
+    // would be looser than the one that was published.
+    assert_eq!(
+        published.get("additionalProperties"),
+        lowered.get("additionalProperties"),
+        "{tool}: lowering changed the root 'additionalProperties'"
+    );
+}
+
+#[test]
+fn every_published_contract_is_lowered_or_refused_for_a_no_root_combinator_endpoint() {
+    let tmp = TempDir::new().expect("tempdir");
+    let specs = published_contracts(&tmp);
+    assert!(
+        specs.len() >= MINIMUM_PUBLISHED_TOOLS,
+        "only {} tools published; the sweep would be vacuous",
+        specs.len()
+    );
+
+    let mut lowered = Vec::new();
+    let mut refused = Vec::new();
+    for spec in &specs {
+        match ToolSchemaDialect::NoRootCombinators.wire_schema(&spec.public_name, &spec.parameters) {
+            Ok(document) => {
+                assert_lowering_kept_the_contract(&spec.public_name, &spec.parameters, &document);
+                lowered.push(spec.public_name.clone());
+            }
+            Err(error) => {
+                assert_refusal_is_actionable(&error, &spec.public_name, &spec.parameters);
+                refused.push(spec.public_name.clone());
+            }
+        }
+    }
+
+    assert_eq!(
+        lowered.len() + refused.len(),
+        specs.len(),
+        "a published contract was neither lowered nor refused"
+    );
+    refused.sort();
+    assert_eq!(
+        refused,
+        pinned(REFUSED_UNDER_NO_ROOT_COMBINATORS),
+        "the set of tools a no-root-combinator endpoint cannot be offered changed"
+    );
+    println!(
+        "{} of {} published contracts lower for a no-root-combinator endpoint; {} are refused by name",
+        lowered.len(),
+        specs.len(),
+        refused.len()
+    );
+}
+
+/// C2b-1: a request offering the whole published surface is refused once,
+/// naming every refused tool in one diagnostic, with the configuration that
+/// makes the endpoint usable. Before, the conversion stopped at the first
+/// refusal, so an operator found the fourteen tools one run at a time.
+#[test]
+fn one_request_names_every_refused_tool_at_once() {
+    let tmp = TempDir::new().expect("tempdir");
+    let specs = published_contracts(&tmp);
+    let refused = ToolSchemaDialect::NoRootCombinators
+        .lower_all(specs.iter().map(|spec| (spec.public_name.as_str(), &spec.parameters)))
+        .expect_err("the published surface holds refused tools");
+    let mut names = refused.iter().map(|error| error.tool.clone()).collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, pinned(REFUSED_UNDER_NO_ROOT_COMBINATORS));
+
+    let rendered = openprx::tools::ToolSchemaRefusals {
+        dialect: ToolSchemaDialect::NoRootCombinators,
+        refusals: refused,
+        provider: "custom:http://127.0.0.1:8080/v1".to_string(),
+        model: "fixture-model".to_string(),
+        descriptor_source: "`[[providers.tool_dialects]]` (provider 'custom:http://127.0.0.1:8080/v1', every model)"
+            .to_string(),
+    }
+    .to_string();
+    for name in REFUSED_UNDER_NO_ROOT_COMBINATORS {
+        assert!(
+            rendered.contains(&format!("\"{name}\"")),
+            "{name} missing from the exclusion: {rendered}"
+        );
+    }
+    assert!(rendered.contains("always_exclude"), "{rendered}");
+    assert!(rendered.contains("[[providers.tool_dialects]]"), "{rendered}");
+    assert_eq!(
+        openprx::tools::ToolSchemaRefusals::tool_names_in(&rendered).map(|mut names| {
+            names.sort();
+            names
+        }),
+        Some(pinned(REFUSED_UNDER_NO_ROOT_COMBINATORS)),
+        "the stable rendering must round-trip the refused names"
+    );
+    println!("{rendered}");
+}
+
+#[test]
+fn a_raw_endpoint_receives_every_published_contract_byte_for_byte() {
+    let tmp = TempDir::new().expect("tempdir");
+    let specs = published_contracts(&tmp);
+    assert!(specs.len() >= MINIMUM_PUBLISHED_TOOLS);
+    for spec in &specs {
+        let wire = ToolSchemaDialect::Raw
+            .wire_schema(&spec.public_name, &spec.parameters)
+            .unwrap_or_else(|error| panic!("test: Raw refused {}: {error}", spec.public_name));
+        assert!(
+            matches!(wire, Cow::Borrowed(_)),
+            "{}: the Raw dialect copied the published document instead of borrowing it",
+            spec.public_name
+        );
+        assert_eq!(
+            serde_json::to_vec(&*wire).expect("test: serialize wire document"),
+            serde_json::to_vec(&spec.parameters).expect("test: serialize published document"),
+            "{}: the Raw dialect changed the bytes on the wire",
+            spec.public_name
+        );
+    }
+}
+
+/// A root `allOf` whose members are *plain* object fragments — no
+/// `additionalProperties`, no `type` other than `"object"`, no keyword beyond
+/// `type`/`properties`/`required`/`description`/`title` — is losslessly
+/// mergeable: union of `properties`, union of `required`. Nothing else is.
+///
+/// The fragment-scoped keywords are deliberately absent from this fixture:
+/// `additionalProperties` is scoped to the object that carries it, so hoisting
+/// it onto a unioned `properties` map produces a document strictly looser than
+/// the published one. That shape is refused, not merged — see
+/// `a_fragment_forbidding_additional_properties_is_refused`.
+#[test]
+fn a_root_all_of_of_plain_object_fragments_merges_losslessly() {
+    let published = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "allOf": [
+            {"properties": {"mode": {"type": "string"}}, "required": ["mode"]},
+            {"type": "object", "properties": {"depth": {"type": "integer"}}}
+        ]
+    });
+    let wire = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_mergeable", &published)
+        .expect("test: plain object fragments merge");
+    assert!(wire.get("allOf").is_none(), "the merged document kept its allOf");
+    let properties = wire
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("test: merged properties");
+    for name in ["path", "mode", "depth"] {
+        assert!(properties.contains_key(name), "merge dropped property '{name}'");
+    }
+    let required: Vec<&str> = wire
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("test: merged required")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(required.contains(&"path") && required.contains(&"mode"));
+    assert_eq!(
+        wire.get("additionalProperties"),
+        None,
+        "the merge must not invent an 'additionalProperties' nobody published"
+    );
+    assert_lowering_kept_the_contract("fixture_mergeable", &published, &wire);
+}
+
+/// `additionalProperties` is scoped to the schema object that carries it. A
+/// fragment saying `false` forbids every member *the fragment itself* does not
+/// declare; hoisting that onto the union of every fragment's properties admits
+/// exactly the members the published contract forbade. There is no lossless
+/// merge, so there must be a refusal.
+#[test]
+fn a_fragment_forbidding_additional_properties_is_refused() {
+    let published = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "allOf": [
+            {"properties": {"token": {"type": "string"}}, "additionalProperties": false}
+        ]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_fragment_closed", &published)
+        .expect_err("test: a fragment-scoped additionalProperties has no lossless hoist");
+    assert_refusal_is_actionable(&error, "fixture_fragment_closed", &published);
+    assert!(
+        error.to_string().contains("additionalProperties"),
+        "the refusal does not name the keyword it could not lower: {error}"
+    );
+    assert_eq!(
+        &*ToolSchemaDialect::NoRootCombinators.enforceable_schema(&published),
+        &published,
+        "a refused contract must be enforced as published, never as a half-merged document"
+    );
+}
+
+/// The same defect from the other side: the *root* forbids unknown members and
+/// a fragment adds one. Merging widens the root's `properties`, so the root's
+/// own `additionalProperties: false` starts admitting a name it forbade.
+#[test]
+fn a_closed_root_is_refused_when_a_fragment_adds_a_property() {
+    let published = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": false,
+        "allOf": [
+            {"properties": {"token": {"type": "string"}}}
+        ]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_closed_root", &published)
+        .expect_err("test: widening a closed root's properties is not lossless");
+    assert_refusal_is_actionable(&error, "fixture_closed_root", &published);
+    assert!(
+        error.to_string().contains("additionalProperties"),
+        "the refusal does not name the keyword it could not lower: {error}"
+    );
+    assert_eq!(
+        &*ToolSchemaDialect::NoRootCombinators.enforceable_schema(&published),
+        &published,
+        "a refused contract must be enforced as published"
+    );
+}
+
+/// A fragment that constrains the *instance type* to something other than an
+/// object is not a plain object fragment. Merging it drops that constraint
+/// silently, because the merge only ever copies `properties` and `required`.
+#[test]
+fn a_fragment_typed_other_than_object_is_refused() {
+    let published = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "allOf": [
+            {"type": "string", "properties": {"token": {"type": "string"}}}
+        ]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_fragment_type", &published)
+        .expect_err("test: a non-object fragment type has no lossless merge");
+    assert_refusal_is_actionable(&error, "fixture_fragment_type", &published);
+    assert!(
+        error.to_string().contains("type"),
+        "the refusal does not name the keyword it could not lower: {error}"
+    );
+}
+
+/// A fragment that declares a property the root also declares, differently, has
+/// no single spelling that means both. The merge must not pick one.
+#[test]
+fn a_colliding_property_with_a_different_sub_schema_is_refused() {
+    let published = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "allOf": [
+            {"properties": {"path": {"type": "integer"}}}
+        ]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_property_collision", &published)
+        .expect_err("test: two spellings of one property cannot be merged");
+    assert_refusal_is_actionable(&error, "fixture_property_collision", &published);
+    assert!(
+        error.to_string().contains("path"),
+        "the refusal does not name the property it could not merge: {error}"
+    );
+}
+
+/// A root with no `type` may adopt the `"object"` a merged fragment declared —
+/// that constraint is in the published contract and must survive the merge
+/// rather than being dropped because the root was silent.
+#[test]
+fn a_fragment_type_is_carried_into_a_root_that_has_none() {
+    let published = json!({
+        "properties": {"path": {"type": "string"}},
+        "allOf": [
+            {"type": "object", "required": ["path"]}
+        ]
+    });
+    let wire = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_untyped_root", &published)
+        .expect("test: an object fragment merges into an untyped root");
+    assert_eq!(
+        wire.get("type"),
+        Some(&json!("object")),
+        "the merge dropped the fragment's object constraint"
+    );
+}
+
+/// A server PRX does not control authors the `inputSchema`, and it is forwarded
+/// verbatim into `ToolSpec::parameters`. These shapes are chosen so that a
+/// merge which hoists a fragment-scoped keyword produces a document strictly
+/// **more permissive** than the published one — and `enforceable_schema` reruns
+/// that merge, so PRX would validate the model's answer against the looser
+/// document. Every one of them must be refused, and what is enforced after a
+/// refusal must be the published document itself.
+#[test]
+fn a_crafted_mcp_alias_can_never_loosen_the_enforced_document() {
+    let crafted = [
+        // The fragment permits only `token`, so the published contract is in
+        // fact unsatisfiable: `path` is required and the fragment forbids it.
+        // The old merge produced a satisfiable document that admitted `token`.
+        (
+            "mcp_alias_closed_fragment",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "allOf": [
+                    {"properties": {"token": {"type": "string"}}, "additionalProperties": false}
+                ]
+            }),
+        ),
+        // A closed root plus a fragment-added property: the merged document
+        // admits `token`, which the published root forbade.
+        (
+            "mcp_alias_closed_root",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": false,
+                "allOf": [{"properties": {"token": {"type": "string"}}}]
+            }),
+        ),
+        // A fragment whose `additionalProperties` is a schema rather than a
+        // boolean: the old merge matched only `false` and dropped it entirely.
+        (
+            "mcp_alias_schema_valued_additional",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "allOf": [
+                    {"properties": {"token": {"type": "string"}}, "additionalProperties": {"type": "string"}}
+                ]
+            }),
+        ),
+        // A fragment constraining the instance type, which the old merge never
+        // copied when the root was silent.
+        (
+            "mcp_alias_untyped_root_string_fragment",
+            json!({
+                "properties": {"path": {"type": "string"}},
+                "allOf": [{"type": "string"}]
+            }),
+        ),
+    ];
+
+    for (tool, published) in &crafted {
+        let refusal = ToolSchemaDialect::NoRootCombinators.wire_schema(tool, published);
+        assert!(
+            refusal.is_err(),
+            "{tool}: a server-authored schema was merged into a document the publisher never wrote: {:?}",
+            refusal.ok()
+        );
+        if let Err(error) = refusal {
+            assert_refusal_is_actionable(&error, tool, published);
+        }
+        // The enforcement side must be the published document, byte for byte:
+        // nothing was put on the wire, so nothing was relaxed.
+        let enforced = ToolSchemaDialect::NoRootCombinators.enforceable_schema(published);
+        assert_eq!(
+            &*enforced, published,
+            "{tool}: enforcement ran against a document that is not the published one"
+        );
+    }
+}
+
+/// Two root branches that disagree about what is required cannot be merged into
+/// one object without either over-requiring or under-requiring. The lowering
+/// must say so rather than pick a branch.
+#[test]
+fn a_root_branch_conflict_is_refused_rather_than_resolved() {
+    let published = json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "url": {"type": "string"}
+        },
+        "anyOf": [{"required": ["path"]}, {"required": ["url"]}],
+        "allOf": [{"required": ["path", "url"]}]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("fixture_branch_conflict", &published)
+        .expect_err("test: a branch conflict must fail closed");
+    assert_refusal_is_actionable(&error, "fixture_branch_conflict", &published);
+    assert_eq!(
+        error.keyword, "anyOf",
+        "the refusal must name the keyword that carries the alternatives"
+    );
+}
+
+/// An MCP server's `inputSchema` is forwarded verbatim into `ToolSpec`
+/// parameters (`src/tools/mcp.rs`), so a root combinator can arrive from
+/// outside PRX entirely. The same runtime pass must see it.
+#[test]
+fn a_verbatim_mcp_alias_schema_is_lowered_or_refused_by_the_same_pass() {
+    // Shape published by a server PRX does not control, forwarded unchanged.
+    let alias_with_alternatives = json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "document_id": {"type": "string"}
+        },
+        "anyOf": [{"required": ["query"]}, {"required": ["document_id"]}]
+    });
+    let error = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("mcp_alias_search", &alias_with_alternatives)
+        .expect_err("test: an alias with alternative required sets must fail closed");
+    assert_refusal_is_actionable(&error, "mcp_alias_search", &alias_with_alternatives);
+
+    let alias_with_fragments = json!({
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "allOf": [{"required": ["query"]}]
+    });
+    let wire = ToolSchemaDialect::NoRootCombinators
+        .wire_schema("mcp_alias_fetch", &alias_with_fragments)
+        .expect("test: a mergeable alias lowers");
+    assert_lowering_kept_the_contract("mcp_alias_fetch", &alias_with_fragments, &wire);
+    assert!(
+        wire.get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|names| names.iter().any(|value| value.as_str() == Some("query"))),
+        "the merge lost the alias's only requirement"
+    );
+}
+
+/// The six combinator-bearing tools this fixture cannot construct — they need a
+/// live provider, channel, hook manager or the WASM plugin runtime — authored
+/// through the same public helpers their builders use, so every root-combinator
+/// shape in the tree has a pinned outcome even where the tool itself is absent.
+fn shapes_the_fixture_cannot_build() -> Vec<(&'static str, Value)> {
+    let object = || {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "id": {"type": "string"},
+                "message": {"type": "string"},
+                "key": {"type": "string"},
+                "content": {"type": "string"},
+                "image": {"type": "string"},
+                "images": {"type": "array", "items": {"type": "string"}},
+                "task": {"type": "string"},
+                "delay_seconds": {"type": "integer"},
+                "run_at": {"type": "string"}
+            },
+            "required": ["action"]
+        })
+    };
+    vec![
+        // src/chat/scheduled_input.rs — action-specific required fields.
+        (
+            "chat_schedule",
+            with_action_requirements(
+                object(),
+                "action",
+                &[
+                    ActionRequirement {
+                        action: "schedule",
+                        required: &["delay_seconds"],
+                    },
+                    ActionRequirement {
+                        action: "cancel",
+                        required: &["id"],
+                    },
+                ],
+            ),
+        ),
+        // src/hooks/mod.rs — per-action required fields.
+        (
+            "hooks_manage",
+            with_action_requirements(
+                object(),
+                "action",
+                &[ActionRequirement {
+                    action: "replace",
+                    required: &["content"],
+                }],
+            ),
+        ),
+        // src/chat/managed_session.rs — per-action fields with an omitted default.
+        (
+            "managed_session",
+            with_default_action_requirements(
+                object(),
+                "action",
+                "list",
+                &[ActionRequirement {
+                    action: "send",
+                    required: &["id", "message"],
+                }],
+            ),
+        ),
+        // src/tools/sessions_spawn.rs — per-action fields.
+        (
+            "sessions_spawn",
+            with_action_requirements(
+                object(),
+                "action",
+                &[ActionRequirement {
+                    action: "spawn",
+                    required: &["task"],
+                }],
+            ),
+        ),
+        // src/plugins/runtime.rs — a literal allOf of the same if/then shape.
+        (
+            "wasm_plugins_manage",
+            with_action_requirements(
+                object(),
+                "action",
+                &[ActionRequirement {
+                    action: "storage_store",
+                    required: &["key", "content"],
+                }],
+            ),
+        ),
+        // src/tools/image.rs — root anyOf over `image` / `images`.
+        (
+            "image",
+            with_required_alternatives(object(), &[&["image"], &["images"]]),
+        ),
+        // src/tools/cron.rs — an if/then whose `then` is an anyOf of field sets.
+        (
+            "cron_alternatives_shape",
+            with_action_alternatives(object(), "action", "add", &[&["key"], &["content"]]),
+        ),
+        // src/tools/cron.rs — an if/then whose `then` is a oneOf.
+        (
+            "cron_exclusive_shape",
+            with_action_exclusive_alternatives(object(), "action", "once", &[&["delay_seconds"], &["run_at"]]),
+        ),
+    ]
+}
+
+#[test]
+fn the_combinator_shapes_the_fixture_cannot_build_are_refused_by_name() {
+    for (tool, published) in shapes_the_fixture_cannot_build() {
+        assert!(
+            has_root_combinator(&published),
+            "{tool}: the shape fixture stopped carrying a root combinator"
+        );
+        let error = ToolSchemaDialect::NoRootCombinators
+            .wire_schema(tool, &published)
+            .expect_err("a conditional or alternative requirement has no lossless merge");
+        assert_refusal_is_actionable(&error, tool, &published);
+    }
+}

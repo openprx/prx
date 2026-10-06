@@ -130,12 +130,101 @@ pub struct HookDiagnostics {
     pub timeout_ms: u64,
     pub action_count: usize,
     pub events: BTreeMap<String, usize>,
+    /// Private catalog identity for the effective hooks file. Not returned
+    /// through doctor/API diagnostics.
+    #[serde(skip)]
+    pub(crate) catalog_digest: Option<[u8; 32]>,
     pub error: Option<String>,
+    /// Whether the command hooks of this `hooks.json` run: only with
+    /// `security.workspace_hooks = "on"` in config.toml (HOOKS-ENV).
+    pub runs: bool,
+    /// When configured hooks do not run: why, with the one-line fix.
+    pub blocked: Option<String>,
+}
+
+/// Where a [`HookManager`] reads whether workspace command hooks run, and
+/// the directory they start in.
+enum HookPolicy {
+    /// Fixed at construction. Without a configuration (a sub-agent's own
+    /// manager, an embedding caller) workspace hooks do not run.
+    Fixed {
+        allowed: bool,
+        launch_root: Option<PathBuf>,
+    },
+    /// The process configuration, read at every event, so turning the
+    /// opt-in off stops hooks at once.
+    Live(crate::config::SharedConfig),
+}
+
+/// The one line that allows workspace command hooks.
+pub const WORKSPACE_HOOKS_OPT_IN: &str = "[security] workspace_hooks = \"on\"";
+
+/// How many command hooks the workspace `hooks.json` under
+/// `workspace_dir` defines; `None` without one. Reads and validates the
+/// file only (for `prx doctor`).
+///
+/// # Errors
+///
+/// An unreadable, oversized or invalid `hooks.json`.
+pub fn workspace_hook_actions(workspace_dir: &Path) -> anyhow::Result<Option<usize>> {
+    let Some(raw) = read_bounded_file(&workspace_dir.join(HOOKS_JSON_FILE), MAX_HOOKS_FILE_BYTES)? else {
+        return Ok(None);
+    };
+    Ok(Some(parse_hook_config(&raw)?.hooks.values().map(Vec::len).sum()))
+}
+
+/// Why the command hooks of a `hooks.json` holding `actions` actions do not
+/// run, with the fix; `None` when there are none.
+#[must_use]
+pub fn blocked_hooks_note(actions: usize) -> Option<String> {
+    (actions > 0).then(|| {
+        format!(
+            "{actions} workspace command hook(s) in hooks.json are not run: `security.workspace_hooks` is off. To \
+             run them, add `{WORKSPACE_HOOKS_OPT_IN}` to config.toml (a high-risk change: the workspace can then \
+             start programs that run as PRX's user)"
+        )
+    })
+}
+
+/// What a change to the workspace hooks can do: the one risk
+/// classification of `hooks.json` changes on every surface (`hooks_manage`,
+/// the Gateway hooks API; D-096). The file tools classify any write of the
+/// file as a launch-definition write, which is High as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookChange {
+    /// Installs, changes or runs a hook command: its program, arguments or
+    /// the event it runs on.
+    Command,
+    /// Only removes hooks or changes their limits: nothing new runs.
+    Restriction,
+}
+
+impl HookChange {
+    /// The side-effect risk of this change.
+    #[must_use]
+    pub const fn risk(self) -> crate::security::policy::ResourceRiskLevel {
+        match self {
+            Self::Command => crate::security::policy::ResourceRiskLevel::High,
+            Self::Restriction => crate::security::policy::ResourceRiskLevel::Medium,
+        }
+    }
+
+    /// The change a `hooks_manage` action makes; `None` for the actions
+    /// that only read.
+    #[must_use]
+    pub fn of_manage_action(action: &str) -> Option<Self> {
+        match action {
+            "test" | "replace" => Some(Self::Command),
+            "remove" => Some(Self::Restriction),
+            _ => None,
+        }
+    }
 }
 
 pub struct HookManager {
     workspace_dir: PathBuf,
     hooks_json_path: PathBuf,
+    policy: HookPolicy,
     media_artifacts: std::sync::Arc<crate::media::MediaArtifactOwner>,
     state: RwLock<RuntimeState>,
     /// Process-level WASM plugin runtime; it is the sole generation owner.
@@ -149,10 +238,54 @@ impl HookManager {
         Self {
             hooks_json_path: workspace_dir.join(HOOKS_JSON_FILE),
             workspace_dir,
+            policy: HookPolicy::Fixed {
+                allowed: false,
+                launch_root: None,
+            },
             media_artifacts,
             state: RwLock::new(RuntimeState::default()),
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Read whether workspace command hooks run
+    /// (`security.workspace_hooks`) from the live process configuration at
+    /// every event, and start them in `hooks/` beside `config.toml`
+    /// (HOOKS-ENV). Without this, workspace command hooks do not run.
+    #[must_use]
+    pub fn with_config(mut self, shared: crate::config::SharedConfig) -> Self {
+        self.policy = HookPolicy::Live(shared);
+        self
+    }
+
+    /// Workspace hooks run, starting under `launch_root` (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn allowing_workspace_hooks(mut self, launch_root: PathBuf) -> Self {
+        self.policy = HookPolicy::Fixed {
+            allowed: true,
+            launch_root: Some(launch_root),
+        };
+        self
+    }
+
+    /// Whether workspace command hooks run now, and the root their
+    /// dedicated directory lies under.
+    fn workspace_policy(&self) -> (bool, Option<PathBuf>) {
+        match &self.policy {
+            HookPolicy::Fixed { allowed, launch_root } => (*allowed, launch_root.clone()),
+            HookPolicy::Live(shared) => {
+                let config = &shared.pin().effective;
+                (
+                    config.security.workspace_hooks == crate::config::WorkspaceHooks::On,
+                    config
+                        .config_path
+                        .parent()
+                        .filter(|dir| !dir.as_os_str().is_empty())
+                        .map(|dir| dir.join("hooks")),
+                )
+            }
         }
     }
 
@@ -169,6 +302,12 @@ impl HookManager {
     /// Transform one shared agent-pipeline envelope through the current WASM
     /// middleware generation. Invalid JSON output is isolated and the original
     /// envelope is preserved so a plugin cannot corrupt the turn protocol.
+    ///
+    /// The guest is third-party code like a lifecycle hook, so it receives the
+    /// envelope through the same redaction: the `llm_request` and
+    /// `llm_response` stages name the serving provider, whose `custom:` label
+    /// may carry URL userinfo. The turn never reads the provider back from the
+    /// transformed envelope.
     #[cfg(feature = "wasm-plugins")]
     pub async fn process_wasm_middleware(
         &self,
@@ -183,7 +322,7 @@ impl HookManager {
         if chain.is_empty() {
             return envelope;
         }
-        let original = envelope.to_string();
+        let original = redacted_hook_payload(&envelope).to_string();
         let transformed = chain.process(stage, &original).await;
         match serde_json::from_str(&transformed) {
             Ok(value) => value,
@@ -207,14 +346,19 @@ impl HookManager {
             .iter()
             .map(|(event, actions)| (event.clone(), actions.len()))
             .collect::<BTreeMap<_, _>>();
+        let action_count = events.values().sum();
+        let runs = self.workspace_policy().0;
         HookDiagnostics {
             configured: self.hooks_json_path.is_file(),
             valid: error.is_none(),
             config_path: self.hooks_json_path.display().to_string(),
             timeout_ms: state.config.timeout_ms,
-            action_count: events.values().sum(),
+            action_count,
             events,
+            catalog_digest: state.hooks_json_digest,
             error,
+            runs,
+            blocked: if runs { None } else { blocked_hooks_note(action_count) },
         }
     }
 
@@ -228,14 +372,19 @@ impl HookManager {
             .iter()
             .map(|(event, actions)| (event.clone(), actions.len()))
             .collect::<BTreeMap<_, _>>();
+        let action_count = events.values().sum();
+        let runs = self.workspace_policy().0;
         Ok(HookDiagnostics {
             configured: false,
             valid: true,
             config_path: self.hooks_json_path.display().to_string(),
             timeout_ms: config.timeout_ms,
-            action_count: events.values().sum(),
+            action_count,
             events,
+            catalog_digest: Some(Sha256::digest(content.as_bytes()).into()),
             error: None,
+            runs,
+            blocked: if runs { None } else { blocked_hooks_note(action_count) },
         })
     }
 
@@ -314,6 +463,10 @@ impl HookManager {
     }
 
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
+        // One redaction for every consumer below: command hooks, WASM
+        // lifecycle hooks and the plugin event bus all receive this payload.
+        let payload = redacted_hook_payload(&payload);
+        let payload = payload.as_ref();
         if let Err(err) = self.refresh_if_changed() {
             tracing::warn!(error = %err, "hooks refresh failed");
         } else {
@@ -325,9 +478,18 @@ impl HookManager {
                 )
             };
 
-            if !actions.is_empty() {
+            let (allowed, _) = self.workspace_policy();
+            if !actions.is_empty() && !allowed {
+                tracing::warn!(
+                    event = event.as_str(),
+                    actions = actions.len(),
+                    "workspace command hooks are not run: security.workspace_hooks is off; add `{}` to \
+                     config.toml to run them",
+                    WORKSPACE_HOOKS_OPT_IN
+                );
+            } else if !actions.is_empty() {
                 for action in actions {
-                    if let Err(err) = self.run_action(event, &payload, timeout_ms, &action).await {
+                    if let Err(err) = self.run_action(event, payload, timeout_ms, &action).await {
                         tracing::warn!(
                             event = event.as_str(),
                             command = action.command,
@@ -391,15 +553,60 @@ impl HookManager {
         }
         let timeout_ms = bounded_timeout(action.timeout_ms.unwrap_or(default_timeout_ms))?;
 
-        let payload_json = payload.to_string();
+        // `emit` redacted the payload; this redacts again for direct callers
+        // and is a borrow when there is nothing left to redact.
+        let payload_json = redacted_hook_payload(payload).to_string();
         if payload_json.len() > MAX_PAYLOAD_BYTES {
             anyhow::bail!(
                 "hook payload is {} bytes; limit is {MAX_PAYLOAD_BYTES}",
                 payload_json.len()
             );
         }
-        let mut cmd = Command::new(command);
+        // The dedicated directory the hook starts in: beside config.toml,
+        // never the workspace (which the agent's file tools can write) and
+        // never PRX's own working directory (HOOKS-ENV). A `cwd` in
+        // hooks.json is workspace-controlled and is not used.
+        let (_, launch_root) = self.workspace_policy();
+        let Some(launch_root) = launch_root else {
+            anyhow::bail!(
+                "workspace hooks have no launch directory: PRX starts them in `hooks/` beside config.toml, and this \
+                 process has no configuration directory"
+            );
+        };
+        let working_dir = crate::config::mcp_launch::launch_directory(&launch_root, "workspace-hooks", None)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        crate::config::mcp_launch::prepare_launch_directory(&launch_root, &working_dir).await?;
+        if action.cwd.is_some() {
+            tracing::warn!(
+                event = event.as_str(),
+                "hooks.json `cwd` is ignored: workspace hooks start in their dedicated directory"
+            );
+        }
+        // A command with a path separator is workspace content (a script in
+        // the workspace): resolve it against the workspace, since the hook
+        // no longer starts there. A bare name is looked up in `PATH`.
+        let program = if command.contains(['/', '\\']) && !Path::new(command).is_absolute() {
+            self.workspace_dir.join(command)
+        } else {
+            PathBuf::from(command)
+        };
+
+        // A cleared environment through the shared launch builder: the
+        // launch allowlist of PRX's environment plus the hook's own `env`,
+        // without the variables a workspace may not set (HOOKS-ENV, D-045).
+        let (environment, dropped) = crate::config::mcp_launch::workspace_launch_environment(&action.env);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                event = event.as_str(),
+                dropped = ?dropped,
+                "hook environment variables a workspace may not set were dropped"
+            );
+        }
+        let mut cmd = Command::new(&program);
         cmd.args(&action.args);
+        cmd.env_clear();
+        cmd.envs(environment);
+        cmd.current_dir(&working_dir);
         cmd.env("ZERO_HOOK_EVENT", event.as_str());
 
         // Avoid execve argv+env size overflow for large payloads.
@@ -419,41 +626,6 @@ impl HookManager {
         payload_file.write_all(payload_json.as_bytes())?;
         payload_file.flush()?;
         cmd.env("ZERO_HOOK_PAYLOAD_FILE", payload_file.path());
-
-        if !action.env.is_empty() {
-            // Block env vars that could hijack the process (e.g., LD_PRELOAD, PATH).
-            const BLOCKED_VARS: &[&str] = &[
-                "LD_PRELOAD",
-                "LD_LIBRARY_PATH",
-                "DYLD_INSERT_LIBRARIES",
-                "DYLD_LIBRARY_PATH",
-                "PATH",
-                "HOME",
-            ];
-            for (key, value) in &action.env {
-                if value.contains('\0') || key.contains('\0') {
-                    tracing::warn!(env_var = %key, "hook env var contains null byte, skipping");
-                    continue;
-                }
-                if BLOCKED_VARS.iter().any(|b| key.eq_ignore_ascii_case(b)) {
-                    tracing::warn!(env_var = %key, "hook attempted to set blocked env var, skipping");
-                    continue;
-                }
-                cmd.env(key, value);
-            }
-        }
-
-        if let Some(cwd) = &action.cwd {
-            let cwd_path = Path::new(cwd);
-            let resolved = if cwd_path.is_absolute() {
-                cwd_path.to_path_buf()
-            } else {
-                self.workspace_dir.join(cwd_path)
-            };
-            cmd.current_dir(resolved);
-        } else {
-            cmd.current_dir(&self.workspace_dir);
-        }
 
         if action.stdin_json {
             cmd.stdin(std::process::Stdio::piped());
@@ -577,12 +749,12 @@ impl crate::tools::Tool for HooksStatusTool {
 
 impl HooksManageTool {
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), crate::tools::ToolResult> {
-        use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
-        let risk = match action {
-            "test" => ResourceRiskLevel::High,
-            "replace" | "remove" => ResourceRiskLevel::Medium,
-            _ => return Ok(()),
+        use crate::security::policy::{ApprovalGrant, SideEffectGate};
+        // The one classification of hooks.json changes (D-096).
+        let Some(change) = HookChange::of_manage_action(action) else {
+            return Ok(());
         };
+        let risk = change.risk();
         let grant = ApprovalGrant::from_runtime_args("hooks_manage", args);
         SideEffectGate::new(self.security.as_ref())
             .authorize_resource_operation("hooks_manage", &format!("hooks_manage:{action}"), risk, grant.as_ref())
@@ -807,6 +979,43 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     out
 }
 
+/// The payload keys that can quote a provider label: the label itself and the
+/// error texts that name it.
+const PROVIDER_LABEL_PAYLOAD_KEYS: [&str; 4] = ["provider", "message", "error", "error_message"];
+
+/// `payload` as a hook script may see it: a provider label (a `custom:` URL
+/// may carry `user:password@`) and the error texts that quote one are
+/// redacted with the one helper every other surface uses. Borrowed when
+/// nothing needed redacting.
+fn redacted_hook_payload(payload: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+    let Some(object) = payload.as_object() else {
+        return std::borrow::Cow::Borrowed(payload);
+    };
+    let needs_redaction = PROVIDER_LABEL_PAYLOAD_KEYS.iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| {
+                matches!(
+                    crate::providers::redact_endpoint_userinfo(text),
+                    std::borrow::Cow::Owned(_)
+                )
+            })
+    });
+    if !needs_redaction {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+    let mut redacted = object.clone();
+    for key in PROVIDER_LABEL_PAYLOAD_KEYS {
+        if let Some(serde_json::Value::String(text)) = redacted.get_mut(key)
+            && let std::borrow::Cow::Owned(safe) = crate::providers::redact_endpoint_userinfo(text)
+        {
+            *text = safe;
+        }
+    }
+    std::borrow::Cow::Owned(serde_json::Value::Object(redacted))
+}
+
 pub fn payload_error(component: &str, message: &str) -> serde_json::Value {
     json!({
         "component": component,
@@ -819,6 +1028,12 @@ pub fn payload_error(component: &str, message: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A manager whose workspace hooks run (the operator opted in), with its
+    /// workspace and launch root inside `temp`.
+    fn allowed_manager(temp: &TempDir) -> HookManager {
+        HookManager::new(temp.path().join("workspace")).allowing_workspace_hooks(temp.path().join("hooks"))
+    }
 
     /// The shared action contract every action-dispatched tool is held to:
     /// the tool-list description and the `action` parameter's own description
@@ -1088,7 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn run_action_empty_command_fails() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
         let action = HookAction {
             command: "".into(),
             args: vec![],
@@ -1105,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn run_action_success() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
         let action = HookAction {
             command: "true".into(),
             args: vec![],
@@ -1123,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn run_action_failure_exit_code() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
         let action = HookAction {
             command: "false".into(),
             args: vec![],
@@ -1140,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn run_action_timeout() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
         let action = HookAction {
             command: "sleep".into(),
             args: vec!["10".into()],
@@ -1158,14 +1373,16 @@ mod tests {
     #[tokio::test]
     async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
+        let out = temp.path().display().to_string();
         let action = HookAction {
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                "echo $$ > hook.pid; sleep 10 & echo $! > hook-descendant.pid; \
-                 echo \"$ZERO_HOOK_PAYLOAD_FILE\" > payload.path; wait"
-                    .into(),
+                format!(
+                    "echo $$ > '{out}/hook.pid'; sleep 10 & echo $! > '{out}/hook-descendant.pid'; \
+                     echo \"$ZERO_HOOK_PAYLOAD_FILE\" > '{out}/payload.path'; wait"
+                ),
             ],
             env: HashMap::new(),
             cwd: None,
@@ -1208,6 +1425,126 @@ mod tests {
         assert!(!Path::new(payload_path.trim()).exists(), "payload temp file leaked");
     }
 
+    /// Write `hooks.json` into `workspace` with one `turn_complete` hook that
+    /// runs `sh -c <script>`.
+    fn write_turn_complete_hook(workspace: &Path, script: &str) {
+        std::fs::create_dir_all(workspace).unwrap();
+        let hooks = json!({
+            "hooks": {"turn_complete": [{"command": "sh", "args": ["-c", script], "stdin_json": false}]}
+        });
+        std::fs::write(workspace.join("hooks.json"), hooks.to_string()).unwrap();
+    }
+
+    /// RED before HOOKS-ENV (D-085 O-1): a workspace `hooks.json` (which the
+    /// agent's file tools can write) ran its commands with no operator
+    /// consent. Without `security.workspace_hooks = "on"` nothing runs now,
+    /// and the diagnostics say how to allow it.
+    #[tokio::test]
+    async fn workspace_hooks_do_not_run_without_the_operator_opt_in() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let sentinel = temp.path().join("hook-ran");
+        write_turn_complete_hook(&workspace, &format!("touch '{}'", sentinel.display()));
+        let manager = HookManager::new(workspace.clone());
+
+        manager.emit(HookEvent::TurnComplete, json!({"turn": "t"})).await;
+
+        assert!(!sentinel.exists(), "a workspace hook ran without the operator's opt-in");
+        let diagnostics = manager.diagnostics();
+        assert!(!diagnostics.runs);
+        let blocked = diagnostics.blocked.expect("test: a blocked note");
+        assert!(blocked.contains(WORKSPACE_HOOKS_OPT_IN), "{blocked}");
+
+        let allowed = HookManager::new(workspace).allowing_workspace_hooks(temp.path().join("hooks"));
+        allowed.emit(HookEvent::TurnComplete, json!({"turn": "t"})).await;
+        assert!(sentinel.exists(), "with the opt-in the hook runs");
+        assert!(allowed.diagnostics().blocked.is_none());
+    }
+
+    /// RED before HOOKS-ENV: a hook inherited PRX's whole environment (every
+    /// provider key exported in its shell) and ran in the workspace. It now
+    /// starts from the cleared launch environment plus its own `env` (minus
+    /// the variables a workspace may not set), in its dedicated directory.
+    #[tokio::test]
+    async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
+        let temp = TempDir::new().unwrap();
+        let allowlist = ["PATH", "HOME", "LANG", "TMPDIR"];
+        let parent_only = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .find(|name| !allowlist.contains(&name.as_str()) && !name.starts_with("LC_"))
+            .expect("test: the test process has a variable outside the allowlist");
+        let out = temp.path().join("seen");
+        let manager = allowed_manager(&temp);
+        let action = HookAction {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("env > '{0}.env'; pwd -P > '{0}.cwd'", out.display()),
+            ],
+            env: HashMap::from([
+                ("HOOK_OWN".to_string(), "own".to_string()),
+                ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+                ("npm_config_registry".to_string(), "https://evil.example".to_string()),
+            ]),
+            cwd: Some(".".into()),
+            timeout_ms: Some(5_000),
+            stdin_json: false,
+        };
+        manager
+            .run_action(HookEvent::TurnComplete, &json!({}), 5_000, &action)
+            .await
+            .expect("test: the hook runs");
+
+        let environment = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+        let names = environment
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"HOOK_OWN".to_string()), "{names:?}");
+        assert!(names.contains(&"ZERO_HOOK_EVENT".to_string()), "{names:?}");
+        for refused in [parent_only.as_str(), "LD_PRELOAD", "npm_config_registry"] {
+            assert!(
+                !names.iter().any(|name| name == refused),
+                "`{refused}` reached the hook: {names:?}"
+            );
+        }
+        let cwd = std::fs::read_to_string(format!("{}.cwd", out.display())).unwrap();
+        let expected =
+            crate::config::mcp_launch::launch_directory(&temp.path().join("hooks"), "workspace-hooks", None).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(cwd.trim()).unwrap(),
+            std::fs::canonicalize(expected).unwrap(),
+            "the hook must start in its dedicated directory, not the workspace or `cwd`"
+        );
+    }
+
+    /// HOOKS-ENV: without a configuration directory there is no launch
+    /// directory, and a hook is refused rather than started in the workspace.
+    #[tokio::test]
+    async fn a_hook_without_a_launch_root_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager {
+            policy: HookPolicy::Fixed {
+                allowed: true,
+                launch_root: None,
+            },
+            ..HookManager::new(temp.path().to_path_buf())
+        };
+        let action = HookAction {
+            command: "true".into(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(1_000),
+            stdin_json: false,
+        };
+        let refused = manager
+            .run_action(HookEvent::TurnComplete, &json!({}), 1_000, &action)
+            .await
+            .expect_err("test: refused");
+        assert!(refused.to_string().contains("no launch directory"), "{refused}");
+    }
+
     // ── emit with no hooks ──────────────────────────────────────
 
     #[tokio::test]
@@ -1221,7 +1558,7 @@ mod tests {
     #[tokio::test]
     async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
         let temp = TempDir::new().unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
+        let manager = allowed_manager(&temp);
 
         let action = HookAction {
             command: "sh".to_string(),
@@ -1243,5 +1580,143 @@ mod tests {
             result.is_ok(),
             "large payload hook should succeed via file/stdin: {result:?}"
         );
+    }
+
+    /// USERINFO-2: hook scripts receive the provider label and error text of
+    /// every LLM and agent event. A `custom:` URL may carry `user:password@`;
+    /// the payload a hook sees names the endpoint without it.
+    #[tokio::test]
+    async fn a_hook_payload_names_the_provider_without_url_userinfo() {
+        let temp = TempDir::new().unwrap();
+        let manager = allowed_manager(&temp);
+        let seen_path = temp.path().join("payload.json");
+        let action = HookAction {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("cat \"$ZERO_HOOK_PAYLOAD_FILE\" > '{}'", seen_path.display()),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            stdin_json: false,
+        };
+        let label = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
+        let payloads = [
+            json!({"provider": label, "model": "m"}),
+            json!({"provider": label, "model": "m", "success": false, "error_message": format!("provider={label} failed")}),
+            payload_error("llm", &format!("Primary provider \"{label}\" unavailable")),
+        ];
+        for payload in payloads {
+            manager
+                .run_action(HookEvent::LlmResponse, &payload, 5_000, &action)
+                .await
+                .expect("test: the hook runs");
+            let seen = std::fs::read_to_string(&seen_path).expect("test: payload written");
+            assert!(!seen.contains("SECRET-fixture-pw"), "the hook saw the password: {seen}");
+            assert!(seen.contains("custom:http://[redacted]@127.0.0.1:1/v1"), "{seen}");
+        }
+    }
+
+    /// R-C2BU F-2: the same payload fans out to WASM lifecycle hooks and the
+    /// plugin event bus. Third-party plugin code and every bus subscriber must
+    /// see the provider label without its userinfo, like a command hook does.
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn the_plugin_event_bus_receives_the_provider_without_url_userinfo() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None)
+            .await
+            .expect("test: plugin runtime");
+        let (_id, mut events) = runtime
+            .event_bus()
+            .subscribe("fixture", "prx.lifecycle.*")
+            .await
+            .expect("test: subscribe");
+        manager.set_plugin_runtime(runtime).await;
+
+        manager
+            .emit(
+                HookEvent::LlmResponse,
+                json!({
+                    "provider": "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1",
+                    "error_message": "provider=custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1 failed",
+                }),
+            )
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("test: the bus delivers within 5 s")
+            .expect("test: a lifecycle event");
+        assert!(
+            delivered.payload.contains("[redacted]@127.0.0.1:1"),
+            "{}",
+            delivered.payload
+        );
+        assert!(
+            !delivered.payload.contains("SECRET-fixture-pw"),
+            "{}",
+            delivered.payload
+        );
+    }
+
+    /// USERINFO-3: the `llm_request` and `llm_response` middleware envelopes
+    /// name the serving provider, and a `custom:` label may carry
+    /// `user:password@`. The middleware guest is third-party code like a
+    /// lifecycle hook, so it must see the label redacted as well. The
+    /// committed fixture echoes the envelope it received, so its answer is
+    /// what the guest saw.
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn a_middleware_guest_receives_the_provider_without_url_userinfo() {
+        use crate::plugins::capabilities::middleware::MiddlewareStage;
+
+        let temp = TempDir::new().expect("test: temporary workspace");
+        let plugin_dir = temp.path().join("plugins/pipeline-middleware");
+        std::fs::create_dir_all(&plugin_dir).expect("test: fixture plugin directory");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
+        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).expect("test: fixture manifest");
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).expect("test: fixture component");
+        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None)
+            .await
+            .expect("test: plugin runtime");
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager.set_plugin_runtime(runtime).await;
+
+        for stage in [MiddlewareStage::LlmRequest, MiddlewareStage::LlmResponse] {
+            let seen = manager
+                .process_wasm_middleware(
+                    stage,
+                    json!({
+                        "provider": "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1",
+                        "model": "m",
+                        "messages": [],
+                        "text": "t",
+                    }),
+                )
+                .await;
+            assert!(
+                seen.get("middleware_probe").is_some(),
+                "{}: premise: the guest ran and echoed its input: {seen}",
+                stage.as_str()
+            );
+            assert_eq!(
+                seen.get("provider").and_then(serde_json::Value::as_str),
+                Some("custom:http://[redacted]@127.0.0.1:1/v1"),
+                "{}: the guest must not see the provider's URL userinfo",
+                stage.as_str()
+            );
+            assert!(!seen.to_string().contains("SECRET-fixture-pw"), "{seen}");
+        }
+    }
+
+    /// R-C2BUg G-1: hook error texts that start with a URL keep none of their
+    /// credentials.
+    #[test]
+    fn hook_texts_redact_every_url_in_url_first_text() {
+        crate::providers::label_redaction_tests::assert_every_url_redacted("hook payload", &|text| {
+            redacted_hook_payload(&json!({"message": text, "error": text, "error_message": text})).to_string()
+        });
     }
 }

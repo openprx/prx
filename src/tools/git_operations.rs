@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SideEffectGate;
+use crate::security::git_launch::{self, GitScope};
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
@@ -88,13 +89,12 @@ impl GitOperationsTool {
         matches!(operation, "status" | "diff" | "log" | "show" | "branch" | "rev-parse")
     }
 
+    /// Run `git` in the workspace through the hardened launch (GIT-ENV,
+    /// D-100): a cleared environment, and every program the repository's own
+    /// configuration names (fsmonitor, hooks, filters, credential helpers,
+    /// ...) neutralised, while the operator's global configuration applies.
     async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
-        // `git` forks its own helpers (git-remote-https, credential helpers), so
-        // cancelling this future must tear down the whole process group.
-        let mut command = tokio::process::Command::new("git");
-        command.args(args).current_dir(&self.workspace_dir);
-        let output = crate::runtime::shell_process::run_managed_output(command).await?;
-
+        let output = self.run_git_output(args).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("Git command failed: {stderr}");
@@ -103,46 +103,36 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// [`Self::run_git_command`] without judging the exit status.
+    async fn run_git_output(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
+        // `git` forks its own helpers (git-remote-https, credential helpers),
+        // so cancelling this future must tear down the whole process group.
+        let mut command = git_launch::git_command(GitScope::Repository(&self.workspace_dir)).await?;
+        command.args(args);
+        Ok(crate::runtime::shell_process::run_managed_output(command).await?)
+    }
+
     async fn git_status(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let output = self.run_git_command(&["status", "--porcelain=2", "--branch"]).await?;
+        let output = self
+            .run_git_command(&["status", "--porcelain=v2", "--branch", "-z"])
+            .await?;
+        let PorcelainStatus {
+            branch,
+            staged,
+            unstaged,
+            untracked,
+            conflicted,
+        } = parse_porcelain_v2(&output);
 
-        // Parse git status output into structured format
         let mut result = serde_json::Map::new();
-        let mut branch = String::new();
-        let mut staged = Vec::new();
-        let mut unstaged = Vec::new();
-        let mut untracked = Vec::new();
-
-        for line in output.lines() {
-            if line.starts_with("# branch.head ") {
-                branch = line.trim_start_matches("# branch.head ").to_string();
-            } else if let Some(rest) = line.strip_prefix("1 ") {
-                // Ordinary changed entry
-                let mut parts = rest.splitn(3, ' ');
-                if let (Some(staging), Some(path)) = (parts.next(), parts.next()) {
-                    if !staging.is_empty() {
-                        let status_char = staging.chars().next().unwrap_or(' ');
-                        if status_char != '.' && status_char != ' ' {
-                            staged.push(json!({"path": path, "status": status_char}));
-                        }
-                        let status_char = staging.chars().nth(1).unwrap_or(' ');
-                        if status_char != '.' && status_char != ' ' {
-                            unstaged.push(json!({"path": path, "status": status_char}));
-                        }
-                    }
-                }
-            } else if let Some(rest) = line.strip_prefix("? ") {
-                untracked.push(rest.to_string());
-            }
-        }
-
         result.insert("branch".to_string(), json!(branch));
         result.insert("staged".to_string(), json!(staged));
         result.insert("unstaged".to_string(), json!(unstaged));
         result.insert("untracked".to_string(), json!(untracked));
+        result.insert("conflicted".to_string(), json!(conflicted));
         result.insert(
             "clean".to_string(),
-            json!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty()),
+            json!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty() && conflicted.is_empty()),
         );
 
         Ok(ToolResult {
@@ -160,6 +150,7 @@ impl GitOperationsTool {
         self.sanitize_git_args(files)?;
 
         let mut git_args = vec!["diff", "--unified=3"];
+        git_args.extend(git_launch::DIFF_SAFETY_ARGS);
         if cached {
             git_args.push("--cached");
         }
@@ -371,29 +362,124 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_checkout(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    /// The validated target of a `checkout`.
+    fn checkout_target(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let branch = args
             .get("branch")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'branch' parameter"))?;
 
         // Sanitize branch name
-        let sanitized = self.sanitize_git_args(branch)?;
-
-        if sanitized.is_empty() || sanitized.len() > 1 {
+        let mut sanitized = self.sanitize_git_args(branch)?;
+        if sanitized.len() != 1 {
             anyhow::bail!("Invalid branch specification");
         }
-
-        // SAFETY: sanitized is non-empty (checked above)
-        #[allow(clippy::indexing_slicing)]
-        let branch_name = &sanitized[0];
+        let branch_name = sanitized
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Invalid branch specification"))?;
 
         // Block dangerous branch names
         if branch_name.contains('@') || branch_name.contains('^') || branch_name.contains('~') {
             anyhow::bail!("Branch name contains invalid characters");
         }
+        Ok(branch_name)
+    }
 
-        let output = self.run_git_command(&["checkout", branch_name]).await;
+    /// Whether `operation` would change a workspace launch definition
+    /// (`hooks.json` or `mcp.json` at the workspace root, in any letter
+    /// case) in the working tree: a checkout of a revision whose copy
+    /// differs, a stash push that reverts a modified one, or a stash pop
+    /// that brings one back (GIT-ENV). Such an operation decides which
+    /// programs PRX runs, so it is high risk like the file tools' write of
+    /// one. The check reads the repository through the same hardened
+    /// launch, and fails closed: a check that cannot run (an unknown
+    /// revision, a path given as the branch, no stash entry) counts as a
+    /// change.
+    async fn changes_launch_definition(&self, operation: &str, args: &serde_json::Value) -> bool {
+        let checked = match operation {
+            "checkout" => match self.checkout_target(args) {
+                // `-` is the previous branch; any other leading dash would be
+                // read as an option of the check itself.
+                Ok(target) if target == "-" => self.revision_changes_launch_definition("@{-1}").await,
+                Ok(target) if !target.starts_with('-') => self.revision_changes_launch_definition(&target).await,
+                Ok(_) => Err(anyhow::anyhow!("a checkout target starting with '-'")),
+                Err(error) => Err(error),
+            },
+            "stash" => match args.get("action").and_then(|value| value.as_str()).unwrap_or("push") {
+                "push" | "save" => {
+                    self.launch_definition_paths(&["status", "--porcelain", "-z", "--untracked-files=no"])
+                        .await
+                }
+                "pop" => self.stash_pop_changes_launch_definition().await,
+                _ => Ok(false),
+            },
+            _ => Ok(false),
+        };
+        checked.unwrap_or_else(|error| {
+            tracing::warn!(
+                operation,
+                error = %error,
+                "could not tell whether a git operation changes hooks.json or mcp.json; treating it as a change"
+            );
+            true
+        })
+    }
+
+    /// Whether the read-only git command `args`, limited to the launch
+    /// definition paths, prints any path.
+    async fn launch_definition_paths(&self, args: &[&str]) -> anyhow::Result<bool> {
+        let mut full = args.to_vec();
+        full.push("--");
+        full.extend(git_launch::LAUNCH_DEFINITION_PATHSPECS);
+        let output = self.run_git_command(&full).await?;
+        Ok(!output
+            .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+            .is_empty())
+    }
+
+    async fn revision_changes_launch_definition(&self, target: &str) -> anyhow::Result<bool> {
+        let mut args = vec!["diff"];
+        args.extend(git_launch::DIFF_SAFETY_ARGS);
+        args.extend(["--name-only", "-z", "HEAD", target]);
+        self.launch_definition_paths(&args).await
+    }
+
+    async fn stash_pop_changes_launch_definition(&self) -> anyhow::Result<bool> {
+        let mut tracked = vec!["diff"];
+        tracked.extend(git_launch::DIFF_SAFETY_ARGS);
+        tracked.extend(["--name-only", "-z", "stash@{0}^1", "stash@{0}"]);
+        if self.launch_definition_paths(&tracked).await? {
+            return Ok(true);
+        }
+        // The untracked files of `stash push --include-untracked` are the
+        // root commit `stash@{0}^3`, when there is one.
+        // Exit 1 with no output is "no such revision"; anything else that is
+        // not success (a launch refusal, an unreadable configuration) fails
+        // the check, which counts as a change.
+        let verify = self
+            .run_git_output(&["rev-parse", "-q", "--verify", "stash@{0}^3"])
+            .await?;
+        if !verify.status.success() {
+            if verify.status.code() == Some(1) && verify.stdout.is_empty() {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "could not tell whether the stash has untracked files: {}",
+                String::from_utf8_lossy(&verify.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+            );
+        }
+        let mut untracked = vec!["show"];
+        untracked.extend(git_launch::DIFF_SAFETY_ARGS);
+        untracked.extend(["--name-only", "--format=", "-z", "stash@{0}^3"]);
+        self.launch_definition_paths(&untracked).await
+    }
+
+    async fn git_checkout(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let branch_name = self.checkout_target(&args)?;
+        let output = self.run_git_command(&["checkout", branch_name.as_str()]).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
@@ -450,7 +536,9 @@ impl GitOperationsTool {
             .first()
             .ok_or_else(|| anyhow::anyhow!("Invalid remote specification"))?;
 
-        let mut git_args = vec!["push", remote_arg.as_str()];
+        let mut git_args = vec!["push"];
+        git_args.extend(git_launch::PUSH_SAFETY_ARGS);
+        git_args.push(remote_arg.as_str());
         let branch_holder;
         if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
             let branch_args = self.sanitize_git_args(branch)?;
@@ -501,6 +589,75 @@ impl GitOperationsTool {
                 output: String::new(),
                 error: Some(format!("Reset hard failed: {error}")),
             }),
+        }
+    }
+}
+
+/// `git status --porcelain=v2 --branch -z`, parsed.
+#[derive(Debug, Default)]
+struct PorcelainStatus {
+    branch: String,
+    staged: Vec<serde_json::Value>,
+    unstaged: Vec<serde_json::Value>,
+    untracked: Vec<String>,
+    conflicted: Vec<serde_json::Value>,
+}
+
+/// Parse `git status --porcelain=v2 --branch -z`. Records are NUL
+/// separated, so a path may hold spaces:
+///
+/// - `1 XY sub mH mI mW hH hI path` (ordinary change);
+/// - `2 XY sub mH mI mW hH hI Xscore path` followed by the original path as
+///   its own NUL-separated field (rename or copy);
+/// - `u XY sub m1 m2 m3 mW h1 h2 h3 path` (unmerged);
+/// - `? path` (untracked); `! path` (ignored) is skipped.
+fn parse_porcelain_v2(output: &str) -> PorcelainStatus {
+    let mut status = PorcelainStatus::default();
+    let mut records = output.split('\0');
+    while let Some(record) = records.next() {
+        if let Some(head) = record.strip_prefix("# branch.head ") {
+            status.branch = head.to_string();
+        } else if let Some(rest) = record.strip_prefix("1 ") {
+            let fields = rest.splitn(8, ' ').collect::<Vec<_>>();
+            if let (Some(xy), Some(path)) = (fields.first(), fields.get(7)) {
+                status.record_change(xy, path, None);
+            }
+        } else if let Some(rest) = record.strip_prefix("2 ") {
+            let fields = rest.splitn(9, ' ').collect::<Vec<_>>();
+            // The original path is the next NUL-separated field.
+            let original = records.next();
+            if let (Some(xy), Some(path)) = (fields.first(), fields.get(8)) {
+                status.record_change(xy, path, original);
+            }
+        } else if let Some(rest) = record.strip_prefix("u ") {
+            let fields = rest.splitn(10, ' ').collect::<Vec<_>>();
+            if let (Some(xy), Some(path)) = (fields.first(), fields.get(9)) {
+                status.conflicted.push(json!({"path": path, "status": xy}));
+            }
+        } else if let Some(path) = record.strip_prefix("? ") {
+            status.untracked.push(path.to_string());
+        }
+    }
+    status
+}
+
+impl PorcelainStatus {
+    /// Record a changed path under its index (`X`) and working-tree (`Y`)
+    /// codes; `.` means unchanged.
+    fn record_change(&mut self, xy: &str, path: &str, original: Option<&str>) {
+        let mut codes = xy.chars();
+        let entry = |code: char| {
+            let mut entry = json!({"path": path, "status": code});
+            if let (Some(original), Some(object)) = (original, entry.as_object_mut()) {
+                object.insert("original_path".to_string(), json!(original));
+            }
+            entry
+        };
+        if let Some(code) = codes.next().filter(|code| *code != '.') {
+            self.staged.push(entry(code));
+        }
+        if let Some(code) = codes.next().filter(|code| *code != '.') {
+            self.unstaged.push(entry(code));
         }
     }
 }
@@ -644,9 +801,18 @@ impl Tool for GitOperationsTool {
             }
 
             if let Some(operation_name) = self.resource_operation_name(operation, &args) {
-                let risk = match operation {
-                    "push" | "reset_hard" => ResourceRiskLevel::High,
-                    _ => ResourceRiskLevel::Medium,
+                // An operation that rewrites `hooks.json` or `mcp.json` in the
+                // working tree is its own, high-risk operation, so an approval
+                // of the ordinary one does not cover it (GIT-ENV).
+                let launch_definition = self.changes_launch_definition(operation, &args).await;
+                let (operation_name, risk) = if launch_definition {
+                    (format!("{operation_name}:launch-definition"), ResourceRiskLevel::High)
+                } else {
+                    let risk = match operation {
+                        "push" | "reset_hard" => ResourceRiskLevel::High,
+                        _ => ResourceRiskLevel::Medium,
+                    };
+                    (operation_name, risk)
                 };
                 if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
                     self.name(),
@@ -654,6 +820,15 @@ impl Tool for GitOperationsTool {
                     risk,
                     approval_grant.as_ref(),
                 ) {
+                    let error = if launch_definition {
+                        format!(
+                            "{error} (this git operation changes a workspace launch definition: hooks.json and \
+                             mcp.json decide which programs run as PRX's user, so changing one is a high-risk \
+                             operation of its own)"
+                        )
+                    } else {
+                        error
+                    };
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -699,6 +874,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
+        crate::security::git_launch::hermetic_git_for_tests();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -1032,6 +1208,548 @@ mod tests {
         let result = tool.execute(json!({"operation": "fetch_all"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
+    }
+
+    // ── GIT-ENV (D-098): a repository's configuration is a launch definition ──
+
+    /// A provider-key stand-in in PRX's own environment. No program a
+    /// repository configures may see it (and none may run at all).
+    #[cfg(unix)]
+    const PARENT_SENTINEL_NAME: &str = "PRX_GIT_ENV_TEST_PROVIDER_KEY";
+    #[cfg(unix)]
+    const PARENT_SENTINEL_VALUE: &str = "git-env-parent-sentinel-5d1c";
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn plant_parent_sentinel() {
+        static PLANTED: std::sync::Once = std::sync::Once::new();
+        PLANTED.call_once(|| {
+            // SAFETY: test-only; set once, to a name no other code reads,
+            // before any git process of these tests is started.
+            unsafe { std::env::set_var(PARENT_SENTINEL_NAME, PARENT_SENTINEL_VALUE) };
+        });
+    }
+
+    #[cfg(unix)]
+    fn full_tool(dir: &std::path::Path) -> GitOperationsTool {
+        crate::security::git_launch::hermetic_git_for_tests();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    /// Test-side git (repository setup), itself kept away from the
+    /// developer's configuration and from what the test plants.
+    async fn setup_git(dir: &std::path::Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "commit.gpgSign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("test: git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// [`setup_git`] for a command expected to fail (a conflicting merge).
+    async fn setup_git_may_fail(dir: &std::path::Path, args: &[&str]) {
+        let _ = tokio::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("test: git runs");
+    }
+
+    /// A repository at `dir` with an identity and one commit of `files`.
+    async fn committed_repo(dir: &std::path::Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).expect("test: workspace");
+        setup_git(dir, &["init", "-q"]).await;
+        setup_git(dir, &["checkout", "-q", "-b", "main"]).await;
+        setup_git(dir, &["config", "user.name", "PRX Test"]).await;
+        setup_git(dir, &["config", "user.email", "prx@example.invalid"]).await;
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).expect("test: write file");
+        }
+        setup_git(dir, &["add", "-A"]).await;
+        setup_git(dir, &["commit", "-q", "-m", "one"]).await;
+    }
+
+    /// An executable script that dumps its environment to `marker` (and,
+    /// for a filter, passes its input through).
+    #[cfg(unix)]
+    fn plant_script(path: &std::path::Path, marker: &std::path::Path, pass_through: bool) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let body = format!(
+            "#!/bin/sh\nenv > '{}'\n{}",
+            marker.display(),
+            if pass_through { "cat\n" } else { "" }
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("test: script directory");
+        }
+        std::fs::write(path, body).expect("test: write script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("test: chmod");
+        path.display().to_string()
+    }
+
+    /// The planted program never ran, and so never saw PRX's environment.
+    #[cfg(unix)]
+    fn assert_not_run(marker: &std::path::Path, what: &str) {
+        let dump = std::fs::read_to_string(marker).ok();
+        assert!(
+            dump.as_deref()
+                .is_none_or(|environment| !environment.contains(PARENT_SENTINEL_VALUE)),
+            "{what} ran with PRX's environment: the parent sentinel reached it"
+        );
+        assert!(dump.is_none(), "{what} ran (with a cleared environment)");
+    }
+
+    async fn run(tool: &GitOperationsTool, args: serde_json::Value) -> ToolResult {
+        // D-103: the tool's git reads a scratch global file, no system file.
+        crate::security::git_launch::hermetic_git_for_tests();
+        tokio::time::timeout(std::time::Duration::from_mins(1), tool.execute(args))
+            .await
+            .expect("test: git operation finished")
+            .expect("test: git operation executes")
+    }
+
+    fn granted(operation_name: &str, mut args: serde_json::Value) -> serde_json::Value {
+        let grant = ApprovalGrant::for_resource_operation("git_operations", operation_name, "test", None);
+        if let Some(object) = args.as_object_mut() {
+            object.insert(
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                serde_json::to_value(grant).expect("test: grant serialises"),
+            );
+        }
+        args
+    }
+
+    /// RED before GIT-ENV (R-HOOKSENV F-2): a workspace `.git/config` with
+    /// `core.fsmonitor` made a plain `status`, at supervised autonomy and
+    /// with no approval, run that command with PRX's full environment. It
+    /// must not run at all, whether set directly or through `include.path`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_does_not_run_a_workspace_fsmonitor() {
+        plant_parent_sentinel();
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("a.txt", "a\n")]).await;
+        let marker = tmp.path().join("fsmonitor-ran");
+        let script = plant_script(&tmp.path().join("bin/fsmonitor.sh"), &marker, false);
+        setup_git(&workspace, &["config", "core.fsmonitor", &script]).await;
+        std::fs::write(workspace.join("a.txt"), "changed\n").expect("test: modify");
+
+        let tool = test_tool(&workspace);
+        let result = run(&tool, json!({"operation": "status"})).await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("\"clean\": false"), "{}", result.output);
+        assert!(result.output.contains("\"path\": \"a.txt\""), "{}", result.output);
+        assert_not_run(&marker, "core.fsmonitor");
+
+        // The same setting pulled in from an included file.
+        setup_git(&workspace, &["config", "--unset", "core.fsmonitor"]).await;
+        let included_marker = tmp.path().join("included-fsmonitor-ran");
+        let included_script = plant_script(&tmp.path().join("bin/included.sh"), &included_marker, false);
+        let included = tmp.path().join("included.cfg");
+        std::fs::write(&included, format!("[core]\n\tfsmonitor = {included_script}\n")).expect("test: include");
+        setup_git(&workspace, &["config", "include.path", &included.display().to_string()]).await;
+        let result = run(&tool, json!({"operation": "diff"})).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_not_run(&included_marker, "an included core.fsmonitor");
+    }
+
+    /// RED before GIT-ENV: `commit` ran the hooks of `.git/hooks` (and of a
+    /// repository-chosen `core.hooksPath`) with PRX's environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_run_repository_hooks() {
+        plant_parent_sentinel();
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("a.txt", "a\n")]).await;
+        let marker = tmp.path().join("hook-ran");
+        for hook in [
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+            "reference-transaction",
+        ] {
+            plant_script(&workspace.join(".git/hooks").join(hook), &marker, false);
+        }
+        let chosen_marker = tmp.path().join("chosen-hook-ran");
+        plant_script(&workspace.join(".githooks/pre-commit"), &chosen_marker, false);
+
+        let tool = full_tool(&workspace);
+        std::fs::write(workspace.join("b.txt"), "b\n").expect("test: new file");
+        let add = run(&tool, json!({"operation": "add", "paths": "b.txt"})).await;
+        assert!(add.success, "{:?}", add.error);
+        let commit = run(&tool, json!({"operation": "commit", "message": "two"})).await;
+        assert!(commit.success, "{:?}", commit.error);
+        assert_not_run(&marker, "a .git/hooks hook");
+
+        setup_git(&workspace, &["config", "core.hooksPath", ".githooks"]).await;
+        std::fs::write(workspace.join("b.txt"), "b2\n").expect("test: modify");
+        let add = run(&tool, json!({"operation": "add", "paths": "b.txt"})).await;
+        assert!(add.success, "{:?}", add.error);
+        let commit = run(&tool, json!({"operation": "commit", "message": "three"})).await;
+        assert!(commit.success, "{:?}", commit.error);
+        assert_not_run(&chosen_marker, "a core.hooksPath hook");
+
+        // The commits landed, under the repository's own identity.
+        let log = run(&tool, json!({"operation": "log", "limit": 3})).await;
+        assert!(log.success, "{:?}", log.error);
+        assert!(
+            log.output.contains("three") && log.output.contains("two"),
+            "{}",
+            log.output
+        );
+        assert!(log.output.contains("prx@example.invalid"), "{}", log.output);
+    }
+
+    /// RED before GIT-ENV: `add` ran a filter driver's `clean` command (and
+    /// stash pop its `smudge`) named by `.gitattributes` and defined in
+    /// `.git/config`. The driver is neutralised; the content passes through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_stash_and_diff_do_not_run_filter_or_diff_drivers() {
+        plant_parent_sentinel();
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(
+            &workspace,
+            &[
+                ("a.txt", "a\n"),
+                (".gitattributes", "*.txt filter=ev diff=ev merge=ev\n"),
+            ],
+        )
+        .await;
+        let marker = tmp.path().join("driver-ran");
+        let filter = plant_script(&tmp.path().join("bin/filter.sh"), &marker, true);
+        for (key, value) in [
+            ("filter.ev.clean", filter.as_str()),
+            ("filter.ev.smudge", filter.as_str()),
+            ("filter.ev.required", "true"),
+            ("diff.ev.textconv", filter.as_str()),
+            ("diff.ev.command", filter.as_str()),
+            ("diff.external", filter.as_str()),
+            ("merge.ev.driver", filter.as_str()),
+        ] {
+            setup_git(&workspace, &["config", key, value]).await;
+        }
+
+        let tool = full_tool(&workspace);
+        std::fs::write(workspace.join("a.txt"), "a2\n").expect("test: modify");
+        let diff = run(&tool, json!({"operation": "diff"})).await;
+        assert!(diff.success, "{:?}", diff.error);
+        assert!(diff.output.contains("a2"), "{}", diff.output);
+        let add = run(&tool, json!({"operation": "add", "paths": "a.txt"})).await;
+        assert!(add.success, "{:?}", add.error);
+        let commit = run(&tool, json!({"operation": "commit", "message": "two"})).await;
+        assert!(commit.success, "{:?}", commit.error);
+        std::fs::write(workspace.join("a.txt"), "a3\n").expect("test: modify");
+        let push = run(&tool, json!({"operation": "stash", "action": "push"})).await;
+        assert!(push.success, "{:?}", push.error);
+        let pop = run(&tool, json!({"operation": "stash", "action": "pop"})).await;
+        assert!(pop.success, "{:?}", pop.error);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).expect("test: read"),
+            "a3\n"
+        );
+        assert_not_run(&marker, "a filter or diff driver");
+    }
+
+    /// RED before GIT-ENV: an authenticated transfer ran the repository's
+    /// `credential.helper` with PRX's environment. A loopback server that
+    /// answers every request with 401 makes git ask for credentials.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_does_not_run_a_repository_credential_helper() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        plant_parent_sentinel();
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("a.txt", "a\n")]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let port = listener.local_addr().expect("test: address").port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 8192];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"prx\"\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let marker = tmp.path().join("credential-helper-ran");
+        let helper = plant_script(&tmp.path().join("bin/credential.sh"), &marker, false);
+        let url = format!("http://127.0.0.1:{port}/r.git");
+        setup_git(&workspace, &["remote", "add", "origin", &url]).await;
+        setup_git(&workspace, &["config", "http.proxy", ""]).await;
+        setup_git(&workspace, &["config", "credential.helper", &helper]).await;
+        setup_git(&workspace, &["config", &format!("credential.{url}.helper"), &helper]).await;
+
+        let tool = full_tool(&workspace);
+        let push = run(
+            &tool,
+            json!({"operation": "push", "remote": "origin", "branch": "main"}),
+        )
+        .await;
+        server.abort();
+        assert!(!push.success, "the push to a 401 server cannot succeed");
+        assert_not_run(&marker, "credential.helper");
+    }
+
+    /// RED before GIT-ENV (R-HOOKSENV I-3): a checkout that rewrites the
+    /// workspace `hooks.json` was an ordinary, medium-risk checkout, so its
+    /// ordinary approval covered it. It is now a high-risk operation of its
+    /// own; a checkout that leaves the launch definitions alone keeps its
+    /// ordinary approval.
+    #[tokio::test]
+    async fn a_checkout_that_changes_hooks_json_needs_its_own_approval() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("a.txt", "a\n"), ("hooks.json", "{\"v\":1}\n")]).await;
+        setup_git(&workspace, &["checkout", "-q", "-b", "other"]).await;
+        std::fs::write(workspace.join("hooks.json"), "{\"v\":2}\n").expect("test: hooks v2");
+        setup_git(&workspace, &["commit", "-q", "-am", "hooks v2"]).await;
+        setup_git(&workspace, &["checkout", "-q", "main"]).await;
+        setup_git(&workspace, &["checkout", "-q", "-b", "same"]).await;
+        std::fs::write(workspace.join("a.txt"), "a2\n").expect("test: a2");
+        setup_git(&workspace, &["commit", "-q", "-am", "a2"]).await;
+        setup_git(&workspace, &["checkout", "-q", "main"]).await;
+
+        let tool = test_tool(&workspace);
+        let result = run(
+            &tool,
+            granted(
+                "git_operations:checkout:other",
+                json!({"operation": "checkout", "branch": "other"}),
+            ),
+        )
+        .await;
+        assert!(
+            !result.success,
+            "an ordinary checkout approval covered a hooks.json change"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("workspace launch definition"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("hooks.json")).expect("test: read"),
+            "{\"v\":1}\n"
+        );
+
+        let result = run(
+            &tool,
+            granted(
+                "git_operations:checkout:same",
+                json!({"operation": "checkout", "branch": "same"}),
+            ),
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).expect("test: read"),
+            "a2\n"
+        );
+    }
+
+    /// RED before GIT-ENV: `stash pop` bringing back a changed `mcp.json`,
+    /// and `stash push` reverting a changed `hooks.json`, were ordinary
+    /// stash operations.
+    #[tokio::test]
+    async fn a_stash_that_changes_a_launch_definition_needs_its_own_approval() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("hooks.json", "{\"v\":1}\n"), ("mcp.json", "{}\n")]).await;
+        std::fs::write(workspace.join("mcp.json"), "{\"servers\":{}}\n").expect("test: mcp v2");
+        setup_git(&workspace, &["stash", "push", "-q"]).await;
+        std::fs::write(workspace.join("hooks.json"), "{\"v\":2}\n").expect("test: hooks v2");
+
+        let tool = test_tool(&workspace);
+        let push = run(
+            &tool,
+            granted(
+                "git_operations:stash:push",
+                json!({"operation": "stash", "action": "push"}),
+            ),
+        )
+        .await;
+        assert!(!push.success, "an ordinary stash approval covered reverting hooks.json");
+        assert!(
+            push.error.unwrap_or_default().contains("workspace launch definition"),
+            "the refusal names the launch definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("hooks.json")).expect("test: read"),
+            "{\"v\":2}\n"
+        );
+
+        setup_git(&workspace, &["checkout", "-q", "--", "hooks.json"]).await;
+        let pop = run(
+            &tool,
+            granted(
+                "git_operations:stash:pop",
+                json!({"operation": "stash", "action": "pop"}),
+            ),
+        )
+        .await;
+        assert!(!pop.success, "an ordinary stash approval covered restoring mcp.json");
+        assert!(
+            pop.error.unwrap_or_default().contains("workspace launch definition"),
+            "the refusal names the launch definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("mcp.json")).expect("test: read"),
+            "{}\n"
+        );
+    }
+
+    /// R-GITENV F-1: a push to a local-path remote whose
+    /// `remote.origin.receivepack` names a program (first-wins, so no `-c`
+    /// replaces it) runs git's own receive-pack.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_does_not_run_a_repository_receive_pack() {
+        plant_parent_sentinel();
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(&workspace, &[("a.txt", "a\n")]).await;
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).expect("test: remote");
+        setup_git(&remote, &["init", "-q", "--bare"]).await;
+        let marker = tmp.path().join("receive-pack-ran");
+        let program = plant_script(&tmp.path().join("bin/receive.sh"), &marker, false);
+        setup_git(&workspace, &["remote", "add", "origin", &remote.display().to_string()]).await;
+        setup_git(&workspace, &["config", "remote.origin.receivepack", &program]).await;
+
+        let tool = full_tool(&workspace);
+        let push = run(
+            &tool,
+            json!({"operation": "push", "remote": "origin", "branch": "main"}),
+        )
+        .await;
+        assert!(!push.success, "a repository receive-pack program must refuse the push");
+        assert!(
+            push.error.as_deref().is_some_and(|error| error.contains("receivepack")),
+            "{:?}",
+            push.error
+        );
+        assert_not_run(&marker, "remote.origin.receivepack");
+        setup_git(&workspace, &["config", "--unset", "remote.origin.receivepack"]).await;
+        let push = run(
+            &tool,
+            json!({"operation": "push", "remote": "origin", "branch": "main"}),
+        )
+        .await;
+        assert!(push.success, "{:?}", push.error);
+        setup_git(&remote, &["rev-parse", "--verify", "refs/heads/main"]).await;
+    }
+
+    /// R-GITENV F-11: the porcelain-v2 records, NUL separated.
+    #[test]
+    fn the_status_parser_reads_every_porcelain_v2_record() {
+        let output = [
+            "# branch.oid 0123",
+            "# branch.head main",
+            "1 M. N... 100644 100644 100644 aaaa bbbb staged.txt",
+            "1 .M N... 100644 100644 100644 aaaa aaaa with space.txt",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 new name.txt",
+            "old name.txt",
+            "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.txt",
+            "? untracked file.txt",
+            "! ignored.txt",
+            "",
+        ]
+        .join("\0");
+        let status = parse_porcelain_v2(&output);
+        assert_eq!(status.branch, "main");
+        assert_eq!(
+            status.staged,
+            vec![
+                json!({"path": "staged.txt", "status": "M"}),
+                json!({"path": "new name.txt", "status": "R", "original_path": "old name.txt"}),
+            ]
+        );
+        assert_eq!(status.unstaged, vec![json!({"path": "with space.txt", "status": "M"})]);
+        assert_eq!(status.conflicted, vec![json!({"path": "conflict.txt", "status": "UU"})]);
+        assert_eq!(status.untracked, vec!["untracked file.txt".to_string()]);
+    }
+
+    /// R-GITENV F-11 through the tool: staged, unstaged, a space in a path,
+    /// a rename and a conflict.
+    #[tokio::test]
+    async fn status_reports_staged_unstaged_renamed_and_conflicted_paths() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let workspace = tmp.path().join("ws");
+        committed_repo(
+            &workspace,
+            &[
+                ("a.txt", "a\n"),
+                ("b c.txt", "b\n"),
+                ("old.txt", "o\n"),
+                ("conflict.txt", "base\n"),
+            ],
+        )
+        .await;
+        setup_git(&workspace, &["checkout", "-q", "-b", "other"]).await;
+        std::fs::write(workspace.join("conflict.txt"), "other\n").expect("test: other side");
+        setup_git(&workspace, &["commit", "-q", "-am", "other"]).await;
+        setup_git(&workspace, &["checkout", "-q", "main"]).await;
+        std::fs::write(workspace.join("conflict.txt"), "main\n").expect("test: main side");
+        setup_git(&workspace, &["commit", "-q", "-am", "main"]).await;
+        setup_git_may_fail(&workspace, &["merge", "-q", "other"]).await;
+        std::fs::write(workspace.join("a.txt"), "a2\n").expect("test: staged");
+        setup_git(&workspace, &["add", "a.txt"]).await;
+        std::fs::write(workspace.join("b c.txt"), "b2\n").expect("test: unstaged");
+        setup_git(&workspace, &["mv", "old.txt", "new.txt"]).await;
+
+        let result = run(&test_tool(&workspace), json!({"operation": "status"})).await;
+        assert!(result.success, "{:?}", result.error);
+        let status: serde_json::Value = serde_json::from_str(&result.output).expect("test: json");
+        let paths = |list: &str| {
+            status
+                .get(list)
+                .and_then(serde_json::Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert!(paths("staged").contains(&"a.txt".to_string()), "{status}");
+        assert!(paths("staged").contains(&"new.txt".to_string()), "{status}");
+        assert!(paths("unstaged").contains(&"b c.txt".to_string()), "{status}");
+        assert_eq!(paths("conflicted"), vec!["conflict.txt".to_string()], "{status}");
+        assert_eq!(status.get("clean"), Some(&json!(false)));
     }
 
     #[test]

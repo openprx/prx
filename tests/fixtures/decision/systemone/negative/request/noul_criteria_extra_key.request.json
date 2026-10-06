@@ -1,0 +1,15 @@
+{
+  "state": "x",
+  "model": "jev-1.13.0",
+  "questions": {
+    "q": {
+      "type": "noul",
+      "instructions": "Is it?",
+      "criteria": {
+        "true": "yes",
+        "false": "no",
+        "maybe": "?"
+      }
+    }
+  }
+}

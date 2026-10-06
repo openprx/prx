@@ -71,6 +71,54 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
 }
 
+/// A live WhatsApp Web session the release guard closes.
+#[cfg(feature = "whatsapp-web")]
+#[async_trait::async_trait]
+trait BotSession: Send + Sync + 'static {
+    /// Close the connection: stop the keep-alive, close the WebSocket.
+    async fn close(self: Arc<Self>);
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[async_trait::async_trait]
+impl BotSession for wa_rs::Client {
+    async fn close(self: Arc<Self>) {
+        self.disconnect().await;
+    }
+}
+
+/// Closes the session, stops the running bot and drops the client when the
+/// `listen` that started them ends, however it ends (D-067, D-072 M-1). The
+/// channel `Arc` outlives a listener, and the bot task was detached (dropping
+/// a `JoinHandle` does not stop the task), so a channel-runtime restart left
+/// the previous bot running next to the new one. Aborting the bot task alone
+/// is not enough either: the client's WebSocket and keep-alive loop live in
+/// the client, so the session is closed with `disconnect()` as well.
+#[cfg(feature = "whatsapp-web")]
+struct BotRelease<C: BotSession = wa_rs::Client> {
+    bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    client: Arc<Mutex<Option<Arc<C>>>>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl<C: BotSession> Drop for BotRelease<C> {
+    fn drop(&mut self) {
+        let client = self.client.lock().take();
+        if let Some(client) = client {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(client.close());
+                }
+                Err(_) => tracing::warn!("WhatsApp Web session released outside a runtime; it closes on its own"),
+            }
+        }
+        let handle = self.bot_handle.lock().take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+}
+
 impl WhatsAppWebChannel {
     /// Create a new WhatsApp Web channel
     ///
@@ -418,6 +466,12 @@ impl Channel for WhatsAppWebChannel {
 
         let mut bot = builder.build().await?;
         *self.client.lock() = Some(bot.client());
+        // Stopped when this listener ends, also when the channel runtime drops
+        // the listener on a restart or shutdown (D-067).
+        let _release = BotRelease {
+            bot_handle: Arc::clone(&self.bot_handle),
+            client: Arc::clone(&self.client),
+        };
 
         // Run the bot
         let bot_handle = bot.run().await?;
@@ -437,12 +491,7 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        *self.client.lock() = None;
-        let value = self.bot_handle.lock().take();
-        if let Some(handle) = value {
-            handle.abort();
-        }
-
+        // `_release` stops the bot and drops the client here.
         Ok(())
     }
 
@@ -575,6 +624,95 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn make_channel() -> WhatsAppWebChannel {
         WhatsAppWebChannel::new("/tmp/test-whatsapp.db".into(), None, None, vec!["+1234567890".into()])
+    }
+
+    /// Stands in for the wa-rs client: holds a real loopback connection
+    /// until it is closed.
+    #[cfg(feature = "whatsapp-web")]
+    struct LoopbackSession {
+        stream: Mutex<Option<tokio::net::TcpStream>>,
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[async_trait::async_trait]
+    impl BotSession for LoopbackSession {
+        async fn close(self: Arc<Self>) {
+            self.stream.lock().take();
+        }
+    }
+
+    /// D-067 / D-072 M-1, RED before: the bot task started by `listen` was
+    /// detached and the client kept its connection, so dropping the listener
+    /// on a channel-runtime restart left the previous session open. After:
+    /// the release guard `listen` holds closes the session, stops the bot and
+    /// frees the client. wa-rs connects only after a Noise handshake with the
+    /// real service, so the session here is a loopback stand-in behind the
+    /// same trait the guard calls on the wa-rs client.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn dropping_the_listener_closes_the_session_and_stops_the_bot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let address = listener.local_addr().expect("test: addr");
+        let open = Arc::new(AtomicUsize::new(0));
+        {
+            let open = Arc::clone(&open);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let open = Arc::clone(&open);
+                    open.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = [0_u8; 64];
+                        while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+                        open.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        let session = Arc::new(LoopbackSession {
+            stream: Mutex::new(Some(
+                tokio::net::TcpStream::connect(address).await.expect("test: connect"),
+            )),
+        });
+        let client: Arc<Mutex<Option<Arc<LoopbackSession>>>> = Arc::new(Mutex::new(Some(Arc::clone(&session))));
+        let (alive, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let bot_handle = Arc::new(Mutex::new(Some(tokio::spawn(async move {
+            // Stands in for the bot's run loop; holds `alive` until stopped.
+            let _alive = alive;
+            std::future::pending::<()>().await;
+        }))));
+        for _ in 0..6000 {
+            if open.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(open.load(Ordering::SeqCst), 1, "the session is connected");
+
+        drop(BotRelease {
+            bot_handle: Arc::clone(&bot_handle),
+            client: Arc::clone(&client),
+        });
+
+        assert!(bot_handle.lock().is_none());
+        assert!(client.lock().is_none());
+        for _ in 0..6000 {
+            if open.load(Ordering::SeqCst) == 0 && Arc::strong_count(&session) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(open.load(Ordering::SeqCst), 0, "the session's connection is closed");
+        assert_eq!(
+            Arc::strong_count(&session),
+            1,
+            "nothing but the test holds the client any more"
+        );
+        assert!(
+            (&mut stopped).await.is_err(),
+            "the bot task is stopped, dropping what it held"
+        );
     }
 
     #[test]

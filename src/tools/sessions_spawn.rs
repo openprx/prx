@@ -8,11 +8,19 @@
 //! - `history` action: view the conversation log of any sub-agent run
 //! - `steer` action: inject a message into a running sub-agent's context
 
+mod batch_journal;
+mod process_terminal;
+mod task_control;
+mod task_terminal;
+pub(crate) use task_control::{TaskFinalization, TaskRunControl};
+
 use super::chat_assignment::{self, ReturnTrip};
 use super::sessions_list::format_run_usage;
 use super::sessions_read_model;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, SpawnEventSink};
+use crate::agent::document_ingest::DocumentIngestRuntime;
+use crate::agent::turn_contracts::ScopeContext;
+use crate::agent::turn_request::SpawnEventSink;
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -33,7 +41,7 @@ use futures_util::FutureExt;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -102,6 +110,8 @@ pub struct SubAgentRun {
     /// exposes no PID/PGID: only the monitor that owns `Child` may signal and
     /// reap it. Task-mode runs leave this as `None` and retain abort semantics.
     pub(crate) process_control: Option<Arc<ProcessRunControl>>,
+    /// Observer-owned task cleanup acknowledgement; never inferred from abort().
+    pub(crate) task_control: Option<Arc<TaskRunControl>>,
     /// Accumulated conversation history from the sub-agent's execution.
     pub history: Arc<RwLock<Vec<HistoryEntry>>>,
     /// Channel to inject steering messages into the running sub-agent.
@@ -216,6 +226,7 @@ fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
         channel_name: seed.channel_name,
         abort_handle: None,
         process_control: Some(seed.process_control),
+        task_control: None,
         history: seed.history,
         steer_tx: Some(seed.steer_tx),
         parent_run_id: seed.parent_run_id,
@@ -232,6 +243,7 @@ pub(crate) enum ProcessFinalization {
     Natural,
     Terminated,
     TerminationFailed,
+    Unconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +256,8 @@ pub(crate) enum ProcessTerminationRequestResult {
 /// every requester waits for the sole process owner to publish finalization.
 #[derive(Debug)]
 pub(crate) struct ProcessRunControl {
+    /// A recovery projection has no live process owner and cannot signal it.
+    recovery_only: bool,
     termination_tx: watch::Sender<Option<String>>,
     finalized_tx: watch::Sender<Option<ProcessFinalization>>,
     request_timeout: std::time::Duration,
@@ -260,9 +274,23 @@ impl ProcessRunControl {
         let (termination_tx, _) = watch::channel(None);
         let (finalized_tx, _) = watch::channel(None);
         Arc::new(Self {
+            recovery_only: false,
             termination_tx,
             finalized_tx,
             request_timeout,
+            #[cfg(test)]
+            timeout_barrier: None,
+        })
+    }
+
+    fn recovered_unconfirmed() -> Arc<Self> {
+        let (termination_tx, _) = watch::channel(None);
+        let (finalized_tx, _) = watch::channel(Some(ProcessFinalization::Unconfirmed));
+        Arc::new(Self {
+            recovery_only: true,
+            termination_tx,
+            finalized_tx,
+            request_timeout: std::time::Duration::from_secs(PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS),
             #[cfg(test)]
             timeout_barrier: None,
         })
@@ -378,6 +406,7 @@ impl ProcessRunControl {
         let (termination_tx, _) = watch::channel(None);
         let (finalized_tx, _) = watch::channel(None);
         Arc::new(Self {
+            recovery_only: false,
             termination_tx,
             finalized_tx,
             request_timeout: std::time::Duration::from_millis(20),
@@ -398,6 +427,13 @@ impl ProcessRunControl {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SpawnExecutionContext {
+    pub(crate) operator_authority: Option<Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
+    pub(crate) ordinary_authority: Option<Arc<crate::runtime::child_source::ordinary_task::OrdinaryTaskAuthority>>,
+    /// Incoming authority for this child, never an outgoing grant for its tools.
+    pub(crate) incoming_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
+    pub(crate) provider_binding: Option<Arc<crate::runtime::child_source::ChildProviderBinding>>,
+    pub(crate) terminal_usage: Option<Arc<crate::runtime::turn_terminal::TerminalUsageCollector>>,
+    pub(crate) input_receipt: Option<Arc<crate::runtime::child_source::ChildInputReceipt>>,
     pub(crate) run_id: String,
     pub(crate) session_scope_key: String,
     pub(crate) spawn_depth: usize,
@@ -432,6 +468,12 @@ impl SpawnExecutionContext {
     /// computation in `execute`).
     pub(crate) const fn seed_turn_context(run_id: String, session_scope_key: String) -> Self {
         Self {
+            operator_authority: None,
+            ordinary_authority: None,
+            incoming_grant: None,
+            provider_binding: None,
+            terminal_usage: None,
+            input_receipt: None,
             run_id,
             session_scope_key,
             spawn_depth: 0,
@@ -480,6 +522,21 @@ struct SpawnScope {
 }
 
 fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
+    if let Some(context) = crate::tools::execution::current_child_call_context() {
+        let context = context.context();
+        return Some(SpawnScope {
+            sender: context.sender().to_owned(),
+            channel: context.channel().to_owned(),
+            chat_type: context.chat_type.clone(),
+            chat_id: context.chat_id.clone(),
+            owner_id: sessions_read_model::effective_run_owner_from_context(context),
+            topic_id: context.envelope.topic_id.clone(),
+            parent_task_id: context.envelope.task_id.clone(),
+            source_message_event_id: context.envelope.source_message_event_id.clone(),
+            config_generation_id: context.envelope.config_generation_id,
+            config_source_revision: context.envelope.config_source_revision.clone(),
+        });
+    }
     let trusted = args
         .get("_zc_scope_trusted")
         .and_then(serde_json::Value::as_bool)
@@ -519,12 +576,11 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
         channel,
         chat_type,
         chat_id,
-        owner_id: scope
-            .get("owner_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
+        // OWNER-VIS: the run is tagged with the owner the reader side confines
+        // to (`RunOwnerScope::from_args`), computed by the one shared function,
+        // so a caller whose scope carries no explicit owner (a gateway webhook
+        // turn) still finds the runs it started.
+        owner_id: sessions_read_model::effective_run_owner(args),
         topic_id: scope
             .get("topic_id")
             .and_then(serde_json::Value::as_str)
@@ -709,7 +765,7 @@ async fn record_withheld_notice(
     );
     history.write().await.push(HistoryEntry {
         role: "system".to_string(),
-        content: crate::security::audit::redact_secrets(&format!(
+        content: crate::security::redaction::redact_secrets(&format!(
             "{label} withheld: outbound messaging to recipient {recipient_ref} on channel \
              '{dst_channel}' is not permitted by the configured scope rules"
         )),
@@ -826,6 +882,119 @@ const fn status_label(status: &SubAgentStatus) -> &'static str {
     }
 }
 
+/// The tool registry a `sessions_spawn` tool runs its sub-agents with,
+/// bound once after the registry is built.
+///
+/// It holds the registry weakly. The tool is itself an entry of that
+/// registry, so a strong reference was a cycle that kept every superseded
+/// Gateway runtime generation alive, and with it the MCP tool and one stdio
+/// child per used server for each configuration change (D-097 M-3). Whoever
+/// runs a turn holds the registry, so it is alive while the tool executes;
+/// a spawned run takes its own strong reference for as long as it runs.
+#[derive(Default)]
+pub struct ParentToolRegistry(OnceLock<Weak<Vec<Box<dyn Tool>>>>);
+
+impl ParentToolRegistry {
+    /// Bind `registry`; `false` when a registry was already bound.
+    pub fn set(&self, registry: &Arc<Vec<Box<dyn Tool>>>) -> bool {
+        self.0.set(Arc::downgrade(registry)).is_ok()
+    }
+
+    /// The bound registry: `Ok(None)` when none was bound (the tool then
+    /// runs a sub-agent without tools, as before any registry existed).
+    ///
+    /// # Errors
+    ///
+    /// When a registry was bound and is gone: the configuration the tool was
+    /// built for was replaced and its registry released. The tool then
+    /// refuses to spawn rather than run a sub-agent silently without its
+    /// tools (D-098).
+    pub fn get(&self) -> anyhow::Result<Option<Arc<Vec<Box<dyn Tool>>>>> {
+        self.0.get().map_or(Ok(None), |registry| {
+            registry.upgrade().map(Some).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sessions_spawn's tool registry is gone: the configuration it was built for was replaced; \
+                     nothing was spawned, retry the turn"
+                )
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestWorkerRecoveryResult {
+    pub(crate) launch_event_id: i64,
+    pub(crate) result: anyhow::Result<Option<bool>>,
+}
+
+/// Read-only fixture observation of the actual built worker manifest. No key,
+/// transport seal or grant bytes leave the launch producer through this seam.
+#[cfg(test)]
+pub(crate) struct TestWorkerRouteObservation {
+    pub(crate) run_id: String,
+    pub(crate) parent_run_id: Option<String>,
+    pub(crate) owner_id: Option<String>,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) route_hint: Option<String>,
+    pub(crate) route_source_provider: Option<String>,
+    pub(crate) route_credential: Option<providers::credentials::CredentialRef>,
+    pub(crate) key_sha256: Option<[u8; 32]>,
+    pub(crate) route_uses_root_connection: bool,
+    pub(crate) direct_uses_root_connection: bool,
+    pub(crate) child_source_present: bool,
+    pub(crate) child_allowed_count: Option<usize>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestWorkerRouteCapture {
+    pub(crate) total: usize,
+    pub(crate) first: Option<TestWorkerRouteObservation>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestWorkerExecutable {
+    path: PathBuf,
+    sha256: String,
+    private_home: PathBuf,
+    route_observer: Option<Arc<parking_lot::Mutex<TestWorkerRouteCapture>>>,
+}
+
+#[cfg(test)]
+impl TestWorkerExecutable {
+    fn verify(&self) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read as _;
+        anyhow::ensure!(self.path.is_absolute(), "worker artifact path must be absolute");
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&self.path)?.file_type().is_file(),
+            "worker artifact must be a regular file, not a symlink"
+        );
+        let mut file = std::fs::File::open(&self.path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(buffer.get(..count).context("worker artifact read exceeded buffer")?);
+        }
+        anyhow::ensure!(
+            hex::encode(hash.finalize()) == self.sha256,
+            "worker artifact hash changed"
+        );
+        anyhow::ensure!(
+            self.private_home.is_absolute() && std::fs::symlink_metadata(&self.private_home)?.file_type().is_dir(),
+            "worker HOME must be an existing private directory, not a symlink"
+        );
+        Ok(())
+    }
+}
+
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
 /// Returns immediately with a run ID; results are announced via the active channel
 /// when the sub-agent completes.
@@ -841,6 +1010,8 @@ pub struct SessionsSpawnTool {
     /// snapshots the active channel at request time, so the announcement routes to
     /// whichever channel launched the run.
     channel: Arc<RwLock<Arc<dyn Channel>>>,
+    #[cfg(test)]
+    test_worker_executable: Option<TestWorkerExecutable>,
     /// Registry of every configured channel, keyed by [`Channel::name`].
     ///
     /// announce/kill resolve the *originating* channel object from here using the
@@ -856,8 +1027,6 @@ pub struct SessionsSpawnTool {
     provider_name: String,
     /// Model to use for sub-agent calls.
     model: String,
-    /// Temperature for sub-agent LLM calls.
-    temperature: f64,
     /// Security policy (for operation enforcement).
     security: Arc<SecurityPolicy>,
     /// Default recipient for result announcements.
@@ -868,30 +1037,38 @@ pub struct SessionsSpawnTool {
     /// Shared tool registry for sub-agent tool call loops.
     /// Set post-construction via `tools_handle().set(...)` to resolve the chicken-and-egg
     /// problem (sessions_spawn is part of tools_registry, but needs it to run sub-agents).
-    tools: Arc<OnceLock<Arc<Vec<Box<dyn Tool>>>>>,
+    tools: Arc<ParentToolRegistry>,
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
-    /// Multimodal config for sub-agent tool call loops.
-    multimodal_config: MultimodalConfig,
     /// Model-aware compaction resolver for sub-agent tool call loops.
     compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
-    /// Global credential fallback from root config.
+    /// Credential issued for `provider_name` (the gateway provider): released
+    /// to a child only when the child runs on that same provider identity.
     fallback_api_key: Option<String>,
-    /// Provider runtime options (auth profile, state dir, etc.).
-    provider_runtime_options: providers::ProviderRuntimeOptions,
+    /// The providers the operator configured: the only ones a per-call
+    /// `provider` argument may name.
+    configured_providers: providers::ConfiguredProviders,
+    /// What the configured models can do: operator declarations and cached
+    /// catalog metadata. Empty means the adapter bounds only.
+    model_catalog: Arc<providers::catalog::CatalogView>,
+    /// Pinned configuration for a selected hint's owner-bound credential.
+    hint_config: Option<Arc<crate::config::Config>>,
+    default_route_source: Option<(String, providers::credentials::CredentialRef)>,
+    fallback_api_key_owner: String,
+    fallback_uses_root_connection: bool,
     /// Reliability settings applied when a sub-agent overrides the provider.
     ///
     /// Without this the override path built a bare provider with no retry,
     /// backoff or rate-limit handling at all — see [`Self::build_override_provider`].
     reliability: crate::config::ReliabilityConfig,
-    /// Process-mode controls for workspace lifecycle.
-    spawn_config: SessionsSpawnConfig,
     /// Pricing table used only for recording/displaying child-agent token cost.
     cost_config: crate::config::schema::CostConfig,
     /// Shared memory backend for normalized spawn lifecycle events.
     memory: Option<Arc<dyn Memory>>,
+    source_fabric: Option<MemoryFabric>,
+    restart_recovery: Option<AbortOnDrop>,
     event_recording: MemoryEventRecording,
     /// Optional event bridge sink. When set (chat `/bg` path), a task-mode
     /// sub-agent streams its incremental output + tool calls through a
@@ -904,7 +1081,7 @@ pub struct SessionsSpawnTool {
     /// (NeedsInput) awaiting an operator `/approve` / `/deny` decision instead of
     /// auto-failing. When `None` (channels/gateway path, or chat without the
     /// factory) the historical auto-fail-on-gate semantics are preserved.
-    approval_resolver_factory: Option<crate::agent::loop_::SpawnApprovalResolverFactory>,
+    approval_resolver_factory: Option<crate::agent::turn_request::SpawnApprovalResolverFactory>,
     /// Membership of each fan-out, as `spawn_batch` recorded it the moment it
     /// launched.
     ///
@@ -925,42 +1102,64 @@ pub struct SessionsSpawnTool {
     batch_rosters: Arc<RwLock<Vec<BatchRoster>>>,
 }
 
-/// Select a credential for a child provider. The gateway fallback is scoped to
-/// the gateway provider and must not override another provider's auth profile.
+/// Select a credential for a child provider.
+///
+/// Each credential in scope goes only to the provider identity it was issued
+/// for: a named agent's key to that agent's own provider, the gateway fallback
+/// to the gateway provider. A child on any other provider gets none and
+/// resolves its own auth profile, or runs keyless.
 fn resolve_child_provider_api_key(
-    selected_agent_api_key: Option<String>,
-    fallback_api_key: Option<String>,
+    selected_agent: Option<&DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
     child_provider_name: &str,
     gateway_provider_name: &str,
 ) -> Option<String> {
-    if selected_agent_api_key.is_some() {
-        selected_agent_api_key
-    } else if child_provider_name == gateway_provider_name {
-        fallback_api_key
-    } else {
-        None
-    }
+    providers::credential_for_provider_identity(
+        child_provider_name,
+        &[
+            (
+                selected_agent.map(|agent| agent.provider.as_str()),
+                selected_agent.and_then(|agent| agent.api_key.as_deref()),
+            ),
+            (Some(gateway_provider_name), fallback_api_key),
+        ],
+    )
+    .map(str::to_string)
 }
 
 #[cfg(test)]
 mod credential_tests {
     use super::resolve_child_provider_api_key;
+    use crate::config::DelegateAgentConfig;
+
+    fn kimi_agent(api_key: Option<&str>) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: "kimi-code".to_string(),
+            model: "k3".to_string(),
+            system_prompt: None,
+            api_key: api_key.map(str::to_string),
+            credential_ref: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        }
+    }
 
     #[test]
     fn gateway_fallback_is_not_forwarded_to_an_overridden_provider() {
         assert_eq!(
-            resolve_child_provider_api_key(
-                None,
-                Some("qwen-key".to_string()),
-                "kimi-code",
-                "custom:http://127.0.0.1:18082/v1",
-            ),
+            resolve_child_provider_api_key(None, Some("qwen-key"), "kimi-code", "custom:http://127.0.0.1:18082/v1",),
             None
         );
+        let agent = kimi_agent(Some("kimi-key"));
         assert_eq!(
             resolve_child_provider_api_key(
-                Some("kimi-key".to_string()),
-                Some("qwen-key".to_string()),
+                Some(&agent),
+                Some("qwen-key"),
                 "kimi-code",
                 "custom:http://127.0.0.1:18082/v1",
             ),
@@ -969,13 +1168,41 @@ mod credential_tests {
         assert_eq!(
             resolve_child_provider_api_key(
                 None,
-                Some("qwen-key".to_string()),
+                Some("qwen-key"),
                 "custom:http://127.0.0.1:18082/v1",
                 "custom:http://127.0.0.1:18082/v1",
             ),
             Some("qwen-key".to_string())
         );
     }
+
+    /// C0-C: a named agent's key belongs to the agent's provider; a child the
+    /// model moved to another provider does not carry it there.
+    #[test]
+    fn an_agent_key_is_not_forwarded_to_another_provider() {
+        let agent = kimi_agent(Some("kimi-key"));
+        assert_eq!(
+            resolve_child_provider_api_key(Some(&agent), None, "custom:https://elsewhere.example/v1", "openai"),
+            None
+        );
+        assert_eq!(
+            resolve_child_provider_api_key(Some(&agent), Some("root-key"), "OpenAI", "openai"),
+            Some("root-key".to_string())
+        );
+    }
+}
+
+/// How a task-mode child gets its provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildProvider {
+    /// The spawning tool's own chain, built with the connection it was
+    /// configured with (credential, base URL and rotation keys together).
+    Gateway,
+    /// The parent is a routed hint, so its chain is not the configured root
+    /// connection even when a direct child names the root provider.
+    Root,
+    /// A fresh chain with this credential and no base URL.
+    Build { api_key: Option<String> },
 }
 
 /// One member of a fan-out, as it was launched.
@@ -991,6 +1218,9 @@ struct BatchMember {
 #[derive(Debug, Clone)]
 struct BatchRoster {
     batch_id: String,
+    /// The owner the batch was launched for (OWNER-VIS): `join` answers a
+    /// batch only to a caller whose run scope admits this owner.
+    owner_id: Option<String>,
     members: Vec<BatchMember>,
 }
 
@@ -1003,14 +1233,26 @@ struct BatchRoster {
 const MAX_TRACKED_BATCH_ROSTERS: usize = 256;
 
 impl SessionsSpawnTool {
-    fn resolved_process_config_source(&self) -> anyhow::Result<(PathBuf, String)> {
-        let configured_dir = self
-            .provider_runtime_options
+    fn resolved_process_config_source(
+        options: &providers::ProviderRuntimeOptions,
+        pinned_config: Option<&crate::config::Config>,
+    ) -> anyhow::Result<(PathBuf, String)> {
+        let configured_dir = options
             .openprx_dir
             .as_ref()
             .context("sessions_spawn process mode requires the resolved parent config directory")?;
         let config_dir = std::fs::canonicalize(configured_dir)
             .with_context(|| format!("failed to resolve parent config directory {}", configured_dir.display()))?;
+        if let Some(config) = pinned_config {
+            let pinned_path = std::fs::canonicalize(&config.config_path)
+                .context("failed to resolve pinned worker configuration source")?;
+            let worker_path = std::fs::canonicalize(config_dir.join("config.toml"))
+                .context("failed to resolve worker configuration source")?;
+            anyhow::ensure!(
+                pinned_path == worker_path,
+                "worker configuration differs from pinned parent source"
+            );
+        }
         let generation = config_source_generation(&config_dir)?;
         Ok((config_dir, generation))
     }
@@ -1069,45 +1311,116 @@ impl SessionsSpawnTool {
         provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
-        temperature: f64,
+        _temperature: f64,
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
-        multimodal_config: MultimodalConfig,
+        _multimodal_config: MultimodalConfig,
         compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
-        provider_runtime_options: providers::ProviderRuntimeOptions,
-        spawn_config: SessionsSpawnConfig,
+        _provider_runtime_options: providers::ProviderRuntimeOptions,
+        _spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
         let compaction_resolver = CompactionResolver::from_base(compaction_config);
         tracing::debug!("sessions_spawn initialized child compaction resolver");
+        let provider_name: String = provider_name.into();
+        let configured_providers = providers::ConfiguredProviders::default()
+            .with_providers(std::iter::once(provider_name.as_str()))
+            .with_providers(agents.values().map(|agent| agent.provider.as_str()));
         Self {
             channel: Arc::new(RwLock::new(channel)),
+            #[cfg(test)]
+            test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
             provider,
-            provider_name: provider_name.into(),
+            fallback_api_key_owner: provider_name.clone(),
+            fallback_uses_root_connection: true,
+            provider_name,
             model: model.into(),
-            temperature,
             security,
             default_recipient: Arc::new(RwLock::new(None)),
             active_runs,
-            tools: Arc::new(OnceLock::new()),
+            tools: Arc::new(ParentToolRegistry::default()),
             workspace_dir,
-            multimodal_config,
             compaction_resolver,
+            configured_providers,
+            model_catalog: Arc::default(),
+            hint_config: None,
+            default_route_source: None,
             agents: Arc::new(agents),
             fallback_api_key,
-            provider_runtime_options,
             reliability: crate::config::ReliabilityConfig::default(),
-            spawn_config,
             cost_config: crate::config::schema::CostConfig::default(),
             memory: None,
+            source_fabric: None,
             event_recording: MemoryEventRecording::default(),
             event_sink: None,
             approval_resolver_factory: None,
             batch_rosters: Arc::new(RwLock::new(Vec::new())),
+            restart_recovery: None,
         }
+    }
+
+    /// One actual bounded recovery page, retaining every per-launch error.
+    /// This exposes no grant, signing key, or alternate verification path.
+    #[cfg(test)]
+    pub(crate) async fn recover_process_page_for_test(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TestWorkerRecoveryResult>> {
+        let fabric = self
+            .memory_fabric()
+            .context("recovery fixture requires source fabric")?;
+        let workspace = PathBuf::from(fabric.workspace_id());
+        let page = process_terminal::recover_restart_page(&fabric, &workspace, after_id, limit).await?;
+        let mut outcomes = Vec::with_capacity(page.outcomes.len());
+        for item in page.outcomes {
+            let result = match item.result {
+                Ok(Some(recovered)) => recovered.restore(&self.active_runs).await.map(Some),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            };
+            outcomes.push(TestWorkerRecoveryResult {
+                launch_event_id: item.launch_event_id,
+                result,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// Isolated AUT only: the caller validates a root-frozen build/profile manifest.
+    /// Production launch always resolves current_exe and has no override.
+    #[cfg(test)]
+    pub(crate) fn with_test_worker_executable(
+        mut self,
+        path: PathBuf,
+        sha256: String,
+        private_home: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let executable = TestWorkerExecutable {
+            path,
+            sha256,
+            private_home,
+            route_observer: None,
+        };
+        executable.verify()?;
+        self.test_worker_executable = Some(executable);
+        Ok(self)
+    }
+
+    /// Optional per-instance readback only; does not construct or mutate authority.
+    #[cfg(test)]
+    pub(crate) fn with_test_route_observer(
+        mut self,
+        observer: Arc<parking_lot::Mutex<TestWorkerRouteCapture>>,
+    ) -> anyhow::Result<Self> {
+        self.test_worker_executable
+            .as_mut()
+            .context("route observation requires an attested worker artifact")?
+            .route_observer = Some(observer);
+        Ok(self)
     }
 
     pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
@@ -1118,6 +1431,51 @@ impl SessionsSpawnTool {
     #[must_use]
     pub fn with_cost_config(mut self, cost_config: crate::config::schema::CostConfig) -> Self {
         self.cost_config = cost_config;
+        self
+    }
+
+    /// Widen the providers a per-call `provider` argument may name to every
+    /// provider the operator configured (see
+    /// [`providers::ConfiguredProviders::from_config`]). Without it only the
+    /// gateway provider and the named agents' providers are selectable.
+    #[must_use]
+    pub fn with_configured_providers(mut self, configured: &providers::ConfiguredProviders) -> Self {
+        self.configured_providers = self.configured_providers.union(configured);
+        self
+    }
+
+    /// Supply the model evidence a spawn is resolved against
+    /// (`providers::selection::catalog_for`).
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: providers::catalog::CatalogView) -> Self {
+        self.model_catalog = Arc::new(catalog);
+        self
+    }
+
+    #[must_use]
+    pub fn with_hint_config(mut self, config: &crate::config::Config) -> Self {
+        self.hint_config = Some(Arc::new(config.clone()));
+        self
+    }
+
+    /// Preserve a sealed route selection independently of agent execution
+    /// identity when a worker spawns another child.
+    pub fn with_default_route_source(
+        mut self,
+        provider: &str,
+        credential: providers::credentials::CredentialRef,
+    ) -> Self {
+        self.default_route_source = Some((provider.to_string(), credential));
+        self
+    }
+
+    pub fn with_fallback_api_key_owner(mut self, provider: &str) -> Self {
+        self.fallback_api_key_owner = provider.to_string();
+        self
+    }
+
+    pub const fn with_fallback_root_connection(mut self, uses_root: bool) -> Self {
+        self.fallback_uses_root_connection = uses_root;
         self
     }
 
@@ -1175,6 +1533,34 @@ impl SessionsSpawnTool {
         Ok(Arc::from(provider))
     }
 
+    /// How a task-mode child on `child_provider` gets its provider.
+    ///
+    /// Any spelling of the gateway's own provider identity reuses the gateway
+    /// chain, which was built with the credential, base URL and rotation keys
+    /// that belong together. A rebuilt chain never receives the gateway key:
+    /// only a named agent's own key for the agent's own provider, or nothing.
+    fn child_provider_plan(&self, selected_agent: Option<&DelegateAgentConfig>, child_provider: &str) -> ChildProvider {
+        if let Some(agent) = selected_agent.filter(|agent| {
+            providers::ProviderId::of(&agent.provider) == providers::ProviderId::of(child_provider)
+                && (agent.credential_ref.is_some()
+                    || agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))
+        }) {
+            return ChildProvider::Build {
+                api_key: agent.api_key.clone(),
+            };
+        }
+        if providers::canonical_provider_key(child_provider) == providers::canonical_provider_key(&self.provider_name) {
+            if self.model.trim().starts_with("hint:") {
+                return ChildProvider::Root;
+            }
+            return ChildProvider::Gateway;
+        }
+        ChildProvider::Build {
+            api_key: resolve_child_provider_api_key(selected_agent, None, child_provider, &self.provider_name),
+        }
+    }
+
+    #[cfg(test)]
     fn resolve_child_compaction(
         &self,
         provider: &str,
@@ -1183,7 +1569,7 @@ impl SessionsSpawnTool {
         self.compaction_resolver.resolve(provider, model)
     }
 
-    /// Attach a [`SpawnEventSink`] so task-mode sub-agents spawned by this tool
+    /// Attach a `SpawnEventSink` so task-mode sub-agents spawned by this tool
     /// stream their incremental output and tool-call notifications to the chat UI
     /// (live read-only attach, v1.1a).
     ///
@@ -1195,20 +1581,18 @@ impl SessionsSpawnTool {
         self
     }
 
-    /// Attach a [`SpawnApprovalResolverFactory`](crate::agent::loop_::SpawnApprovalResolverFactory)
+    /// Attach a [`SpawnApprovalResolverFactory`](crate::agent::turn_request::SpawnApprovalResolverFactory)
     /// so a task-mode sub-agent that hits the supervised approval gate suspends
     /// (NeedsInput) awaiting an operator decision instead of auto-failing.
     ///
     /// Only the chat `/bg` path sets this; channels/gateway leave it `None` and
     /// keep the historical auto-fail-on-gate semantics (no human is present to
     /// approve, so suspending would only create a zombie).
-    // Called only by the binary crate's `chat::run` (the sole NeedsInput
-    // opt-in), which is not part of a `--lib` build.
-    #[allow(dead_code)]
+    // Called only by `chat::run`, the sole NeedsInput opt-in.
     #[must_use]
     pub(crate) fn with_approval_resolver_factory(
         mut self,
-        factory: crate::agent::loop_::SpawnApprovalResolverFactory,
+        factory: crate::agent::turn_request::SpawnApprovalResolverFactory,
     ) -> Self {
         self.approval_resolver_factory = Some(factory);
         self
@@ -1222,7 +1606,7 @@ impl SessionsSpawnTool {
 
     /// Return a handle to the tools OnceLock so callers can set the registry
     /// post-construction (resolves the chicken-and-egg registration problem).
-    pub fn tools_handle(&self) -> Arc<OnceLock<Arc<Vec<Box<dyn Tool>>>>> {
+    pub fn tools_handle(&self) -> Arc<ParentToolRegistry> {
         self.tools.clone()
     }
 
@@ -1257,9 +1641,32 @@ impl SessionsSpawnTool {
     }
 
     /// Attach shared memory so spawned runs are visible in the live fabric.
+    /// Logical lifecycle storage is independent of execution-memory isolation.
+    pub(crate) fn with_source_fabric(mut self, fabric: MemoryFabric) -> Self {
+        self.source_fabric = Some(fabric);
+        self
+    }
+
     pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
+    }
+
+    /// The owning tool generation bounds recovery lifetime. Disabled decision
+    /// mode starts no task and performs no storage or process probes.
+    pub(crate) fn with_process_recovery(mut self, enabled: bool) -> anyhow::Result<Self> {
+        if !enabled {
+            return Ok(self);
+        }
+        anyhow::ensure!(self.restart_recovery.is_none(), "worker recovery is already attached");
+        let fabric = self.memory_fabric().context("worker recovery requires shared memory")?;
+        let workspace = std::path::PathBuf::from(fabric.workspace_id());
+        let runs = Arc::clone(&self.active_runs);
+        let handle = tokio::runtime::Handle::try_current()?;
+        self.restart_recovery = Some(AbortOnDrop(handle.spawn(async move {
+            process_terminal::run_restart_recovery(fabric, workspace, runs).await;
+        })));
+        Ok(self)
     }
 
     pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
@@ -1329,37 +1736,38 @@ async fn record_spawn_request_event(
     provider_name: &str,
     model: &str,
     lineage: &SpawnLineage,
-) {
+) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
-        return;
+        return Ok(None);
     };
+    // Durable records keep the endpoint, never a URL's `user:password@`.
+    let provider_name = crate::providers::redact_endpoint_userinfo(provider_name);
     let task_event_scope = scope.clone();
     let task_id = task_event_scope
         .run_id
         .clone()
         .unwrap_or_else(|| "sessions_spawn:unknown".to_string());
-    if let Err(error) = fabric
-        .record_inbound_user_message(
-            scope,
-            task,
-            None,
-            Some(
-                json!({
-                    "mode": mode,
-                    "provider": provider_name,
-                    "model": model,
-                    "owner_id": lineage.owner_id,
-                    "topic_id": lineage.topic_id,
-                    "parent_task_id": lineage.parent_task_id,
-                    "source_message_event_id": lineage.source_message_event_id
-                })
-                .to_string(),
-            ),
-        )
-        .await
-    {
-        tracing::warn!("failed to record sessions_spawn request event: {error}");
-    }
+    let grant = crate::runtime::child_source::outgoing_grant();
+    let receipt = crate::runtime::child_source::record_child_input(
+        fabric,
+        scope,
+        task,
+        None,
+        Some(
+            json!({
+                "mode": mode,
+                "provider": provider_name,
+                "model": model,
+                "owner_id": lineage.owner_id,
+                "topic_id": lineage.topic_id,
+                "parent_task_id": lineage.parent_task_id,
+                "source_message_event_id": lineage.source_message_event_id
+            })
+            .to_string(),
+        ),
+        grant.as_deref(),
+    )
+    .await?;
     if let Err(error) = fabric
         .record_task_event(
             task_event_scope,
@@ -1383,6 +1791,7 @@ async fn record_spawn_request_event(
     {
         tracing::warn!("failed to record sessions_spawn task.spawned event: {error}");
     }
+    Ok(receipt)
 }
 
 async fn record_spawn_result_event(
@@ -1407,19 +1816,21 @@ async fn record_spawn_result_event(
         SubAgentStatus::AwaitingInput { prompt } => (false, Some(format!("awaiting approval: {prompt}"))),
         SubAgentStatus::Failed(error) => (false, Some(error.clone())),
     };
+    // The result and task records carry the sub-agent's reply or error text:
+    // redacted like the terminal commit (D-053).
     if let Err(error) = fabric
         .record_worker_result(
             scope,
-            result_text,
+            crate::agent::terminal::redact_persisted_text(result_text),
             Some(
-                json!({
+                crate::agent::terminal::redact_persisted_json(json!({
                     "success": success,
                     "error": error,
                     "owner_id": lineage.owner_id,
                     "topic_id": lineage.topic_id,
                     "parent_task_id": lineage.parent_task_id,
                     "source_message_event_id": lineage.source_message_event_id
-                })
+                }))
                 .to_string(),
             ),
         )
@@ -1434,7 +1845,7 @@ async fn record_spawn_result_event(
             task_id,
             task_event_type,
             Some(
-                json!({
+                crate::agent::terminal::redact_persisted_json(json!({
                     "success": success,
                     "error": error,
                     "result_preview": result_text.chars().take(500).collect::<String>(),
@@ -1442,7 +1853,7 @@ async fn record_spawn_result_event(
                     "topic_id": lineage.topic_id,
                     "parent_task_id": lineage.parent_task_id,
                     "source_message_event_id": lineage.source_message_event_id
-                })
+                }))
                 .to_string(),
             ),
         )
@@ -1465,15 +1876,73 @@ async fn commit_process_terminal_state(
     token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
     process_control: &ProcessRunControl,
     finalization: ProcessFinalization,
+    repair: Option<&process_terminal::ConfirmedProcessRepair>,
     #[cfg(test)] commit_hook: Option<ProcessTerminalCommitHook>,
-) {
+) -> anyhow::Result<()> {
     let mut runs = active_runs.write().await;
-    if let Some(run) = runs.iter_mut().find(|run| run.id == run_id) {
-        run.finished_at = Some(Utc::now());
-        run.status = status;
-        run.token_usage_records.extend(token_usage_records);
-        run.steer_tx = None;
+    let run = runs
+        .iter_mut()
+        .find(|run| run.id == run_id)
+        .context("process terminal registry row missing")?;
+    let prior_finalization = process_control.finalization();
+    if let Some(repair) = repair {
+        anyhow::ensure!(
+            finalization == ProcessFinalization::Natural
+                && repair.matches(run_id, run.owner_id.as_deref(), &status, &token_usage_records),
+            "process repair proposal differs from verified completion"
+        );
     }
+    let repairing = repair.is_some()
+        && matches!(
+            prior_finalization,
+            Some(ProcessFinalization::Unconfirmed | ProcessFinalization::TerminationFailed)
+        );
+    if let Some(previous) = prior_finalization.filter(|_| !repairing) {
+        let same_status = match (&run.status, &status) {
+            (SubAgentStatus::Completed(left), SubAgentStatus::Completed(right))
+            | (SubAgentStatus::Failed(left), SubAgentStatus::Failed(right)) => left == right,
+            _ => false,
+        };
+        anyhow::ensure!(
+            previous == finalization && same_status,
+            "process terminal conflicts with confirmed finalization"
+        );
+    }
+    // Validate the entire merge before changing status or releasing the slot.
+    let mut known = std::collections::BTreeMap::new();
+    for usage in &run.token_usage_records {
+        anyhow::ensure!(
+            repair.is_none() || usage.settlement_id.is_some(),
+            "verified process repair cannot reconcile unidentified prior usage"
+        );
+        if let Some(id) = usage.settlement_id.as_deref() {
+            anyhow::ensure!(!id.is_empty(), "process settlement identity is empty");
+            if let Some(previous) = known.insert(id, usage) {
+                anyhow::ensure!(previous == usage, "process registry contains conflicting settlements");
+            }
+        }
+    }
+    let mut additions = Vec::new();
+    for usage in &token_usage_records {
+        if let Some(id) = usage.settlement_id.as_deref() {
+            anyhow::ensure!(!id.is_empty(), "process settlement identity is empty");
+            if let Some(previous) = known.get(id) {
+                anyhow::ensure!(*previous == usage, "process settlement conflicts with prior usage");
+                continue;
+            }
+            known.insert(id, usage);
+        } else {
+            anyhow::ensure!(
+                prior_finalization.is_none(),
+                "legacy process usage cannot be replayed without settlement identity"
+            );
+        }
+        additions.push(usage.clone());
+    }
+    run.finished_at.get_or_insert_with(Utc::now);
+    run.status = status;
+    run.token_usage_records.extend(additions);
+    run.steer_tx = None;
 
     #[cfg(test)]
     if let Some(hook) = commit_hook {
@@ -1484,7 +1953,14 @@ async fn commit_process_terminal_state(
     // Registry readers remain excluded by the write lock until both terminal
     // status and finalization are committed, so no caller can observe an early
     // slot release or terminal status with an unfinalized process control.
-    process_control.finalize(finalization);
+    if repairing {
+        // The external observer has joined the sole monitor and still holds
+        // the registry lock; the verified proposal and usage merge agree.
+        process_control.finalized_tx.send_replace(Some(finalization));
+    } else {
+        process_control.finalize(finalization);
+    }
+    Ok(())
 }
 
 async fn commit_process_owner_failure_if_unfinalized(
@@ -1496,17 +1972,21 @@ async fn commit_process_owner_failure_if_unfinalized(
     if process_control.finalization().is_some() {
         return;
     }
-    commit_process_terminal_state(
+    if let Err(commit_error) = commit_process_terminal_state(
         active_runs,
         run_id,
         SubAgentStatus::Failed(error),
         Vec::new(),
         process_control,
         ProcessFinalization::TerminationFailed,
+        None,
         #[cfg(test)]
         None,
     )
-    .await;
+    .await
+    {
+        tracing::error!(run_id, error = %commit_error, "process failure terminal remains unconfirmed");
+    }
 }
 
 /// Make a process-mode run answer a kill aimed at its **own** registry row.
@@ -1627,14 +2107,132 @@ fn watch_task_mode_monitor(
     handle: tokio::task::JoinHandle<()>,
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     run_id: String,
+    cleanup: Option<Arc<crate::runtime::turn_cleanup::CleanupTracker>>,
+    task_control: Option<Arc<TaskRunControl>>,
+    mut work_guard: Option<crate::runtime::registry::WorkGuard>,
+    terminal_journal: Option<Arc<task_terminal::TaskTerminalJournal>>,
 ) {
     tokio::spawn(async move {
-        let Err(error) = handle.await else {
-            return;
+        let joined = handle.await;
+        if let Some(control) = &task_control {
+            control.revoke_authority();
+        }
+        // The observer outlives abort of the run, and owns its cleanup ticket
+        // chain independently of the turn that originally spawned the run.
+        let drained = match cleanup {
+            Some(owner) => {
+                owner
+                    .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(15))
+                    .await
+            }
+            None => Ok(()),
         };
-        let reason = vanished_monitor_reason(&error, "sub-agent run");
-        if commit_run_termination_if_unfinished(&active_runs, &run_id, &reason).await {
-            tracing::warn!(run_id = %run_id, "{reason}");
+        let recovered = if drained.is_ok() {
+            if let Some(journal) = terminal_journal.as_ref() {
+                let interruption = joined.as_ref().err().map(|error| {
+                    let status = if error.is_cancelled() {
+                        crate::agent::terminal::TurnTerminalStatus::Cancelled
+                    } else {
+                        crate::agent::terminal::TurnTerminalStatus::Failed
+                    };
+                    let reason = task_control
+                        .as_ref()
+                        .and_then(|control| control.reason())
+                        .unwrap_or_else(|| vanished_monitor_reason(error, "sub-agent run"));
+                    (status, reason)
+                });
+                Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(15), journal.recover(interruption))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (reason, mut finalization) = if drained.is_err() {
+            tracing::error!(run_id = %run_id, "Sub-agent child cleanup remains unconfirmed");
+            (
+                Some("sub-agent child cleanup remains unconfirmed".to_owned()),
+                TaskFinalization::Unconfirmed,
+            )
+        } else if let Some(recovered) = recovered {
+            let reconciled = match recovered {
+                Ok(committed) => {
+                    let mut runs = active_runs.write().await;
+                    runs.iter_mut().find(|run| run.id == run_id).map_or_else(
+                        || {
+                            Err(anyhow::anyhow!(
+                                "task registry disappeared before terminal reconciliation"
+                            ))
+                        },
+                        |run| committed.reconcile_run(run),
+                    )
+                }
+                Err(error) => Err(error),
+            };
+            match reconciled {
+                Ok(status) => (
+                    None,
+                    if status == crate::agent::terminal::TurnTerminalStatus::Cancelled {
+                        TaskFinalization::Terminated
+                    } else {
+                        TaskFinalization::Natural
+                    },
+                ),
+                Err(error) => {
+                    tracing::error!(run_id = %run_id, error = %error, "task terminal recovery remains unconfirmed");
+                    (
+                        Some("task terminal recovery remains unconfirmed".to_owned()),
+                        TaskFinalization::Unconfirmed,
+                    )
+                }
+            }
+        } else if let Err(error) = joined {
+            if error.is_cancelled() {
+                (
+                    Some(
+                        task_control
+                            .as_ref()
+                            .and_then(|control| control.reason())
+                            .map(|reason| {
+                                if reason == KILLED_BY_USER_REASON {
+                                    reason
+                                } else {
+                                    format!("sub-agent run ({reason}) {TERMINATED_BEFORE_RESULT_SUFFIX}")
+                                }
+                            })
+                            .unwrap_or_else(|| vanished_monitor_reason(&error, "sub-agent run")),
+                    ),
+                    TaskFinalization::Terminated,
+                )
+            } else {
+                (
+                    Some(vanished_monitor_reason(&error, "sub-agent run")),
+                    TaskFinalization::Unconfirmed,
+                )
+            }
+        } else {
+            (None, TaskFinalization::Natural)
+        };
+        if let Some(reason) = reason {
+            if commit_run_termination_if_unfinished(&active_runs, &run_id, &reason).await {
+                tracing::warn!(run_id = %run_id, "{reason}");
+            } else if finalization == TaskFinalization::Terminated {
+                // A previously committed terminal result wins the abort race.
+                finalization = TaskFinalization::Natural;
+            }
+        }
+        if finalization != TaskFinalization::Unconfirmed {
+            if let Some(guard) = work_guard.as_mut() {
+                guard.mark_cleanup_confirmed();
+            }
+        }
+        if let Some(control) = task_control {
+            control.publish(finalization);
         }
     });
 }
@@ -1650,14 +2248,208 @@ fn watch_process_mode_monitor(
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     run_id: String,
     process_control: Arc<ProcessRunControl>,
+    mut work_guard: crate::runtime::registry::WorkGuard,
+    verified_terminal: Arc<parking_lot::Mutex<Option<process_terminal::VerifiedWorkerCompletion>>>,
+    recovery: Option<Arc<process_terminal::ProcessRecovery>>,
+    ordinary_terminal: Arc<parking_lot::Mutex<Option<process_terminal::ordinary::VerifiedOrdinaryWorkerCompletion>>>,
+    ordinary_recovery: Option<process_terminal::ordinary::OrdinaryProcessRecovery>,
+    operator_terminal: Arc<parking_lot::Mutex<Option<process_terminal::operator::VerifiedOperatorWorkerCompletion>>>,
+    operator_recovery: Option<process_terminal::operator::OperatorProcessRecovery>,
 ) {
     tokio::spawn(async move {
-        let Err(error) = handle.await else {
-            return;
-        };
-        let reason = vanished_monitor_reason(&error, "sub-agent process monitor");
-        tracing::warn!(run_id = %run_id, "{reason}");
-        commit_process_owner_failure_if_unfinalized(&active_runs, &run_id, process_control.as_ref(), reason).await;
+        let joined = handle.await;
+        if !matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            let mut retained = verified_terminal.lock().clone();
+            if retained.is_none() {
+                if let Some(recovery) = recovery.as_ref() {
+                    match recovery.recover().await {
+                        Ok(completion) => retained = completion,
+                        Err(error) => tracing::error!(run_id = %run_id, error = %error,
+                            "process observer journal recovery remains unconfirmed"),
+                    }
+                }
+            }
+            if let Some(completion) = retained {
+                if completion.run_id() == run_id {
+                    let repair = recovery
+                        .as_ref()
+                        .map(|owner| owner.repair(completion.clone()))
+                        .transpose();
+                    let repair = match repair {
+                        Ok(repair) => repair,
+                        Err(error) => {
+                            tracing::error!(run_id = %run_id, error = %error, "process repair authority unavailable");
+                            None
+                        }
+                    };
+                    let (result, usage) = completion.into_parts();
+                    let status = if result.success {
+                        SubAgentStatus::Completed(result.output)
+                    } else {
+                        SubAgentStatus::Failed(sub_agent_reported_failure(
+                            result.error.as_deref().unwrap_or("worker failed"),
+                        ))
+                    };
+                    if let Some(repair) = repair {
+                        if let Err(error) = commit_process_terminal_state(
+                            &active_runs,
+                            &run_id,
+                            status,
+                            usage,
+                            process_control.as_ref(),
+                            ProcessFinalization::Natural,
+                            Some(&repair),
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!(run_id = %run_id, error = %error,
+                            "retained worker completion could not be reconciled");
+                        }
+                    }
+                } else {
+                    tracing::error!(run_id = %run_id, "retained worker completion belongs to another run");
+                }
+            }
+        }
+        if !matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            let mut completion = ordinary_terminal.lock().clone();
+            if completion.is_none() {
+                if let Some(recovery) = ordinary_recovery.as_ref() {
+                    match recovery.recover().await {
+                        Ok(recovered) => completion = recovered,
+                        Err(error) => tracing::error!(run_id = %run_id, error = %error,
+                            "ordinary monitor journal recovery remains unconfirmed"),
+                    }
+                }
+            }
+            if let Some(completion) = completion {
+                let repair = completion.repair();
+                match repair {
+                    Ok(repair) => {
+                        let status = if completion.result.success {
+                            SubAgentStatus::Completed(completion.result.output)
+                        } else {
+                            SubAgentStatus::Failed(sub_agent_reported_failure(
+                                completion.result.error.as_deref().unwrap_or("worker failed"),
+                            ))
+                        };
+                        if let Err(error) = commit_process_terminal_state(
+                            &active_runs,
+                            &run_id,
+                            status,
+                            completion.usage,
+                            process_control.as_ref(),
+                            ProcessFinalization::Natural,
+                            Some(&repair),
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!(run_id = %run_id, error = %error, "ordinary completion registry repair remains unconfirmed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(run_id = %run_id, error = %error, "ordinary process exit remains unconfirmed")
+                    }
+                }
+            }
+        }
+        if !matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            if let Some(recovery) = ordinary_recovery.as_ref() {
+                if let Err(error) = recovery.retain_partial(&active_runs).await {
+                    tracing::error!(run_id = %run_id, error = %error, "ordinary partial usage remains unconfirmed");
+                }
+            }
+        }
+        if !matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            let mut completion = operator_terminal.lock().clone();
+            if completion.is_none() {
+                if let Some(recovery) = operator_recovery.as_ref() {
+                    match recovery.recover().await {
+                        Ok(recovered) => completion = recovered,
+                        Err(error) => tracing::error!(run_id = %run_id, error = %error,
+                            "operator monitor journal recovery remains unconfirmed"),
+                    }
+                }
+            }
+            if let Some(completion) = completion {
+                let repair = completion.repair();
+                match repair {
+                    Ok(repair) => {
+                        let status = if completion.result.success {
+                            SubAgentStatus::Completed(completion.result.output)
+                        } else {
+                            SubAgentStatus::Failed(sub_agent_reported_failure(
+                                completion.result.error.as_deref().unwrap_or("worker failed"),
+                            ))
+                        };
+                        if let Err(error) = commit_process_terminal_state(
+                            &active_runs,
+                            &run_id,
+                            status,
+                            completion.usage,
+                            process_control.as_ref(),
+                            ProcessFinalization::Natural,
+                            Some(&repair),
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!(run_id = %run_id, error = %error, "operator completion registry repair remains unconfirmed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(run_id = %run_id, error = %error, "operator process exit remains unconfirmed")
+                    }
+                }
+            }
+        }
+        if !matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            if let Some(recovery) = operator_recovery.as_ref() {
+                if let Err(error) = recovery.retain_partial(&active_runs).await {
+                    tracing::error!(run_id = %run_id, error = %error, "operator partial usage remains unconfirmed");
+                }
+            }
+        }
+        if process_control.finalization().is_none() {
+            let reason = joined.err().map_or_else(
+                || "process monitor ended with unconfirmed settlement".to_owned(),
+                |error| vanished_monitor_reason(&error, "sub-agent process monitor"),
+            );
+            let mut runs = active_runs.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == run_id) {
+                run.status = SubAgentStatus::Failed(format!("{reason}; cleanup and provider usage remain unconfirmed"));
+                run.steer_tx = None;
+            }
+            process_control.finalize(ProcessFinalization::Unconfirmed);
+            tracing::error!(run_id = %run_id, "process observer could not confirm cleanup and settlement");
+        }
+        if matches!(
+            process_control.finalization(),
+            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
+        ) {
+            work_guard.mark_cleanup_confirmed();
+        }
+        // Unconfirmed and failed termination retain an abandoned registry row.
     });
 }
 
@@ -1814,7 +2606,7 @@ fn task_failure_reason(error: &anyhow::Error) -> String {
         // carries the markers `failure_gave_no_conclusion` recognises, and no
         // sub-agent can produce this type.
         error.to_string()
-    } else if crate::agent::loop_::is_tool_loop_cancelled(error) {
+    } else if crate::agent::turn_contracts::is_tool_loop_cancelled(error) {
         // Somebody cancelled the loop — `prx tasks kill`, a parent cascade, a
         // shutdown. That is a kill, and it is the same shape
         // `vanished_monitor_reason` records for the cascade it can observe.
@@ -2183,7 +2975,7 @@ fn settled_batch(runs: &[SubAgentRun], members: &[BatchMember]) -> Option<Vec<Jo
                         run_id: member.run_id.clone(),
                         task: member.task.clone(),
                         verdict: JoinedVerdict::NoResult(
-                            "the run's registry row was retired before the join could read its result".to_string(),
+                            "no confirmed registry result is available for this recorded batch member".to_string(),
                         ),
                     },
                     |run| JoinedMember {
@@ -2283,7 +3075,7 @@ impl Tool for SessionsSpawnTool {
                     },
                     "provider": {
                         "type": "string",
-                        "description": "For 'spawn' and 'spawn_batch': provider override (e.g. openrouter, ollama). Defaults to the agent config provider, then the gateway provider."
+                        "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider."
                     },
                     "agent": {
                         "type": "string",
@@ -2377,10 +3169,25 @@ impl Tool for SessionsSpawnTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::execution::verify_current_child_call("sessions_spawn")?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
+        if action == "spawn_batch" {
+            anyhow::ensure!(
+                !self
+                    .hint_config
+                    .as_ref()
+                    .is_some_and(|config| config.causal_tree.enabled)
+                    || crate::runtime::child_source::outgoing_grant().is_some(),
+                "decision-enabled spawning requires an issued child grant"
+            );
+        }
+        // OWNER-VIS: every run lookup below is confined to the runs this
+        // caller's owner started; the local-process operator sees them all. A
+        // run outside the scope answers exactly like a missing one.
+        let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
 
         match action {
-            "list" => return self.execute_list().await,
+            "list" => return self.execute_list(&owner_scope).await,
             "kill" => {
                 let run_id = args
                     .get("run_id")
@@ -2399,7 +3206,13 @@ impl Tool for SessionsSpawnTool {
                 // identity `AnnounceOrigin` documents, never a privileged one.
                 let notice_origin = AnnounceOrigin::from_scope(parse_spawn_scope(&args).as_ref());
                 return self
-                    .execute_kill(run_id, approval_grant.as_ref(), notice_origin.as_ref())
+                    .execute_kill(
+                        run_id,
+                        approval_grant.as_ref(),
+                        notice_origin.as_ref(),
+                        &owner_scope,
+                        &args,
+                    )
                     .await;
             }
             "history" => {
@@ -2418,7 +3231,9 @@ impl Tool for SessionsSpawnTool {
                     .and_then(|v| v.as_u64())
                     .map(|value| value.clamp(80, 4000) as usize)
                     .unwrap_or(DEFAULT_HISTORY_ENTRY_MAX_CHARS);
-                return self.execute_history(run_id, last_n, max_chars_per_entry).await;
+                return self
+                    .execute_history(run_id, last_n, max_chars_per_entry, &owner_scope, &args)
+                    .await;
             }
             "steer" => {
                 let run_id = args
@@ -2434,7 +3249,9 @@ impl Tool for SessionsSpawnTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                return self.execute_steer(run_id, message, approval_grant.as_ref()).await;
+                return self
+                    .execute_steer(run_id, message, approval_grant.as_ref(), &owner_scope)
+                    .await;
             }
             "chat_sessions" => return self.execute_chat_sessions(&args),
             "chat_assign" => return self.execute_chat_assign(&args).await,
@@ -2446,7 +3263,7 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'batch_id' parameter for join action"))?;
-                return self.execute_join(batch_id).await;
+                return self.execute_join(batch_id, &owner_scope).await;
             }
             _ => {} // fall through to spawn
         }
@@ -2604,15 +3421,38 @@ impl SessionsSpawnTool {
             });
         }
 
+        let batch_caller = crate::tools::execution::current_child_call_context();
+        if let Some(caller) = &batch_caller {
+            caller.verify_tool("sessions_spawn")?;
+        }
+        let batch_owner = batch_caller
+            .as_ref()
+            .map(|caller| caller.context().envelope.resolved_owner_id())
+            .or_else(|| parse_spawn_scope(args).and_then(|scope| scope.owner_id));
         let batch_id = format!("batch-{}", Uuid::new_v4());
         let mut member_args = Vec::with_capacity(entries.len());
         let mut rejected = Vec::new();
         for entry in entries {
             match Self::batch_member_args(args, entry) {
-                Ok(built) => member_args.push(built),
+                Ok(built) => member_args.push((Uuid::new_v4().to_string(), built)),
                 Err(error) => rejected.push(json!({"task": entry, "error": error.to_string()})),
             }
         }
+
+        let prepared = if let Some(grant) = crate::runtime::child_source::outgoing_grant() {
+            let fabric = grant.source_fabric().clone();
+            Some(batch_journal::PreparedBatch::prepare(fabric, &grant, &batch_id, &member_args).await?)
+        } else if let Some(caller) = crate::tools::execution::current_child_call_context() {
+            caller.verify_tool("sessions_spawn")?;
+            if let Some(publication) = caller.context().ordinary_child_publication.as_ref() {
+                batch_journal::PreparedBatch::prepare_ordinary(publication, caller.context(), &batch_id, &member_args)
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Launched together rather than one after another: `execute_spawn`
         // awaits (memory events, config hashing for process mode) before it
@@ -2622,13 +3462,33 @@ impl SessionsSpawnTool {
         let outcomes = futures_util::future::join_all(
             member_args
                 .iter()
-                .map(|member| self.execute_spawn(member, Some(&batch_id))),
+                .map(|(run_id, member)| self.execute_spawn_with_id(member, Some(&batch_id), Some(run_id))),
         )
         .await;
 
+        let mut dispatched = Vec::with_capacity(outcomes.len());
+        for ((reserved, _), outcome) in member_args.iter().zip(&outcomes) {
+            dispatched.push(match outcome {
+                Ok(outcome) => match &outcome.run_id {
+                    Some(actual) => {
+                        anyhow::ensure!(actual == reserved, "batch member run differs from reserved identity");
+                        batch_journal::DispatchState::Started
+                    }
+                    None => batch_journal::DispatchState::Rejected,
+                },
+                Err(_) => batch_journal::DispatchState::Unknown,
+            });
+        }
+        let journal_required = prepared.is_some();
+        let journal_failed = if let Some(prepared) = prepared {
+            prepared.finish(dispatched).await.is_err()
+        } else {
+            false
+        };
         let mut spawned = Vec::new();
+        let mut uncertain_dispatch = Vec::new();
         let mut roster = Vec::new();
-        for (member, outcome) in member_args.iter().zip(outcomes) {
+        for ((reserved_run_id, member), outcome) in member_args.iter().zip(outcomes) {
             let task = member.get("task").cloned().unwrap_or(serde_json::Value::Null);
             match outcome {
                 Ok(outcome) => match outcome.run_id {
@@ -2647,7 +3507,8 @@ impl SessionsSpawnTool {
                         "error": outcome.result.error.unwrap_or_else(|| "sub-agent was not started".to_string()),
                     })),
                 },
-                Err(error) => rejected.push(json!({"task": task, "error": error.to_string()})),
+                Err(error) => uncertain_dispatch
+                    .push(json!({"run_id": reserved_run_id, "task": task, "error": error.to_string()})),
             }
         }
         if !roster.is_empty() {
@@ -2657,22 +3518,41 @@ impl SessionsSpawnTool {
             }
             rosters.push(BatchRoster {
                 batch_id: batch_id.clone(),
+                owner_id: batch_owner,
                 members: roster,
             });
         }
 
         let started = spawned.len();
-        let payload = json!({
+        let mut payload = json!({
             "batch_id": batch_id,
             "requested": entries.len(),
             "started": started,
             "spawned": spawned,
             "rejected": rejected,
         });
+        if !uncertain_dispatch.is_empty() {
+            payload
+                .as_object_mut()
+                .context("batch result must be an object")?
+                .insert("dispatch_unconfirmed".to_owned(), json!(uncertain_dispatch));
+        }
+        if journal_required {
+            payload
+                .as_object_mut()
+                .context("batch result must be an object")?
+                .insert("recovery_journal_confirmed".to_owned(), json!(!journal_failed));
+        }
         Ok(ToolResult {
-            success: started > 0,
+            success: started > 0 && !journal_failed,
             output: serde_json::to_string_pretty(&payload)?,
-            error: (started == 0).then(|| format!("no sub-agent in batch {batch_id} could be started")),
+            error: if journal_failed {
+                Some(format!(
+                    "batch {batch_id} dispatched, but durable dispatch confirmation is unavailable; use this batch ID to reconcile before retrying"
+                ))
+            } else {
+                (started == 0).then(|| format!("no sub-agent in batch {batch_id} was confirmed started"))
+            },
         })
     }
 
@@ -2684,8 +3564,53 @@ impl SessionsSpawnTool {
     /// because the caller's next decision depends on seeing all four buckets at
     /// once. Nothing is hidden: [`join_summary`] accounts for every member
     /// exactly once and `total` is the sum of the buckets.
-    async fn execute_join(&self, batch_id: &str) -> anyhow::Result<ToolResult> {
-        let members = self.batch_members(batch_id).await;
+    async fn execute_join(
+        &self,
+        batch_id: &str,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+    ) -> anyhow::Result<ToolResult> {
+        let caller = crate::tools::execution::current_child_call_context();
+        if let Some(caller) = &caller {
+            caller.verify_tool("sessions_spawn")?;
+        }
+        let publication = caller
+            .as_ref()
+            .and_then(|caller| caller.context().ordinary_child_publication.as_ref());
+        if let (Some(publication), Some(caller)) = (publication, caller.as_ref()) {
+            publication.verify_caller(caller.context())?;
+        }
+        let recording_enabled = publication.map_or(self.event_recording.enabled, |publication| {
+            publication
+                .generation()
+                .effective
+                .memory
+                .event_recording_config()
+                .enabled
+        });
+        let source_fabric = publication
+            .map(|publication| publication.source_fabric())
+            .or_else(|| self.memory_fabric());
+        let recorded = if recording_enabled {
+            if let Some(fabric) = source_fabric {
+                batch_journal::read(
+                    &fabric,
+                    std::path::Path::new(fabric.workspace_id()),
+                    batch_id,
+                    owner_scope,
+                    None,
+                )
+                .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let members = if let Some(roster) = recorded {
+            roster.members
+        } else {
+            self.batch_members(batch_id, owner_scope).await
+        };
         if members.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -2912,20 +3837,25 @@ impl SessionsSpawnTool {
     /// cover — a batch launched before this tool instance existed, and one
     /// evicted by [`MAX_TRACKED_BATCH_ROSTERS`] — where it is exactly as good,
     /// and exactly as lossy, as it was before.
-    async fn batch_members(&self, batch_id: &str) -> Vec<BatchMember> {
+    async fn batch_members(
+        &self,
+        batch_id: &str,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+    ) -> Vec<BatchMember> {
         let recorded = {
             let rosters = self.batch_rosters.read().await;
             rosters
                 .iter()
                 .find(|roster| roster.batch_id == batch_id)
-                .map(|roster| roster.members.clone())
+                .map(|roster| (owner_scope.admits(roster.owner_id.as_deref()), roster.members.clone()))
         };
-        if let Some(members) = recorded {
-            return members;
+        if let Some((admitted, members)) = recorded {
+            // Another owner's batch is answered as an unknown one.
+            return if admitted { members } else { Vec::new() };
         }
         let runs = self.active_runs.read().await;
         runs.iter()
-            .filter(|run| run.batch_id.as_deref() == Some(batch_id))
+            .filter(|run| run.batch_id.as_deref() == Some(batch_id) && owner_scope.admits(run.owner_id.as_deref()))
             .map(|run| BatchMember {
                 run_id: run.id.clone(),
                 task: run.task.clone(),
@@ -2951,6 +3881,60 @@ impl SessionsSpawnTool {
     /// `batch_id` stamps the run's registry row so `join`, `sessions_list`, and
     /// the control plane can address the whole fan-out as one unit.
     async fn execute_spawn(&self, args: &serde_json::Value, batch_id: Option<&str>) -> anyhow::Result<SpawnOutcome> {
+        self.execute_spawn_with_id(args, batch_id, None).await
+    }
+
+    async fn execute_spawn_with_id(
+        &self,
+        args: &serde_json::Value,
+        batch_id: Option<&str>,
+        reserved_run_id: Option<&str>,
+    ) -> anyhow::Result<SpawnOutcome> {
+        let operator_source = crate::runtime::operator_spawn::claim(args)?;
+        if let Some(source) = &operator_source {
+            source.verify_live()?;
+        }
+        let caller = crate::tools::execution::current_child_call_context();
+        if let Some(caller) = &caller {
+            caller.verify_tool("sessions_spawn")?;
+        }
+        let ordinary_publication = caller
+            .as_ref()
+            .and_then(|caller| caller.context().ordinary_child_publication.as_ref());
+        if let (Some(publication), Some(caller)) = (ordinary_publication, caller.as_ref()) {
+            publication.verify_caller(caller.context())?;
+        }
+        let child_grant = crate::runtime::child_source::outgoing_grant();
+        anyhow::ensure!(
+            child_grant.is_some() || ordinary_publication.is_some() || operator_source.is_some(),
+            "session spawning requires an admitted parent or operator source"
+        );
+        anyhow::ensure!(
+            operator_source.is_none()
+                || (caller.is_none() && child_grant.is_none() && current_spawn_execution_context().is_none()),
+            "operator spawn cannot inherit model or child authority"
+        );
+        let child_model_config = child_grant
+            .as_ref()
+            .map(|grant| grant.generation().effective.as_ref())
+            .or_else(|| ordinary_publication.map(|publication| publication.generation().effective.as_ref()))
+            .or_else(|| {
+                operator_source
+                    .as_ref()
+                    .map(|source| source.generation().effective.as_ref())
+            })
+            .context("spawn admitted configuration missing")?;
+        let launch_security = child_grant
+            .as_ref()
+            .map(|grant| grant.security())
+            .or_else(|| ordinary_publication.map(|publication| publication.security()))
+            .or_else(|| operator_source.as_ref().map(|source| source.security()))
+            .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
+        let provider_options = providers::provider_runtime_options_from_config(child_model_config);
+        let provider_options = &provider_options;
+        let provider_reliability = &child_model_config.reliability;
+        let spawn_config = &child_model_config.sessions_spawn;
+        let agents = &child_model_config.agents;
         let task = args
             .get("task")
             .and_then(|v| v.as_str())
@@ -2966,7 +3950,7 @@ impl SessionsSpawnTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(self.spawn_config.default_mode.as_str())
+            .unwrap_or(spawn_config.default_mode.as_str())
             .to_ascii_lowercase();
         if mode != "task" && mode != "process" {
             return Ok(SpawnOutcome::rejected(format!(
@@ -2974,14 +3958,10 @@ impl SessionsSpawnTool {
             )));
         }
         let process_memory_strategy = if mode == "process" {
-            normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string()
+            normalize_process_memory_strategy(&spawn_config.process_memory_strategy)?.to_string()
         } else {
             String::new()
         };
-        let process_memory_backend = self
-            .memory
-            .as_ref()
-            .map_or_else(|| "none".to_string(), |memory| memory.name().to_string());
 
         let model_override = args
             .get("model")
@@ -3005,7 +3985,28 @@ impl SessionsSpawnTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let spawn_scope = parse_spawn_scope(args);
+        let spawn_scope = if let Some(source) = &operator_source {
+            use crate::runtime::turn_source::TurnSourceProof;
+            let proof = source.proof();
+            Some(SpawnScope {
+                sender: proof.policy_sender().to_owned(),
+                channel: proof.policy_channel().to_owned(),
+                chat_type: proof.policy_chat_type().to_owned(),
+                chat_id: proof
+                    .memory_scope()
+                    .chat_id
+                    .clone()
+                    .context("operator spawn recipient missing")?,
+                owner_id: Some(proof.owner_id().to_owned()),
+                topic_id: None,
+                parent_task_id: Some(proof.run_id().to_owned()),
+                source_message_event_id: proof.source_event_id().map(str::to_owned),
+                config_generation_id: Some(proof.config_generation_id()),
+                config_source_revision: Some(proof.config_source_revision().to_owned()),
+            })
+        } else {
+            parse_spawn_scope(args)
+        };
         let parent_exec_ctx = current_spawn_execution_context();
         // D8-4: a turn-root context represents the turn itself (zero spawn
         // nesting so far), so its first child reports depth 0 — identical to the
@@ -3018,14 +4019,25 @@ impl SessionsSpawnTool {
                 ctx.spawn_depth.saturating_add(1)
             }
         });
-        let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone());
+        let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone()).or_else(|| {
+            use crate::runtime::turn_source::TurnSourceProof;
+            operator_source
+                .as_ref()
+                .map(|source| source.proof().run_id().to_owned())
+        });
         // Whatever the parent turn's surface hides stays hidden for everything
         // this spawn produces, however deeply it nests.
         let inherited_channel_exclusions = parent_exec_ctx
             .as_ref()
             .map(|ctx| ctx.channel_excluded_tools.clone())
             .unwrap_or_default();
-        let session_scope_key = spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+        let session_scope_key = operator_source.as_ref().map_or_else(
+            || spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref()),
+            |source| {
+                use crate::runtime::turn_source::TurnSourceProof;
+                source.proof().session_key().to_owned()
+            },
+        );
 
         // This runtime caps neither how many sub-agents run at once, how deeply
         // they nest, nor how many one session may own: an operator sees every
@@ -3046,7 +4058,7 @@ impl SessionsSpawnTool {
         // so it is a Medium-risk side effect (requires an approval grant under
         // supervised autonomy; denied outright under read-only) rather than Low.
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
-        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+        if let Err(error) = SideEffectGate::new(launch_security.as_ref()).authorize_resource_operation(
             self.name(),
             "sessions_spawn:spawn",
             ResourceRiskLevel::Medium,
@@ -3055,21 +4067,30 @@ impl SessionsSpawnTool {
             return Ok(SpawnOutcome::rejected(error));
         }
 
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = reserved_run_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
 
         let selected_agent = match agent_name.as_deref() {
-            Some(name) => match self.agents.get(name) {
+            Some(name) => match agents.get(name) {
                 Some(cfg) => {
                     if !cfg.spawn_enabled.unwrap_or(true) {
                         return Ok(SpawnOutcome::rejected(format!(
                             "Agent '{name}' is not allowed for sessions_spawn (spawn_enabled=false)."
                         )));
                     }
-                    Some((name.to_string(), cfg.clone()))
+                    let mut selected = cfg.clone();
+                    {
+                        let config = child_model_config;
+                        selected.api_key = providers::credentials::configured_key(
+                            &providers::credentials::ConfigCredentialSource::new(config),
+                            &cfg.provider,
+                            cfg.api_key.as_deref(),
+                            cfg.credential_ref.as_deref(),
+                        );
+                    }
+                    Some((name.to_string(), selected))
                 }
                 None => {
-                    let mut available = self
-                        .agents
+                    let mut available = agents
                         .iter()
                         .filter(|(_, cfg)| cfg.spawn_enabled.unwrap_or(true))
                         .map(|(name, _)| name.as_str())
@@ -3109,6 +4130,16 @@ impl SessionsSpawnTool {
         // `None` (no trusted scope) falls back at announce time to the shared
         // active channel, preserving single-channel / legacy behaviour.
         let run_channel_name = spawn_scope.as_ref().map(|scope| scope.channel.clone());
+        let operator_channel = if operator_source.is_some() {
+            let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
+            anyhow::ensure!(
+                Some(channel.name()) == run_channel_name.as_deref(),
+                "operator spawn announcement channel differs from its source"
+            );
+            Some(channel)
+        } else {
+            None
+        };
 
         // Whether this run posts its own result to the channel when it ends.
         //
@@ -3143,24 +4174,218 @@ impl SessionsSpawnTool {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
 
-        let resolved_provider_name = provider_override.unwrap_or_else(|| {
+        anyhow::ensure!(
+            !child_model_config.causal_tree.enabled || child_grant.is_some() || operator_source.is_some(),
+            "decision-enabled spawning requires a child grant or typed operator source"
+        );
+        let memory_fabric = child_grant
+            .as_ref()
+            .map(|grant| grant.source_fabric().clone())
+            .or_else(|| ordinary_publication.map(|publication| publication.source_fabric()))
+            .or_else(|| operator_source.as_ref().map(|source| source.fabric().clone()))
+            .context("spawn admitted memory fabric missing")?;
+        let process_memory_backend = memory_fabric.memory().name().to_owned();
+        let child_model_catalog = child_grant
+            .as_ref()
+            .map(|grant| grant.provider_catalog())
+            .or_else(|| ordinary_publication.map(|publication| publication.provider_catalog()))
+            .or_else(|| operator_source.as_ref().map(|source| source.catalog()))
+            .context("spawn admitted provider catalog missing")?;
+        // A per-call provider is accepted only among the providers the operator
+        // configured: a prompt must not be able to direct this run, or a
+        // credential, to a host the operator never chose.
+        if let Some(requested) = provider_override.as_deref() {
+            let configured = providers::ConfiguredProviders::from_config(child_model_config);
+            if let Err(error) = configured.ensure_permits(requested) {
+                return Ok(SpawnOutcome::rejected(error.to_string()));
+            }
+        }
+        let inherited_model = if let Some(grant) = &child_grant {
+            grant.model_source()?
+        } else if let Some(publication) = ordinary_publication {
+            publication.model_source()
+        } else {
+            use crate::runtime::turn_source::TurnSourceProof;
+            let source = operator_source.as_ref().context("spawn model source missing")?;
+            (
+                source.proof().provider_name(),
+                source.proof().model_name(),
+                source.resolved().credential().reference(),
+            )
+        };
+        let inherits_default_route =
+            provider_override.is_none() && model_override.is_none() && selected_agent.is_none();
+        let mut resolved_provider_name = provider_override.unwrap_or_else(|| {
             selected_agent
                 .as_ref()
                 .map(|(_, cfg)| cfg.provider.trim().to_string())
                 .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| self.provider_name.clone())
+                .unwrap_or_else(|| inherited_model.0.to_owned())
         });
-        let resolved_model = model_override.unwrap_or_else(|| {
+        let mut resolved_model = model_override.unwrap_or_else(|| {
             selected_agent
                 .as_ref()
                 .map(|(_, cfg)| cfg.model.trim().to_string())
                 .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| self.model.clone())
+                .unwrap_or_else(|| inherited_model.1.to_owned())
         });
-        let resolved_compaction = self.resolve_child_compaction(&resolved_provider_name, &resolved_model);
+        // Retain the request spelling: a resolved hint alone cannot prove which
+        // route and credential source selected the actual child provider.
+        let child_requested_model = (child_grant.is_some() || ordinary_publication.is_some())
+            .then(|| (resolved_provider_name.clone(), resolved_model.clone()));
+        let selected_route_hint = resolved_model.trim().strip_prefix("hint:").map(str::to_string);
+        let route_source_provider = selected_route_hint.as_ref().map(|_| resolved_provider_name.clone());
+        // Resolve the child's model for chat before any run or provider
+        // exists: a model that cannot chat is refused and nothing is sent. The
+        // gateway's own provider was resolved when it was built; a provider
+        // this build cannot name fails construction with its own message.
+        if providers::ProviderId::of(&resolved_provider_name).is_resolvable()
+            && let Err(refusal) = providers::selection::check_model(
+                child_model_catalog,
+                &resolved_provider_name,
+                &resolved_model,
+                &providers::catalog::Requirement::chat(),
+                providers::catalog::UnknownPolicy::Invocation,
+            )
+        {
+            return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}")));
+        }
+        let child_credential = operator_source.as_ref().map_or_else(
+            || {
+                (child_grant.is_some() || ordinary_publication.is_some() || resolved_model.trim().starts_with("hint:"))
+                    .then_some(child_model_config)
+                    .map(|config| {
+                        let credential = if inherits_default_route {
+                            (providers::ProviderId::of(inherited_model.0)
+                                == providers::ProviderId::of(&resolved_provider_name))
+                            .then(|| inherited_model.2.clone())
+                        } else {
+                            None
+                        };
+                        credential.unwrap_or_else(|| {
+                            selected_agent
+                                .as_ref()
+                                .filter(|(_, agent)| {
+                                    providers::ProviderId::of(&agent.provider)
+                                        == providers::ProviderId::of(&resolved_provider_name)
+                                })
+                                .map_or_else(
+                                    || providers::selection::credential_for(config, &resolved_provider_name),
+                                    |(name, agent)| {
+                                        agent.credential_ref.as_deref().map_or_else(
+                                            || {
+                                                if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                                                    providers::credentials::CredentialRef::LegacyInline(
+                                                        providers::credentials::LegacySlot::Agent(name.clone()),
+                                                    )
+                                                } else {
+                                                    providers::selection::credential_for(
+                                                        config,
+                                                        &resolved_provider_name,
+                                                    )
+                                                }
+                                            },
+                                            |id| providers::credentials::CredentialRef::Profile { id: id.to_string() },
+                                        )
+                                    },
+                                )
+                        })
+                    })
+            },
+            |source| Some(source.resolved().credential().reference().clone()),
+        );
+        // An admitted ordinary child also needs an exact PMM/credential
+        // selection for direct model names, rather than reusing the gateway.
+        let selected_hint = if let Some(source) = &operator_source {
+            source.verify_live()?;
+            let resolved = source.resolved().clone();
+            resolved_provider_name = resolved.provider_label().to_owned();
+            resolved_model = resolved.model().to_owned();
+            Some(resolved)
+        } else if ordinary_publication.is_some() || resolved_model.trim().starts_with("hint:") {
+            let config = child_model_config;
+            let credential = child_credential.clone().context("child credential selection missing")?;
+            let resolved = match providers::selection::check_with(
+                config,
+                child_model_catalog,
+                &resolved_provider_name,
+                &resolved_model,
+                credential,
+                &providers::catalog::Requirement::chat(),
+                providers::catalog::UnknownPolicy::Invocation,
+            ) {
+                Ok(resolved) => resolved,
+                Err(refusal) => return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}"))),
+            };
+            resolved_provider_name = resolved.provider_label().to_string();
+            resolved_model = resolved.model().to_string();
+            Some(resolved)
+        } else {
+            None
+        };
+        if selected_hint.is_none()
+            && let Some((_, agent)) = selected_agent.as_ref()
+            && let Some(id) = agent.credential_ref.as_deref()
+        {
+            let config = child_model_config;
+            let checked = match providers::selection::check_with(
+                config,
+                child_model_catalog,
+                &resolved_provider_name,
+                &resolved_model,
+                providers::credentials::CredentialRef::Profile { id: id.to_string() },
+                &providers::catalog::Requirement::chat(),
+                providers::catalog::UnknownPolicy::Invocation,
+            ) {
+                Ok(checked) => checked,
+                Err(refusal) => return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}"))),
+            };
+            if checked.credential().api_key() != agent.api_key.as_deref() {
+                return Ok(SpawnOutcome::rejected(
+                    "Cannot spawn this run: agent credential is unavailable".to_string(),
+                ));
+            }
+        }
+        let route_credential = selected_hint
+            .as_ref()
+            .filter(|_| operator_source.as_ref().is_none_or(|source| source.route().is_some()))
+            .map(|resolved| resolved.credential().reference().clone());
+        let route_uses_root_connection = operator_source.as_ref().is_none_or(|source| source.route().is_some())
+            && selected_hint.as_ref().is_some_and(|resolved| {
+                matches!(
+                    resolved.credential().reference(),
+                    providers::credentials::CredentialRef::LegacyInline(providers::credentials::LegacySlot::Root)
+                )
+            });
+        let direct_uses_root_connection = operator_source.as_ref().map_or_else(
+            || {
+                selected_hint.is_none()
+                    && self.fallback_uses_root_connection
+                    && providers::ProviderId::of(&resolved_provider_name)
+                        == providers::ProviderId::of(&self.fallback_api_key_owner)
+                    && selected_agent.as_ref().is_none_or(|(_, agent)| {
+                        agent.credential_ref.is_none()
+                            && agent.api_key.as_deref().is_none_or(|key| key.trim().is_empty())
+                    })
+            },
+            |source| {
+                source.route().is_none()
+                    && matches!(
+                        source.resolved().credential().reference(),
+                        providers::credentials::CredentialRef::LegacyInline(providers::credentials::LegacySlot::Root)
+                    )
+            },
+        );
+        let resolved_compaction = crate::router::context::resolve_effective_compaction_config(
+            &child_model_config.agent.compaction,
+            &resolved_provider_name,
+            &resolved_model,
+            &child_model_config.router,
+            &child_model_config.model_routes,
+        );
         tracing::debug!(
             mode = mode.as_str(),
-            provider = resolved_compaction.selected_provider.as_str(),
+            provider = %resolved_compaction.shown_provider(),
             model = resolved_compaction.selected_model.as_str(),
             max_context_tokens = resolved_compaction.config.max_context_tokens,
             source = ?resolved_compaction.max_context_source,
@@ -3170,38 +4395,73 @@ impl SessionsSpawnTool {
         let resolved_temperature = selected_agent
             .as_ref()
             .and_then(|(_, cfg)| cfg.temperature)
-            .unwrap_or(self.temperature);
-        let selected_agent_api_key = selected_agent.as_ref().and_then(|(_, cfg)| {
-            cfg.api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
-        // A gateway key is only meaningful for the gateway provider.  Passing
-        // it to an explicitly selected provider overrides that provider's own
-        // auth-profile lookup and reliably produces an authentication failure
-        // when the vendors differ (for example, Qwen gateway -> Kimi child).
-        // A named agent key remains an explicit credential for that agent.
-        let resolved_api_key = resolve_child_provider_api_key(
-            selected_agent_api_key,
-            self.fallback_api_key.clone(),
-            &resolved_provider_name,
-            &self.provider_name,
+            .unwrap_or(child_model_config.default_temperature);
+        // A gateway key is only meaningful for the gateway provider, and a named
+        // agent's key only for that agent's own provider. Passing either to a
+        // different provider hands one vendor's secret to another (and, for a
+        // model-chosen provider, to a host the model picked).
+        let resolved_api_key = selected_hint.as_ref().map_or_else(
+            || {
+                resolve_child_provider_api_key(
+                    selected_agent.as_ref().map(|(_, cfg)| cfg),
+                    self.fallback_api_key.as_deref(),
+                    &resolved_provider_name,
+                    &self.fallback_api_key_owner,
+                )
+            },
+            |resolved| resolved.credential().api_key().map(str::to_string),
         );
-        let memory_fabric = self.memory.as_ref().map(|memory| {
-            MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
-                .with_event_recording(self.event_recording)
-        });
-        let spawn_scope_for_event = spawn_event_scope(
-            &self.workspace_dir.to_string_lossy(),
+        let task_provider_plan =
+            self.child_provider_plan(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
+        // Bind ordinary input to the pinned selection before recording.
+        // Tasks retain this provider instance; processes export its verified
+        // selection and construct their own instance from signed snapshots.
+        let ordinary_binding = ordinary_publication
+            .map(|publication| -> anyhow::Result<_> {
+                let (provider, model) = child_requested_model
+                    .as_ref()
+                    .context("ordinary task model request missing")?;
+                Ok(Arc::new(
+                    crate::runtime::child_source::ChildProviderBinding::build_ordinary(
+                        &publication.generation().effective,
+                        publication.provider_catalog(),
+                        provider,
+                        model,
+                        child_credential.clone().context("ordinary task credential missing")?,
+                        Some(publication),
+                    )?,
+                ))
+            })
+            .transpose()?;
+        let event_workspace = memory_fabric.workspace_id();
+        let mut spawn_scope_for_event = spawn_event_scope(
+            event_workspace,
             &run_id,
             &session_scope_key,
             parent_run_id.as_deref(),
             agent_name.as_deref(),
             spawn_scope.as_ref(),
         );
-        let run_lineage = spawn_lineage(&spawn_scope_for_event, parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+        if let Some(grant) = child_grant.as_ref() {
+            grant.bind_event_scope(&mut spawn_scope_for_event)?;
+        }
+        if let Some(binding) = &ordinary_binding {
+            binding.bind_ordinary_input_scope(
+                &binding.provider(),
+                event_workspace,
+                &mut spawn_scope_for_event,
+                caller.as_ref(),
+            )?;
+        }
+        if let Some(source) = &operator_source {
+            source.bind_input_scope(&mut spawn_scope_for_event)?;
+        }
+        let mut run_lineage = spawn_lineage(&spawn_scope_for_event, parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+        if let Some(source) = &operator_source {
+            use crate::runtime::turn_source::TurnSourceProof;
+            run_lineage.parent_task_id = Some(source.proof().run_id().to_owned());
+            run_lineage.source_message_event_id = source.proof().source_event_id().map(str::to_owned);
+        }
         let allowed_tools = selected_agent
             .as_ref()
             .map(|(_, cfg)| {
@@ -3212,19 +4472,22 @@ impl SessionsSpawnTool {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let tools = self.tools.get().cloned();
+        let tools = self.tools.get()?;
         if let Some(registry) = &tools {
             refresh_tools_for_explicit_allowlist(registry, &allowed_tools).await?;
         } else if !allowed_tools.is_empty() {
             anyhow::bail!("sessions_spawn tool registry is not initialized");
         }
         let process_config_source = if mode == "process" {
-            Some(self.resolved_process_config_source()?)
+            Some(Self::resolved_process_config_source(
+                provider_options,
+                Some(child_model_config),
+            )?)
         } else {
             None
         };
-        record_spawn_request_event(
-            memory_fabric.as_ref(),
+        let source_receipt = record_spawn_request_event(
+            Some(&memory_fabric),
             spawn_scope_for_event.clone(),
             task,
             &mode,
@@ -3232,11 +4495,52 @@ impl SessionsSpawnTool {
             &resolved_model,
             &run_lineage,
         )
-        .await;
+        .await?;
 
         if mode == "process" {
             let (process_config_dir, process_config_generation) =
                 process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
+            let process_provider_selection = if child_grant.is_some() || ordinary_publication.is_some() {
+                let (provider, model) = child_requested_model
+                    .as_ref()
+                    .context("process child selection missing")?;
+                Some(crate::session_worker::protocol::WorkerProviderSelection {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    credential: child_credential.clone().context("process child credential missing")?,
+                })
+            } else {
+                None
+            };
+            let process_source_launch = ordinary_publication
+                .map(|publication| {
+                    publication.capture_process_launch(
+                        caller.as_ref().context("ordinary process caller missing")?,
+                        ordinary_binding
+                            .as_deref()
+                            .context("ordinary process binding missing")?,
+                        &spawn_scope_for_event,
+                        task,
+                        source_receipt.clone(),
+                        process_provider_selection
+                            .clone()
+                            .context("ordinary process selection missing")?,
+                        process_config_generation.clone(),
+                    )
+                })
+                .transpose()?
+                .map(crate::runtime::operator_spawn::process::ProcessSourceLaunch::Ordinary);
+            let process_source_launch = match &operator_source {
+                Some(source) => Some(crate::runtime::operator_spawn::process::ProcessSourceLaunch::Operator(
+                    source.capture_process(
+                        &spawn_scope_for_event,
+                        task,
+                        source_receipt.clone(),
+                        process_config_generation.clone(),
+                    )?,
+                )),
+                None => process_source_launch,
+            };
             let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
             let process_control = ProcessRunControl::new();
@@ -3275,9 +4579,9 @@ impl SessionsSpawnTool {
             let model = resolved_model;
             let provider_name = resolved_provider_name;
             let api_key = resolved_api_key;
-            let workspace_root = self.workspace_dir.clone();
-            let worker_workspace_root = self
-                .spawn_config
+            let route_hint = selected_route_hint;
+            let workspace_root = child_model_config.workspace_dir.clone();
+            let worker_workspace_root = spawn_config
                 .worker_workspace_root
                 .as_deref()
                 .map(str::trim)
@@ -3287,17 +4591,20 @@ impl SessionsSpawnTool {
                     if path.is_absolute() {
                         path
                     } else {
-                        self.workspace_dir.join(path)
+                        workspace_root.join(path)
                     }
                 })
-                .unwrap_or_else(|| self.workspace_dir.join("workers"));
+                .unwrap_or_else(|| workspace_root.join("workers"));
             let active_runs = self.active_runs.clone();
             // Resolve the announce channel from the *per-turn* channel name bound
             // to this run (the launching message's scope), not the shared active
             // channel — so a concurrently-processed message cannot mis-route this
             // run's result. Falls back to the active channel when no scope name.
-            let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
-            let keep_workspace = !self.spawn_config.cleanup_on_complete;
+            let channel = match &operator_channel {
+                Some(channel) => Arc::clone(channel),
+                None => self.resolve_announce_channel(run_channel_name.as_deref()).await,
+            };
+            let keep_workspace = !spawn_config.cleanup_on_complete;
             let process_agent_id = selected_agent.as_ref().map(|(name, _)| name.clone());
             let identity_dir = selected_agent.as_ref().and_then(|(_, cfg)| {
                 cfg.identity_dir
@@ -3323,7 +4630,7 @@ impl SessionsSpawnTool {
             // Announcement gate inputs for the process-mode monitor. Same three
             // values the task-mode branch below captures, handed to the same
             // `deliver_or_withhold_notice`.
-            let process_announce_security = self.security.clone();
+            let process_announce_security = Arc::clone(launch_security);
             let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
             let process_announce_history = history_arc.clone();
             let process_parent_run_id = parent_run_id.clone();
@@ -3331,8 +4638,14 @@ impl SessionsSpawnTool {
             let process_spawn_depth = spawn_depth;
             let process_channel_exclusions = inherited_channel_exclusions.clone();
             let process_compaction_config = resolved_compaction.config.clone();
-            let process_event_recording = self.event_recording;
+            let process_event_recording = child_model_config.memory.event_recording_config();
             let process_execution_ctx = SpawnExecutionContext {
+                operator_authority: None,
+                ordinary_authority: None,
+                incoming_grant: child_grant.clone(),
+                provider_binding: None,
+                terminal_usage: None,
+                input_receipt: source_receipt.clone(),
                 run_id: rid.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
@@ -3344,10 +4657,10 @@ impl SessionsSpawnTool {
                 is_turn_root: false,
                 channel_excluded_tools: inherited_channel_exclusions.clone(),
             };
-            let process_memory_fabric = memory_fabric.clone();
+            let process_memory_fabric = Some(memory_fabric.clone());
             let process_result_scope = spawn_scope_for_event.clone();
             let process_lineage = run_lineage.clone();
-            let process_cost_config = self.cost_config.clone();
+            let process_cost_config = child_model_config.cost.clone();
             let monitor_process_control = process_control.clone();
 
             // Registry row for this run. The parent is captured *here*, on the
@@ -3364,17 +4677,73 @@ impl SessionsSpawnTool {
             let sub_agent_label = process_agent_id
                 .clone()
                 .unwrap_or_else(|| "sub-agent (process)".to_string());
-            let sub_agent_work =
+            let mut sub_agent_work =
                 register_killable_process_run(&sub_agent_label, &rid, sub_agent_parent, batch_id, &process_control);
             // Publish this run's steering channel on its registry row so the
             // control plane can address it by run id from another entry point.
             // Same sender, same bounded queue as `sessions_send` — only the
             // lookup is new; see `registry::attach_steer_sender`.
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
+            sub_agent_work.require_cleanup_acknowledgement();
+            let process_work_id = sub_agent_work.id();
+            let process_recovery = child_grant.as_ref().map(|grant| {
+                Arc::new(process_terminal::ProcessRecovery::new(
+                    process_memory_fabric.clone(),
+                    Arc::clone(grant),
+                    source_receipt.clone(),
+                    batch_id.map(str::to_owned),
+                ))
+            });
+            let is_ordinary_process = process_source_launch
+                .as_ref()
+                .is_some_and(|launch| launch.is_ordinary());
+            let ordinary_recovery = if is_ordinary_process {
+                Some(process_terminal::ordinary::OrdinaryProcessRecovery::new(
+                    process_memory_fabric
+                        .clone()
+                        .context("ordinary recovery fabric missing")?,
+                    workspace_root.clone(),
+                    run_lineage
+                        .owner_id
+                        .clone()
+                        .context("ordinary recovery owner missing")?,
+                    run_id.clone(),
+                )?)
+            } else {
+                None
+            };
+            let is_operator_process = process_source_launch
+                .as_ref()
+                .is_some_and(|launch| !launch.is_ordinary());
+            let operator_recovery = if is_operator_process {
+                Some(process_terminal::operator::OperatorProcessRecovery::new(
+                    process_memory_fabric
+                        .clone()
+                        .context("operator recovery fabric missing")?,
+                    workspace_root.clone(),
+                    run_lineage
+                        .owner_id
+                        .clone()
+                        .context("operator recovery owner missing")?,
+                    run_id.clone(),
+                )?)
+            } else {
+                None
+            };
+            let process_batch_id = batch_id.map(str::to_owned);
+            #[cfg(test)]
+            let test_worker_executable = self.test_worker_executable.clone();
+            let monitor_recovery = process_recovery.clone();
+            let verified_terminal = Arc::new(parking_lot::Mutex::new(None));
+            let monitor_verified_terminal = Arc::clone(&verified_terminal);
+            let ordinary_terminal = Arc::new(parking_lot::Mutex::new(None));
+            let monitor_ordinary_terminal = Arc::clone(&ordinary_terminal);
+            let operator_terminal = Arc::new(parking_lot::Mutex::new(None));
+            let monitor_operator_terminal = Arc::clone(&operator_terminal);
             let monitor_active_runs = active_runs.clone();
             let monitor_progress = Arc::clone(&process_progress);
-            let jh = tokio::spawn(crate::runtime::registry::scoped(
-                sub_agent_work,
+            let jh = tokio::spawn(crate::runtime::registry::scope_current(
+                process_work_id,
                 SPAWN_EXECUTION_CONTEXT.scope(
                     process_execution_ctx,
                     crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
@@ -3383,12 +4752,17 @@ impl SessionsSpawnTool {
                         let monitor_result = std::panic::AssertUnwindSafe(async {
                             tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                            let worker_result = run_sub_agent_process(
+                            let mut worker_result = run_sub_agent_process(
                                 &rid,
                                 &task_owned,
                                 &provider_name,
                                 &model,
                                 api_key.as_deref(),
+                                route_hint.as_deref(),
+                                route_source_provider.as_deref(),
+                                route_credential.as_ref(),
+                                route_uses_root_connection,
+                                direct_uses_root_connection,
                                 temperature,
                                 &workspace_root,
                                 &worker_workspace_root,
@@ -3413,10 +4787,85 @@ impl SessionsSpawnTool {
                                 process_steer_rx,
                                 history_arc,
                                 Arc::clone(&monitor_progress),
+                                process_provider_selection.as_ref(),
+                                process_memory_fabric.as_ref(),
+                                monitor_recovery.as_deref(),
+                                process_source_launch,
+                                process_batch_id.as_deref(),
+                                #[cfg(test)]
+                                test_worker_executable.as_ref(),
                             )
                             .await;
 
-                            let (status, result_text, token_usage_records, finalization) = match worker_result {
+                            let recovered_usage = if matches!(
+                                &worker_result,
+                                Ok(ProcessWorkerOutcome::Terminated(_) | ProcessWorkerOutcome::ExitedWithoutResult(_))
+                            ) {
+                                let context = current_spawn_execution_context();
+                                if let Some(grant) = context.as_ref().and_then(|value| value.incoming_grant.as_ref()) {
+                                    let recovery = async {
+                                        let fabric = process_memory_fabric.as_ref().context("worker recovery storage missing")?;
+                                        let input = context.as_ref().and_then(|value| value.input_receipt.as_deref())
+                                            .context("worker recovery input missing")?;
+                                        if let Some(completion) = process_terminal::recover_completion(fabric, grant, input).await? {
+                                            Ok::<_, anyhow::Error>((Some(completion), None))
+                                        } else {
+                                            let usage = process_terminal::recover_usage(fabric, grant, input).await?;
+                                            Ok((None, Some(usage)))
+                                        }
+                                    }.await;
+                                    match recovery {
+                                        Ok((completion, usage)) => {
+                                            if let Some(completion) = completion {
+                                                worker_result = Ok(ProcessWorkerOutcome::VerifiedFinished(completion));
+                                            }
+                                            usage
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(run_id = %rid, error = %error,
+                                                "worker interruption settlement remains unconfirmed");
+                                            return;
+                                        }
+                                    }
+                                } else { None }
+                            } else { None };
+                            let (status, mut result_text, mut token_usage_records, finalization) = match worker_result {
+                                Ok(ProcessWorkerOutcome::VerifiedFinished(completion)) => {
+                                    *monitor_verified_terminal.lock() = Some(completion.clone());
+                                    let (result, usage) = completion.into_parts();
+                                    let (status, text) = if result.success {
+                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                    } else {
+                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        (
+                                            SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
+                                            format!("Sub-agent error: {error}"),
+                                        )
+                                    };
+                                    (status, text, usage, ProcessFinalization::Natural)
+                                }
+                                Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
+                                    *monitor_ordinary_terminal.lock() = Some(completion.clone());
+                                    let result = completion.result;
+                                    let (status, text) = if result.success {
+                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                    } else {
+                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
+                                    };
+                                    (status, text, completion.usage, ProcessFinalization::Natural)
+                                }
+                                Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion)) => {
+                                    *monitor_operator_terminal.lock() = Some(completion.clone());
+                                    let result = completion.result;
+                                    let (status, text) = if result.success {
+                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                    } else {
+                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
+                                    };
+                                    (status, text, completion.usage, ProcessFinalization::Natural)
+                                }
                                 Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
                                     let token_usage_records = result
                                         .tokens_used
@@ -3463,6 +4912,18 @@ impl SessionsSpawnTool {
                                         ProcessFinalization::Terminated,
                                     )
                                 }
+                                Ok(ProcessWorkerOutcome::OrdinaryInterrupted { detail, usage }) => {
+                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
+                                        exited_without_result_reason(&detail), usage.unfinished_segments);
+                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
+                                        usage.records, ProcessFinalization::Unconfirmed)
+                                }
+                                Ok(ProcessWorkerOutcome::OperatorInterrupted { detail, usage }) => {
+                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
+                                        exited_without_result_reason(&detail), usage.unfinished_segments);
+                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
+                                        usage.records, ProcessFinalization::Unconfirmed)
+                                }
                                 Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
                                     // MUTATION GUARD: folding this back into the
                                     // generic parse-error path loses the only
@@ -3493,12 +4954,41 @@ impl SessionsSpawnTool {
                                         SubAgentStatus::Failed(error.to_string()),
                                         msg,
                                         Vec::new(),
-                                        ProcessFinalization::Natural,
+                                        if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
+                                            .is_some_and(|context| context.incoming_grant.is_some()) {
+                                            ProcessFinalization::Unconfirmed
+                                        } else { ProcessFinalization::Natural },
                                     )
                                 }
                             };
 
+                            if let Some(recovered) = recovered_usage {
+                                token_usage_records.extend(recovered.records);
+                                result_text.push_str(&format!(
+                                    "; provider usage may be incomplete ({} recorded segments lack terminals)",
+                                    recovered.unfinished_segments,
+                                ));
+                            }
+
                             let announce = format_announce_message(&rid, &status, &result_text);
+                            if let Err(error) = commit_process_terminal_state(
+                                &active_runs,
+                                &rid,
+                                status.clone(),
+                                token_usage_records,
+                                monitor_process_control.as_ref(),
+                                finalization,
+                                None,
+                                #[cfg(test)]
+                                None,
+                            )
+                            .await {
+                                tracing::error!(run_id = %rid, error = %error, "process terminal registry commit remains unconfirmed");
+                                return;
+                            }
+                            if finalization == ProcessFinalization::Unconfirmed {
+                                return;
+                            }
                             record_spawn_result_event(
                                 process_memory_fabric.as_ref(),
                                 process_result_scope,
@@ -3509,17 +4999,6 @@ impl SessionsSpawnTool {
                             )
                             .await;
 
-                            commit_process_terminal_state(
-                                &active_runs,
-                                &rid,
-                                status,
-                                token_usage_records,
-                                monitor_process_control.as_ref(),
-                                finalization,
-                                #[cfg(test)]
-                                None,
-                            )
-                            .await;
                             if !announce_result {
                                 tracing::debug!(
                                     run_id = %rid,
@@ -3571,7 +5050,19 @@ impl SessionsSpawnTool {
             // Awaiting the handle from a *separate* task does not abort it, and
             // is the only way a cancellation of the monitor (runtime shutdown,
             // a future registry abort) can still reach the tool-plane row.
-            watch_process_mode_monitor(jh, monitor_active_runs, run_id.clone(), process_control.clone());
+            watch_process_mode_monitor(
+                jh,
+                monitor_active_runs,
+                run_id.clone(),
+                process_control.clone(),
+                sub_agent_work,
+                verified_terminal,
+                process_recovery,
+                ordinary_terminal,
+                ordinary_recovery,
+                operator_terminal,
+                operator_recovery,
+            );
 
             return Ok(SpawnOutcome::started(
                 run_id.clone(),
@@ -3601,29 +5092,103 @@ impl SessionsSpawnTool {
         // this run (the launching message's scope), not the shared active channel
         // — so a concurrently-processed message cannot mis-route this run's
         // result. Falls back to the active channel when no scope name is present.
-        let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
-        let provider_name = resolved_provider_name;
-        let model = resolved_model;
-        let temperature = resolved_temperature;
-        // Rebuild the provider object whenever the resolved provider differs
-        // from the gateway provider. This covers a named agent provider AND an
-        // inline `provider` override (BUG-12) even without a named agent.
-        let provider = if provider_name != self.provider_name {
-            match Self::build_override_provider(
-                &provider_name,
-                resolved_api_key.as_deref(),
-                &self.reliability,
-                &self.provider_runtime_options,
-            ) {
-                Ok(provider) => provider,
-                Err(error) => {
-                    return Ok(SpawnOutcome::rejected(format!(
-                        "Failed to create provider '{provider_name}' for sessions_spawn: {error}"
-                    )));
-                }
-            }
+        let channel = match &operator_channel {
+            Some(channel) => Arc::clone(channel),
+            None => self.resolve_announce_channel(run_channel_name.as_deref()).await,
+        };
+        let mut provider_name = resolved_provider_name;
+        let mut model = resolved_model;
+        let child_provider_binding = if let Some(grant) = child_grant.as_ref() {
+            let credential = child_credential.context("child credential selection missing")?;
+            let (requested_child_provider, requested_child_model) =
+                child_requested_model.as_ref().context("child model request missing")?;
+            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build(
+                Arc::clone(grant),
+                requested_child_provider,
+                requested_child_model,
+                credential,
+            )?);
+            provider_name = binding.provider_name().to_owned();
+            model = binding.model().to_owned();
+            Some(binding)
+        } else if let Some(source) = &operator_source {
+            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_operator(
+                source,
+            )?);
+            provider_name = binding.provider_name().to_owned();
+            model = binding.model().to_owned();
+            Some(binding)
+        } else if let Some(binding) = ordinary_binding {
+            provider_name = binding.provider_name().to_owned();
+            model = binding.model().to_owned();
+            Some(binding)
         } else {
-            self.provider.clone()
+            None
+        };
+        let temperature = resolved_temperature;
+        // An explicit hint always builds its exact selected chain, even when
+        // it names the gateway provider: the gateway may hold another route's
+        // credential. Direct models keep their existing provider plan.
+        if let Some(source) = &operator_source {
+            source.verify_live()?;
+            let binding = child_provider_binding
+                .as_ref()
+                .context("operator child model binding missing")?;
+            anyhow::ensure!(
+                Arc::ptr_eq(&binding.provider(), source.provider()),
+                "operator child provider differs from captured ingress"
+            );
+        }
+        let provider_result = if let Some(binding) = child_provider_binding.as_ref() {
+            Ok(binding.provider())
+        } else if let Some(resolved) = selected_hint.as_ref() {
+            let reliability = crate::config::ReliabilityConfig {
+                fallback_providers: Vec::new(),
+                ..provider_reliability.clone()
+            };
+            providers::create_provider_for(resolved, child_model_catalog, &reliability, provider_options).map(Arc::from)
+        } else {
+            match task_provider_plan {
+                ChildProvider::Root => {
+                    let config = child_model_config;
+                    let resolved = match providers::selection::check_with(
+                        config,
+                        child_model_catalog,
+                        &provider_name,
+                        &model,
+                        providers::selection::credential_for(config, &provider_name),
+                        &providers::catalog::Requirement::chat(),
+                        providers::catalog::UnknownPolicy::Invocation,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(refusal) => return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}"))),
+                    };
+                    providers::create_provider_for(
+                        &resolved,
+                        child_model_catalog,
+                        provider_reliability,
+                        provider_options,
+                    )
+                    .map(Arc::from)
+                }
+                ChildProvider::Build { api_key } => Self::build_override_provider(
+                    &provider_name,
+                    api_key.as_deref(),
+                    provider_reliability,
+                    provider_options,
+                ),
+                ChildProvider::Gateway => Ok(self.provider.clone()),
+            }
+        };
+        let provider = match provider_result {
+            Ok(provider) => provider,
+            Err(error) => {
+                return Ok(SpawnOutcome::rejected(format!(
+                    "Failed to create provider '{}' for sessions_spawn: {}",
+                    providers::redact_endpoint_userinfo(&provider_name),
+                    providers::sanitize_api_error(&providers::redact_endpoint_userinfo(&error.to_string()))
+                )));
+            }
         };
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
@@ -3651,25 +5216,37 @@ impl SessionsSpawnTool {
             (None, None)
         };
         let task_owned = task.to_string();
-        let workspace_dir = self.workspace_dir.clone();
-        let multimodal_config = self.multimodal_config.clone();
-        let security = self.security.clone();
+        let identity_workspace = child_model_config.workspace_dir.clone();
+        let security = Arc::clone(launch_security);
         // Second handle, for the announcement gate: `security` above is moved
         // into the sub-agent's own loop, and the announcement is authorized only
         // once that loop has returned.
-        let announce_security = self.security.clone();
+        let announce_security = Arc::clone(launch_security);
         // The launching turn's trusted identity, captured atomically with
         // `recipient` / `run_channel_name` from the same scope snapshot.
         let announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
         // Same handle the run writes its transcript through, so a refused
         // announcement is visible on the run itself and not only in the log.
         let announce_history = history_arc.clone();
-        let task_scope = spawn_scope.clone();
-        let task_memory = self.memory.clone();
-        let task_event_recording = self.event_recording;
-        let compaction_config = resolved_compaction.config.clone();
-        let cost_config = self.cost_config.clone();
-        let task_execution_ctx = SpawnExecutionContext {
+        let mut terminal_usage = child_grant.as_ref().map(|grant| {
+            Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new(
+                grant
+                    .generation()
+                    .effective
+                    .workspace_dir
+                    .to_string_lossy()
+                    .into_owned(),
+                grant.scope().gate_inputs().0.authority.owner.clone(),
+                rid.clone(),
+            ))
+        });
+        let mut task_execution_ctx = SpawnExecutionContext {
+            operator_authority: None,
+            ordinary_authority: None,
+            incoming_grant: child_grant,
+            provider_binding: child_provider_binding,
+            terminal_usage: terminal_usage.clone(),
+            input_receipt: source_receipt,
             run_id: rid.clone(),
             session_scope_key: session_scope_key.clone(),
             spawn_depth,
@@ -3691,7 +5268,7 @@ impl SessionsSpawnTool {
                 .as_deref()
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .map(|identity_dir| build_identity_prompt(&workspace_dir.join(identity_dir)))
+                .map(|identity_dir| build_identity_prompt(&identity_workspace.join(identity_dir)))
                 .unwrap_or_default();
             let prompt = if identity_prompt.trim().is_empty() {
                 DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string()
@@ -3700,6 +5277,24 @@ impl SessionsSpawnTool {
             };
             let memory_scope = parse_memory_scope(cfg.memory_scope.as_deref())?;
             let tools = tools.map(|registry| {
+                if ordinary_publication.is_some() {
+                    // Keep the backend root identity and dynamic metadata for
+                    // the sealed catalog. The child service enforces the exact
+                    // manifest, agent allowance and inherited exclusions.
+                    let memory_prefix = (memory_scope == MemoryScope::Isolated).then(|| agent.clone());
+                    return Arc::new(
+                        registry
+                            .iter()
+                            .map(|tool| {
+                                Box::new(AllowedToolProxy {
+                                    source: Arc::clone(&registry),
+                                    public_name: tool.name().to_owned(),
+                                    memory_prefix: memory_prefix.clone(),
+                                }) as Box<dyn Tool>
+                            })
+                            .collect(),
+                    );
+                }
                 resolve_tools_for_agent(
                     registry,
                     &agent,
@@ -3719,6 +5314,90 @@ impl SessionsSpawnTool {
 
         // Register the run.
         //
+        // A background run outlives its spawning turn. Its independent observer
+        // owns cleanup; parenting this to the caller would cancel valid work
+        // when that caller returns. Register before publishing the active row.
+        let task_control = TaskRunControl::new();
+        if let Some(source) = &operator_source {
+            let (authority, lifetime) = source.issue_task(
+                Arc::clone(
+                    task_execution_ctx
+                        .provider_binding
+                        .as_ref()
+                        .context("operator model binding missing")?,
+                ),
+                &task_result_scope,
+                task,
+                task_execution_ctx.input_receipt.as_deref(),
+                task_control.cancellation(),
+            )?;
+            task_control.retain_operator_lifetime(lifetime)?;
+            use crate::runtime::turn_source::TurnSourceProof;
+            let usage = Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
+                authority.workspace_id().to_owned(),
+                authority.owner_id().to_owned(),
+                rid.clone(),
+                authority.generation().effective.memory.event_recording_config(),
+            ));
+            terminal_usage = Some(Arc::clone(&usage));
+            task_execution_ctx.terminal_usage = Some(usage);
+            task_execution_ctx.operator_authority = Some(authority);
+        }
+        if ordinary_publication.is_some() {
+            let binding = task_execution_ctx
+                .provider_binding
+                .as_ref()
+                .context("ordinary task provider binding missing")?;
+            let caller = caller.as_ref().context("ordinary task caller missing")?;
+            let (authority, lifetime) = binding.issue_ordinary_task(
+                caller,
+                &task_result_scope,
+                task,
+                task_execution_ctx.input_receipt.as_deref(),
+                task_control.cancellation(),
+            )?;
+            task_control.retain_ordinary_lifetime(lifetime)?;
+            use crate::runtime::turn_source::TurnSourceProof;
+            let (proof, _) = authority.source()?;
+            let usage = Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
+                proof.workspace_id().to_owned(),
+                proof.owner_id().to_owned(),
+                rid.clone(),
+                authority
+                    .publication()
+                    .generation()
+                    .effective
+                    .memory
+                    .event_recording_config(),
+            ));
+            terminal_usage = Some(Arc::clone(&usage));
+            task_execution_ctx.terminal_usage = Some(usage);
+            task_execution_ctx.ordinary_authority = Some(authority);
+        }
+        let logical_terminal = {
+            use crate::agent::terminal::logical::LogicalTaskTerminalRef;
+            match (
+                task_execution_ctx.incoming_grant.as_deref(),
+                task_execution_ctx.ordinary_authority.as_deref(),
+                task_execution_ctx.operator_authority.as_deref(),
+            ) {
+                (Some(grant), None, None) => LogicalTaskTerminalRef::granted(
+                    grant,
+                    task_execution_ctx
+                        .input_receipt
+                        .as_deref()
+                        .context("logical task input missing")?,
+                    &task_result_scope,
+                )?,
+                (None, Some(authority), None) => LogicalTaskTerminalRef::ordinary(authority)?,
+                (None, None, Some(authority)) => LogicalTaskTerminalRef::operator(authority)?,
+                _ => anyhow::bail!("logical task completion requires one issued source authority"),
+            }
+        };
+        let run_cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let run_cleanup_scope =
+            crate::runtime::turn_cleanup::CleanupScope::new(Some(&run_cleanup), CancellationToken::new())?;
+
         // Deliberately the *last* fallible-free step before the driver task is
         // spawned, and never earlier: everything between this block and
         // `tokio::spawn` below is infallible, so the presence of a row in
@@ -3745,6 +5424,7 @@ impl SessionsSpawnTool {
                 channel_name: run_channel_name.clone(),
                 abort_handle: None,
                 process_control: None,
+                task_control: Some(Arc::clone(&task_control)),
                 history: history_arc.clone(),
                 steer_tx: Some(steer_tx.clone()),
                 parent_run_id: parent_run_id.clone(),
@@ -3761,211 +5441,190 @@ impl SessionsSpawnTool {
         // task-locals of its own.
         let sub_agent_parent = crate::runtime::registry::current_work_id();
         let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
-        let sub_agent_work =
+        let mut sub_agent_work =
             crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
         let sub_agent_work_id = sub_agent_work.id();
+        sub_agent_work.require_cleanup_acknowledgement();
         // As in the process branch: the control plane resolves `run_id` through
         // the process-wide work registry, so the run's existing steer sender is
         // published there. `active_runs` stays the tool-plane source of truth.
         crate::runtime::registry::attach_steer_sender(sub_agent_work_id, steer_tx.clone());
 
+        let terminal_journal = Arc::new(task_terminal::TaskTerminalJournal::new(
+            task_memory_fabric.clone(),
+            task_result_scope.clone(),
+            logical_terminal,
+            true,
+            terminal_usage,
+        ));
+        let driver_terminal_journal = Arc::clone(&terminal_journal);
         // Spawn async task (fire-and-forget); capture handle to support kill
-        let jh = tokio::spawn(crate::runtime::registry::scoped(
-            sub_agent_work,
+        let jh = tokio::spawn(crate::runtime::registry::scope_current(
+            sub_agent_work_id,
             SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
-            tracing::info!(run_id = %rid, "Sub-agent task starting");
-            let provider_started_at = Utc::now();
-            let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-                provider_name.clone(),
-                model.clone(),
-                task_lineage
-                    .owner_id
-                    .clone()
-                    .unwrap_or_else(|| "owner:sessions-spawn".to_string()),
-                task_result_scope
-                    .session_key
-                    .clone()
-                    .unwrap_or_else(|| format!("sessions_spawn:{rid}")),
-                task_lineage.source_message_event_id.clone(),
-                None,
-                "sessions_spawn",
-                u32::try_from(task_owned.chars().count() / 4).unwrap_or(u32::MAX),
-                filtered_tools.as_ref().is_some_and(|tools| !tools.is_empty()),
-                false,
-            );
-            let (run_on_delta, run_on_tool) = match run_event_streams {
-                Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
-                None => (None, None),
-            };
-            let run_future = run_sub_agent_task(
-                &task_owned,
-                provider,
-                &provider_name,
-                &model,
-                temperature,
-                filtered_tools,
-                &system_prompt,
-                &workspace_dir,
-                security,
-                &multimodal_config,
-                &compaction_config,
-                steer_rx,
-                history_arc,
-                task_scope,
-                task_memory,
-                task_event_recording,
-                run_on_delta,
-                run_on_tool,
-                run_approval_resolver,
-                restore_active_runs,
-                restore_run_id,
-                Arc::clone(&task_progress),
-            );
-            let result = run_future.await;
-            tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
+                tracing::info!(run_id = %rid, "Sub-agent task starting");
+                let provider_started_at = Utc::now();
+                let (run_on_delta, run_on_tool) = match run_event_streams {
+                    Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
+                    None => (None, None),
+                };
+                let run_future = run_sub_agent_task(
+                    &task_owned,
+                    provider,
+                    &provider_name,
+                    &model,
+                    temperature,
+                    filtered_tools,
+                    &system_prompt,
+                    security,
+                    steer_rx,
+                    history_arc,
+                    run_on_delta,
+                    run_on_tool,
+                    run_approval_resolver,
+                    restore_active_runs,
+                    restore_run_id,
+                    Arc::clone(&task_progress),
+                );
+                let result = run_cleanup_scope.run(run_future).await;
+                tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
-            let (status, result_text, provider_outcome, terminal_status, history_projection) = match result {
-                Ok(task_result) => {
-                    let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
-                        &route_decision,
-                        provider_started_at,
-                        task_result.trace,
-                    );
-                    (
+                let (status, result_text, terminal_status, history_projection, token_usage_records) = match result {
+                    Ok(task_result) => (
                         SubAgentStatus::Completed(task_result.output.clone()),
                         task_result.output.clone(),
-                        provider_outcome,
                         crate::agent::terminal::TurnTerminalStatus::Completed,
                         Some(crate::agent::terminal::TurnHistoryProjection {
                             assistant_content: task_result.output,
                             history_commit_len: task_result.history_commit_len,
                         }),
-                    )
-                }
-                Err(e) => {
-                    let msg = format!("Sub-agent error: {e}");
-                    (
-                        SubAgentStatus::Failed(task_failure_reason(&e)),
-                        msg,
-                        crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                            &route_decision,
-                            provider_started_at,
-                            &e,
-                        ),
-                        crate::agent::terminal::TurnTerminalStatus::Failed,
-                        None,
-                    )
-                }
-            };
+                        task_result.segment_usage,
+                    ),
+                    Err(error) => {
+                        // Persist the same runtime-classified reason used by the
+                        // live registry. Recovery after commit must not lose the
+                        // quarantine tag on provider/tool-authored failure text.
+                        let reason = task_failure_reason(&error);
+                        let terminal_status = if matches!(termination_cause(&reason), TerminationCause::Killed) {
+                            crate::agent::terminal::TurnTerminalStatus::Cancelled
+                        } else {
+                            crate::agent::terminal::TurnTerminalStatus::Failed
+                        };
+                        (
+                            SubAgentStatus::Failed(reason.clone()),
+                            reason,
+                            terminal_status,
+                            None,
+                            Vec::new(),
+                        )
+                    }
+                };
 
-            let delivery_intent = recipient.as_ref().map_or_else(
-                || crate::agent::terminal::TurnDeliveryIntent::Deferred {
-                    route: "sessions_registry".to_string(),
-                },
-                |target| crate::agent::terminal::TurnDeliveryIntent::Reply { target: target.clone() },
-            );
-            let usage_settlement = if let Some(fabric) = task_memory_fabric.as_ref() {
-                match crate::agent::terminal::finalize_turn(
-                    fabric,
-                    crate::agent::terminal::TurnTerminalCommit {
+                let delivery_intent = recipient.as_ref().map_or_else(
+                    || crate::agent::terminal::TurnDeliveryIntent::Deferred {
+                        route: "sessions_registry".to_string(),
+                    },
+                    |target| crate::agent::terminal::TurnDeliveryIntent::Reply { target: target.clone() },
+                );
+                match driver_terminal_journal
+                    .commit(crate::agent::terminal::TurnTerminalDraft {
+                        decision: None,
                         terminal_id: rid.clone(),
                         scope: task_result_scope.clone(),
                         status: terminal_status,
                         history: history_projection,
                         history_scope: None,
-                        provider_outcome: Some(provider_outcome.clone()),
+                        provider_outcome: None,
                         telemetry: crate::agent::terminal::TurnTerminalTelemetry {
                             summary: result_text.clone(),
                             started_at: provider_started_at,
                             finished_at: Utc::now(),
                         },
                         delivery_intent,
-                    },
-                    &cost_config,
-                    &workspace_dir,
-                )
-                .await
+                    })
+                    .await
                 {
-                    Ok(receipt) => receipt.usage_settlement,
+                    Ok(_) => {}
                     Err(error) => {
-                        tracing::warn!(run_id = %rid, error = %error, "failed to commit sessions_spawn terminal event");
-                        crate::agent::terminal::usage_settlement(&rid, &provider_outcome, &cost_config)
+                        tracing::error!(run_id = %rid, error = %error, "task terminal persistence remains unconfirmed");
+                        // The external observer retries this exact proposal.
+                        // Do not publish a result or a substitute usage receipt.
+                        return;
                     }
                 }
-            } else {
-                crate::agent::terminal::usage_settlement(&rid, &provider_outcome, &cost_config)
-            };
-            let token_usage_records = usage_settlement.into_iter().collect::<Vec<_>>();
-
-            let announce = format_announce_message(&rid, &status, &result_text);
-            record_spawn_result_event(
-                task_memory_fabric.as_ref(),
-                task_result_scope,
-                &result_text,
-                &status,
-                &task_lineage,
-                None,
-            )
-            .await;
-
-            // Update run status
-            {
-                let mut runs = active_runs.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
-                    run.finished_at = Some(Utc::now());
-                    run.status = status;
-                    run.token_usage_records.extend(token_usage_records);
-                    run.steer_tx = None; // drop sender — no more steering possible
-                }
-            }
-
-            // Announce result back to channel if we have a recipient
-            if !announce_result {
-                tracing::debug!(
-                    run_id = %rid,
-                    "Sub-agent result withheld from the channel (announce=false); \
-                     it is delivered to whoever joins this run's batch"
-                );
-            } else if let Some(target) = recipient {
-                // MUTATION GUARD: route this straight to `channel.send` and the
-                // model-supplied `recipient` on the spawn call reaches the
-                // channel with no authorization at all — the hole
-                // `message_send`'s own outbound gate closes on its side.
-                deliver_or_withhold_notice(
-                    &announce_security,
-                    announce_origin.as_ref(),
-                    channel.as_ref(),
-                    &announce_history,
-                    &rid,
-                    &target,
-                    &announce,
-                    OutboundNotice::RunResult,
+                let announce = format_announce_message(&rid, &status, &result_text);
+                record_spawn_result_event(
+                    Some(&task_memory_fabric),
+                    task_result_scope,
+                    &result_text,
+                    &status,
+                    &task_lineage,
+                    None,
                 )
                 .await;
-            } else {
-                tracing::warn!(
-                    run_id = %rid,
-                    "Sub-agent completed but no recipient configured for announcement"
-                );
-            }
+
+                // Update run status
+                {
+                    let mut runs = active_runs.write().await;
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
+                        run.finished_at = Some(Utc::now());
+                        run.status = status;
+                        run.token_usage_records.extend(token_usage_records);
+                        run.steer_tx = None; // drop sender — no more steering possible
+                    }
+                }
+
+                // Announce result back to channel if we have a recipient
+                if !announce_result {
+                    tracing::debug!(
+                        run_id = %rid,
+                        "Sub-agent result withheld from the channel (announce=false); \
+                         it is delivered to whoever joins this run's batch"
+                    );
+                } else if let Some(target) = recipient {
+                    // MUTATION GUARD: route this straight to `channel.send` and the
+                    // model-supplied `recipient` on the spawn call reaches the
+                    // channel with no authorization at all — the hole
+                    // `message_send`'s own outbound gate closes on its side.
+                    deliver_or_withhold_notice(
+                        &announce_security,
+                        announce_origin.as_ref(),
+                        channel.as_ref(),
+                        &announce_history,
+                        &rid,
+                        &target,
+                        &announce,
+                        OutboundNotice::RunResult,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(
+                        run_id = %rid,
+                        "Sub-agent completed but no recipient configured for announcement"
+                    );
+                }
             }),
         ));
 
-        // Store the abort handle so kill action can cancel this run
+        // Install the external owner before the first suspension after spawn.
         let abort_handle = jh.abort_handle();
+        task_control.attach(abort_handle.clone());
+        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, abort_handle.clone());
+        watch_task_mode_monitor(
+            jh,
+            self.active_runs.clone(),
+            run_id.clone(),
+            Some(run_cleanup),
+            Some(task_control),
+            Some(sub_agent_work),
+            Some(terminal_journal),
+        );
         {
             let mut runs = self.active_runs.write().await;
             if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                run.abort_handle = Some(abort_handle.clone());
+                run.abort_handle = Some(abort_handle);
             }
         }
-        // Same handle for `prx tasks kill`: aborting drops the run future, which
-        // drops its registry guard, which is how the kill is confirmed.
-        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, abort_handle);
-        // ... and because that abort runs no further code inside the monitor,
-        // an outside observer is what turns the kill into a terminal status on
-        // this run's row.
-        watch_task_mode_monitor(jh, self.active_runs.clone(), run_id.clone());
 
         Ok(SpawnOutcome::started(
             run_id.clone(),
@@ -3976,9 +5635,11 @@ impl SessionsSpawnTool {
         ))
     }
     fn memory_fabric(&self) -> Option<MemoryFabric> {
-        self.memory.as_ref().map(|memory| {
-            MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
-                .with_event_recording(self.event_recording)
+        self.source_fabric.clone().or_else(|| {
+            self.memory.as_ref().map(|memory| {
+                MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
+                    .with_event_recording(self.event_recording)
+            })
         })
     }
 
@@ -4013,8 +5674,12 @@ impl SessionsSpawnTool {
     }
 
     /// List all tracked sub-agent runs.
-    async fn execute_list(&self) -> anyhow::Result<ToolResult> {
-        let runs = self.active_runs.read().await;
+    async fn execute_list(&self, owner_scope: &sessions_read_model::RunOwnerScope) -> anyhow::Result<ToolResult> {
+        let registry = self.active_runs.read().await;
+        let runs = registry
+            .iter()
+            .filter(|run| owner_scope.admits(run.owner_id.as_deref()))
+            .collect::<Vec<_>>();
         if runs.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -4061,78 +5726,81 @@ impl SessionsSpawnTool {
         run_id: &str,
         approval_grant: Option<&ApprovalGrant>,
         notice_origin: Option<&AnnounceOrigin>,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+        args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
-        let (process_control, task_kill_target) =
+        let (process_control, task_kill_target) = {
+            let mut runs = self.active_runs.write().await;
+            match runs
+                .iter_mut()
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
             {
-                let mut runs = self.active_runs.write().await;
-                match runs.iter_mut().find(|r| r.id == run_id) {
-                    Some(run) => {
-                        match &run.status {
-                            // A live run (executing) or one suspended awaiting approval
-                            // (NeedsInput) is killable: aborting the task tears down the
-                            // suspended approval resolver's pending await along with it.
-                            SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
-                                let operation_name = format!("sessions_spawn:kill:{run_id}");
-                                if let Err(error) = SideEffectGate::new(self.security.as_ref())
-                                    .authorize_resource_operation(
-                                        self.name(),
-                                        &operation_name,
-                                        ResourceRiskLevel::Medium,
-                                        approval_grant,
-                                    )
-                                {
-                                    return Ok(ToolResult {
-                                        success: false,
-                                        output: String::new(),
-                                        error: Some(error),
-                                    });
-                                }
-                                if let Some(control) = run.process_control.clone() {
-                                    (Some(control), None)
-                                } else {
-                                    if let Some(ah) = run.abort_handle.as_ref() {
-                                        ah.abort();
-                                    }
-                                    let recipient = run.recipient.clone();
-                                    // Per-turn channel bound at spawn time — kill-notify routes
-                                    // to the same channel + recipient as the launching message,
-                                    // not the shared active channel (avoids cross-channel leak).
-                                    let channel_name = run.channel_name.clone();
-                                    let rid = run.id.clone();
-                                    run.finished_at = Some(Utc::now());
-                                    run.status = SubAgentStatus::Failed(KILLED_BY_USER_REASON.into());
-                                    run.steer_tx = None;
-                                    (None, Some((recipient, channel_name, rid, run.clone())))
-                                }
-                            }
-                            SubAgentStatus::Completed(_) => {
+                Some(run) => {
+                    match &run.status {
+                        // A live run (executing) or one suspended awaiting approval
+                        // (NeedsInput) is killable: aborting the task tears down the
+                        // suspended approval resolver's pending await along with it.
+                        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
+                            let operation_name = format!("sessions_spawn:kill:{run_id}");
+                            if let Err(error) = SideEffectGate::new(self.security.as_ref())
+                                .authorize_resource_operation(
+                                    self.name(),
+                                    &operation_name,
+                                    ResourceRiskLevel::Medium,
+                                    approval_grant,
+                                )
+                            {
                                 return Ok(ToolResult {
                                     success: false,
                                     output: String::new(),
-                                    error: Some(format!("Run `{run_id}` already completed.")),
+                                    error: Some(error),
                                 });
                             }
-                            SubAgentStatus::Failed(e) => {
-                                if run.process_control.as_ref().is_some_and(|control| {
-                                    control.finalization() == Some(ProcessFinalization::Terminated)
-                                }) {
-                                    return Ok(ToolResult {
-                                        success: true,
-                                        output: format!("Sub-agent `{run_id}` has been killed."),
-                                        error: None,
-                                    });
-                                }
-                                return Ok(ToolResult {
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some(format!("Run `{run_id}` already failed: {e}")),
-                                });
+                            if let Some(control) = run.process_control.clone() {
+                                (Some(control), None)
+                            } else {
+                                let recipient = run.recipient.clone();
+                                // Per-turn channel bound at spawn time — kill-notify routes
+                                // to the same channel + recipient as the launching message,
+                                // not the shared active channel (avoids cross-channel leak).
+                                let channel_name = run.channel_name.clone();
+                                let rid = run.id.clone();
+                                (None, Some((recipient, channel_name, rid, run.clone())))
                             }
                         }
+                        SubAgentStatus::Completed(_) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Run `{run_id}` already completed.")),
+                            });
+                        }
+                        SubAgentStatus::Failed(e) => {
+                            if run
+                                .task_control
+                                .as_ref()
+                                .is_some_and(|control| control.finalization() == Some(TaskFinalization::Terminated))
+                                || run.process_control.as_ref().is_some_and(|control| {
+                                    control.finalization() == Some(ProcessFinalization::Terminated)
+                                })
+                            {
+                                return Ok(ToolResult {
+                                    success: true,
+                                    output: format!("Sub-agent `{run_id}` has been killed."),
+                                    error: None,
+                                });
+                            }
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Run `{run_id}` already failed: {e}")),
+                            });
+                        }
                     }
-                    None => (None, None),
                 }
-            };
+                None => (None, None),
+            }
+        };
 
         if let Some(control) = process_control {
             return match control.request_termination(KILLED_BY_USER_REASON).await {
@@ -4151,6 +5819,11 @@ impl SessionsSpawnTool {
                     output: String::new(),
                     error: Some(format!("Run `{run_id}` could not be terminated by its process owner.")),
                 }),
+                ProcessTerminationRequestResult::Finalized(ProcessFinalization::Unconfirmed) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` cleanup and settlement remain unconfirmed.")),
+                }),
                 ProcessTerminationRequestResult::Pending => Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -4162,8 +5835,43 @@ impl SessionsSpawnTool {
         }
 
         let Some((recipient_opt, channel_name_opt, rid, killed_run)) = task_kill_target else {
-            return Ok(self.no_runtime_run_result(run_id).await);
+            return Ok(self.no_runtime_run_result(run_id, args).await);
         };
+
+        let Some(control) = killed_run.task_control.as_ref() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Task termination owner is unavailable; completion is unconfirmed".to_owned()),
+            });
+        };
+        match control.request_termination(KILLED_BY_USER_REASON).await {
+            Some(TaskFinalization::Terminated) => {}
+            Some(TaskFinalization::Natural) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` finalized before termination was confirmed.")),
+                });
+            }
+            Some(TaskFinalization::Unconfirmed) | None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Termination for run `{run_id}` remains unconfirmed; cleanup has not been acknowledged."
+                    )),
+                });
+            }
+        }
+        let killed_run = self
+            .active_runs
+            .read()
+            .await
+            .iter()
+            .find(|run| run.id == rid)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("terminated task row is unavailable"))?;
 
         self.record_active_run_task_event(&killed_run, "task.killed", json!({"reason": "killed by user"}))
             .await;
@@ -4219,10 +5927,15 @@ impl SessionsSpawnTool {
         run_id: &str,
         last_n: Option<usize>,
         max_chars_per_entry: usize,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+        args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
         let runs = self.active_runs.read().await;
-        let Some(run) = runs.iter().find(|r| r.id == run_id) else {
-            return Ok(self.no_runtime_run_result(run_id).await);
+        let Some(run) = runs
+            .iter()
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+        else {
+            return Ok(self.no_runtime_run_result(run_id, args).await);
         };
 
         let entries = run.history.read().await;
@@ -4277,8 +5990,8 @@ impl SessionsSpawnTool {
         })
     }
 
-    async fn no_runtime_run_result(&self, run_id: &str) -> ToolResult {
-        if self.recovered_run_exists(run_id).await {
+    async fn no_runtime_run_result(&self, run_id: &str, args: &serde_json::Value) -> ToolResult {
+        if self.recovered_run_exists(run_id, args).await {
             return ToolResult {
                 success: false,
                 output: String::new(),
@@ -4294,9 +6007,14 @@ impl SessionsSpawnTool {
         }
     }
 
-    async fn recovered_run_exists(&self, run_id: &str) -> bool {
-        let args = json!({"status": "all", "limit": 100});
-        sessions_read_model::recover_task_runs(self.memory.as_ref(), &self.workspace_dir.to_string_lossy(), &args, 100)
+    /// Whether the caller could recover `run_id` from memory. Asked with the
+    /// caller's own scope, so another owner's recorded run is not confirmed to
+    /// exist.
+    async fn recovered_run_exists(&self, run_id: &str, args: &serde_json::Value) -> bool {
+        let Some(fabric) = self.memory_fabric() else {
+            return false;
+        };
+        sessions_read_model::recover_task_runs(Some(&fabric.memory()), fabric.workspace_id(), args, 100)
             .await
             .is_ok_and(|runs| runs.iter().any(|run| run.run_id == run_id))
     }
@@ -4307,6 +6025,7 @@ impl SessionsSpawnTool {
         run_id: &str,
         message: &str,
         approval_grant: Option<&ApprovalGrant>,
+        owner_scope: &sessions_read_model::RunOwnerScope,
     ) -> anyhow::Result<ToolResult> {
         // The steer sender is cloned out of the registry and the guard is
         // dropped *before* the send. The channel is bounded, so a send can now
@@ -4315,7 +6034,10 @@ impl SessionsSpawnTool {
         // guard (`restore_running`) as its very next step after `recv`.
         let (steer_tx, run_snapshot) = {
             let runs = self.active_runs.read().await;
-            let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            let Some(run) = runs
+                .iter()
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            else {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -4486,10 +6208,7 @@ impl AllowedToolProxy {
     }
 
     fn source_spec(&self) -> Option<crate::tools::ToolSpec> {
-        self.find_source_tool()?
-            .specs()
-            .into_iter()
-            .find(|spec| spec.name == self.public_name)
+        self.find_source_tool()?.spec_for_name(&self.public_name)
     }
 
     fn rewrite_args(&self, mut args: serde_json::Value) -> serde_json::Value {
@@ -4582,6 +6301,77 @@ impl Tool for AllowedToolProxy {
         }
     }
 
+    fn spec_for_name(&self, name: &str) -> Option<crate::tools::ToolSpec> {
+        self.supports_name(name)
+            .then(|| self.find_source_tool()?.spec_for_name(name))
+            .flatten()
+    }
+
+    fn catalog_specs(&self) -> Vec<crate::tools::ToolSpec> {
+        let Some(tool) = self.find_source_tool() else {
+            return Vec::new();
+        };
+        if self.public_name == tool.name() {
+            tool.catalog_specs()
+        } else {
+            tool.spec_for_name(&self.public_name).into_iter().collect()
+        }
+    }
+
+    fn immutable_catalog_specs(&self) -> Option<&[crate::tools::ToolSpec]> {
+        let tool = self.find_source_tool()?;
+        if self.public_name == tool.name() {
+            tool.immutable_catalog_specs()
+        } else {
+            None
+        }
+    }
+
+    fn shared_catalog_snapshot(&self) -> Option<crate::tools::SharedToolCatalogSnapshot> {
+        let tool = self.find_source_tool()?;
+        let snapshot = tool.shared_catalog_snapshot()?;
+        Some(if self.public_name == tool.name() {
+            snapshot
+        } else {
+            snapshot.restrict_to(&self.public_name, false)
+        })
+    }
+
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        let Some(tool) = self.find_source_tool() else {
+            return Default::default();
+        };
+        let mut bindings = tool.catalog_binding_snapshot();
+        if self.public_name != tool.name() {
+            bindings.retain(|name, _| name == &self.public_name);
+        }
+        bindings
+    }
+
+    fn catalog_availability_is_configured(&self) -> bool {
+        self.find_source_tool()
+            .is_some_and(Tool::catalog_availability_is_configured)
+    }
+
+    async fn resolve_approval_operation(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
+        let Some(tool) = self.find_source_tool() else {
+            return Ok(None);
+        };
+        // The root resolver has no alias name parameter; do not apply it to
+        // another public operation hosted by the same backend.
+        if self.public_name != tool.name() {
+            return Ok(None);
+        }
+        if self.public_name == "memory_store" && self.memory_prefix.is_some() {
+            tool.resolve_approval_operation(&self.rewrite_args(args.clone())).await
+        } else {
+            tool.resolve_approval_operation(args).await
+        }
+    }
+
     fn tier(&self) -> crate::tools::ToolTier {
         self.find_source_tool()
             .map_or(crate::tools::ToolTier::Standard, Tool::tier)
@@ -4599,6 +6389,7 @@ impl Tool for AllowedToolProxy {
     }
 
     async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        anyhow::ensure!(self.supports_name(name), "proxied tool does not expose requested name");
         let Some(tool) = self.find_source_tool() else {
             return Ok(ToolResult {
                 success: false,
@@ -4615,6 +6406,7 @@ impl Tool for AllowedToolProxy {
         args: serde_json::Value,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> anyhow::Result<ToolResult> {
+        anyhow::ensure!(self.supports_name(name), "proxied tool does not expose requested name");
         let Some(tool) = self.find_source_tool() else {
             return Ok(ToolResult {
                 success: false,
@@ -4812,6 +6604,14 @@ fn manifest_signing_payload(manifest: &WorkerManifest) -> anyhow::Result<String>
 /// Compute `HMAC_SHA256(secret, run_id \0 expiry \0 sha256_hex(manifest))` as
 /// base64url (no padding).
 fn compute_worker_capability(run_id: &str, expiry_unix: u64, manifest_json: &str) -> String {
+    compute_worker_capability_with_key(&session_worker_signing_key(), run_id, expiry_unix, manifest_json)
+}
+fn compute_worker_capability_with_key(
+    key: &ring::hmac::Key,
+    run_id: &str,
+    expiry_unix: u64,
+    manifest_json: &str,
+) -> String {
     use base64::Engine as _;
     use ring::hmac;
     use sha2::{Digest, Sha256};
@@ -4827,7 +6627,7 @@ fn compute_worker_capability(run_id: &str, expiry_unix: u64, manifest_json: &str
     payload.push(0);
     payload.extend_from_slice(manifest_hex.as_bytes());
 
-    let tag = hmac::sign(&session_worker_signing_key(), &payload);
+    let tag = hmac::sign(key, &payload);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag.as_ref())
 }
 
@@ -4872,6 +6672,20 @@ fn session_worker_signing_key() -> ring::hmac::Key {
     hmac::Key::new(hmac::HMAC_SHA256, bytes)
 }
 
+/// Recovery must never create or rotate the transport key, or substitute a
+/// process-local fallback when the original signing material is unavailable.
+fn existing_session_worker_signing_key() -> anyhow::Result<ring::hmac::Key> {
+    if let Ok(secret) = std::env::var("SESSION_WORKER_SECRET") {
+        if !secret.is_empty() {
+            return Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes()));
+        }
+    }
+    let path = session_secret_path().context("worker recovery key location unavailable")?;
+    let bytes = std::fs::read(path).context("existing worker recovery key unavailable")?;
+    anyhow::ensure!(bytes.len() == 32, "existing worker recovery key has invalid length");
+    Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes))
+}
+
 /// Generate 32 random bytes, falling back to a time-derived seed (never panics)
 /// when the system RNG is unavailable.
 fn generate_session_secret() -> [u8; 32] {
@@ -4903,8 +6717,7 @@ fn session_secret_path() -> Option<std::path::PathBuf> {
     if let Some(config_dir) = crate::config::process_config_dir() {
         return Some(config_dir.join("keys").join("session_worker.secret"));
     }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-    Some(home.join(".openprx").join("keys").join("session_worker.secret"))
+    crate::config::default_openprx_dir().map(|dir| dir.join("keys").join("session_worker.secret"))
 }
 
 /// Load the persisted 32-byte secret, creating it on first use. Returns `None`
@@ -4956,7 +6769,7 @@ fn chat_messages_to_history(messages: &[ChatMessage]) -> Vec<HistoryEntry> {
 /// - Steering: injected messages are added to the conversation and the loop restarts
 /// - History: `history_out` is updated after each significant state change
 ///
-/// Falls back to a single-turn completion when no tools are registered.
+/// Uses the admitted shared turn loop even when no tools are registered.
 ///
 /// Deterministically restore a single run from a suspended approval back to
 /// [`SubAgentStatus::Running`].
@@ -4974,11 +6787,18 @@ fn restore_run_to_running(runs: &mut [SubAgentRun], run_id: &str) {
     }
 }
 
+/// Dropping an outer steering future must not detach its active inner loop.
+struct AbortLoopOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortLoopOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct SubAgentTaskResult {
+    segment_usage: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
     output: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    tokens_used: crate::llm::route_decision::TokenUsage,
-    trace: crate::agent::loop_::ToolLoopTrace,
     history_commit_len: usize,
 }
 
@@ -4990,18 +6810,12 @@ async fn run_sub_agent_task(
     temperature: f64,
     tools: Option<Arc<Vec<Box<dyn Tool>>>>,
     system_prompt: &str,
-    workspace_dir: &std::path::Path,
     security: Arc<SecurityPolicy>,
-    multimodal_config: &MultimodalConfig,
-    compaction_config: &AgentCompactionConfig,
     mut steer_rx: tokio::sync::mpsc::Receiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
-    scope: Option<SpawnScope>,
-    memory: Option<Arc<dyn Memory>>,
-    event_recording: MemoryEventRecording,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
-    on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
-    approval_resolver: Option<Arc<dyn crate::agent::loop_::ApprovalResolver>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::turn_contracts::ToolCallNotification>>,
+    approval_resolver: Option<Arc<dyn crate::agent::turn_contracts::ApprovalResolver>>,
     // NeedsInput: the shared run registry + this run's id, used to
     // deterministically restore `AwaitingInput` -> `Running` whenever the loop
     // leaves a suspended approval to continue running (steer / cancel-and-resume).
@@ -5018,67 +6832,158 @@ async fn run_sub_agent_task(
     // `crate::agent::idle` already defines as progress.
     progress: Arc<crate::agent::idle::ProgressBeat>,
 ) -> anyhow::Result<SubAgentTaskResult> {
-    // --- No-tools fallback: single-turn completion ---
-    let Some(tools_registry) = tools else {
-        let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(task)];
-        let trace = provider
-            .chat_traced(
-                crate::providers::traits::ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                },
-                model,
-                temperature,
-            )
+    let operator_authority = SPAWN_EXECUTION_CONTEXT
+        .try_with(|context| context.operator_authority.clone())
+        .ok()
+        .flatten();
+    if let Some(authority) = &operator_authority {
+        authority.verify_execution(run_id.as_deref(), task, &provider, provider_name, model)?;
+    }
+    let mut operator_segments = operator_authority
+        .as_ref()
+        .map(|authority| authority.segments())
+        .transpose()?;
+    let ordinary_authority = SPAWN_EXECUTION_CONTEXT
+        .try_with(|context| context.ordinary_authority.clone())
+        .ok()
+        .flatten();
+    let mut ordinary_segments = ordinary_authority
+        .as_ref()
+        .map(|authority| -> anyhow::Result<_> {
+            anyhow::ensure!(
+                Arc::ptr_eq(&authority.binding().provider(), &provider)
+                    && authority.binding().provider_name() == provider_name
+                    && authority.binding().model() == model,
+                "ordinary task provider differs from issued source"
+            );
+            authority.segments()
+        })
+        .transpose()?;
+    let mut child_segments = SPAWN_EXECUTION_CONTEXT
+        .try_with(|context| -> anyhow::Result<_> {
+            let Some(grant) = context.incoming_grant.as_ref() else {
+                return Ok(None);
+            };
+            let binding = context
+                .provider_binding
+                .as_ref()
+                .context("child provider binding missing")?;
+            let receipt = context.input_receipt.as_ref().context("child input receipt missing")?;
+            anyhow::ensure!(
+                binding.provider_name() == provider_name && binding.model() == model && receipt.input() == task,
+                "child execution inputs differ from their admitted source"
+            );
+            binding.source_proof(grant, receipt, &provider)?;
+            Ok(Some((
+                Arc::clone(grant),
+                Arc::clone(binding),
+                crate::runtime::child_source::ChildSegmentSequence::new(Arc::clone(grant), Arc::clone(receipt))?,
+            )))
+        })
+        .unwrap_or(Ok(None))?;
+    anyhow::ensure!(
+        usize::from(child_segments.is_some())
+            + usize::from(ordinary_segments.is_some())
+            + usize::from(operator_segments.is_some())
+            == 1,
+        "task execution requires exactly one admitted source authority"
+    );
+    let child_usage = SPAWN_EXECUTION_CONTEXT
+        .try_with(|context| context.terminal_usage.clone())
+        .ok()
+        .flatten();
+    anyhow::ensure!(
+        (child_segments.is_none() && ordinary_segments.is_none() && operator_segments.is_none())
+            || child_usage.is_some(),
+        "child segment usage owner missing"
+    );
+    let child_fabric = child_segments
+        .as_ref()
+        .map(|(grant, _, _)| grant.source_fabric().clone())
+        .or_else(|| {
+            ordinary_authority
+                .as_ref()
+                .map(|authority| authority.publication().source_fabric())
+        })
+        .or_else(|| operator_authority.as_ref().map(|authority| authority.fabric().clone()));
+    let mut child_source = if let Some((grant, binding, segments)) = child_segments.as_mut() {
+        let receipt = segments
+            .record(child_fabric.as_ref().context("child segment fabric missing")?, task)
             .await?;
-        // A completed provider round-trip is progress by the shared definition.
-        progress.record(crate::agent::idle::ProgressKind::ProviderResponse);
-        let response = trace.response.text_or_empty().to_string();
-        // No incremental loop output exists on this path (single completion);
-        // surface the final response as one delta so an attached follower sees
-        // it (best-effort; dropped on a full/closed channel).
-        if let Some(ref tx) = on_delta
-            && !response.trim().is_empty()
-        {
-            let _ = tx.try_send(response.clone());
-        }
-        let history = vec![
-            HistoryEntry {
-                role: "user".into(),
-                content: task.to_string(),
-                timestamp: Utc::now(),
-            },
-            HistoryEntry {
-                role: "assistant".into(),
-                content: response.clone(),
-                timestamp: Utc::now(),
-            },
-        ];
-        *history_out.write().await = history;
-        let output = if response.trim().is_empty() {
-            "[Sub-agent produced no output]".to_string()
-        } else {
-            response
-        };
-        let any_turn_had_fallback =
-            trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
-        let loop_trace = crate::agent::loop_::ToolLoopTrace {
-            final_provider: Some(trace.final_provider),
-            final_model: Some(trace.final_model),
-            attempts: trace.attempts,
-            any_turn_had_fallback,
-            tokens_used: trace.tokens_used.clone(),
-        };
-        return Ok(SubAgentTaskResult {
-            output,
-            tokens_used: trace.tokens_used,
-            trace: loop_trace,
-            history_commit_len: 2,
-        });
+        let proof = Arc::new(binding.source_proof(grant, &receipt, &provider)?);
+        let execution_context = receipt.execution_context(&proof)?;
+        Some((proof, execution_context))
+    } else if let Some(segments) = ordinary_segments.as_mut() {
+        Some(segments.record(task).await?)
+    } else if let Some(segments) = operator_segments.as_mut() {
+        Some(segments.record(task).await?)
+    } else {
+        None
     };
+    // Empty tool registries still enter the same source-bound decision and
+    // terminal lifecycle. No direct provider path can bypass admission.
+    let tools_registry = tools.unwrap_or_else(|| Arc::new(Vec::new()));
+
+    let child_config = child_segments
+        .as_ref()
+        .map(|(grant, _, _)| Arc::clone(&grant.generation().effective))
+        .or_else(|| {
+            ordinary_authority
+                .as_ref()
+                .map(|authority| Arc::clone(&authority.publication().generation().effective))
+        })
+        .or_else(|| {
+            operator_authority
+                .as_ref()
+                .map(|authority| Arc::clone(&authority.generation().effective))
+        });
+    let mut settled_segment_usage = Vec::new();
+    let child_service = if let Some((grant, _, _)) = child_segments.as_ref() {
+        Some(
+            crate::runtime::turn_publication::ChildDecisionPublication {
+                allowed_tools: None,
+                grant: Arc::clone(grant),
+                registry: Arc::clone(&tools_registry),
+                observer: Arc::new(NoopObserver),
+            }
+            .publish()
+            .await?,
+        )
+    } else if let Some(authority) = &ordinary_authority {
+        let owner = crate::runtime::turn_cleanup::current_tracker().context("ordinary task cleanup owner missing")?;
+        let excluded = SPAWN_EXECUTION_CONTEXT
+            .try_with(|context| context.channel_excluded_tools.clone())
+            .context("ordinary task execution scope missing")?;
+        let service = authority.publication().task_service(
+            Arc::clone(authority),
+            Arc::clone(&tools_registry),
+            authority.allowed_tools(),
+            &excluded,
+        )?;
+        owner.retain_child_service(Arc::clone(&service))?;
+        Some(service)
+    } else if let Some(authority) = &operator_authority {
+        let owner = crate::runtime::turn_cleanup::current_tracker().context("operator task cleanup owner missing")?;
+        let service = authority
+            .publication()
+            .task_service(Arc::clone(authority), Arc::clone(&tools_registry))?;
+        owner.retain_child_service(Arc::clone(&service))?;
+        Some(service)
+    } else {
+        None
+    };
+    let ordinary_runtime = ordinary_authority
+        .as_ref()
+        .map(|authority| authority.publication().loop_runtime().cloned())
+        .or_else(|| {
+            operator_authority
+                .as_ref()
+                .map(|authority| authority.publication().loop_runtime().cloned())
+        })
+        .transpose()?;
 
     // --- Agentic loop with steering support ---
-    let mut history: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt), ChatMessage::user(task)];
+    let mut history: Vec<ChatMessage> = Vec::new();
 
     // NeedsInput: deterministically restore a suspended run to `Running` before
     // re-entering the loop. Called on every path that *continues* running after a
@@ -5097,30 +7002,39 @@ async fn run_sub_agent_task(
     };
 
     loop {
+        if let Some(authority) = &operator_authority {
+            authority.verify_execution(run_id.as_deref(), task, &provider, provider_name, model)?;
+        }
         let cancel_token = CancellationToken::new();
 
         // Clone everything needed for the inner spawned task.
         // We move `history` into the task and get it back after completion.
+        let initial_system = (child_source.is_some() || history.first().is_none_or(|message| message.role != "system"))
+            .then(|| system_prompt.to_owned());
+        let initial_task = history.is_empty().then(|| task.to_owned());
         let mut task_history = history;
         let provider_instance = provider.clone();
+        let child_source_owned = child_source.clone().context("task segment source missing")?;
+        let ordinary_runtime_owned = ordinary_runtime.clone();
+        let child_service_owned = child_service.clone().context("task segment service missing")?;
+        let child_config_owned = child_config.clone().context("task segment configuration missing")?;
+        let child_fabric_owned = child_fabric.clone().context("task segment fabric missing")?;
+        let child_usage_owned = child_usage.clone();
         let provider_name_owned = provider_name.to_string();
         let model_name = model.to_string();
         let temperature_value = temperature;
         let tools_registry_owned = tools_registry.clone();
-        let workspace_dir_owned = workspace_dir.to_path_buf();
-        let multimodal_config_owned = multimodal_config.clone();
-        let compaction_config_owned = compaction_config.clone();
+        let workspace_dir_owned = child_config_owned.workspace_dir.clone();
+        let multimodal_config_owned = child_config_owned.multimodal.clone();
         let cancel_token_owned = cancel_token.clone();
         let security = security.clone();
-        let scope_owned = scope.clone();
-        let memory_owned = memory.clone();
         // Clone the event-bridge senders per iteration so they survive across
         // steer-driven loop restarts (the inner spawn consumes its clones; the
         // originals stay owned by this outer loop). When `None`, the loop runs
         // silently exactly as before (channels/gateway behaviour unchanged).
         //
         // NOTE: the agent stays `silent = true` regardless. `silent` only gates
-        // the loop's *direct* `print!` to stdout (loop_.rs); a background
+        // the loop's *direct* `print!` to stdout (turn_engine.rs); a background
         // sub-agent must never print to the chat's terminal (it would corrupt
         // the TUI). The `on_delta` / `on_tool_call` channel sends are NOT gated
         // by `silent`, so the event bridge streams to the drainer either way.
@@ -5142,22 +7056,39 @@ async fn run_sub_agent_task(
         // of the spawned monitor task, which has none, and both properties are
         // silently lost.
         let run_beat = Arc::clone(&progress);
+        let cleanup_parent = crate::runtime::turn_cleanup::current_tracker();
+        let (cleanup_ack, cleanup_confirmed) = tokio::sync::oneshot::channel();
+        let loop_cleanup =
+            crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
+                .with_acknowledgement(Some(cleanup_ack));
         let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(Some(run_beat), async move {
-            let observer = NoopObserver;
-            let hooks = HookManager::new(workspace_dir_owned.clone());
-            let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
+            // Carry the segment proof across the spawn boundary explicitly.
+            let child_source = child_source_owned;
+            let child_service = child_service_owned;
+            let (observer, hooks): (Arc<dyn crate::observability::Observer>, Arc<HookManager>) =
+                match ordinary_runtime_owned {
+                    Some(runtime) => (runtime.observer, runtime.hooks),
+                    None => (
+                        Arc::new(NoopObserver),
+                        Arc::new(HookManager::new(workspace_dir_owned.clone())),
+                    ),
+                };
+            let context = &child_source.1;
+            let envelope = &context.envelope;
+            let scope_ctx = ScopeContext {
                 policy: &security,
-                sender: scope.sender.as_str(),
-                channel: scope.channel.as_str(),
-                chat_type: scope.chat_type.as_str(),
-                chat_id: scope.chat_id.as_str(),
-                owner_id: scope.owner_id.as_deref(),
-                topic_id: scope.topic_id.as_deref(),
-                task_id: scope.parent_task_id.as_deref(),
-                source_message_event_id: scope.source_message_event_id.as_deref(),
-                config_generation_id: scope.config_generation_id,
-                config_source_revision: scope.config_source_revision.as_deref(),
-            });
+                sender: envelope.sender.as_deref().unwrap_or_default(),
+                channel: envelope.channel.as_deref().unwrap_or_default(),
+                chat_type: context.chat_type.as_str(),
+                chat_id: envelope.recipient.as_deref().unwrap_or_default(),
+                owner_id: envelope.owner_id.as_deref(),
+                topic_id: envelope.topic_id.as_deref(),
+                task_id: envelope.task_id.as_deref(),
+                source_message_event_id: envelope.source_message_event_id.as_deref(),
+                config_generation_id: envelope.config_generation_id,
+                config_source_revision: envelope.config_source_revision.as_deref(),
+            };
+            let memory_owned = child_fabric_owned.memory();
             // Only build an `ApprovalManager` when a resolver is attached. Under
             // permission-model Phase 1 the unified `SecurityPolicy::decide`
             // (supervised: act-tools → Ask) is what routes a call into the
@@ -5167,60 +7098,127 @@ async fn run_sub_agent_task(
             let approval_manager = approval_resolver_iter
                 .as_ref()
                 .map(|_| crate::approval::ApprovalManager::new());
-            let loop_outcome = crate::agent::loop_::run_tool_call_loop_outcome(
-                provider_instance.as_ref(),
-                &mut task_history,
-                tools_registry_owned,
-                &observer,
-                &hooks,
-                &provider_name_owned,
-                &model_name,
-                temperature_value,
-                true, // silent — never print to the chat terminal (see note above)
-                approval_manager.map(Arc::new),
-                "sessions_spawn",
-                &multimodal_config_owned,
-                2,
-                false,
-                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
-                Some(&compaction_config_owned),
-                Some(cancel_token_owned),
-                on_delta_iter, // chat event bridge: incremental loop output (v1.1a)
-                scope_ctx.as_ref(),
-                on_tool_call_iter, // chat event bridge: tool-call notifications (v1.1a)
-                None,              // spawned sessions do not use tool tiering
-                // The ledger is keyed off the shared memory alone: a spawned
-                // session without an ingest scope must still run write tools.
-                memory_owned.as_ref().map_or_else(
-                    || crate::agent::loop_::ToolLoopMemory::ledger_only(&workspace_dir_owned),
-                    |memory| {
-                        crate::agent::loop_::ToolLoopMemory::new(
-                            memory,
-                            &workspace_dir_owned,
-                            scope_ctx
-                                .as_ref()
-                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx).into_nested_turn()),
-                        )
-                        .with_event_fabric(
-                            MemoryFabric::new(memory.clone(), workspace_dir_owned.to_string_lossy().to_string())
-                                .with_event_recording(event_recording),
-                        )
-                    },
-                ),
-                crate::agent::loop_::ChatMode::default(),
-                approval_resolver_iter,
-                false,
-                None,
-            )
+            let result = async {
+                let child_turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
+                    child_service,
+                    child_source.clone(),
+                    child_fabric_owned.clone(),
+                    child_config_owned,
+                    cleanup_parent.as_ref().context("child segment cleanup owner missing")?,
+                    &cancel_token_owned,
+                    child_usage_owned,
+                )
+                .await?
+                .with_child_cleanup(cleanup_confirmed);
+                if child_turn.is_close()? {
+                    loop_cleanup.run(async { Ok(()) }).await?;
+                    let reply = child_turn
+                        .close(&cancel_token_owned)
+                        .await?
+                        .context("child segment close disposition changed")?;
+                    task_history.push(ChatMessage::assistant(reply.clone()));
+                    if let Some(sender) = on_delta_iter.as_ref() {
+                        let _ = sender.try_send(reply.clone());
+                    }
+                    return Ok(SubAgentTaskResult {
+                        segment_usage: Vec::new(),
+                        output: reply,
+                        history_commit_len: task_history.len(),
+                    });
+                }
+                if let Some(system) = initial_system {
+                    let system = child_turn.prompt_with_skills(&system)?;
+                    if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {
+                        *previous = ChatMessage::system(system);
+                    } else {
+                        task_history.insert(0, ChatMessage::system(system));
+                    }
+                }
+                if let Some(task) = initial_task {
+                    task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
+                }
+                child_turn.enrich_input(&mut task_history)?;
+                let loop_outcome = loop_cleanup
+                    .run(crate::agent::turn_engine::run_turn(
+                        &mut task_history,
+                        crate::agent::turn_request::TurnRequest {
+                            channel_name: "sessions_spawn",
+                            // chat event bridge: incremental loop output (v1.1a)
+                            scope: Some(&scope_ctx),
+                            mode: crate::agent::turn_contracts::ChatMode::default(),
+                            silent: true,
+                            expose_stay_silent: false,
+                            multimodal: &multimodal_config_owned,
+                            schedule: crate::agent::turn_request::TurnSchedule {
+                                read_only_tool_concurrency_window: 2,
+                                priority_scheduling_enabled: false,
+                                low_priority_tool_names: vec![
+                                    "sessions_spawn".to_string(),
+                                    "delegate".to_string(),
+                                    "cron".to_string(),
+                                ],
+                            },
+                            compaction: Some(child_turn.compaction()),
+                            decision: child_turn.routing(),
+                        },
+                        crate::agent::turn_request::TurnServices {
+                            provider: provider_instance.as_ref(),
+                            provider_name: &provider_name_owned,
+                            model: &model_name,
+                            temperature: temperature_value,
+                            tools_registry: tools_registry_owned,
+                            observer: observer.as_ref(),
+                            hooks: hooks.as_ref(),
+                            // silent — never print to the chat terminal (see note above)
+                            approval: approval_manager.map(Arc::new),
+                            approval_resolver: approval_resolver_iter,
+                            runtime_adapter: Some(child_turn.adapter()),
+                            memory: crate::agent::turn_request::ToolLoopMemory::new(
+                                &memory_owned,
+                                &workspace_dir_owned,
+                                Some(
+                                    DocumentIngestRuntime::from_scope(memory_owned.clone(), &scope_ctx)
+                                        .into_nested_turn(),
+                                ),
+                            )
+                            .with_event_fabric(child_fabric_owned),
+                        },
+                        crate::agent::turn_request::TurnDelivery {
+                            cancellation: Some(cancel_token_owned.clone()),
+                            on_delta: on_delta_iter,
+                            on_tool_call: on_tool_call_iter,
+                        },
+                    ))
+                    .await;
+                let (outcome, trace) = match loop_outcome {
+                    Ok(result) => result,
+                    Err(error) => {
+                        child_turn
+                            .fail(
+                                &error,
+                                cancel_token_owned.is_cancelled()
+                                    || crate::agent::turn_contracts::is_tool_loop_cancelled(&error),
+                            )
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                let segment_usage = child_turn
+                    .complete(&outcome, &trace)
+                    .await?
+                    .usage_settlement
+                    .into_iter()
+                    .collect();
+                Ok(SubAgentTaskResult {
+                    segment_usage,
+                    output: outcome.into_text(),
+                    history_commit_len: task_history.len(),
+                })
+            }
             .await;
-            let result = loop_outcome.map(|(outcome, trace)| SubAgentTaskResult {
-                output: outcome.into_text(),
-                tokens_used: trace.tokens_used.clone(),
-                trace,
-                history_commit_len: task_history.len(),
-            });
             (task_history, result)
         }));
+        let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
 
         // Race: loop completion vs steering message
         tokio::select! {
@@ -5232,6 +7230,8 @@ async fn run_sub_agent_task(
                 *history_out.write().await = chat_messages_to_history(&history);
                 return match result {
                     Ok(mut result) => {
+                        settled_segment_usage.append(&mut result.segment_usage);
+                        result.segment_usage = settled_segment_usage;
                         if result.output.trim().is_empty() {
                             result.output = "[Sub-agent produced no output]".to_string();
                         }
@@ -5246,8 +7246,16 @@ async fn run_sub_agent_task(
                         // Cancel the running inner loop
                         cancel_token.cancel();
                         // Wait for the task to acknowledge cancellation and return history
-                        let (returned_history, _cancelled_result) = loop_handle.await?;
+                        let (returned_history, cancelled_result) = loop_handle.await?;
                         history = returned_history;
+                        match cancelled_result {
+                            Err(error) if error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>() => {
+                                *history_out.write().await = chat_messages_to_history(&history);
+                                return Err(error);
+                            }
+                            Ok(mut completed) => settled_segment_usage.append(&mut completed.segment_usage),
+                            Err(_) => {}
+                        }
                         // NeedsInput: the cancelled inner loop may have been parked
                         // on a suspended approval (`resolve()` future dropped on
                         // cancel). Its registry status can be a zombie
@@ -5257,9 +7265,23 @@ async fn run_sub_agent_task(
                         // here (async, authoritative) — never clobbering a terminal
                         // state set by a concurrent kill / timeout.
                         restore_running().await;
+                        let segment_input = steering_instruction(&steer_msg);
+                        if let Some((grant, binding, segments)) = child_segments.as_mut() {
+                            let receipt = segments.record(
+                                child_fabric.as_ref().context("child segment fabric missing")?,
+                                &segment_input,
+                            ).await?;
+                            let proof = Arc::new(binding.source_proof(grant, &receipt, &provider)?);
+                            let execution_context = receipt.execution_context(&proof)?;
+                            child_source = Some((proof, execution_context));
+                        } else if let Some(segments) = ordinary_segments.as_mut() {
+                            child_source = Some(segments.record(&segment_input).await?);
+                        } else if let Some(segments) = operator_segments.as_mut() {
+                            child_source = Some(segments.record(&segment_input).await?);
+                        }
                         // Inject the steering message as a user turn
                         tracing::info!("Sub-agent steering: injecting message");
-                        history.push(ChatMessage::user(steering_instruction(&steer_msg)));
+                        history.push(ChatMessage::user(segment_input));
                         // Update shared history so callers can see the injected message
                         *history_out.write().await = chat_messages_to_history(&history);
                         // Loop continues — will re-enter with updated history
@@ -5271,6 +7293,8 @@ async fn run_sub_agent_task(
                         *history_out.write().await = chat_messages_to_history(&history);
                         return match result {
                             Ok(mut result) => {
+                                settled_segment_usage.append(&mut result.segment_usage);
+                                result.segment_usage = settled_segment_usage;
                                 if result.output.trim().is_empty() {
                                     result.output = "[Sub-agent produced no output]".to_string();
                                 }
@@ -5348,6 +7372,11 @@ fn build_session_worker_manifest(
     provider_name: &str,
     model: &str,
     api_key: Option<&str>,
+    route_hint: Option<&str>,
+    route_source_provider: Option<&str>,
+    route_credential: Option<&providers::credentials::CredentialRef>,
+    route_uses_root_connection: bool,
+    direct_uses_root_connection: bool,
     temperature: f64,
     worker_workspace: std::path::PathBuf,
     memory_db_path: std::path::PathBuf,
@@ -5370,14 +7399,32 @@ fn build_session_worker_manifest(
     parent_run_id: Option<&str>,
     compaction_config: &AgentCompactionConfig,
     channel_excluded_tools: &[String],
+    child_source: Option<(
+        &crate::runtime::child_source::IssuedChildGrant,
+        &crate::runtime::child_source::ChildInputReceipt,
+        &crate::session_worker::protocol::WorkerProviderSelection,
+    )>,
+    source_launch: Option<(
+        crate::runtime::operator_spawn::process::ProcessSourceLaunch,
+        &ring::hmac::Key,
+    )>,
 ) -> anyhow::Result<(WorkerManifest, String, u64)> {
     let mut manifest = WorkerManifest {
         parent_capability: None,
+        capability_manifest: None,
+        child_source: None,
+        ordinary_source: None,
+        operator_source: None,
         run_id: run_id.to_string(),
         task: task.to_string(),
         provider_name: provider_name.to_string(),
         model: model.to_string(),
         api_key: api_key.map(str::to_string),
+        route_hint: route_hint.map(str::to_string),
+        route_source_provider: route_source_provider.map(str::to_string),
+        route_credential: route_credential.cloned(),
+        route_uses_root_connection,
+        direct_uses_root_connection,
         temperature,
         config_dir,
         config_generation: config_generation.to_string(),
@@ -5391,7 +7438,9 @@ fn build_session_worker_manifest(
         shared_memory_db_path: Some(shared_memory_db_path),
         worker_memory_db_path: Some(worker_memory_db_path),
         agent_id: agent_id.map(str::to_string),
-        persona_id: None,
+        persona_id: source_launch
+            .as_ref()
+            .and_then(|(launch, _)| launch.persona_id().map(str::to_owned)),
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
         channel_excluded_tools: channel_excluded_tools.to_vec(),
@@ -5411,8 +7460,22 @@ fn build_session_worker_manifest(
         compaction_config: Some(compaction_config.clone()),
     };
 
+    if let Some((grant, receipt, selection)) = child_source {
+        grant.bind_worker_manifest(&mut manifest, receipt, selection)?;
+    }
+
     let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
-    let sealed_capability = seal_worker_capability(&manifest, capability_expiry)?;
+    let sealed_capability = if let Some((launch, key)) = source_launch {
+        launch.bind_worker_manifest(key, &mut manifest)?;
+        compute_worker_capability_with_key(
+            key,
+            &manifest.run_id,
+            capability_expiry,
+            &manifest_signing_payload(&manifest)?,
+        )
+    } else {
+        seal_worker_capability(&manifest, capability_expiry)?
+    };
     manifest.parent_capability = Some(sealed_capability.clone());
     Ok((manifest, sealed_capability, capability_expiry))
 }
@@ -5562,7 +7625,18 @@ async fn wait_for_owned_process(
 }
 
 enum ProcessWorkerOutcome {
+    OperatorVerifiedFinished(process_terminal::operator::VerifiedOperatorWorkerCompletion),
+    OperatorInterrupted {
+        detail: String,
+        usage: process_terminal::RecoveredWorkerUsage,
+    },
     Finished(WorkerResult),
+    VerifiedFinished(process_terminal::VerifiedWorkerCompletion),
+    OrdinaryVerifiedFinished(process_terminal::ordinary::VerifiedOrdinaryWorkerCompletion),
+    OrdinaryInterrupted {
+        detail: String,
+        usage: process_terminal::RecoveredWorkerUsage,
+    },
     Terminated(String),
     TerminationFailed(String),
     /// The worker's stdout reached EOF without a `WorkerResult` line.
@@ -6012,12 +8086,51 @@ fn cleanup_process_worker_workspace(run_id: &str, worker_workspace: &std::path::
     }
 }
 
+async fn recover_ordinary_interruption(
+    fabric: &MemoryFabric,
+    manifest: &crate::session_worker::protocol::WorkerManifest,
+    generation: &crate::config::ConfigGeneration,
+    transport_key: &ring::hmac::Key,
+    detail: String,
+) -> anyhow::Result<ProcessWorkerOutcome> {
+    if let Some(mut completion) =
+        process_terminal::ordinary::recover_completion(fabric, manifest, generation, transport_key).await?
+    {
+        completion.confirm_reaped(&manifest.run_id)?;
+        return Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion));
+    }
+    let usage = process_terminal::ordinary::recover_partial_usage(fabric, manifest, generation, transport_key).await?;
+    Ok(ProcessWorkerOutcome::OrdinaryInterrupted { detail, usage })
+}
+
+async fn recover_operator_interruption(
+    fabric: &MemoryFabric,
+    manifest: &crate::session_worker::protocol::WorkerManifest,
+    generation: &crate::config::ConfigGeneration,
+    transport_key: &ring::hmac::Key,
+    detail: String,
+) -> anyhow::Result<ProcessWorkerOutcome> {
+    if let Some(mut completion) =
+        process_terminal::operator::recover_completion(fabric, manifest, generation, transport_key).await?
+    {
+        completion.confirm_reaped(&manifest.run_id)?;
+        return Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion));
+    }
+    let usage = process_terminal::operator::recover_partial_usage(fabric, manifest, generation, transport_key).await?;
+    Ok(ProcessWorkerOutcome::OperatorInterrupted { detail, usage })
+}
+
 async fn run_sub_agent_process(
     run_id: &str,
     task: &str,
     provider_name: &str,
     model: &str,
     api_key: Option<&str>,
+    route_hint: Option<&str>,
+    route_source_provider: Option<&str>,
+    route_credential: Option<&providers::credentials::CredentialRef>,
+    route_uses_root_connection: bool,
+    direct_uses_root_connection: bool,
     temperature: f64,
     workspace_root: &std::path::Path,
     worker_workspace_root: &std::path::Path,
@@ -6042,16 +8155,74 @@ async fn run_sub_agent_process(
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
     progress: Arc<crate::agent::idle::ProgressBeat>,
+    provider_selection: Option<&crate::session_worker::protocol::WorkerProviderSelection>,
+    source_fabric: Option<&MemoryFabric>,
+    recovery: Option<&process_terminal::ProcessRecovery>,
+    source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
+    batch_id: Option<&str>,
+    #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
+    let process_generation = source_launch.as_ref().map(|launch| Arc::clone(launch.generation()));
+    let ordinary_generation = source_launch
+        .as_ref()
+        .filter(|launch| launch.is_ordinary())
+        .map(|launch| Arc::clone(launch.generation()));
+    let operator_generation = source_launch
+        .as_ref()
+        .filter(|launch| !launch.is_ordinary())
+        .map(|launch| Arc::clone(launch.generation()));
+    anyhow::ensure!(
+        operator_generation.is_none() || batch_id.is_none(),
+        "operator process cannot claim model batch provenance"
+    );
+    let source_transport_key = source_launch.as_ref().map(|_| session_worker_signing_key());
+    if let Some(launch) = &source_launch {
+        let fabric = source_fabric.context("process source fabric missing")?;
+        let issued = launch.source_fabric();
+        anyhow::ensure!(
+            fabric.workspace_id() == issued.workspace_id() && Arc::ptr_eq(&fabric.memory(), &issued.memory()),
+            "process source storage differs from captured launch"
+        );
+    }
+    let execution = current_spawn_execution_context();
+    let child_source = execution
+        .as_ref()
+        .and_then(|context| context.incoming_grant.as_deref())
+        .map(|grant| {
+            let receipt = execution
+                .as_ref()
+                .and_then(|context| context.input_receipt.as_deref())
+                .context("process child input receipt is missing")?;
+            grant.verify_receipt(receipt)?;
+            let selection = provider_selection.context("process child provider selection missing")?;
+            Ok::<_, anyhow::Error>((grant, receipt, selection))
+        })
+        .transpose()?;
+    let logical_workspace_root = child_source.as_ref().map_or_else(
+        || {
+            process_generation.as_ref().map_or(workspace_root, |generation| {
+                generation.effective.workspace_dir.as_path()
+            })
+        },
+        |(grant, _, _)| grant.generation().effective.workspace_dir.as_path(),
+    );
+    if let Some((grant, _, _)) = child_source.as_ref() {
+        let fabric = source_fabric.context("process child logical source fabric missing")?;
+        anyhow::ensure!(
+            fabric.workspace_id() == grant.source_fabric().workspace_id()
+                && Arc::ptr_eq(&fabric.memory(), &grant.source_fabric().memory()),
+            "process child source storage differs from issued grant"
+        );
+    }
     let worker_workspace = worker_workspace_root.join(run_id);
     std::fs::create_dir_all(&worker_workspace)?;
-    let shared_memory_db_path = shared_worker_memory_db_path(workspace_root);
+    let shared_memory_db_path = shared_worker_memory_db_path(logical_workspace_root);
     let worker_memory_db_path = private_worker_memory_db_path(&worker_workspace);
     let normalized_memory_strategy = normalize_process_memory_strategy(memory_strategy)?;
     let (memory_db_path, memory_workspace_id) = match normalized_memory_strategy {
         PROCESS_MEMORY_STRATEGY_SHARED => (
             shared_memory_db_path.clone(),
-            workspace_root.to_string_lossy().to_string(),
+            logical_workspace_root.to_string_lossy().to_string(),
         ),
         PROCESS_MEMORY_STRATEGY_ISOLATED | PROCESS_MEMORY_STRATEGY_HYBRID => (
             worker_memory_db_path.clone(),
@@ -6093,6 +8264,11 @@ async fn run_sub_agent_process(
         provider_name,
         model,
         api_key,
+        route_hint,
+        route_source_provider,
+        route_credential,
+        route_uses_root_connection,
+        direct_uses_root_connection,
         temperature,
         worker_workspace.clone(),
         memory_db_path,
@@ -6115,6 +8291,8 @@ async fn run_sub_agent_process(
         parent_run_id,
         compaction_config,
         channel_excluded_tools,
+        child_source,
+        source_launch.zip(source_transport_key.as_ref()),
     )?;
 
     if let Some(reason) = process_control.termination_reason() {
@@ -6122,9 +8300,53 @@ async fn run_sub_agent_process(
         return Ok(ProcessWorkerOutcome::Terminated(reason));
     }
 
+    #[cfg(not(test))]
     let executable = std::env::current_exe()?;
+    #[cfg(test)]
+    let executable = if let Some(artifact) = test_worker_executable {
+        artifact.verify()?;
+        artifact.path.clone()
+    } else {
+        std::env::current_exe()?
+    };
+    #[cfg(test)]
+    if let Some(observer) = test_worker_executable.and_then(|artifact| artifact.route_observer.as_ref()) {
+        use sha2::{Digest as _, Sha256};
+        let mut capture = observer.lock();
+        capture.total = capture.total.saturating_add(1);
+        if capture.first.is_none() {
+            capture.first = Some(TestWorkerRouteObservation {
+                run_id: manifest.run_id.clone(),
+                parent_run_id: manifest.parent_run_id.clone(),
+                owner_id: manifest.owner_id.clone(),
+                source_event_id: manifest.source_message_event_id.clone(),
+                provider: manifest.provider_name.clone(),
+                model: manifest.model.clone(),
+                route_hint: manifest.route_hint.clone(),
+                route_source_provider: manifest.route_source_provider.clone(),
+                route_credential: manifest.route_credential.clone(),
+                key_sha256: manifest
+                    .api_key
+                    .as_ref()
+                    .map(|key| Sha256::digest(key.as_bytes()).into()),
+                route_uses_root_connection: manifest.route_uses_root_connection,
+                direct_uses_root_connection: manifest.direct_uses_root_connection,
+                child_source_present: manifest.child_source.is_some(),
+                child_allowed_count: manifest.capability_manifest.as_ref().map(|scope| scope.allowed.len()),
+            });
+        }
+    }
     let cli_args = build_session_worker_cli_args(&manifest)?;
     let mut command = tokio::process::Command::new(executable);
+    #[cfg(test)]
+    if let Some(artifact) = test_worker_executable {
+        // The outer guarded runner remains responsible for OS filesystem/network
+        // confinement. Do not launch this ignored AUT outside that guard.
+        command
+            .env_clear()
+            .env("HOME", &artifact.private_home)
+            .env("PATH", "/usr/bin:/bin");
+    }
     command.env(SESSION_WORKER_CAP_ENV, &sealed_capability);
     command.env(SESSION_WORKER_CAP_EXPIRY_ENV, capability_expiry.to_string());
     command
@@ -6156,30 +8378,66 @@ async fn run_sub_agent_process(
             start_kill_and_reap_direct_child(&mut child)
                 .await
                 .map_err(|cleanup_error| anyhow::anyhow!("{error}; direct-child cleanup failed: {cleanup_error}"))?;
+            worker_registration.mark_reaped();
+            if let Some(recovery) = recovery {
+                recovery.confirm_exit(run_id)?;
+            }
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Err(error);
         }
     };
-    let owned_phase = std::panic::AssertUnwindSafe(run_spawned_child_lifecycle(
-        &mut child,
-        &mut process_group,
-        &payload,
-        process_control,
-        Some(WorkerSteerPipe {
-            steer_rx,
-            history,
-            run_id: run_id.to_string(),
-        }),
-        Some(progress),
-        #[cfg(test)]
-        false,
-    ))
+    let owned_phase = std::panic::AssertUnwindSafe(async {
+        if let Some(recovery) = recovery {
+            recovery
+                .persist_launch(child.id().context("worker process id unavailable before launch")?)
+                .await?;
+        }
+        if let Some(generation) = &ordinary_generation {
+            process_terminal::ordinary::launch::persist(
+                source_fabric.context("ordinary launch source storage missing")?,
+                &manifest,
+                generation,
+                source_transport_key
+                    .as_ref()
+                    .context("ordinary launch transport key missing")?,
+                child.id().context("ordinary worker PID unavailable before launch")?,
+                batch_id,
+            )
+            .await?;
+        }
+        if let Some(generation) = &operator_generation {
+            process_terminal::operator::launch::persist(
+                source_fabric.context("operator launch source storage missing")?,
+                &manifest,
+                generation,
+                source_transport_key
+                    .as_ref()
+                    .context("operator launch transport key missing")?,
+                child.id().context("operator worker PID unavailable before launch")?,
+            )
+            .await?;
+        }
+        run_spawned_child_lifecycle(
+            &mut child,
+            &mut process_group,
+            &payload,
+            process_control,
+            Some(WorkerSteerPipe {
+                steer_rx,
+                history,
+                run_id: run_id.to_string(),
+            }),
+            Some(progress),
+            #[cfg(test)]
+            false,
+        )
+        .await
+    })
     .catch_unwind()
     .await;
-    // Every branch below reaps the leader and tears the group down, so the
-    // ledger row is retired here rather than being reported as an orphan. If the
-    // await above is cancelled instead, the guard drops unreaped and the row
-    // stays visible — which is exactly the orphan report it exists for.
-    worker_registration.mark_reaped();
+    // Confirm the leader's reap only on branches with actual cleanup evidence.
+    // Failed cleanup keeps the process ledger row and workspace available for
+    // recovery; a returned lifecycle result alone is not acknowledgement.
     let owned_phase = match owned_phase {
         Ok(Ok(phase)) => phase,
         Ok(Err(error)) => {
@@ -6190,10 +8448,14 @@ async fn run_sub_agent_process(
                 false,
             )
             .await;
-            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             cleanup.map_err(|cleanup_error| {
                 anyhow::anyhow!("session-worker lifecycle failed: {error}; cleanup failed: {cleanup_error}")
             })?;
+            worker_registration.mark_reaped();
+            if let Some(recovery) = recovery {
+                recovery.confirm_exit(run_id)?;
+            }
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Err(error);
         }
         Err(_) => {
@@ -6204,29 +8466,168 @@ async fn run_sub_agent_process(
                 false,
             )
             .await;
-            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error}"))?;
+            worker_registration.mark_reaped();
+            if let Some(recovery) = recovery {
+                recovery.confirm_exit(run_id)?;
+            }
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             anyhow::bail!("{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child");
         }
     };
     let (status, stdout, stderr) = match owned_phase {
-        OwnedProcessPhase::Exited { status, stdout, stderr } => (status, stdout, stderr),
+        OwnedProcessPhase::Exited { status, stdout, stderr } => {
+            worker_registration.mark_reaped();
+            if let Some(recovery) = recovery {
+                recovery.confirm_exit(run_id)?;
+            }
+            (status, stdout, stderr)
+        }
         OwnedProcessPhase::Terminated(reason) => {
+            worker_registration.mark_reaped();
+            if let Some(recovery) = recovery {
+                recovery.confirm_exit(run_id)?;
+            }
+            if let Some(generation) = &ordinary_generation {
+                let recovered = recover_ordinary_interruption(
+                    source_fabric.context("ordinary interrupted source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("ordinary interruption transport key missing")?,
+                    reason,
+                )
+                .await;
+                cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+                return recovered;
+            }
+            if let Some(generation) = &operator_generation {
+                let recovered = recover_operator_interruption(
+                    source_fabric.context("operator interrupted source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("operator interruption transport key missing")?,
+                    reason,
+                )
+                .await;
+                cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+                return recovered;
+            }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Ok(ProcessWorkerOutcome::Terminated(reason));
         }
         OwnedProcessPhase::TerminationFailed(error) => {
-            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+            tracing::warn!(
+                run_id,
+                "worker cleanup unconfirmed; retaining process record and workspace"
+            );
             return Ok(ProcessWorkerOutcome::TerminationFailed(error));
         }
     };
     let stdout_raw = String::from_utf8_lossy(&stdout).trim().to_string();
     let stderr_raw = String::from_utf8_lossy(&stderr).trim().to_string();
     let outcome = classify_worker_output(status, &stdout_raw, &stderr_raw);
-    // Cleanup on *every* exit path now, including the two error ones. The
-    // classification above no longer returns early, so a worker that died
-    // without a result cannot leak its workspace the way a decode failure used
-    // to.
+    let outcome = async {
+        // A cleanup-confirmed worker can exit after journaling but before its
+        // stdout result reaches the parent. Reuse its exact launch authority.
+        if let Some(generation) = &ordinary_generation {
+            let interruption = match &outcome {
+                Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => Some(detail.clone()),
+                Err(_) => Some("worker output was invalid or conflicted with its exit status".to_owned()),
+                _ => None,
+            };
+            if let Some(detail) = interruption {
+                return recover_ordinary_interruption(
+                    source_fabric.context("ordinary interrupted source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("ordinary interruption transport key missing")?,
+                    detail,
+                )
+                .await;
+            }
+        }
+        if let Some(generation) = &operator_generation {
+            let interruption = match &outcome {
+                Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => Some(detail.clone()),
+                Err(_) => Some("worker output was invalid or conflicted with its exit status".to_owned()),
+                _ => None,
+            };
+            if let Some(detail) = interruption {
+                return recover_operator_interruption(
+                    source_fabric.context("operator interrupted source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("operator interruption transport key missing")?,
+                    detail,
+                )
+                .await;
+            }
+        }
+        match outcome? {
+            ProcessWorkerOutcome::Finished(result) => {
+                if let Some((grant, input, _)) = child_source {
+                    anyhow::ensure!(
+                        input.event().run_id.as_deref() == Some(run_id),
+                        "worker result belongs to another launched run"
+                    );
+                    let verified = process_terminal::verify(
+                        source_fabric.context("worker logical source storage missing")?,
+                        grant,
+                        input,
+                        result,
+                    )
+                    .await?;
+                    Ok(ProcessWorkerOutcome::VerifiedFinished(verified))
+                } else if let Some(generation) = &ordinary_generation {
+                    let mut verified = process_terminal::ordinary::verify(
+                        source_fabric.context("ordinary process source storage missing")?,
+                        &manifest,
+                        generation,
+                        source_transport_key
+                            .as_ref()
+                            .context("ordinary process transport key missing")?,
+                        result,
+                    )
+                    .await?;
+                    verified.confirm_reaped(run_id)?;
+                    Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(verified))
+                } else if let Some(generation) = &operator_generation {
+                    let mut verified = process_terminal::operator::verify(
+                        source_fabric.context("operator process source storage missing")?,
+                        &manifest,
+                        generation,
+                        source_transport_key
+                            .as_ref()
+                            .context("operator process transport key missing")?,
+                        result,
+                    )
+                    .await?;
+                    verified.confirm_reaped(run_id)?;
+                    Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(verified))
+                } else {
+                    anyhow::ensure!(
+                        result.completion_evidence.is_none()
+                            && result.ordinary_completion.is_none()
+                            && result.operator_completion.is_none(),
+                        "ordinary worker completion requires its authenticated verifier"
+                    );
+                    Ok(ProcessWorkerOutcome::Finished(result))
+                }
+            }
+            other => Ok(other),
+        }
+    }
+    .await;
+    // The leader is confirmed reaped here, including decode/verification
+    // failures. Unconfirmed cleanup branches above retain their workspace.
     cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
     outcome
 }
@@ -6421,11 +8822,10 @@ mod tests {
             Some(scoped.join("keys").join("session_worker.secret")),
             "a scoped run must keep its session-worker secret inside the resolved config dir"
         );
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         assert_eq!(
             unscoped_path,
-            home.map(|home| home.join(".openprx").join("keys").join("session_worker.secret")),
-            "without a published config dir the historical $HOME location is kept"
+            crate::config::default_openprx_dir().map(|dir| dir.join("keys").join("session_worker.secret")),
+            "without a published config dir the default ~/.openprx location is kept"
         );
     }
 
@@ -6691,6 +9091,7 @@ mod tests {
                 }],
                 final_provider: "echo".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
@@ -6766,66 +9167,53 @@ mod tests {
                 }],
                 final_provider: "gated".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
     }
 
-    struct TraceUsageProvider;
+    struct TaskTraceParentProvider;
 
     #[async_trait::async_trait]
-    impl crate::providers::Provider for TraceUsageProvider {
-        async fn chat_with_system(
-            &self,
-            _system: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("task-mode no-tools path must use chat_traced so token usage is preserved")
+    impl Provider for TaskTraceParentProvider {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            anyhow::bail!("task trace fixture requires the shared parent loop")
         }
-
         async fn chat(
             &self,
-            _request: crate::providers::ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<crate::providers::ChatResponse> {
-            anyhow::bail!("task-mode no-tools path should use chat_traced directly")
-        }
-
-        async fn chat_traced(
-            &self,
             request: crate::providers::ChatRequest<'_>,
-            model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
-            assert_eq!(model, "metered-model");
-            assert_eq!(request.messages.len(), 2);
-            assert_eq!(request.messages[0].role, "system");
-            assert_eq!(request.messages[1].role, "user");
-            let started_at = chrono::Utc::now();
-            let finished_at = chrono::Utc::now();
-            Ok(crate::providers::traits::ChatTrace {
-                response: crate::providers::ChatResponse {
-                    text: Some("metered task output".to_string()),
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                },
-                attempts: vec![crate::llm::route_decision::ProviderAttempt {
-                    seq: 1,
-                    provider: "trace".to_string(),
-                    model: model.to_string(),
-                    started_at,
-                    finished_at,
-                    status: crate::llm::route_decision::AttemptStatus::Success,
-                    error_class: None,
-                    error_message: None,
-                }],
-                final_provider: "trace".to_string(),
-                final_model: model.to_string(),
-                tokens_used: crate::llm::route_decision::TokenUsage::reported(Some(11), Some(7), Some(18)),
+            _: &str,
+            _: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            let completed = request.messages.iter().any(|message| {
+                message.role == "tool"
+                    || (message.role == "user"
+                        && message
+                            .content
+                            .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX))
+            });
+            let content = if completed {
+                "parent complete".to_owned()
+            } else {
+                format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    json!({"name":"sessions_spawn",
+                    "arguments":{"task":"metered task", "mode":"task"}})
+                )
+            };
+            Ok(crate::providers::ChatResponse {
+                text: Some(content),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
             })
+        }
+    }
+
+    struct TaskTraceServer(tokio::task::JoinHandle<()>);
+    impl Drop for TaskTraceServer {
+        fn drop(&mut self) {
+            self.0.abort();
         }
     }
 
@@ -6915,6 +9303,7 @@ mod tests {
                 }],
                 final_provider: "sleepy".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
@@ -6979,6 +9368,7 @@ mod tests {
                 }],
                 final_provider: "echo-system".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
@@ -6990,6 +9380,7 @@ mod tests {
             model: "agent-model".to_string(),
             system_prompt: None,
             api_key: None,
+            credential_ref: None,
             temperature: None,
             max_depth: 3,
             agentic: false,
@@ -7038,6 +9429,47 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             spawn_config,
         )
+    }
+
+    /// D-098: a registry that was bound and is gone (its configuration was
+    /// replaced) refuses the spawn, instead of running the sub-agent
+    /// silently without tools. A tool that never had one runs as before.
+    #[tokio::test]
+    async fn a_spawn_whose_registry_is_gone_is_refused() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        assert!(matches!(tool.tools_handle().get(), Ok(None)));
+        {
+            let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
+            assert!(tool.tools_handle().set(&registry));
+            assert!(matches!(tool.tools_handle().get(), Ok(Some(_))));
+        }
+        assert!(
+            tool.tools_handle().get().is_err(),
+            "a released registry must not read as unbound"
+        );
+
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+        let outcome = tool
+            .execute(json!({
+                "task": "a task for a replaced configuration",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "operator",
+                    "channel": "silent",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1"
+                }
+            }))
+            .await;
+        let text = match outcome {
+            Ok(result) => {
+                assert!(!result.success, "the spawn was accepted: {:?}", result.output);
+                result.error.unwrap_or_default()
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(text.contains("tool registry is gone"), "{text}");
     }
 
     fn router_model(provider: &str, model_id: &str, max_context: usize) -> crate::config::RouterModelConfig {
@@ -7116,6 +9548,11 @@ mod tests {
             "openrouter",
             "small-child",
             None,
+            None,
+            None,
+            None,
+            false,
+            false,
             0.2,
             temp.path().join("worker"),
             temp.path().join("brain.db"),
@@ -7138,6 +9575,8 @@ mod tests {
             None,
             &resolved.config,
             &[],
+            None,
+            None,
         )
         .expect("manifest");
 
@@ -7188,6 +9627,11 @@ mod tests {
                 "openrouter",
                 "small-child",
                 None,
+                None,
+                None,
+                None,
+                false,
+                false,
                 0.2,
                 temp.path().join("worker"),
                 temp.path().join("brain.db"),
@@ -7210,6 +9654,8 @@ mod tests {
                 None,
                 &resolved.config,
                 excluded,
+                None,
+                None,
             )
             .expect("manifest")
         };
@@ -7294,45 +9740,157 @@ mod tests {
 
     #[tokio::test]
     async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
-        let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
-        let history_out = Arc::new(RwLock::new(Vec::new()));
-
-        let result = run_sub_agent_task(
-            "metered task",
-            Arc::new(TraceUsageProvider),
-            "trace",
-            "metered-model",
-            0.0,
-            None,
-            "system prompt",
-            std::path::Path::new("."),
-            test_security(),
-            &MultimodalConfig::default(),
-            &AgentCompactionConfig::default(),
-            steer_rx,
-            Arc::clone(&history_out),
-            None,
-            None,
-            MemoryEventRecording::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::agent::idle::child_beat(),
+        let workspace = tempfile::tempdir().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/api/chat",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(request);
+                    axum::Json(json!({"model":"prx-local-model", "done":true,
+                        "message":{"role":"assistant", "content":"metered task output"},
+                        "prompt_eval_count":11, "eval_count":7}))
+                }
+            }),
+        );
+        let mut server = TaskTraceServer(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.config_path = workspace.path().join("config.toml");
+        config.default_provider = Some("ollama".to_owned());
+        config.default_model = Some("prx-local-model".to_owned());
+        config.api_url = Some(endpoint);
+        config.causal_tree.enabled = false;
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        config.reliability.provider_retries = 0;
+        config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let (channel, _) = RecordingChannel::new();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let tool = make_tool_with_security_and_spawn_config(
+            Arc::new(channel),
+            Arc::new(TaskTraceParentProvider),
+            security,
+            config.sessions_spawn.clone(),
+        )
+        .with_shared_memory(Arc::clone(&memory));
+        let active_runs = tool.active_runs_arc();
+        let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(tool)]);
+        let input = "sessions_spawn metered task";
+        let admitted = crate::agent::test_admission::AdmittedTurn::with_memory(
+            config,
+            input,
+            Arc::clone(&registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        let mut parent_history = vec![crate::providers::ChatMessage::user(input)];
+        let hooks = crate::hooks::HookManager::new(workspace.path().to_owned());
+        let multimodal = MultimodalConfig::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::agent::turn_engine::run_turn(
+                &mut parent_history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "agent",
+                    scope: None,
+                    mode: Default::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &multimodal,
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: Some(admitted.compaction()),
+                    decision: admitted.decision(),
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &TaskTraceParentProvider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: registry,
+                    observer: &crate::observability::noop::NoopObserver,
+                    hooks: &hooks,
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admitted.adapter()),
+                    memory: admitted.memory_runtime(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            ),
         )
         .await
-        .unwrap();
-
-        assert_eq!(result.output, "metered task output");
+        .expect("bounded parent execution")
+        .expect("parent execution");
+        let (usage, history_out) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let runs = active_runs.read().await;
+                    assert_eq!(
+                        runs.len(),
+                        1,
+                        "the parent must launch exactly one task: {parent_history:?}"
+                    );
+                    match &runs[0].status {
+                        SubAgentStatus::Completed(output) => {
+                            assert_eq!(output, "metered task output");
+                            break (runs[0].token_usage_records.clone(), Arc::clone(&runs[0].history));
+                        }
+                        SubAgentStatus::Failed(error) => panic!("admitted task failed: {error}"),
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded task completion");
+        server.0.abort();
+        let _ = (&mut server.0).await;
+        assert_eq!(usage.len(), 1, "exactly one model segment must settle usage");
+        assert_eq!(usage[0].source, crate::llm::route_decision::TokenUsageSource::Reported);
         assert_eq!(
-            result.tokens_used.source,
-            crate::llm::route_decision::TokenUsageSource::Reported
+            (
+                usage[0].prompt_tokens,
+                usage[0].completion_tokens,
+                usage[0].total_tokens
+            ),
+            (11, 7, 18)
         );
-        assert_eq!(result.tokens_used.total_tokens, Some(18));
+        assert!(
+            usage[0].settlement_id.is_some(),
+            "usage must carry its terminal settlement identity"
+        );
         let history = history_out.read().await;
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].content, "metered task output");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]["tools"].as_array().is_none_or(Vec::is_empty),
+            "the child must have no tools"
+        );
     }
 
     #[test]
@@ -7543,11 +10101,15 @@ mod tests {
             obj.insert("_zc_scope_trusted".to_string(), json!(true));
             obj.insert(
                 "_zc_scope".to_string(),
+                // `workspace_id` as `normalize_arguments` always authors it:
+                // the run owner (OWNER-VIS) is composed from it on both the
+                // spawn and the kill/steer side.
                 json!({
                     "sender": "alice",
                     "channel": channel,
                     "chat_type": "group",
                     "chat_id": chat_id,
+                    "workspace_id": "/tmp",
                 }),
             );
         }
@@ -8318,6 +10880,149 @@ mod tests {
         assert_eq!(task_payload["source_message_event_id"].as_str(), Some("msg-1"));
     }
 
+    /// A provider whose every call fails with an error carrying the D-053 probe
+    /// secret.
+    struct SecretFailingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for SecretFailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(anyhow!(
+                "upstream rejected key {}",
+                crate::agent::terminal::persistence_probe::PROBE_SECRET
+            ))
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            Err(anyhow!(
+                "upstream rejected key {}",
+                crate::agent::terminal::persistence_probe::PROBE_SECRET
+            ))
+        }
+    }
+
+    /// Spawn one task-mode run through the real `execute` path with the
+    /// memory in `tmp`, wait (bounded) until the run leaves `Running` — its
+    /// terminal commit and result events are written before the status flips —
+    /// and return the final status plus the recorded `turn.finalized` count.
+    async fn spawn_probe_run(
+        tmp: &tempfile::TempDir,
+        provider: Arc<dyn crate::providers::Provider>,
+    ) -> (SubAgentStatus, usize) {
+        let memory: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new(tmp.path()).expect("test: open sqlite memory in tempdir"));
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), provider).with_shared_memory(memory.clone());
+
+        let result = tool
+            .execute(with_spawn_grant(json!({
+                "task": "probe the persisted terminal",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "alice",
+                    "channel": "telegram",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1",
+                    "topic_id": "topic-1",
+                    "source_message_event_id": "msg-1"
+                }
+            })))
+            .await
+            .expect("test: spawn tool call");
+        assert!(result.success, "{result:?}");
+        let run_id = {
+            let runs = tool.active_runs_snapshot().await;
+            runs.first().expect("test: the spawned run is registered").id.clone()
+        };
+        let _ = await_terminal_reason(&tool.active_runs, &run_id).await;
+        let status = tool
+            .active_runs_snapshot()
+            .await
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .expect("test: the finished run stays registered")
+            .status;
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    require_owner_match: false,
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                50,
+            )
+            .await
+            .expect("test: list message events");
+        let finalized = events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count();
+        (status, finalized)
+    }
+
+    /// D-053 / REDACT-TURN probe: a task-mode `sessions_spawn` run whose provider
+    /// reply carries a secret goes through `finalize_turn` (Completed) and
+    /// `record_spawn_result_event`; this must fail before the REDACT-TURN commits.
+    #[tokio::test]
+    async fn spawn_persists_no_secret_from_a_reply() {
+        use crate::agent::terminal::persistence_probe::{PROBE_SECRET, assert_nothing_under_persists_the_probe_secret};
+        let tmp = tempfile::TempDir::new().expect("test: tempdir");
+        let (status, finalized) = spawn_probe_run(
+            &tmp,
+            Arc::new(EchoProvider {
+                response: format!("Here is the key {PROBE_SECRET} you asked for"),
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(&status, SubAgentStatus::Completed(output) if output.contains(PROBE_SECRET)),
+            "the run must complete with the provider's reply: {status:?}"
+        );
+        assert_eq!(finalized, 1, "the terminal commit must have been recorded");
+        // `make_tool` hard-codes workspace_dir=/tmp (cost ledger lives there),
+        // so only the tempdir holding the SQLite memory is scanned.
+        assert_nothing_under_persists_the_probe_secret(tmp.path());
+    }
+
+    /// D-053 / REDACT-TURN probe: a task-mode `sessions_spawn` run whose provider
+    /// fails with an error carrying a secret goes through `finalize_turn` (Failed)
+    /// and `record_spawn_result_event`; this must fail before the REDACT-TURN commits.
+    #[tokio::test]
+    async fn spawn_persists_no_secret_from_a_provider_error() {
+        use crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret;
+        let tmp = tempfile::TempDir::new().expect("test: tempdir");
+        let (status, finalized) = spawn_probe_run(&tmp, Arc::new(SecretFailingProvider)).await;
+
+        assert!(
+            matches!(&status, SubAgentStatus::Failed(_)),
+            "the run must fail with the provider error: {status:?}"
+        );
+        assert_eq!(finalized, 1, "the terminal commit must have been recorded");
+        // `make_tool` hard-codes workspace_dir=/tmp (cost ledger lives there),
+        // so only the tempdir holding the SQLite memory is scanned.
+        assert_nothing_under_persists_the_probe_secret(tmp.path());
+    }
+
     #[tokio::test]
     async fn no_recipient_skips_announcement() {
         let (ch, sent) = RecordingChannel::new();
@@ -8457,6 +11162,12 @@ mod tests {
             let result = SPAWN_EXECUTION_CONTEXT
                 .scope(
                     SpawnExecutionContext {
+                        operator_authority: None,
+                        ordinary_authority: None,
+                        incoming_grant: None,
+                        provider_binding: None,
+                        terminal_usage: None,
+                        input_receipt: None,
                         run_id: format!("spawn-run-{parent_depth}"),
                         session_scope_key: format!("signal:direct:+1555000{parent_depth}"),
                         spawn_depth: parent_depth,
@@ -8539,6 +11250,12 @@ mod tests {
         let result = SPAWN_EXECUTION_CONTEXT
             .scope(
                 SpawnExecutionContext {
+                    operator_authority: None,
+                    ordinary_authority: None,
+                    incoming_grant: None,
+                    provider_binding: None,
+                    terminal_usage: None,
+                    input_receipt: None,
                     run_id: "spawn-run".to_string(),
                     session_scope_key: "signal:+15551234567:openprx_user".to_string(),
                     spawn_depth: 0,
@@ -8744,6 +11461,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: None,
                 parent_run_id: None,
@@ -9231,6 +11949,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: Some(steer_tx),
                 parent_run_id: None,
@@ -9315,6 +12034,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: Some(steer_tx),
                 parent_run_id: None,
@@ -9432,6 +12152,7 @@ mod tests {
                 channel_name: None,
                 abort_handle: None,
                 process_control: None,
+                task_control: None,
                 history,
                 steer_tx: None,
                 parent_run_id: Some("parent".to_string()),
@@ -9591,11 +12312,20 @@ mod tests {
     fn process_mode_task_arg_is_not_json_encoded() {
         let manifest = WorkerManifest {
             parent_capability: Some("capability".to_string()),
+            capability_manifest: None,
+            child_source: None,
+            ordinary_source: None,
+            operator_source: None,
             run_id: "run".to_string(),
             task: "say \"hello\"".to_string(),
             provider_name: "provider".to_string(),
             model: "model".to_string(),
             api_key: None,
+            route_hint: None,
+            route_source_provider: None,
+            route_credential: None,
+            route_uses_root_connection: false,
+            direct_uses_root_connection: false,
             temperature: 0.7,
             config_dir: std::path::PathBuf::from("/tmp/openprx"),
             config_generation: "0".repeat(64),
@@ -10286,12 +13016,14 @@ mod tests {
                     Vec::new(),
                     control.as_ref(),
                     ProcessFinalization::Terminated,
+                    None,
                     Some(ProcessTerminalCommitHook {
                         entered: entered_tx,
                         release: release_rx,
                     }),
                 )
-                .await;
+                .await
+                .expect("process terminal commit");
             })
         };
 
@@ -10406,6 +13138,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -10689,7 +13422,15 @@ mod tests {
                 run.finished_at = Some(Utc::now());
             }
         });
-        watch_task_mode_monitor(handle, Arc::clone(&active_runs), "happy-run".to_string());
+        watch_task_mode_monitor(
+            handle,
+            Arc::clone(&active_runs),
+            "happy-run".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Give the observer every chance to misbehave.
         for _ in 0..20 {
@@ -11918,6 +14659,7 @@ mod tests {
                 }],
                 final_provider: "routing".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
@@ -12333,7 +15075,7 @@ mod tests {
         );
 
         let cancelled = SubAgentStatus::Failed(task_failure_reason(&anyhow::Error::new(
-            crate::agent::loop_::ToolLoopCancelled,
+            crate::agent::turn_contracts::ToolLoopCancelled,
         )));
         assert!(
             matches!(settled_verdict(&cancelled), Some(JoinedVerdict::Killed(_))),
@@ -13189,5 +15931,535 @@ mod tests {
                 "tool-list summary never names the '{parameter}' parameter: {summary}"
             );
         }
+    }
+
+    // ── C0-C: model-chosen provider credential containment ──────────────
+
+    const SPAWN_AGENT_SENTINEL: &str = "C0-SPAWN-AGENT-SENTINEL";
+    const SPAWN_ROOT_SENTINEL: &str = "C0-SPAWN-ROOT-SENTINEL";
+
+    fn containment_agent(provider: &str, api_key: Option<&str>) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: provider.to_string(),
+            model: crate::providers::credential_probe::PROBE_MODEL.to_string(),
+            system_prompt: None,
+            api_key: api_key.map(str::to_string),
+            credential_ref: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        }
+    }
+
+    fn containment_tool(
+        temp: &tempfile::TempDir,
+        agents: HashMap<String, DelegateAgentConfig>,
+        gateway_provider: &str,
+        fallback_api_key: Option<&str>,
+    ) -> SessionsSpawnTool {
+        let (channel, _sent) = RecordingChannel::new();
+        SessionsSpawnTool::new(
+            Arc::new(channel),
+            Arc::new(EchoProvider {
+                response: "gateway".into(),
+            }),
+            gateway_provider,
+            crate::providers::credential_probe::PROBE_MODEL,
+            0.0,
+            Arc::new(SecurityPolicy {
+                workspace_dir: temp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            temp.path().to_path_buf(),
+            MultimodalConfig::default(),
+            AgentCompactionConfig::default(),
+            agents,
+            fallback_api_key.map(str::to_string),
+            providers::ProviderRuntimeOptions {
+                openprx_dir: Some(temp.path().to_path_buf()),
+                codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),
+                codex_auth_json_auto_import: false,
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            crate::config::SessionsSpawnConfig::default(),
+        )
+    }
+
+    /// R-PMMC F-5: every production construction of the spawn tool hands it
+    /// the model evidence, so operator declarations are consulted on every
+    /// surface (chat's `prx chat` registry included).
+    #[test]
+    fn every_production_spawn_tool_carries_the_model_catalog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut missing = Vec::new();
+        for file in [
+            "chat/mod.rs",
+            "gateway/mod.rs",
+            "channels/mod.rs",
+            "session_worker/runner.rs",
+        ] {
+            let text = std::fs::read_to_string(root.join(file)).expect("test: read source");
+            let mut offset = 0;
+            for line in text.split_inclusive('\n') {
+                let code = !line.trim_start().starts_with("//");
+                if code && line.contains("SessionsSpawnTool::new") {
+                    let tail = &text[offset..];
+                    let statement = &tail[..tail.find(";\n").unwrap_or(tail.len())];
+                    if !statement.contains(".with_model_catalog(") {
+                        missing.push(file);
+                    }
+                }
+                offset += line.len();
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "spawn tools built without the model catalog in: {missing:?}"
+        );
+    }
+
+    /// INT-2B USERINFO-3, RED before: a spawn on a `custom:` endpoint with
+    /// `user:password@` logged the raw label in the compaction-window debug
+    /// line, and when the provider could not be built the refusal quoted the
+    /// raw label and the unsanitized factory error. After: both are redacted.
+    #[tokio::test]
+    async fn a_spawn_never_logs_or_returns_provider_url_userinfo() {
+        // Log-capturing tests share per-callsite interest process-wide.
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        // Port 99999 cannot be built into a provider.
+        let agents = HashMap::from([(
+            "broken".to_string(),
+            containment_agent(
+                "custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1",
+                Some(SPAWN_AGENT_SENTINEL),
+            ),
+        )]);
+        let tool = containment_tool(&temp, agents, "test-provider", None);
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "agent": "broken"})))
+            .await
+            .expect("test: spawn returns a tool result");
+
+        assert!(!result.success, "the provider cannot be built");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("Failed to create provider"), "{error}");
+        assert!(!error.contains("SPAWN-SECRET-pw"), "{error}");
+        let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+        // The value the compaction line prints, checked directly
+        // (deterministic); the log capture is checked for absence only.
+        let shown = tool
+            .resolve_child_compaction("custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1", "m")
+            .shown_provider()
+            .into_owned();
+        assert_eq!(shown, "custom:http://[redacted]@127.0.0.1:99999/v1");
+        assert!(!logs.contains("SPAWN-SECRET-pw"), "{logs}");
+    }
+
+    /// PMM-C: a spawn whose model cannot chat is refused before any run or
+    /// provider exists.
+    #[tokio::test]
+    async fn a_spawn_of_a_decision_only_model_is_refused_before_transport() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let own = CredentialProbe::start().await;
+        let mut decision = containment_agent(&own.custom_provider(), Some(SPAWN_AGENT_SENTINEL));
+        decision.model = "jev-decision-test".to_string();
+        let agents = HashMap::from([("a".to_string(), decision)]);
+        let catalog = providers::catalog::CatalogView::default().with_curated([providers::catalog::CuratedModel {
+            operations: Some(vec![providers::catalog::ModelOperation::DecisionEndpoint]),
+            ..providers::catalog::CuratedModel::new(
+                providers::ProviderId::of(&own.custom_provider()),
+                Some("jev-decision-test"),
+            )
+        }]);
+        let tool = containment_tool(&temp, agents, "test-provider", None).with_model_catalog(catalog);
+
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "agent": "a"})))
+            .await
+            .expect("test: spawn returns a tool result");
+        if result.success {
+            own.wait_for_requests(1, std::time::Duration::from_secs(5)).await;
+        }
+        assert!(!result.success, "a decision-only model was spawned");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("cannot be used for chat"), "{error}");
+        assert!(own.requests().is_empty(), "nothing is sent");
+    }
+
+    /// A model-named `custom:<url>` the operator never configured is refused
+    /// before anything is spawned, and the named agent's key never reaches it.
+    #[tokio::test]
+    async fn a_spawn_to_an_unconfigured_endpoint_is_refused() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let own = CredentialProbe::start().await;
+        let foreign = CredentialProbe::start().await;
+        let agents = HashMap::from([(
+            "a".to_string(),
+            containment_agent(&own.custom_provider(), Some(SPAWN_AGENT_SENTINEL)),
+        )]);
+        let tool = containment_tool(&temp, agents, "test-provider", None);
+
+        let result = tool
+            .execute(with_spawn_grant(json!({
+                "task": "probe", "agent": "a", "provider": foreign.custom_provider()
+            })))
+            .await
+            .expect("test: spawn returns a tool result");
+        if result.success {
+            foreign.wait_for_requests(1, std::time::Duration::from_secs(5)).await;
+        }
+
+        assert!(
+            !foreign.saw(SPAWN_AGENT_SENTINEL),
+            "agent a's key reached an unconfigured endpoint"
+        );
+        assert!(!result.success, "an unconfigured endpoint must be refused");
+        assert!(result.error.unwrap_or_default().contains("not configured"));
+        assert!(foreign.requests().is_empty());
+    }
+
+    /// A configured provider named per call gets only its own credential.
+    #[tokio::test]
+    async fn a_spawned_agent_key_stays_with_its_own_provider() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let own = CredentialProbe::start().await;
+        let other = CredentialProbe::start().await;
+        let agents = HashMap::from([
+            (
+                "a".to_string(),
+                containment_agent(&own.custom_provider(), Some(SPAWN_AGENT_SENTINEL)),
+            ),
+            ("b".to_string(), containment_agent(&other.custom_provider(), None)),
+        ]);
+        let tool = containment_tool(&temp, agents, "test-provider", None);
+
+        let result = tool
+            .execute(with_spawn_grant(json!({
+                "task": "probe", "agent": "a", "provider": other.custom_provider()
+            })))
+            .await
+            .expect("test: spawn returns a tool result");
+        assert!(result.success, "a configured endpoint is spawnable: {:?}", result.error);
+        let seen = other.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
+
+        assert_eq!(seen, 1, "the spawned run reaches its provider");
+        assert!(
+            !other.saw(SPAWN_AGENT_SENTINEL),
+            "agent a's key reached another provider"
+        );
+        assert!(other.requests().iter().all(|request| request.authorization().is_none()));
+        assert!(own.requests().is_empty());
+    }
+
+    /// Guard: the gateway's own key still reaches the gateway provider when a
+    /// run names it in another spelling. Since C0-f that spelling is served by
+    /// the gateway chain itself, so the chain is a real one here.
+    #[tokio::test]
+    async fn the_gateway_key_still_reaches_the_gateway_provider() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let gateway = CredentialProbe::start().await;
+        let mut tool = containment_tool(
+            &temp,
+            HashMap::new(),
+            &gateway.custom_provider(),
+            Some(SPAWN_ROOT_SENTINEL),
+        );
+        tool.provider = Arc::from(
+            providers::create_resilient_provider_with_options(
+                &gateway.custom_provider(),
+                Some(SPAWN_ROOT_SENTINEL),
+                None,
+                &crate::config::ReliabilityConfig::default(),
+                &providers::ProviderRuntimeOptions::default(),
+            )
+            .expect("test: gateway chain builds"),
+        );
+
+        let result = tool
+            .execute(with_spawn_grant(json!({
+                "task": "probe", "provider": format!("{}/", gateway.custom_provider())
+            })))
+            .await
+            .expect("test: spawn returns a tool result");
+        assert!(result.success, "{:?}", result.error);
+        gateway.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
+
+        assert!(gateway.saw(SPAWN_ROOT_SENTINEL));
+    }
+
+    // ── C0-f F-1: the root key travels only with the root URL ─────────────
+
+    const F1_SPAWN_ROOT_SENTINEL: &str = "C0F-SPAWN-ROOT-SENTINEL";
+
+    /// Reviewer scenario: a `litellm` gateway whose root key belongs to its own
+    /// base URL. A model-chosen spelling of the same provider reuses the
+    /// gateway chain (key, URL and rotation keys together) instead of
+    /// rebuilding on the catalog default host with the key alone.
+    #[test]
+    fn a_respelled_gateway_provider_reuses_the_gateway_chain() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
+        for spelling in ["litellm", "lite-llm", "LiteLLM"] {
+            assert_eq!(
+                tool.child_provider_plan(None, spelling),
+                ChildProvider::Gateway,
+                "{spelling}"
+            );
+        }
+
+        let openai = containment_tool(&temp, HashMap::new(), "openai", Some(F1_SPAWN_ROOT_SENTINEL));
+        for spelling in ["openai", "OpenAI"] {
+            assert_eq!(
+                openai.child_provider_plan(None, spelling),
+                ChildProvider::Gateway,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// A rebuild never carries the gateway key: only a named agent's own key
+    /// for the agent's own provider, or nothing.
+    #[test]
+    fn a_rebuilt_child_never_carries_the_gateway_key() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
+        let agent = containment_agent("groq", Some(SPAWN_AGENT_SENTINEL));
+
+        assert_eq!(
+            tool.child_provider_plan(Some(&agent), "GROQ"),
+            ChildProvider::Build {
+                api_key: Some(SPAWN_AGENT_SENTINEL.to_string())
+            }
+        );
+        assert_eq!(
+            tool.child_provider_plan(Some(&agent), "mistral"),
+            ChildProvider::Build { api_key: None }
+        );
+    }
+
+    /// A routed parent keeps its route key for an inherited child, while a
+    /// direct-model child returns to the configured root connection.
+    #[tokio::test]
+    async fn default_hint_child_and_direct_override_use_their_own_wire_keys() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let root = CredentialProbe::start().await;
+        let route = CredentialProbe::start().await;
+        let root_provider = root.custom_provider();
+        let route_provider = route.custom_provider();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.default_provider = Some(root_provider.clone());
+        config.default_model = Some("hint:fast".to_string());
+        config.api_key = Some("PRX-HINT-ROOT-WIRE".to_string());
+        config.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: route_provider.clone(),
+            model: PROBE_MODEL.to_string(),
+            api_key: Some("PRX-HINT-ROUTE-WIRE".to_string()),
+            credential_ref: None,
+        });
+        let catalog = providers::selection::catalog_for(&config);
+        let selected = providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
+            .expect("test: default hint resolves");
+        let routed_provider = providers::create_provider_for(
+            &selected,
+            &catalog,
+            &config.reliability,
+            &providers::ProviderRuntimeOptions::default(),
+        )
+        .expect("test: routed provider builds");
+        let mut tool = containment_tool(&temp, HashMap::new(), &root_provider, Some("PRX-HINT-ROOT-WIRE"))
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        tool.model = "hint:fast".to_string();
+        tool.provider = Arc::from(routed_provider);
+
+        let inherited = tool
+            .execute(with_spawn_grant(json!({"task": "probe"})))
+            .await
+            .expect("test: inherited spawn result");
+        assert!(inherited.success, "{:?}", inherited.error);
+        assert_eq!(route.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
+        assert!(route.saw("PRX-HINT-ROUTE-WIRE"));
+        assert!(!route.saw("PRX-HINT-ROOT-WIRE"));
+        assert!(root.requests().is_empty());
+
+        let direct = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "model": PROBE_MODEL})))
+            .await
+            .expect("test: direct override spawn result");
+        assert!(direct.success, "{:?}", direct.error);
+        assert_eq!(root.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
+        assert!(root.saw("PRX-HINT-ROOT-WIRE"));
+        assert!(!root.saw("PRX-HINT-ROUTE-WIRE"));
+        assert_eq!(route.requests().len(), 1);
+    }
+
+    /// A named direct agent on the hinted parent's source provider owns a
+    /// separate key. Task mode must select it just as process mode does.
+    #[tokio::test]
+    async fn hinted_parent_direct_agent_child_uses_agent_key_on_wire() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let root = CredentialProbe::start().await;
+        let route = CredentialProbe::start().await;
+        let root_provider = root.custom_provider();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.default_provider = Some(root_provider.clone());
+        config.default_model = Some("hint:fast".to_string());
+        config.api_key = Some("PRX-HINT-ROOT-WIRE".to_string());
+        config.secrets.encrypt = false;
+        config.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: route.custom_provider(),
+            model: PROBE_MODEL.to_string(),
+            api_key: Some("PRX-HINT-ROUTE-WIRE".to_string()),
+            credential_ref: None,
+        });
+        let catalog = providers::selection::catalog_for(&config);
+        let selected = providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
+            .expect("test: default hint resolves");
+        let routed_provider = providers::create_provider_for(
+            &selected,
+            &catalog,
+            &config.reliability,
+            &providers::ProviderRuntimeOptions::default(),
+        )
+        .expect("test: routed provider builds");
+        let profile = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .expect("isolated credential store")
+            .set(&root_provider, "prx-direct-agent", "PRX-HINT-PROFILE-WIRE")
+            .expect("store direct agent profile");
+        let mut profile_agent = containment_agent(&root_provider, None);
+        profile_agent.credential_ref = Some(profile.id.clone());
+        config.agents.insert("prx_profile".to_string(), profile_agent);
+        let agents = HashMap::from([
+            (
+                "prx_agent".to_string(),
+                containment_agent(&root_provider, Some("PRX-HINT-AGENT-WIRE")),
+            ),
+            (
+                "prx_profile".to_string(),
+                config
+                    .agents_with_references()
+                    .get("prx_profile")
+                    .expect("resolved agent")
+                    .clone(),
+            ),
+        ]);
+        let mut tool = containment_tool(&temp, agents, &root_provider, Some("PRX-HINT-ROOT-WIRE"))
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        tool.model = "hint:fast".to_string();
+        tool.provider = Arc::from(routed_provider);
+
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
+            .await
+            .expect("test: direct agent child result");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(root.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
+        assert!(root.saw("PRX-HINT-AGENT-WIRE"));
+        assert!(!root.saw("PRX-HINT-ROOT-WIRE"));
+        assert!(!root.saw("PRX-HINT-ROUTE-WIRE"));
+        assert!(route.requests().is_empty());
+
+        let profile_result = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})))
+            .await
+            .expect("test: profile agent child result");
+        assert!(profile_result.success, "{:?}", profile_result.error);
+        assert_eq!(root.wait_for_requests(2, std::time::Duration::from_secs(10)).await, 2);
+        let requests = root.requests();
+        let profile_request = requests.get(1).expect("profile agent request");
+        assert!(profile_request.carries("PRX-HINT-PROFILE-WIRE"));
+        assert!(!profile_request.carries("PRX-HINT-ROOT-WIRE"));
+        assert!(!profile_request.carries("PRX-HINT-AGENT-WIRE"));
+
+        crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .expect("isolated credential store")
+            .remove(&profile.id)
+            .expect("remove isolated credential");
+        let missing = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})))
+            .await
+            .expect("test: missing profile spawn result");
+        assert!(!missing.success, "missing profile must be refused");
+        assert_eq!(root.requests().len(), 2, "missing profile caused outbound I/O");
+    }
+
+    /// On the wire: the respelled child is served by the gateway chain, whose
+    /// connection is the root key at the root URL.
+    #[tokio::test]
+    async fn f1_wire_a_respelled_gateway_child_reaches_only_the_root_url() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let root = CredentialProbe::start().await;
+        let gateway = providers::create_resilient_provider_with_options(
+            "litellm",
+            Some(F1_SPAWN_ROOT_SENTINEL),
+            Some(&root.base_url()),
+            &crate::config::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 0,
+                ..crate::config::ReliabilityConfig::default()
+            },
+            &providers::ProviderRuntimeOptions {
+                openprx_dir: Some(temp.path().to_path_buf()),
+                codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),
+                codex_auth_json_auto_import: false,
+                ..providers::ProviderRuntimeOptions::default()
+            },
+        )
+        .expect("test: litellm gateway builds");
+        let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
+        tool.provider = Arc::from(gateway);
+
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})))
+            .await
+            .expect("test: spawn returns a tool result");
+        assert!(result.success, "{:?}", result.error);
+
+        assert_eq!(root.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
+        assert!(root.saw(F1_SPAWN_ROOT_SENTINEL));
     }
 }

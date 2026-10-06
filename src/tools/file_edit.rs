@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+#[cfg(test)]
 use crate::security::op_id;
-use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::policy::ApprovalGrant;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::tools::tool_diff::build_unified_diff;
 use async_trait::async_trait;
@@ -69,7 +70,22 @@ impl Tool for FileEditTool {
         })
     }
 
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(scope) = super::owner_filesystem_dispatch::current() {
+            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+        }
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -123,30 +139,23 @@ impl Tool for FileEditTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
-
-        let Some(parent) = full_path.parent() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing parent directory".into()),
-            });
-        };
-
-        // file_edit only edits existing files; the parent directory must already
-        // exist. Resolve it to block symlink escapes (mirrors file_write).
-        let resolved_parent = match tokio::fs::canonicalize(parent).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
-                });
-            }
-        };
-
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        let resolved_target =
+            match crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, false)
+                .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to resolve file path: {error}")),
+                    });
+                }
+            };
+        let resolved_parent = resolved_target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("file parent missing"))?;
+        if !self.security.is_resolved_path_allowed(resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -156,24 +165,31 @@ impl Tool for FileEditTool {
                 )),
             });
         }
-
-        let Some(file_name) = full_path.file_name() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing file name".into()),
-            });
-        };
-
-        let resolved_target = resolved_parent.join(file_name);
-        let operation_name = op_id::op_id(self.name(), "edit", &[&op_id::ref_for_file(&resolved_target)]);
+        let (operation_name, risk, launch_file, git_control) = crate::security::approval_operation::file_operation(
+            self.name(),
+            &self.security.workspace_dir,
+            &resolved_target,
+        );
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
             self.name(),
             &operation_name,
-            ResourceRiskLevel::Medium,
+            risk,
             approval_grant.as_ref(),
         ) {
+            let error = if launch_file {
+                format!(
+                    "{error} (a workspace launch definition: hooks.json and mcp.json decide which programs run as \
+                     PRX's user, so writing one is a high-risk operation of its own)"
+                )
+            } else if git_control {
+                format!(
+                    "{error} (a git control file: .git/config, .git/hooks and .git/info decide which programs git \
+                     runs as PRX's user, so writing one is a high-risk operation of its own)"
+                )
+            } else {
+                error
+            };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -361,6 +377,32 @@ mod tests {
                 None,
             )
         })
+    }
+
+    /// RED before GIT-ENV: editing `.git/config` (or a hook) was an ordinary
+    /// edit, so an approval for an ordinary edit covered it.
+    #[tokio::test]
+    async fn editing_a_git_control_file_needs_its_own_approval() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let workspace = dir.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".git/hooks")).expect("test: .git/hooks");
+        std::fs::write(workspace.join(".git/config"), "[core]\n\tbare = false\n").expect("test: config");
+        std::fs::write(workspace.join(".git/hooks/post-checkout"), "#!/bin/sh\ntrue\n").expect("test: hook");
+        let tool = FileEditTool::new(test_security(workspace.clone()));
+        for (file, old) in [(".git/config", "bare = false"), (".git/hooks/post-checkout", "true")] {
+            let result = tool
+                .execute(approved_args(&workspace, file, old, "fsmonitor = ./evil", false))
+                .await
+                .expect("test: executes");
+            assert!(
+                !result.success,
+                "{file}: an ordinary edit approval covered a git control file"
+            );
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("git control file"), "{file}: {error}");
+            let text = std::fs::read_to_string(workspace.join(file)).expect("test: read back");
+            assert!(!text.contains("fsmonitor"), "{file} was edited");
+        }
     }
 
     #[test]

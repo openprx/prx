@@ -15,16 +15,14 @@
 //!
 //! Tests agent behavior with malformed tool calls, empty responses,
 //! max iteration limits, and cascading tool failures using mock providers.
-//! Complements inline `parse_tool_calls` tests in `src/agent/loop_.rs`.
+//! Complements `parse_tool_calls` tests in `src/agent/turn_tests/tool_call_parser.rs`.
 
 use anyhow::Result;
 use async_trait::async_trait;
-use openprx::agent::agent::Agent;
+#[path = "support/embedded_agent.rs"]
+mod embedded_agent;
+use embedded_agent::EmbeddedAgentFixture;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::MemoryConfig;
-use openprx::memory;
-use openprx::memory::Memory;
-use openprx::observability::{NoopObserver, Observer};
 use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use openprx::tools::{Tool, ToolResult};
 use serde_json::json;
@@ -164,18 +162,6 @@ impl Tool for CountingTool {
 // Test helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn make_memory() -> Arc<dyn Memory> {
-    let cfg = MemoryConfig {
-        backend: "none".into(),
-        ..MemoryConfig::default()
-    };
-    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
-}
-
-fn make_observer() -> Arc<dyn Observer> {
-    Arc::from(NoopObserver {})
-}
-
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
@@ -193,16 +179,9 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     }
 }
 
-fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .build()
-        .unwrap()
+fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
+    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(NativeToolDispatcher));
+    EmbeddedAgentFixture::finish(builder, workspace)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

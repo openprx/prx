@@ -8,8 +8,8 @@
 //! ## Terminal semantics
 //!
 //! Calling `stay_silent` is a *terminal* decision for the turn: the tool loop
-//! (`run_tool_call_loop_outcome`) recognizes the call by name and returns
-//! [`ToolLoopOutcome::Silent`](crate::agent::loop_) **without executing the tool
+//! (`run_turn`) recognizes the call by name and returns
+//! `ToolLoopOutcome::Silent` **without executing the tool
 //! and without writing any assistant/tool history**, so the silent turn leaves
 //! no trace in the conversation history and nothing is sent to the channel.
 //!
@@ -23,7 +23,7 @@
 //! The tool name constant is the single source of truth shared with the loop's
 //! short-circuit detection. The tool is only *advertised* to the model in smart
 //! group context (the loop filters its spec out otherwise); see
-//! `run_tool_call_loop_outcome`'s `expose_stay_silent` gate. DMs and non-smart
+//! `run_turn`'s `expose_stay_silent` gate. DMs and non-smart
 //! modes never expose it, which is one of the three hard-coded "DM never stays
 //! silent" guarantees.
 

@@ -107,11 +107,31 @@ pub enum Role {
 
 impl Role {
     fn from_db(value: &str) -> Self {
+        Self::parse(value).unwrap_or(Self::Guest)
+    }
+
+    /// The canonical reading of a configured role (trimmed, any case), or
+    /// `None` for an unknown one. Shared by the runtime, the load-time check
+    /// of `[[user_policies]]` and the configuration plan (D-050).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "owner" => Self::Owner,
-            "member" => Self::Member,
-            "anonymous" => Self::Anonymous,
-            _ => Self::Guest,
+            "owner" => Some(Self::Owner),
+            "member" => Some(Self::Member),
+            "guest" => Some(Self::Guest),
+            "anonymous" => Some(Self::Anonymous),
+            _ => None,
+        }
+    }
+
+    /// How much the role may do: anonymous < guest < member < owner.
+    #[must_use]
+    pub const fn privilege_rank(&self) -> u8 {
+        match self {
+            Self::Anonymous => 0,
+            Self::Guest => 1,
+            Self::Member => 2,
+            Self::Owner => 3,
         }
     }
 }
@@ -153,14 +173,23 @@ impl Visibility {
     }
 
     fn from_db(value: &str) -> Self {
+        Self::parse(value).unwrap_or(Self::Private)
+    }
+
+    /// The canonical reading of a configured visibility (trimmed, any case),
+    /// or `None` for an unknown one. Shared by the runtime, the load-time
+    /// check of `[[user_policies]]` and the configuration plan (D-050).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "system" => Self::System,
-            "owner" => Self::Owner,
-            "user" => Self::User,
-            "group" => Self::Group,
-            "project" => Self::Project,
-            "public" => Self::Public,
-            _ => Self::Private,
+            "system" => Some(Self::System),
+            "owner" => Some(Self::Owner),
+            "private" => Some(Self::Private),
+            "user" => Some(Self::User),
+            "group" => Some(Self::Group),
+            "project" => Some(Self::Project),
+            "public" => Some(Self::Public),
+            _ => None,
         }
     }
 }
@@ -231,6 +260,28 @@ pub struct Principal {
     /// reach memories they themselves produced. Empty string means "no anchor".
     pub raw_sender: String,
     pub acl_enforced: bool,
+    /// Authenticated, issuer-qualified owner anchor for this read (C03 /
+    /// V02-R5).
+    ///
+    /// Distinct from [`Self::user_id`] (an ACL identity resolved from
+    /// `identity_bindings`) and from [`Self::raw_sender`] (a channel-account
+    /// anchor). It is only consulted when [`Self::require_owner_match`] is set.
+    pub owner_id: Option<String>,
+    /// Require `memories.owner_id` equality on every non-public scope arm
+    /// (C03 / V02-R5).
+    ///
+    /// `false` (the historical contract) emits no owner fragment at all, so
+    /// every statement stays byte-identical for channel, chat, cron, xin and
+    /// sub-agent principals.
+    ///
+    /// `true` is set ONLY from the trusted runtime scope authored by the
+    /// execution service for an owner-isolated origin — today an externally
+    /// authenticated MCP caller, whose chat id (`mcp:{subject}`) and raw sender
+    /// are the external *subject* only, so two identities presenting the same
+    /// subject under different issuers would otherwise resolve to the same
+    /// principal. It is never read from model-supplied tool arguments, and it
+    /// is never a function of `memory.acl_enabled`.
+    pub require_owner_match: bool,
 }
 
 /// Dialect-agnostic scope parameter value.
@@ -266,6 +317,104 @@ pub struct ScopePredicate {
 }
 
 impl Principal {
+    /// Carry the trusted context's owner anchor and isolation bit onto a
+    /// principal that was just resolved from policy or built as a fallback.
+    ///
+    /// Single seam: every backend that resolves a read principal from a
+    /// [`MemoryWriteContext`] goes through this, so no construction site can
+    /// silently drop the isolation bit or invent its own source for it.
+    #[must_use]
+    pub fn with_owner_scope(mut self, context: &MemoryWriteContext) -> Self {
+        self.owner_id = context.owner_id.clone();
+        self.require_owner_match = context.require_owner_match;
+        self
+    }
+
+    /// The owner id this principal is isolated to, with blank values treated as
+    /// absent (same rule as [`crate::memory::owner_predicate::has_owner_id`]).
+    fn isolated_owner_id(&self) -> Option<&str> {
+        self.owner_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+    }
+
+    /// The shared owner-isolation suffix, rendered into the dialect-agnostic
+    /// marker vocabulary this predicate uses.
+    ///
+    /// The fragment text and the fail-closed rule come from
+    /// [`crate::memory::owner_predicate::owner_match_suffix`] — the single seam
+    /// C03 installed — so no second owner-isolation vocabulary can appear here.
+    /// Only the placeholder spelling is translated: `owner_match_suffix` emits
+    /// a concrete `?N` / `$N` token because its callers write SQL directly,
+    /// while this predicate is rendered per backend later and marks its bind
+    /// points with [`SCOPE_BIND_MARKER`]. The suffix contains exactly one
+    /// placeholder when it binds, so the one-marker-one-param accounting holds.
+    fn owner_match_fragment(&self) -> crate::memory::owner_predicate::OwnerMatchPredicate {
+        const RENDER_INDEX: usize = 1;
+        const RENDER_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
+            crate::memory::session_predicate::PlaceholderDialect::Sqlite;
+        let mut fragment = crate::memory::owner_predicate::owner_match_suffix(
+            RENDER_DIALECT,
+            RENDER_INDEX,
+            self.require_owner_match,
+            self.isolated_owner_id().is_some(),
+        );
+        fragment.sql = fragment
+            .sql
+            .replace(&RENDER_DIALECT.token(RENDER_INDEX), SCOPE_BIND_MARKER);
+        fragment
+    }
+
+    /// Record the owner bind this fragment consumes, if any.
+    ///
+    /// Called immediately before the fragment's placeholder is emitted, so the
+    /// parameter list stays in template order (one marker, one param).
+    fn push_owner_param(
+        &self,
+        fragment: &crate::memory::owner_predicate::OwnerMatchPredicate,
+        params: &mut Vec<ScopeParam>,
+    ) {
+        if fragment.bound_owner {
+            params.push(ScopeParam::Text(
+                self.isolated_owner_id().unwrap_or_default().to_string(),
+            ));
+        }
+    }
+
+    /// Wrap one non-public visibility condition in its parentheses, owner-
+    /// qualified when the caller is owner-isolated.
+    ///
+    /// `body` is the condition without its enclosing parentheses; the owner
+    /// fragment always lands inside them, so it binds that arm alone and never
+    /// the `visibility = 'public'` arm beside it.
+    fn owner_scoped_group(
+        &self,
+        fragment: &crate::memory::owner_predicate::OwnerMatchPredicate,
+        body: &str,
+        params: &mut Vec<ScopeParam>,
+    ) -> String {
+        self.push_owner_param(fragment, params);
+        format!("({body}{})", fragment.sql)
+    }
+
+    /// The unconditional (`1=1`) arm, owner-qualified when the caller is
+    /// owner-isolated.
+    ///
+    /// An owner-isolated caller must never reach a truly unconditional
+    /// predicate, even when it resolves to an `owner`-role policy row or to a
+    /// principal with ACL enforcement off. Without isolation this renders the
+    /// historical `"1=1"` byte-for-byte.
+    fn unconditional_predicate(&self) -> ScopePredicate {
+        let fragment = self.owner_match_fragment();
+        let mut params = Vec::new();
+        self.push_owner_param(&fragment, &mut params);
+        ScopePredicate {
+            template: format!("1=1{}", fragment.sql),
+            params,
+        }
+    }
+
     /// Single-source scope truth table (D11).
     ///
     /// Produces a dialect-agnostic [`ScopePredicate`] from `role` /
@@ -274,74 +423,98 @@ impl Principal {
     /// between backends. Bind points use [`SCOPE_BIND_MARKER`]; the literal SQL
     /// is portable (plain scalar comparisons plus one standard sub-query, no
     /// dialect-specific functions).
+    ///
+    /// C03 / V02-R5: when [`Principal::require_owner_match`] is set, every
+    /// **non-public** arm additionally requires `owner_id` equality. The
+    /// `visibility = 'public'` arm and the `sensitivity != 'secret'` guard are
+    /// untouched, matching C03's treatment of `workspace` / `global` rows in
+    /// the event read model. When the flag is clear no fragment is emitted at
+    /// all, so every rendering is byte-identical to the pre-V02-R5 one (locked
+    /// by the `golden_build_sql_scope_*` suite).
     pub fn build_scope_predicate(&self) -> ScopePredicate {
         let m = SCOPE_BIND_MARKER;
 
         if !self.acl_enforced {
-            return ScopePredicate {
-                template: "1=1".to_string(),
-                params: Vec::new(),
-            };
+            return self.unconditional_predicate();
         }
 
         match self.role {
-            Role::Owner => ScopePredicate {
-                template: "1=1".to_string(),
-                params: Vec::new(),
-            },
+            Role::Owner => self.unconditional_predicate(),
             // FIX-P1-06: unify the Anonymous scope with the previously hardcoded
             // SQLite recall/forget branches. An anonymous principal sees public
             // rows plus rows it authored, matched on the
             // `(channel, chat_id, raw_sender)` triple, excluding secrets.
-            Role::Anonymous => ScopePredicate {
-                template: format!(
-                    "(visibility = 'public' OR (channel = {m} AND chat_id = {m} AND raw_sender = {m})) \
-                     AND sensitivity != 'secret'"
-                ),
-                params: vec![
+            Role::Anonymous => {
+                let fragment = self.owner_match_fragment();
+                let mut params = vec![
                     ScopeParam::Text(self.current_channel.clone()),
                     ScopeParam::Text(self.current_chat_id.clone()),
                     ScopeParam::Text(self.raw_sender.clone()),
-                ],
-            },
+                ];
+                let authored = self.owner_scoped_group(
+                    &fragment,
+                    &format!("channel = {m} AND chat_id = {m} AND raw_sender = {m}"),
+                    &mut params,
+                );
+                ScopePredicate {
+                    template: format!(
+                        "(visibility = 'public' OR {authored}) \
+                     AND sensitivity != 'secret'"
+                    ),
+                    params,
+                }
+            }
             Role::Member | Role::Guest => {
+                let fragment = self.owner_match_fragment();
                 let ceiling_ord = self.visibility_ceiling.ordinal();
                 let mut conditions = vec!["visibility = 'public'".to_string()];
                 let mut params = Vec::new();
 
                 if ceiling_ord >= Visibility::Private.ordinal() {
-                    conditions.push(format!(
-                        "(visibility = 'private' AND chat_type = 'dm' AND channel = {m} AND chat_id = {m})"
-                    ));
                     params.push(ScopeParam::Text(self.current_channel.clone()));
                     params.push(ScopeParam::Text(self.current_chat_id.clone()));
+                    conditions.push(self.owner_scoped_group(
+                        &fragment,
+                        &format!("visibility = 'private' AND chat_type = 'dm' AND channel = {m} AND chat_id = {m}"),
+                        &mut params,
+                    ));
                 }
 
                 if ceiling_ord >= Visibility::User.ordinal() {
-                    conditions.push(format!("(visibility = 'user' AND sender_id = {m})"));
                     params.push(ScopeParam::Text(self.user_id.clone()));
+                    conditions.push(self.owner_scoped_group(
+                        &fragment,
+                        &format!("visibility = 'user' AND sender_id = {m}"),
+                        &mut params,
+                    ));
                 }
 
                 if ceiling_ord >= Visibility::Group.ordinal() {
-                    conditions.push(format!(
-                        "(visibility = 'group' AND chat_type = 'group' AND channel = {m} AND chat_id = {m})"
-                    ));
                     params.push(ScopeParam::Text(self.current_channel.clone()));
                     params.push(ScopeParam::Text(self.current_chat_id.clone()));
+                    conditions.push(self.owner_scoped_group(
+                        &fragment,
+                        &format!("visibility = 'group' AND chat_type = 'group' AND channel = {m} AND chat_id = {m}"),
+                        &mut params,
+                    ));
                 }
 
                 if ceiling_ord >= Visibility::Project.ordinal() && !self.projects.is_empty() {
                     let placeholders = (0..self.projects.len()).map(|_| m).collect::<Vec<_>>().join(",");
-                    conditions.push(format!(
-                        "(visibility = 'project' AND topic_id IN (\
+                    params.extend(self.projects.iter().cloned().map(ScopeParam::Text));
+                    params.push(ScopeParam::Text(self.user_id.clone()));
+                    conditions.push(self.owner_scoped_group(
+                        &fragment,
+                        &format!(
+                            "visibility = 'project' AND topic_id IN (\
                             SELECT t.id FROM topics t \
                             INNER JOIN topic_participants tp ON tp.topic_id = t.id \
                             WHERE t.project IN ({placeholders}) \
                             AND tp.user_id = {m}\
-                        ))"
+                        )"
+                        ),
+                        &mut params,
                     ));
-                    params.extend(self.projects.iter().cloned().map(ScopeParam::Text));
-                    params.push(ScopeParam::Text(self.user_id.clone()));
                 }
 
                 ScopePredicate {
@@ -417,6 +590,19 @@ pub struct MemoryWriteContext {
     pub chat_id: Option<String>,
     pub sender_id: Option<String>,
     pub raw_sender: Option<String>,
+    /// Authenticated, issuer-qualified owner id from the trusted runtime scope
+    /// (C03 / V02-R5).
+    ///
+    /// Distinct from [`Self::sender_id`], which is a channel-account anchor
+    /// that several callers also use as a write-time owner default.
+    pub owner_id: Option<String>,
+    /// Require `owner_id` equality on every non-public scope arm
+    /// (C03 / V02-R5).
+    ///
+    /// Set ONLY from the service-authored `_zc_scope.owner_isolated` marker, by
+    /// way of [`crate::tools::execution::scope_requires_owner_match`]. Never
+    /// from model-supplied arguments, and never from a config flag.
+    pub require_owner_match: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -492,7 +678,8 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
             current_chat_id,
             current_chat_type,
             raw_sender_anchor,
-        ));
+        )
+        .with_owner_scope(ctx));
     };
 
     let Some(raw_sender) = ctx.raw_sender.as_deref() else {
@@ -502,7 +689,8 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
             current_chat_id,
             current_chat_type,
             raw_sender_anchor,
-        ));
+        )
+        .with_owner_scope(ctx));
     };
 
     let binding_user_id: Option<String> = conn
@@ -520,7 +708,8 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
             current_chat_id,
             current_chat_type,
             raw_sender_anchor,
-        ));
+        )
+        .with_owner_scope(ctx));
     };
 
     let policy: Option<(String, String, String, String)> = conn
@@ -539,7 +728,8 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         current_chat_id,
         current_chat_type,
         raw_sender_anchor,
-    ))
+    )
+    .with_owner_scope(ctx))
 }
 
 /// Build a [`Principal`] from a resolved user id and optional `user_policies`
@@ -548,6 +738,10 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
 /// (for example Postgres) call this so policy interpretation stays identical.
 ///
 /// `policy` is `(role, projects_json, visibility_ceiling, blocked_patterns_json)`.
+///
+/// The returned principal carries no owner anchor: owner isolation is a
+/// property of the *trusted context*, not of the policy row, so callers apply
+/// [`Principal::with_owner_scope`] to the result.
 #[must_use]
 pub fn principal_from_policy(
     user_id: String,
@@ -574,6 +768,8 @@ pub fn principal_from_policy(
             current_chat_type,
             raw_sender,
             acl_enforced,
+            owner_id: None,
+            require_owner_match: false,
         };
     }
 
@@ -588,6 +784,8 @@ pub fn principal_from_policy(
         current_chat_type,
         raw_sender,
         acl_enforced: is_acl_enforced_for_role(&Role::Guest),
+        owner_id: None,
+        require_owner_match: false,
     }
 }
 
@@ -672,6 +870,8 @@ const fn anonymous_principal(
         current_chat_type,
         raw_sender,
         acl_enforced: is_acl_enforced_for_role(&Role::Anonymous),
+        owner_id: None,
+        require_owner_match: false,
     }
 }
 
@@ -745,6 +945,8 @@ mod tests {
                 chat_id: Some("chat-1".into()),
                 sender_id: None,
                 raw_sender: Some("sender-a".into()),
+                owner_id: None,
+                require_owner_match: false,
             },
         )
         .unwrap();
@@ -762,6 +964,8 @@ mod tests {
             chat_id: Some("chat-1".into()),
             sender_id: Some("+15551234567".into()),
             raw_sender: Some("display-name".into()),
+            owner_id: None,
+            require_owner_match: false,
         };
 
         let owner = OwnerPrincipal::from_write_context("workspace-a", "signal_display-name", &ctx);
@@ -801,6 +1005,8 @@ mod tests {
                 chat_id: Some("chat-ak".into()),
                 sender_id: None,
                 raw_sender: Some("sender-ak".into()),
+                owner_id: None,
+                require_owner_match: false,
             },
         )
         .unwrap();
@@ -841,6 +1047,8 @@ mod tests {
                 chat_id: Some("chat-a".into()),
                 sender_id: None,
                 raw_sender: Some("unknown".into()),
+                owner_id: None,
+                require_owner_match: false,
             },
         )
         .unwrap();
@@ -853,6 +1061,8 @@ mod tests {
                 chat_id: Some("chat-m".into()),
                 sender_id: None,
                 raw_sender: Some("sender-member".into()),
+                owner_id: None,
+                require_owner_match: false,
             },
         )
         .unwrap();
@@ -876,6 +1086,8 @@ mod tests {
             current_chat_type: ChatType::Group,
             raw_sender: "sender-1".into(),
             acl_enforced: true,
+            owner_id: None,
+            require_owner_match: false,
         };
         let ctx = MemoryWriteContext {
             workspace_id: Some("workspace-a".into()),
@@ -884,6 +1096,8 @@ mod tests {
             chat_id: Some("group:1".into()),
             sender_id: None,
             raw_sender: Some("sender-1".into()),
+            owner_id: None,
+            require_owner_match: false,
         };
 
         let classified = classify_memory(&ctx, "my api_key is 123456", &principal);
@@ -906,6 +1120,8 @@ mod tests {
             current_chat_type: ChatType::Dm,
             raw_sender: "sender-ak".into(),
             acl_enforced: false,
+            owner_id: None,
+            require_owner_match: false,
         };
         let ctx = MemoryWriteContext {
             workspace_id: Some("workspace-a".into()),
@@ -914,6 +1130,8 @@ mod tests {
             chat_id: Some("chat-ak".into()),
             sender_id: None,
             raw_sender: Some("sender-ak".into()),
+            owner_id: None,
+            require_owner_match: false,
         };
 
         let classified = classify_memory(&ctx, "normal project update", &principal);
@@ -950,6 +1168,17 @@ mod tests {
             current_chat_type: ChatType::Dm,
             raw_sender: "sender-1".into(),
             acl_enforced,
+            owner_id: None,
+            require_owner_match: false,
+        }
+    }
+
+    /// The same fixture, owner-isolated (C03 / V02-R5).
+    fn isolated_principal(role: Role, ceiling: Visibility, owner_id: Option<&str>) -> Principal {
+        Principal {
+            owner_id: owner_id.map(str::to_string),
+            require_owner_match: true,
+            ..base_principal(role, ceiling)
         }
     }
 
@@ -1155,6 +1384,136 @@ AND tp.user_id = ?\
     }
 
     // ----------------------------------------------------------------------
+    // C03 / V02-R5: owner-isolated renderings. The golden block above is the
+    // proof that a non-isolated caller is untouched — every one of those
+    // principals has `require_owner_match = false`. These pin what the
+    // isolated rendering adds, equally byte-exactly.
+    // ----------------------------------------------------------------------
+
+    const TEST_OWNER: &str = "owner:ws-isolation:agent:issuer-a.example:shared-subject";
+
+    #[test]
+    fn owner_isolated_scope_appends_the_owner_match_to_every_non_public_arm() {
+        let anonymous = isolated_principal(Role::Anonymous, Visibility::Private, Some(TEST_OWNER));
+        let (scope, params) = anonymous.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (channel = ? AND chat_id = ? AND raw_sender = ? AND owner_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1", "sender-1", TEST_OWNER]);
+
+        let member = isolated_principal(Role::Member, Visibility::Project, Some(TEST_OWNER));
+        let (scope, params) = member.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ? AND owner_id = ?) OR \
+             (visibility = 'user' AND sender_id = ? AND owner_id = ?) OR \
+             (visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ? AND owner_id = ?) OR \
+             (visibility = 'project' AND topic_id IN (\
+SELECT t.id FROM topics t \
+INNER JOIN topic_participants tp ON tp.topic_id = t.id \
+WHERE t.project IN (?,?) \
+AND tp.user_id = ?\
+) AND owner_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(
+            texts(&params),
+            vec![
+                "telegram", "chat-1", TEST_OWNER, "u1", TEST_OWNER, "telegram", "chat-1", TEST_OWNER, "proj-a",
+                "proj-b", "u1", TEST_OWNER,
+            ]
+        );
+    }
+
+    #[test]
+    fn owner_isolated_scope_without_an_owner_id_is_false_on_every_non_public_arm() {
+        // Fail closed: no owner id means no owned row at all, and — critically —
+        // nothing is bound, so the arm can never degrade to matching on the
+        // channel/sender triple that two issuers share.
+        for owner in [None, Some("   ")] {
+            let anonymous = isolated_principal(Role::Anonymous, Visibility::Private, owner);
+            let (scope, params) = anonymous.build_sql_scope();
+            assert_eq!(
+                scope,
+                "(visibility = 'public' OR \
+                 (channel = ? AND chat_id = ? AND raw_sender = ? AND FALSE)) \
+                 AND sensitivity != 'secret'",
+                "owner {owner:?}"
+            );
+            assert_eq!(
+                texts(&params),
+                vec!["telegram", "chat-1", "sender-1"],
+                "owner {owner:?}"
+            );
+
+            let member = isolated_principal(Role::Member, Visibility::User, owner);
+            let (scope, params) = member.build_sql_scope();
+            assert!(
+                scope.contains("visibility = 'user' AND sender_id = ? AND FALSE"),
+                "{scope}"
+            );
+            assert_eq!(texts(&params), vec!["telegram", "chat-1", "u1"], "owner {owner:?}");
+        }
+    }
+
+    #[test]
+    fn owner_isolated_owner_role_is_not_unconditional() {
+        // An operator who has bound the MCP channel to an `owner`-role user
+        // must not thereby hand every external caller the whole store.
+        let principal = isolated_principal(Role::Owner, Visibility::Public, Some(TEST_OWNER));
+        let (scope, params) = principal.build_sql_scope();
+        assert_ne!(scope, "1=1");
+        assert_eq!(scope, "1=1 AND owner_id = ?");
+        assert_eq!(texts(&params), vec![TEST_OWNER]);
+    }
+
+    #[test]
+    fn owner_isolated_acl_disabled_principal_is_not_unconditional() {
+        let mut principal = isolated_principal(Role::Member, Visibility::Public, Some(TEST_OWNER));
+        principal.acl_enforced = false;
+        let (scope, params) = principal.build_sql_scope();
+        assert_ne!(scope, "1=1");
+        assert_eq!(scope, "1=1 AND owner_id = ?");
+        assert_eq!(texts(&params), vec![TEST_OWNER]);
+
+        // And with no owner id it admits nothing rather than everything.
+        let mut ownerless = isolated_principal(Role::Owner, Visibility::Public, None);
+        ownerless.acl_enforced = false;
+        let (scope, params) = ownerless.build_sql_scope();
+        assert_eq!(scope, "1=1 AND FALSE");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn owner_isolated_scope_keeps_public_and_secret_semantics() {
+        // The two deliberate contracts the owner suffix must never touch:
+        // `public` rows stay shared, and `secret` rows stay excluded.
+        for principal in [
+            isolated_principal(Role::Anonymous, Visibility::Private, Some(TEST_OWNER)),
+            isolated_principal(Role::Member, Visibility::Project, Some(TEST_OWNER)),
+            isolated_principal(Role::Guest, Visibility::Private, None),
+        ] {
+            let (scope, _) = principal.build_sql_scope();
+            assert!(
+                scope.contains("visibility = 'public' OR "),
+                "the public arm must stay unqualified: {scope}"
+            );
+            assert!(
+                !scope.contains("visibility = 'public' AND owner_id"),
+                "the public arm must not gain an owner match: {scope}"
+            );
+            assert!(
+                scope.contains("sensitivity != 'secret'"),
+                "the secret exclusion must survive: {scope}"
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------------
     // D11 A1: dialect-agnostic predicate invariants. The number of bind
     // markers in the template must always equal the number of params, and the
     // SQLite renderer must reproduce the predicate's markers as `?`.
@@ -1166,7 +1525,7 @@ AND tp.user_id = ?\
 
     #[test]
     fn scope_predicate_marker_count_matches_param_count_all_branches() {
-        let cases = [
+        let mut cases = vec![
             base_principal(Role::Owner, Visibility::Public),
             base_principal(Role::Anonymous, Visibility::Private),
             base_principal(Role::Guest, Visibility::Private),
@@ -1174,6 +1533,22 @@ AND tp.user_id = ?\
             base_principal(Role::Member, Visibility::Group),
             base_principal(Role::Member, Visibility::Project),
         ];
+        // C03 / V02-R5: the owner suffix adds one marker and exactly one bound
+        // param per non-public arm when it carries an owner id, and adds
+        // neither when it fails closed. Both must hold on every branch.
+        for role in [Role::Owner, Role::Anonymous, Role::Guest, Role::Member] {
+            for ceiling in [
+                Visibility::Private,
+                Visibility::User,
+                Visibility::Group,
+                Visibility::Project,
+                Visibility::Public,
+            ] {
+                for owner in [None, Some(TEST_OWNER), Some("   ")] {
+                    cases.push(isolated_principal(role.clone(), ceiling.clone(), owner));
+                }
+            }
+        }
         for principal in cases {
             let predicate = principal.build_scope_predicate();
             assert_eq!(
@@ -1375,28 +1750,36 @@ AND tp.user_id = $11\
             Visibility::Public,
         ];
         let roles = [Role::Owner, Role::Anonymous, Role::Member, Role::Guest];
+        // C03 / V02-R5: sweep the isolation bit and the owner id as well, so
+        // the SQLite `?` and Postgres `$N` renderings of the new arm cannot
+        // drift apart either.
+        let isolations: [(bool, Option<&str>); 3] = [(false, None), (true, None), (true, Some(TEST_OWNER))];
 
         for role in roles {
             for ceiling in &ceilings {
-                let principal = base_principal(role.clone(), ceiling.clone());
+                for (require_owner_match, owner_id) in isolations {
+                    let mut principal = base_principal(role.clone(), ceiling.clone());
+                    principal.require_owner_match = require_owner_match;
+                    principal.owner_id = owner_id.map(str::to_string);
 
-                let (sqlite_sql, sqlite_params) = principal.build_sql_scope();
-                // Use a non-trivial start index to prove the parity holds
-                // independent of the caller's parameter offset.
-                let (pg_sql, pg_params) = principal.build_sql_scope_pg(4);
+                    let (sqlite_sql, sqlite_params) = principal.build_sql_scope();
+                    // Use a non-trivial start index to prove the parity holds
+                    // independent of the caller's parameter offset.
+                    let (pg_sql, pg_params) = principal.build_sql_scope_pg(4);
 
-                assert_eq!(
-                    sqlite_to_marker(&sqlite_sql),
-                    pg_to_marker(&pg_sql),
-                    "scope predicate structure drift for role {role:?} ceiling {ceiling:?}"
-                );
+                    assert_eq!(
+                        sqlite_to_marker(&sqlite_sql),
+                        pg_to_marker(&pg_sql),
+                        "scope predicate structure drift for role {role:?} ceiling {ceiling:?}"
+                    );
 
-                let sqlite_texts: Vec<&str> = sqlite_params.iter().map(text_of).collect();
-                let pg_texts = param_texts(&pg_params);
-                assert_eq!(
-                    sqlite_texts, pg_texts,
-                    "scope parameter value/order drift for role {role:?} ceiling {ceiling:?}"
-                );
+                    let sqlite_texts: Vec<&str> = sqlite_params.iter().map(text_of).collect();
+                    let pg_texts = param_texts(&pg_params);
+                    assert_eq!(
+                        sqlite_texts, pg_texts,
+                        "scope parameter value/order drift for role {role:?} ceiling {ceiling:?}"
+                    );
+                }
             }
         }
     }

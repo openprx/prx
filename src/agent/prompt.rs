@@ -160,6 +160,16 @@ impl PromptSection for TaskSection {
         "task"
     }
 
+    /// Neither branch names a call syntax.
+    ///
+    /// `ctx.native_tools` is computed once, far from the request, at a mode
+    /// fixed to `Streaming`, while the agent loop recomputes the same question
+    /// per turn at the mode the turn runs in. The two can disagree, and a
+    /// grammar sentence here would then be sent alongside the `tools` array —
+    /// the one place PRX could contradict itself about how to call a tool. The
+    /// canonical protocol in `crate::tools::prompt` is gated on the loop's own
+    /// flag and already says everything this sentence said, so this section
+    /// states the task and leaves syntax to the one owner of it.
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         if ctx.native_tools {
             Ok(
@@ -174,7 +184,7 @@ impl PromptSection for TaskSection {
                 "## Your Task\n\n\
                  When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
                  Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-                 Instead: emit actual <tool_call> tags when you need to act. Just do what they ask."
+                 Instead: call the tool when you need to act, in the format the tool-use protocol above specifies. Just do what they ask."
                     .to_string(),
             )
         }
@@ -573,6 +583,39 @@ mod tests {
             native_tools: false,
         };
 
-        assert!(TaskSection.build(&ctx).unwrap().contains("actual <tool_call> tags"));
+        assert!(TaskSection.build(&ctx).unwrap().contains("Use the tools to fulfill"));
+    }
+
+    /// The base system prompt must not teach a tool-call grammar in either
+    /// branch.
+    ///
+    /// `native_tools` here is computed once at chat startup, at a request mode
+    /// fixed to `Streaming`, while the agent loop recomputes it per turn at the
+    /// mode that turn actually runs in. The two can disagree — a failover chain
+    /// whose members are all non-streaming advertises no native tools in
+    /// `Streaming` and native tools in `NonStreaming` — and when they do, a
+    /// grammar sentence here is sent alongside the `tools` array. The canonical
+    /// protocol in `crate::tools::prompt` is gated on the loop's own flag and is
+    /// the one place that teaches a grammar, so this section states the task and
+    /// nothing about syntax.
+    #[test]
+    fn no_task_section_branch_teaches_a_tool_call_grammar() {
+        for native_tools in [true, false] {
+            let ctx = PromptContext {
+                workspace_dir: Path::new("/tmp"),
+                model_name: "test-model",
+                skills: &[],
+                identity_config: None,
+                bootstrap_max_chars: None,
+                native_tools,
+            };
+            let section = TaskSection.build(&ctx).expect("test: task section builds");
+            for grammar in ["<tool_call>", "<function="] {
+                assert!(
+                    !section.contains(grammar),
+                    "the task section teaches '{grammar}' with native_tools={native_tools}: {section}"
+                );
+            }
+        }
     }
 }

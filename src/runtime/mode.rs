@@ -36,16 +36,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::{self, Config};
+use crate::manage_cli::{self, ManageCommand};
 use crate::{
     ChannelCommands, Commands, ConfigCommands, ConfigShowFormat, DoctorCommands, IntegrationCommands, ModelCommands,
 };
 use crate::{
     agent, channels, chat, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, integrations, memory, migration,
-    onboard, providers, service, skills,
+    service, skills,
 };
 use crate::{
     handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, handle_tasks_command,
-    handle_xin_command, redact_config_show_value,
+    handle_xin_command,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -390,7 +391,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+                crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
             );
             println!(
                 "   Model:         {}",
@@ -446,6 +447,16 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             evolution_command,
         } => evolution_cli::handle_command(evolution_command, json, &config).await,
 
+        Commands::Causal { json, causal_command } => match causal_command {
+            openprx::causal_cli::CausalCommands::Read(command) => {
+                openprx::causal_cli::run(&config, json, command).await
+            }
+            // Configuration changes go through the management CLI: the same
+            // plan text, apply flags and credential input as `prx providers`.
+            openprx::causal_cli::CausalCommands::Config { command } => {
+                manage_cli::run_process(ManageCommand::Causal(command), config).await
+            }
+        },
         Commands::Fitness { json, fitness_command } => {
             fitness_cli::handle_command(fitness_command, json, &config).await
         }
@@ -454,44 +465,24 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
 
         Commands::Xin { xin_command } => handle_xin_command(xin_command, &config).await,
 
-        Commands::Models { model_command } => match model_command.unwrap_or(ModelCommands::List { provider: None }) {
-            ModelCommands::List { provider } => onboard::run_models_list(&config, provider.as_deref()),
-            ModelCommands::Refresh { provider, force } => {
-                let config_for_refresh = config.clone();
-                crate::runtime::blocking::spawn_blocking(move || {
-                    onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
-            }
-        },
+        Commands::Models { model_command } => {
+            manage_cli::run_process(
+                ManageCommand::Models(model_command.unwrap_or(ModelCommands::List {
+                    provider: None,
+                    operation: None,
+                    executable: false,
+                })),
+                config,
+            )
+            .await
+        }
 
-        Commands::Providers => {
-            let providers = providers::list_providers();
-            let current = config
-                .default_provider
-                .as_deref()
-                .unwrap_or("openrouter")
-                .trim()
-                .to_ascii_lowercase();
-            println!("Supported providers ({} total):\n", providers.len());
-            println!("  ID (use in config)  DESCRIPTION");
-            println!("  ─────────────────── ───────────");
-            for p in &providers {
-                let is_active = p.name.eq_ignore_ascii_case(&current)
-                    || p.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&current));
-                let marker = if is_active { " (active)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                let aliases = if p.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (aliases: {})", p.aliases.join(", "))
-                };
-                println!("  {:<19} {}{}{}{}", p.name, p.display_name, local_tag, marker, aliases);
-            }
-            println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
-            println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
-            Ok(())
+        Commands::Providers { providers_command } => {
+            manage_cli::run_process(ManageCommand::Providers(providers_command), config).await
+        }
+
+        Commands::Routes { routes_command } => {
+            manage_cli::run_process(ManageCommand::Routes(routes_command), config).await
         }
 
         Commands::Service {
@@ -551,8 +542,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Show { format } => {
-                let mut value = config.to_stored_toml_value()?;
-                redact_config_show_value(&mut value);
+                let value = config::secret_paths::redacted_stored_toml(&config)?;
                 match format {
                     ConfigShowFormat::Toml => {
                         println!(
@@ -589,6 +579,14 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 config::files::merge_split_config(&config).await?;
                 println!("Merged configuration into {}", config.config_path.display());
                 Ok(())
+            }
+            management @ (ConfigCommands::Plan { .. }
+            | ConfigCommands::Apply { .. }
+            | ConfigCommands::History { .. }
+            | ConfigCommands::Rollback { .. }
+            | ConfigCommands::Status
+            | ConfigCommands::Agents { .. }) => {
+                manage_cli::run_process(ManageCommand::Config(management), config).await
             }
         },
     }
@@ -765,7 +763,9 @@ mod tests {
             channel_command: ChannelCommands::List
         }));
         assert!(!starts_agent_runtime(&Commands::Status));
-        assert!(!starts_agent_runtime(&Commands::Providers));
+        assert!(!starts_agent_runtime(&Commands::Providers {
+            providers_command: None
+        }));
         assert!(!starts_agent_runtime(&Commands::Doctor { doctor_command: None }));
     }
 
@@ -783,7 +783,9 @@ mod tests {
     fn whitelist_excludes_query_and_management_commands() {
         // A representative sample of query / management commands — none long-running.
         assert!(!should_bind_signal(&Commands::Status));
-        assert!(!should_bind_signal(&Commands::Providers));
+        assert!(!should_bind_signal(&Commands::Providers {
+            providers_command: None
+        }));
         assert!(!should_bind_signal(&Commands::Doctor { doctor_command: None }));
     }
 }

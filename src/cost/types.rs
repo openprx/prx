@@ -72,6 +72,9 @@ pub struct CostRecord {
     /// Stable terminal settlement identifier. Legacy/manual records omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_id: Option<String>,
+    /// Canonical metered settlement digest. Legacy/manual rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_sha256: Option<String>,
     /// Token usage details
     pub usage: TokenUsage,
     /// Session identifier (for grouping)
@@ -84,6 +87,7 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             settlement_id: None,
+            settlement_sha256: None,
             usage,
             session_id: session_id.into(),
         }
@@ -94,6 +98,7 @@ impl CostRecord {
         Self {
             id: settlement_id.clone(),
             settlement_id: Some(settlement_id),
+            settlement_sha256: None,
             usage,
             session_id: session_id.into(),
         }

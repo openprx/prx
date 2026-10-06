@@ -38,7 +38,9 @@
 //! deliberate exception: a process guard dropped *without* [`WorkGuard::mark_reaped`]
 //! keeps its ledger row precisely because the OS process may well have
 //! outlived its Rust owner — that row is the orphan report, and it is retired
-//! automatically once the pid is observed to be gone.
+//! automatically once the pid is observed to be gone. Externally supervised
+//! tasks can also require cleanup acknowledgement; dropping their owner without
+//! confirmation retains an abandoned row instead of reporting a successful kill.
 //!
 //! ## Concurrency
 //!
@@ -258,6 +260,7 @@ impl Slot {
                 .pid
                 .map_or(Some(WorkState::Abandoned), |pid| match probe_process(pid) {
                     ProcessLiveness::Running => Some(WorkState::Orphaned),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     ProcessLiveness::Zombie => Some(WorkState::Zombie),
                     ProcessLiveness::Gone => None,
                 }),
@@ -357,6 +360,7 @@ pub struct WorkGuard {
     /// Child processes only: whether the owner confirmed the process was reaped.
     /// An unconfirmed process keeps its row as an orphan report.
     reaped: bool,
+    cleanup_pending: bool,
 }
 
 impl WorkGuard {
@@ -373,6 +377,16 @@ impl WorkGuard {
         self.reaped = true;
     }
 
+    /// Keep the row visible if its external cleanup owner disappears.
+    pub(crate) const fn require_cleanup_acknowledgement(&mut self) {
+        self.cleanup_pending = true;
+    }
+
+    /// Permit retirement after the external owner confirms cleanup.
+    pub(crate) const fn mark_cleanup_confirmed(&mut self) {
+        self.cleanup_pending = false;
+    }
+
     /// Whether a kill has been requested for this item.
     #[must_use]
     pub fn kill_requested(&self) -> bool {
@@ -382,7 +396,7 @@ impl WorkGuard {
 
 impl Drop for WorkGuard {
     fn drop(&mut self) {
-        if self.slot.kind == WorkKind::Process && !self.reaped {
+        if self.cleanup_pending || (self.slot.kind == WorkKind::Process && !self.reaped) {
             // The Rust owner is gone but the OS process may not be. Keep the
             // row; `snapshot_all` classifies it against the OS and retires it
             // once the pid is genuinely gone.
@@ -422,7 +436,11 @@ fn register(
         warnings: AtomicU32::new(0),
     });
     REGISTRY.insert(Arc::clone(&slot));
-    WorkGuard { slot, reaped: false }
+    WorkGuard {
+        slot,
+        reaped: false,
+        cleanup_pending: false,
+    }
 }
 
 /// Register one agent turn.
@@ -832,7 +850,12 @@ pub async fn kill(id: WorkId, cascade: bool) -> Vec<KillResult> {
 
     let mut issued = Vec::with_capacity(targets.len());
     for slot in &targets {
-        slot.state.store(STATE_KILL_REQUESTED, Ordering::Relaxed);
+        let _ = slot.state.compare_exchange(
+            STATE_RUNNING,
+            STATE_KILL_REQUESTED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         issued.push(request_termination(slot));
     }
 
@@ -874,7 +897,12 @@ pub async fn kill_batch(batch_id: &str, cascade: bool) -> Vec<KillResult> {
 
     let mut issued = Vec::with_capacity(targets.len());
     for slot in &targets {
-        slot.state.store(STATE_KILL_REQUESTED, Ordering::Relaxed);
+        let _ = slot.state.compare_exchange(
+            STATE_RUNNING,
+            STATE_KILL_REQUESTED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         issued.push(request_termination(slot));
     }
 
@@ -1008,7 +1036,8 @@ fn terminated(slot: &Slot) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessLiveness {
     Running,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Only the Linux and macOS probes can tell a zombie from a live process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Zombie,
     Gone,
 }

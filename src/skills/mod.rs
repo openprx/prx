@@ -1,7 +1,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::security::git_launch::{GitScope, git_command};
 use anyhow::{Context, Result, bail};
-use directories::UserDirs;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tokio::process::Command;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
@@ -20,7 +19,7 @@ const OPENCLAW_SKILLS_SYNC_MARKER: &str = ".openprx-openclaw-skills-sync";
 const MAX_SKILLS: usize = 256;
 const MAX_CATALOGS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-const MAX_SKILL_MD_BYTES: u64 = 64 * 1024;
+const MAX_SKILL_FRONTMATTER_BYTES: u64 = 8 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
 #[cfg(test)]
 const MAX_INSTRUCTION_BYTES: usize = 16 * 1024;
@@ -65,6 +64,165 @@ pub struct Skill {
     pub location: Option<PathBuf>,
     #[serde(default, skip)]
     pub embedding: Option<Vec<f32>>,
+}
+
+/// Metadata available to capability discovery before a skill is selected.
+/// Instruction bytes are loaded only through `skill_read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+    pub location: PathBuf,
+    pub frontmatter_sha: [u8; 32],
+}
+
+pub(crate) fn catalog_skill_binding_digest(metadata: &SkillMetadata) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let location = metadata.location.to_string_lossy();
+    for part in [metadata.name.as_bytes(), location.as_bytes(), &metadata.frontmatter_sha] {
+        hasher.update(part.len().to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+/// Read at most the frontmatter window of one installed skill. A large body
+/// cannot enter the discovery catalog or a decision request through this path.
+pub(crate) fn load_skill_metadata(path: &Path, fallback_name: &str) -> Result<SkillMetadata> {
+    use sha2::{Digest, Sha256};
+
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!("skill metadata path is a symlink");
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_SKILL_FRONTMATTER_BYTES)
+        .read_to_end(&mut bytes)?;
+    let prefix = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => std::str::from_utf8(
+            bytes
+                .get(..error.valid_up_to())
+                .context("invalid skill metadata boundary")?,
+        )?,
+        Err(error) => return Err(error.into()),
+    };
+    let metadata_text = if prefix.starts_with("---\n") {
+        let closing = prefix
+            .strip_prefix("---\n")
+            .context("skill metadata has no frontmatter start")?
+            .find("\n---")
+            .context("skill frontmatter exceeds the metadata window or has no closing marker")?;
+        prefix
+            .get(..4 + closing + 4)
+            .context("invalid skill frontmatter boundary")?
+    } else {
+        prefix.split("\n\n").next().unwrap_or(prefix)
+    };
+    let (name, description) = parse_skill_frontmatter(metadata_text)
+        .unwrap_or_else(|| (fallback_name.to_string(), extract_description(metadata_text)));
+    Ok(SkillMetadata {
+        name: bounded_text(&name, MAX_DESCRIPTION_BYTES),
+        description: bounded_text(&description, MAX_DESCRIPTION_BYTES),
+        location: path.to_path_buf(),
+        frontmatter_sha: Sha256::digest(metadata_text.as_bytes()).into(),
+    })
+}
+
+/// A metadata-only discovery snapshot with the same community/workspace
+/// precedence as the normal Skill catalog. No `SKILL.md` instruction body is
+/// loaded while collecting this snapshot.
+pub(crate) fn catalog_skill_metadata(workspace_dir: &Path, config: &crate::config::Config) -> Vec<SkillMetadata> {
+    let mut discovered = BTreeMap::<String, SkillMetadata>::new();
+    if let Some(root) = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref()) {
+        for entry in sorted_directory_entries(&root).unwrap_or_default() {
+            let path = entry.path();
+            if !path.is_file() || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")) {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("README") {
+                continue;
+            }
+            if let Ok(mut metadata) = load_skill_metadata(&path, name) {
+                // The executable open-skills loader names these by file stem,
+                // even when a Markdown frontmatter name differs.
+                metadata.name = name.to_string();
+                discovered.insert(metadata.name.to_lowercase(), metadata);
+            }
+        }
+    }
+    if let Some(root) = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref()) {
+        collect_directory_skill_metadata(&root.join("skills"), &mut discovered);
+    }
+    let workspace_root = workspace_dir.join("skills");
+    let mut workspace = BTreeMap::<String, SkillMetadata>::new();
+    collect_directory_skill_metadata(&workspace_root, &mut workspace);
+    let disabled: BTreeSet<_> = sorted_directory_entries(&workspace_root.join(DISABLED_SKILL_MARKER))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_lowercase))
+        .collect();
+    workspace.retain(|name, metadata| {
+        !disabled.contains(name)
+            && !metadata
+                .location
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|directory| disabled.contains(&directory.to_lowercase()))
+    });
+    let workspace_names = workspace.keys().cloned().collect::<BTreeSet<_>>();
+    discovered.extend(workspace);
+    for name in &disabled {
+        discovered.remove(name);
+    }
+    let mut admitted = workspace_names.into_iter().take(MAX_SKILLS).collect::<BTreeSet<_>>();
+    for name in discovered.keys() {
+        if admitted.len() >= MAX_SKILLS {
+            break;
+        }
+        admitted.insert(name.clone());
+    }
+    discovered
+        .into_iter()
+        .filter_map(|(name, metadata)| admitted.contains(&name).then_some(metadata))
+        .collect()
+}
+
+fn collect_directory_skill_metadata(root: &Path, discovered: &mut BTreeMap<String, SkillMetadata>) {
+    use sha2::Digest;
+
+    for entry in sorted_directory_entries(root).unwrap_or_default() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) || !path.is_dir() {
+            continue;
+        }
+        let Some(fallback_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let md_path = path.join("SKILL.md");
+        let toml_path = path.join("SKILL.toml");
+        let metadata = if toml_path.is_file() {
+            load_skill_toml(&toml_path).ok().map(|skill| SkillMetadata {
+                frontmatter_sha: sha2::Sha256::digest(format!("{}\0{}", skill.name, skill.description).as_bytes())
+                    .into(),
+                name: skill.name,
+                description: skill.description,
+                location: toml_path,
+            })
+        } else if md_path.is_file() {
+            load_skill_metadata(&md_path, &fallback_name).ok()
+        } else {
+            None
+        };
+        if let Some(metadata) = metadata {
+            discovered.insert(metadata.name.to_lowercase(), metadata);
+        }
+    }
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -585,7 +743,7 @@ fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathB
     if let Some(config_dir) = config_open_skills_dir.and_then(parse_dir) {
         return Some(config_dir);
     }
-    UserDirs::new().map(|dirs| dirs.home_dir().join("open-skills"))
+    crate::config::user_home_dir().map(|home| home.join("open-skills"))
 }
 
 async fn clone_open_skills_repo(repo_dir: &Path) -> bool {
@@ -599,7 +757,13 @@ async fn clone_open_skills_repo(repo_dir: &Path) -> bool {
         }
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = match git_command(GitScope::NewRepository).await {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            tracing::warn!("failed to prepare git clone for open-skills: {err}");
+            return false;
+        }
+    };
     cmd.args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL]).arg(repo_dir);
     let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
@@ -626,8 +790,18 @@ async fn pull_open_skills_repo(repo_dir: &Path) -> bool {
         return true;
     }
 
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_dir).args(["pull", "--ff-only"]);
+    let mut cmd = match git_command(GitScope::Repository(repo_dir)).await {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            tracing::warn!("failed to prepare git pull for open-skills: {err}");
+            return false;
+        }
+    };
+    // The explicit upload-pack: a repository's first-wins
+    // `remote.origin.uploadpack` would otherwise run (GIT-ENV F-1).
+    cmd.arg("pull")
+        .args(crate::security::git_launch::FETCH_SAFETY_ARGS)
+        .arg("--ff-only");
     let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
@@ -671,14 +845,12 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
-    let content = read_utf8_bounded(path, MAX_SKILL_MD_BYTES)?;
     let fallback_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-    let frontmatter = parse_skill_frontmatter(&content);
-    let (name, description) = frontmatter.unwrap_or_else(|| (fallback_name.to_string(), extract_description(&content)));
+    let metadata = load_skill_metadata(path, fallback_name)?;
 
     Ok(Skill {
-        name: bounded_text(&name, MAX_DESCRIPTION_BYTES),
-        description: bounded_text(&description, MAX_DESCRIPTION_BYTES),
+        name: metadata.name,
+        description: metadata.description,
         version: "0.1.0".to_string(),
         author: None,
         tags: Vec::new(),
@@ -691,16 +863,16 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
 }
 
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
-    let content = read_utf8_bounded(path, MAX_SKILL_MD_BYTES)?;
     let name = path
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("open-skill")
         .to_string();
+    let metadata = load_skill_metadata(path, &name)?;
 
     Ok(Skill {
         name,
-        description: bounded_text(&extract_description(&content), MAX_DESCRIPTION_BYTES),
+        description: metadata.description,
         version: "open-skills".to_string(),
         author: Some("besoeasy/open-skills".to_string()),
         tags: vec!["open-skills".to_string()],
@@ -764,7 +936,7 @@ fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Opti
     }
 
     // 2. Default: ~/.openprx/openclaw-skills/
-    UserDirs::new().map(|dirs| dirs.home_dir().join(".openprx/openclaw-skills"))
+    crate::config::default_openprx_dir().map(|dir| dir.join("openclaw-skills"))
 }
 
 /// Sparse-clone the OpenClaw repository, checking out only the `skills/` directory.
@@ -779,7 +951,13 @@ async fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
         }
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = match git_command(GitScope::NewRepository).await {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            tracing::warn!("failed to prepare git clone for openclaw skills: {err}");
+            return false;
+        }
+    };
     cmd.args([
         "clone",
         "--depth",
@@ -794,12 +972,15 @@ async fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
     match output {
         Ok(result) if result.status.success() => {
             // Configure sparse checkout to include only skills/
-            let mut sparse_cmd = Command::new("git");
-            sparse_cmd
-                .arg("-C")
-                .arg(repo_dir)
-                .args(["sparse-checkout", "set", "skills"]);
-            let sparse = crate::runtime::shell_process::run_managed_output(sparse_cmd).await;
+            let sparse = match git_command(GitScope::Repository(repo_dir)).await {
+                Ok(mut sparse_cmd) => {
+                    sparse_cmd.args(["sparse-checkout", "set", "skills"]);
+                    crate::runtime::shell_process::run_managed_output(sparse_cmd)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+                Err(err) => Err(err),
+            };
             match sparse {
                 Ok(r) if r.status.success() => {
                     tracing::info!("initialized openclaw-skills at {}", repo_dir.display());
@@ -832,8 +1013,18 @@ async fn pull_openclaw_skills_repo(repo_dir: &Path) -> bool {
         return true;
     }
 
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_dir).args(["pull", "--ff-only"]);
+    let mut cmd = match git_command(GitScope::Repository(repo_dir)).await {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            tracing::warn!("failed to prepare git pull for openclaw-skills: {err}");
+            return false;
+        }
+    };
+    // The explicit upload-pack: a repository's first-wins
+    // `remote.origin.uploadpack` would otherwise run (GIT-ENV F-1).
+    cmd.arg("pull")
+        .args(crate::security::git_launch::FETCH_SAFETY_ARGS)
+        .arg("--ff-only");
     let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
@@ -946,26 +1137,14 @@ fn load_openclaw_skills_from_dir(skills_dir: &Path) -> Vec<Skill> {
         if std::fs::symlink_metadata(&md_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
             continue;
         }
-        let Ok(content) = read_utf8_bounded(&md_path, MAX_SKILL_MD_BYTES) else {
+        let fallback_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown");
+        let Ok(metadata) = load_skill_metadata(&md_path, fallback_name) else {
             continue;
         };
 
-        let (name, description) = if let Some((n, d)) = parse_skill_frontmatter(&content) {
-            (n, d)
-        } else {
-            // Fallback: use directory name and first non-heading line
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let desc = extract_description(&content);
-            (name, desc)
-        };
-
         skills.push(Skill {
-            name: bounded_text(&name, MAX_DESCRIPTION_BYTES),
-            description: bounded_text(&description, MAX_DESCRIPTION_BYTES),
+            name: metadata.name,
+            description: metadata.description,
             version: "openclaw".to_string(),
             author: Some("openclaw".to_string()),
             tags: vec!["openclaw".to_string()],
@@ -1401,7 +1580,7 @@ pub async fn install_skill_from_source(workspace_dir: &Path, source: &str) -> Re
 
     let staging_result: Result<()> = async {
         if is_git_source(source) {
-            let mut cmd = Command::new("git");
+            let mut cmd = git_command(GitScope::NewRepository).await?;
             cmd.args(["clone", "--depth", "1", source]).arg(&staging);
             let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
             if !output.status.success() {
@@ -1424,7 +1603,7 @@ pub async fn install_skill_from_source(workspace_dir: &Path, source: &str) -> Re
         {
             use std::os::windows::fs::symlink_dir;
             if symlink_dir(&src, &staging).is_err() {
-                let mut junction_cmd = Command::new("cmd");
+                let mut junction_cmd = tokio::process::Command::new("cmd");
                 junction_cmd
                     .args(["/C", "mklink", "/J"])
                     .arg(&staging)
@@ -1556,7 +1735,7 @@ pub async fn update_installed_skill(workspace_dir: &Path, name: &str) -> Result<
     let staging = root.join(format!(".{directory_name}.staging-{}", uuid::Uuid::new_v4()));
     let backup = root.join(format!(".{directory_name}.backup-{}", uuid::Uuid::new_v4()));
     let updated = async {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command(GitScope::NewRepository).await?;
         cmd.args(["clone", "--depth", "1", source]).arg(&staging);
         let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
         if !output.status.success() {
@@ -2008,17 +2187,122 @@ command = "echo hello"
     }
 
     #[test]
-    fn oversized_markdown_skill_is_rejected_before_reading_prompt_content() {
+    fn oversized_markdown_skill_loads_metadata_without_prompt_content() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("skills").join("oversized");
         fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), vec![b'x'; 70_000]).unwrap();
+
+        let skills = CommunityRoots::absent(dir.path()).load(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert!(skills.first().unwrap().prompts.is_empty());
+    }
+
+    #[test]
+    fn skill_metadata_reads_only_the_frontmatter_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        let header = "---\nname: prx_skill\ndescription: Bounded metadata\n---\n";
+        let body = format!("{header}{}PRIVATE-BODY-SENTINEL", "x".repeat(70_000));
+        fs::write(&path, body).unwrap();
+
+        let metadata = load_skill_metadata(&path, "fallback").unwrap();
+        assert_eq!(metadata.name, "prx_skill");
+        assert_eq!(metadata.description, "Bounded metadata");
+        assert!(!format!("{metadata:?}").contains("PRIVATE-BODY-SENTINEL"));
+        assert_eq!(metadata.location, path);
+    }
+
+    #[test]
+    fn skill_metadata_rejects_unclosed_frontmatter_within_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        fs::write(&path, format!("---\nname: prx_skill\n{}", "x".repeat(10_000))).unwrap();
+        assert!(load_skill_metadata(&path, "fallback").is_err());
+    }
+
+    #[test]
+    fn catalog_skill_metadata_prefers_workspace_and_never_loads_a_large_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let community = dir.path().join("community");
+        let openclaw = dir.path().join("openclaw");
+        fs::create_dir_all(workspace.join("skills/prx_skill")).unwrap();
+        fs::create_dir_all(&community).unwrap();
+        fs::create_dir_all(&openclaw).unwrap();
+        fs::write(community.join("prx_skill.md"), "# Community\nCommunity description\n").unwrap();
         fs::write(
-            skill_dir.join("SKILL.md"),
-            vec![b'x'; usize::try_from(MAX_SKILL_MD_BYTES).unwrap() + 1],
+            workspace.join("skills/prx_skill/SKILL.md"),
+            format!(
+                "---\nname: prx_skill\ndescription: Workspace description\n---\n{}BODY-SENTINEL",
+                "x".repeat(70_000)
+            ),
         )
         .unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.skills.open_skills_dir = Some(community.to_string_lossy().to_string());
+        config.skills.openclaw_skills_dir = Some(openclaw.to_string_lossy().to_string());
 
-        assert!(CommunityRoots::absent(dir.path()).load(dir.path()).is_empty());
+        let discovered = catalog_skill_metadata(&workspace, &config);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered.first().unwrap().description, "Workspace description");
+        assert!(!format!("{discovered:?}").contains("BODY-SENTINEL"));
+    }
+
+    #[test]
+    fn metadata_admission_reserves_workspace_skill_after_community_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let community = dir.path().join("community");
+        let openclaw = dir.path().join("openclaw");
+        fs::create_dir_all(workspace.join("skills/zzz_prx")).unwrap();
+        fs::create_dir_all(&community).unwrap();
+        fs::create_dir_all(&openclaw).unwrap();
+        fs::write(
+            workspace.join("skills/zzz_prx/SKILL.md"),
+            "# Workspace\nWorkspace instruction\n",
+        )
+        .unwrap();
+        for index in 0..260 {
+            fs::write(
+                community.join(format!("aaa_{index:03}.md")),
+                "# Community\nCommunity instruction\n",
+            )
+            .unwrap();
+        }
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.skills.open_skills_dir = Some(community.to_string_lossy().to_string());
+        config.skills.openclaw_skills_dir = Some(openclaw.to_string_lossy().to_string());
+        let metadata = catalog_skill_metadata(&workspace, &config);
+        assert_eq!(metadata.len(), MAX_SKILLS);
+        assert!(metadata.iter().any(|skill| skill.name == "zzz_prx"));
+        let runtime = load_skills_with_config(&workspace, &config);
+        assert_eq!(runtime.len(), MAX_SKILLS);
+        assert!(runtime.iter().any(|skill| skill.name == "zzz_prx"));
+    }
+
+    #[test]
+    fn open_skill_metadata_uses_filename_even_when_frontmatter_names_another_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let community = dir.path().join("community");
+        let openclaw = dir.path().join("openclaw");
+        fs::create_dir_all(&community).unwrap();
+        fs::write(
+            community.join("prx_filename.md"),
+            "---\nname: another_name\ndescription: Metadata\n---\nBody\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.skills.open_skills_dir = Some(community.to_string_lossy().to_string());
+        config.skills.openclaw_skills_dir = Some(openclaw.to_string_lossy().to_string());
+        let metadata = catalog_skill_metadata(&workspace, &config);
+        let runtime = load_skills_with_config(&workspace, &config);
+        assert_eq!(metadata.first().unwrap().name, "prx_filename");
+        assert_eq!(runtime.first().unwrap().name, "prx_filename");
     }
 
     #[test]
@@ -2372,6 +2656,87 @@ description = "Bare minimum"
         let skills = CommunityRoots::absent(dir.path()).load(dir.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "from-toml"); // TOML takes priority
+    }
+
+    /// R-GITENV F-1: pulling a skills checkout whose local-path remote has a
+    /// planted `remote.origin.uploadpack` (first-wins) does not run it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pulling_a_skills_checkout_does_not_run_a_repository_upload_pack() {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::security::git_launch::hermetic_git_for_tests();
+        let dir = tempfile::tempdir().expect("test: temp dir");
+        let setup = |cwd: std::path::PathBuf, args: Vec<String>| async move {
+            let output = tokio::process::Command::new("git")
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(&args)
+                .current_dir(&cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .expect("test: git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let owned = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("test: upstream");
+        setup(upstream.clone(), owned(&["init", "-q"])).await;
+        setup(
+            upstream.clone(),
+            owned(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ]),
+        )
+        .await;
+        let checkout = dir.path().join("checkout");
+        setup(
+            dir.path().to_path_buf(),
+            vec![
+                "clone".to_string(),
+                "-q".to_string(),
+                upstream.display().to_string(),
+                checkout.display().to_string(),
+            ],
+        )
+        .await;
+        let marker = dir.path().join("upload-pack-ran");
+        let program = dir.path().join("upload.sh");
+        std::fs::write(&program, format!("#!/bin/sh\necho ran > '{}'\n", marker.display())).expect("test: script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("test: chmod");
+        setup(
+            checkout.clone(),
+            owned(&["config", "remote.origin.uploadpack", &program.display().to_string()]),
+        )
+        .await;
+
+        assert!(
+            !pull_open_skills_repo(&checkout).await,
+            "a repository upload-pack program must refuse the pull"
+        );
+        assert!(!marker.exists(), "the repository's upload-pack program ran");
+        setup(
+            checkout.clone(),
+            owned(&["config", "--unset", "remote.origin.uploadpack"]),
+        )
+        .await;
+        assert!(
+            pull_open_skills_repo(&checkout).await,
+            "a pull without a repository upload-pack must work"
+        );
     }
 
     #[test]

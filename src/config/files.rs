@@ -171,6 +171,11 @@ pub fn read_merged_toml_with_gate(config_path: &Path) -> Result<Value> {
 
 pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Value> {
     let mut merged = read_toml_file(config_path)?;
+    let mut table_owners: Vec<(&'static str, String)> = OWNED_PROVIDER_TABLES
+        .iter()
+        .filter(|table| has_provider_table(&merged, table))
+        .map(|table| (*table, "config.toml".to_string()))
+        .collect();
 
     // Merge every managed config.d fragment into the already-loaded base.
     for fragment in list_config_fragment_paths(config_path)? {
@@ -185,6 +190,23 @@ pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Valu
             continue;
         }
         let value = read_toml_file(&fragment)?;
+        // A fragment's array replaces the base's wholesale, which for these
+        // tables would be a silent "last file wins" over declarations the
+        // loader otherwise refuses to let shadow each other. One file owns
+        // each table.
+        for table in OWNED_PROVIDER_TABLES {
+            if !has_provider_table(&value, table) {
+                continue;
+            }
+            let fragment_name = format!("config.d/{file_name}");
+            if let Some((_, owner)) = table_owners.iter().find(|(owned, _)| *owned == table) {
+                bail!(
+                    "[[providers.{table}]] is declared in both {owner} and {fragment_name}; a fragment's \
+                     table would silently replace the other file's entries. Declare every entry in one file."
+                );
+            }
+            table_owners.push((table, fragment_name));
+        }
         deep_merge_toml(&mut merged, value);
     }
 
@@ -195,6 +217,17 @@ pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Valu
         );
     }
     Ok(merged)
+}
+
+/// The `[[providers.*]]` declaration tables exactly one file may declare.
+const OWNED_PROVIDER_TABLES: [&str; 2] = ["tool_dialects", "models"];
+
+/// Whether a parsed configuration file declares `[[providers.<table>]]`.
+fn has_provider_table(value: &Value, table: &str) -> bool {
+    value
+        .get("providers")
+        .and_then(|providers| providers.get(table))
+        .is_some()
 }
 
 fn config_generation_path(config_path: &Path) -> Result<PathBuf> {
@@ -413,6 +446,10 @@ pub struct ConfigMutationPlan {
     main_toml: String,
     managed_fragments: BTreeMap<String, String>,
     user_owned_writes: BTreeMap<std::ffi::OsString, String>,
+    /// User-owned `config.d` files this mutation deletes. Only a restore of a
+    /// recorded before-image removes one: the file did not exist before the
+    /// transaction that created it.
+    user_owned_removals: BTreeSet<std::ffi::OsString>,
 }
 
 /// Plan and stage a complete configuration-tree mutation without changing the
@@ -440,9 +477,116 @@ pub fn plan_mutation(
         main_toml,
         managed_fragments: desired,
         user_owned_writes: BTreeMap::new(),
+        user_owned_removals: BTreeSet::new(),
     };
     stage_and_validate_mutation(&plan)?;
     Ok(plan)
+}
+
+/// Plan the structured save of a complete configuration in its stored form
+/// (every encrypted-at-rest secret path encrypted), keeping the current file
+/// layout: split into the managed fragments when any exist, one file
+/// otherwise. This is the planning half of `Config::save`.
+pub fn plan_structured_save(config: &crate::config::schema::Config) -> Result<ConfigMutationPlan> {
+    if has_managed_fragments(&config.config_path)? {
+        let (main_toml, fragments) = config.to_split_toml_strings()?;
+        return plan_mutation(&config.config_path, &config.workspace_dir, main_toml, fragments);
+    }
+    let main_toml = config.to_stored_toml_string()?;
+    plan_mutation(&config.config_path, &config.workspace_dir, main_toml, Vec::new())
+}
+
+/// Plan the restore of a recorded before-image: every file it names gets
+/// exactly its recorded content back, and a file it records as absent is
+/// removed. The restored tree is staged and validated like any mutation.
+pub fn plan_before_image_restore(
+    config_path: &Path,
+    workspace_dir: &Path,
+    before: &ConfigBeforeImage,
+) -> Result<ConfigMutationPlan> {
+    let main_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Config path must have a UTF-8 file name")?;
+    let managed = managed_fragment_names().into_iter().collect::<BTreeSet<_>>();
+    let mut main_toml = None;
+    let mut managed_fragments = Vec::new();
+    let mut user_owned_writes = BTreeMap::new();
+    let mut user_owned_removals = BTreeSet::new();
+    for file in &before.files {
+        // Re-validates the recorded layout: only config.toml and direct
+        // children of config.d are accepted.
+        config_snapshot_path_from_relative(config_path, &file.relative_path)?;
+        if file.relative_path == main_name {
+            main_toml = Some(
+                file.contents
+                    .clone()
+                    .context("The recorded configuration has no config.toml to restore")?,
+            );
+            continue;
+        }
+        let name = file
+            .relative_path
+            .strip_prefix("config.d/")
+            .with_context(|| format!("Unsupported before-image path: {}", file.relative_path))?;
+        match (&file.contents, managed.contains(name)) {
+            (Some(contents), true) => managed_fragments.push((name.to_string(), contents.clone())),
+            (Some(contents), false) => {
+                user_owned_writes.insert(std::ffi::OsString::from(name), contents.clone());
+            }
+            (None, false) => {
+                user_owned_removals.insert(std::ffi::OsString::from(name));
+            }
+            // An absent managed fragment is removed by the stale-fragment
+            // sweep because it is not part of the desired set.
+            (None, true) => {}
+        }
+    }
+    let main_toml = main_toml.context("The recorded configuration has no config.toml to restore")?;
+    let mut plan = plan_mutation(config_path, workspace_dir, main_toml, managed_fragments)?;
+    if !user_owned_writes.is_empty() || !user_owned_removals.is_empty() {
+        plan.user_owned_writes = user_owned_writes;
+        plan.user_owned_removals = user_owned_removals;
+        stage_and_validate_mutation(&plan)?;
+    }
+    Ok(plan)
+}
+
+impl ConfigMutationPlan {
+    /// The configuration file this plan writes.
+    #[must_use]
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// The merged stored tree this plan would publish, read back from a
+    /// private staging copy exactly as the loader merges it. Secrets are in
+    /// their stored (possibly encrypted) form.
+    pub fn effective_stored_tree(&self) -> Result<Value> {
+        let staging = stage_mutation(self)?;
+        read_merged_toml_with_gate_once(&staging.path().join("config.toml"))
+    }
+
+    /// The content every target file has after this plan commits (`None`:
+    /// the file does not exist), in the before-image vocabulary.
+    fn intended_state(&self) -> Result<BTreeMap<String, Option<String>>> {
+        let mut intended = BTreeMap::new();
+        for path in mutation_targets(self)? {
+            let relative = config_snapshot_relative_path(&self.config_path, &path)?;
+            let contents = if path == self.config_path {
+                Some(self.main_toml.clone())
+            } else {
+                let name = path.file_name().context("Config fragment path has no file name")?;
+                let managed = name.to_str().and_then(|name| self.managed_fragments.get(name));
+                match (managed, self.user_owned_writes.get(name)) {
+                    (Some(contents), _) | (None, Some(contents)) => Some(contents.clone()),
+                    (None, None) => None,
+                }
+            };
+            intended.insert(relative, contents);
+        }
+        Ok(intended)
+    }
 }
 
 /// Plan a main-file-only edit while retaining every currently managed
@@ -482,6 +626,7 @@ pub fn plan_config_file_mutation(
     filename: &str,
     contents: String,
 ) -> Result<ConfigMutationPlan> {
+    validate_raw_config_file_name(filename)?;
     let managed_names = managed_fragment_names().into_iter().collect::<BTreeSet<_>>();
     let (main_toml, mut managed_fragments) = with_consistent_config_snapshot(config_path, || {
         let main = if filename == "config.toml" {
@@ -522,6 +667,69 @@ pub fn plan_config_file_mutation(
     Ok(plan)
 }
 
+/// Refuse a raw file name that differs only in letter case from
+/// `config.toml` or a managed fragment name. On a case-insensitive
+/// filesystem (the macOS and Windows default) such a name is the managed
+/// file itself, while the plan would treat it as a separate user-owned file:
+/// the plan, its validation and its risk checks would not see what is
+/// written.
+pub fn refuse_case_variant_of_managed_name(filename: &str) -> Result<()> {
+    let managed = std::iter::once("config.toml").chain(managed_fragment_names());
+    for name in managed {
+        if filename != name && filename.eq_ignore_ascii_case(name) {
+            bail!(
+                "The file name `{filename}` differs only in letter case from the managed file `{name}`; use `{name}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The longest raw configuration file name accepted, in bytes (the common
+/// filesystem limit for one path component).
+pub const MAX_RAW_CONFIG_FILE_NAME_BYTES: usize = 255;
+
+/// Accept only a plain lowercase ASCII raw file name:
+/// `[a-z0-9][a-z0-9._-]*.toml`, without `..`.
+///
+/// Case-insensitive filesystems fold more than ASCII case: APFS maps
+/// `ſ` (U+017F) to `s`, the Kelvin sign (U+212A) to `k` and the `ﬆ` ligature
+/// (U+FB06) to `st`, so `ſecurity.toml` opens `security.toml`, and NTFS
+/// compares through its own case table. No comparison here can know every
+/// folding, so any name outside that set is refused: then no name can be an
+/// alias of a managed file on any filesystem. The ASCII case-variant check
+/// runs first for its clearer message.
+pub fn validate_raw_config_file_name(filename: &str) -> Result<()> {
+    // Checked first, before any other rule or filesystem access (D-045 I-4):
+    // a longer name would otherwise reach staging and fail with the OS text.
+    if filename.len() > MAX_RAW_CONFIG_FILE_NAME_BYTES {
+        bail!(
+            "The file name is {} bytes long; a configuration file name is at most {MAX_RAW_CONFIG_FILE_NAME_BYTES} bytes",
+            filename.len()
+        );
+    }
+    refuse_case_variant_of_managed_name(filename)?;
+    let Some(stem) = filename.strip_suffix(".toml") else {
+        bail!("The file name `{}` must end with .toml", filename.escape_default());
+    };
+    let plain = stem
+        .bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
+        && !filename.contains("..");
+    if !plain {
+        bail!(
+            "The file name `{}` is not allowed: use lowercase ASCII letters, digits, `.`, `_` and `-` only, \
+             starting with a letter or digit and ending in .toml",
+            filename.escape_default()
+        );
+    }
+    Ok(())
+}
+
 fn current_unmanaged_fragment_bytes(config_path: &Path) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
     with_consistent_config_snapshot(config_path, || {
         let mut fragments = Vec::new();
@@ -539,6 +747,18 @@ fn current_unmanaged_fragment_bytes(config_path: &Path) -> Result<Vec<(std::ffi:
 }
 
 fn stage_and_validate_mutation(plan: &ConfigMutationPlan) -> Result<()> {
+    let staging = stage_mutation(plan)?;
+    crate::config::schema::Config::validate_stored_from_path(
+        &staging.path().join("config.toml"),
+        plan.workspace_dir.clone(),
+    )
+    .context("Staged effective configuration is invalid")
+}
+
+/// Write the complete tree a plan would publish into a private temporary
+/// directory: the plan's files plus every current user-owned fragment the
+/// plan does not remove.
+fn stage_mutation(plan: &ConfigMutationPlan) -> Result<tempfile::TempDir> {
     let staging = tempfile::tempdir().context("Failed to create config mutation staging directory")?;
     let staged_config_path = staging.path().join("config.toml");
     let staged_config_dir = staging.path().join("config.d");
@@ -546,6 +766,9 @@ fn stage_and_validate_mutation(plan: &ConfigMutationPlan) -> Result<()> {
     std::fs::write(&staged_config_path, &plan.main_toml).context("Failed to stage config.toml")?;
 
     for (name, bytes) in current_unmanaged_fragment_bytes(&plan.config_path)? {
+        if plan.user_owned_removals.contains(&name) {
+            continue;
+        }
         std::fs::write(staged_config_dir.join(name), bytes).context("Failed to stage user-owned config fragment")?;
     }
     for (name, contents) in &plan.user_owned_writes {
@@ -556,9 +779,154 @@ fn stage_and_validate_mutation(plan: &ConfigMutationPlan) -> Result<()> {
         std::fs::write(staged_config_dir.join(name), contents)
             .with_context(|| format!("Failed to stage managed config fragment: {name}"))?;
     }
+    Ok(staging)
+}
 
-    crate::config::schema::Config::validate_stored_from_path(&staged_config_path, plan.workspace_dir.clone())
-        .context("Staged effective configuration is invalid")
+/// The stored content of every file one mutation may touch, captured under
+/// the configuration writer lock immediately before the mutation writes.
+///
+/// Secrets are in their stored form: `enc2:` ciphertext when encryption is on,
+/// otherwise the plaintext the live file holds. It is therefore never
+/// rendered by `Debug` and only persisted with owner-only permissions.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigBeforeImage {
+    pub files: Vec<BeforeImageFile>,
+}
+
+/// One file of a [`ConfigBeforeImage`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeforeImageFile {
+    /// `config.toml` or `config.d/<name>`.
+    pub relative_path: String,
+    /// The stored text; `None` when the file did not exist.
+    pub contents: Option<String>,
+}
+
+impl std::fmt::Debug for ConfigBeforeImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.files
+                    .iter()
+                    .map(|file| (file.relative_path.as_str(), file.contents.as_ref().map(String::len))),
+            )
+            .finish()
+    }
+}
+
+impl ConfigBeforeImage {
+    fn from_snapshot(config_path: &Path, snapshot: &BTreeMap<PathBuf, ConfigFileSnapshot>) -> Result<Self> {
+        let files = snapshot
+            .iter()
+            .map(|(path, previous)| {
+                let contents = previous
+                    .bytes
+                    .as_ref()
+                    .map(|bytes| {
+                        String::from_utf8(bytes.clone())
+                            .with_context(|| format!("Config file is not UTF-8 TOML: {}", path.display()))
+                    })
+                    .transpose()?;
+                Ok(BeforeImageFile {
+                    relative_path: config_snapshot_relative_path(config_path, path)?,
+                    contents,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { files })
+    }
+
+    fn state(&self) -> BTreeMap<String, Option<String>> {
+        self.files
+            .iter()
+            .map(|file| (file.relative_path.clone(), file.contents.clone()))
+            .collect()
+    }
+}
+
+/// The stored content of every configuration file now on disk
+/// (`config.toml` and each `config.d` fragment), as a before-image. The
+/// caller holds the configuration writer lock, so the files are one
+/// generation. Used for a history record of a change that writes no
+/// configuration file (a credential reference replaced, PMM-H), whose
+/// rollback restores the configuration as it was then.
+///
+/// # Errors
+///
+/// When a file cannot be read or is not UTF-8.
+pub fn current_before_image(config_path: &Path) -> Result<ConfigBeforeImage> {
+    let mut paths = vec![config_path.to_path_buf()];
+    paths.extend(list_config_fragment_paths(config_path)?);
+    let files = paths
+        .iter()
+        .map(|path| {
+            let contents = match std::fs::read(path) {
+                Ok(bytes) => Some(
+                    String::from_utf8(bytes)
+                        .with_context(|| format!("Config file is not UTF-8 TOML: {}", path.display()))?,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).with_context(|| format!("Failed to read {}", path.display())),
+            };
+            Ok(BeforeImageFile {
+                relative_path: config_snapshot_relative_path(config_path, path)?,
+                contents,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ConfigBeforeImage { files })
+}
+
+/// A guarded commit found the configuration at a different revision than
+/// the caller based its change on. Nothing was written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the configuration changed since revision {expected} (current revision {actual}); nothing was written")]
+pub struct ConfigRevisionConflict {
+    pub expected: String,
+    pub actual: String,
+}
+
+/// Result of [`commit_mutation_guarded`].
+#[derive(Debug)]
+pub enum GuardedCommit {
+    /// The plan was written. `before` is the exact prior content of every
+    /// target; `revision` is the fingerprint of the tree now on disk.
+    Committed {
+        before: ConfigBeforeImage,
+        revision: String,
+    },
+    /// The files already held exactly the planned content; nothing was
+    /// written and no generation was published.
+    Unchanged { revision: String },
+}
+
+/// Hex rendering of a configuration fingerprint, as
+/// `ConfigSourceRevision::fingerprint_sha256` renders it.
+fn fingerprint_hex(fingerprint: &[u8]) -> String {
+    let mut hex = String::with_capacity(fingerprint.len() * 2);
+    for byte in fingerprint {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            // A nibble is below 16, so the digit always exists.
+            if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                hex.push(digit);
+            }
+        }
+    }
+    hex
+}
+
+/// A fingerprint (as `compute_config_fingerprint_gated` returns it) in the
+/// revision form `ConfigSourceRevision::fingerprint_sha256` uses.
+#[must_use]
+pub fn revision_of_fingerprint(fingerprint: &[u8]) -> String {
+    fingerprint_hex(fingerprint)
+}
+
+/// The revision (fingerprint) of the configuration tree currently on disk,
+/// in the form `ConfigSourceRevision::fingerprint_sha256` reports it.
+pub fn current_config_revision(config_path: &Path) -> Result<String> {
+    compute_config_fingerprint_gated(config_path).map(|fingerprint| fingerprint_hex(&fingerprint))
 }
 
 #[derive(Debug)]
@@ -780,6 +1148,7 @@ fn mutation_targets(plan: &ConfigMutationPlan) -> Result<Vec<PathBuf>> {
     let mut targets = vec![plan.config_path.clone()];
     targets.extend(managed_fragment_names().into_iter().map(|name| config_dir.join(name)));
     targets.extend(plan.user_owned_writes.keys().map(|name| config_dir.join(name)));
+    targets.extend(plan.user_owned_removals.iter().map(|name| config_dir.join(name)));
     Ok(targets)
 }
 
@@ -827,14 +1196,14 @@ async fn restore_mutation_snapshot(snapshot: &BTreeMap<PathBuf, ConfigFileSnapsh
 
 #[cfg(test)]
 #[derive(Debug)]
-struct MutationFailureHook {
-    config_path: PathBuf,
-    writes_remaining: usize,
+pub(crate) struct MutationFailureHook {
+    pub(crate) config_path: PathBuf,
+    pub(crate) writes_remaining: usize,
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-fn mutation_failure_hook() -> &'static std::sync::Mutex<Option<MutationFailureHook>> {
+pub(crate) fn mutation_failure_hook() -> &'static std::sync::Mutex<Option<MutationFailureHook>> {
     use std::sync::{Mutex, OnceLock};
     static HOOK: OnceLock<Mutex<Option<MutationFailureHook>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -867,6 +1236,37 @@ const fn fail_config_mutation_if_requested(_config_path: &Path) -> Result<()> {
 /// reject or retry an in-progress generation, so they observe either the old
 /// complete tree or the new complete tree, never a mixed set of files.
 pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> {
+    commit_mutation_locked(plan, None, false, |_| Ok(())).await.map(|_| ())
+}
+
+/// Commit one validated configuration generation under an optimistic
+/// concurrency guard, handing the exact before-image to `before_publish`.
+///
+/// Under the same OS-backed writer lock every PRX config writer takes:
+/// 1. when `expected_revision` is given, the tree on disk must still have
+///    that fingerprint, otherwise [`ConfigRevisionConflict`] is returned and
+///    nothing is written (no lost update, across processes too);
+/// 2. the before-image of every target is captured; if the files already hold
+///    the planned content, nothing is written ([`GuardedCommit::Unchanged`]);
+/// 3. `before_publish` runs with the before-image before any file changes, so
+///    a durable record of it exists before the new tree can be observed; its
+///    error aborts the commit with nothing written. It runs on a blocking
+///    worker thread (it does file I/O), while the lock is held;
+/// 4. the plan is committed exactly as [`commit_mutation_atomically`] does.
+pub async fn commit_mutation_guarded(
+    plan: ConfigMutationPlan,
+    expected_revision: Option<&str>,
+    before_publish: impl FnOnce(&ConfigBeforeImage) -> Result<()> + Send + 'static,
+) -> Result<GuardedCommit> {
+    commit_mutation_locked(plan, expected_revision, true, before_publish).await
+}
+
+async fn commit_mutation_locked(
+    plan: ConfigMutationPlan,
+    expected_revision: Option<&str>,
+    skip_unchanged: bool,
+    before_publish: impl FnOnce(&ConfigBeforeImage) -> Result<()> + Send + 'static,
+) -> Result<GuardedCommit> {
     let parent = plan
         .config_path
         .parent()
@@ -877,9 +1277,31 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
     let _transaction_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(&plan.config_path).await?;
 
     reconcile_unfinished_generation_locked(&plan.config_path, &plan.workspace_dir).await?;
+    if let Some(expected) = expected_revision {
+        // Every PRX writer holds this lock while the generation is odd, so
+        // the tree read here is one complete generation.
+        let actual = fingerprint_hex(&compute_config_fingerprint_gated_once(&plan.config_path)?);
+        if actual != expected {
+            return Err(ConfigRevisionConflict {
+                expected: expected.to_string(),
+                actual,
+            }
+            .into());
+        }
+    }
     // Re-stage under the writer lock so concurrently edited user-owned
     // fragments are part of the validated effective tree.
     stage_and_validate_mutation(&plan)?;
+    let snapshot = capture_mutation_snapshot(&plan)?;
+    let before = ConfigBeforeImage::from_snapshot(&plan.config_path, &snapshot)?;
+    if skip_unchanged && before.state() == plan.intended_state()? {
+        let revision = fingerprint_hex(&compute_config_fingerprint_gated_once(&plan.config_path)?);
+        return Ok(GuardedCommit::Unchanged { revision });
+    }
+    let image = before.clone();
+    crate::runtime::blocking::spawn_blocking(move || before_publish(&image))
+        .await
+        .map_err(|error| anyhow::anyhow!("config transaction hook worker failed: {error}"))??;
     let stable_generation = read_config_generation(&plan.config_path)?;
     let pending_generation = stable_generation
         .checked_add(1)
@@ -887,7 +1309,6 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
     let committed_generation = stable_generation
         .checked_add(2)
         .context("Config generation overflow after transaction")?;
-    let snapshot = capture_mutation_snapshot(&plan)?;
     let generation_path = config_generation_path(&plan.config_path)?;
     write_config_transaction_journal(&plan.config_path, stable_generation, pending_generation, &snapshot).await?;
     if let Err(error) = crate::config::schema::write_toml_string_atomic_without_lock(
@@ -916,6 +1337,10 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
         }
         for (name, contents) in &plan.user_owned_writes {
             crate::config::schema::write_toml_string_atomic_without_lock(&config_dir.join(name), contents).await?;
+            fail_config_mutation_if_requested(&plan.config_path)?;
+        }
+        for name in &plan.user_owned_removals {
+            remove_regular_file_if_present(&config_dir.join(name)).await?;
             fail_config_mutation_if_requested(&plan.config_path)?;
         }
         crate::config::schema::write_toml_string_atomic_without_lock(&plan.config_path, &plan.main_toml).await?;
@@ -978,7 +1403,25 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
             "Config transaction committed but its stale journal could not be removed"
         );
     }
-    Ok(())
+    let revision = fingerprint_hex(&compute_config_fingerprint_gated_once(&plan.config_path)?);
+    Ok(GuardedCommit::Committed { before, revision })
+}
+
+async fn remove_regular_file_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(path)
+                .await
+                .with_context(|| format!("Failed to remove config file: {}", path.display()))?;
+            let parent = path
+                .parent()
+                .with_context(|| format!("Config file has no parent: {}", path.display()))?;
+            crate::config::schema::sync_directory(parent).await
+        }
+        Ok(_) => bail!("Refusing to remove non-file config target: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect config file: {}", path.display())),
+    }
 }
 
 pub async fn write_split_config(config: &crate::config::schema::Config, dry_run: bool) -> Result<String> {
@@ -1481,6 +1924,182 @@ backend = "sqlite"
             "[operator_owned]\nvalue = 11\n"
         );
         assert!(tmp.path().join("config.d/memory.toml").exists());
+    }
+
+    async fn split_fixture() -> (tempfile::TempDir, crate::config::Config) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        write_split_config(&config, false).await.unwrap();
+        (tmp, config)
+    }
+
+    fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let config_dir = root.join("config.d");
+        out.insert(
+            root.join("config.toml"),
+            std::fs::read(root.join("config.toml")).unwrap(),
+        );
+        if let Ok(entries) = std::fs::read_dir(&config_dir) {
+            for entry in entries {
+                let path = entry.unwrap().path();
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn guarded_commit_refuses_a_stale_revision_and_writes_nothing() {
+        let (tmp, mut config) = split_fixture().await;
+        let base = current_config_revision(&config.config_path).unwrap();
+        // Another writer (here: a manual edit) changes the tree afterwards.
+        let manual = tmp.path().join("config.d/memory.toml");
+        let mut edited = std::fs::read_to_string(&manual).unwrap();
+        edited.push_str("\n# edited by hand\n");
+        std::fs::write(&manual, &edited).unwrap();
+        let on_disk = tree_bytes(tmp.path());
+        let generation = read_config_generation(&config.config_path).unwrap();
+
+        config.default_model = Some("stale-candidate".into());
+        let plan = plan_structured_save(&config).unwrap();
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&hook_ran);
+        let error = commit_mutation_guarded(plan, Some(&base), move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+        let conflict = error
+            .downcast_ref::<ConfigRevisionConflict>()
+            .expect("a typed conflict");
+        assert_eq!(conflict.expected, base);
+        assert_eq!(conflict.actual, current_config_revision(&config.config_path).unwrap());
+        assert!(
+            !hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing may be recorded for a refused commit"
+        );
+        assert_eq!(tree_bytes(tmp.path()), on_disk, "the manual edit must survive");
+        assert_eq!(read_config_generation(&config.config_path).unwrap(), generation);
+    }
+
+    #[tokio::test]
+    async fn guarded_commit_of_the_current_content_writes_nothing() {
+        let (tmp, config) = split_fixture().await;
+        let on_disk = tree_bytes(tmp.path());
+        let generation = read_config_generation(&config.config_path).unwrap();
+        let before = BeforeImage::capture(tmp.path());
+        let plan = plan_before_image_restore(&config.config_path, &config.workspace_dir, &before).unwrap();
+
+        let outcome = commit_mutation_guarded(plan, None, |_| bail!("must not run"))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GuardedCommit::Unchanged { .. }), "{outcome:?}");
+        assert_eq!(tree_bytes(tmp.path()), on_disk);
+        assert_eq!(read_config_generation(&config.config_path).unwrap(), generation);
+    }
+
+    #[tokio::test]
+    async fn a_failing_before_publish_hook_aborts_with_nothing_written() {
+        let (tmp, mut config) = split_fixture().await;
+        let on_disk = tree_bytes(tmp.path());
+        config.default_model = Some("unrecorded-candidate".into());
+        let plan = plan_structured_save(&config).unwrap();
+
+        let error = commit_mutation_guarded(plan, None, |_| bail!("history is unavailable"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("history is unavailable"), "{error:#}");
+        assert_eq!(tree_bytes(tmp.path()), on_disk);
+        assert_eq!(read_config_generation(&config.config_path).unwrap() % 2, 0);
+        assert!(!config_transaction_journal_path(&config.config_path).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn restoring_a_guarded_before_image_is_byte_identical() {
+        let (tmp, config) = split_fixture().await;
+        let on_disk = tree_bytes(tmp.path());
+
+        // A raw write that also creates a user-owned fragment.
+        let plan = plan_config_file_mutation(
+            &config.config_path,
+            &config.workspace_dir,
+            "operator-owned.toml",
+            "[operator_owned]\nvalue = 1\n".to_string(),
+        )
+        .unwrap();
+        let GuardedCommit::Committed { before, .. } = commit_mutation_guarded(plan, None, |_| Ok(())).await.unwrap()
+        else {
+            panic!("the raw write must commit");
+        };
+        let mut changed = config.clone();
+        changed.default_model = Some("second-change".into());
+        let plan = plan_structured_save(&changed).unwrap();
+        let GuardedCommit::Committed { before: second, .. } =
+            commit_mutation_guarded(plan, None, |_| Ok(())).await.unwrap()
+        else {
+            panic!("the structured write must commit");
+        };
+        assert!(tmp.path().join("config.d/operator-owned.toml").exists());
+
+        // Restore the image taken before the first write: the second change
+        // is undone and the created user-owned file is removed.
+        let merged = ConfigBeforeImage {
+            files: before
+                .files
+                .iter()
+                .chain(second.files.iter().filter(|file| {
+                    !before
+                        .files
+                        .iter()
+                        .any(|first| first.relative_path == file.relative_path)
+                }))
+                .cloned()
+                .collect(),
+        };
+        let restore = plan_before_image_restore(&config.config_path, &config.workspace_dir, &merged).unwrap();
+        commit_mutation_guarded(restore, None, |_| Ok(())).await.unwrap();
+
+        assert_eq!(tree_bytes(tmp.path()), on_disk, "rollback must restore the exact bytes");
+        assert!(!tmp.path().join("config.d/operator-owned.toml").exists());
+    }
+
+    #[test]
+    fn a_before_image_debug_rendering_carries_no_content() {
+        let image = ConfigBeforeImage {
+            files: vec![BeforeImageFile {
+                relative_path: "config.toml".into(),
+                contents: Some("api_key = \"plain-sentinel\"\n".into()),
+            }],
+        };
+        let rendered = format!("{image:?}");
+        assert!(!rendered.contains("plain-sentinel"), "{rendered}");
+        assert!(rendered.contains("config.toml"), "{rendered}");
+    }
+
+    /// Test helper: the before-image of the current tree, as a guarded
+    /// commit would capture it for a structured save.
+    struct BeforeImage;
+
+    impl BeforeImage {
+        fn capture(root: &Path) -> ConfigBeforeImage {
+            let config_path = root.join("config.toml");
+            let plan = ConfigMutationPlan {
+                config_path: config_path.clone(),
+                workspace_dir: root.join("workspace"),
+                main_toml: String::new(),
+                managed_fragments: BTreeMap::new(),
+                user_owned_writes: BTreeMap::new(),
+                user_owned_removals: BTreeSet::new(),
+            };
+            ConfigBeforeImage::from_snapshot(&config_path, &capture_mutation_snapshot(&plan).unwrap()).unwrap()
+        }
     }
 
     #[tokio::test]

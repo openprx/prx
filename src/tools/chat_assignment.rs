@@ -453,6 +453,7 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::io::Write;
+    use std::sync::LazyLock;
     use tracing_subscriber::fmt::writer::MakeWriter;
 
     const SENDER: &str = "+15550009999";
@@ -486,6 +487,34 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// A dispatcher that is registered once and never dropped, and that is
+    /// interested in nothing.
+    ///
+    /// `tracing-core` computes a callsite's process-wide interest from every
+    /// registered dispatcher only while there are at least two; with exactly
+    /// one it asks the registering thread's own default instead. A capture
+    /// installed while this one is alive is therefore always the second, so a
+    /// sibling test on a thread with no subscriber that reaches a line first
+    /// still registers it with this capture's interest, not with "never".
+    /// Being a `NoSubscriber`, it adds no interest and no level of its own.
+    static PLURAL_DISPATCHERS: LazyLock<tracing::Dispatch> =
+        LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+    /// Install a capturing subscriber as this thread's default, in a way that
+    /// does not depend on which thread reaches a log line first. See
+    /// [`PLURAL_DISPATCHERS`].
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        LazyLock::force(&PLURAL_DISPATCHERS);
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
     }
 
     struct RecordingChannel {
@@ -827,16 +856,10 @@ mod tests {
         let (channel, sent) = RecordingChannel::new();
         let (session_id, token, assignment_id) = assign_one(&security, &correspondent());
 
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
         // Thread-local: a `#[tokio::test]` drives its tasks on this very thread,
         // so the spawned trip logs into this writer and no other test's output
         // can land in it.
-        let guard = tracing::subscriber::set_default(subscriber);
+        let (logs, guard) = capture_logs();
 
         let ending = tokio::spawn({
             let trip = trip(
@@ -894,6 +917,41 @@ mod tests {
             "test: the relayed body must never reach the log: {text}"
         );
         chat_sessions::deregister(&session_id);
+    }
+
+    /// The capture must not depend on which thread reaches a log line first.
+    ///
+    /// `tracing` caches each callsite's interest for the whole process, and
+    /// the first thread to reach a callsite computes it. While exactly one
+    /// dispatcher is registered, `tracing-core` computes it from *that
+    /// thread's* default rather than from every registered dispatcher, so a
+    /// sibling test reaching `deliver`'s success line first — on a thread
+    /// with no subscriber — cached "never" for the whole process and the
+    /// capture came back empty. That is the intermittent empty-log failure of
+    /// `a_relayed_result_is_logged_without_the_recipient_or_the_body`, which
+    /// shared its callsite with every other test here that delivers.
+    ///
+    /// The probe is a callsite of its own, so the first reach is certainly
+    /// the one on the other thread, with the capture already installed.
+    ///
+    /// MUTATION GUARD: remove the permanent second dispatcher from
+    /// `capture_logs` and this test goes red when run on its own.
+    #[test]
+    fn a_callsite_first_reached_on_another_thread_still_reaches_the_capture() {
+        fn probe() {
+            tracing::info!("capture-probe-5d1e: reached");
+        }
+
+        let (logs, guard) = capture_logs();
+        std::thread::spawn(probe).join().expect("test: probe thread");
+        probe();
+        drop(guard);
+
+        let text = logs.text();
+        assert!(
+            text.contains("capture-probe-5d1e: reached"),
+            "test: a line first reached on a thread without a subscriber must still reach this capture: {text:?}"
+        );
     }
 
     /// The hint is omitted, not emptied, when the caller may assign nowhere.

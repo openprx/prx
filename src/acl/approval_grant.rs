@@ -27,6 +27,20 @@ pub struct ApprovalGrantV2 {
     pub related_message_event_id: Option<i64>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revocation_reason: Option<String>,
+    /// Optional decision-plane binding. Omitted on legacy v2 grants so their
+    /// canonical signed representation remains byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_binding: Option<DecisionApprovalBinding>,
+}
+
+/// Signed identity of the one decision call a human approved. This contains
+/// fingerprints only; tool arguments and credentials are not serialized here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionApprovalBinding {
+    pub decision_id: String,
+    pub catalog_generation: [u8; 32],
+    pub call_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,8 +143,7 @@ fn default_witness_key_path() -> Option<PathBuf> {
     if let Some(config_dir) = crate::config::process_config_dir() {
         return Some(config_dir.join("keys").join("runtime_witness.key"));
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join(".openprx").join("keys").join("runtime_witness.key"))
+    crate::config::default_openprx_dir().map(|dir| dir.join("keys").join("runtime_witness.key"))
 }
 
 impl WitnessKeyring {
@@ -349,9 +362,71 @@ impl ApprovalGrantV2 {
             related_message_event_id: None,
             revoked_at: None,
             revocation_reason: None,
+            decision_binding: None,
         };
         sign_grant(keyring, &mut grant)?;
         Ok(grant)
+    }
+
+    /// Issue a human-reviewed, exact-operation grant for a pending decision.
+    /// The producer must obtain `subject` and `binding` from authenticated
+    /// pending state, never from fields supplied by an approval HTTP request.
+    pub fn issue_decision_one_shot(
+        keyring: &WitnessKeyring,
+        subject: Subject,
+        op_id: impl Into<String>,
+        risk_level: RiskLevel,
+        binding: DecisionApprovalBinding,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self> {
+        let op_id = op_id.into();
+        let now = Utc::now();
+        anyhow::ensure!(
+            !Uuid::parse_str(&binding.decision_id)?.is_nil()
+                && !op_id.trim().is_empty()
+                && !subject.agent_id.is_empty()
+                && !subject.principal_id.is_empty()
+                && !subject.owner_id.is_empty()
+                && !subject.workspace_id.is_empty()
+                && subject
+                    .session_key
+                    .as_deref()
+                    .is_some_and(|session| !session.is_empty())
+                && now < expires_at
+                && expires_at <= now + Duration::minutes(5),
+            "decision approval scope is incomplete or expired"
+        );
+        let mut grant = Self::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op_id, risk_level)?;
+        grant.expires_at = grant.expires_at.min(expires_at);
+        grant.decision_binding = Some(binding);
+        sign_grant(keyring, &mut grant)?;
+        Ok(grant)
+    }
+
+    /// Verify the signed scope against independently obtained pending state.
+    /// This does not reserve or consume a grant: the durable single-use claim
+    /// remains required before execution can receive approval evidence.
+    pub fn verify_for_decision(
+        &self,
+        keyring: &WitnessKeyring,
+        subject: &Subject,
+        binding: &DecisionApprovalBinding,
+        op_id: &str,
+        risk_level: RiskLevel,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.verify_operation_signature(keyring, op_id, risk_level, now)?;
+        anyhow::ensure!(
+            self.subject == *subject
+                && self.decision_binding.as_ref() == Some(binding)
+                && self.issuer.authority == IssuerAuthority::HumanReview
+                && self.max_uses == 1
+                && self.uses_consumed == 0
+                && self.capability.op_id_match == OpIdMatch::Exact
+                && self.capability.op_id == op_id,
+            "approval grant does not match the pending decision call"
+        );
+        Ok(())
     }
 
     #[must_use]
@@ -376,6 +451,20 @@ impl ApprovalGrantV2 {
     }
 
     pub fn verify_for_operation(
+        &self,
+        keyring: &WitnessKeyring,
+        op_id: &str,
+        risk_level: RiskLevel,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.decision_binding.is_none(),
+            "decision-bound approval requires decision-scope verification"
+        );
+        self.verify_operation_signature(keyring, op_id, risk_level, now)
+    }
+
+    fn verify_operation_signature(
         &self,
         keyring: &WitnessKeyring,
         op_id: &str,
@@ -676,11 +765,10 @@ mod tests {
             Some(scoped.join("keys").join("runtime_witness.key")),
             "a scoped run must keep its witness key inside the resolved config dir"
         );
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         assert_eq!(
             unscoped_path,
-            home.map(|home| home.join(".openprx").join("keys").join("runtime_witness.key")),
-            "without a published config dir the historical $HOME location is kept"
+            crate::config::default_openprx_dir().map(|dir| dir.join("keys").join("runtime_witness.key")),
+            "without a published config dir the default ~/.openprx location is kept"
         );
     }
 

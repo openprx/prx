@@ -165,10 +165,10 @@ pub(crate) async fn run_fitness_report_for_window(config: &Config, window: Windo
     validate_fitness_config(&config.self_system.fitness)?;
     let memory = memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.embedding_routes,
+        &config.embedding_routes_with_references(),
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        memory::EmbeddingRootCredential::from_config(config),
     )?;
     let report = build_fitness_report(memory.as_ref(), config, window).await?;
     FitnessStore::new(&config.workspace_dir).store(&report, config.self_system.fitness.retention_days)?;
@@ -766,6 +766,7 @@ mod tests {
             terminal_state: None,
             approval_grant_json: None,
             delivery_principal: cron::DeliveryPrincipal::default(),
+            origin: cron::JobOrigin::default(),
         }
     }
 
@@ -944,6 +945,12 @@ mod tests {
         let memory = SqliteMemory::new(&config.workspace_dir).unwrap();
         memory
             .store("keep", "sentinel", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Since D-026 a store is no longer mirrored into MEMORY.md on its own;
+        // the operator mirror seeds the projection this test inspects.
+        memory
+            .mirror_operator_write("keep", "sentinel", &MemoryCategory::Core)
             .await
             .unwrap();
         let day = Utc::now().date_naive() - Duration::days(1);

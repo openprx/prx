@@ -112,7 +112,7 @@ pub async fn exchange_code_for_tokens(client: &Client, code: &str, pkce: &PkceSt
     ];
 
     let response = client
-        .post(OPENAI_OAUTH_TOKEN_URL)
+        .post(crate::providers::token_host(OPENAI_OAUTH_TOKEN_URL))
         .form(&form)
         .send()
         .await
@@ -129,7 +129,7 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
     ];
 
     let response = client
-        .post(OPENAI_OAUTH_TOKEN_URL)
+        .post(crate::providers::token_host(OPENAI_OAUTH_TOKEN_URL))
         .form(&form)
         .send()
         .await
@@ -145,7 +145,7 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
     ];
 
     let response = client
-        .post(OPENAI_OAUTH_DEVICE_CODE_URL)
+        .post(crate::providers::token_host(OPENAI_OAUTH_DEVICE_CODE_URL))
         .form(&form)
         .send()
         .await
@@ -191,7 +191,7 @@ pub async fn poll_device_code_tokens(client: &Client, device: &DeviceCodeStart) 
         ];
 
         let response = client
-            .post(OPENAI_OAUTH_TOKEN_URL)
+            .post(crate::providers::token_host(OPENAI_OAUTH_TOKEN_URL))
             .form(&form)
             .send()
             .await

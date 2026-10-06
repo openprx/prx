@@ -12,6 +12,7 @@ use crate::config::{
 };
 use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
+use crate::providers::catalog::discovery::{self, DiscoveredModel};
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_huggingface_alias, is_litellm_alias,
     is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_vllm_alias,
@@ -20,9 +21,7 @@ use crate::providers::{
 use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,7 +56,6 @@ const BANNER: &str = r"
 
 const LIVE_MODEL_MAX_OPTIONS: usize = 120;
 const MODEL_PREVIEW_LIMIT: usize = 20;
-const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
@@ -115,28 +113,31 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     );
     println!();
 
-    print_step(1, 8, "Workspace Setup");
+    print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace(config_dir)?;
 
-    print_step(2, 8, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
+    print_step(2, 9, "AI Provider & API Key");
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 8, "Channels (How You Talk to OpenPRX)");
+    print_step(3, 9, "Channels (How You Talk to OpenPRX)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 8, "Tunnel (Expose to Internet)");
+    print_step(4, 9, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 8, "Tool Mode & Security");
+    print_step(5, 9, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 8, "Memory Configuration");
+    print_step(6, 9, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(7, 8, "Project Context (Personalize Your Agent)");
+    print_step(7, 9, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(8, 8, "Workspace Files");
+    print_step(8, 9, "Decision Plane");
+    let decision = setup_decision_plane()?;
+
+    print_step(9, 9, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
@@ -147,7 +148,8 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         api_key: if api_key.is_empty() { None } else { Some(api_key) },
         api_url: provider_api_url,
         default_provider: Some(provider),
-        default_model: Some(model),
+        // Stored as the resolver reads it (R-PMMCh C-2).
+        default_model: Some(model.trim().to_string()),
         default_temperature: 0.7,
         providers: crate::config::ProvidersConfig::default(),
         observability: ObservabilityConfig::default(),
@@ -230,11 +232,32 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         style(spec.name()).cyan()
     );
 
+    // The chosen default is an operator selection (D-034): a model the
+    // evidence rules out is refused before anything is written; an
+    // unverified one is accepted with a warning.
+    check_onboarding_selection(
+        &config,
+        crate::providers::selection::default_provider(&config),
+        crate::providers::selection::default_model(&config),
+    )?;
+
     // Write config.toml (main) + config.d/ fragment files.
     // This replaces the flat config.save() call so that the user's
     // workspace is set up with the split layout from the start.
     crate::config::files::write_split_config(&config, false).await?;
     persist_workspace_selection(&config.config_path).await?;
+
+    // ── Decision plane: the shared setup service, then a local test ──
+    if let Some(decision) = &decision {
+        decision.apply(config.clone()).await?;
+        let written = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
+        let outcome = crate::causal_cli::test_configured_locally(&written).await?;
+        println!(
+            "  {} Decision backend: {} (local test: {outcome})",
+            style("✓").green().bold(),
+            decision.kind.as_str()
+        );
+    }
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -391,9 +414,7 @@ pub async fn run_quick_setup(
     memory_backend: Option<&str>,
     config_dir: Option<&str>,
 ) -> Result<Config> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
 
     run_quick_setup_with_home(
         credential_override,
@@ -431,8 +452,9 @@ async fn run_quick_setup_with_home(
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
+    // Stored as the resolver reads it (R-PMMCh C-2).
     let model = model_override
-        .map(str::to_string)
+        .map(|model| model.trim().to_string())
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
     let memory_backend_name = memory_backend.unwrap_or(default_memory_backend_key()).to_string();
 
@@ -502,6 +524,10 @@ async fn run_quick_setup_with_home(
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
+    // A new durable default (D-018 Q1): the model must be one PRX has
+    // evidence for, or nothing is written.
+    check_onboarding_selection(&config, &provider_name, &model)?;
+
     let config_d_dir = config
         .config_path
         .parent()
@@ -529,11 +555,7 @@ async fn run_quick_setup_with_home(
         style("✓").green().bold(),
         style(workspace_dir.display()).green()
     );
-    println!(
-        "  {} Provider:   {}",
-        style("✓").green().bold(),
-        style(&provider_name).green()
-    );
+    println!("{}", setup_provider_line(&provider_name));
     println!("  {} Model:      {}", style("✓").green().bold(), style(&model).green());
     println!(
         "  {} API Key:    {}",
@@ -584,10 +606,9 @@ async fn run_quick_setup_with_home(
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
-        println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.openprx/config.toml");
-        println!("    3. Chat:              prx agent -m \"Hello!\"");
-        println!("    4. Gateway:           prx gateway");
+        println!("    1. Add your API key:  {}", credential_setup_hint(&provider_name));
+        println!("    2. Chat:              prx agent -m \"Hello!\"");
+        println!("    3. Gateway:           prx gateway");
     } else {
         println!("    1. Chat:     prx agent -m \"Hello!\"");
         println!("    2. Gateway:  prx gateway");
@@ -633,6 +654,41 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
         canonical_provider_name(provider_name),
         "openrouter" | "ollama" | "llamacpp" | "litellm" | "vllm" | "compatible" | "venice" | "astrai" | "nvidia"
     )
+}
+
+/// Resolve a new default as an operator selection (D-034): negative
+/// evidence refuses and nothing is written; no evidence is accepted and the
+/// operator is told the model is unverified.
+///
+/// The evidence is the one every other surface resolves against
+/// ([`crate::providers::selection::catalog_for`], D-078 T-8), so a default
+/// onboarding accepts is judged the same way by the configuration API and
+/// `config.patch` afterwards.
+fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> Result<()> {
+    let catalog = crate::providers::selection::catalog_for(config);
+    let credential = crate::providers::selection::credential_for(config, provider);
+    match crate::providers::selection::check_with(
+        config,
+        &catalog,
+        provider,
+        model,
+        credential,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::OperatorSelection,
+    ) {
+        Ok(resolved) => {
+            if let crate::providers::catalog::Verification::Unverified { unproven } = resolved.verification() {
+                println!(
+                    "  {} model '{model}' is unverified for {}: PRX has no catalog evidence for it yet. It will be \
+                     used; declare it in `[[providers.models]]` once you know what it supports.",
+                    style("!").yellow().bold(),
+                    unproven.join(", ")
+                );
+            }
+            Ok(())
+        }
+        Err(refusal) => bail!("{refusal}. Nothing was written."),
+    }
 }
 
 /// Pick a sensible default model for the given provider.
@@ -1112,101 +1168,34 @@ fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
         .context("failed to build model-fetch HTTP client")
 }
 
-fn normalize_model_ids(ids: Vec<String>) -> Vec<String> {
-    let mut unique = BTreeSet::new();
-    for id in ids {
-        let trimmed = id.trim();
-        if !trimmed.is_empty() {
-            unique.insert(trimmed.to_string());
-        }
-    }
-    unique.into_iter().collect()
-}
-
-fn parse_openai_compatible_model_ids(payload: &Value) -> Vec<String> {
-    let mut models = Vec::new();
-
-    if let Some(data) = payload.get("data").and_then(Value::as_array) {
-        for model in data {
-            if let Some(id) = model.get("id").and_then(Value::as_str) {
-                models.push(id.to_string());
-            }
-        }
-    } else if let Some(data) = payload.as_array() {
-        for model in data {
-            if let Some(id) = model.get("id").and_then(Value::as_str) {
-                models.push(id.to_string());
-            }
-        }
-    }
-
-    normalize_model_ids(models)
-}
-
-fn parse_gemini_model_ids(payload: &Value) -> Vec<String> {
-    let Some(models) = payload.get("models").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    let mut ids = Vec::new();
-    for model in models {
-        let supports_generate_content = model
-            .get("supportedGenerationMethods")
-            .and_then(Value::as_array)
-            .is_none_or(|methods| methods.iter().any(|method| method.as_str() == Some("generateContent")));
-
-        if !supports_generate_content {
-            continue;
-        }
-
-        if let Some(name) = model.get("name").and_then(Value::as_str) {
-            ids.push(name.trim_start_matches("models/").to_string());
-        }
-    }
-
-    normalize_model_ids(ids)
-}
-
-fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
-    let Some(models) = payload.get("models").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    let mut ids = Vec::new();
-    for model in models {
-        if let Some(name) = model.get("name").and_then(Value::as_str) {
-            ids.push(name.to_string());
-        }
-    }
-
-    normalize_model_ids(ids)
-}
-
 fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DiscoveredModel>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get(endpoint);
+    // An `api_url` may carry `user:password@`; errors name the endpoint only.
+    let shown_endpoint = crate::providers::redact_endpoint_userinfo(endpoint);
 
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     } else if !allow_unauthenticated {
-        bail!("model fetch requires API key for endpoint {endpoint}");
+        bail!("model fetch requires API key for endpoint {shown_endpoint}");
     }
 
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .with_context(|| format!("model fetch failed: GET {endpoint}"))?
+        .map_err(|error| anyhow::anyhow!("{}", crate::providers::redact_endpoint_userinfo(&error.to_string())))
+        .with_context(|| format!("model fetch failed: GET {shown_endpoint}"))?
         .json()
         .context("failed to parse model list response")?;
 
-    Ok(parse_openai_compatible_model_ids(&payload))
+    Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
+fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
     if let Some(api_key) = api_key {
@@ -1220,10 +1209,10 @@ fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .json()
         .context("failed to parse OpenRouter model list response")?;
 
-    Ok(parse_openai_compatible_model_ids(&payload))
+    Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
@@ -1255,10 +1244,10 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .json()
         .context("failed to parse Anthropic model list response")?;
 
-    Ok(parse_openai_compatible_model_ids(&payload))
+    Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
+fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let Some(api_key) = api_key else {
         bail!("Gemini model fetch requires API key");
     };
@@ -1273,10 +1262,10 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .json()
         .context("failed to parse Gemini model list response")?;
 
-    Ok(parse_gemini_model_ids(&payload))
+    Ok(discovery::parse_gemini_models(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+fn fetch_ollama_models() -> Result<Vec<DiscoveredModel>> {
     let client = build_model_fetch_client()?;
     let payload: Value = client
         .get("http://localhost:11434/api/tags")
@@ -1286,24 +1275,31 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
         .json()
         .context("failed to parse Ollama model list response")?;
 
-    Ok(parse_ollama_model_ids(&payload))
+    Ok(discovery::parse_ollama_models(&payload))
 }
 
-fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
-    if matches!(
-        canonical_provider_name(provider_name),
-        "llamacpp" | "litellm" | "vllm" | "huggingface" | "compatible"
-    ) {
-        if let Some(url) = provider_api_url.map(str::trim).filter(|url| !url.is_empty()) {
-            let normalized = url.trim_end_matches('/');
-            if normalized.ends_with("/models") {
-                return Some(normalized.to_string());
-            }
-            if canonical_provider_name(provider_name) == "litellm" && !normalized.ends_with("/v1") {
-                return Some(format!("{normalized}/v1/models"));
-            }
-            return Some(format!("{normalized}/models"));
+pub(crate) fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
+    // The configured endpoint wherever provider construction honours it
+    // (D-095 M-1): the key goes to the host the provider itself addresses,
+    // never to the vendor's public host behind an operator's gateway.
+    let configured = crate::providers::honoured_base_url(provider_name, provider_api_url).or_else(|| {
+        (canonical_provider_name(provider_name) == "compatible")
+            .then_some(provider_api_url)
+            .flatten()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    });
+    if let Some(url) = configured {
+        let path_ends = |suffix: &str| {
+            reqwest::Url::parse(url).is_ok_and(|parsed| parsed.path().trim_end_matches('/').ends_with(suffix))
+        };
+        if path_ends("/models") {
+            return crate::providers::endpoint_url(url, "/models");
         }
+        if canonical_provider_name(provider_name) == "litellm" && !path_ends("/v1") {
+            return crate::providers::endpoint_url(url, "/v1/models");
+        }
+        return crate::providers::endpoint_url(url, "/models");
     }
 
     models_endpoint_for_provider(provider_name).map(str::to_string)
@@ -1313,12 +1309,12 @@ fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DiscoveredModel>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
     let api_key = if api_key.trim().is_empty() {
-        std::env::var(provider_env_var(provider_name))
-            .ok()
+        provider_credential_env_var(provider_name)
+            .and_then(|variable| std::env::var(variable).ok())
             .or_else(|| {
                 // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
                 if provider_name == "anthropic" {
@@ -1345,17 +1341,20 @@ fn fetch_live_models_for_provider(
                 fetch_ollama_models()?
             } else {
                 // Key is present, assume Ollama Cloud and return hardcoded list
-                vec![
-                    "glm-5:cloud".to_string(),
-                    "glm-4.7:cloud".to_string(),
-                    "gpt-oss:cloud".to_string(),
-                    "gemini-3-flash-preview:cloud".to_string(),
-                    "qwen2.5-coder:1.5b".to_string(),
-                    "qwen2.5-coder:3b".to_string(),
-                    "qwen2.5:cloud".to_string(),
-                    "minimax-m2.5:cloud".to_string(),
-                    "deepseek-v3.1:cloud".to_string(),
+                [
+                    "glm-5:cloud",
+                    "glm-4.7:cloud",
+                    "gpt-oss:cloud",
+                    "gemini-3-flash-preview:cloud",
+                    "qwen2.5-coder:1.5b",
+                    "qwen2.5-coder:3b",
+                    "qwen2.5:cloud",
+                    "minimax-m2.5:cloud",
+                    "deepseek-v3.1:cloud",
                 ]
+                .into_iter()
+                .map(DiscoveredModel::id_only)
+                .collect()
             }
         }
         _ => {
@@ -1371,24 +1370,70 @@ fn fetch_live_models_for_provider(
     Ok(models)
 }
 
-fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
-    if let Some(key) = config.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
-        return key.to_string();
-    }
+/// Async boundary for the blocking model-discovery fan-out.
+///
+/// `reqwest::blocking` enters and drops a temporary Tokio runtime on the calling
+/// thread, so running it on an async worker panics with "Cannot drop a runtime in
+/// a context where blocking is not allowed". `prx models refresh` already routes
+/// this exact fan-out through `runtime::blocking::spawn_blocking`; the
+/// interactive wizard uses the same boundary.
+///
+/// Arguments are owned because the blocking closure must be `'static`.
+async fn fetch_live_models_for_provider_off_runtime(
+    provider_name: String,
+    api_key: String,
+    provider_api_url: Option<String>,
+) -> Result<Vec<DiscoveredModel>> {
+    crate::runtime::blocking::spawn_blocking(move || {
+        fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url.as_deref())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("model discovery task failed: {error}"))?
+}
 
+/// The credential and base URL model discovery may present to a provider.
+struct DiscoveryConnection<'a> {
+    /// Empty when the provider has no credential of its own.
+    api_key: String,
+    api_url: Option<&'a str>,
+}
+
+/// What `prx models refresh`, the read-only probe and `prx doctor models`
+/// (which probes every catalog provider) send to `provider_name`.
+///
+/// The root `api_key` and `api_url` belong to the configured default provider
+/// and are released only on a provider-identity match; any other provider is
+/// probed with its own auth profile (or its own environment variable, read by
+/// the fetcher), or without a credential.
+fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
+    let configured_provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let root = crate::providers::configured_connection_for(
+        provider_name,
+        configured_provider,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+    );
+    let api_key = root
+        .api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map_or_else(|| model_discovery_api_key(config, provider_name), str::to_string);
+    DiscoveryConnection {
+        api_key,
+        api_url: root.api_url,
+    }
+}
+
+/// The selected provider's own auth-profile credential, or empty.
+fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
     let state_dir = config
         .config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            directories::UserDirs::new().map_or_else(
-                || PathBuf::from(".openprx"),
-                |dirs| default_user_config_dir(dirs.home_dir()),
-            )
-        });
+        .unwrap_or_else(|| crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx")));
     let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
-    let Ok(data) = store.load() else {
+    let Ok(data) = store.load_read_only() else {
         return String::new();
     };
     let canonical = canonical_provider_name(provider_name);
@@ -1408,26 +1453,10 @@ fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
         .to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ModelCacheEntry {
-    provider: String,
-    fetched_at_unix: u64,
-    models: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ModelCacheState {
-    entries: Vec<ModelCacheEntry>,
-}
-
 #[derive(Debug, Clone)]
 struct CachedModels {
     models: Vec<String>,
     age_secs: u64,
-}
-
-fn model_cache_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("state").join(MODEL_CACHE_FILE)
 }
 
 fn now_unix_secs() -> u64 {
@@ -1436,51 +1465,9 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
-    let path = model_cache_path(workspace_dir);
-    if !path.exists() {
-        return Ok(ModelCacheState::default());
-    }
-
-    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read model cache at {}", path.display()))?;
-
-    serde_json::from_str::<ModelCacheState>(&raw).map_or_else(|_| Ok(ModelCacheState::default()), Ok)
-}
-
-fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
-    let path = model_cache_path(workspace_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create model cache directory {}", parent.display()))?;
-    }
-
-    let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
-    fs::write(&path, json).with_context(|| format!("failed to write model cache at {}", path.display()))?;
-
-    Ok(())
-}
-
-fn cache_live_models_for_provider(workspace_dir: &Path, provider_name: &str, models: &[String]) -> Result<()> {
-    let normalized_models = normalize_model_ids(models.to_vec());
-    if normalized_models.is_empty() {
-        return Ok(());
-    }
-
-    let mut state = load_model_cache_state(workspace_dir)?;
-    let now = now_unix_secs();
-
-    if let Some(entry) = state.entries.iter_mut().find(|entry| entry.provider == provider_name) {
-        entry.fetched_at_unix = now;
-        entry.models = normalized_models;
-    } else {
-        state.entries.push(ModelCacheEntry {
-            provider: provider_name.to_string(),
-            fetched_at_unix: now,
-            models: normalized_models,
-        });
-    }
-
-    save_model_cache_state(workspace_dir, &state)
+/// Record a fetched catalog, with every model's metadata, in the model cache.
+fn cache_live_models_for_provider(workspace_dir: &Path, provider_name: &str, models: &[DiscoveredModel]) -> Result<()> {
+    discovery::record_discovered(workspace_dir, provider_name, models, now_unix_secs())
 }
 
 fn load_cached_models_for_provider_internal(
@@ -1488,7 +1475,7 @@ fn load_cached_models_for_provider_internal(
     provider_name: &str,
     ttl_secs: Option<u64>,
 ) -> Result<Option<CachedModels>> {
-    let state = load_model_cache_state(workspace_dir)?;
+    let state = discovery::load_model_cache_state(workspace_dir)?;
     let now = now_unix_secs();
 
     let Some(entry) = state.entries.into_iter().find(|entry| entry.provider == provider_name) else {
@@ -1562,6 +1549,8 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
+    // Printed and quoted in errors: a `custom:` URL may carry `user:password@`.
+    let shown = crate::security::redaction::redact_provider_text(&provider_name);
 
     let canonical = canonical_provider_name(&provider_name).to_string();
     let cached = load_any_cached_models_for_provider(&config.workspace_dir, &canonical)?.or_else(|| {
@@ -1571,7 +1560,12 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
     });
     let curated = curated_models_for_provider(&canonical);
 
-    println!("Model catalog for '{}':", provider_name);
+    println!("Model catalog for '{}':", shown);
+    if provider_override.is_none() {
+        match crate::providers::selection::default_status(config) {
+            Ok((_, line)) | Err(line) => println!("  {line}"),
+        }
+    }
     if let Some(cached) = cached {
         println!(
             "  Source: cached live catalog (updated {} ago)",
@@ -1580,7 +1574,7 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
         println!("  Models: {}", cached.models.len());
         print_model_preview(&cached.models);
         if cached.models.len() > MODEL_PREVIEW_LIMIT {
-            println!("  Tip: use `prx models refresh --provider {provider_name} --force` to refresh this cache.");
+            println!("  Tip: use `prx models refresh --provider {shown} --force` to refresh this cache.");
         }
     } else if !curated.is_empty() {
         println!("  Source: curated defaults (no live cache found)");
@@ -1588,7 +1582,7 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
         for (model, label) in curated.iter().take(MODEL_PREVIEW_LIMIT) {
             println!("  {} {model} — {label}", style("-"));
         }
-        println!("  Tip: run `prx models refresh --provider {provider_name}` to cache a live catalog when supported.");
+        println!("  Tip: run `prx models refresh --provider {shown}` to cache a live catalog when supported.");
     } else {
         println!("  No cached or curated models found.");
         println!(
@@ -1609,9 +1603,11 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
+    // Printed and quoted in errors: a `custom:` URL may carry `user:password@`.
+    let shown = crate::security::redaction::redact_provider_text(&provider_name);
 
     if !supports_live_model_fetch(&provider_name) {
-        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
+        anyhow::bail!("Provider '{shown}' does not support live model discovery yet");
     }
 
     if !force {
@@ -1620,30 +1616,26 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
         {
             println!(
                 "Using cached model list for '{}' (updated {} ago):",
-                provider_name,
+                shown,
                 humanize_age(cached.age_secs)
             );
             print_model_preview(&cached.models);
             println!();
             println!(
                 "Tip: run `prx models refresh --force --provider {}` to fetch latest now.",
-                provider_name
+                shown
             );
             return Ok(());
         }
     }
 
-    let api_key = model_discovery_api_key(config, &provider_name);
+    let connection = model_discovery_connection(config, &provider_name);
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    match fetch_live_models_for_provider(&provider_name, &connection.api_key, connection.api_url) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
-            println!(
-                "Refreshed '{}' model cache with {} models.",
-                provider_name,
-                models.len()
-            );
-            print_model_preview(&models);
+            println!("Refreshed '{}' model cache with {} models.", shown, models.len());
+            print_model_preview(&discovery::chat_model_ids(&models));
             Ok(())
         }
         Ok(_) => {
@@ -1656,7 +1648,7 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
                 return Ok(());
             }
 
-            anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
+            anyhow::bail!("Provider '{}' returned an empty model list", shown)
         }
         Err(error) => {
             if let Some(stale_cache) = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)? {
@@ -1669,7 +1661,7 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
                 return Ok(());
             }
 
-            Err(error).with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
+            Err(error).with_context(|| format!("failed to refresh models for provider '{shown}'"))
         }
     }
 }
@@ -1685,8 +1677,10 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
+    // Printed and quoted in errors: a `custom:` URL may carry `user:password@`.
+    let shown = crate::security::redaction::redact_provider_text(&provider_name);
     if !supports_live_model_fetch(&provider_name) {
-        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
+        anyhow::bail!("Provider '{shown}' does not support live model discovery yet");
     }
 
     if prefer_cache
@@ -1695,25 +1689,25 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
     {
         println!(
             "Using cached model list for '{}' as read-only evidence (updated {} ago):",
-            provider_name,
+            shown,
             humanize_age(cached.age_secs)
         );
         print_model_preview(&cached.models);
         return Ok(());
     }
 
-    let api_key = model_discovery_api_key(config, &provider_name);
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    let connection = model_discovery_connection(config, &provider_name);
+    match fetch_live_models_for_provider(&provider_name, &connection.api_key, connection.api_url) {
         Ok(models) if !models.is_empty() => {
             println!(
                 "Read-only live probe returned {} model(s) for '{}'; cache was not updated.",
                 models.len(),
-                provider_name
+                shown
             );
-            print_model_preview(&models);
+            print_model_preview(&discovery::chat_model_ids(&models));
             Ok(())
         }
-        Ok(_) => anyhow::bail!("Provider '{provider_name}' returned an empty model list"),
+        Ok(_) => anyhow::bail!("Provider '{shown}' returned an empty model list"),
         Err(error) => {
             if let Some(stale_cache) = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)? {
                 println!(
@@ -1723,7 +1717,7 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
                 print_model_preview(&stale_cache.models);
                 return Ok(());
             }
-            Err(error).with_context(|| format!("failed to probe models for provider '{provider_name}'"))
+            Err(error).with_context(|| format!("failed to probe models for provider '{shown}'"))
         }
     }
 }
@@ -1778,9 +1772,7 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let openprx_dir = if let Some(dir) = config_dir {
         PathBuf::from(dir)
     } else {
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
+        let home = crate::config::user_home_dir().context("Could not find home directory")?;
         let default_dir = default_user_config_dir(&home);
 
         print_bullet(&format!("Default location: {}", style(default_dir.display()).green()));
@@ -1794,8 +1786,7 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
             default_dir
         } else {
             let custom: String = Input::new().with_prompt("  Enter workspace path").interact_text()?;
-            let expanded = shellexpand::tilde(&custom).to_string();
-            PathBuf::from(expanded)
+            crate::config::expand_home(Path::new(&custom))
         }
     };
 
@@ -1820,7 +1811,7 @@ fn default_user_config_dir(home: &Path) -> PathBuf {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -1927,12 +1918,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
         let provider_name = format!("custom:{base_url}");
 
-        println!(
-            "  {} Provider: {} | Model: {}",
-            style("✓").green().bold(),
-            style(&provider_name).green(),
-            style(&model).green()
-        );
+        println!("{}", selected_provider_line(&provider_name, &model));
 
         return Ok((provider_name, api_key, model, None));
     }
@@ -1986,8 +1972,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
             if key.trim().is_empty() {
                 print_bullet(&format!(
-                    "No API key provided. Set {} later if required by your endpoint.",
-                    style("OLLAMA_API_KEY").yellow()
+                    "No API key provided. If your endpoint requires one, later {}.",
+                    style(credential_setup_hint(provider_name)).yellow()
                 ));
             }
 
@@ -2021,8 +2007,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
         if key.trim().is_empty() {
             print_bullet(&format!(
-                "No API key provided. Set {} later only if your server requires authentication.",
-                style("LLAMACPP_API_KEY").yellow()
+                "No API key provided. Only if your server requires authentication, later {}.",
+                style(credential_setup_hint(provider_name)).yellow()
             ));
         }
 
@@ -2069,41 +2055,37 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact_text()?
         }
     } else if canonical_provider_name(provider_name) == "anthropic" {
-        if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
-            print_bullet(&format!(
-                "{} ANTHROPIC_OAUTH_TOKEN environment variable detected!",
-                style("✓").green().bold()
-            ));
-            String::new()
-        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            print_bullet(&format!(
-                "{} ANTHROPIC_API_KEY environment variable detected!",
-                style("✓").green().bold()
-            ));
-            String::new()
-        } else {
-            print_bullet(&format!(
-                "Get your API key at: {}",
-                style("https://console.anthropic.com/settings/keys").cyan().underlined()
-            ));
-            print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
-            println!();
-
-            let key: String = Input::new()
-                .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            if key.is_empty() {
+        // PRX reads no Anthropic credential from the environment, so a
+        // variable set in this shell is not "detected" as configured: the
+        // key has to be pasted here or stored later (ONBOARD-HINT, D-062).
+        for variable in ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if std::env::var_os(variable).is_some() {
                 print_bullet(&format!(
-                    "Skipped. Set {} or {} or edit config.toml later.",
-                    style("ANTHROPIC_API_KEY").yellow(),
-                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                    "{} is set in this shell, but PRX does not read it: paste the key below to use it.",
+                    style(variable).yellow()
                 ));
             }
-
-            key
         }
+        print_bullet(&format!(
+            "Get your API key at: {}",
+            style("https://console.anthropic.com/settings/keys").cyan().underlined()
+        ));
+        print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
+        println!();
+
+        let key: String = Input::new()
+            .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.is_empty() {
+            print_bullet(&format!(
+                "Skipped. Later, {}.",
+                style(credential_setup_hint(provider_name)).yellow()
+            ));
+        }
+
+        key
     } else if canonical_provider_name(provider_name) == "qwen-code" {
         if std::env::var("QWEN_OAUTH_TOKEN").is_ok() {
             print_bullet(&format!(
@@ -2196,7 +2178,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             if !key_url.is_empty() {
                 print_bullet(&format!("Get your API key at: {}", style(key_url).cyan().underlined()));
             }
-            print_bullet("You can also set it later via env var or config file.");
+            print_bullet(&format!(
+                "You can also add it later: {}.",
+                credential_setup_hint(provider_name)
+            ));
             println!();
 
             let key: String = Input::new()
@@ -2205,10 +2190,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact_text()?;
 
             if key.is_empty() {
-                let env_var = provider_env_var(provider_name);
                 print_bullet(&format!(
-                    "Skipped. Set {} or edit config.toml later.",
-                    style(env_var).yellow()
+                    "Skipped. Later, {}.",
+                    style(credential_setup_hint(provider_name)).yellow()
                 ));
             }
 
@@ -2225,8 +2209,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
     if supports_live_model_fetch(provider_name) {
         let can_fetch_without_key = allows_unauthenticated_model_fetch(provider_name);
         let has_api_key = !api_key.trim().is_empty()
-            || std::env::var(provider_env_var(provider_name))
-                .ok()
+            || provider_credential_env_var(provider_name)
+                .and_then(|variable| std::env::var(variable).ok())
                 .is_some_and(|value| !value.trim().is_empty())
             || (provider_name == "minimax"
                 && std::env::var("MINIMAX_OAUTH_TOKEN")
@@ -2257,9 +2241,16 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(provider_name, &api_key, provider_api_url.as_deref()) {
-                    Ok(live_model_ids) if !live_model_ids.is_empty() => {
-                        cache_live_models_for_provider(workspace_dir, provider_name, &live_model_ids)?;
+                match fetch_live_models_for_provider_off_runtime(
+                    provider_name.to_string(),
+                    api_key.clone(),
+                    provider_api_url.clone(),
+                )
+                .await
+                {
+                    Ok(live_models) if !live_models.is_empty() => {
+                        cache_live_models_for_provider(workspace_dir, provider_name, &live_models)?;
+                        let live_model_ids = discovery::chat_model_ids(&live_models);
 
                         let fetched_count = live_model_ids.len();
                         let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
@@ -2357,23 +2348,51 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         selected_model
     };
 
-    println!(
-        "  {} Provider: {} | Model: {}",
-        style("✓").green().bold(),
-        style(provider_name).green(),
-        style(&model).green()
-    );
+    println!("{}", selected_provider_line(provider_name, &model));
 
     Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
+/// The onboarding line naming the provider a quick setup configured.
+///
+/// Each provider line below prints the label through the one redaction helper:
+/// a `custom:` URL may carry `user:password@`.
+fn setup_provider_line(provider_name: &str) -> String {
+    format!(
+        "  {} Provider:   {}",
+        style("✓").green().bold(),
+        style(crate::providers::redact_endpoint_userinfo(provider_name)).green()
+    )
+}
+
+/// The onboarding line confirming the provider and model just selected.
+fn selected_provider_line(provider_name: &str, model: &str) -> String {
+    format!(
+        "  {} Provider: {} | Model: {}",
+        style("✓").green().bold(),
+        style(crate::providers::redact_endpoint_userinfo(provider_name)).green(),
+        style(model).green()
+    )
+}
+
+/// The provider line of the closing quick summary.
+fn quick_summary_provider_line(config: &Config) -> String {
+    format!(
+        "    {} Provider:      {}",
+        style("🤖").cyan(),
+        crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
+    )
+}
+
 /// Map provider name to its conventional env var
-fn provider_env_var(name: &str) -> &'static str {
+/// The environment variable that holds `name`'s own credential, if the
+/// provider has one. Model discovery reads only this.
+fn provider_credential_env_var(name: &str) -> Option<&'static str> {
     if canonical_provider_name(name) == "qwen-code" {
-        return "QWEN_OAUTH_TOKEN";
+        return Some("QWEN_OAUTH_TOKEN");
     }
 
-    match canonical_provider_name(name) {
+    Some(match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
@@ -2403,7 +2422,66 @@ fn provider_env_var(name: &str) -> &'static str {
         "gemini" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
-        _ => "API_KEY",
+        _ => return None,
+    })
+}
+
+/// The environment variable the daemon itself reads for `name`'s credential,
+/// if there is one (ONBOARD-HINT, D-062).
+///
+/// Provider construction reads no other API-key variable: `GEMINI_API_KEY`
+/// (or `GOOGLE_API_KEY`) for Gemini and `QWEN_OAUTH_TOKEN` for Qwen Code are
+/// the only ones (Bedrock reads the AWS variables, which its own step
+/// explains). Exporting `OPENROUTER_API_KEY` or the like changes nothing for
+/// the daemon, the gateway or a channel, so onboarding never suggests one; it
+/// points at the configuration or the auth store instead. Model discovery
+/// during onboarding reads more ([`provider_credential_env_var`]).
+fn daemon_credential_env_var(name: &str) -> Option<&'static str> {
+    match canonical_provider_name(name) {
+        "gemini" => Some("GEMINI_API_KEY"),
+        "qwen-code" => Some("QWEN_OAUTH_TOKEN"),
+        _ => None,
+    }
+}
+
+/// How onboarding tells the operator to supply `name`'s credential later:
+/// only a variable the daemon reads, and always the supported mechanism
+/// (`api_key` in config.toml or `prx auth paste-token`).
+fn credential_setup_hint(name: &str) -> String {
+    daemon_credential_env_var(name).map_or_else(
+        || keyless_provider_hint(name),
+        |variable| format!("export {variable} for the daemon, or {}", keyless_provider_hint(name)),
+    )
+}
+
+/// How onboarding tells the operator to supply a key later for a provider
+/// with no variable of its own (INT-2B a36). Nothing reads a generic
+/// `API_KEY`, so the key goes into the configuration or the auth store.
+///
+/// The command must work when pasted (B2f F-8): the label is shell-quoted
+/// when it needs it, and a label that carries URL userinfo is never printed
+/// (neither the password nor a redacted spelling, which would register the
+/// key under a different identity), so the operator is pointed at the label
+/// in config.toml instead.
+fn keyless_provider_hint(name: &str) -> String {
+    let provider = match crate::providers::redact_endpoint_userinfo(name) {
+        std::borrow::Cow::Borrowed(_) => shell_quoted(name),
+        std::borrow::Cow::Owned(_) => "<your default_provider value from config.toml, quoted>".to_string(),
+    };
+    format!("set `api_key` in config.toml (or run `prx auth paste-token --provider {provider}`)")
+}
+
+/// `value` as one shell word: unchanged when it holds only characters no
+/// POSIX shell treats specially, otherwise single-quoted.
+fn shell_quoted(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@' | b'+' | b'=' | b',')
+        });
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 
@@ -2634,9 +2712,76 @@ fn setup_memory() -> Result<MemoryConfig> {
     Ok(config)
 }
 
+// ── Step 8: Decision plane (CDP-14) ─────────────────────────────
+
+/// Choose the decision backend. The builtin (the default) keeps every
+/// decision on this machine and changes nothing. A local System One
+/// endpoint is checked by the one decision check before anything is
+/// written, and tested locally once the configuration is written. A hosted
+/// service needs a credential and sends decision state off the machine, so
+/// it is set up with `prx causal config` after onboarding.
+fn setup_decision_plane() -> Result<Option<crate::causal_cli::DecisionSetup>> {
+    print_bullet("The decision plane chooses between candidate actions before the model answers.");
+    print_bullet("The builtin decides locally; nothing is sent anywhere.");
+    println!();
+    let options = [
+        "Builtin (default): decisions stay on this machine",
+        "A local System One endpoint (loopback)",
+        "A hosted service (TypeSafe or OpenRouter): set up after onboarding",
+    ];
+    let choice = Select::new()
+        .with_prompt("  Decision backend")
+        .items(&options)
+        .default(0)
+        .interact()?;
+    match choice {
+        1 => {
+            let endpoint: String = Input::new()
+                .with_prompt("  Endpoint (http://127.0.0.1:<port>/v1)")
+                .interact_text()?;
+            let model: String = Input::new().with_prompt("  Model, one exact version").interact_text()?;
+            let enable = Confirm::new()
+                .with_prompt("  Turn the decision plane on now?")
+                .default(true)
+                .interact()?;
+            let setup = crate::causal_cli::DecisionSetup {
+                kind: crate::decision::BackendKind::CompatibleHttp,
+                endpoint: Some(endpoint.trim().to_string()),
+                model: Some(model.trim().to_string()),
+                enable,
+            };
+            setup.check()?;
+            Ok(Some(setup))
+        }
+        2 => {
+            print_bullet("A hosted service receives decision state off this machine and needs a credential.");
+            for kind in [
+                crate::decision::BackendKind::TypeSafe,
+                crate::decision::BackendKind::OpenRouter,
+            ] {
+                if let Some(owner) = crate::causal_cli::hosted_owner(kind) {
+                    print_bullet(&crate::causal_cli::hosted_setup_steps(kind, owner, None));
+                }
+            }
+            print_bullet(
+                "Each change prints its plan; apply it with --yes (and --confirm-high-risk <REVISION> when it \
+                 asks), then `prx causal config enable-remote`; `prx causal test --live` asks the service once.",
+            );
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
+// Every channel connection probe below runs its blocking HTTP on a dedicated thread and joins it,
+// which keeps `reqwest::blocking` off the Tokio worker that awaits `run_wizard`. The join itself
+// still parks that worker for the round trip, and the probe clients carry no timeout.
+// Known limit: moving the probes onto `runtime::blocking::spawn_blocking` and giving them explicit
+// timeouts would require making `setup_channels` async, which is a separate concern from keeping
+// the blocking client off the worker.
 fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to OpenPRX from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
@@ -3664,19 +3809,26 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt("  Client Secret (AppSecret)")
                     .interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in a separate thread — reqwest::blocking enters and
+                // drops its own runtime, which must not happen on a Tokio worker)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let body = serde_json::json!({
-                    "clientId": client_id,
-                    "clientSecret": client_secret,
-                });
-                match client
-                    .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
-                    .json(&body)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
+                let probe_client_id = client_id.clone();
+                let probe_client_secret = client_secret.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let body = serde_json::json!({
+                        "clientId": probe_client_id,
+                        "clientSecret": probe_client_secret,
+                    });
+                    let resp = client
+                        .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
+                        .json(&body)
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
                         println!(
                             "\r  {} DingTalk credentials verified        ",
                             style("✅").green().bold()
@@ -3731,26 +3883,35 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let app_secret: String = Input::new().with_prompt("  App Secret").interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in a separate thread — reqwest::blocking enters and
+                // drops its own runtime, which must not happen on a Tokio worker)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let body = serde_json::json!({
-                    "appId": app_id,
-                    "clientSecret": app_secret,
-                });
-                match client
-                    .post("https://bots.qq.com/app/getAppAccessToken")
-                    .json(&body)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        if data.get("access_token").is_some() {
-                            println!("\r  {} QQ Bot credentials verified        ", style("✅").green().bold());
-                        } else {
-                            println!("\r  {} Auth error — check your credentials", style("❌").red().bold());
-                            continue;
-                        }
+                let probe_app_id = app_id.clone();
+                let probe_app_secret = app_secret.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let body = serde_json::json!({
+                        "appId": probe_app_id,
+                        "clientSecret": probe_app_secret,
+                    });
+                    let resp = client
+                        .post("https://bots.qq.com/app/getAppAccessToken")
+                        .json(&body)
+                        .send()?;
+                    if !resp.status().is_success() {
+                        return Ok::<_, reqwest::Error>((false, false));
+                    }
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    Ok((true, data.get("access_token").is_some()))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, true))) => {
+                        println!("\r  {} QQ Bot credentials verified        ", style("✅").green().bold());
+                    }
+                    Ok(Ok((true, false))) => {
+                        println!("\r  {} Auth error — check your credentials", style("❌").red().bold());
+                        continue;
                     }
                     _ => {
                         println!(
@@ -4427,11 +4588,7 @@ fn print_summary(config: &Config) {
     println!();
 
     println!("  {}", style("Quick summary:").white().bold());
-    println!(
-        "    {} Provider:      {}",
-        style("🤖").cyan(),
-        config.default_provider.as_deref().unwrap_or("openrouter")
-    );
+    println!("{}", quick_summary_provider_line(config));
     println!(
         "    {} Model:         {}",
         style("🧠").cyan(),
@@ -4541,15 +4698,15 @@ fn print_summary(config: &Config) {
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
             );
-            println!("       {}", style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow());
+            println!("       {}", style(credential_setup_hint(provider)).yellow());
             println!(
                 "       {}",
-                style("or: prx auth paste-token --provider anthropic --auth-kind authorization").yellow()
+                style("or, for a setup-token: prx auth paste-token --provider anthropic --auth-kind authorization")
+                    .yellow()
             );
         } else {
-            let env_var = provider_env_var(provider);
-            println!("    {} Set your API key:", style(format!("{step}.")).cyan().bold());
-            println!("       {}", style(format!("export {env_var}=\"sk-...\"")).yellow());
+            println!("    {} Add your API key:", style(format!("{step}.")).cyan().bold());
+            println!("       {}", style(credential_setup_hint(provider)).yellow());
         }
         println!();
         step += 1;
@@ -4611,6 +4768,11 @@ mod tests {
     )]
     use super::*;
     use serde_json::json;
+
+    fn id_only(ids: &[String]) -> Vec<DiscoveredModel> {
+        ids.iter().map(|id| DiscoveredModel::id_only(id)).collect()
+    }
+    use std::io::{BufRead, Write};
     use tempfile::TempDir;
 
     // ── ProjectContext defaults ──────────────────────────────────
@@ -4631,7 +4793,7 @@ mod tests {
         let config = run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("openrouter"),
-            Some("custom-model-946"),
+            Some("openai/gpt-5-mini"),
             Some("sqlite"),
             None,
             tmp.path(),
@@ -4640,12 +4802,109 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-        assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
+        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5-mini"));
         assert_eq!(config.api_key.as_deref(), Some("sk-issue946"));
 
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
-        assert!(config_raw.contains("default_model = \"custom-model-946\""));
+        assert!(config_raw.contains("default_model = \"openai/gpt-5-mini\""));
+    }
+
+    /// INT-2B B5 (D-070 amendment), RED before: `prx onboard --provider
+    /// llamacpp` without `-m` chose `ggml-org/gpt-oss-20b-GGUF`, which the
+    /// provider/model check refused ("not compatible with provider
+    /// 'llamacpp'"), so quick setup failed. llama.cpp serves whatever model it
+    /// loaded, under a Hugging Face `org/model` id, so the default and every
+    /// curated choice are accepted now.
+    #[tokio::test]
+    async fn quick_setup_for_llamacpp_without_a_model_chooses_a_compatible_default() {
+        let tmp = TempDir::new().unwrap();
+        let config = run_quick_setup_with_home(None, Some("llamacpp"), None, Some("sqlite"), None, tmp.path())
+            .await
+            .expect("test: llamacpp quick setup without -m succeeds");
+        assert_eq!(config.default_provider.as_deref(), Some("llamacpp"));
+        let model = config.default_model.unwrap_or_default();
+        assert_eq!(model, default_model_for_provider("llamacpp"));
+        for (curated, _) in curated_models_for_provider("llamacpp") {
+            crate::providers::validate_provider_model("llamacpp", &curated)
+                .unwrap_or_else(|error| panic!("curated llama.cpp model {curated} is refused: {error:#}"));
+        }
+    }
+
+    /// R-PMMCh C-2: a padded `--model` is stored as the resolver reads it.
+    #[tokio::test]
+    async fn quick_setup_stores_the_model_trimmed() {
+        let tmp = TempDir::new().unwrap();
+        let config = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("openrouter"),
+            Some("  openai/gpt-5-mini \t"),
+            Some("sqlite"),
+            None,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5-mini"));
+        let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
+        assert!(
+            config_raw.contains("default_model = \"openai/gpt-5-mini\""),
+            "{config_raw}"
+        );
+    }
+
+    /// D-034: quick setup is an operator selection. A model PRX has no
+    /// evidence for is accepted and marked unverified (a fresh install has
+    /// no catalog yet); only negative evidence refuses, and nothing is then
+    /// written.
+    #[tokio::test]
+    async fn quick_setup_accepts_an_unverified_model_and_refuses_only_negative_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let config = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("openrouter"),
+            Some("custom-model-946"),
+            Some("sqlite"),
+            None,
+            tmp.path(),
+        )
+        .await
+        .expect("an unverified model is accepted at onboarding");
+        assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
+
+        let local = TempDir::new().unwrap();
+        run_quick_setup_with_home(
+            None,
+            Some("custom:http://127.0.0.1:9/v1"),
+            Some("my-local-model"),
+            Some("sqlite"),
+            None,
+            local.path(),
+        )
+        .await
+        .expect("a local endpoint's model is accepted");
+
+        let refused = TempDir::new().unwrap();
+        let error = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("anthropic"),
+            Some("openai/gpt-4o"),
+            Some("sqlite"),
+            None,
+            refused.path(),
+        )
+        .await
+        .expect_err("a model the provider cannot serve is refused");
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("prx models refresh"),
+            "no chicken-and-egg advice on a fresh install: {text}"
+        );
+        assert!(!text.contains("sk-issue946"), "{text}");
+        assert!(
+            !default_user_config_dir(refused.path()).join("config.toml").exists(),
+            "a refused quick setup wrote config.toml"
+        );
     }
 
     #[tokio::test]
@@ -5264,6 +5523,209 @@ mod tests {
         assert_eq!(model_discovery_api_key(&config, "kimi-code"), "profile-secret");
     }
 
+    const DISCOVERY_ROOT_SENTINEL: &str = "C0-DISCOVERY-ROOT-SENTINEL";
+
+    fn discovery_config(temp: &TempDir) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.secrets.encrypt = false;
+        config.default_provider = Some("openai".to_string());
+        config.api_key = Some(DISCOVERY_ROOT_SENTINEL.to_string());
+        config.api_url = Some("http://127.0.0.1:9/v1".to_string());
+        config
+    }
+
+    /// C0-D: `prx doctor models` probes every catalog provider through this
+    /// connection. The root key and base URL belong to the configured default
+    /// provider only; every other vendor gets its own credential or none.
+    #[test]
+    fn model_discovery_releases_the_root_connection_only_to_the_default_provider() {
+        let temp = TempDir::new().unwrap();
+        let config = discovery_config(&temp);
+        let default_key = crate::providers::canonical_provider_key("openai");
+
+        for info in crate::providers::list_providers() {
+            if crate::providers::canonical_provider_key(info.name) == default_key {
+                continue;
+            }
+            let connection = model_discovery_connection(&config, info.name);
+            assert!(
+                !connection.api_key.contains(DISCOVERY_ROOT_SENTINEL),
+                "the root key would be sent to {}'s model catalog",
+                info.name
+            );
+            assert_eq!(
+                connection.api_url, None,
+                "the root base URL would be used for {}",
+                info.name
+            );
+        }
+
+        let own = model_discovery_connection(&config, "OpenAI");
+        assert_eq!(own.api_key, DISCOVERY_ROOT_SENTINEL);
+        assert_eq!(own.api_url, Some("http://127.0.0.1:9/v1"));
+    }
+
+    /// A provider that is not the default still finds its own auth profile.
+    #[test]
+    fn model_discovery_uses_the_selected_provider_profile_despite_a_root_key() {
+        let temp = TempDir::new().unwrap();
+        let config = discovery_config(&temp);
+        let store = AuthProfilesStore::new(temp.path(), false);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token("kimi-code", "default", "kimi-profile".to_string()),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(model_discovery_connection(&config, "kimi-code").api_key, "kimi-profile");
+    }
+
+    /// `prx models refresh --provider compatible` while the root connection is
+    /// configured for `openai`: the loopback stands in for the root base URL.
+    /// Before, the refresh sent the root key there; now it reaches nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn models_refresh_for_another_provider_sends_no_root_credential() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let probe = CredentialProbe::start().await;
+        let temp = TempDir::new().unwrap();
+        let mut config = discovery_config(&temp);
+        config.api_url = Some(probe.base_url());
+
+        let outcome = tokio::task::spawn_blocking(move || run_models_refresh(&config, Some("compatible"), true))
+            .await
+            .expect("test: refresh task joins");
+
+        assert!(
+            !probe.saw(DISCOVERY_ROOT_SENTINEL),
+            "the root key reached another provider's catalog"
+        );
+        assert!(
+            probe.requests().is_empty(),
+            "the root base URL must not serve another provider"
+        );
+        assert!(outcome.is_err(), "no endpoint of its own means nothing to refresh");
+    }
+
+    /// Guard: the configured provider still refreshes with its own key and URL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn models_refresh_for_the_default_provider_keeps_its_connection() {
+        use crate::providers::credential_probe::CredentialProbe;
+        let probe = CredentialProbe::start().await;
+        let temp = TempDir::new().unwrap();
+        let mut config = discovery_config(&temp);
+        config.default_provider = Some("compatible".to_string());
+        config.api_url = Some(probe.base_url());
+
+        let outcome = tokio::task::spawn_blocking(move || run_models_refresh(&config, Some("compatible"), true))
+            .await
+            .expect("test: refresh task joins");
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let requests = probe.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests.first().and_then(|request| request.authorization()),
+            Some(format!("Bearer {DISCOVERY_ROOT_SENTINEL}").as_str())
+        );
+    }
+
+    /// C0-f F-7: model discovery reads a provider's own credential variable
+    /// only. The generic `API_KEY` belongs to no provider, so a provider
+    /// without a variable of its own reads nothing (and no test reads the
+    /// operator's ambient `$API_KEY`).
+    #[test]
+    fn discovery_reads_no_generic_api_key_variable() {
+        for provider in ["litellm", "vllm", "huggingface", "compatible", "unknown-provider"] {
+            assert_eq!(provider_credential_env_var(provider), None, "{provider}");
+        }
+        assert_eq!(provider_credential_env_var("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(provider_credential_env_var("openrouter"), Some("OPENROUTER_API_KEY"));
+        // INT-2B a36, RED before: the onboarding hint for such a provider was
+        // "export API_KEY", a variable nothing reads.
+        let hint = keyless_provider_hint("litellm");
+        assert!(!hint.contains("API_KEY"), "{hint}");
+        assert!(hint.contains("`api_key` in config.toml"), "{hint}");
+        assert!(hint.contains("prx auth paste-token --provider litellm"), "{hint}");
+        let custom = keyless_provider_hint("custom:http://alice:a36-pw@127.0.0.1:1/v1");
+        assert!(!custom.contains("a36-pw"), "{custom}");
+        // B2f F-8, RED before: the redacted label was printed, and pasted it
+        // registers the key under a different identity (`[redacted]`).
+        assert!(!custom.contains("[redacted]") && !custom.contains("alice"), "{custom}");
+        assert!(custom.contains("default_provider value from config.toml"), "{custom}");
+        // A label without userinfo is printed as a word the shell passes
+        // through unchanged, quoted when it needs it.
+        let plain = keyless_provider_hint("custom:http://127.0.0.1:1/v1");
+        assert!(plain.contains("--provider custom:http://127.0.0.1:1/v1`"), "{plain}");
+        let quoted = keyless_provider_hint("custom:http://127.0.0.1:1/v1?a=1&b='x'");
+        assert!(
+            quoted.contains(r"--provider 'custom:http://127.0.0.1:1/v1?a=1&b='\''x'\'''`"),
+            "{quoted}"
+        );
+    }
+
+    /// ONBOARD-HINT (D-062): onboarding points every provider at the
+    /// supported mechanism (`api_key` in config.toml, or the auth store via
+    /// `prx auth paste-token`) and names an environment variable only when
+    /// the daemon reads it. It used to print `export OPENROUTER_API_KEY=…`,
+    /// `export ANTHROPIC_API_KEY=…` and the like, which the daemon never
+    /// reads, and it reported a set `ANTHROPIC_API_KEY` as "detected".
+    #[test]
+    fn onboarding_credential_hints_name_only_what_the_daemon_reads() {
+        for provider in [
+            "openrouter",
+            "openai",
+            "anthropic",
+            "groq",
+            "mistral",
+            "deepseek",
+            "xai",
+            "glm",
+            "minimax",
+            "moonshot",
+            "qwen",
+            "ollama",
+            "llamacpp",
+            "litellm",
+        ] {
+            let hint = credential_setup_hint(provider);
+            assert!(
+                !hint.contains("export") && !hint.contains("_API_KEY"),
+                "{provider}: {hint}"
+            );
+            assert!(hint.contains("`api_key` in config.toml"), "{provider}: {hint}");
+            assert!(
+                hint.contains(&format!("prx auth paste-token --provider {provider}")),
+                "{provider}: {hint}"
+            );
+        }
+        for (provider, variable) in [("gemini", "GEMINI_API_KEY"), ("qwen-code", "QWEN_OAUTH_TOKEN")] {
+            let hint = credential_setup_hint(provider);
+            assert!(hint.contains(variable), "{provider}: {hint}");
+            assert!(hint.contains("`api_key` in config.toml"), "{provider}: {hint}");
+        }
+
+        // No production text of the wizard suggests exporting a variable the
+        // daemon does not read (the needles are split so this test does not
+        // match itself).
+        let source = include_str!("wizard.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap_or(source);
+        for needle in [
+            concat!("export ", "OPENROUTER_API_KEY"),
+            concat!("export ", "ANTHROPIC_API_KEY"),
+            concat!("\"export {", "env_var}"),
+            concat!("via env var ", "or config file"),
+            concat!("ANTHROPIC_API_KEY environment ", "variable detected"),
+            concat!("ANTHROPIC_OAUTH_TOKEN environment ", "variable detected"),
+            concat!("style(\"OLLAMA", "_API_KEY\")"),
+            concat!("style(\"LLAMACPP", "_API_KEY\")"),
+        ] {
+            assert!(!production.contains(needle), "the wizard still prints `{needle}`");
+        }
+    }
+
     #[test]
     fn curated_models_provider_aliases_share_same_catalog() {
         assert_eq!(curated_models_for_provider("xai"), curated_models_for_provider("grok"));
@@ -5399,6 +5861,28 @@ mod tests {
         );
     }
 
+    /// RED before PMME-h (D-095 M-1): `prx models refresh` for `openai` with
+    /// a configured `api_url` (an operator's gateway, where provider
+    /// construction sends the key) listed models at `api.openai.com` with
+    /// that key. It now addresses the configured endpoint, query kept.
+    #[test]
+    fn model_discovery_addresses_the_configured_endpoint_construction_uses() {
+        assert_eq!(
+            resolve_live_models_endpoint("openai", Some("http://127.0.0.1:19071/v1")),
+            Some("http://127.0.0.1:19071/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("OpenAI", Some("https://gateway.corp.example/v1?tenant=t1")),
+            Some("https://gateway.corp.example/v1/models?tenant=t1".to_string())
+        );
+        // An adapter with a fixed endpoint ignores `api_url` in construction,
+        // so discovery does too.
+        assert_eq!(
+            resolve_live_models_endpoint("venice", Some("http://localhost:9999/v1")),
+            Some("https://api.venice.ai/api/v1/models".to_string())
+        );
+    }
+
     #[test]
     fn resolve_live_models_endpoint_falls_back_to_provider_defaults() {
         assert_eq!(
@@ -5423,7 +5907,7 @@ mod tests {
             ]
         });
 
-        let ids = parse_openai_compatible_model_ids(&payload);
+        let ids = discovery::chat_model_ids(&discovery::parse_openai_compatible_models(&payload));
         assert_eq!(ids, vec!["gpt-5-mini".to_string(), "gpt-5.1".to_string()]);
     }
 
@@ -5435,7 +5919,7 @@ mod tests {
             {"id": "alpha"}
         ]);
 
-        let ids = parse_openai_compatible_model_ids(&payload);
+        let ids = discovery::chat_model_ids(&discovery::parse_openai_compatible_models(&payload));
         assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
@@ -5458,7 +5942,7 @@ mod tests {
             ]
         });
 
-        let ids = parse_gemini_model_ids(&payload);
+        let ids = discovery::chat_model_ids(&discovery::parse_gemini_models(&payload));
         assert_eq!(ids, vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()]);
     }
 
@@ -5472,7 +5956,7 @@ mod tests {
             ]
         });
 
-        let ids = parse_ollama_model_ids(&payload);
+        let ids = discovery::chat_model_ids(&discovery::parse_ollama_models(&payload));
         assert_eq!(ids, vec!["llama3.2:latest".to_string(), "mistral:latest".to_string()]);
     }
 
@@ -5481,7 +5965,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let models = vec!["gpt-5.1".to_string(), "gpt-5-mini".to_string()];
 
-        cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &id_only(&models)).unwrap();
 
         let cached = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
         let cached = cached.expect("expected fresh cached models");
@@ -5494,15 +5978,17 @@ mod tests {
     #[test]
     fn model_cache_ttl_filters_stale_entries() {
         let tmp = TempDir::new().unwrap();
-        let stale = ModelCacheState {
-            entries: vec![ModelCacheEntry {
+        let stale = discovery::ModelCacheState {
+            version: 1,
+            entries: vec![discovery::ModelCacheEntry {
                 provider: "openai".to_string(),
                 fetched_at_unix: now_unix_secs().saturating_sub(MODEL_CACHE_TTL_SECS + 120),
                 models: vec!["gpt-5.1".to_string()],
+                descriptors: Vec::new(),
             }],
         };
 
-        save_model_cache_state(tmp.path(), &stale).unwrap();
+        discovery::save_model_cache_state(tmp.path(), &stale).unwrap();
 
         let fresh = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
         assert!(fresh.is_none());
@@ -5515,7 +6001,7 @@ mod tests {
     fn run_models_refresh_uses_fresh_cache_without_network() {
         let tmp = TempDir::new().unwrap();
 
-        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &id_only(&["gpt-5.1".to_string()])).unwrap();
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
@@ -5529,8 +6015,8 @@ mod tests {
     #[test]
     fn run_models_probe_read_only_uses_cache_without_mutation() {
         let tmp = TempDir::new().unwrap();
-        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
-        let cache_path = model_cache_path(tmp.path());
+        cache_live_models_for_provider(tmp.path(), "openai", &id_only(&["gpt-5.1".to_string()])).unwrap();
+        let cache_path = discovery::model_cache_path(tmp.path());
         let before = std::fs::read(&cache_path).unwrap();
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
@@ -5558,41 +6044,234 @@ mod tests {
         assert!(err.to_string().contains("does not support live model discovery"));
     }
 
-    // ── provider_env_var ────────────────────────────────────────
+    // ── model discovery off the async runtime ───────────────────
+
+    /// Serve exactly one HTTP exchange on loopback and then stop.
+    ///
+    /// Mirrors the hand-rolled listener fixtures already used across the tree;
+    /// no mock-HTTP dependency is introduced.
+    fn spawn_canned_discovery_endpoint(status_line: &str, body: &str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let response = format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(peer) = stream.try_clone() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(peer);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (addr, handle)
+    }
+
+    /// Hold every incoming connection open without replying until the test
+    /// raises `stop`, then drop them all.
+    ///
+    /// The accept loop is non-blocking so the fixture terminates even when the
+    /// cancelled task never gets far enough to open a connection.
+    fn spawn_silent_discovery_endpoint(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let handle = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            drop(held);
+        });
+
+        (addr, handle)
+    }
+
+    /// The wizard's discovery path must run on a blocking thread, not on the
+    /// async worker that `run_wizard` is awaited on.
+    ///
+    /// Before the fix this call was made synchronously inside the runtime and
+    /// panicked with "Cannot drop a runtime in a context where blocking is not
+    /// allowed", because `reqwest::blocking` enters and drops a temporary
+    /// runtime on the calling thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn onboard_model_discovery_runs_off_the_async_worker() {
+        let workspace = TempDir::new().unwrap();
+        // An empty cache means discovery is genuinely attempted, exactly as in
+        // a first-run wizard session.
+        assert!(
+            load_cached_models_for_provider(workspace.path(), "compatible", MODEL_CACHE_TTL_SECS)
+                .unwrap()
+                .is_none()
+        );
+
+        let body = r#"{"data":[{"id":"prx-model-alpha"},{"id":"prx-model-beta"}]}"#;
+        let (addr, server) = spawn_canned_discovery_endpoint("HTTP/1.1 200 OK", body);
+        let endpoint = format!("http://{addr}/v1/models");
+
+        let models = fetch_live_models_for_provider_off_runtime(
+            "compatible".to_string(),
+            "prx_test_key".to_string(),
+            Some(endpoint),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            discovery::chat_model_ids(&models),
+            vec!["prx-model-alpha".to_string(), "prx-model-beta".to_string()]
+        );
+
+        cache_live_models_for_provider(workspace.path(), "compatible", &models).unwrap();
+        let cached = load_cached_models_for_provider(workspace.path(), "compatible", MODEL_CACHE_TTL_SECS)
+            .unwrap()
+            .expect("test: discovery result must be cached for the next wizard run");
+        assert_eq!(cached.models, discovery::chat_model_ids(&models));
+
+        server.join().unwrap();
+    }
+
+    /// A failing discovery surfaces a typed, contextual error and leaves the
+    /// runtime healthy, so the wizard can report it and fall back to cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn onboard_model_discovery_failure_falls_back_to_cache() {
+        let workspace = TempDir::new().unwrap();
+        let (addr, server) = spawn_canned_discovery_endpoint(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":"discovery unavailable"}"#,
+        );
+        let endpoint = format!("http://{addr}/v1/models");
+
+        let error = fetch_live_models_for_provider_off_runtime(
+            "compatible".to_string(),
+            "prx_test_key".to_string(),
+            Some(endpoint.clone()),
+        )
+        .await
+        .expect_err("test: a 500 response must surface as an error, not an empty model list");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!("model fetch failed: GET {endpoint}")),
+            "discovery failure must stay reportable, got: {rendered}"
+        );
+
+        // The wizard falls back to whatever the cache holds.
+        cache_live_models_for_provider(
+            workspace.path(),
+            "compatible",
+            &id_only(&["prx-model-cached".to_string()]),
+        )
+        .unwrap();
+        let cached = load_any_cached_models_for_provider(workspace.path(), "compatible")
+            .unwrap()
+            .expect("test: cached models must remain available after a failed discovery");
+        assert_eq!(cached.models, vec!["prx-model-cached".to_string()]);
+
+        // The property the panic used to destroy: the runtime still works.
+        tokio::task::yield_now().await;
+        assert_eq!(tokio::spawn(async { 1_u8 }).await.unwrap(), 1);
+
+        server.join().unwrap();
+    }
+
+    /// Cancelling the discovery task is observable to the caller and does not
+    /// wedge or poison the runtime.
+    ///
+    /// Limitation, stated deliberately: `spawn_blocking` closures are not
+    /// cancellable. Aborting the handle detaches the caller; the blocking HTTP
+    /// call itself still runs to completion or to its timeout. This asserts the
+    /// caller-visible contract only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn onboard_model_discovery_cancellation_leaves_the_runtime_healthy() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (addr, server) = spawn_silent_discovery_endpoint(std::sync::Arc::clone(&stop));
+        let endpoint = format!("http://{addr}/v1/models");
+
+        let handle = tokio::spawn(fetch_live_models_for_provider_off_runtime(
+            "compatible".to_string(),
+            "prx_test_key".to_string(),
+            Some(endpoint),
+        ));
+
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("test: an aborted discovery task must report cancellation");
+        assert!(join_error.is_cancelled());
+
+        // The runtime is still healthy after the cancellation.
+        tokio::task::yield_now().await;
+        assert_eq!(tokio::spawn(async { 2_u8 }).await.unwrap(), 2);
+
+        // Release the detached blocking call so the runtime can shut down promptly.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    // ── provider_credential_env_var ────────────────────────────────────────
 
     #[test]
-    fn provider_env_var_known_providers() {
-        assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
-        assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
-        assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
-        assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
-        assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
-        assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
-        assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
-        assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
-        assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
-        assert_eq!(provider_env_var("together-ai"), "TOGETHER_API_KEY");
-        assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
-        assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
-        assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
-        assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
-        assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
-        assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
-        assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("kimi-code"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("kimi_coding"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("kimi_for_coding"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
-        assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
-        assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
-        assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
-        assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
-        assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
+    fn provider_credential_env_var_known_providers() {
+        assert_eq!(provider_credential_env_var("openrouter"), Some("OPENROUTER_API_KEY"));
+        assert_eq!(provider_credential_env_var("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(provider_credential_env_var("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(provider_credential_env_var("ollama"), Some("OLLAMA_API_KEY"));
+        assert_eq!(provider_credential_env_var("llamacpp"), Some("LLAMACPP_API_KEY"));
+        assert_eq!(provider_credential_env_var("llama.cpp"), Some("LLAMACPP_API_KEY"));
+        assert_eq!(provider_credential_env_var("xai"), Some("XAI_API_KEY"));
+        assert_eq!(provider_credential_env_var("grok"), Some("XAI_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("together"), Some("TOGETHER_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("together-ai"), Some("TOGETHER_API_KEY"));
+        assert_eq!(provider_credential_env_var("google"), Some("GEMINI_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("google-gemini"), Some("GEMINI_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("gemini"), Some("GEMINI_API_KEY"));
+        assert_eq!(provider_credential_env_var("qwen"), Some("DASHSCOPE_API_KEY"));
+        assert_eq!(provider_credential_env_var("qwen-intl"), Some("DASHSCOPE_API_KEY"));
+        assert_eq!(provider_credential_env_var("dashscope-us"), Some("DASHSCOPE_API_KEY"));
+        assert_eq!(provider_credential_env_var("qwen-code"), Some("QWEN_OAUTH_TOKEN"));
+        assert_eq!(provider_credential_env_var("qwen-oauth"), Some("QWEN_OAUTH_TOKEN"));
+        assert_eq!(provider_credential_env_var("glm-cn"), Some("GLM_API_KEY"));
+        assert_eq!(provider_credential_env_var("minimax-cn"), Some("MINIMAX_API_KEY"));
+        assert_eq!(provider_credential_env_var("kimi-code"), Some("KIMI_CODE_API_KEY"));
+        assert_eq!(provider_credential_env_var("kimi_coding"), Some("KIMI_CODE_API_KEY"));
+        assert_eq!(
+            provider_credential_env_var("kimi_for_coding"),
+            Some("KIMI_CODE_API_KEY")
+        );
+        assert_eq!(provider_credential_env_var("minimax-oauth"), Some("MINIMAX_API_KEY"));
+        assert_eq!(provider_credential_env_var("minimax-oauth-cn"), Some("MINIMAX_API_KEY"));
+        assert_eq!(provider_credential_env_var("moonshot-intl"), Some("MOONSHOT_API_KEY"));
+        assert_eq!(provider_credential_env_var("zai-cn"), Some("ZAI_API_KEY"));
+        assert_eq!(provider_credential_env_var("nvidia"), Some("NVIDIA_API_KEY"));
+        assert_eq!(provider_credential_env_var("nvidia-nim"), Some("NVIDIA_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("build.nvidia.com"), Some("NVIDIA_API_KEY")); // alias
+        assert_eq!(provider_credential_env_var("astrai"), Some("ASTRAI_API_KEY"));
     }
 
     #[test]
@@ -5604,8 +6283,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_env_var_unknown_falls_back() {
-        assert_eq!(provider_env_var("some-new-provider"), "API_KEY");
+    fn provider_env_var_unknown_has_no_variable() {
+        assert_eq!(provider_credential_env_var("some-new-provider"), None);
     }
 
     #[test]
@@ -5686,5 +6365,120 @@ mod tests {
             mention_only: false,
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    // ── USERINFO-2: onboarding and `prx models` name the provider without
+    //    URL userinfo ─────────────────────────────────────────────────────
+
+    const USERINFO_LABEL: &str = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
+
+    #[test]
+    fn onboarding_summaries_name_the_provider_without_url_userinfo() {
+        let config = Config {
+            default_provider: Some(USERINFO_LABEL.to_string()),
+            ..Config::default()
+        };
+        for line in [
+            setup_provider_line(USERINFO_LABEL),
+            selected_provider_line(USERINFO_LABEL, "fixture-model"),
+            quick_summary_provider_line(&config),
+        ] {
+            assert!(line.contains("custom:http://[redacted]@127.0.0.1:1/v1"), "{line}");
+            assert!(!line.contains("SECRET-fixture-pw"), "{line}");
+        }
+    }
+
+    #[test]
+    fn model_discovery_errors_name_the_provider_and_endpoint_without_url_userinfo() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let errors = [
+            run_models_refresh(&config, Some(USERINFO_LABEL), true).expect_err("test: custom has no live discovery"),
+            run_models_probe_read_only(&config, Some(USERINFO_LABEL), false)
+                .expect_err("test: custom has no live discovery"),
+            fetch_openai_compatible_models("http://u:SECRET-fixture-pw@127.0.0.1:1/v1/models", None, false)
+                .expect_err("test: no key and no anonymous access"),
+            fetch_openai_compatible_models("http://u:SECRET-fixture-pw@127.0.0.1:1/v1/models", None, true)
+                .expect_err("test: port 1 refuses connections"),
+        ];
+        for error in errors {
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("[redacted]@127.0.0.1:1"), "{rendered}");
+            assert!(!rendered.contains("SECRET-fixture-pw"), "{rendered}");
+        }
+    }
+
+    /// PMM-B-6: `prx models refresh` keeps what the catalog said about each
+    /// model. It used to keep the ids only, so a no-tools or image-only model
+    /// was indistinguishable from a chat model afterwards.
+    #[test]
+    fn a_models_refresh_keeps_the_catalog_metadata() {
+        let workspace = TempDir::new().unwrap();
+        let body = r#"{"data":[
+            {"id":"vendor/chat-no-tools","context_length":32768,
+             "architecture":{"input_modalities":["text"],"output_modalities":["text"]},
+             "supported_parameters":["temperature","max_tokens"]},
+            {"id":"vendor/image-maker",
+             "architecture":{"input_modalities":["text"],"output_modalities":["image"]},
+             "supported_parameters":[]},
+            {"id":"vendor/bare"}
+        ]}"#;
+        let (addr, server) = spawn_canned_discovery_endpoint("HTTP/1.1 200 OK", body);
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            default_provider: Some("compatible".to_string()),
+            api_url: Some(format!("http://{addr}/v1")),
+            ..Config::default()
+        };
+
+        run_models_refresh(&config, None, true).expect("test: refresh from the loopback catalog");
+        server.join().unwrap();
+
+        let raw = std::fs::read_to_string(workspace.path().join("state").join("models_cache.json")).unwrap();
+        let cache: Value = serde_json::from_str(&raw).unwrap();
+        let entry = &cache["entries"][0];
+        assert_eq!(
+            entry["models"],
+            serde_json::json!(["vendor/bare", "vendor/chat-no-tools"]),
+            "the chat list offers a model the catalog says has no text output: {raw}"
+        );
+        let described = entry["descriptors"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == "vendor/chat-no-tools"))
+            .unwrap_or_else(|| panic!("the refresh dropped the catalog metadata: {raw}"));
+        assert_eq!(
+            described["supported_parameters"],
+            serde_json::json!(["temperature", "max_tokens"])
+        );
+        assert_eq!(described["output_modalities"], serde_json::json!(["text"]));
+        assert_eq!(described["context_window"], serde_json::json!(32768));
+        assert_eq!(cache["version"], serde_json::json!(2));
+    }
+
+    /// RED before PMMDtail-j (D-084 E-3): the onboarding model-discovery
+    /// profile read loaded through the migrating load, rewriting
+    /// auth-profiles.json.
+    #[test]
+    fn the_onboarding_profile_read_never_rewrites_the_profiles_file() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let path = crate::auth::profiles::write_legacy_token_profile(tmp.path(), "moonshot", "sentinel-moonshot");
+        let before = std::fs::read_to_string(&path).expect("test: read");
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.secrets.encrypt = true;
+
+        let key = model_discovery_api_key(&config, "moonshot");
+
+        assert_eq!(key, "sentinel-moonshot");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("test: read"),
+            before,
+            "the file was rewritten"
+        );
     }
 }

@@ -392,13 +392,12 @@ async fn prepare_remote_target(url: &reqwest::Url) -> Result<RemoteTarget, Artif
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ArtifactError::InvalidUrl("missing port".to_string()))?;
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
+    let addrs = crate::tools::http_request::lookup_host(&host, port)
         .await
         .map_err(|error| ArtifactError::RemoteFailed {
             url: url.to_string(),
             reason: format!("DNS resolution failed: {error}"),
-        })?
-        .collect::<Vec<_>>();
+        })?;
     if addrs.is_empty()
         || addrs
             .iter()
@@ -735,6 +734,23 @@ mod tests {
         let source = format!("data:image/png;base64,{}", "A".repeat(4096));
         let error = owner.decode_data_uri(&source, 32).unwrap_err();
         assert!(matches!(error, ArtifactError::TooLarge { .. }));
+    }
+
+    /// B2f F-6, RED before: a remote media host was resolved through the
+    /// system resolver, so this test asked live DNS. After: the test
+    /// resolver answers, and a name outside its table fails without a
+    /// network lookup.
+    #[tokio::test]
+    async fn remote_target_resolution_never_uses_live_dns_in_tests() {
+        let url = reqwest::Url::parse("https://unlisted.test/a.png").unwrap();
+        let error = prepare_remote_target(&url).await.unwrap_err();
+        assert!(
+            matches!(&error, ArtifactError::RemoteFailed { reason, .. } if reason.contains("test resolver")),
+            "{error:?}"
+        );
+        let url = reqwest::Url::parse("https://example.com/a.png").unwrap();
+        let target = prepare_remote_target(&url).await.unwrap();
+        assert_eq!(target.addrs.len(), 1);
     }
 
     #[tokio::test]

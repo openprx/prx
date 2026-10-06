@@ -1,17 +1,162 @@
+mod operator_completion;
+pub use operator_completion::OperatorWorkerCompletionEvidence;
+mod ordinary_completion;
+pub use ordinary_completion::OrdinaryWorkerCompletionEvidence;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+pub use crate::tools::capability::child::wire::{WorkerChildCapabilityManifest, WorkerChildCapabilityRef};
+
+/// Original PMM selection, covered by the complete worker transport signature.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProviderSelection {
+    pub provider: String,
+    pub model: String,
+    pub credential: crate::providers::credentials::CredentialRef,
+}
+impl std::fmt::Debug for WorkerProviderSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerProviderSelection").finish_non_exhaustive()
+    }
+}
+
+/// Source identifiers covered by the outer worker signature. These are lookup
+/// bindings, not authority: admission must re-read and verify the parent decision
+/// and durable child input before constructing a source proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerChildSource {
+    pub input_event_id: String,
+    pub provider_selection: WorkerProviderSelection,
+    pub input_event_mac: [u8; 32],
+    pub parent_source: crate::runtime::child_source::parent::ParentSourceSnapshot,
+    pub provider_catalog: crate::providers::catalog::process_snapshot::ProcessProviderCatalog,
+    pub parent_store_workspace: String,
+    pub parent_decision_digest: String,
+    pub parent_constraints: crate::tools::capability::child::wire::WorkerParentConstraints,
+    pub config_generation: crate::config::generation::ProcessGenerationBinding,
+    pub catalog: crate::tools::capability::catalog::process_snapshot::ProcessCatalogSnapshot,
+}
+
+/// Optional durable input evidence for an ordinary worker. Absence means
+/// recording was disabled; it must never be replaced by a synthetic event ID.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecordedInput {
+    pub event_id: String,
+    pub event_mac: [u8; 32],
+}
+
+/// Ordinary process provenance, sealed in the worker-channel key domain.
+/// This deliberately carries no durable parent decision/store assertion.
+/// Deserialization is transport parsing only; outer worker authentication,
+/// scope subset checks and each snapshot seal must precede source issuance.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOrdinarySource {
+    pub attempt_id: Option<String>,
+    pub lease_epoch: Option<i64>,
+    pub input: Option<WorkerRecordedInput>,
+    pub provider_selection: WorkerProviderSelection,
+    pub parent_source: crate::runtime::child_source::parent::ParentSourceSnapshot,
+    pub provider_catalog: crate::providers::catalog::process_snapshot::ProcessProviderCatalog,
+    pub parent_constraints: crate::tools::capability::child::wire::WorkerParentConstraints,
+    pub capability_manifest: WorkerChildCapabilityManifest,
+    pub config_generation: crate::config::generation::ProcessGenerationBinding,
+    pub catalog: crate::tools::capability::catalog::process_snapshot::ProcessCatalogSnapshot,
+}
+
+impl std::fmt::Debug for WorkerOrdinarySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerOrdinarySource").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for WorkerRecordedInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerRecordedInput").finish_non_exhaustive()
+    }
+}
+
+/// Root capability ceiling captured from an explicit local operator source.
+/// The publication ID is a transport identity, not a parent model decision.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOperatorPublication {
+    pub publication_id: String,
+    pub owner: String,
+    pub workspace: String,
+    pub level: crate::security::AutonomyLevel,
+    pub max_cost_cents: u32,
+    pub allowed: Vec<crate::tools::capability::child::wire::WorkerChildCapabilityRef>,
+    pub catalog_generation: [u8; 32],
+    pub seal: [u8; 32],
+}
+
+/// Transport parsing alone grants no execution authority. The receiver must
+/// authenticate the channel, all snapshots, actual input and executor parity.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOperatorSource {
+    pub attempt_id: Option<String>,
+    pub lease_epoch: Option<i64>,
+    pub input: Option<WorkerRecordedInput>,
+    pub provider_selection: WorkerProviderSelection,
+    pub operator_source: crate::runtime::child_source::parent::ParentSourceSnapshot,
+    pub publication: WorkerOperatorPublication,
+    pub provider_catalog: crate::providers::catalog::process_snapshot::ProcessProviderCatalog,
+    pub config_generation: crate::config::generation::ProcessGenerationBinding,
+    pub catalog: crate::tools::capability::catalog::process_snapshot::ProcessCatalogSnapshot,
+}
+
+impl std::fmt::Debug for WorkerOperatorSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerOperatorSource").finish_non_exhaustive()
+    }
+}
 
 /// Manifest passed from parent `sessions_spawn` to `session-worker`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerManifest {
     #[serde(default)]
     pub parent_capability: Option<String>,
+    /// Included in the outer worker HMAC payload whenever present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<WorkerChildCapabilityManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_source: Option<WorkerChildSource>,
+    /// Mutually exclusive with durable child authority; covered by the outer HMAC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_source: Option<WorkerOrdinarySource>,
+    /// Explicit operator root provenance, mutually exclusive with delegated sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_source: Option<WorkerOperatorSource>,
     pub run_id: String,
     pub task: String,
     pub provider_name: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// Selected model route, when the parent resolved a `hint:` model.
+    /// The worker verifies its destination against the sealed config.
+    #[serde(default)]
+    pub route_hint: Option<String>,
+    /// Original provider selection and final credential reference, sealed
+    /// separately from `agent_id` (which controls execution identity).
+    #[serde(default)]
+    pub route_source_provider: Option<String>,
+    #[serde(default)]
+    pub route_credential: Option<crate::providers::credentials::CredentialRef>,
+    /// True only when that route selected the root connection as a unit.
+    /// A byte-identical route key cannot acquire the root URL by accident.
+    #[serde(default)]
+    pub route_uses_root_connection: bool,
+    /// A direct-model child may use the root URL and rotation keys only when
+    /// its parent selected the root connection, independent of key equality.
+    #[serde(default)]
+    pub direct_uses_root_connection: bool,
     pub temperature: f64,
     /// Canonical configuration directory selected by the parent process.
     #[serde(default)]
@@ -139,9 +284,87 @@ pub enum WorkerControlFrame {
     Steer { message: String },
 }
 
+/// Durable segment lookup references; consumers must verify the stored events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSegmentTerminal {
+    pub terminal_id: String,
+    pub event_id: String,
+    pub event_digest: String,
+}
+
+/// Authenticated inventory of a logical worker completion and its segments.
+/// This is transport evidence, not a verified usage receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCompletionEvidence {
+    pub run_id: String,
+    pub input_event_id: String,
+    pub terminal_event_id: String,
+    pub terminal_event_digest: String,
+    pub recorded_segments: u64,
+    pub segments: Vec<WorkerSegmentTerminal>,
+    pub seal: [u8; 32],
+}
+
+impl WorkerCompletionEvidence {
+    pub(crate) fn validate_inventory(&self, success: bool) -> anyhow::Result<()> {
+        let confirmed = u64::try_from(self.segments.len())?;
+        anyhow::ensure!(
+            confirmed <= self.recorded_segments,
+            "worker inventory exceeds recorded segments"
+        );
+        anyhow::ensure!(
+            !success || (self.recorded_segments > 0 && confirmed == self.recorded_segments),
+            "successful worker inventory has unconfirmed segments"
+        );
+        let prefix = format!("child-segment:{}:", self.input_event_id);
+        let mut indices = std::collections::BTreeSet::new();
+        let mut events = std::collections::BTreeSet::new();
+        events.insert(self.terminal_event_id.as_str());
+        for segment in &self.segments {
+            let index = segment
+                .terminal_id
+                .strip_prefix(&prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| anyhow::anyhow!("worker segment identity differs from original input"))?;
+            anyhow::ensure!(
+                index < self.recorded_segments
+                    && segment.terminal_id == format!("{prefix}{index}")
+                    && indices.insert(index)
+                    && !segment.event_id.is_empty()
+                    && events.insert(segment.event_id.as_str()),
+                "worker inventory contains duplicate or invalid segment references"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn signing_bytes(&self, result: &WorkerResult) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&(
+            &self.run_id,
+            &self.input_event_id,
+            &self.terminal_event_id,
+            &self.terminal_event_digest,
+            self.recorded_segments,
+            &self.segments,
+            result.success,
+            &result.output,
+            &result.error,
+            &result.tokens_used,
+        ))?)
+    }
+}
+
 /// Result returned by `session-worker` on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_evidence: Option<WorkerCompletionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_completion: Option<OrdinaryWorkerCompletionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_completion: Option<OperatorWorkerCompletionEvidence>,
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
@@ -157,11 +380,20 @@ mod tests {
     fn worker_manifest_roundtrip_json() {
         let manifest = WorkerManifest {
             parent_capability: Some("capability".into()),
+            capability_manifest: None,
+            child_source: None,
+            ordinary_source: None,
+            operator_source: None,
             run_id: "run-1".into(),
             task: "analyze".into(),
             provider_name: "openrouter".into(),
             model: "anthropic/claude-sonnet-4.6".into(),
             api_key: None,
+            route_hint: None,
+            route_source_provider: None,
+            route_credential: None,
+            route_uses_root_connection: false,
+            direct_uses_root_connection: false,
             temperature: 0.7,
             config_dir: PathBuf::from("/tmp/openprx"),
             config_generation: "a".repeat(64),
@@ -256,6 +488,9 @@ mod tests {
     #[test]
     fn worker_result_roundtrip_json() {
         let result = WorkerResult {
+            completion_evidence: None,
+            ordinary_completion: None,
+            operator_completion: None,
             success: false,
             output: String::new(),
             error: Some("timeout".into()),

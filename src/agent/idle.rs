@@ -126,7 +126,7 @@ static INSTALLED_IDLE_SECS: AtomicU64 = AtomicU64::new(NOT_INSTALLED);
 
 /// Publish the configured thresholds process-wide.
 ///
-/// Threading the values through every `run_tool_call_loop_outcome` call site
+/// Threading the values through every `run_turn` call site
 /// would touch six modules for a value that is uniform per process, so this
 /// mirrors how `[runtime] long_task_warn_secs` is installed
 /// ([`crate::runtime::registry::start_long_task_warner`]). Call it once during

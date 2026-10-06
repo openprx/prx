@@ -23,7 +23,142 @@ const SNAPSHOT_HEADER: &str = "# 🧠 OpenPRX Memory Snapshot\n\n\
     > This file is the \"soul\" of your agent — if `brain.db` is lost, start the agent\n\
     > in this workspace and it will auto-hydrate from this file.\n\n";
 
-/// Export all `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
+/// Written on its own line right after [`SNAPSHOT_HEADER`] by every exporter
+/// that escapes content and records origins, and required before a parse
+/// honours either (R-MCPBh L-2).
+///
+/// A snapshot written before origins existed escaped nothing, and it exported
+/// every core row, so an entry's content could carry a line that reads as an
+/// `*Origin:` line — naming any owner it likes. Such a file is read the way it
+/// was written: keys and content verbatim, and no origin, so every entry
+/// restores ownerless. The marker sits in the preamble, before the first
+/// entry, which no entry's content can reach.
+const SNAPSHOT_FORMAT_MARKER: &str = "<!-- openprx-memory-snapshot format=2 -->";
+
+/// The origin a snapshot entry restores with, so cold-boot hydration never
+/// drops a row's owner (D-026). Serialised on one `*Origin: {json}*` line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotOrigin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_id: Option<String>,
+}
+
+impl SnapshotOrigin {
+    const fn is_empty(&self) -> bool {
+        self.owner_id.is_none() && self.channel.is_none() && self.raw_sender.is_none() && self.chat_id.is_none()
+    }
+}
+
+/// One entry parsed back from a snapshot.
+type SnapshotEntry = (String, String, Option<SnapshotOrigin>);
+
+/// The `core` rows the snapshot carries (D-026, R-MCPBfg N-1).
+///
+/// `MEMORY_SNAPSHOT.md` is a workspace-root, Git-visible copy of memory, so it
+/// holds only what the operator's own process wrote: `memory_store` rows from
+/// the terminal UI (`terminal`/`user`/`terminal:user`) or the `prx agent` CLI
+/// (`cli`/`agent`/`agent:local`) — the tuples
+/// `tools::execution::scope_is_local_process_operator` admits — and rows
+/// written with no caller context at all (no channel, no owner). Rows of
+/// owner-isolated MCP callers and of every network surface (webhook, IM
+/// channels, Console, sub-agents) stay in the owner-scoped table only.
+const OPERATOR_ROWS_SQL: &str = "SELECT key, content, category, created_at, updated_at,
+            owner_id, channel, raw_sender, chat_id
+     FROM memories
+     WHERE category = 'core'
+       AND (
+            (channel = 'terminal' AND raw_sender = 'user' AND chat_id = 'terminal:user')
+            OR (channel = 'cli' AND raw_sender = 'agent' AND chat_id = 'agent:local')
+            OR (channel IS NULL AND owner_id IS NULL)
+       )
+     ORDER BY updated_at DESC";
+
+/// The pre-origin schema (no owner or channel columns): every row there
+/// predates owner attribution and is exported as before.
+const LEGACY_ROWS_SQL: &str = "SELECT key, content, category, created_at, updated_at,
+            NULL, NULL, NULL, NULL
+     FROM memories
+     WHERE category = 'core'
+     ORDER BY updated_at DESC";
+
+fn memories_columns(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(names)
+}
+
+/// A snapshot key as it appears between the header backticks: backslash,
+/// backtick and line breaks escaped, so a key can neither end the header early
+/// nor span lines.
+fn escape_snapshot_key(key: &str) -> String {
+    let mut escaped = String::with_capacity(key.len());
+    for character in key.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '`' => escaped.push_str("\\`"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+fn unescape_snapshot_key(escaped: &str) -> String {
+    let mut key = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            key.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => key.push('\n'),
+            Some('r') => key.push('\r'),
+            Some(other) => key.push(other),
+            None => key.push('\\'),
+        }
+    }
+    key
+}
+
+/// Whether a content line would be read as snapshot structure (an entry
+/// header or any heading, a metadata line, a separator) or starts with the
+/// escape character itself.
+fn content_line_needs_escape(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with("*Created:")
+        || trimmed.starts_with("*Origin:")
+        || trimmed.starts_with("---")
+        || trimmed.starts_with('\\')
+}
+
+/// Content as written into the snapshot: every line that could be read as
+/// structure gets one leading backslash, which [`parse_snapshot`] removes.
+fn escape_snapshot_content(content: &str) -> String {
+    content
+        .split('\n')
+        .map(|line| {
+            if content_line_needs_escape(line) {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Export the operator's `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
 ///
 /// Returns the number of entries exported.
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
@@ -38,16 +173,31 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let conn = Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
-    let mut stmt = conn.prepare(
-        "SELECT key, content, category, created_at, updated_at
-         FROM memories
-         WHERE category = 'core'
-         ORDER BY updated_at DESC",
-    )?;
+    let columns = memories_columns(&conn)?;
+    let with_origin = ["owner_id", "channel", "raw_sender", "chat_id"]
+        .iter()
+        .all(|column| columns.contains(*column));
+    let mut stmt = conn.prepare(if with_origin {
+        OPERATOR_ROWS_SQL
+    } else {
+        LEGACY_ROWS_SQL
+    })?;
 
-    let rows: Vec<(String, String, String, String, String)> = stmt
+    let rows: Vec<(String, String, String, String, String, SnapshotOrigin)> = stmt
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                SnapshotOrigin {
+                    owner_id: row.get(5)?,
+                    channel: row.get(6)?,
+                    raw_sender: row.get(7)?,
+                    chat_id: row.get(8)?,
+                },
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -59,14 +209,20 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 
     let mut output = String::with_capacity(rows.len() * 200);
     output.push_str(SNAPSHOT_HEADER);
+    output.push_str(SNAPSHOT_FORMAT_MARKER);
+    output.push_str("\n\n");
 
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     write!(output, "**Last exported:** {now}\n\n")?;
     write!(output, "**Total core memories:** {}\n\n---\n\n", rows.len())?;
 
-    for (key, content, _category, created_at, updated_at) in &rows {
-        write!(output, "### 🔑 `{key}`\n\n")?;
-        write!(output, "{content}\n\n")?;
+    for (key, content, _category, created_at, updated_at, origin) in &rows {
+        write!(output, "### 🔑 `{}`\n\n", escape_snapshot_key(key))?;
+        write!(output, "{}\n\n", escape_snapshot_content(content))?;
+        if !origin.is_empty() {
+            // JSON keeps the origin on one line whatever it contains.
+            write!(output, "*Origin: {}*\n\n", serde_json::to_string(origin)?)?;
+        }
         write!(output, "*Created: {created_at} | Updated: {updated_at}*\n\n---\n\n")?;
     }
 
@@ -113,6 +269,7 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             session_id TEXT,
+            owner_id TEXT,
             channel TEXT,
             chat_type TEXT,
             chat_id TEXT,
@@ -123,8 +280,56 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
             sensitivity TEXT NOT NULL DEFAULT 'normal',
             risk_signals TEXT DEFAULT '[]',
             policy_version INTEGER DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
+        );",
+    )?;
+
+    // A database hydrated into that already had a `memories` table from
+    // before the owner and ACL columns gets them here, as the table above
+    // defines them, before the indexes and the insert below name them;
+    // without one of them hydration failed outright.
+    //
+    // `visibility` defaults to `private` here, not to the `workspace` that
+    // `SqliteMemory`'s own migration uses (FIX-P2-04): rows already in such a
+    // table carry no owner or channel, so nothing tells whom they belong to,
+    // and owner isolation takes precedence over workspace convenience
+    // (D-016, OQ-19/OQ-8/OQ-20). `private` fails closed: an unattributed row
+    // stays readable by the operator (ACL off, or the owner arm) but is never
+    // widened to every workspace caller. The column is created once, so this
+    // choice is what those rows keep. Hydrated rows set `owner` explicitly.
+    let columns = memories_columns(&conn)?;
+    for (column, add) in [
+        ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
+        ("owner_id", "ALTER TABLE memories ADD COLUMN owner_id TEXT"),
+        ("channel", "ALTER TABLE memories ADD COLUMN channel TEXT"),
+        ("chat_type", "ALTER TABLE memories ADD COLUMN chat_type TEXT"),
+        ("chat_id", "ALTER TABLE memories ADD COLUMN chat_id TEXT"),
+        ("sender_id", "ALTER TABLE memories ADD COLUMN sender_id TEXT"),
+        ("raw_sender", "ALTER TABLE memories ADD COLUMN raw_sender TEXT"),
+        ("topic_id", "ALTER TABLE memories ADD COLUMN topic_id TEXT"),
+        (
+            "visibility",
+            "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'",
+        ),
+        (
+            "sensitivity",
+            "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+        ),
+        (
+            "risk_signals",
+            "ALTER TABLE memories ADD COLUMN risk_signals TEXT DEFAULT '[]'",
+        ),
+        (
+            "policy_version",
+            "ALTER TABLE memories ADD COLUMN policy_version INTEGER DEFAULT 1",
+        ),
+    ] {
+        if !columns.contains(column) {
+            conn.execute_batch(add)?;
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
         CREATE INDEX IF NOT EXISTS idx_mem_cat ON memories(category);
         CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
         CREATE INDEX IF NOT EXISTS idx_mem_vis_chan_type_chat
@@ -246,12 +451,25 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     let now = Local::now().to_rfc3339();
     let mut hydrated = 0;
 
-    for (key, content, category) in &entries {
+    for (key, content, category, origin) in &entries {
         let id = uuid::Uuid::new_v4().to_string();
+        let origin = origin.clone().unwrap_or_default();
         let result = conn.execute(
-            "INSERT OR IGNORE INTO memories (id, key, content, category, visibility, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'owner', ?5, ?6)",
-            params![id, key, content, category, now, now],
+            "INSERT OR IGNORE INTO memories
+                (id, key, content, category, visibility, created_at, updated_at, owner_id, channel, raw_sender, chat_id)
+             VALUES (?1, ?2, ?3, ?4, 'owner', ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                key,
+                content,
+                category,
+                now,
+                now,
+                origin.owner_id,
+                origin.channel,
+                origin.raw_sender,
+                origin.chat_id
+            ],
         );
 
         match result {
@@ -313,32 +531,53 @@ fn snapshot_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(SNAPSHOT_FILENAME)
 }
 
-/// Parse the structured markdown snapshot back into (key, content) pairs.
-fn parse_snapshot(input: &str) -> Vec<(String, String)> {
+/// Parse the structured markdown snapshot back into entries.
+///
+/// A snapshot that carries [`SNAPSHOT_FORMAT_MARKER`] was escaped on export
+/// ([`escape_snapshot_content`], [`escape_snapshot_key`]), so an entry's
+/// content can never open another entry, and its origin line is unforgeable
+/// from inside the content. A snapshot without the marker predates escaping
+/// and origins, and parses exactly as it did then: keys and content verbatim,
+/// no origin. It cannot be told apart from content that merely looks like
+/// structure, so an old snapshot can still split an entry at a forged header,
+/// but never gives a row an owner.
+fn parse_snapshot(input: &str) -> Vec<SnapshotEntry> {
+    let versioned = input
+        .lines()
+        .take_while(|line| !is_entry_header(line.trim()))
+        .any(|line| line.trim() == SNAPSHOT_FORMAT_MARKER);
     let mut entries = Vec::new();
     let mut current_key: Option<String> = None;
     let mut current_content = String::new();
+    let mut current_origin: Option<SnapshotOrigin> = None;
+
+    let mut finish = |key: Option<String>, content: &str, origin: Option<SnapshotOrigin>| {
+        if let Some(key) = key {
+            let content = content.trim().to_string();
+            if !content.is_empty() {
+                entries.push((key, content, origin));
+            }
+        }
+    };
 
     for line in input.lines() {
         let trimmed = line.trim();
 
         // Match: ### 🔑 `key_name`
-        if trimmed.starts_with("### 🔑 `") && trimmed.ends_with('`') {
-            // Save previous entry
-            if let Some(key) = current_key.take() {
-                let content = current_content.trim().to_string();
-                if !content.is_empty() {
-                    entries.push((key, content));
-                }
-            }
+        if is_entry_header(trimmed) {
+            finish(current_key.take(), &current_content, current_origin.take());
 
-            // Extract new key
             let key = trimmed
                 .strip_prefix("### 🔑 `")
                 .and_then(|s| s.strip_suffix('`'))
-                .unwrap_or("")
-                .to_string();
-
+                .map(|key| {
+                    if versioned {
+                        unescape_snapshot_key(key)
+                    } else {
+                        key.to_string()
+                    }
+                })
+                .unwrap_or_default();
             if !key.is_empty() {
                 current_key = Some(key);
                 current_content = String::new();
@@ -348,8 +587,23 @@ fn parse_snapshot(input: &str) -> Vec<(String, String)> {
             if trimmed.starts_with("*Created:") || trimmed == "---" {
                 continue;
             }
+            if versioned
+                && let Some(json) = trimmed
+                    .strip_prefix("*Origin: ")
+                    .and_then(|rest| rest.strip_suffix('*'))
+            {
+                if current_origin.is_none() {
+                    current_origin = parse_origin(json);
+                }
+                continue;
+            }
+            let line = if versioned {
+                line.strip_prefix('\\').unwrap_or(line)
+            } else {
+                line
+            };
             // Accumulate content
-            if !current_content.is_empty() || !trimmed.is_empty() {
+            if !current_content.is_empty() || !line.trim().is_empty() {
                 if !current_content.is_empty() {
                     current_content.push('\n');
                 }
@@ -359,14 +613,31 @@ fn parse_snapshot(input: &str) -> Vec<(String, String)> {
     }
 
     // Don't forget the last entry
-    if let Some(key) = current_key {
-        let content = current_content.trim().to_string();
-        if !content.is_empty() {
-            entries.push((key, content));
-        }
-    }
+    finish(current_key, &current_content, current_origin);
 
     entries
+}
+
+/// Whether a trimmed line opens a snapshot entry.
+fn is_entry_header(trimmed: &str) -> bool {
+    trimmed.starts_with("### 🔑 `") && trimmed.ends_with('`')
+}
+
+/// One entry's origin, or none when the line does not parse. A malformed
+/// origin restores the row ownerless; it is logged without the line itself,
+/// which can carry an owner id and a chat id.
+fn parse_origin(json: &str) -> Option<SnapshotOrigin> {
+    match serde_json::from_str(json) {
+        Ok(origin) => Some(origin),
+        Err(error) => {
+            tracing::warn!(
+                line = error.line(),
+                column = error.column(),
+                "snapshot hydration: malformed origin line ignored; the entry is restored without an owner"
+            );
+            None
+        }
+    }
 }
 
 fn parse_memory_markdown_entries(path_label: &str, input: &str) -> Vec<(String, String)> {
@@ -408,16 +679,16 @@ fn has_markdown_memory_files(workspace_dir: &Path) -> bool {
 /// NOTE: All `.exists()` checks below are TOCTOU safe — read-only probes for
 /// data files. If a file disappears between check and read, `fs::read_to_string`
 /// returns an error that is propagated via `?`.
-fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String, String)>> {
-    let mut hydrated: Vec<(String, String, String)> = Vec::new();
+fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String, String, Option<SnapshotOrigin>)>> {
+    let mut hydrated: Vec<(String, String, String, Option<SnapshotOrigin>)> = Vec::new();
     let mut seen_keys = HashSet::new();
 
     let snapshot = snapshot_path(workspace_dir);
     if snapshot.exists() {
         let content = fs::read_to_string(&snapshot)?;
-        for (key, content) in parse_snapshot(&content) {
+        for (key, content, origin) in parse_snapshot(&content) {
             if seen_keys.insert(key.clone()) {
-                hydrated.push((key, content, "core".to_string()));
+                hydrated.push((key, content, "core".to_string(), origin));
             }
         }
     }
@@ -427,7 +698,7 @@ fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String
         let content = fs::read_to_string(&memory_md_path)?;
         for (key, value) in parse_memory_markdown_entries("MEMORY.md", &content) {
             if seen_keys.insert(key.clone()) {
-                hydrated.push((key, value, "core".to_string()));
+                hydrated.push((key, value, "core".to_string(), None));
             }
         }
     }
@@ -450,13 +721,20 @@ fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String
             let label = format!("memory/{file_name}");
             for (key, value) in parse_memory_markdown_entries(&label, &content) {
                 if seen_keys.insert(key.clone()) {
-                    hydrated.push((key, value, "daily".to_string()));
+                    hydrated.push((key, value, "daily".to_string(), None));
                 }
             }
         }
     }
 
     Ok(hydrated)
+}
+
+/// The snapshot format marker, for tests that write a current-format file by
+/// hand.
+#[cfg(test)]
+const fn snapshot_format_marker_for_tests() -> &'static str {
+    SNAPSHOT_FORMAT_MARKER
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -712,5 +990,37 @@ Rule 3: Protect the user.
             )
             .unwrap();
         assert_eq!(visibility, "owner");
+    }
+
+    /// The exporter's own snapshots keep their origins across a cold boot.
+    #[test]
+    fn an_exported_snapshot_restores_its_origins() {
+        let origin = SnapshotOrigin {
+            owner_id: Some("alice".to_string()),
+            ..SnapshotOrigin::default()
+        };
+        let input = format!(
+            "{SNAPSHOT_HEADER}{}\n\n### 🔑 `k`\n\nbody\n\n*Origin: {}*\n\n---\n",
+            snapshot_format_marker_for_tests(),
+            serde_json::to_string(&origin).unwrap()
+        );
+        let entries = parse_snapshot(&input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, Some(origin));
+    }
+
+    /// R-MCPBh Info (b): a malformed origin line is logged — without its
+    /// text — instead of being dropped silently.
+    #[test]
+    fn a_malformed_origin_is_logged_without_its_text() {
+        let input = format!(
+            "{SNAPSHOT_HEADER}{}\n\n### 🔑 `k`\n\nbody\n\n*Origin: {{\"owner_id\": secret-owner*\n\n---\n",
+            snapshot_format_marker_for_tests()
+        );
+        let (entries, logs) = crate::runtime::sqlite_pool::log_capture::capturing_logs(|| parse_snapshot(&input));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, None);
+        assert!(logs.contains("malformed origin"), "{logs}");
+        assert!(!logs.contains("secret-owner"), "{logs}");
     }
 }

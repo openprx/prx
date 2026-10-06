@@ -8,7 +8,6 @@ use crate::providers::traits::{
 };
 use crate::providers::utf8_stream::SseTextDecoder;
 use crate::tools::ToolSpec;
-use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::stream::{self, BoxStream, StreamExt};
@@ -290,7 +289,7 @@ impl AnthropicProvider {
         if state.refresh_token.is_none() {
             return state.credential.clone().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                    "Anthropic credentials not set. Set `api_key` in config.toml, or store a key or setup-token with `prx auth paste-token --provider anthropic`."
                 )
             });
         }
@@ -338,7 +337,7 @@ impl AnthropicProvider {
 
         state.credential.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                "Anthropic credentials not set. Set `api_key` in config.toml, or store a key or setup-token with `prx auth paste-token --provider anthropic`."
             )
         })
     }
@@ -516,27 +515,38 @@ impl AnthropicProvider {
         }
     }
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
-        let items = tools?;
-        if items.is_empty() {
-            return None;
-        }
-        let mut native_tools: Vec<NativeToolSpec<'a>> = items
-            .iter()
-            .map(|tool| NativeToolSpec {
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn convert_tools<'a>(&self, tools: Option<&'a [ToolSpec]>) -> anyhow::Result<Option<Vec<NativeToolSpec<'a>>>> {
+        let items = tools.filter(|items| !items.is_empty());
+        let Some(items) = items else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut native_tools: Vec<NativeToolSpec<'a>> = Vec::with_capacity(items.len());
+        for tool in items {
+            let input_schema =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "anthropic".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            native_tools.push(NativeToolSpec {
                 name: &tool.name,
                 description: &tool.description,
-                input_schema: SchemaCleanr::clean_for_anthropic(tool.parameters.clone()),
+                input_schema: input_schema.into_owned(),
                 cache_control: None,
-            })
-            .collect();
+            });
+        }
 
         // Cache the last tool definition (caches all tools)
         if let Some(last_tool) = native_tools.last_mut() {
             last_tool.cache_control = Some(CacheControl::ephemeral());
         }
 
-        Some(native_tools)
+        Ok(Some(native_tools))
     }
 
     fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<NativeContentOut>> {
@@ -750,7 +760,7 @@ impl AnthropicProvider {
             system: system_prompt,
             messages,
             temperature,
-            tools: Self::convert_tools(request.tools),
+            tools: self.convert_tools(request.tools)?,
         };
 
         let req = self
@@ -804,6 +814,27 @@ impl AnthropicProvider {
             })
             .unwrap_or_else(|_| Client::new())
     }
+
+    /// Client for streaming requests: a connect timeout, but no whole-request
+    /// deadline. A reqwest client timeout covers the entire response body, so
+    /// the buffered client's two-minute limit cut healthy streams while tokens
+    /// were still arriving. A stalled stream is ended by the agent's
+    /// progress-aware idle guard, which every received chunk resets.
+    fn streaming_http_client(&self) -> Client {
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        crate::config::apply_runtime_proxy_to_builder(builder, "provider.anthropic")
+            .build()
+            .map_err(|e| {
+                tracing::error!("streaming client build failed for provider.anthropic, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| {
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|_| Client::new())
+            })
+    }
 }
 
 // ─── Streaming SSE (5a-7a) ────────────────────────────────────────────────
@@ -834,8 +865,9 @@ impl AnthropicProvider {
 //   - `content_block_stop(tool_use)` → emit a terminal
 //     `ToolCallChunk { status: Completed, args: full JSON, .. }`.
 // All chunks for one tool_use share the same stable `index` allocated at
-// `content_block_start` time. Driver-side `ToolCallAggregator` (T3-1) handles
-// both legacy (single Completed) and incremental (Streaming…Completed) shapes.
+// `content_block_start` time. The engine's streaming tool-call aggregator
+// (`agent::provider_round`) handles both legacy (single Completed) and
+// incremental (Streaming…Completed) shapes.
 
 #[derive(Debug, Serialize)]
 struct OwnedNativeToolSpec {
@@ -844,6 +876,17 @@ struct OwnedNativeToolSpec {
     input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+}
+
+impl From<NativeToolSpec<'_>> for OwnedNativeToolSpec {
+    fn from(spec: NativeToolSpec<'_>) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+            input_schema: spec.input_schema,
+            cache_control: spec.cache_control,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -890,6 +933,9 @@ struct AnthropicStreamState {
     blocks: std::collections::HashMap<usize, AnthropicBlockState>,
     /// Stable emission order for tool calls (chunk `index` field).
     tool_call_order: usize,
+    /// Whether the most recently started content block is a `tool_use` block.
+    /// A `max_tokens` stop then cut that call's arguments short.
+    last_block_is_tool_use: bool,
 }
 
 #[derive(Debug, Default)]
@@ -946,6 +992,7 @@ impl AnthropicStreamState {
             String::new()
         };
         let tool_order = if is_tool { self.next_tool_order() } else { 0 };
+        self.last_block_is_tool_use = is_tool;
 
         let entry = AnthropicBlockState {
             kind,
@@ -1034,42 +1081,6 @@ impl AnthropicStreamState {
             status: ToolCallChunkStatus::Completed,
         })
     }
-
-    /// Defensive tail flush invoked at stream EOF when no `content_block_stop`
-    /// (and no `message_stop`) ever arrived for one or more in-flight tool_use
-    /// blocks. Drains every remaining block and returns a terminal `Completed`
-    /// chunk for each well-formed tool_use entry so the driver does not silently
-    /// lose tool calls on truncated streams. Non-tool / unnamed blocks are
-    /// discarded. The returned chunks preserve their original `index` so the
-    /// driver can still reconcile them with the prior Streaming deltas.
-    fn drain_pending_tool_calls(&mut self) -> Vec<ToolCallChunk> {
-        let mut completed: Vec<ToolCallChunk> = self
-            .blocks
-            .drain()
-            .filter_map(|(_, entry)| {
-                if entry.kind != "tool_use" || entry.tool_name.is_empty() {
-                    return None;
-                }
-                let args = if entry.tool_args.is_empty() {
-                    "{}".to_string()
-                } else {
-                    entry.tool_args
-                };
-                Some(ToolCallChunk {
-                    id: entry.tool_id,
-                    name: entry.tool_name,
-                    args,
-                    index: entry.tool_order,
-                    arguments_delta: None,
-                    status: ToolCallChunkStatus::Completed,
-                })
-            })
-            .collect();
-        // HashMap iteration order is non-deterministic; sort by the stable
-        // `tool_order` so callers and tests observe a predictable sequence.
-        completed.sort_by_key(|c| c.index);
-        completed
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1085,8 +1096,9 @@ enum DeltaOutcome {
 enum AnthropicEvent {
     /// `event: message_start` with optional initial usage.
     MessageStart(AnthropicUsage),
-    /// `event: message_delta` with optional cumulative output usage.
-    MessageDelta(AnthropicUsage),
+    /// `event: message_delta` with optional cumulative output usage and the
+    /// message's `stop_reason`.
+    MessageDelta(AnthropicUsage, Option<String>),
     /// `event: content_block_start` with parsed payload index + block.
     BlockStart(usize, AnthropicSseContentBlock),
     /// `event: content_block_delta` index + delta.
@@ -1114,7 +1126,30 @@ struct MessageStartBody {
 #[derive(Debug, Default, Deserialize)]
 struct MessageDeltaPayload {
     #[serde(default)]
+    delta: MessageDeltaBody,
+    #[serde(default)]
     usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageDeltaBody {
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// `event: error`: `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`.
+#[derive(Debug, Default, Deserialize)]
+struct StreamErrorPayload {
+    #[serde(default)]
+    error: StreamErrorBody,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamErrorBody {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1132,6 +1167,30 @@ struct BlockDeltaPayload {
 #[derive(Debug, Deserialize)]
 struct BlockStopPayload {
     index: usize,
+}
+
+/// Why a message that ended with `stop_reason` while its last block was a
+/// `tool_use` left that call unfinished, or `None` for the stops that end a
+/// message normally.
+///
+/// The wording never names the raw `max_tokens` / context-window reasons:
+/// the loop's context-overflow classifier matches those words, and a
+/// truncated call is not a request that compaction could fix.
+fn unfinished_tool_call_stop(stop_reason: &str) -> Option<String> {
+    match stop_reason {
+        "tool_use" | "end_turn" | "stop_sequence" => None,
+        "max_tokens" => Some("the output cap was reached".to_string()),
+        "model_context_window_exceeded" => Some("the model ran out of room".to_string()),
+        "refusal" => Some("the model refused".to_string()),
+        other => {
+            let reason: String = other
+                .chars()
+                .filter(|c| c.is_ascii_lowercase() || *c == '_')
+                .take(40)
+                .collect();
+            Some(format!("stop reason {reason}"))
+        }
+    }
 }
 
 /// Parse a single Anthropic SSE record into a structured event. The record
@@ -1169,7 +1228,10 @@ fn parse_anthropic_sse_record(record: &str) -> StreamResult<Option<AnthropicEven
         }
         "message_delta" => {
             let payload: MessageDeltaPayload = serde_json::from_str(&data_buf).unwrap_or_default();
-            Ok(Some(AnthropicEvent::MessageDelta(payload.usage.unwrap_or_default())))
+            Ok(Some(AnthropicEvent::MessageDelta(
+                payload.usage.unwrap_or_default(),
+                payload.delta.stop_reason,
+            )))
         }
         "content_block_start" => {
             let payload: BlockStartPayload = serde_json::from_str(&data_buf).map_err(StreamError::Json)?;
@@ -1184,6 +1246,21 @@ fn parse_anthropic_sse_record(record: &str) -> StreamResult<Option<AnthropicEven
             Ok(Some(AnthropicEvent::BlockStop(payload.index)))
         }
         "message_stop" => Ok(Some(AnthropicEvent::MessageStop)),
+        // The API reports a failure that happens after the 200 response (for
+        // example `overloaded_error`) as an in-stream event and then closes
+        // the stream. It ends the turn; it is never skipped as noise.
+        "error" => {
+            let payload: StreamErrorPayload = serde_json::from_str(&data_buf).unwrap_or_default();
+            let kind = if payload.error.kind.is_empty() {
+                "unknown_error"
+            } else {
+                payload.error.kind.as_str()
+            };
+            let message: String = payload.error.message.chars().take(300).collect();
+            Err(StreamError::Provider(format!(
+                "Anthropic stream error ({kind}): {message}"
+            )))
+        }
         _ => Ok(Some(AnthropicEvent::Other)),
     }
 }
@@ -1287,6 +1364,7 @@ impl Provider for AnthropicProvider {
             }],
             final_provider: "anthropic".to_string(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used,
         })
     }
@@ -1367,7 +1445,8 @@ impl Provider for AnthropicProvider {
 
     /// **5a-7a**: Native Anthropic Messages API streaming.
     ///
-    /// Sends `stream: true` to `/v1/messages`, parses the event-driven SSE
+    /// Sends `stream: true` and the native tools in `options.tools` to
+    /// `/v1/messages`, parses the event-driven SSE
     /// stream via [`parse_anthropic_sse_record`], aggregates `input_json_delta`
     /// fragments per content_block, and emits a [`ToolCallChunk`] on each
     /// `content_block_stop` whose block is `tool_use`.
@@ -1386,21 +1465,25 @@ impl Provider for AnthropicProvider {
             }
         };
 
-        let (system_prompt, native_messages) = Self::convert_messages(messages);
-        // Anthropic tools API is not surfaced over the legacy
-        // `stream_chat_with_history(messages, model, ..)` signature; the
-        // driver passes tools through `EffectDeps.tools_registry` and we
-        // serialise assistant tool_call / tool_result back into history. So we
-        // *also* need to send the tool catalogue on every streaming call —
-        // resolve it from the global registry hook below. Until tools are
-        // threaded through the trait, we omit tools here; chat::run still
-        // injects native tool schema through the legacy chat_with_tools path
-        // when needed. driver path will operate without native schema until
-        // step 5a-7b adds tools to the streaming signature.
-        let tools: Option<Vec<OwnedNativeToolSpec>> = None;
+        // Offer the caller's tools exactly as the buffered path does: lowered
+        // through this endpoint's dialect, with the cache marker on the last
+        // one. A refusal fails the turn before any connection is opened.
+        let tools = match self.convert_tools(options.tools.as_deref()) {
+            Ok(tools) => tools.map(|tools| tools.into_iter().map(OwnedNativeToolSpec::from).collect::<Vec<_>>()),
+            Err(e) => {
+                let msg = e.to_string();
+                return stream::once(async move { Err(StreamError::Provider(msg)) }).boxed();
+            }
+        };
+        let (system_prompt, mut native_messages) = Self::convert_messages(messages);
+        // The same breakpoint the buffered path sets (STREAM-S3): with the
+        // system prompt and the last tool, at most three of Anthropic's four.
+        if Self::should_cache_conversation(messages) {
+            Self::apply_cache_to_last_message(&mut native_messages);
+        }
 
         let url = format!("{}/v1/messages", self.base_url);
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let use_bearer = Self::is_setup_token(&credential);
 
         let request_body = StreamingChatRequest {
@@ -1415,7 +1498,7 @@ impl Provider for AnthropicProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
 
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let mut req = client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
@@ -1445,6 +1528,7 @@ impl Provider for AnthropicProvider {
             let mut state = AnthropicStreamState::default();
             let mut usage_state = AnthropicUsage::default();
             let mut usage_seen = false;
+            let mut stop_reason_seen = false;
             let mut byte_stream = response.bytes_stream();
             let mut buf = String::new();
             // Byte-level decoder; `buf` above stays the SSE record accumulator.
@@ -1452,7 +1536,18 @@ impl Provider for AnthropicProvider {
             let mut completion_chars: usize = 0;
             let mut sent_final = false;
 
-            'outer: while let Some(bytes_res) = byte_stream.next().await {
+            'outer: loop {
+                // Stop reading as soon as nobody consumes the stream (the
+                // turn ended, for example by the idle guard): otherwise this
+                // task and its connection wait on the server indefinitely,
+                // since the streaming client has no whole-request deadline.
+                let next = tokio::select! {
+                    () = tx.closed() => return,
+                    next = byte_stream.next() => next,
+                };
+                let Some(bytes_res) = next else {
+                    break 'outer;
+                };
                 let bytes = match bytes_res {
                     Ok(b) => b,
                     Err(e) => {
@@ -1496,7 +1591,24 @@ impl Provider for AnthropicProvider {
                                 }
                             }
                         }
-                        AnthropicEvent::MessageDelta(usage) => {
+                        AnthropicEvent::MessageDelta(usage, stop_reason) => {
+                            stop_reason_seen |= stop_reason.is_some();
+                            // Any stop other than a normal end while the last
+                            // block is a `tool_use` left that call unfinished,
+                            // possibly with no argument bytes at all. The block
+                            // was already closed, so fail the whole message: a
+                            // failed stream's calls are never executed.
+                            if state.last_block_is_tool_use
+                                && let Some(why) = stop_reason.as_deref().and_then(unfinished_tool_call_stop)
+                            {
+                                let _ = tx
+                                    .send(Err(StreamError::Provider(format!(
+                                        "Anthropic ended the message inside a tool call ({why}); the call's \
+                                         arguments are incomplete and it was not run"
+                                    ))))
+                                    .await;
+                                return;
+                            }
                             if usage.has_any_tokens() {
                                 usage_seen = true;
                                 if usage.input_tokens.is_some() {
@@ -1558,6 +1670,20 @@ impl Provider for AnthropicProvider {
                             }
                         }
                         AnthropicEvent::MessageStop => {
+                            // No `stop_reason` ever confirmed how the message
+                            // ended, and its last block is a `tool_use`: that
+                            // call is unconfirmed, and a name-only one would
+                            // run as `{}`.
+                            if !stop_reason_seen && state.last_block_is_tool_use {
+                                let _ = tx
+                                    .send(Err(StreamError::Provider(
+                                        "Anthropic ended the message inside a tool call (no stop reason); the call's \
+                                         arguments are incomplete and it was not run"
+                                            .to_string(),
+                                    )))
+                                    .await;
+                                return;
+                            }
                             if usage_seen {
                                 if tx
                                     .send(Ok(StreamChunk::usage(usage_state.into_reported())))
@@ -1589,33 +1715,14 @@ impl Provider for AnthropicProvider {
                     let _ = tx.send(Err(e)).await;
                     return;
                 }
-
-                // Defensive tail flush: if the upstream closed the byte stream
-                // without ever sending `content_block_stop` (and `message_stop`)
-                // for in-flight tool_use blocks, drain them now so the driver
-                // gets the terminal `Completed` chunks it needs to finalise the
-                // turn. Without this, partial tool calls would be lost on EOF.
-                for call in state.drain_pending_tool_calls() {
-                    if tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err() {
-                        return;
-                    }
-                }
-                if usage_seen {
-                    if tx
-                        .send(Ok(StreamChunk::usage(usage_state.into_reported())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                } else if completion_chars > 0 {
-                    let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
-                    let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
-                    if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
-                        return;
-                    }
-                }
-                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                // Either way the message is incomplete: a `tool_use` block may
+                // hold half of its arguments, and a text answer is cut short.
+                // Fail the stream instead of passing it off as a finished one.
+                let _ = tx
+                    .send(Err(StreamError::InvalidSse(
+                        "Anthropic stream ended before message_stop; the response is incomplete".to_string(),
+                    )))
+                    .await;
             }
         });
 
@@ -2158,7 +2265,11 @@ mod tests {
             },
         ];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let native_tools = provider
+            .convert_tools(Some(&tools))
+            .expect("test: tools convert")
+            .expect("test: tools present");
 
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
@@ -2173,7 +2284,11 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let native_tools = provider
+            .convert_tools(Some(&tools))
+            .expect("test: tools convert")
+            .expect("test: tools present");
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -2542,7 +2657,7 @@ mod tests {
             other => panic!("expected message_start usage, got {other:?}"),
         };
         let delta_usage = match parse_anthropic_sse_record(delta).unwrap().expect("message_delta event") {
-            AnthropicEvent::MessageDelta(usage) => usage,
+            AnthropicEvent::MessageDelta(usage, _) => usage,
             other => panic!("expected message_delta usage, got {other:?}"),
         };
 
@@ -2704,59 +2819,729 @@ mod tests {
         assert_eq!(completed2.status, ToolCallChunkStatus::Completed);
     }
 
-    /// Regression for the Anthropic EOF tail-flush path.
-    ///
-    /// If the upstream byte stream closes after `input_json_delta` events but
-    /// before `content_block_stop` (and `message_stop`) arrive, the provider
-    /// must still emit the terminal `Completed` chunks for every in-flight
-    /// tool_use block so the driver does not silently lose the tool call.
-    /// `drain_pending_tool_calls` is the canonical entry point for that flush.
-    #[test]
-    fn test_tool_use_eof_tail_flush_drains_pending_calls() {
-        let mut state = AnthropicStreamState::default();
+    // -----------------------------------------------------------------
+    // STREAM-TOOLS: native tools on the streaming request
+    // -----------------------------------------------------------------
 
-        // Two in-flight tool_use blocks, both received their fragments but
-        // neither got a `content_block_stop` before EOF.
-        let _ = state
-            .on_content_block_start(0, tool_use_start_block("tu_x", "search"))
-            .expect("initial Streaming chunk for tool 0");
-        let _ = state
-            .on_content_block_delta(0, input_json_delta(r#"{"q":"abc"}"#))
-            .expect("partial fragment must surface for tool 0");
+    /// One Anthropic SSE record (`event:` + `data:` + blank line).
+    fn anthropic_sse_record(event: &str, data: &serde_json::Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
 
-        let _ = state
-            .on_content_block_start(1, tool_use_start_block("tu_y", "edit"))
-            .expect("initial Streaming chunk for tool 1");
-        // Tool 1 received no fragments — `args` must fall back to `{}`.
+    /// The streamed `tool_use` reply the real Messages API sends for a
+    /// `fixture_write({"value":"x"})` call, split across two JSON fragments.
+    fn anthropic_streamed_tool_use_body() -> String {
+        [
+            anthropic_sse_record(
+                "message_start",
+                &serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+            ),
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"toolu_s1","name":"fixture_write","input":{}}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"{\"value\":"}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}),
+            ),
+            anthropic_sse_record(
+                "content_block_stop",
+                &serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            anthropic_sse_record(
+                "message_delta",
+                &serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat()
+    }
 
-        assert_eq!(state.blocks.len(), 2, "two in-flight blocks before EOF flush");
+    /// Loopback `/v1/messages` stub that records every request body and answers
+    /// with `body` as `text/event-stream`.
+    async fn spawn_anthropic_sse_stub(
+        body: String,
+    ) -> (
+        String,
+        std::sync::Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::header, routing::post};
+        use tokio::net::TcpListener;
 
-        // Simulate EOF: the byte stream ended without BlockStop / MessageStop.
-        let flushed = state.drain_pending_tool_calls();
-
-        // Both pending tool_use blocks must surface as terminal Completed
-        // chunks. Order is sorted by stable `index` for determinism.
-        assert_eq!(
-            flushed.len(),
-            2,
-            "EOF flush must emit one Completed per pending tool_use"
+        let captured: std::sync::Arc<Mutex<Vec<serde_json::Value>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                let body = body.clone();
+                async move {
+                    sink.lock().push(request);
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
         );
-        assert!(state.blocks.is_empty(), "drain must empty the per-block map");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
 
-        assert_eq!(flushed[0].index, 0);
-        assert_eq!(flushed[0].id, "tu_x");
-        assert_eq!(flushed[0].name, "search");
-        assert_eq!(flushed[0].args, r#"{"q":"abc"}"#);
-        assert_eq!(flushed[0].status, ToolCallChunkStatus::Completed);
-        assert!(flushed[0].arguments_delta.is_none());
+    /// A tool whose schema carries `$defs` + `$ref`, so the Anthropic dialect's
+    /// lowering is observable on the wire.
+    fn fixture_write_spec() -> ToolSpec {
+        ToolSpec {
+            name: "fixture_write".to_string(),
+            description: "Write a fixture value".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "$defs": {"Value": {"type": "string", "description": "the value"}},
+                "properties": {"value": {"$ref": "#/$defs/Value"}},
+                "required": ["value"]
+            }),
+        }
+    }
 
-        assert_eq!(flushed[1].index, 1);
-        assert_eq!(flushed[1].id, "tu_y");
-        assert_eq!(flushed[1].name, "edit");
-        assert_eq!(flushed[1].args, "{}", "no fragments => fallback {{}}");
-        assert_eq!(flushed[1].status, ToolCallChunkStatus::Completed);
+    #[tokio::test]
+    async fn anthropic_streaming_request_carries_lowered_native_tools_and_surfaces_the_call() {
+        let (base, captured, server) = spawn_anthropic_sse_stub(anthropic_streamed_tool_use_body()).await;
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&base));
+        let messages = vec![ChatMessage::user("write x")];
 
-        // Re-draining an empty state must be a safe no-op.
-        assert!(state.drain_pending_tool_calls().is_empty());
+        let chunks: Vec<StreamChunk> = provider
+            .stream_chat_with_history(
+                &messages,
+                "claude-test",
+                0.0,
+                StreamOptions::new(true).with_tools(vec![fixture_write_spec()]),
+            )
+            .map(|chunk| chunk.expect("test: stream chunk"))
+            .collect()
+            .await;
+        server.abort();
+
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1, "exactly one streaming request");
+        let body = &bodies[0];
+        assert_eq!(body["stream"], true);
+        let tools = body["tools"]
+            .as_array()
+            .expect("test: streaming request must carry tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "fixture_write");
+        assert_eq!(tools[0]["description"], "Write a fixture value");
+        let schema = tools[0]["input_schema"].to_string();
+        assert!(
+            !schema.contains("$ref"),
+            "schema must be lowered through the Anthropic dialect, got {schema}"
+        );
+        assert_eq!(tools[0]["input_schema"]["properties"]["value"]["type"], "string");
+        assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+
+        let completed: Vec<&ToolCallChunk> = chunks
+            .iter()
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == ToolCallChunkStatus::Completed)
+            .collect();
+        assert_eq!(completed.len(), 1, "exactly one completed tool call");
+        assert_eq!(completed[0].id, "toolu_s1");
+        assert_eq!(completed[0].name, "fixture_write");
+        let args: serde_json::Value = serde_json::from_str(&completed[0].args).expect("test: args are JSON");
+        assert_eq!(args, serde_json::json!({"value": "x"}));
+        assert!(
+            chunks.last().is_some_and(|c| c.is_final),
+            "stream ends with a final chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_streaming_request_without_tools_omits_the_field() {
+        let text_body = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let (base, captured, server) = spawn_anthropic_sse_stub(text_body).await;
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&base));
+        let messages = vec![ChatMessage::user("hi")];
+
+        let text: String = provider
+            .stream_chat_with_history(&messages, "claude-test", 0.0, StreamOptions::new(true))
+            .map(|chunk| chunk.expect("test: stream chunk").delta)
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        server.abort();
+
+        assert_eq!(text, "hi");
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "no tools offered => no tools key, got {}",
+            bodies[0]
+        );
+    }
+
+    /// STREAM-S3 (DC-7): a streamed multi-step conversation carries the same
+    /// cache breakpoint on its last message as the buffered path, so a tool
+    /// loop does not re-send its whole history uncached on every step.
+    #[tokio::test]
+    async fn anthropic_streaming_request_caches_a_long_conversation_like_the_buffered_one() {
+        let text_body = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let (base, captured, server) = spawn_anthropic_sse_stub(text_body).await;
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&base));
+        let messages = vec![
+            ChatMessage::user("step 1"),
+            ChatMessage::assistant("answer 1"),
+            ChatMessage::user("step 2"),
+            ChatMessage::assistant("answer 2"),
+            ChatMessage::user("step 3"),
+        ];
+        assert!(
+            AnthropicProvider::should_cache_conversation(&messages),
+            "test: the buffered path caches this conversation"
+        );
+
+        let text: String = provider
+            .stream_chat_with_history(&messages, "claude-test", 0.0, StreamOptions::new(true))
+            .map(|chunk| chunk.expect("test: stream chunk").delta)
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        server.abort();
+
+        assert_eq!(text, "ok");
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1);
+        let last_block = bodies[0]["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_array())
+            .and_then(|content| content.last())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            last_block["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the last message must carry the cache breakpoint: {}",
+            bodies[0]
+        );
+        let short = vec![ChatMessage::user("hi")];
+        assert!(!AnthropicProvider::should_cache_conversation(&short));
+    }
+
+    // -----------------------------------------------------------------
+    // STREAM-f: a half-received tool call must fail the stream, never
+    // surface as a completed call
+    // -----------------------------------------------------------------
+
+    /// `message_start`, a `tool_use` block for `fixture_write` and the first
+    /// half of its arguments: everything a stream has sent when it is cut in
+    /// the middle of a call.
+    fn anthropic_tool_use_prefix() -> String {
+        [
+            anthropic_sse_record(
+                "message_start",
+                &serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+            ),
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"toolu_s1","name":"fixture_write","input":{}}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"{\"value\":"}}),
+            ),
+        ]
+        .concat()
+    }
+
+    /// Drive one streaming request against `body` with `fixture_write` offered.
+    async fn anthropic_stream_results(body: String) -> Vec<StreamResult<StreamChunk>> {
+        let (base, _captured, server) = spawn_anthropic_sse_stub(body).await;
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&base));
+        let messages = vec![ChatMessage::user("write x")];
+        let results = provider
+            .stream_chat_with_history(
+                &messages,
+                "claude-test",
+                0.0,
+                StreamOptions::new(true).with_tools(vec![fixture_write_spec()]),
+            )
+            .collect()
+            .await;
+        server.abort();
+        results
+    }
+
+    /// The stream must end in an error, and nothing may follow that error.
+    fn assert_stream_ends_in_error(results: &[StreamResult<StreamChunk>]) -> &StreamError {
+        let last = results.last().expect("test: the stream yielded something");
+        let error = last.as_ref().err().unwrap_or_else(|| {
+            panic!(
+                "the stream must end in an error, got {:?}",
+                results
+                    .iter()
+                    .map(|r| r.as_ref().map(|c| (&c.delta, &c.tool_calls, c.is_final)))
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            results.iter().filter(|r| r.is_err()).count() == 1,
+            "exactly one error ends the stream"
+        );
+        error
+    }
+
+    fn completed_calls(results: &[StreamResult<StreamChunk>]) -> Vec<&ToolCallChunk> {
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == ToolCallChunkStatus::Completed)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_cut_mid_tool_arguments_ends_in_an_error() {
+        let results = anthropic_stream_results(anthropic_tool_use_prefix()).await;
+
+        let error = assert_stream_ends_in_error(&results);
+        assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
+        assert!(error.to_string().contains("message_stop"), "got {error}");
+        assert!(
+            completed_calls(&results).is_empty(),
+            "a call whose block never closed must not surface as completed"
+        );
+        assert!(
+            !results.iter().filter_map(|r| r.as_ref().ok()).any(|c| c.is_final),
+            "a truncated stream must not report a final chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_text_cut_before_message_stop_ends_in_an_error() {
+        let body = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}),
+            ),
+        ]
+        .concat();
+        let results = anthropic_stream_results(body).await;
+        let error = assert_stream_ends_in_error(&results);
+        assert!(error.to_string().contains("message_stop"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_error_event_ends_in_a_provider_error() {
+        let body = [
+            anthropic_tool_use_prefix(),
+            anthropic_sse_record(
+                "error",
+                &serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+            ),
+        ]
+        .concat();
+        let results = anthropic_stream_results(body).await;
+
+        let error = assert_stream_ends_in_error(&results);
+        assert!(matches!(error, StreamError::Provider(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains("overloaded_error"),
+            "the upstream error type is kept: {message}"
+        );
+        assert!(
+            message.contains("Overloaded"),
+            "the upstream message is kept: {message}"
+        );
+        assert!(completed_calls(&results).is_empty());
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_max_tokens_inside_a_tool_call_ends_in_an_error() {
+        let body = [
+            anthropic_tool_use_prefix(),
+            anthropic_sse_record(
+                "content_block_stop",
+                &serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            anthropic_sse_record(
+                "message_delta",
+                &serde_json::json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let results = anthropic_stream_results(body).await;
+
+        let error = assert_stream_ends_in_error(&results);
+        let message = error.to_string();
+        assert!(message.contains("output cap"), "got {message}");
+        assert!(
+            !results.iter().filter_map(|r| r.as_ref().ok()).any(|c| c.is_final),
+            "a truncated tool call must not end in a final chunk"
+        );
+    }
+
+    /// `max_tokens` after a complete tool call and a truncated *text* block is
+    /// an ordinary truncated answer, not a truncated call.
+    #[tokio::test]
+    async fn anthropic_stream_max_tokens_inside_text_stays_a_normal_end() {
+        let body = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"long answ"}}),
+            ),
+            anthropic_sse_record(
+                "content_block_stop",
+                &serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            anthropic_sse_record(
+                "message_delta",
+                &serde_json::json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let results = anthropic_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok), "no error for truncated text");
+        assert!(results.last().is_some_and(|r| r.as_ref().is_ok_and(|c| c.is_final)));
+    }
+
+    /// A healthy stream that keeps sending for longer than the old two-minute
+    /// client deadline must complete.
+    ///
+    /// The clock is paused once the first chunk has arrived, so the two
+    /// 90-second gaps that follow are virtual. Pausing only after the
+    /// connection is up keeps auto-advance away from the connect timeout.
+    #[tokio::test]
+    async fn anthropic_stream_survives_past_the_old_two_minute_deadline() {
+        use axum::{Router, body::Body, http::header, routing::post};
+        use tokio::net::TcpListener;
+
+        let parts: Vec<(u64, String)> = vec![
+            (0, [
+                    anthropic_sse_record(
+                        "content_block_start",
+                        &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                    ),
+                    anthropic_sse_record(
+                        "content_block_delta",
+                        &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"slow "}}),
+                    ),
+                ]
+                .concat()),
+            (90, anthropic_sse_record(
+                    "content_block_delta",
+                    &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+                )),
+            (90, anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"}))),
+        ];
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let parts = parts.clone();
+                async move {
+                    let body = futures::stream::iter(parts).then(|(delay, part)| async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        Ok::<_, std::convert::Infallible>(part)
+                    });
+                    ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&format!("http://{addr}")));
+        let messages = vec![ChatMessage::user("take your time")];
+        let mut stream = provider.stream_chat_with_history(&messages, "claude-test", 0.0, StreamOptions::new(true));
+        let first = stream.next().await.expect("test: the first chunk arrives at once");
+        // Connected and streaming: from here on the gaps are virtual time.
+        tokio::time::pause();
+        let mut results = vec![first];
+        while let Some(item) = stream.next().await {
+            results.push(item);
+        }
+        server.abort();
+
+        let errors: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a healthy slow stream must not be cut (after {:?} of virtual time): {errors:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_mins(3),
+            "the stub really ran past two minutes"
+        );
+        let text: String = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|c| c.delta.as_str())
+            .collect();
+        assert_eq!(text, "slow answer");
+    }
+
+    // -----------------------------------------------------------------
+    // STREAM-g
+    // -----------------------------------------------------------------
+
+    /// A `tool_use` block that got its name but no argument bytes, closed, then
+    /// the message ends with `stop_reason`.
+    fn anthropic_name_only_call_ended_by(stop_reason: &str) -> String {
+        [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"toolu_s1","name":"fixture_write","input":{}}}),
+            ),
+            anthropic_sse_record(
+                "content_block_stop",
+                &serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            anthropic_sse_record(
+                "message_delta",
+                &serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":3}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat()
+    }
+
+    /// F-2: any stop other than `tool_use`, `end_turn` or `stop_sequence` while
+    /// the last block is a `tool_use` means the call is unfinished, even when
+    /// no argument byte arrived (which would otherwise become `{}`).
+    #[tokio::test]
+    async fn anthropic_stream_unfinished_stop_inside_a_tool_call_ends_in_an_error() {
+        for reason in ["max_tokens", "model_context_window_exceeded", "refusal", "pause_turn"] {
+            let results = anthropic_stream_results(anthropic_name_only_call_ended_by(reason)).await;
+            let last = results.last().expect("test: the stream yielded something");
+            assert!(
+                last.is_err(),
+                "stop_reason {reason} inside a tool call must fail the stream"
+            );
+            assert!(
+                !results.iter().filter_map(|r| r.as_ref().ok()).any(|c| c.is_final),
+                "stop_reason {reason}: no final chunk"
+            );
+        }
+    }
+
+    /// F-2 guard: the stops that end a message normally keep a no-argument
+    /// call as `{}`.
+    #[tokio::test]
+    async fn anthropic_stream_normal_stops_keep_a_no_argument_call() {
+        for reason in ["tool_use", "end_turn", "stop_sequence"] {
+            let results = anthropic_stream_results(anthropic_name_only_call_ended_by(reason)).await;
+            assert!(
+                results.iter().all(Result::is_ok),
+                "stop_reason {reason} is a normal end"
+            );
+            let completed = completed_calls(&results);
+            assert_eq!(completed.len(), 1, "stop_reason {reason}");
+            assert_eq!(completed[0].args, "{}");
+        }
+    }
+
+    /// F-1: no truncation error may read as a context overflow; the loop would
+    /// compact the history and replay the request.
+    #[tokio::test]
+    async fn anthropic_truncation_errors_never_read_as_context_overflow() {
+        for reason in ["max_tokens", "model_context_window_exceeded", "refusal", "pause_turn"] {
+            let results = anthropic_stream_results(anthropic_name_only_call_ended_by(reason)).await;
+            let error = results
+                .last()
+                .and_then(|r| r.as_ref().err())
+                .unwrap_or_else(|| panic!("stop_reason {reason}: the stream must fail"));
+            let message = error.to_string();
+            assert!(
+                !crate::recovery::overflow::is_context_overflow_error(&anyhow::anyhow!(message.clone())),
+                "stop_reason {reason}: '{message}' reads as a context overflow"
+            );
+        }
+    }
+
+    /// F-5: once the consumer drops the stream (the idle guard ended the turn),
+    /// the background task lets go of the connection instead of waiting on a
+    /// server that never sends again.
+    #[tokio::test]
+    async fn anthropic_stream_releases_the_connection_when_the_consumer_goes_away() {
+        use axum::{Router, body::Body, http::header, routing::post};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let first = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}),
+            ),
+        ]
+        .concat();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let flag = flag.clone();
+                let first = first.clone();
+                async move {
+                    // One record, then silence forever. The guard drops with
+                    // the body, i.e. when the server lets go of the response.
+                    let guard = DropFlag(flag);
+                    let body = futures::stream::once(async move { Ok::<_, std::convert::Infallible>(first) })
+                        .chain(futures::stream::pending())
+                        .map(move |item| {
+                            let _keep = &guard;
+                            item
+                        });
+                    ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&format!("http://{addr}")));
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat_with_history(&messages, "claude-test", 0.0, StreamOptions::new(true));
+        let first_chunk = stream.next().await.expect("test: first chunk");
+        assert_eq!(first_chunk.expect("test: first chunk is ok").delta, "hel");
+        drop(stream);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !released.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the provider task must close the connection once nobody reads the stream"
+        );
+    }
+
+    /// COMPAT-STREAM (R-1): a message that ends without any `stop_reason`
+    /// while its last block is a `tool_use` leaves that call unconfirmed; a
+    /// name-only one would run as `{}`.
+    #[tokio::test]
+    async fn anthropic_stream_without_a_stop_reason_after_a_tool_call_ends_in_an_error() {
+        let start = anthropic_sse_record(
+            "content_block_start",
+            &serde_json::json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":"toolu_s1","name":"fixture_write","input":{}}}),
+        );
+        let stop = anthropic_sse_record(
+            "content_block_stop",
+            &serde_json::json!({"type":"content_block_stop","index":0}),
+        );
+        let message_stop = anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"}));
+        for body in [
+            // No `message_delta` at all.
+            [start.clone(), stop.clone(), message_stop.clone()].concat(),
+            // A `message_delta` without `stop_reason`.
+            [
+                start.clone(),
+                stop.clone(),
+                anthropic_sse_record(
+                    "message_delta",
+                    &serde_json::json!({"type":"message_delta","delta":{},"usage":{"output_tokens":3}}),
+                ),
+                message_stop.clone(),
+            ]
+            .concat(),
+        ] {
+            let results = anthropic_stream_results(body).await;
+            let last = results.last().expect("test: the stream yielded something");
+            let error = last
+                .as_ref()
+                .expect_err("test: no stop reason after a tool call must fail");
+            assert!(error.to_string().contains("inside a tool call"), "got {error}");
+            assert!(
+                !crate::recovery::overflow::is_context_overflow_error(&anyhow::anyhow!(error.to_string())),
+                "must not read as an overflow: {error}"
+            );
+        }
+    }
+
+    /// R-1 guard: a text-only message without `message_delta` stays a normal end.
+    #[tokio::test]
+    async fn anthropic_stream_text_without_a_stop_reason_stays_a_normal_end() {
+        let body = [
+            anthropic_sse_record(
+                "content_block_start",
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            anthropic_sse_record(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            ),
+            anthropic_sse_record("message_stop", &serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let results = anthropic_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert!(results.last().is_some_and(|r| r.as_ref().is_ok_and(|c| c.is_final)));
     }
 }

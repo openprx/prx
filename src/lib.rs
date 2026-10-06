@@ -90,15 +90,17 @@ pub mod agent;
 pub mod approval;
 pub mod auth;
 pub mod capability;
+pub mod causal_cli;
 pub(crate) mod causal_tree;
 pub mod channels;
-#[allow(dead_code, private_interfaces)]
+#[allow(private_interfaces)]
 pub mod chat;
 pub mod compliance;
 pub mod config;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
+pub mod decision;
 pub mod doctor;
 pub mod evolution_cli;
 pub mod fitness_cli;
@@ -109,6 +111,7 @@ pub(crate) mod hooks;
 pub mod identity;
 pub mod integrations;
 pub mod llm;
+pub(crate) mod markdown;
 pub mod media;
 pub mod memory;
 pub mod migration;
@@ -125,9 +128,7 @@ pub mod runtime;
 pub mod schema_migration;
 pub mod security;
 pub mod self_system;
-#[allow(dead_code)]
 pub mod service;
-#[allow(dead_code)]
 pub mod session_worker;
 pub mod skillforge;
 pub mod skills;
@@ -331,6 +332,13 @@ pub enum CronCommands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Mark a scheduled task as the operator's own (created before PRX
+    /// recorded who creates jobs): its shell command may then run git,
+    /// hardened. Jobs the agent created stay refused.
+    MarkOperator {
+        /// Task ID
+        id: String,
+    },
     /// Pause a scheduled task
     Pause {
         /// Task ID
@@ -367,6 +375,9 @@ pub enum XinCommands {
         #[arg(long, default_value_t = 0)]
         interval_secs: u64,
     },
+    /// Mark a task as the operator's own (created before PRX recorded who
+    /// creates tasks): its shell command may then run git, hardened.
+    MarkOperator { id: String },
     /// Update editable task fields.
     Update {
         id: String,
@@ -497,6 +508,7 @@ mod module_ownership_tests {
             "mod agent;",
             "mod approval;",
             "mod auth;",
+            "mod causal_cli;",
             "mod causal_tree;",
             "mod channels;",
             "mod chat;",

@@ -465,6 +465,8 @@ mod tests {
             current_chat_type: ChatType::Dm,
             raw_sender: String::new(),
             acl_enforced: true,
+            owner_id: None,
+            require_owner_match: false,
         }
     }
 

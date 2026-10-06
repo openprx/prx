@@ -1,9 +1,13 @@
+pub mod credential_slots;
 pub(crate) mod deprecations;
 pub mod files;
 pub mod generation;
 pub mod hotreload;
 pub mod init;
+pub mod manage;
+pub mod mcp_launch;
 pub mod schema;
+pub mod secret_paths;
 
 pub use generation::{
     ConfigApplyReport, ConfigGeneration, ConfigGenerationAuditEvent, ConfigGenerationAuditSink, ConfigGenerationId,
@@ -25,13 +29,14 @@ pub use schema::{
     MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, NodeServerConfig, NodesConfig,
     ObservabilityConfig, OllamaProviderConfig, OsPagingConfig, ProvidersConfig, ProxyConfig, ProxyScope,
     QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig, RetrievalInjectionRole, RouterConfig,
-    RouterModelConfig, RuntimeConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig,
-    SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
+    RouterModelConfig, RuntimeConfig, SchedulerConfig, ScopeConfig, ScopeDefault, ScopeRule, SecretsConfig,
+    SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
     TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig, WacliConfig, WebSearchConfig,
-    WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder, bootstrap_max_blocking_threads,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, process_config_dir, resolve_init_target_dir,
-    runtime_proxy_config, set_process_config_dir,
+    WebhookConfig, WhatsAppConfig, WorkspaceHooks, WorkspaceMcpServers, apply_runtime_proxy_to_builder,
+    bootstrap_max_blocking_threads, build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts,
+    default_openprx_dir, expand_home, platform_config_dir, process_config_dir, resolve_init_target_dir,
+    runtime_proxy_config, runtime_proxy_generation, set_process_config_dir, user_home_dir,
 };
 
 #[cfg(test)]

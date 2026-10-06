@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::schema_migration;
 use anyhow::{Context, Result, bail};
-use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::fs;
@@ -449,9 +448,7 @@ fn resolve_openclaw_workspace(source: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(src);
     }
 
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
 
     Ok(home.join(".openclaw").join("workspace"))
 }

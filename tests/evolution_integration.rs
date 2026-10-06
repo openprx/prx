@@ -2,10 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use openprx::self_system::evolution::{
-    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState, DataBasis,
-    DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig,
+    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState, CommitDecision,
+    DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig,
     EvolutionEngine, EvolutionLayer, EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger,
-    JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
+    FileChange, JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
     RollbackManager, TaskType, with_trace,
 };
 use openprx::self_system::evolution::{
@@ -100,7 +100,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
 
     let report = pipeline
         .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, &mut engine, now)
@@ -150,7 +150,7 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
 
     let report = pipeline
         .run_for_layer(
@@ -199,7 +199,7 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
 
     let report = pipeline
         .run_for_layer(
@@ -229,7 +229,7 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
     tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, None)?;
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
 
     let mut target = BTreeMap::new();
     target.insert("task_type".to_string(), "planning".to_string());
@@ -256,14 +256,17 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
     Ok(())
 }
 
-struct RollbackTriggerEngine {
+/// Proposes rewriting `target.toml` (D-046: engines propose, the pipeline
+/// writes after an accepted verdict).
+struct ProposingEngine {
+    workspace: std::path::PathBuf,
     target_path: std::path::PathBuf,
 }
 
 #[async_trait]
-impl EvolutionEngine for RollbackTriggerEngine {
+impl EvolutionEngine for ProposingEngine {
     fn name(&self) -> &'static str {
-        "rollback_trigger_engine"
+        "proposing_engine"
     }
 
     fn layer(&self) -> EvolutionLayer {
@@ -313,7 +316,7 @@ impl EvolutionEngine for RollbackTriggerEngine {
                     delta: Some(-0.1),
                     notes: "unsafe violation timeout".to_string(),
                 },
-                outcome: CycleOutcome::Applied,
+                outcome: CycleOutcome::NoAction,
                 alert: None,
                 errors: Vec::new(),
             },
@@ -335,21 +338,29 @@ impl EvolutionEngine for RollbackTriggerEngine {
             }),
             needs_human_approval: false,
             shadow_mode: false,
+            pending: Some(Arc::new(FileChange::new(
+                self.workspace.clone(),
+                self.target_path.clone(),
+                "value = 99\n".to_string(),
+                RollbackManager::new(
+                    &self.workspace,
+                    &self.target_path,
+                    self.workspace.join(".evolution/rollback/memory"),
+                    5,
+                )?,
+            ))),
         })
     }
 }
 
+/// D-046: without an accepted verdict (here the built-in mock judge, which
+/// only ever defers) the proposed change is never written.
 #[tokio::test]
-async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
+async fn a_change_without_an_accepted_verdict_is_never_written() -> Result<()> {
     let dir = tempdir()?;
     let storage_root = dir.path().join("logs");
     let target = dir.path().join("target.toml");
     tokio::fs::write(&target, "value = 1\n").await?;
-
-    let rollback_dir = dir.path().join(".evolution/rollback/memory");
-    let manager = RollbackManager::new(dir.path(), &target, &rollback_dir, 5)?;
-    let _ = manager.backup_current_version().await?;
-    tokio::fs::write(&target, "value = 2\n").await?;
 
     let cfg = base_config(&storage_root);
     let writer = Arc::new(
@@ -375,7 +386,8 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
-    let mut engine = RollbackTriggerEngine {
+    let mut engine = ProposingEngine {
+        workspace: dir.path().to_path_buf(),
         target_path: target.clone(),
     };
 
@@ -388,10 +400,13 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
         )
         .await?;
 
-    assert!(report.rolled_back);
+    assert_eq!(report.commit, CommitDecision::Deferred, "{:?}", report.errors);
     assert!(matches!(
-        report.evolution_log.as_ref().map(|item| &item.change_type),
-        Some(ChangeType::Rollback)
+        report
+            .evolution_log
+            .as_ref()
+            .map(|item| (&item.change_type, &item.result)),
+        Some((ChangeType::Tune, Some(EvolutionResult::Deferred)))
     ));
     assert_eq!(tokio::fs::read_to_string(&target).await?, "value = 1\n");
     Ok(())

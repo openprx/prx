@@ -1,11 +1,20 @@
+use super::labels::{
+    BoundedLabel, COMPONENT_LABEL_CAP, channel_label, direction_label, model_label, provider_label, tool_label,
+};
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder,
 };
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
+///
+/// Every label value is bounded (OBS-LABELS, `observability::labels`):
+/// providers, tools, channels and directions map onto fixed sets, models onto
+/// the configured-model allowlist (D-059), and error components onto a capped
+/// set per observer, so no input can grow the number of series without bound.
 pub struct PrometheusObserver {
     registry: Registry,
+    component_labels: BoundedLabel,
 
     // Counters
     agent_starts: IntCounterVec,
@@ -26,9 +35,14 @@ pub struct PrometheusObserver {
     active_sessions: GaugeVec,
     queue_depth: GaugeVec,
 
-    // CTE metrics
-    cte_runs: IntCounterVec,
-    cte_extra_latency: Histogram,
+    // Decision-plane metrics (SP-CDP-A 5.11): bounded labels only (AG-11).
+    causal_decisions: IntCounterVec,
+    causal_failures: IntCounterVec,
+    causal_fallbacks: IntCounterVec,
+    causal_circuit_transitions: IntCounterVec,
+    causal_latency: HistogramVec,
+    causal_outcome_delay: Histogram,
+    causal_store_dropped: IntCounter,
 }
 
 impl PrometheusObserver {
@@ -101,24 +115,63 @@ impl PrometheusObserver {
         let queue_depth = GaugeVec::new(prometheus::Opts::new("prx_queue_depth", "Message queue depth"), &[])
             .map_err(|e| anyhow::anyhow!("failed to create queue_depth metric: {e}"))?;
 
-        let cte_runs = IntCounterVec::new(
-            prometheus::Opts::new("prx_cte_runs_total", "Total CTE pipeline runs"),
-            &["commit_succeeded", "circuit_breaker_tripped"],
+        let causal_decisions = IntCounterVec::new(
+            prometheus::Opts::new("prx_causal_decisions_total", "Decisions served, by backend and source"),
+            &["backend", "locality", "served_by"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create cte_runs metric: {e}"))?;
-
-        let cte_extra_latency = Histogram::with_opts(
+        .map_err(|e| anyhow::anyhow!("failed to create causal_decisions metric: {e}"))?;
+        let causal_failures = IntCounterVec::new(
+            prometheus::Opts::new(
+                "prx_causal_prediction_failures_total",
+                "Decision attempts that failed or were not made, by backend and error class",
+            ),
+            &["backend", "error_class"],
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create causal_failures metric: {e}"))?;
+        let causal_fallbacks = IntCounterVec::new(
+            prometheus::Opts::new("prx_causal_fallbacks_total", "Decisions that moved to the next backend"),
+            &["from", "to"],
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create causal_fallbacks metric: {e}"))?;
+        let causal_circuit_transitions = IntCounterVec::new(
+            prometheus::Opts::new(
+                "prx_causal_circuit_transitions_total",
+                "Decision backend circuit breaker transitions",
+            ),
+            &["backend", "state"],
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create causal_circuit_transitions metric: {e}"))?;
+        let causal_latency = HistogramVec::new(
             HistogramOpts::new(
-                "prx_cte_extra_latency_seconds",
-                "Extra latency from CTE pipeline in seconds",
+                "prx_causal_decision_latency_seconds",
+                "Decision attempt latency in seconds",
             )
-            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
+            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+            &["backend"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create cte_extra_latency metric: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create causal_latency metric: {e}"))?;
+        let causal_outcome_delay = Histogram::with_opts(
+            HistogramOpts::new(
+                "prx_causal_outcome_delay_seconds",
+                "Elapsed time from committed decision to a newly committed outcome",
+            )
+            .buckets(vec![0.01, 0.1, 1.0, 10.0, 60.0, 300.0, 3600.0, 86400.0]),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create causal_outcome_delay metric: {e}"))?;
+        let causal_store_dropped = IntCounter::new(
+            "prx_causal_store_dropped_total",
+            "Decision or outcome records the store's queue dropped",
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create causal_store_dropped metric: {e}"))?;
 
         // Register all metrics
-        registry.register(Box::new(cte_runs.clone())).ok();
-        registry.register(Box::new(cte_extra_latency.clone())).ok();
+        registry.register(Box::new(causal_decisions.clone())).ok();
+        registry.register(Box::new(causal_failures.clone())).ok();
+        registry.register(Box::new(causal_fallbacks.clone())).ok();
+        registry.register(Box::new(causal_circuit_transitions.clone())).ok();
+        registry.register(Box::new(causal_latency.clone())).ok();
+        registry.register(Box::new(causal_outcome_delay.clone())).ok();
+        registry.register(Box::new(causal_store_dropped.clone())).ok();
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(tool_batches.clone())).ok();
@@ -135,6 +188,7 @@ impl PrometheusObserver {
 
         Ok(Self {
             registry,
+            component_labels: BoundedLabel::new(COMPONENT_LABEL_CAP),
             agent_starts,
             tool_calls,
             tool_batches,
@@ -148,8 +202,13 @@ impl PrometheusObserver {
             tokens_used,
             active_sessions,
             queue_depth,
-            cte_runs,
-            cte_extra_latency,
+            causal_decisions,
+            causal_failures,
+            causal_fallbacks,
+            causal_circuit_transitions,
+            causal_latency,
+            causal_outcome_delay,
+            causal_store_dropped,
         })
     }
 
@@ -199,11 +258,74 @@ fn encode_families(families: &[prometheus::proto::MetricFamily]) -> String {
     }
 }
 
+impl PrometheusObserver {
+    /// A decision-plane event: counters and histograms with bounded labels
+    /// only; the lineage is never a label (AG-11).
+    fn record_causal(&self, event: &crate::decision::telemetry::CausalEvent) {
+        use crate::decision::telemetry::{CausalEventKind, IncompleteReason};
+        let fields = &event.fields;
+        let backend = fields.backend.map_or("none", crate::decision::BackendKind::as_str);
+        match event.kind {
+            CausalEventKind::SnapshotCreated
+            | CausalEventKind::CandidatesGenerated
+            | CausalEventKind::CandidateGated
+            | CausalEventKind::CandidateScored => {}
+            CausalEventKind::DecisionCommitted | CausalEventKind::DirectiveApplied => {}
+            CausalEventKind::OutcomeRecorded => {
+                if let Some(delay_ms) = fields.latency_ms {
+                    self.causal_outcome_delay
+                        .observe(std::time::Duration::from_millis(delay_ms).as_secs_f64());
+                }
+            }
+            CausalEventKind::PredictionStarted => {}
+            CausalEventKind::PredictionSucceeded => {
+                let locality = fields.locality.map_or("none", crate::decision::BackendLocality::as_str);
+                let served = fields
+                    .served
+                    .map_or("none", crate::decision::telemetry::ServedLabel::as_str);
+                self.causal_decisions
+                    .with_label_values(&[backend, locality, served])
+                    .inc();
+                if let Some(latency) = fields.latency_ms {
+                    self.causal_latency
+                        .with_label_values(&[backend])
+                        .observe(std::time::Duration::from_millis(latency).as_secs_f64());
+                }
+            }
+            CausalEventKind::PredictionFailed => {
+                self.causal_failures
+                    .with_label_values(&[backend, fields.error_class.unwrap_or("none")])
+                    .inc();
+            }
+            CausalEventKind::BackendFallback => {
+                let to = fields.to_backend.map_or("none", crate::decision::BackendKind::as_str);
+                self.causal_fallbacks.with_label_values(&[backend, to]).inc();
+            }
+            CausalEventKind::BackendCircuitOpened => {
+                let state = fields
+                    .circuit
+                    .map_or("none", crate::decision::telemetry::CircuitState::as_str);
+                self.causal_circuit_transitions
+                    .with_label_values(&[backend, state])
+                    .inc();
+            }
+            CausalEventKind::OutcomeIncomplete => {
+                if fields.incomplete == Some(IncompleteReason::StoreDropped) {
+                    self.causal_store_dropped.inc();
+                }
+            }
+        }
+    }
+}
+
 impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::AgentStart { provider, model } => {
-                self.agent_starts.with_label_values(&[provider, model]).inc();
+                let provider = provider_label(provider);
+                self.agent_starts
+                    .with_label_values(&[provider.as_str(), &model_label(model)])
+                    .inc();
             }
             ObserverEvent::AgentEnd {
                 provider,
@@ -213,8 +335,9 @@ impl Observer for PrometheusObserver {
                 cost_usd: _,
             } => {
                 // Agent duration is recorded via the histogram with provider/model labels
+                let provider = provider_label(provider);
                 self.agent_duration
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[provider.as_str(), &model_label(model)])
                     .observe(duration.as_secs_f64());
                 if let Some(t) = tokens_used {
                     self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
@@ -230,9 +353,10 @@ impl Observer for PrometheusObserver {
                 success,
             } => {
                 let success_str = if *success { "true" } else { "false" };
-                self.tool_calls.with_label_values(&[tool.as_str(), success_str]).inc();
+                let tool = tool_label(tool);
+                self.tool_calls.with_label_values(&[tool, success_str]).inc();
                 self.tool_duration
-                    .with_label_values(&[tool.as_str()])
+                    .with_label_values(&[tool])
                     .observe(duration.as_secs_f64());
             }
             ObserverEvent::ToolBatch {
@@ -244,24 +368,19 @@ impl Observer for PrometheusObserver {
                 self.tool_batch_size.observe(*batch_size as f64);
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
-                self.channel_messages.with_label_values(&[channel, direction]).inc();
+                self.channel_messages
+                    .with_label_values(&[channel_label(channel), direction_label(direction)])
+                    .inc();
             }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.inc();
             }
             ObserverEvent::Error { component, message: _ } => {
-                self.errors.with_label_values(&[component]).inc();
+                self.errors
+                    .with_label_values(&[self.component_labels.label(component)])
+                    .inc();
             }
-            ObserverEvent::CteRun {
-                commit_succeeded,
-                circuit_breaker_tripped,
-                ..
-            } => {
-                let committed = if *commit_succeeded { "true" } else { "false" };
-                let cb_tripped = if *circuit_breaker_tripped { "true" } else { "false" };
-                self.cte_runs.with_label_values(&[committed, cb_tripped]).inc();
-                // Latency is recorded via record_metric(CteExtraLatency) to avoid double-counting.
-            }
+            ObserverEvent::Causal(event) => self.record_causal(event),
         }
     }
 
@@ -278,9 +397,6 @@ impl Observer for PrometheusObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.with_label_values(&[] as &[&str]).set(*d as f64);
-            }
-            ObserverMetric::CteExtraLatency(d) => {
-                self.cte_extra_latency.observe(d.as_secs_f64());
             }
         }
     }
@@ -299,6 +415,94 @@ impl Observer for PrometheusObserver {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// CDP-08: each causal kind lands on its metric with enum labels only;
+    /// the lineage and the configured model are never labels.
+    #[test]
+    fn causal_events_land_on_their_metrics() {
+        use crate::decision::telemetry::{
+            CausalEvent, CausalEventFields, CausalEventKind, CausalLineage, CircuitState, IncompleteReason, ServedLabel,
+        };
+        use crate::decision::{BackendKind, BackendLocality};
+        let obs = PrometheusObserver::try_new().expect("test: observer");
+        let lineage = CausalLineage {
+            workspace_id: "WORKSPACE-SENTINEL".into(),
+            session_key: Some("SESSION-SENTINEL".into()),
+            ..CausalLineage::default()
+        };
+        let backend = CausalEventFields {
+            backend: Some(BackendKind::CompatibleHttp),
+            locality: Some(BackendLocality::Loopback),
+            configured_model: Some("MODEL-SENTINEL".into()),
+            ..CausalEventFields::default()
+        };
+        let emit = |kind, fields: CausalEventFields| {
+            obs.record_event(&ObserverEvent::Causal(Box::new(CausalEvent {
+                kind,
+                lineage: lineage.clone(),
+                fields,
+            })));
+        };
+        emit(CausalEventKind::PredictionStarted, backend.clone());
+        emit(
+            CausalEventKind::PredictionSucceeded,
+            CausalEventFields {
+                served: Some(ServedLabel::Fallback),
+                latency_ms: Some(40),
+                ..backend.clone()
+            },
+        );
+        emit(
+            CausalEventKind::PredictionFailed,
+            CausalEventFields {
+                error_class: Some("transport"),
+                ..backend.clone()
+            },
+        );
+        emit(
+            CausalEventKind::BackendFallback,
+            CausalEventFields {
+                to_backend: Some(BackendKind::Builtin),
+                ..backend.clone()
+            },
+        );
+        emit(
+            CausalEventKind::BackendCircuitOpened,
+            CausalEventFields {
+                circuit: Some(CircuitState::OpenForGeneration),
+                ..backend
+            },
+        );
+        emit(
+            CausalEventKind::OutcomeIncomplete,
+            CausalEventFields {
+                incomplete: Some(IncompleteReason::StoreDropped),
+                ..CausalEventFields::default()
+            },
+        );
+        emit(
+            CausalEventKind::OutcomeRecorded,
+            CausalEventFields {
+                latency_ms: Some(125),
+                ..CausalEventFields::default()
+            },
+        );
+        let text = obs.encode();
+        for expected in [
+            r#"prx_causal_decisions_total{backend="compatible_http",locality="loopback",served_by="fallback"} 1"#,
+            r#"prx_causal_prediction_failures_total{backend="compatible_http",error_class="transport"} 1"#,
+            r#"prx_causal_fallbacks_total{from="compatible_http",to="builtin"} 1"#,
+            r#"prx_causal_circuit_transitions_total{backend="compatible_http",state="open_for_generation"} 1"#,
+            r#"prx_causal_decision_latency_seconds_count{backend="compatible_http"} 1"#,
+            "prx_causal_store_dropped_total 1",
+            "prx_causal_outcome_delay_seconds_count 1",
+        ] {
+            assert!(text.contains(expected), "{expected} missing: {text}");
+        }
+        for sentinel in ["WORKSPACE-SENTINEL", "SESSION-SENTINEL", "MODEL-SENTINEL"] {
+            assert!(!text.contains(sentinel), "{sentinel} became a label: {text}");
+        }
+    }
 
     #[test]
     fn prometheus_observer_name() {
@@ -349,22 +553,6 @@ mod tests {
             component: "provider".into(),
             message: "timeout".into(),
         });
-        obs.record_event(&ObserverEvent::CteRun {
-            branch_count: 3,
-            chosen_branch: "branch-1".into(),
-            chosen_label: "DirectAnswer".into(),
-            extra_latency_ms: 42,
-            commit_succeeded: true,
-            circuit_breaker_tripped: false,
-        });
-        obs.record_event(&ObserverEvent::CteRun {
-            branch_count: 0,
-            chosen_branch: String::new(),
-            chosen_label: String::new(),
-            extra_latency_ms: 0,
-            commit_succeeded: false,
-            circuit_breaker_tripped: true,
-        });
     }
 
     #[test]
@@ -375,7 +563,6 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(3));
         obs.record_metric(&ObserverMetric::QueueDepth(42));
-        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(30)));
     }
 
     #[test]
@@ -456,6 +643,111 @@ mod tests {
         let output = obs.encode();
         assert!(output.contains(r#"prx_errors_total{component="provider"} 2"#));
         assert!(output.contains(r#"prx_errors_total{component="channels"} 1"#));
+    }
+
+    /// The number of series one metric family holds after `gather`.
+    fn series_count(obs: &PrometheusObserver, family: &str) -> usize {
+        obs.registry
+            .gather()
+            .iter()
+            .find(|metric_family| metric_family.name() == family)
+            .map_or(0, |metric_family| metric_family.get_metric().len())
+    }
+
+    /// OBS-LABELS (D-040 OQ-A12, X-7): labels come from free text, so every
+    /// distinct `custom:` endpoint and every model string used to open a new
+    /// series. A thousand turns against a thousand endpoints must stay a
+    /// bounded number of series; a catalog provider keeps its canonical name.
+    #[test]
+    fn agent_labels_stay_bounded_for_free_text_providers_and_models() {
+        let obs = PrometheusObserver::try_new().unwrap();
+        for i in 0..1_000 {
+            obs.record_event(&ObserverEvent::AgentStart {
+                provider: format!("custom:http://h{i}/v1"),
+                model: format!("model-{i}-{}", i * 7919),
+            });
+            obs.record_event(&ObserverEvent::AgentEnd {
+                provider: format!("anthropic-custom:https://gw{i}.example/v1"),
+                model: format!("m{i}"),
+                duration: Duration::from_millis(5),
+                tokens_used: None,
+                cost_usd: None,
+            });
+        }
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "OpenAI".into(),
+            model: "gpt-4o".into(),
+        });
+
+        let starts = series_count(&obs, "prx_agent_starts_total");
+        let durations = series_count(&obs, "prx_agent_duration_seconds");
+        assert!(starts <= 4, "prx_agent_starts_total holds {starts} series");
+        assert!(durations <= 4, "prx_agent_duration_seconds holds {durations} series");
+
+        let output = obs.encode();
+        assert!(
+            !output.contains("h999"),
+            "a custom endpoint URL must not become a label value"
+        );
+        assert!(
+            output.contains(r#"prx_agent_starts_total{model="unlisted",provider="custom"}"#),
+            "a model the configuration does not name is `unlisted` (D-059): {output}"
+        );
+        assert!(!output.contains("model-999"), "{output}");
+        assert!(
+            output.contains(r#"provider="openai""#),
+            "a catalog provider keeps its canonical name"
+        );
+    }
+
+    /// OBS-LABELS: a tool name is whatever the model asked for, so an
+    /// invented name used to open a series. Registered names stay, an MCP
+    /// alias is `mcp`, a skill alias is `skill`, anything else is `other`;
+    /// channel, direction and component values are bounded the same way.
+    #[test]
+    fn tool_channel_and_component_labels_stay_bounded() {
+        let obs = PrometheusObserver::try_new().unwrap();
+        for i in 0..500 {
+            obs.record_event(&ObserverEvent::ToolCall {
+                tool: format!("hallucinated_tool_{i}"),
+                duration: Duration::from_millis(1),
+                success: i % 2 == 0,
+            });
+            obs.record_event(&ObserverEvent::ChannelMessage {
+                channel: format!("chan-{i}"),
+                direction: format!("dir-{i}"),
+            });
+            obs.record_event(&ObserverEvent::Error {
+                component: format!("component-{i}"),
+                message: "boom".into(),
+            });
+        }
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "mcp__docs__search".into(),
+            duration: Duration::from_millis(1),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "skill__demo__run".into(),
+            duration: Duration::from_millis(1),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::ChannelMessage {
+            channel: "telegram".into(),
+            direction: "inbound".into(),
+        });
+
+        assert!(series_count(&obs, "prx_tool_calls_total") <= 8);
+        assert!(series_count(&obs, "prx_tool_duration_seconds") <= 4);
+        assert!(series_count(&obs, "prx_channel_messages_total") <= 4);
+        assert!(series_count(&obs, "prx_errors_total") <= 40);
+
+        let output = obs.encode();
+        assert!(!output.contains("hallucinated_tool_"), "{output}");
+        assert!(output.contains(r#"prx_tool_calls_total{success="true",tool="mcp"} 1"#));
+        assert!(output.contains(r#"prx_tool_calls_total{success="true",tool="skill"} 1"#));
+        assert!(output.contains(r#"prx_channel_messages_total{channel="telegram",direction="inbound"} 1"#));
+        assert!(output.contains(r#"prx_channel_messages_total{channel="other",direction="other"} 500"#));
     }
 
     #[test]

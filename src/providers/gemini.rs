@@ -10,9 +10,7 @@ use crate::providers::traits::{
 };
 use crate::providers::utf8_stream::SseTextDecoder;
 use crate::tools::ToolSpec;
-use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
-use directories::UserDirs;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -327,7 +325,7 @@ impl GeminiProvider {
 
     /// Get the Gemini CLI config directory (~/.gemini)
     fn gemini_cli_dir() -> Option<PathBuf> {
-        UserDirs::new().map(|u| u.home_dir().join(".gemini"))
+        crate::config::user_home_dir().map(|home| home.join(".gemini"))
     }
 
     /// Check if Gemini CLI is configured and has valid credentials
@@ -631,18 +629,32 @@ impl GeminiProvider {
         }
     }
 
-    fn native_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<GeminiToolGroup>> {
-        let declarations = tools?
-            .iter()
-            .map(|tool| GeminiFunctionDeclaration {
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn native_tools(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<Vec<GeminiToolGroup>>> {
+        let Some(items) = tools else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut declarations = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "gemini".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            declarations.push(GeminiFunctionDeclaration {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: SchemaCleanr::clean_for_gemini(tool.parameters.clone()),
-            })
-            .collect::<Vec<_>>();
-        (!declarations.is_empty()).then_some(vec![GeminiToolGroup {
+                parameters: parameters.into_owned(),
+            });
+        }
+        Ok((!declarations.is_empty()).then_some(vec![GeminiToolGroup {
             function_declarations: declarations,
-        }])
+        }]))
     }
 
     fn parse_response(result: GenerateContentResponse) -> anyhow::Result<ChatResponse> {
@@ -728,7 +740,7 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
-            tools: Self::native_tools(tools),
+            tools: self.native_tools(tools)?,
         };
 
         let url = Self::build_generate_content_url(model, auth);
@@ -740,7 +752,7 @@ impl GeminiProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = super::read_error_body(response).await;
             anyhow::bail!("Gemini API error ({status}): {error_text}");
         }
 
@@ -836,7 +848,13 @@ fn drain_gemini_chunk(
 ) -> StreamResult<Vec<StreamChunk>> {
     let effective = chunk.into_effective_response();
     if let Some(err) = effective.error {
-        return Err(StreamError::Provider(err.message));
+        // Prefixed like every other upstream error, so an upstream message can
+        // never read as one of PRX's own (a tool-schema refusal starts the
+        // message; D-069 L-2).
+        return Err(StreamError::Provider(format!(
+            "Gemini stream error: {}",
+            super::sanitize_api_error(&err.message)
+        )));
     }
     let usage = GeminiProvider::usage_metadata_to_reported(effective.usage_metadata.as_ref());
     let mut out: Vec<StreamChunk> = Vec::new();
@@ -914,18 +932,25 @@ impl Provider for GeminiProvider {
         }
     }
 
-    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
-        let function_declarations = tools
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": SchemaCleanr::clean_for_gemini(tool.parameters.clone()),
-                })
-            })
-            .collect();
-        ToolsPayload::Gemini { function_declarations }
+    fn convert_tools(&self, tools: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
+        let dialect = self.tool_schema_dialect();
+        let mut function_declarations = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "gemini".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            function_declarations.push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": parameters,
+            }));
+        }
+        Ok(ToolsPayload::Gemini { function_declarations })
     }
 
     async fn chat_with_system(
@@ -997,6 +1022,7 @@ impl Provider for GeminiProvider {
             }],
             final_provider: "gemini".to_string(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used,
         })
     }
@@ -1089,6 +1115,15 @@ impl Provider for GeminiProvider {
         };
 
         let (system_instruction, contents) = Self::convert_messages(messages);
+        // Lowered before the connection is opened, so a tool this endpoint
+        // cannot be offered ends the turn with the reason, not an upstream 400.
+        let tools = match self.native_tools(options.tools.as_deref()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let request_body = GenerateContentRequest {
             contents,
             system_instruction,
@@ -1096,7 +1131,7 @@ impl Provider for GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
-            tools: Self::native_tools(options.tools.as_deref()),
+            tools,
         };
 
         let url = Self::build_stream_url(model, auth);
@@ -1330,7 +1365,9 @@ mod tests {
                 temperature: 0.0,
                 max_output_tokens: 8192,
             },
-            tools: GeminiProvider::native_tools(Some(&tools)),
+            tools: GeminiProvider::new(Some("test-api-key"))
+                .native_tools(Some(&tools))
+                .expect("test: tools convert"),
         };
 
         let json = serde_json::to_value(request).unwrap();
@@ -1356,14 +1393,19 @@ mod tests {
             }),
         }];
 
-        let native = GeminiProvider::native_tools(Some(&tools)).unwrap();
+        let native = GeminiProvider::new(Some("test-api-key"))
+            .native_tools(Some(&tools))
+            .expect("test: tools convert")
+            .expect("test: tools present");
         let native_schema = &native[0].function_declarations[0].parameters;
         assert_eq!(native_schema["required"], serde_json::json!(["value"]));
         assert!(native_schema["properties"]["value"].get("minLength").is_none());
         assert!(native_schema.get("additionalProperties").is_none());
 
         let provider = GeminiProvider::new(Some("test-api-key"));
-        let ToolsPayload::Gemini { function_declarations } = provider.convert_tools(&tools) else {
+        let ToolsPayload::Gemini { function_declarations } =
+            provider.convert_tools(&tools).expect("test: tools convert")
+        else {
             panic!("Gemini provider returned a non-Gemini tool payload");
         };
         let converted_schema = &function_declarations[0]["parameters"];
@@ -1478,7 +1520,7 @@ mod tests {
     fn gemini_cli_dir_returns_path() {
         let dir = GeminiProvider::gemini_cli_dir();
         // Should return Some on systems with home dir
-        if UserDirs::new().is_some() {
+        if crate::config::user_home_dir().is_some() {
             assert!(dir.is_some());
             assert!(dir.unwrap().ends_with(".gemini"));
         }
@@ -2053,5 +2095,26 @@ mod tests {
             auth: Some(GeminiAuth::ExplicitKey("k".into())),
         };
         assert!(provider.supports_streaming());
+    }
+
+    /// D-069 L-2: an upstream in-stream error that begins like PRX's own
+    /// tool-schema refusal is not taken for one: it carries the provider
+    /// prefix. Before, the message was passed through verbatim.
+    #[test]
+    fn an_upstream_stream_error_cannot_pose_as_a_refusal() {
+        let record = format!(
+            "data: {}\n\n",
+            serde_json::json!({"error": {"message": "provider_capability_error provider=x capability=tool_schema_dialect message=tool_schema_dialect refused 1 tool(s) for a 'raw' endpoint: shell[allOf]. Nothing was sent"}})
+        );
+        let parsed = parse_gemini_sse_record(&record)
+            .expect("parse ok")
+            .expect("payload present");
+        let mut tool_order: usize = 0;
+        let err = drain_gemini_chunk(parsed, &mut tool_order, false).expect_err("error chunk");
+        let StreamError::Provider(message) = err else {
+            panic!("expected a provider error");
+        };
+        assert!(message.starts_with("Gemini stream error: "), "{message}");
+        assert!(!crate::providers::is_tool_schema_refusal_text(&message), "{message}");
     }
 }

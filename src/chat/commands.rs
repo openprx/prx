@@ -21,7 +21,7 @@ use serde::Serialize;
 // Re-export `ChatMode` from the lib crate so the chat slash-command parser
 // and the tool-execution loop share the same type without crossing the
 // lib/bin module boundary.
-pub use crate::agent::loop_::ChatMode;
+pub use crate::agent::turn_contracts::ChatMode;
 
 /// Outcome of a slash-command dispatch.
 pub enum CommandResult {
@@ -434,10 +434,31 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg: NO_ARG,
     },
     CommandSpec {
+        name: "/resume-decision",
+        aliases: &[],
+        args_hint: "<uuid>",
+        description: "Explicitly resume an approved stored call in this chat",
+        arg: NO_ARG,
+    },
+    CommandSpec {
+        name: "/approval",
+        aliases: &[],
+        args_hint: "--decision <uuid>",
+        description: "Inspect a pending causal decision in this chat",
+        arg: NO_ARG,
+    },
+    CommandSpec {
+        name: "/revoke",
+        aliases: &[],
+        args_hint: "--decision <uuid>",
+        description: "Revoke a causal decision approval in this chat",
+        arg: NO_ARG,
+    },
+    CommandSpec {
         name: "/approve",
         aliases: &[],
         args_hint: "<id>",
-        description: "Approve a child session approval gate",
+        description: "Approve a child session or displayed decision number; --decision <uuid> selects an explicit decision",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },
@@ -446,7 +467,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         name: "/deny",
         aliases: &[],
         args_hint: "<id>",
-        description: "Deny a child session approval gate",
+        description: "Deny a child session or displayed decision number; --decision <uuid> selects an explicit decision",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },
@@ -495,7 +516,10 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/cost" => CommandResult::HandledWithOutput(format_cost_feedback(ctx.chat_session)),
         "/workers" => CommandResult::HandledWithOutput("No main provider workers are active.".to_string()),
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
-        "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
+        "/provider" => CommandResult::HandledWithOutput(format!(
+            "Current provider: {}",
+            crate::providers::redact_endpoint_userinfo(ctx.provider_name)
+        )),
         "/resume" => CommandResult::ResumeAction(ResumeCommand::List),
         _ if input.starts_with("/resume ") => {
             let raw = input["/resume ".len()..].trim();
@@ -546,7 +570,10 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
                 .split_whitespace()
                 .next()
                 .unwrap_or_default();
-            CommandResult::HandledWithOutput(format!("Switching provider to {new_provider}…"))
+            CommandResult::HandledWithOutput(format!(
+                "Switching provider to {}…",
+                crate::providers::redact_endpoint_userinfo(new_provider)
+            ))
         }
         _ if input.starts_with("/memory ") => {
             let query = input["/memory ".len()..].trim();
@@ -689,7 +716,11 @@ pub async fn handle_clear(mem: &dyn Memory, _session_id: Option<&str>) -> u32 {
 
 /// Export a chat session to a file (Markdown or JSON).
 fn export_session(session: &session::ChatSession, format: &str) -> Result<String> {
-    let safe_session = super::sanitize::sanitize_session_content(session);
+    let mut safe_session = super::sanitize::sanitize_session_content(session);
+    // An export leaves the machine; a `custom:` URL may carry `user:password@`.
+    if let std::borrow::Cow::Owned(provider) = crate::providers::redact_endpoint_userinfo(&safe_session.provider) {
+        safe_session.provider = provider;
+    }
     let session = &safe_session;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let ext = match format {
@@ -873,13 +904,16 @@ mod mode_tests {
     use super::{ChatMode, CommandResult, ResumeCommand};
     use crate::memory::NoneMemory;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
-    use crate::tools::{Tool, ToolResult};
+    use crate::tools::Tool;
+    #[cfg(feature = "terminal-tui")]
+    use crate::tools::ToolResult;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
+    #[cfg(feature = "terminal-tui")]
     struct TestTool;
 
     struct ClearTestMemory {
@@ -998,6 +1032,7 @@ mod mode_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[async_trait]
     impl Tool for TestTool {
         fn name(&self) -> &str {
@@ -1756,5 +1791,32 @@ mod mode_tests {
             Some("[REDACTED]")
         );
         assert_eq!(args.get("count").and_then(serde_json::Value::as_i64), Some(2));
+    }
+
+    /// USERINFO-2: `/provider` and `/export` name the provider; a `custom:`
+    /// URL may carry `user:password@`.
+    #[tokio::test]
+    async fn provider_feedback_and_export_name_the_provider_without_url_userinfo() {
+        const LABEL: &str = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new(LABEL, "fixture-model");
+        let ctx = CommandContext {
+            model_name: "fixture-model",
+            provider_name: LABEL,
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+        let mut rendered = vec![
+            command_output(super::dispatch("/provider", &ctx).await),
+            command_output(super::dispatch(&format!("/provider {LABEL}"), &ctx).await),
+        ];
+        rendered.push(export_session_body_in_unique_tempdir(&session, "md"));
+        rendered.push(export_session_body_in_unique_tempdir(&session, "json"));
+        for text in rendered {
+            assert!(text.contains("[redacted]@127.0.0.1:1"), "{text}");
+            assert!(!text.contains("SECRET-fixture-pw"), "{text}");
+        }
     }
 }

@@ -4,16 +4,14 @@ use crate::self_system::evolution::FitnessTrend;
 use crate::self_system::evolution::analyzer::{
     CandidatePriority, DailyDigest, EvolutionAnalyzer, EvolutionCandidate, TrendAnalysis,
 };
+use crate::self_system::evolution::commit::CommitTracker;
 use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::EvolutionEngine;
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, JudgeResult, JudgeScoringModel, MockJudgeModel};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
-use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::run_engine_cycle;
-use crate::self_system::evolution::safety_utils::{
-    acquire_file_lock, resolve_path_in_workspace, validate_path_in_workspace,
-};
+use crate::self_system::evolution::safety_utils::acquire_file_lock;
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
 use crate::self_system::fitness_store::FitnessStore;
@@ -24,12 +22,55 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 
 const BACKFILL_DAYS: i64 = 3;
 /// Derived, append-only file holding inferred outcomes for stale evolution logs.
 /// Backfill writes here instead of mutating the source evolution JSONL in place,
 /// preserving the append-only invariant of the primary audit log.
 const RESULT_HISTORY_FILE: &str = "result_history.jsonl";
+/// Default bound on one evolution judge call (D-044). The provider stack has
+/// no whole-response timeout, so without it a stalled judge would hold an
+/// applied change unjudged for as long as the connection stays open.
+pub const DEFAULT_JUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
+
+/// What became of a cycle's verdict.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeOutcome {
+    /// No cycle ran, so nothing was judged.
+    #[default]
+    NotRun,
+    /// A model judge scored the cycle.
+    Scored,
+    /// Only the mock scorer was available; the verdict was deferred.
+    Degraded,
+    /// The model judge gave no verdict (error, unparseable reply, timeout or
+    /// cancellation); the verdict was deferred.
+    Failed,
+}
+
+/// What the pipeline did with the change a cycle proposed (D-046). An
+/// engine never writes its target: the change is written only after an
+/// accepted verdict.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitDecision {
+    /// The cycle proposed nothing to write (DraftOnly, Shadow, a refused
+    /// gate, a change that needs human approval).
+    #[default]
+    NothingProposed,
+    /// A model judge accepted the change and it was written.
+    Applied,
+    /// A model judge scored the change below the pass threshold; nothing was
+    /// written.
+    Rejected,
+    /// No verdict accepted the change in time (the judge failed or was only
+    /// the mock, or the run was cancelled or shut down); nothing was written.
+    Deferred,
+    /// The verdict accepted the change but writing it failed.
+    ApplyFailed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,12 +92,17 @@ pub struct PipelineRunReport {
     pub judge_result: Option<JudgeResult>,
     pub evolution_log: Option<EvolutionLog>,
     pub shadow_mode: bool,
-    pub rolled_back: bool,
+    /// What became of the proposed change (D-046).
+    #[serde(default)]
+    pub commit: CommitDecision,
     /// FIX-P0-40: `true` when the side-effect gate denied this layer's commit and
     /// the engine was therefore never executed (no config/strategy/prompt write,
     /// no `append_evolution`). Lets the scheduler/daemon distinguish "completed"
     /// from "skipped by gate" instead of treating a denial as a silent success.
     pub gate_denied: bool,
+    /// What became of the verdict; `Failed` and `Degraded` are deferrals.
+    #[serde(default)]
+    pub judge_outcome: JudgeOutcome,
     pub errors: Vec<String>,
 }
 
@@ -65,7 +111,11 @@ pub struct EvolutionPipeline {
     analyzer: Arc<EvolutionAnalyzer>,
     writer: Arc<AsyncJsonlWriter>,
     gate: EvolutionGate,
-    judge: JudgeEngine,
+    judge: Arc<JudgeEngine>,
+    judge_timeout: std::time::Duration,
+    /// Where verdict tasks run; the daemon passes the tracker it drains on
+    /// shutdown (D-046).
+    commits: CommitTracker,
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
     /// FIX-P0-40: optional side-effect gate enforced just before an evolution
@@ -111,7 +161,9 @@ impl EvolutionPipeline {
             analyzer,
             writer,
             gate: EvolutionGate::from_evolution_config(cfg.as_ref()),
-            judge,
+            judge: Arc::new(judge),
+            judge_timeout: DEFAULT_JUDGE_TIMEOUT,
+            commits: CommitTracker::default(),
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
             security_policy: None,
@@ -129,6 +181,23 @@ impl EvolutionPipeline {
     #[must_use]
     pub fn with_security_policy(mut self, policy: Arc<SecurityPolicy>) -> Self {
         self.security_policy = Some(policy);
+        self
+    }
+
+    /// Bound each judge call (D-044). A judge that has not answered when it
+    /// elapses gives no verdict (`judge_failed`), so an applied change is
+    /// rolled back.
+    #[must_use]
+    pub const fn with_judge_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.judge_timeout = timeout;
+        self
+    }
+
+    /// Run verdict tasks on `commits`, so whoever owns it can cancel and
+    /// await them (the daemon does, before it returns: D-046).
+    #[must_use]
+    pub fn with_commit_tracker(mut self, commits: CommitTracker) -> Self {
+        self.commits = commits;
         self
     }
 
@@ -221,8 +290,9 @@ impl EvolutionPipeline {
                 judge_result: None,
                 evolution_log: None,
                 shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
-                rolled_back: false,
+                commit: CommitDecision::NothingProposed,
                 gate_denied: false,
+                judge_outcome: JudgeOutcome::NotRun,
                 errors,
             });
         }
@@ -240,8 +310,9 @@ impl EvolutionPipeline {
                 judge_result: None,
                 evolution_log: None,
                 shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
-                rolled_back: false,
+                commit: CommitDecision::NothingProposed,
                 gate_denied: false,
+                judge_outcome: JudgeOutcome::NotRun,
                 errors,
             });
         };
@@ -274,8 +345,9 @@ impl EvolutionPipeline {
                 judge_result: None,
                 evolution_log: None,
                 shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
-                rolled_back: false,
+                commit: CommitDecision::NothingProposed,
                 gate_denied: true,
+                judge_outcome: JudgeOutcome::NotRun,
                 errors,
             });
         }
@@ -299,41 +371,37 @@ impl EvolutionPipeline {
         });
         evolution_log.experiment_id = experiment_id.clone();
 
-        let judge = self
-            .judge
-            .judge_task(
-                &experiment_id,
-                &cycle_result.cycle.id,
-                cycle_result
-                    .proposal
-                    .as_ref()
-                    .map_or("evolution_cycle", |item| item.summary.as_str()),
-                &cycle_result.cycle.validation.notes,
-            )
-            .await?;
-
-        let mut rolled_back = false;
-        if should_rollback(&judge, &cycle_result, self.judge.pass_threshold()) {
-            if let Err(err) = self.rollback_cycle(layer.clone(), cycle_result.proposal.as_ref()).await {
-                errors.push(format!("rollback_failed: {err}"));
-            } else {
-                rolled_back = true;
-            }
-            evolution_log.change_type = ChangeType::Rollback;
-            evolution_log.result = Some(EvolutionResult::Regressed);
-        } else {
-            evolution_log.result = match cycle_result.cycle.outcome {
-                crate::self_system::evolution::CycleOutcome::Applied => None,
-                crate::self_system::evolution::CycleOutcome::Failed => Some(EvolutionResult::Regressed),
-                _ => Some(EvolutionResult::Neutral),
-            };
+        // D-046: the engine has only proposed its change. Judging, the write
+        // an accepted verdict allows, and the log row run in a task that owns
+        // everything it needs. If this run is dropped, the drop guard cancels
+        // the task's token: the task stops waiting for the judge, writes
+        // nothing and records the cycle as deferred.
+        let stage = VerdictStage {
+            judge: Arc::clone(&self.judge),
+            writer: Arc::clone(&self.writer),
+            judge_timeout: self.judge_timeout,
+            layer: layer.clone(),
+            experiment_id: experiment_id.clone(),
+            cycle_result,
+            evolution_log,
+        };
+        // The task's token is cancelled when this run is dropped (the guard)
+        // and when the tracker is drained (daemon shutdown); the daemon waits
+        // for the task before it returns.
+        let cancel = self.commits.task_token();
+        let _cancel_when_dropped = cancel.clone().drop_guard();
+        let verdict = self
+            .commits
+            .spawn(stage.run(cancel))
+            .await
+            .map_err(|err| anyhow::anyhow!("evolution verdict task failed: {err}"))??;
+        errors.extend(verdict.errors);
+        if let Some(what) = verdict.cancelled {
+            // A drain (daemon shutdown) cancelled the task while this run
+            // still waited for it.
+            errors.push(format!("cancelled: the run was cancelled {what}"));
         }
 
-        // FIX-P0-40: the side-effect gate has already authorized this commit
-        // *before* the engine ran (see the fail-closed check above). The engine's
-        // own writes and this pipeline-level audit append therefore only happen on
-        // an allow decision; a denial returned early and never reached here.
-        self.writer.append_evolution(&evolution_log).await?;
         if let Err(err) = self.backfill_results(now).await {
             tracing::warn!(error = %err, "failed to backfill evolution results");
         }
@@ -346,35 +414,14 @@ impl EvolutionPipeline {
             trend,
             selected_candidate: Some(selected_candidate),
             gate_rejections,
-            judge_result: Some(judge),
-            evolution_log: Some(evolution_log),
-            shadow_mode: cycle_result.shadow_mode,
-            rolled_back,
+            judge_result: verdict.judge,
+            evolution_log: Some(verdict.evolution_log),
+            shadow_mode: verdict.shadow_mode,
+            commit: verdict.commit,
             gate_denied: false,
+            judge_outcome: verdict.outcome,
             errors,
         })
-    }
-
-    async fn rollback_cycle(
-        &self,
-        layer: EvolutionLayer,
-        proposal: Option<&crate::self_system::evolution::EvolutionProposal>,
-    ) -> Result<()> {
-        let Some(proposal) = proposal else {
-            return Ok(());
-        };
-
-        let raw_target = match &proposal.target {
-            crate::self_system::evolution::ChangeTarget::ConfigFile { path }
-            | crate::self_system::evolution::ChangeTarget::CronFile { path }
-            | crate::self_system::evolution::ChangeTarget::WorkspaceFile { path } => path,
-        };
-        let target_path = resolve_path_in_workspace(&self.workspace_root, Path::new(raw_target))?;
-
-        let rollback_dir = infer_rollback_dir(&self.workspace_root, &layer)?;
-        let max_versions = self.shared_config.load_full().rollback.max_versions;
-        let manager = RollbackManager::new(&self.workspace_root, &target_path, rollback_dir, max_versions)?;
-        manager.rollback_latest().await
     }
 
     /// Backfill inferred outcomes for stale evolution logs.
@@ -394,6 +441,7 @@ impl EvolutionPipeline {
 
         let mut pending: Vec<BackfillResultRecord> = Vec::new();
         let mut seen_this_run: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unreadable_files = 0u32;
 
         for tier in ["hot", "warm", "cold"] {
             let dir = root.join(tier);
@@ -407,7 +455,21 @@ impl EvolutionPipeline {
                     continue;
                 }
 
-                let raw = fs::read_to_string(&path).await?;
+                // An unreadable entry is skipped, like a malformed line; the
+                // experiments it holds are backfilled by a later run that can
+                // read it (each id is backfilled at most once).
+                let raw = match fs::read_to_string(&path).await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        unreadable_files = unreadable_files.saturating_add(1);
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "skipped an unreadable evolution file during backfill scan"
+                        );
+                        continue;
+                    }
+                };
                 let mut malformed_lines = 0u32;
                 for line in raw.lines().filter(|line| !line.trim().is_empty()) {
                     let parsed = match serde_json::from_str::<EvolutionLog>(line) {
@@ -450,6 +512,13 @@ impl EvolutionPipeline {
                     );
                 }
             }
+        }
+
+        if unreadable_files > 0 {
+            tracing::warn!(
+                unreadable_files,
+                "backfill scanned the evolution logs without the files that could not be read"
+            );
         }
 
         if !pending.is_empty() {
@@ -614,19 +683,266 @@ const fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
     }
 }
 
-fn should_rollback(
-    judge: &JudgeResult,
-    cycle_result: &crate::self_system::evolution::engine::CycleResult,
-    pass_threshold: f64,
-) -> bool {
-    matches!(
-        cycle_result.cycle.outcome,
-        crate::self_system::evolution::CycleOutcome::Applied
-    ) && judge.scores.overall() < pass_threshold
+/// Everything the verdict of one engine cycle needs, owned, so that it can
+/// finish in its own task when the run that started it is dropped.
+struct VerdictStage {
+    judge: Arc<JudgeEngine>,
+    writer: Arc<AsyncJsonlWriter>,
+    judge_timeout: std::time::Duration,
+    layer: EvolutionLayer,
+    experiment_id: String,
+    cycle_result: crate::self_system::evolution::engine::CycleResult,
+    evolution_log: EvolutionLog,
 }
 
-/// Stable short name for an evolution layer, used in gate operation ids and
-/// rollback directory paths.
+/// The verdict of one engine cycle, after any write and the log append.
+struct Verdict {
+    judge: Option<JudgeResult>,
+    outcome: JudgeOutcome,
+    commit: CommitDecision,
+    evolution_log: EvolutionLog,
+    shadow_mode: bool,
+    /// How the task ended when it was cancelled (R-PMMCi F-3).
+    cancelled: Option<&'static str>,
+    errors: Vec<String>,
+}
+
+impl VerdictStage {
+    /// Judge the proposal, write the change only if a model judge accepted
+    /// it, and record the cycle. `cancel` fires when the run that started
+    /// this stage is dropped: the judge is then abandoned, and nothing is
+    /// written.
+    async fn run(self, cancel: CancellationToken) -> Result<Verdict> {
+        let Self {
+            judge: judge_engine,
+            writer,
+            judge_timeout,
+            layer,
+            experiment_id,
+            cycle_result,
+            mut evolution_log,
+        } = self;
+        let mut errors = Vec::new();
+
+        let task = cycle_result
+            .proposal
+            .as_ref()
+            .map_or("evolution_cycle", |item| item.summary.as_str());
+        // A judge that fails at call time (provider error, reply outside the
+        // score schema), that does not answer within the timeout, or whose
+        // run is cancelled gives no verdict (D-035): nothing is written.
+        // R-PMMCi F-3: remember which branch won, so a later cancellation
+        // warning says what actually happened.
+        let cancelled_before_verdict;
+        let judged = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                cancelled_before_verdict = true;
+                Err(anyhow::anyhow!("the evolution run was cancelled before the judge answered"))
+            }
+            result = tokio::time::timeout(
+                judge_timeout,
+                judge_engine.judge_task(&experiment_id, &cycle_result.cycle.id, task, &cycle_result.cycle.validation.notes),
+            ) => {
+                cancelled_before_verdict = false;
+                result.unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("the judge call timed out after {}s", judge_timeout.as_secs()))
+                })
+            }
+        };
+        let judge = match judged {
+            Ok(judge) => Some(judge),
+            Err(err) => {
+                errors.push(format!(
+                    "judge_failed: the model judge gave no verdict ({err:#}), so the verdict is deferred and nothing \
+                     is written"
+                ));
+                tracing::warn!(
+                    target: "self_system",
+                    layer = ?layer,
+                    error = %format!("{err:#}"),
+                    "evolution judge failed: the cycle's verdict is deferred"
+                );
+                None
+            }
+        };
+
+        // D-035: a degraded (mock) judge cannot approve anything; its verdict
+        // is a deferral.
+        let mock_judge = judge_engine.is_degraded();
+        let outcome = if judge.is_none() {
+            JudgeOutcome::Failed
+        } else if mock_judge {
+            JudgeOutcome::Degraded
+        } else {
+            JudgeOutcome::Scored
+        };
+        if mock_judge {
+            errors.push(
+                "judge_degraded: no model judge is available, so the verdict is deferred and nothing is written"
+                    .to_string(),
+            );
+            tracing::warn!(
+                target: "self_system",
+                layer = ?layer,
+                "evolution judge is degraded: the cycle's verdict is deferred"
+            );
+        }
+        let accepted = outcome == JudgeOutcome::Scored
+            && judge
+                .as_ref()
+                .is_some_and(|judge| judge.scores.overall() >= judge_engine.pass_threshold());
+
+        let commit = match cycle_result.pending.as_ref() {
+            None => {
+                evolution_log.result = match cycle_result.cycle.outcome {
+                    crate::self_system::evolution::CycleOutcome::Applied => {
+                        // D-046: engines propose; one that wrote its target
+                        // itself broke the contract, and the pipeline cannot
+                        // undo it.
+                        errors.push(format!(
+                            "engine_wrote_before_verdict: the {layer:?} engine applied its change itself; engines \
+                             must return it as a pending change"
+                        ));
+                        None
+                    }
+                    crate::self_system::evolution::CycleOutcome::Failed => Some(EvolutionResult::Regressed),
+                    _ => Some(EvolutionResult::Neutral),
+                };
+                CommitDecision::NothingProposed
+            }
+            Some(_) if outcome != JudgeOutcome::Scored => {
+                evolution_log.result = Some(EvolutionResult::Deferred);
+                CommitDecision::Deferred
+            }
+            Some(_) if !accepted => {
+                evolution_log.result = Some(EvolutionResult::Rejected);
+                CommitDecision::Rejected
+            }
+            Some(_) if cancel.is_cancelled() => {
+                errors.push(
+                    "commit_cancelled: the run was cancelled after an accepted verdict and before the change was \
+                     written; nothing is written"
+                        .to_string(),
+                );
+                evolution_log.result = Some(EvolutionResult::Deferred);
+                CommitDecision::Deferred
+            }
+            Some(pending) => match pending.apply().await {
+                Ok(()) => {
+                    // Scored later by the fitness backfill.
+                    evolution_log.result = None;
+                    CommitDecision::Applied
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "apply_failed: the accepted change could not be written ({err:#})"
+                    ));
+                    evolution_log.result = Some(EvolutionResult::Deferred);
+                    CommitDecision::ApplyFailed
+                }
+            },
+        };
+
+        // FIX-P0-40: the side-effect gate has already authorized this commit
+        // *before* the engine ran; a denial returned early and never reached
+        // here.
+        // R-PMMCi F-2: the writer batches lines (64 in production) and
+        // nothing flushes it on a timer or on drop, so a row left in its
+        // buffer is lost with the generation. Evolution rows are rare: flush
+        // each one at once. Retention runs separately: its failure does not
+        // mean the row is missing.
+        let appended = match writer.append_evolution(&evolution_log).await {
+            Ok(()) => writer.flush_lines().await,
+            Err(err) => Err(err),
+        };
+        if appended.is_ok()
+            && let Err(err) = writer.enforce_retention().await
+        {
+            tracing::warn!(target: "self_system", error = %err, "evolution log retention failed");
+        }
+        let cancelled = cancel
+            .is_cancelled()
+            .then(|| cancellation_note(cancelled_before_verdict, outcome, commit));
+        if let Some(what) = cancelled {
+            // Nobody may await this task any more: the log line says what
+            // happened.
+            match &appended {
+                Ok(()) => tracing::warn!(
+                    target: "self_system",
+                    layer = ?layer,
+                    experiment_id = %experiment_id,
+                    commit = ?commit,
+                    errors = ?errors,
+                    "evolution run was cancelled {what}; the cycle is recorded"
+                ),
+                Err(err) => tracing::error!(
+                    target: "self_system",
+                    layer = ?layer,
+                    experiment_id = %experiment_id,
+                    commit = ?commit,
+                    errors = ?errors,
+                    error = %err,
+                    "evolution run was cancelled {what}, and its cycle could not be recorded"
+                ),
+            }
+        }
+        // R-PMMCj G-6: the commit decision stands whether or not its row
+        // could be written; a lost row is reported, not turned into a failed
+        // run that hides an applied change.
+        if let Err(err) = appended {
+            // R-PMMCk K-3: a run nobody cancelled has no other log line for
+            // this (the cancelled branch logged above).
+            if cancelled.is_none() {
+                tracing::error!(
+                    target: "self_system",
+                    layer = ?layer,
+                    experiment_id = %experiment_id,
+                    commit = ?commit,
+                    error = %err,
+                    "evolution cycle row could not be written; the commit decision stands"
+                );
+            }
+            errors.push(format!(
+                "record_failed: the cycle's evolution row could not be written ({err:#}); the commit decision \
+                 stands"
+            ));
+        }
+
+        Ok(Verdict {
+            judge,
+            outcome,
+            commit,
+            evolution_log,
+            shadow_mode: cycle_result.shadow_mode,
+            cancelled,
+            errors,
+        })
+    }
+}
+
+/// How a cancelled verdict task ended, for its warning (R-PMMCi F-3). It
+/// speaks of "its verdict" only when a model judge gave one (R-PMMCj G-5).
+fn cancellation_note(cancelled_before_verdict: bool, outcome: JudgeOutcome, commit: CommitDecision) -> &'static str {
+    if cancelled_before_verdict {
+        return "before the judge answered: nothing was written";
+    }
+    if outcome != JudgeOutcome::Scored {
+        return match commit {
+            CommitDecision::NothingProposed => "after the judge gave no verdict: the cycle proposed nothing to write",
+            _ => "after the judge gave no verdict: nothing was written",
+        };
+    }
+    match commit {
+        CommitDecision::Applied => "after its change was written: the change stands",
+        CommitDecision::Deferred => "after its verdict and before any write: nothing was written",
+        CommitDecision::Rejected => "after the judge rejected the change: nothing was written",
+        CommitDecision::ApplyFailed => "while its accepted change failed to be written: nothing was written",
+        CommitDecision::NothingProposed => "after its verdict: the cycle proposed nothing to write",
+    }
+}
+
+/// Stable short name for an evolution layer, used in gate operation ids.
 const fn layer_slug(layer: &EvolutionLayer) -> &'static str {
     match layer {
         EvolutionLayer::Memory => "memory",
@@ -635,15 +951,6 @@ const fn layer_slug(layer: &EvolutionLayer) -> &'static str {
         EvolutionLayer::Tooling => "tooling",
         EvolutionLayer::Runtime => "runtime",
     }
-}
-
-fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<PathBuf> {
-    let layer_name = layer_slug(layer);
-
-    validate_path_in_workspace(
-        workspace_root,
-        &Path::new(".evolution").join("rollback").join(layer_name),
-    )
 }
 
 /// Convert dedicated, publishable fitness snapshots into the trend carried by
@@ -847,13 +1154,14 @@ mod tests {
                         delta: Some(0.1),
                         notes: "success".to_string(),
                     },
-                    outcome: CycleOutcome::Applied,
+                    outcome: CycleOutcome::NoAction,
                     alert: None,
                     errors: Vec::new(),
                 },
                 evolution_log: None,
                 needs_human_approval: false,
                 shadow_mode: false,
+                pending: None,
             })
         }
     }
@@ -1016,7 +1324,9 @@ mod tests {
             if let Ok(mut rd) = fs::read_dir(&tier_dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     if entry.path().extension().and_then(|v| v.to_str()) == Some("jsonl") {
-                        let raw = fs::read_to_string(entry.path()).await.unwrap_or_default();
+                        let raw = fs::read_to_string(entry.path())
+                            .await
+                            .expect("test: read an evolution jsonl file");
                         if !raw.trim().is_empty() {
                             appended = true;
                         }
@@ -1033,6 +1343,1166 @@ mod tests {
                 .iter()
                 .any(|rejection| rejection.reason == "side_effect_gate_denied"),
             "a structured side_effect_gate_denied rejection must be recorded"
+        );
+    }
+
+    /// An engine that behaves like the real ones in Auto mode (D-046): it
+    /// proposes rewriting `evolution_config.toml` and leaves the write to the
+    /// pipeline.
+    struct ProposingEngine {
+        workspace: PathBuf,
+    }
+
+    #[async_trait]
+    impl EvolutionEngine for ProposingEngine {
+        fn name(&self) -> &'static str {
+            "proposing"
+        }
+
+        fn layer(&self) -> EvolutionLayer {
+            EvolutionLayer::Memory
+        }
+
+        async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+            let target = self.workspace.join("evolution_config.toml");
+            let backup = crate::self_system::evolution::rollback::RollbackManager::new(
+                &self.workspace,
+                &target,
+                self.workspace.join(".evolution/rollback/memory"),
+                5,
+            )?;
+            let mut result = MockEngine.run_cycle(input).await?;
+            result.pending = Some(Arc::new(crate::self_system::evolution::FileChange::new(
+                self.workspace.clone(),
+                target,
+                "changed by the engine".to_string(),
+                backup,
+            )));
+            Ok(result)
+        }
+    }
+
+    /// A real judge that scores every proposal `score`.
+    struct ScoringJudge(f64);
+
+    #[async_trait]
+    impl JudgeScoringModel for ScoringJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            let score = self.0;
+            Ok(format!(
+                "{{\"task_completion\":{score},\"correctness\":{score},\"efficiency\":{score},\
+                 \"safety_compliance\":{score},\"reasoning\":\"test verdict\"}}"
+            ))
+        }
+    }
+
+    /// A real (non-mock) judge whose provider call errors.
+    struct ErroringJudge;
+
+    #[async_trait]
+    impl JudgeScoringModel for ErroringJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            anyhow::bail!("model judge provider call failed: connection refused")
+        }
+    }
+
+    /// A real (non-mock) judge that answers in prose, not the score schema.
+    struct ProseJudge;
+
+    #[async_trait]
+    impl JudgeScoringModel for ProseJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            Ok("I think this change looks fine overall.".to_string())
+        }
+    }
+
+    /// An Auto-mode pipeline over a workspace with enough digests for a
+    /// candidate. `judge_model` of `None` keeps the built-in mock scorer.
+    async fn auto_pipeline(dir: &Path, judge_model: Option<Arc<dyn JudgeScoringModel>>) -> EvolutionPipeline {
+        auto_pipeline_batched(dir, judge_model, 1).await
+    }
+
+    /// `auto_pipeline` with the writer's batch size; production uses 64.
+    async fn auto_pipeline_batched(
+        dir: &Path,
+        judge_model: Option<Arc<dyn JudgeScoringModel>>,
+        batch_size: usize,
+    ) -> EvolutionPipeline {
+        let storage_root = dir.join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                batch_size,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let decision = crate::self_system::evolution::record::DecisionLog {
+            timestamp: Utc::now().to_rfc3339(),
+            experiment_id: "exp-a".to_string(),
+            trace_id: "trace-a".to_string(),
+            decision_type: DecisionType::ToolSelection,
+            task_type: TaskType::ToolCall,
+            risk_level: 1,
+            actor: Actor::Agent,
+            input_context: "ctx".to_string(),
+            action_taken: "act".to_string(),
+            outcome: Outcome::Success,
+            tokens_used: 1,
+            latency_ms: 1,
+            user_correction: None,
+            config_snapshot_hash: "cfg".to_string(),
+        };
+        writer.append_decision(&decision).await.unwrap();
+
+        let memory = crate::self_system::evolution::record::MemoryAccessLog {
+            timestamp: Utc::now().to_rfc3339(),
+            experiment_id: "exp-a".to_string(),
+            trace_id: "trace-a".to_string(),
+            action: MemoryAction::Read,
+            memory_id: "m1".to_string(),
+            task_context: "ctx".to_string(),
+            task_type: TaskType::ToolCall,
+            actor: Actor::Agent,
+            was_useful: Some(true),
+            useful_annotation_source: Some(AnnotationSource::AutoEvaluator),
+            annotation_confidence: Some(0.8),
+            tokens_consumed: 1,
+        };
+        writer.append_memory_access(&memory).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.mode = EvolutionMode::Auto;
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+
+        let pipeline = match judge_model {
+            Some(model) => EvolutionPipeline::with_judge_model(shared, analyzer, writer, dir, model),
+            None => EvolutionPipeline::new(shared, analyzer, writer, dir),
+        };
+        let now = Utc::now();
+        for days in [2, 1, 0] {
+            let _ = pipeline
+                .analyzer
+                .generate_daily_digest(now - chrono::Duration::days(days))
+                .await;
+        }
+        pipeline
+    }
+
+    /// Run one Auto cycle whose engine proposes rewriting
+    /// `evolution_config.toml`, and return the report and the file afterwards.
+    async fn run_proposing_cycle(judge_model: Option<Arc<dyn JudgeScoringModel>>) -> (PipelineRunReport, String) {
+        let dir = tempdir().unwrap();
+        let pipeline = auto_pipeline(dir.path(), judge_model).await;
+        let target = dir.path().join("evolution_config.toml");
+        fs::write(&target, b"original").await.unwrap();
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Memory,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "the run failed ({err:#}) and left the target reading {:?}",
+                    std::fs::read_to_string(&target).unwrap_or_default()
+                )
+            });
+        let after = fs::read_to_string(&target).await.unwrap();
+        (report, after)
+    }
+
+    /// D-035 / D-046: a degraded (mock) judge verdict is a deferral: the
+    /// proposed change is not written, whatever the mock scored.
+    #[tokio::test]
+    async fn a_mock_judge_verdict_writes_nothing() {
+        let (report, after) = run_proposing_cycle(None).await;
+
+        assert!(report.judge_result.is_some());
+        assert_eq!(report.commit, CommitDecision::Deferred, "{:?}", report.errors);
+        assert_eq!(after, "original", "a mock verdict wrote the change");
+        assert!(
+            report.errors.iter().any(|error| error.contains("judge_degraded")),
+            "{:?}",
+            report.errors
+        );
+        let log = report.evolution_log.as_ref().expect("test: the cycle is recorded");
+        assert_eq!(log.result, Some(EvolutionResult::Deferred));
+    }
+
+    /// D-046: a model judge's accepted verdict is what writes the change.
+    #[tokio::test]
+    async fn an_accepted_verdict_writes_the_change() {
+        let (report, after) = run_proposing_cycle(Some(Arc::new(ScoringJudge(0.9)))).await;
+        assert_eq!(report.commit, CommitDecision::Applied, "{:?}", report.errors);
+        assert_eq!(report.judge_outcome, JudgeOutcome::Scored);
+        assert_eq!(after, "changed by the engine");
+        let log = report.evolution_log.as_ref().expect("test: the cycle is recorded");
+        assert_eq!(log.result, None, "an applied change waits for the fitness backfill");
+        assert_ne!(log.change_type, ChangeType::Rollback);
+    }
+
+    /// D-046: a model judge's score below the pass threshold writes nothing.
+    #[tokio::test]
+    async fn a_failing_score_writes_nothing() {
+        let (report, after) = run_proposing_cycle(Some(Arc::new(ScoringJudge(0.1)))).await;
+        assert_eq!(report.commit, CommitDecision::Rejected, "{:?}", report.errors);
+        assert_eq!(after, "original");
+        let log = report.evolution_log.as_ref().expect("test: the cycle is recorded");
+        assert_eq!(log.result, Some(EvolutionResult::Rejected));
+    }
+
+    fn assert_judge_failure_writes_nothing(report: &PipelineRunReport, after: &str) {
+        assert_eq!(after, "original", "an unjudged change was written: {:?}", report.errors);
+        assert_eq!(report.commit, CommitDecision::Deferred, "{:?}", report.errors);
+        assert_eq!(report.judge_outcome, JudgeOutcome::Failed);
+        assert!(report.judge_result.is_none());
+        assert!(
+            report.errors.iter().any(|error| error.contains("judge_failed")),
+            "{:?}",
+            report.errors
+        );
+        let log = report.evolution_log.as_ref().expect("test: the cycle is recorded");
+        assert_ne!(log.change_type, ChangeType::Rollback);
+        assert_eq!(log.result, Some(EvolutionResult::Deferred));
+    }
+
+    /// R-PMMCg J-1 / D-046: a real judge whose provider call errors gives no
+    /// verdict: nothing is written and the run still reports normally.
+    #[tokio::test]
+    async fn a_judge_provider_error_writes_nothing() {
+        let (report, after) = run_proposing_cycle(Some(Arc::new(ErroringJudge))).await;
+        assert_judge_failure_writes_nothing(&report, &after);
+    }
+
+    /// R-PMMCg J-1 / D-046: a real judge whose reply is not the score schema.
+    #[tokio::test]
+    async fn an_unparseable_judge_reply_writes_nothing() {
+        let (report, after) = run_proposing_cycle(Some(Arc::new(ProseJudge))).await;
+        assert_judge_failure_writes_nothing(&report, &after);
+    }
+
+    /// D-046: an accepted change that cannot be written is reported as such,
+    /// not as applied.
+    #[tokio::test]
+    async fn an_accepted_change_that_cannot_be_written_is_reported_truthfully() {
+        let dir = tempdir().unwrap();
+        let pipeline = auto_pipeline(dir.path(), Some(Arc::new(ScoringJudge(0.9)))).await;
+        // The target is a directory, so the atomic replace fails.
+        fs::create_dir_all(dir.path().join("evolution_config.toml"))
+            .await
+            .unwrap();
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Memory,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.commit, CommitDecision::ApplyFailed, "{:?}", report.errors);
+        assert!(
+            report.errors.iter().any(|error| error.contains("apply_failed")),
+            "{:?}",
+            report.errors
+        );
+        let rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+        let row = rows
+            .iter()
+            .find(|row| row.experiment_id == report.experiment_id)
+            .expect("test: the cycle is recorded");
+        assert_eq!(row.result, Some(EvolutionResult::Deferred), "{row:?}");
+    }
+
+    /// A real judge that never answers (a stalled provider connection).
+    struct HangingJudge;
+
+    #[async_trait]
+    impl JudgeScoringModel for HangingJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            std::future::pending::<()>().await;
+            anyhow::bail!("unreachable: a pending future never resolves")
+        }
+    }
+
+    /// A real judge that announces it has been called, then never answers.
+    struct AnnouncingHangingJudge {
+        called: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl JudgeScoringModel for AnnouncingHangingJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            self.called.notify_one();
+            std::future::pending::<()>().await;
+            anyhow::bail!("unreachable: a pending future never resolves")
+        }
+    }
+
+    /// Every evolution log row the pipeline persisted under `storage_root`.
+    async fn persisted_evolution_rows(storage_root: &Path) -> Vec<EvolutionLog> {
+        let mut rows = Vec::new();
+        for tier in ["hot", "warm", "cold"] {
+            let Ok(mut entries) = fs::read_dir(storage_root.join("evolution").join(tier)).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let raw = fs::read_to_string(entry.path())
+                    .await
+                    .expect("test: read an evolution jsonl file");
+                rows.extend(
+                    raw.lines()
+                        .filter_map(|line| serde_json::from_str::<EvolutionLog>(line).ok()),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Run one Auto cycle under a paused clock with a judge that never
+    /// answers. The test's own bound (one hour) is far above the pipeline's
+    /// judge timeout, so reaching it means the run hung.
+    async fn run_with_hanging_judge(engine: &mut dyn EvolutionEngine, dir: &Path) -> PipelineRunReport {
+        let pipeline = auto_pipeline(dir, Some(Arc::new(HangingJudge))).await;
+        tokio::time::timeout(
+            std::time::Duration::from_hours(1),
+            pipeline.run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, engine, Utc::now()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the judge never answered and the run hung with the target reading {:?}",
+                std::fs::read_to_string(dir.join("evolution_config.toml")).unwrap_or_default()
+            )
+        })
+        .expect("test: a hanging judge must still return a report")
+    }
+
+    /// D-044 / D-046: a judge that never answers is bounded by the judge
+    /// timeout, which is a `judge_failed` verdict: nothing is written and the
+    /// cycle is recorded as deferred.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_judge_times_out_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("evolution_config.toml");
+        fs::write(&target, b"original").await.unwrap();
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+        let report = run_with_hanging_judge(&mut engine, dir.path()).await;
+
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "original");
+        assert_eq!(report.commit, CommitDecision::Deferred, "{:?}", report.errors);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("judge_failed") && error.contains("timed out")),
+            "{:?}",
+            report.errors
+        );
+        let rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+        assert!(
+            rows.iter().any(|row| row.experiment_id == report.experiment_id
+                && row.change_type != ChangeType::Rollback
+                && row.result == Some(EvolutionResult::Deferred)),
+            "{rows:?}"
+        );
+    }
+
+    /// D-044 / D-046: dropping the run while the judge works (a configuration
+    /// swap) writes nothing, and the cycle is still recorded without the
+    /// caller.
+    #[tokio::test]
+    async fn cancelling_the_run_mid_judge_writes_nothing_and_records_the_cycle() {
+        let dir = tempdir().unwrap();
+        let called = Arc::new(tokio::sync::Notify::new());
+        let pipeline = auto_pipeline(
+            dir.path(),
+            Some(Arc::new(AnnouncingHangingJudge {
+                called: Arc::clone(&called),
+            })),
+        )
+        .await;
+        let target = dir.path().join("evolution_config.toml");
+        fs::write(&target, b"original").await.unwrap();
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+
+        {
+            let run = pipeline.run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Memory,
+                &mut engine,
+                Utc::now(),
+            );
+            tokio::select! {
+                _ = run => panic!("test: the run finished although its judge never answers"),
+                () = called.notified() => {}
+            }
+            // Leaving this block drops the run while the judge is working.
+        }
+
+        // The record is written without the caller; allow it generous time.
+        let mut rows = Vec::new();
+        for _ in 0..500 {
+            rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "original",
+            "a cancelled run wrote the unjudged change"
+        );
+        assert!(
+            rows.iter().any(|row| row.result == Some(EvolutionResult::Deferred)),
+            "the cancelled cycle was not recorded: {rows:?}"
+        );
+    }
+
+    // ── D-046: an evolution change is written only after an accepted verdict ──
+
+    const PROMPT_ORIGINAL: &str = "system instructions v1\nbe helpful\n";
+    const POLICY_ORIGINAL: &str = "[retry]\nmax_attempts = 3\nbackoff = 0.5\n";
+
+    /// A real judge that records what the layer's target file held when it
+    /// was asked, then answers with `reply` (an error when `None`).
+    struct SnapshotJudge {
+        target: PathBuf,
+        seen: Arc<parking_lot::Mutex<Option<String>>>,
+        reply: Option<f64>,
+    }
+
+    #[async_trait]
+    impl JudgeScoringModel for SnapshotJudge {
+        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+            *self.seen.lock() = Some(std::fs::read_to_string(&self.target).unwrap_or_default());
+            match self.reply {
+                Some(score) => Ok(format!(
+                    "{{\"task_completion\":{score},\"correctness\":{score},\"efficiency\":{score},\
+                     \"safety_compliance\":{score},\"reasoning\":\"test verdict\"}}"
+                )),
+                None => anyhow::bail!("model judge provider call failed: connection refused"),
+            }
+        }
+    }
+
+    /// Point the pipeline's prompt layer at `p.md` holding [`PROMPT_ORIGINAL`].
+    async fn prompt_layer(
+        dir: &Path,
+        pipeline: &EvolutionPipeline,
+    ) -> crate::self_system::evolution::PromptEvolutionEngine {
+        fs::write(dir.join("p.md"), PROMPT_ORIGINAL).await.unwrap();
+        let mut cfg = (*pipeline.shared_config.load_full()).clone();
+        cfg.prompt.mutable_files = vec!["p.md".to_string()];
+        // The analyzer's candidate asks for a rewrite (severity 4); let it
+        // through without human approval.
+        cfg.prompt.human_approval_severity = 4;
+        pipeline.shared_config.store(Arc::new(cfg));
+        crate::self_system::evolution::PromptEvolutionEngine::new(Arc::clone(&pipeline.shared_config), dir, None)
+    }
+
+    /// Point the pipeline's strategy layer at `decision_policy.toml`.
+    async fn strategy_layer(
+        dir: &Path,
+        pipeline: &EvolutionPipeline,
+    ) -> crate::self_system::evolution::StrategyEvolutionEngine {
+        fs::write(dir.join("decision_policy.toml"), POLICY_ORIGINAL)
+            .await
+            .unwrap();
+        // Failed decisions give the strategy gate an improvement to aim for,
+        // so the engine proposes a real change.
+        for index in 0..4 {
+            pipeline
+                .writer
+                .append_decision(&crate::self_system::evolution::record::DecisionLog {
+                    timestamp: Utc::now().to_rfc3339(),
+                    experiment_id: format!("exp-fail-{index}"),
+                    trace_id: format!("trace-fail-{index}"),
+                    decision_type: DecisionType::ToolSelection,
+                    task_type: TaskType::ToolCall,
+                    risk_level: 1,
+                    actor: Actor::Agent,
+                    input_context: "ctx".to_string(),
+                    action_taken: "act".to_string(),
+                    outcome: Outcome::Failure,
+                    tokens_used: 1,
+                    latency_ms: 1,
+                    user_correction: None,
+                    config_snapshot_hash: "cfg".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        pipeline.writer.flush().await.unwrap();
+        crate::self_system::evolution::StrategyEvolutionEngine::new(
+            Arc::clone(&pipeline.shared_config),
+            dir,
+            Arc::clone(&pipeline.writer),
+        )
+        .unwrap()
+    }
+
+    fn snapshot_judge(
+        target: PathBuf,
+        reply: Option<f64>,
+    ) -> (Arc<SnapshotJudge>, Arc<parking_lot::Mutex<Option<String>>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        (
+            Arc::new(SnapshotJudge {
+                target,
+                seen: Arc::clone(&seen),
+                reply,
+            }),
+            seen,
+        )
+    }
+
+    /// D-046: the prompt layer's change is not on disk while the judge
+    /// decides, and a judge that gives no verdict leaves it unwritten.
+    #[tokio::test]
+    async fn the_prompt_layer_writes_nothing_before_the_verdict() {
+        let dir = tempdir().unwrap();
+        let (judge, seen) = snapshot_judge(dir.path().join("p.md"), None);
+        let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
+        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Prompt,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().as_deref(),
+            Some(PROMPT_ORIGINAL),
+            "the prompt was rewritten before the judge answered: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("p.md")).await.unwrap(),
+            PROMPT_ORIGINAL
+        );
+    }
+
+    /// D-046: an accepted verdict is what writes the prompt change.
+    #[tokio::test]
+    async fn the_prompt_layer_writes_after_an_accepted_verdict() {
+        let dir = tempdir().unwrap();
+        let (judge, seen) = snapshot_judge(dir.path().join("p.md"), Some(0.9));
+        let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
+        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Prompt,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().as_deref(), Some(PROMPT_ORIGINAL), "{:?}", report.errors);
+        assert_ne!(
+            fs::read_to_string(dir.path().join("p.md")).await.unwrap(),
+            PROMPT_ORIGINAL,
+            "an accepted verdict did not write the change: {:?}",
+            report.errors
+        );
+    }
+
+    /// D-046: the strategy layer's change is not on disk while the judge
+    /// decides.
+    #[tokio::test]
+    async fn the_strategy_layer_writes_nothing_before_the_verdict() {
+        let dir = tempdir().unwrap();
+        let (judge, seen) = snapshot_judge(dir.path().join("decision_policy.toml"), None);
+        let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
+        let mut engine = strategy_layer(dir.path(), &pipeline).await;
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Policy,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().as_deref(),
+            Some(POLICY_ORIGINAL),
+            "the policy was rewritten before the judge answered: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("decision_policy.toml"))
+                .await
+                .unwrap(),
+            POLICY_ORIGINAL
+        );
+    }
+
+    /// R-PMMCi F-2: at the production batch size (64) the cycle's row is on
+    /// disk when the run returns, for a refused and an accepted verdict.
+    #[tokio::test]
+    async fn the_cycle_row_is_on_disk_at_the_production_batch_size() {
+        for reply in [None, Some(0.9)] {
+            let dir = tempdir().unwrap();
+            let (judge, _seen) = snapshot_judge(dir.path().join("p.md"), reply);
+            let pipeline = auto_pipeline_batched(dir.path(), Some(judge), 64).await;
+            let mut engine = prompt_layer(dir.path(), &pipeline).await;
+            let report = pipeline
+                .run_for_layer(
+                    EvolutionTrigger::Manual,
+                    EvolutionLayer::Prompt,
+                    &mut engine,
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+            assert!(
+                rows.iter().any(|row| row.experiment_id == report.experiment_id),
+                "reply {reply:?}: the row is still buffered: {rows:?}"
+            );
+        }
+    }
+
+    /// R-PMMCi F-2: a run dropped while its judge works still leaves its row
+    /// on disk at the production batch size, and nothing written.
+    #[tokio::test]
+    async fn a_cancelled_run_row_is_on_disk_at_the_production_batch_size() {
+        let dir = tempdir().unwrap();
+        let called = Arc::new(tokio::sync::Notify::new());
+        let pipeline = auto_pipeline_batched(
+            dir.path(),
+            Some(Arc::new(AnnouncingHangingJudge {
+                called: Arc::clone(&called),
+            })),
+            64,
+        )
+        .await;
+        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        {
+            let run = pipeline.run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Prompt,
+                &mut engine,
+                Utc::now(),
+            );
+            tokio::select! {
+                _ = run => panic!("test: the run finished although its judge never answers"),
+                () = called.notified() => {}
+            }
+        }
+        let mut rows = Vec::new();
+        for _ in 0..500 {
+            rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!rows.is_empty(), "the cancelled cycle's row never reached disk");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("p.md")).await.unwrap(),
+            PROMPT_ORIGINAL
+        );
+    }
+
+    /// Every evolution row on disk, read without an async runtime.
+    fn persisted_row_count_sync(storage_root: &Path) -> usize {
+        let mut count = 0;
+        for tier in ["hot", "warm", "cold"] {
+            let Ok(entries) = std::fs::read_dir(storage_root.join("evolution").join(tier)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                count += std::fs::read_to_string(entry.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .count();
+            }
+        }
+        count
+    }
+
+    /// What `daemon::run` does after aborting its supervisors and before it
+    /// returns: drain the evolution commit tracker (D-046).
+    async fn daemon_teardown(commits: &CommitTracker) {
+        crate::daemon::drain_evolution_commits(commits).await;
+    }
+
+    /// R-PMMCi F-1 probe, as a test: a daemon-style teardown while the judge
+    /// works. `mode` 0 cancels the worker and awaits it, 1 aborts it, 2
+    /// leaves it running; then the daemon's own step runs
+    /// (`daemon_teardown`), `block_on` returns and the runtime is shut down
+    /// with main's two-second bound. Returns (prompt unchanged, rows on disk).
+    fn daemon_style_shutdown(mode: u8) -> (bool, usize) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on({
+            let root = root.clone();
+            async move {
+                let called = Arc::new(tokio::sync::Notify::new());
+                let commits = CommitTracker::default();
+                let pipeline = auto_pipeline_batched(
+                    &root,
+                    Some(Arc::new(AnnouncingHangingJudge {
+                        called: Arc::clone(&called),
+                    })),
+                    64,
+                )
+                .await
+                .with_commit_tracker(commits.clone());
+                let mut engine = prompt_layer(&root, &pipeline).await;
+                let token = CancellationToken::new();
+                let worker_token = token.clone();
+                let worker = tokio::spawn(async move {
+                    tokio::select! {
+                        _ = pipeline.run_for_layer(EvolutionTrigger::CronTick, EvolutionLayer::Prompt, &mut engine, Utc::now()) => {}
+                        () = worker_token.cancelled() => {}
+                    }
+                });
+                called.notified().await;
+                match mode {
+                    0 => {
+                        token.cancel();
+                        let _ = worker.await;
+                    }
+                    1 => worker.abort(),
+                    _ => {}
+                }
+                daemon_teardown(&commits).await;
+            }
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+        let unchanged = std::fs::read_to_string(root.join("p.md")).unwrap_or_default() == PROMPT_ORIGINAL;
+        (unchanged, persisted_row_count_sync(&root.join("logs")))
+    }
+
+    /// R-PMMCi F-1 / D-046: whichever way the daemon tears the worker down,
+    /// a change the judge never accepted is not written, and the cycle's row
+    /// reaches disk before the runtime is gone.
+    #[test]
+    fn a_daemon_shutdown_mid_judge_writes_nothing_and_records_the_cycle() {
+        for mode in [0u8, 1, 2] {
+            for run in 0..10 {
+                let (unchanged, rows) = daemon_style_shutdown(mode);
+                assert!(unchanged, "mode {mode} run {run}: the unjudged change was kept");
+                assert!(rows > 0, "mode {mode} run {run}: the cycle was not recorded");
+            }
+        }
+    }
+
+    /// A pending change that announces its write has started, takes a while,
+    /// then writes: the window a shutdown must wait out.
+    #[derive(Debug)]
+    struct SlowChange {
+        target: PathBuf,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::self_system::evolution::PendingChange for SlowChange {
+        async fn apply(&self) -> Result<()> {
+            self.started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fs::write(&self.target, b"changed by the engine").await?;
+            Ok(())
+        }
+    }
+
+    struct SlowProposingEngine {
+        workspace: PathBuf,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl EvolutionEngine for SlowProposingEngine {
+        fn name(&self) -> &'static str {
+            "slow_proposing"
+        }
+
+        fn layer(&self) -> EvolutionLayer {
+            EvolutionLayer::Memory
+        }
+
+        async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+            let mut result = MockEngine.run_cycle(input).await?;
+            result.pending = Some(Arc::new(SlowChange {
+                target: self.workspace.join("evolution_config.toml"),
+                started: Arc::clone(&self.started),
+            }));
+            Ok(result)
+        }
+    }
+
+    /// D-046: a write an accepted verdict started is tracked: a daemon-style
+    /// shutdown (worker aborted, tracker drained, runtime shut down with
+    /// main's two-second bound) waits for it and for the cycle's row.
+    #[test]
+    fn a_daemon_shutdown_waits_for_an_accepted_write_and_its_row() {
+        for run in 0..5 {
+            let dir = tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on({
+                let root = root.clone();
+                async move {
+                    let commits = CommitTracker::default();
+                    let pipeline = auto_pipeline_batched(&root, Some(Arc::new(ScoringJudge(0.9))), 64)
+                        .await
+                        .with_commit_tracker(commits.clone());
+                    fs::write(root.join("evolution_config.toml"), b"original")
+                        .await
+                        .unwrap();
+                    let started = Arc::new(tokio::sync::Notify::new());
+                    let mut engine = SlowProposingEngine {
+                        workspace: root.clone(),
+                        started: Arc::clone(&started),
+                    };
+                    let worker = tokio::spawn(async move {
+                        let _ = pipeline
+                            .run_for_layer(
+                                EvolutionTrigger::CronTick,
+                                EvolutionLayer::Memory,
+                                &mut engine,
+                                Utc::now(),
+                            )
+                            .await;
+                    });
+                    started.notified().await;
+                    worker.abort();
+                    daemon_teardown(&commits).await;
+                }
+            });
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            assert_eq!(
+                std::fs::read_to_string(root.join("evolution_config.toml")).unwrap_or_default(),
+                "changed by the engine",
+                "run {run}: the accepted write was cut off"
+            );
+            assert!(
+                persisted_row_count_sync(&root.join("logs")) > 0,
+                "run {run}: the applied cycle was not recorded"
+            );
+        }
+    }
+
+    /// R-PMMCi F-3: a verdict task cancelled after the judge accepted and
+    /// the write started says so: the change was written and recorded as
+    /// applied, not "cancelled before its verdict". The shutdown drain
+    /// cancels it while the run still waits, so the note reaches the report.
+    #[tokio::test]
+    async fn a_cancellation_after_the_write_started_is_reported_as_such() {
+        let dir = tempdir().unwrap();
+        let commits = CommitTracker::default();
+        let pipeline = auto_pipeline(dir.path(), Some(Arc::new(ScoringJudge(0.9))))
+            .await
+            .with_commit_tracker(commits.clone());
+        fs::write(dir.path().join("evolution_config.toml"), b"original")
+            .await
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut engine = SlowProposingEngine {
+            workspace: dir.path().to_path_buf(),
+            started: Arc::clone(&started),
+        };
+        let run = pipeline.run_for_layer(
+            EvolutionTrigger::Manual,
+            EvolutionLayer::Memory,
+            &mut engine,
+            Utc::now(),
+        );
+        let drain = async {
+            started.notified().await;
+            commits.drain(std::time::Duration::from_secs(5)).await
+        };
+        let (report, drained) = tokio::join!(run, drain);
+        let report = report.unwrap();
+        assert!(drained);
+        assert_eq!(report.commit, CommitDecision::Applied, "{:?}", report.errors);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("cancelled after its change was written")),
+            "{:?}",
+            report.errors
+        );
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|error| error.contains("before the judge answered")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// R-PMMCi F-3: a drain that lands while the judge still works is
+    /// reported as a cancellation before the verdict, with nothing written.
+    #[tokio::test]
+    async fn a_cancellation_before_the_verdict_is_reported_as_such() {
+        let dir = tempdir().unwrap();
+        let commits = CommitTracker::default();
+        let called = Arc::new(tokio::sync::Notify::new());
+        let pipeline = auto_pipeline(
+            dir.path(),
+            Some(Arc::new(AnnouncingHangingJudge {
+                called: Arc::clone(&called),
+            })),
+        )
+        .await
+        .with_commit_tracker(commits.clone());
+        fs::write(dir.path().join("evolution_config.toml"), b"original")
+            .await
+            .unwrap();
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+        let run = pipeline.run_for_layer(
+            EvolutionTrigger::Manual,
+            EvolutionLayer::Memory,
+            &mut engine,
+            Utc::now(),
+        );
+        let drain = async {
+            called.notified().await;
+            commits.drain(std::time::Duration::from_secs(5)).await
+        };
+        let (report, drained) = tokio::join!(run, drain);
+        let report = report.unwrap();
+        assert!(drained);
+        assert_eq!(report.commit, CommitDecision::Deferred, "{:?}", report.errors);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("cancelled before the judge answered")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("evolution_config.toml"))
+                .await
+                .unwrap(),
+            "original"
+        );
+    }
+
+    /// R-PMMCj G-1 (probe J6): while the daemon's drain waits on an accepted
+    /// write in flight (generation A), another run on the same tracker
+    /// (generation B) reaches its verdict. Once shutdown has begun, B must
+    /// write nothing and record its cycle as deferred.
+    #[test]
+    fn a_run_that_starts_while_the_drain_waits_writes_nothing() {
+        for run in 0..10 {
+            let dir_a = tempdir().unwrap();
+            let dir_b = tempdir().unwrap();
+            let (root_a, root_b) = (dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let report_b = runtime.block_on({
+                let (root_a, root_b) = (root_a.clone(), root_b.clone());
+                async move {
+                    let commits = CommitTracker::default();
+                    let pipeline_a = auto_pipeline_batched(&root_a, Some(Arc::new(ScoringJudge(0.9))), 64)
+                        .await
+                        .with_commit_tracker(commits.clone());
+                    let pipeline_b = auto_pipeline_batched(&root_b, Some(Arc::new(ScoringJudge(0.9))), 64)
+                        .await
+                        .with_commit_tracker(commits.clone());
+                    fs::write(root_a.join("evolution_config.toml"), b"original")
+                        .await
+                        .unwrap();
+                    fs::write(root_b.join("evolution_config.toml"), b"original")
+                        .await
+                        .unwrap();
+                    let started = Arc::new(tokio::sync::Notify::new());
+                    let mut engine_a = SlowProposingEngine {
+                        workspace: root_a.clone(),
+                        started: Arc::clone(&started),
+                    };
+                    let worker_a = tokio::spawn(async move {
+                        let _ = pipeline_a
+                            .run_for_layer(
+                                EvolutionTrigger::CronTick,
+                                EvolutionLayer::Memory,
+                                &mut engine_a,
+                                Utc::now(),
+                            )
+                            .await;
+                    });
+                    started.notified().await;
+                    // Shutdown: the supervisors are aborted and the drain begins.
+                    worker_a.abort();
+                    let drain = daemon_teardown(&commits);
+                    let late = async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        let mut engine_b = ProposingEngine {
+                            workspace: root_b.clone(),
+                        };
+                        pipeline_b
+                            .run_for_layer(
+                                EvolutionTrigger::CronTick,
+                                EvolutionLayer::Memory,
+                                &mut engine_b,
+                                Utc::now(),
+                            )
+                            .await
+                    };
+                    let ((), report_b) = tokio::join!(drain, late);
+                    report_b
+                }
+            });
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            let report_b = report_b.expect("test: the late run reports");
+            assert_eq!(
+                std::fs::read_to_string(root_b.join("evolution_config.toml")).unwrap_or_default(),
+                "original",
+                "run {run}: the late run wrote after shutdown began"
+            );
+            assert_eq!(
+                report_b.commit,
+                CommitDecision::Deferred,
+                "run {run}: {:?}",
+                report_b.errors
+            );
+            assert!(
+                persisted_row_count_sync(&root_b.join("logs")) > 0,
+                "run {run}: not recorded"
+            );
+            // A's accepted write was already running: it completes.
+            assert_eq!(
+                std::fs::read_to_string(root_a.join("evolution_config.toml")).unwrap_or_default(),
+                "changed by the engine",
+                "run {run}"
+            );
+        }
+    }
+
+    /// R-PMMCj G-6: when the change was written but its row cannot be, the
+    /// run still reports the commit (Applied) with a `record_failed` error,
+    /// not a failed run with no commit.
+    #[tokio::test]
+    async fn a_row_that_cannot_be_written_does_not_hide_an_applied_change() {
+        let dir = tempdir().unwrap();
+        let pipeline = auto_pipeline_batched(dir.path(), Some(Arc::new(ScoringJudge(0.9))), 64).await;
+        fs::write(dir.path().join("evolution_config.toml"), b"original")
+            .await
+            .unwrap();
+        // The evolution log file for today (and tomorrow, across midnight) is
+        // a directory, so the row cannot be written.
+        for day in [Utc::now(), Utc::now() + chrono::Duration::days(1)] {
+            fs::create_dir_all(
+                dir.path()
+                    .join("logs/evolution/hot")
+                    .join(format!("{}.jsonl", day.format("%Y-%m-%d"))),
+            )
+            .await
+            .unwrap();
+        }
+        let mut engine = ProposingEngine {
+            workspace: dir.path().to_path_buf(),
+        };
+        let report = pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Memory,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .expect("an applied change is reported even when its row fails");
+        assert_eq!(report.commit, CommitDecision::Applied, "{:?}", report.errors);
+        assert!(
+            report.errors.iter().any(|error| error.contains("record_failed")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("evolution_config.toml"))
+                .await
+                .unwrap(),
+            "changed by the engine"
+        );
+    }
+
+    /// R-PMMCj G-5: "after its verdict" only when a model judge gave one.
+    #[test]
+    fn the_cancellation_note_mentions_a_verdict_only_when_there_was_one() {
+        for outcome in [JudgeOutcome::Failed, JudgeOutcome::Degraded] {
+            for commit in [CommitDecision::Deferred, CommitDecision::NothingProposed] {
+                let note = cancellation_note(false, outcome, commit);
+                assert!(note.contains("gave no verdict"), "{outcome:?} {commit:?}: {note}");
+                assert!(!note.contains("its verdict"), "{outcome:?} {commit:?}: {note}");
+            }
+        }
+        assert_eq!(
+            cancellation_note(false, JudgeOutcome::Scored, CommitDecision::Deferred),
+            "after its verdict and before any write: nothing was written"
+        );
+        assert_eq!(
+            cancellation_note(true, JudgeOutcome::Failed, CommitDecision::Deferred),
+            "before the judge answered: nothing was written"
+        );
+    }
+
+    /// Carried from R-PMMCg: a strategy cycle is recorded once, by the
+    /// pipeline, not also by the engine (the orphan `Tune` row).
+    #[tokio::test]
+    async fn a_strategy_cycle_is_recorded_once() {
+        let dir = tempdir().unwrap();
+        let (judge, _seen) = snapshot_judge(dir.path().join("decision_policy.toml"), Some(0.9));
+        let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
+        let mut engine = strategy_layer(dir.path(), &pipeline).await;
+        pipeline
+            .run_for_layer(
+                EvolutionTrigger::Manual,
+                EvolutionLayer::Policy,
+                &mut engine,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let rows = persisted_evolution_rows(&dir.path().join("logs")).await;
+        assert_eq!(
+            rows.iter().filter(|row| row.layer == EvolutionLayer::Policy).count(),
+            1,
+            "{rows:?}"
         );
     }
 
@@ -1220,44 +2690,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_cycle_rejects_path_traversal_target() {
-        let dir = tempdir().unwrap();
-        let storage_root = dir.path().join("logs");
-        let writer = Arc::new(
-            AsyncJsonlWriter::new(
-                JsonlStoragePaths::new(storage_root.clone()),
-                JsonlRetentionPolicy::default(),
-                1,
-            )
-            .await
-            .unwrap(),
-        );
-        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
-        let mut cfg = EvolutionConfig::default();
-        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
-        let shared = new_shared_evolution_config(cfg);
-        let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
-        let proposal = EvolutionProposal {
-            id: "p".to_string(),
-            summary: "s".to_string(),
-            rationale: "r".to_string(),
-            risk_level: RiskLevel::High,
-            target: crate::self_system::evolution::ChangeTarget::WorkspaceFile {
-                path: "../escape.txt".to_string(),
-            },
-            operation: crate::self_system::evolution::ChangeOperation::Write {
-                content: "x".to_string(),
-            },
-        };
-
-        let err = pipeline
-            .rollback_cycle(EvolutionLayer::Prompt, Some(&proposal))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside workspace"));
-    }
-
-    #[tokio::test]
     async fn backfill_results_waits_for_file_lock_and_updates_atomically() {
         let dir = tempdir().unwrap();
         let storage_root = dir.path().join("logs");
@@ -1349,5 +2781,45 @@ mod tests {
         let history = fs::read_to_string(&history_path).await.unwrap();
         let count = history.lines().filter(|l| l.contains("exp-once")).count();
         assert_eq!(count, 1);
+    }
+
+    /// EVO-JSONL: the backfill scan skips an unreadable `*.jsonl` entry (here
+    /// a directory with that name) instead of failing the whole run, and
+    /// still backfills the readable file next to it.
+    #[tokio::test]
+    async fn backfill_results_skips_an_unreadable_jsonl_entry() {
+        let dir = tempdir().unwrap();
+        let storage_root = dir.path().join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+        let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+        store_neutral_fitness_backfill(dir.path());
+
+        let hot = storage_root.join("evolution/hot");
+        fs::create_dir_all(hot.join("2026-01-01.jsonl")).await.unwrap();
+        let line = r#"{"experiment_id":"exp-readable","timestamp":"2026-02-20T00:00:00Z","layer":"memory","change_type":"tune","before_value":"a","after_value":"b","trigger_reason":"r","data_basis":{"sample_count":1,"time_range_days":1,"key_metrics":{},"patterns_found":[]},"result":null}"#;
+        fs::write(hot.join("2026-02-20.jsonl"), format!("{line}\n"))
+            .await
+            .unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated = pipeline
+            .backfill_results(now)
+            .await
+            .expect("test: an unreadable entry must not fail the backfill");
+        assert_eq!(updated, 1);
     }
 }

@@ -55,6 +55,13 @@ impl TasksEndpoint {
         &self.base_url
     }
 
+    /// The base URL as a message may show it: `chat.daemon.url` (or `--url`)
+    /// can carry `user:password@`, which is replaced.
+    #[must_use]
+    pub fn shown_url(&self) -> std::borrow::Cow<'_, str> {
+        crate::providers::redact_endpoint_userinfo(&self.base_url)
+    }
+
     /// A request that authenticates as this *session* as well as this
     /// operator. Both credentials ride along: the bearer says the caller may
     /// talk to this daemon at all, the session token says which mailbox is its
@@ -351,17 +358,20 @@ fn auth_hint(endpoint: &TasksEndpoint, status: reqwest::StatusCode, what: &str, 
          `gateway.paired_tokens` when chat and the daemon share a config dir. A token is minted \
          by pairing: `POST /pair` with header `X-Pairing-Code: <code>`, using the one-time code \
          the daemon prints at startup.",
-        endpoint.base_url()
+        endpoint.shown_url()
     )
 }
 
 fn unreachable_hint(endpoint: &TasksEndpoint, error: &reqwest::Error) -> anyhow::Error {
+    // The transport error quotes the request URL, userinfo included; the
+    // message reaches the model through the daemon message tool.
+    let error = crate::providers::redact_endpoint_userinfo(&error.to_string()).into_owned();
     anyhow::anyhow!(
         "cannot reach a running PRX process at {}: {error}\n\
          The work registry lives inside the process that owns the work, so this command needs a \
          live gateway. Start one with `prx daemon`, or point `--url` at the process you want to \
          inspect.",
-        endpoint.base_url()
+        endpoint.shown_url()
     )
 }
 
@@ -750,6 +760,26 @@ mod tests {
         assert!(text.contains("gateway.paired_tokens"), "{text}");
         assert!(text.contains("chat.daemon.token"), "{text}");
         assert!(!text.contains("No bearer token was sent"), "{text}");
+    }
+
+    /// D-049 D, RED before SECRETS-h (R-SECRETSfg P19): with
+    /// `chat.daemon.url` carrying `user:password@`, the "cannot reach"
+    /// error (which the daemon message tool hands the model) quoted it twice:
+    /// once as the endpoint and once inside the transport error.
+    #[tokio::test]
+    async fn an_unreachable_daemon_error_never_shows_url_userinfo() {
+        let endpoint = TasksEndpoint::resolve(
+            &Config::default(),
+            Some("http://daemon-user:userinfo-sentinel-daemon@127.0.0.1:1".to_string()),
+            None,
+        );
+        let error = fetch_tasks(&endpoint)
+            .await
+            .expect_err("test: nothing listens on port 1");
+        let text = format!("{error:#}");
+        assert!(!text.contains("userinfo-sentinel"), "{text}");
+        assert!(text.contains("127.0.0.1:1"), "the host is still named: {text}");
+        assert_eq!(endpoint.shown_url(), "http://[redacted]@127.0.0.1:1");
     }
 
     #[test]

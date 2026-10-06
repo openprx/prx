@@ -280,9 +280,16 @@ pub async fn install_skill(
     // an inactive same-filesystem directory, validate, then atomically rename.
     // `git clone` forks transport helpers; a cancelled request must not leave
     // them behind, so the whole process group is torn down with the future.
-    let mut command = tokio::process::Command::new("git");
-    command.args(["clone", "--depth", "1", &req.url]).arg(&staging_dir);
-    let output = crate::runtime::shell_process::run_managed_output(command).await;
+    // The hardened git launch (GIT-ENV): cleared environment, no hooks, no
+    // command-executing configuration.
+    let output =
+        match crate::security::git_launch::git_command(crate::security::git_launch::GitScope::NewRepository).await {
+            Ok(mut command) => {
+                command.args(["clone", "--depth", "1", &req.url]).arg(&staging_dir);
+                crate::runtime::shell_process::run_managed_output(command).await
+            }
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        };
 
     match output {
         Ok(out) if out.status.success() => {

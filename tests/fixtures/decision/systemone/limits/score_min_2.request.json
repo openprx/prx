@@ -1,0 +1,14 @@
+{
+  "state": "limit probe",
+  "model": "jev-1.13.0",
+  "questions": {
+    "level": {
+      "type": "score",
+      "instructions": "Which level applies?",
+      "criteria": [
+        "Low",
+        "High"
+      ]
+    }
+  }
+}

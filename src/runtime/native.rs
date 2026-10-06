@@ -24,18 +24,7 @@ impl RuntimeAdapter for NativeRuntime {
     }
 
     fn storage_path(&self) -> PathBuf {
-        directories::UserDirs::new().map_or_else(
-            || PathBuf::from(".openprx"),
-            |u| {
-                let primary = u.home_dir().join(".openprx");
-                if primary.exists() {
-                    primary
-                } else {
-                    let legacy = u.home_dir().join(".openprx");
-                    if legacy.exists() { legacy } else { primary }
-                }
-            },
-        )
+        crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx"))
     }
 
     fn supports_long_running(&self) -> bool {

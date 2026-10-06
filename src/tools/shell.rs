@@ -39,6 +39,7 @@ impl ShellTool {
             ShellProcessError::Cancelled => TOOL_EXECUTION_CANCELLED.to_string(),
             ShellProcessError::Timeout(timeout) => format!("Command timed out after {timeout:?} and was killed"),
             ShellProcessError::Runtime(error) => format!("Failed to build runtime command: {error}"),
+            ShellProcessError::GitRefused => ShellProcessError::GitRefused.to_string(),
             ShellProcessError::Spawn(error) | ShellProcessError::Wait(error) | ShellProcessError::Output(error) => {
                 format!("Failed to execute command: {error}")
             }
@@ -61,6 +62,7 @@ impl ShellTool {
                 workspace_dir: &self.workspace_dir,
                 timeout: None,
                 cancellation,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await
         {

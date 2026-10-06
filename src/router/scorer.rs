@@ -109,21 +109,42 @@ pub fn rank_models(
     config: &RouterConfig,
     similarity_scores: Option<&HashMap<String, f32>>,
 ) -> RouterResult {
+    rank_models_by(intent, estimated_tokens, models, config, |model| {
+        similarity_scores
+            .and_then(|scores| scores.get(&model.config.model_id))
+            .copied()
+            .unwrap_or(0.0)
+    })
+}
+
+pub(crate) fn rank_models_scoped(
+    intent: &RouterIntent,
+    estimated_tokens: usize,
+    models: &[ModelCapabilityEntry],
+    config: &RouterConfig,
+    scores: &HashMap<(String, String), f32>,
+) -> RouterResult {
+    rank_models_by(intent, estimated_tokens, models, config, |model| {
+        scores
+            .iter()
+            .find(|((provider, id), _)| {
+                id == &model.config.model_id
+                    && provider == crate::providers::redact_endpoint_userinfo(&model.config.provider).as_ref()
+            })
+            .map_or(0.0, |(_, score)| *score)
+    })
+}
+
+fn rank_models_by(
+    intent: &RouterIntent,
+    estimated_tokens: usize,
+    models: &[ModelCapabilityEntry],
+    config: &RouterConfig,
+    similarity: impl Fn(&ModelCapabilityEntry) -> f32,
+) -> RouterResult {
     let mut candidates: Vec<ModelScore> = models
         .iter()
-        .map(|model| {
-            let similarity = similarity_scores
-                .and_then(|scores| scores.get(&model.config.model_id))
-                .copied()
-                .unwrap_or_else(|| {
-                    tracing::trace!(
-                        "No similarity score for model {}, defaulting to 0.0",
-                        model.config.model_id
-                    );
-                    0.0
-                });
-            compute_score(intent, estimated_tokens, model, config, similarity)
-        })
+        .map(|model| compute_score(intent, estimated_tokens, model, config, similarity(model)))
         .collect();
 
     candidates.sort_by(|a, b| {

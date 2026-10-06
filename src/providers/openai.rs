@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 /// streaming path.
 const STREAM_DECODER_LABEL: &str = "OpenAI";
 
+/// Highest streamed `tool_calls[].index` accepted. The index sizes the
+/// per-call buffer, and it is chosen by the server; one SSE line naming a huge
+/// index must not allocate a buffer entry for every slot below it.
+const MAX_STREAMED_TOOL_CALL_INDEX: usize = 128;
+
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
@@ -184,6 +189,10 @@ struct StreamingChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<NativeToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
     stream: bool,
     stream_options: StreamUsageOptions,
 }
@@ -238,20 +247,37 @@ impl OpenAiProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools.map(|items| {
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect()
-        })
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    ///
+    /// An empty list is no offer, on both the buffered and the streaming path:
+    /// it must not become `tools: []` beside `tool_choice`, which the endpoint
+    /// rejects.
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<Vec<NativeToolSpec>>> {
+        let Some(items) = tools.filter(|items| !items.is_empty()) else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut converted = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "openai".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            converted.push(NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: parameters.into_owned(),
+                },
+            });
+        }
+        Ok(Some(converted))
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -349,12 +375,13 @@ impl OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openai`."
+            )
+        })?;
 
-        let tools = Self::convert_tools(request.tools);
+        let tools = self.convert_tools(request.tools)?;
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -363,16 +390,21 @@ impl OpenAiProvider {
             tools,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let endpoint = format!("{}/chat/completions", self.base_url);
+        let response = super::attempt_accounting::send_json(
+            self.http_client()
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {credential}")),
+            model,
+            &endpoint,
+            Some(credential),
+            &native_request,
+            super::attempt_accounting::PhysicalKind::Chat,
+        )
+        .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(response.api_error("OpenAI").await);
         }
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -401,6 +433,27 @@ impl OpenAiProvider {
             })
             .unwrap_or_else(|_| Client::new())
     }
+
+    /// Client for streaming requests: a connect timeout, but no whole-request
+    /// deadline. A reqwest client timeout covers the entire response body, so
+    /// the buffered client's two-minute limit cut healthy streams while tokens
+    /// were still arriving. A stalled stream is ended by the agent's
+    /// progress-aware idle guard, which every received chunk resets.
+    fn streaming_http_client(&self) -> Client {
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        crate::config::apply_runtime_proxy_to_builder(builder, "provider.openai")
+            .build()
+            .map_err(|e| {
+                tracing::error!("streaming client build failed for provider.openai, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| {
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|_| Client::new())
+            })
+    }
 }
 
 // ─── Streaming SSE (5a-7a) ────────────────────────────────────────────────
@@ -421,6 +474,19 @@ struct StreamSseResponse {
     choices: Vec<StreamSseChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    /// A failure reported inside a stream that already answered 200.
+    #[serde(default)]
+    error: Option<StreamSseError>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamSseError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +568,16 @@ fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
     }
 
     let parsed: StreamSseResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+    if let Some(error) = parsed.error {
+        // An in-stream error ends the turn; it must not parse as an empty,
+        // successful chunk and be skipped.
+        return Err(super::reliable::in_stream_error_object(
+            "OpenAI",
+            error.kind,
+            error.code,
+            error.message,
+        ));
+    }
     let usage = parsed.usage.and_then(OpenAiUsage::into_reported);
     let Some(choice) = parsed.choices.into_iter().next() else {
         return Ok(usage.map(|usage| OpenAiSseEvent {
@@ -538,10 +614,24 @@ fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
 /// `id` is sourced from whichever delta first carried it; if absent, a UUID is
 /// minted lazily and recorded back into the buffer so the matching `Completed`
 /// chunk shares the same id.
-fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) -> Vec<ToolCallChunk> {
+///
+/// The buffer is indexed by the server-supplied `index`, so an index above
+/// [`MAX_STREAMED_TOOL_CALL_INDEX`] is refused as malformed SSE instead of
+/// growing the buffer to whatever the upstream names.
+fn apply_tool_call_deltas(
+    buf: &mut Vec<ToolCallBuffer>,
+    deltas: Vec<StreamSseToolCall>,
+) -> StreamResult<Vec<ToolCallChunk>> {
     let mut streaming = Vec::with_capacity(deltas.len());
     for delta in deltas {
         let slot = delta.index;
+        if slot > MAX_STREAMED_TOOL_CALL_INDEX {
+            return Err(super::reliable::tool_call_index_over_limit(
+                "OpenAI",
+                slot,
+                MAX_STREAMED_TOOL_CALL_INDEX,
+            ));
+        }
         while buf.len() <= slot {
             buf.push(ToolCallBuffer::default());
         }
@@ -599,7 +689,7 @@ fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseTo
             status: crate::providers::traits::ToolCallChunkStatus::Streaming,
         });
     }
-    streaming
+    Ok(streaming)
 }
 
 /// Flush the tool_call buffer into chunks suitable for [`StreamChunk::tool_call_chunk`].
@@ -637,6 +727,18 @@ fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn accounting_targets(&self, model: &str) -> Option<super::AccountingTargets> {
+        Some(super::AccountingTargets::chat(
+            model,
+            vec![format!("{}/chat/completions", self.base_url)],
+            self.credential.as_deref(),
+        ))
+    }
+
+    fn supports_attempt_accounting(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
@@ -651,10 +753,11 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openai`."
+            )
+        })?;
 
         let mut messages = Vec::new();
 
@@ -747,6 +850,7 @@ impl Provider for OpenAiProvider {
             }],
             final_provider: "openai".to_string(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used,
         })
     }
@@ -762,10 +866,11 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openai`."
+            )
+        })?;
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -827,7 +932,9 @@ impl Provider for OpenAiProvider {
 
     /// **5a-7a**: Native streaming with full history + tool_calls.
     ///
-    /// Sends `stream: true` to `/v1/chat/completions`, parses SSE chunks via
+    /// Sends `stream: true`, the native tools in `options.tools` and
+    /// `tool_choice: "auto"` (only when tools are offered) to
+    /// `/v1/chat/completions`, parses SSE chunks via
     /// [`parse_openai_sse_line`].
     ///
     /// **S3 T3-2-B**: emits the dual-phase tool-call protocol:
@@ -849,21 +956,33 @@ impl Provider for OpenAiProvider {
             return stream::once(async { Err(StreamError::Provider("OpenAI API key not set".to_string())) }).boxed();
         };
 
+        // Offer the caller's tools exactly as the buffered path does, with
+        // `tool_choice: "auto"` whenever any are offered. A refusal fails the
+        // turn before any connection is opened.
+        let tools = match self.convert_tools(options.tools.as_deref()) {
+            Ok(tools) => tools,
+            Err(e) => {
+                let msg = e.to_string();
+                return stream::once(async move { Err(StreamError::Provider(msg)) }).boxed();
+            }
+        };
         let native_messages = Self::convert_messages(messages);
         let url = format!("{}/chat/completions", self.base_url);
-        let client = self.http_client();
+        let client = self.streaming_http_client();
 
         let request_body = StreamingChatRequest {
             model: model.to_string(),
             messages: native_messages,
             temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
             stream: true,
             stream_options: StreamUsageOptions { include_usage: true },
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
 
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let response = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {credential}"))
@@ -894,7 +1013,19 @@ impl Provider for OpenAiProvider {
             let mut sent_final = false;
             let mut saw_sse_event = false;
             let mut saw_non_sse_line = false;
-            'outer: while let Some(bytes_res) = byte_stream.next().await {
+            let mut saw_finish_reason = false;
+            'outer: loop {
+                // Stop reading as soon as nobody consumes the stream (the
+                // turn ended, for example by the idle guard): otherwise this
+                // task and its connection wait on the server indefinitely,
+                // since the streaming client has no whole-request deadline.
+                let next = tokio::select! {
+                    () = tx.closed() => return,
+                    next = byte_stream.next() => next,
+                };
+                let Some(bytes_res) = next else {
+                    break 'outer;
+                };
                 let bytes = match bytes_res {
                     Ok(b) => b,
                     Err(e) => {
@@ -926,6 +1057,31 @@ impl Provider for OpenAiProvider {
                     saw_sse_event = true;
 
                     if event.done_sentinel {
+                        // Calls still buffered at `[DONE]` never got a
+                        // `finish_reason` (every finish flushes or fails
+                        // them). Apply the `stop` rule instead of dropping
+                        // them: a name-only call fails the stream, and the
+                        // rest are handed over for the loop to check.
+                        if !tool_buf.is_empty() {
+                            if tool_buf
+                                .iter()
+                                .any(|entry| !entry.name.is_empty() && entry.arguments.trim().is_empty())
+                            {
+                                let _ = tx
+                                    .send(Err(StreamError::Provider(
+                                        "OpenAI ended the message ([DONE] without finish_reason) with an incomplete \
+                                         tool call; it was not run"
+                                            .to_string(),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            let calls = flush_tool_call_buffer(&tool_buf);
+                            tool_buf.clear();
+                            if !calls.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await.is_err() {
+                                return;
+                            }
+                        }
                         if !usage_seen && completion_chars > 0 {
                             let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
                             let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
@@ -944,7 +1100,13 @@ impl Provider for OpenAiProvider {
                     }
 
                     if !event.tool_call_deltas.is_empty() {
-                        let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                        let streaming = match apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas) {
+                            Ok(streaming) => streaming,
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
                         if !streaming.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(streaming))).await.is_err()
                         {
                             return;
@@ -973,7 +1135,54 @@ impl Provider for OpenAiProvider {
                     }
 
                     if let Some(finish) = event.finish_reason.as_deref() {
-                        if finish == "tool_calls" && !tool_buf.is_empty() {
+                        saw_finish_reason = true;
+                        // A filtered response is cut wherever the filter hit:
+                        // fail visibly instead of passing it off as an answer.
+                        if finish == "content_filter" {
+                            let _ = tx
+                                .send(Err(super::reliable::content_filter_stop(
+                                    "OpenAI",
+                                    "finish_reason content_filter",
+                                )))
+                                .await;
+                            return;
+                        }
+                        // The output limit ended the message inside a call:
+                        // its arguments are truncated, so fail the stream
+                        // rather than drop or run the call.
+                        if finish == "length" && !tool_buf.is_empty() {
+                            let _ = tx
+                                .send(Err(StreamError::Provider(
+                                    "OpenAI stopped at the output length limit inside a tool call; its arguments \
+                                     are truncated and the call was not run"
+                                        .to_string(),
+                                )))
+                                .await;
+                            return;
+                        }
+                        if finish != "tool_calls" && !tool_buf.is_empty() {
+                            // Some servers end a complete call with `stop`
+                            // (for example a forced tool choice). A call that
+                            // got its name but not one argument byte cannot be
+                            // told apart downstream from a no-argument call,
+                            // so it fails the stream. Every other call is
+                            // handed over as received: the loop runs the ones
+                            // whose arguments parse and refuses the rest on
+                            // their call id.
+                            if tool_buf
+                                .iter()
+                                .any(|entry| !entry.name.is_empty() && entry.arguments.trim().is_empty())
+                            {
+                                let _ = tx
+                                    .send(Err(StreamError::Provider(format!(
+                                        "OpenAI ended the message (finish_reason {finish}) with an incomplete tool \
+                                         call; it was not run"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        }
+                        if !tool_buf.is_empty() {
                             let calls = flush_tool_call_buffer(&tool_buf);
                             tool_buf.clear();
                             if !calls.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await.is_err() {
@@ -1015,23 +1224,25 @@ impl Provider for OpenAiProvider {
                     return;
                 }
 
-                // Defensive tail flush: some upstream gateways close the byte
-                // stream without ever delivering `finish_reason == "tool_calls"`
-                // (and without `[DONE]`). Surface any buffered tool calls so the
-                // driver does not silently lose them on EOF.
-                if !tool_buf.is_empty() {
-                    let calls = flush_tool_call_buffer(&tool_buf);
-                    tool_buf.clear();
-                    if !calls.is_empty() {
-                        let _ = tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await;
+                // No `[DONE]`. A message that already ended with a
+                // `finish_reason` and has no call still buffered is complete;
+                // accept it. Otherwise the body was cut: buffered tool calls
+                // may hold half of their arguments and a text answer is cut
+                // short, so fail the stream instead of reporting success.
+                if saw_finish_reason && tool_buf.is_empty() {
+                    if !usage_seen && completion_chars > 0 {
+                        let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                        let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+                        let _ = tx.send(Ok(StreamChunk::usage(usage))).await;
                     }
+                    let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                    return;
                 }
-                if !usage_seen && completion_chars > 0 {
-                    let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
-                    let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
-                    let _ = tx.send(Ok(StreamChunk::usage(usage))).await;
-                }
-                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                let _ = tx
+                    .send(Err(StreamError::InvalidSse(
+                        "OpenAI stream ended before [DONE]; the response is incomplete".to_string(),
+                    )))
+                    .await;
             }
         });
 
@@ -1452,7 +1663,8 @@ mod tests {
                     arguments: Some(r#"{"a""#.into()),
                 }),
             }],
-        );
+        )
+        .expect("test: in-range tool-call index");
         // First delta carries id+name+partial args → one Streaming chunk.
         assert_eq!(s1.len(), 1);
         assert_eq!(s1[0].status, crate::providers::traits::ToolCallChunkStatus::Streaming);
@@ -1468,7 +1680,8 @@ mod tests {
                     arguments: Some(r#": 1}"#.into()),
                 }),
             }],
-        );
+        )
+        .expect("test: in-range tool-call index");
         assert_eq!(s2.len(), 1);
         assert_eq!(s2[0].arguments_delta.as_deref(), Some(r#": 1}"#));
 
@@ -1508,7 +1721,8 @@ mod tests {
                     }),
                 },
             ],
-        );
+        )
+        .expect("test: in-range tool-call index");
         assert_eq!(streaming.len(), 2);
         assert_eq!(streaming[0].index, 0);
         assert_eq!(streaming[1].index, 1);
@@ -1518,69 +1732,6 @@ mod tests {
         assert_eq!(flushed[0].name, "ls");
         assert_eq!(flushed[1].name, "pwd");
         assert_eq!(flushed[1].index, 1);
-    }
-
-    /// Regression for the OpenAI EOF tail-flush path.
-    ///
-    /// Some OpenAI-compatible gateways close the byte stream after emitting
-    /// `tool_calls` deltas but before sending `finish_reason == "tool_calls"`
-    /// or `[DONE]`. Without an EOF tail flush the buffered tool call would be
-    /// silently dropped. We replay the exact splitter + post-loop flush that
-    /// `stream_chat_with_system` runs and verify the buffer would still flush
-    /// to a `Completed` chunk on EOF.
-    #[test]
-    fn tool_call_buffer_flushes_on_eof_without_finish_reason() {
-        use crate::providers::traits::ToolCallChunkStatus;
-
-        // Replay: 1 SSE line with id+name+partial args, 1 SSE line with the
-        // remainder of args, then the byte stream ends WITHOUT any
-        // `finish_reason` or `[DONE]` line. The post-loop branch in
-        // `stream_chat_with_system` must surface the buffered tool call.
-        let lines = [
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_eof","function":{"name":"shell","arguments":"{\"cmd\":"}}]}}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}"#,
-        ];
-
-        let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
-        let mut streaming_emitted: Vec<ToolCallChunk> = Vec::new();
-        let mut saw_finish = false;
-        for line in lines {
-            let event = match parse_openai_sse_line(line).expect("test: line parses") {
-                Some(e) => e,
-                None => continue,
-            };
-            if event.done_sentinel {
-                saw_finish = true;
-                break;
-            }
-            if !event.tool_call_deltas.is_empty() {
-                streaming_emitted.extend(apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas));
-            }
-            if event.finish_reason.is_some() {
-                saw_finish = true;
-                break;
-            }
-        }
-
-        // Precondition: nothing closed the turn — neither [DONE] nor a
-        // finish_reason landed before the byte stream ended.
-        assert!(!saw_finish, "test setup: no terminator must arrive before EOF");
-        assert!(!tool_buf.is_empty(), "test setup: tool buffer must hold the call");
-        assert_eq!(streaming_emitted.len(), 2, "two Streaming deltas (open + arg fragment)");
-
-        // Drive the exact post-loop branch from `stream_chat_with_system`:
-        // when no `final_chunk` has been sent, flush the buffered tool calls
-        // before sending the synthetic final chunk.
-        let calls = flush_tool_call_buffer(&tool_buf);
-        tool_buf.clear();
-
-        assert_eq!(calls.len(), 1, "EOF tail flush must surface the buffered call");
-        assert_eq!(calls[0].id, "call_eof");
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
-        assert_eq!(calls[0].index, 0);
-        assert_eq!(calls[0].status, ToolCallChunkStatus::Completed);
-        assert!(calls[0].arguments_delta.is_none());
     }
 
     #[test]
@@ -1598,7 +1749,8 @@ mod tests {
                     arguments: Some(String::new()),
                 }),
             }],
-        );
+        )
+        .expect("test: in-range tool-call index");
         // No name yet → no Streaming chunk emitted to the driver.
         assert!(streaming.is_empty());
         assert!(flush_tool_call_buffer(&buf).is_empty());
@@ -1626,7 +1778,8 @@ mod tests {
                 break;
             }
             if !event.tool_call_deltas.is_empty() {
-                let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas)
+                    .expect("test: in-range tool-call index");
                 emitted_calls.extend(streaming);
             }
             if let Some(c) = event.content {
@@ -1884,5 +2037,670 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Invalid SSE format"), "got: {msg}");
         assert!(msg.contains("incomplete trailing data"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // STREAM-TOOLS: native tools on the streaming request
+    // -----------------------------------------------------------------
+
+    /// One OpenAI SSE `data:` line followed by the blank separator.
+    fn openai_sse_data(data: &serde_json::Value) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    /// The streamed reply the real Chat Completions API sends for a
+    /// `fixture_write({"value":"x"})` call, split across two argument fragments.
+    fn openai_streamed_tool_call_body() -> String {
+        [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant",
+                "tool_calls":[{"index":0,"id":"call_s1","type":"function",
+                    "function":{"name":"fixture_write","arguments":"{\"value\":"}}]}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{
+                "tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})),
+            openai_sse_data(&serde_json::json!({"choices":[],
+                "usage":{"prompt_tokens":10,"completion_tokens":7,"total_tokens":17}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat()
+    }
+
+    /// Loopback `/chat/completions` stub that records every request body and
+    /// answers with `body` as `text/event-stream`.
+    async fn spawn_openai_sse_stub(
+        body: String,
+    ) -> (
+        String,
+        std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::header, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                let body = body.clone();
+                async move {
+                    sink.lock().push(request);
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    fn fixture_write_spec() -> ToolSpec {
+        ToolSpec {
+            name: "fixture_write".to_string(),
+            description: "Write a fixture value".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_request_carries_native_tools_and_tool_choice() {
+        use crate::providers::traits::ToolCallChunkStatus;
+
+        let (base, captured, server) = spawn_openai_sse_stub(openai_streamed_tool_call_body()).await;
+        let provider = OpenAiProvider::with_base_url(Some(&base), Some("test-key"));
+        let messages = vec![ChatMessage::user("write x")];
+
+        let chunks: Vec<StreamChunk> = provider
+            .stream_chat_with_history(
+                &messages,
+                "gpt-test",
+                0.0,
+                StreamOptions::new(true).with_tools(vec![fixture_write_spec()]),
+            )
+            .map(|chunk| chunk.expect("test: stream chunk"))
+            .collect()
+            .await;
+        server.abort();
+
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1, "exactly one streaming request");
+        let body = &bodies[0];
+        assert_eq!(body["stream"], true);
+        let tools = body["tools"]
+            .as_array()
+            .expect("test: streaming request must carry tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "fixture_write");
+        assert_eq!(tools[0]["function"]["description"], "Write a fixture value");
+        assert_eq!(tools[0]["function"]["parameters"], fixture_write_spec().parameters);
+        assert_eq!(body["tool_choice"], "auto");
+
+        let completed: Vec<&ToolCallChunk> = chunks
+            .iter()
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == ToolCallChunkStatus::Completed)
+            .collect();
+        assert_eq!(completed.len(), 1, "exactly one completed tool call");
+        assert_eq!(completed[0].id, "call_s1");
+        assert_eq!(completed[0].name, "fixture_write");
+        let args: serde_json::Value = serde_json::from_str(&completed[0].args).expect("test: args are JSON");
+        assert_eq!(args, serde_json::json!({"value": "x"}));
+        assert!(
+            chunks.last().is_some_and(|c| c.is_final),
+            "stream ends with a final chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_request_without_tools_omits_tools_and_tool_choice() {
+        // `with_tools` normalises an empty list away, but the field is public:
+        // a raw empty list must not reach the wire either.
+        for options in [
+            StreamOptions::new(true),
+            StreamOptions {
+                tools: Some(Vec::new()),
+                ..StreamOptions::new(true)
+            },
+        ] {
+            assert_streaming_request_omits_tools(options).await;
+        }
+    }
+
+    async fn assert_streaming_request_omits_tools(options: StreamOptions) {
+        let text_body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"hi"}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base, captured, server) = spawn_openai_sse_stub(text_body).await;
+        let provider = OpenAiProvider::with_base_url(Some(&base), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi")];
+
+        let text: String = provider
+            .stream_chat_with_history(&messages, "gpt-test", 0.0, options)
+            .map(|chunk| chunk.expect("test: stream chunk").delta)
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        server.abort();
+
+        assert_eq!(text, "hi");
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("tools").is_none(), "got {}", bodies[0]);
+        assert!(bodies[0].get("tool_choice").is_none(), "got {}", bodies[0]);
+    }
+
+    /// The tool-call `index` is server-controlled; the buffer must not grow to
+    /// whatever it names. An index past the cap ends the stream with an error.
+    #[tokio::test]
+    async fn openai_stream_rejects_an_out_of_range_tool_call_index() {
+        let body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{
+                "tool_calls":[{"index":1000,"id":"call_far","type":"function",
+                    "function":{"name":"fixture_write","arguments":"{}"}}]}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base, _captured, server) = spawn_openai_sse_stub(body).await;
+        let provider = OpenAiProvider::with_base_url(Some(&base), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi")];
+
+        let results: Vec<StreamResult<StreamChunk>> = provider
+            .stream_chat_with_history(&messages, "gpt-test", 0.0, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+
+        let error = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("test: an out-of-range tool-call index must end the stream with an error");
+        assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
+        assert!(error.to_string().contains("1000"), "got {error}");
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .all(|c| c.tool_calls.is_empty()),
+            "no tool call may surface from the rejected delta"
+        );
+    }
+
+    /// The largest in-range index is still accepted.
+    #[test]
+    fn apply_tool_call_deltas_accepts_the_last_in_range_index() {
+        let mut buf = Vec::new();
+        let chunks = apply_tool_call_deltas(
+            &mut buf,
+            vec![StreamSseToolCall {
+                index: MAX_STREAMED_TOOL_CALL_INDEX,
+                id: Some("call_last".into()),
+                function: Some(StreamSseFunction {
+                    name: Some("shell".into()),
+                    arguments: Some("{}".into()),
+                }),
+            }],
+        )
+        .expect("test: the cap itself is in range");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(buf.len(), MAX_STREAMED_TOOL_CALL_INDEX + 1);
+    }
+
+    // -----------------------------------------------------------------
+    // STREAM-f: a half-received tool call must fail the stream, never
+    // surface as a completed call
+    // -----------------------------------------------------------------
+
+    /// The first half of a `fixture_write` call: what a stream has sent when it
+    /// is cut in the middle of the arguments.
+    fn openai_tool_call_prefix() -> String {
+        openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant",
+            "tool_calls":[{"index":0,"id":"call_s1","type":"function",
+                "function":{"name":"fixture_write","arguments":"{\"value\":"}}]}}]}))
+    }
+
+    async fn openai_stream_results(body: String) -> Vec<StreamResult<StreamChunk>> {
+        let (base, _captured, server) = spawn_openai_sse_stub(body).await;
+        let provider = OpenAiProvider::with_base_url(Some(&base), Some("test-key"));
+        let messages = vec![ChatMessage::user("write x")];
+        let results = provider
+            .stream_chat_with_history(
+                &messages,
+                "gpt-test",
+                0.0,
+                StreamOptions::new(true).with_tools(vec![fixture_write_spec()]),
+            )
+            .collect()
+            .await;
+        server.abort();
+        results
+    }
+
+    fn openai_stream_error(results: &[StreamResult<StreamChunk>]) -> &StreamError {
+        let error = results
+            .last()
+            .and_then(|r| r.as_ref().err())
+            .unwrap_or_else(|| panic!("the stream must end in an error, got {} items", results.len()));
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1, "exactly one error");
+        assert!(
+            !results.iter().filter_map(|r| r.as_ref().ok()).any(|c| c.is_final),
+            "a failed stream must not report a final chunk"
+        );
+        error
+    }
+
+    fn openai_completed_calls(results: &[StreamResult<StreamChunk>]) -> usize {
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == crate::providers::traits::ToolCallChunkStatus::Completed)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn openai_stream_cut_mid_tool_arguments_ends_in_an_error() {
+        let results = openai_stream_results(openai_tool_call_prefix()).await;
+        let error = openai_stream_error(&results);
+        assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
+        assert!(error.to_string().contains("[DONE]"), "got {error}");
+        assert_eq!(
+            openai_completed_calls(&results),
+            0,
+            "a cut call must not be flushed as completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stream_text_cut_before_done_ends_in_an_error() {
+        let body = openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"half an ans"}}]}));
+        let results = openai_stream_results(body).await;
+        let error = openai_stream_error(&results);
+        assert!(error.to_string().contains("[DONE]"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn openai_stream_error_object_ends_in_a_provider_error() {
+        let body = [
+            openai_tool_call_prefix(),
+            openai_sse_data(&serde_json::json!({"error":{"message":"The server is overloaded","type":"server_error"}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        let error = openai_stream_error(&results);
+        assert!(matches!(error, StreamError::Provider(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("server_error"), "got {message}");
+        assert!(message.contains("The server is overloaded"), "got {message}");
+        assert_eq!(openai_completed_calls(&results), 0);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_length_inside_a_tool_call_ends_in_an_error() {
+        let body = [
+            openai_tool_call_prefix(),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        let error = openai_stream_error(&results);
+        assert!(error.to_string().contains("length"), "got {error}");
+        assert_eq!(openai_completed_calls(&results), 0);
+    }
+
+    /// A healthy stream that keeps sending for longer than the old two-minute
+    /// client deadline must complete.
+    ///
+    /// The clock is paused once the first chunk has arrived, so the two
+    /// 90-second gaps that follow are virtual. Pausing only after the
+    /// connection is up keeps auto-advance away from the connect timeout.
+    #[tokio::test]
+    async fn openai_stream_survives_past_the_old_two_minute_deadline() {
+        use axum::{Router, body::Body, http::header, routing::post};
+        use tokio::net::TcpListener;
+
+        let parts: Vec<(u64, String)> = vec![
+            (
+                0,
+                openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"slow "}}]})),
+            ),
+            (
+                90,
+                openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"answer"}}]})),
+            ),
+            (
+                90,
+                [
+                    openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .concat(),
+            ),
+        ];
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let parts = parts.clone();
+                async move {
+                    let body = futures::stream::iter(parts).then(|(delay, part)| async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        Ok::<_, std::convert::Infallible>(part)
+                    });
+                    ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let provider = OpenAiProvider::with_base_url(Some(&format!("http://{addr}")), Some("test-key"));
+        let messages = vec![ChatMessage::user("take your time")];
+        let mut stream = provider.stream_chat_with_history(&messages, "gpt-test", 0.0, StreamOptions::new(true));
+        let first = stream.next().await.expect("test: the first chunk arrives at once");
+        // Connected and streaming: from here on the gaps are virtual time.
+        tokio::time::pause();
+        let mut results = vec![first];
+        while let Some(item) = stream.next().await {
+            results.push(item);
+        }
+        server.abort();
+
+        let errors: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a healthy slow stream must not be cut (after {:?} of virtual time): {errors:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_mins(3),
+            "the stub really ran past two minutes"
+        );
+        let text: String = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|c| c.delta.as_str())
+            .collect();
+        assert_eq!(text, "slow answer");
+    }
+
+    /// The buffered path treats an empty tool list as no offer too, like the
+    /// streaming path: no `tools: []` and no `tool_choice`.
+    #[tokio::test]
+    async fn openai_buffered_request_with_an_empty_tool_list_omits_tools_and_tool_choice() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = captured.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().push(request);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = OpenAiProvider::with_base_url(Some(&format!("http://{addr}")), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi")];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&[]),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect("test: buffered chat succeeds");
+        server.abort();
+
+        assert_eq!(response.text.as_deref(), Some("hi"));
+        let bodies = captured.lock().clone();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("tools").is_none(), "got {}", bodies[0]);
+        assert!(bodies[0].get("tool_choice").is_none(), "got {}", bodies[0]);
+    }
+
+    // -----------------------------------------------------------------
+    // STREAM-g
+    // -----------------------------------------------------------------
+
+    /// F-3: a complete text answer (`finish_reason: stop`) whose body ends
+    /// without `[DONE]` is accepted.
+    #[tokio::test]
+    async fn openai_stream_complete_text_answer_without_done_is_accepted() {
+        let body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"hello"}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok), "a finished answer is not an error");
+        let text: String = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|c| c.delta.as_str())
+            .collect();
+        assert_eq!(text, "hello");
+        assert!(results.last().is_some_and(|r| r.as_ref().is_ok_and(|c| c.is_final)));
+    }
+
+    /// F-3: calls already flushed on `finish_reason: tool_calls` are complete;
+    /// a missing `[DONE]` after them is not an error.
+    #[tokio::test]
+    async fn openai_stream_flushed_tool_calls_without_done_are_accepted() {
+        let body = [
+            openai_tool_call_prefix(),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{
+                "tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok), "complete calls are not an error");
+        assert_eq!(openai_completed_calls(&results), 1);
+    }
+
+    /// F-4: `stop` with buffered calls hands over the complete ones as
+    /// completed calls and the incomplete ones with their raw arguments, which
+    /// the loop refuses visibly on the same call id.
+    #[tokio::test]
+    async fn openai_stream_stop_hands_over_buffered_calls_for_the_loop_to_check() {
+        let body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                {"index":0,"id":"call_ok","type":"function","function":{"name":"fixture_write","arguments":"{\"value\":\"x\"}"}},
+                {"index":1,"id":"call_cut","type":"function","function":{"name":"fixture_write","arguments":"{\"value\":"}}
+            ]}}]})),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok));
+        let completed: Vec<(String, String)> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == crate::providers::traits::ToolCallChunkStatus::Completed)
+            .map(|c| (c.id.clone(), c.args.clone()))
+            .collect();
+        assert_eq!(
+            completed,
+            vec![
+                ("call_ok".to_string(), r#"{"value":"x"}"#.to_string()),
+                ("call_cut".to_string(), r#"{"value":"#.to_string()),
+            ]
+        );
+    }
+
+    /// F-4: `stop` with a call that never got argument bytes cannot be told
+    /// apart from a no-argument call downstream, so the stream fails.
+    #[tokio::test]
+    async fn openai_stream_stop_with_a_name_only_call_ends_in_an_error() {
+        let body = [
+            openai_sse_data(
+                &serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                    {"index":0,"id":"call_s1","type":"function","function":{"name":"fixture_write","arguments":""}}
+                ]}}]}),
+            ),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        let error = openai_stream_error(&results);
+        assert!(error.to_string().contains("incomplete"), "got {error}");
+        assert_eq!(openai_completed_calls(&results), 0);
+    }
+
+    /// F-4: `content_filter` fails the stream visibly, with or without a call.
+    #[tokio::test]
+    async fn openai_stream_content_filter_ends_in_an_error() {
+        for prefix in [
+            openai_tool_call_prefix(),
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"partial"}}]})),
+        ] {
+            let body = [
+                prefix,
+                openai_sse_data(
+                    &serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}),
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat();
+            let results = openai_stream_results(body).await;
+            let error = openai_stream_error(&results);
+            assert!(error.to_string().contains("content_filter"), "got {error}");
+            assert_eq!(openai_completed_calls(&results), 0);
+        }
+    }
+
+    /// F-5: once the consumer drops the stream, the background task lets go of
+    /// the connection instead of waiting on a server that never sends again.
+    #[tokio::test]
+    async fn openai_stream_releases_the_connection_when_the_consumer_goes_away() {
+        use axum::{Router, body::Body, http::header, routing::post};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let first = openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"hel"}}]}));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let flag = flag.clone();
+                let first = first.clone();
+                async move {
+                    let guard = DropFlag(flag);
+                    let body = futures::stream::once(async move { Ok::<_, std::convert::Infallible>(first) })
+                        .chain(futures::stream::pending())
+                        .map(move |item| {
+                            let _keep = &guard;
+                            item
+                        });
+                    ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = OpenAiProvider::with_base_url(Some(&format!("http://{addr}")), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat_with_history(&messages, "gpt-test", 0.0, StreamOptions::new(true));
+        let first_chunk = stream.next().await.expect("test: first chunk");
+        assert_eq!(first_chunk.expect("test: first chunk is ok").delta, "hel");
+        drop(stream);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !released.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the provider task must close the connection once nobody reads the stream"
+        );
+    }
+
+    /// COMPAT-STREAM (R-3): a server that never sends `finish_reason` but ends
+    /// with `[DONE]` still delivers its complete calls, as compatible does.
+    #[tokio::test]
+    async fn openai_stream_done_without_finish_reason_flushes_complete_calls() {
+        let body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant",
+                "tool_calls":[{"index":0,"id":"call_s1","type":"function",
+                    "function":{"name":"fixture_write","arguments":"{\"value\":\"x\"}"}}]}}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        assert!(results.iter().all(Result::is_ok), "a complete call is not an error");
+        assert_eq!(
+            openai_completed_calls(&results),
+            1,
+            "the call is delivered, not dropped"
+        );
+    }
+
+    /// R-3: the same end with a call that never got argument bytes fails, as
+    /// with `stop`: downstream it would run as `{}`.
+    #[tokio::test]
+    async fn openai_stream_done_without_finish_reason_refuses_a_name_only_call() {
+        let body = [
+            openai_sse_data(&serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant",
+                "tool_calls":[{"index":0,"id":"call_s1","type":"function",
+                    "function":{"name":"fixture_write","arguments":""}}]}}]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let results = openai_stream_results(body).await;
+        let error = openai_stream_error(&results);
+        assert!(error.to_string().contains("incomplete"), "got {error}");
+        assert_eq!(openai_completed_calls(&results), 0);
     }
 }

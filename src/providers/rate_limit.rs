@@ -155,19 +155,24 @@ impl RateLimitGate {
         deadline.checked_duration_since(Instant::now())
     }
 
-    /// Park until `provider`'s shared cool-down has elapsed.
+    /// Park until the shared cool-down kept under `gate_key` has elapsed.
+    ///
+    /// The deferral is counted in the telemetry under `telemetry_name`, the
+    /// provider's display name: a gate key may be a chain member's
+    /// in-process key, which must never reach telemetry, health output or
+    /// `daemon_state.json` (D-069 L-3).
     ///
     /// Returns the number of milliseconds actually spent waiting, or `None`
     /// when the provider was not throttled (the overwhelmingly common case,
     /// which costs one uncontended read lock). The total wait is bounded by
     /// [`MAX_GATE_DEFER_MS`] so a pathological upstream cannot park a request
     /// forever.
-    pub async fn wait_until_clear(&self, provider: &str) -> Option<u64> {
+    pub async fn wait_until_clear(&self, gate_key: &str, telemetry_name: &str) -> Option<u64> {
         let started = Instant::now();
         let budget = Duration::from_millis(MAX_GATE_DEFER_MS);
         let mut deferred = false;
 
-        while let Some(remaining) = self.cooldown_remaining(provider) {
+        while let Some(remaining) = self.cooldown_remaining(gate_key) {
             let elapsed = started.elapsed();
             if elapsed >= budget {
                 break;
@@ -182,7 +187,7 @@ impl RateLimitGate {
             return None;
         }
         let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        record_gate_deferral(provider, waited);
+        record_gate_deferral(telemetry_name, waited);
         Some(waited)
     }
 }
@@ -354,7 +359,11 @@ mod tests {
     #[tokio::test]
     async fn gate_is_transparent_when_no_rate_limit_was_observed() {
         let gate = RateLimitGate::new();
-        assert!(gate.wait_until_clear("quiet-provider").await.is_none());
+        assert!(
+            gate.wait_until_clear("quiet-provider", "quiet-provider")
+                .await
+                .is_none()
+        );
         assert!(gate.cooldown_remaining("quiet-provider").is_none());
     }
 
@@ -364,7 +373,7 @@ mod tests {
         gate.note_rate_limited("shared", 200);
 
         let started = Instant::now();
-        let waited = gate.wait_until_clear("shared").await;
+        let waited = gate.wait_until_clear("shared", "shared").await;
         let elapsed = started.elapsed();
 
         assert!(waited.is_some(), "a throttled provider must defer the next request");

@@ -1,17 +1,29 @@
 //! Shared terminal commit for provider/tool turns.
 //!
-//! Provider execution has one owner in `agent::loop_`; this module owns the
+//! Provider execution has one owner in `agent::turn_engine`; this module owns the
 //! matching durable terminal boundary. Entry points supply their projection and
 //! delivery intent, while this finalizer writes idempotent history/telemetry,
 //! computes one usage settlement, and appends one `turn.finalized` commit marker.
 
+pub(crate) mod logical;
+mod replay;
+pub(crate) mod served_auxiliary;
+pub(crate) use replay::{VerifiedTerminalReplay, verify_terminal_replay, verify_terminal_replay_until};
+
+use crate::causal_tree::ids::DecisionId;
+use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
+use crate::causal_tree::store::{DecisionScope, DecisionStoreReader, DecisionStoreWriter, Enqueue};
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
+use crate::decision::{DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
-use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
+use crate::memory::{Memory, MemoryFabric, MessageEvent, MessageEventScope};
+use crate::runtime::turn_decision::{SettlementIssueToken, TurnDecisionContext};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,7 +58,10 @@ pub struct TurnTerminalTelemetry {
 }
 
 #[derive(Debug, Clone)]
-pub struct TurnTerminalCommit {
+pub struct TurnTerminalDraft {
+    /// The owning guard fills omitted authority before sealing this draft.
+    /// Direct finalization rejects an omitted link before any writes.
+    pub decision: Option<DecisionSettlementRef>,
     pub terminal_id: String,
     pub scope: MessageEventScope,
     pub status: TurnTerminalStatus,
@@ -59,6 +74,249 @@ pub struct TurnTerminalCommit {
     pub delivery_intent: TurnDeliveryIntent,
 }
 
+/// A finalized model-turn proposal always carries service-issued authority.
+#[derive(Debug, Clone)]
+pub struct TurnTerminalCommit {
+    /// Required service-issued source binding, including disabled turns.
+    pub decision: DecisionSettlementRef,
+    pub terminal_id: String,
+    pub scope: MessageEventScope,
+    pub status: TurnTerminalStatus,
+    pub history: Option<TurnHistoryProjection>,
+    /// Optional message scope for the assistant history projection. Runtime
+    /// telemetry may use a different channel/recipient scope.
+    pub history_scope: Option<MessageEventScope>,
+    pub provider_outcome: Option<ProviderExecutionOutcome>,
+    pub telemetry: TurnTerminalTelemetry,
+    pub delivery_intent: TurnDeliveryIntent,
+}
+
+impl TryFrom<TurnTerminalDraft> for TurnTerminalCommit {
+    type Error = anyhow::Error;
+
+    fn try_from(draft: TurnTerminalDraft) -> anyhow::Result<Self> {
+        Ok(Self {
+            decision: draft
+                .decision
+                .context("terminal draft has no service-issued decision")?,
+            terminal_id: draft.terminal_id,
+            scope: draft.scope,
+            status: draft.status,
+            history: draft.history,
+            history_scope: draft.history_scope,
+            provider_outcome: draft.provider_outcome,
+            telemetry: draft.telemetry,
+            delivery_intent: draft.delivery_intent,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct DecisionSettlementRef {
+    parent_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
+    operator_parent: Option<Arc<crate::runtime::child_source::parent::ParentSource>>,
+    decision_id: DecisionId,
+    context: Arc<TurnDecisionContext>,
+    recorded: Option<RecordedDecisionSettlement>,
+    workspace_dir: PathBuf,
+    cost_config: CostConfig,
+    record_redacted_projection: bool,
+    memory: Arc<dyn Memory>,
+}
+
+#[derive(Clone)]
+struct RecordedDecisionSettlement {
+    writer: DecisionStoreWriter,
+    reader: DecisionStoreReader,
+    store_workspace_id: Arc<str>,
+    key: Arc<DecisionKey>,
+}
+
+impl std::fmt::Debug for DecisionSettlementRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionSettlementRef")
+            .field("decision_id", &self.decision_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecisionSettlementRef {
+    /// Whether this link can participate in durable decision replay/outcomes.
+    /// Disabled source binding alone never grants that authority.
+    pub(crate) const fn is_recorded(&self) -> bool {
+        self.recorded.is_some()
+    }
+
+    /// A terminal guard may reuse only its own issued context, never another
+    /// decision with a caller-selected identifier or matching scope strings.
+    pub(crate) fn same_context(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.context, &other.context)
+    }
+
+    pub(crate) fn issued(
+        context: Arc<TurnDecisionContext>,
+        writer: DecisionStoreWriter,
+        reader: DecisionStoreReader,
+        store_workspace_id: Arc<str>,
+        key: Arc<DecisionKey>,
+        workspace_dir: PathBuf,
+        cost_config: CostConfig,
+        record_redacted_projection: bool,
+        memory: Arc<dyn Memory>,
+        _token: SettlementIssueToken,
+    ) -> Self {
+        Self {
+            parent_grant: None,
+            operator_parent: None,
+            decision_id: context.decision_id(),
+            context,
+            recorded: Some(RecordedDecisionSettlement {
+                writer,
+                reader,
+                store_workspace_id,
+                key,
+            }),
+            workspace_dir,
+            cost_config,
+            record_redacted_projection,
+            memory,
+        }
+    }
+
+    /// A disabled turn retains its source binding without any store writer,
+    /// reader or replay key. It cannot claim a durable decision outcome.
+    pub(crate) fn issued_disabled(
+        context: Arc<TurnDecisionContext>,
+        workspace_dir: PathBuf,
+        cost_config: CostConfig,
+        memory: Arc<dyn Memory>,
+        _token: SettlementIssueToken,
+    ) -> Self {
+        Self {
+            parent_grant: None,
+            operator_parent: None,
+            decision_id: context.decision_id(),
+            context,
+            recorded: None,
+            workspace_dir,
+            cost_config,
+            record_redacted_projection: false,
+            memory,
+        }
+    }
+
+    pub(crate) fn with_parent_grant(
+        mut self,
+        grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
+    ) -> Self {
+        self.parent_grant = grant;
+        self
+    }
+
+    pub(crate) fn with_operator_parent(
+        mut self,
+        parent: Option<Arc<crate::runtime::child_source::parent::ParentSource>>,
+    ) -> Self {
+        self.operator_parent = parent;
+        self
+    }
+
+    fn validate_terminal_scope(
+        &self,
+        fabric: &MemoryFabric,
+        scope: &MessageEventScope,
+        history_scope: Option<&MessageEventScope>,
+        workspace_dir: &Path,
+        cost_config: &CostConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.memory, &fabric.memory()),
+            "decision terminal memory does not match the pinned service"
+        );
+        let trusted = self
+            .context
+            .audit_hops()
+            .last()
+            .context("decision has no final hop")?
+            .state
+            .trusted
+            .parts();
+        anyhow::ensure!(self.decision_id == self.context.decision_id(), "decision link changed");
+        anyhow::ensure!(
+            workspace_dir == self.workspace_dir && cost_config == &self.cost_config,
+            "decision settlement workspace or cost configuration does not match the pinned turn"
+        );
+        anyhow::ensure!(
+            trusted.workspace_id.as_ref() == fabric.workspace_id(),
+            "decision terminal workspace does not match the pinned turn"
+        );
+        // Both writes retain the recorded ingress identity and visibility. Sender
+        // and recipient are presentation labels and may differ for history.
+        for write_scope in [scope, history_scope.unwrap_or(scope)] {
+            anyhow::ensure!(
+                crate::runtime::turn_source::ingress_event_surface(
+                    &write_scope.source,
+                    write_scope.channel.as_deref(),
+                    &write_scope.visibility
+                ) == Some(trusted.surface)
+                    && write_scope.channel.as_deref() == Some(self.context.source_channel())
+                    && write_scope.owner_id.as_deref() == trusted.owner_id.as_deref()
+                    && write_scope.session_key.as_deref() == trusted.session_key.as_deref()
+                    && write_scope.run_id.as_deref() == trusted.run_id.as_deref()
+                    && crate::runtime::turn_source::subject_task_id(write_scope.subject.as_ref())
+                        == trusted.task_id.as_deref(),
+                "decision terminal or history scope does not match the pinned turn"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn validate_durable_chain(&self) -> anyhow::Result<()> {
+        let recorded = self
+            .recorded
+            .as_ref()
+            .context("disabled decision has no durable settlement")?;
+        anyhow::ensure!(
+            recorded.writer.drain(Instant::now() + Duration::from_secs(5)).await,
+            "decision chain did not reach durable storage before terminal claim"
+        );
+        let trusted = self
+            .context
+            .audit_hops()
+            .last()
+            .context("decision has no final hop")?
+            .state
+            .trusted
+            .parts();
+        let scope = DecisionScope::Owner {
+            workspace_id: Arc::clone(&recorded.store_workspace_id),
+            owner_id: trusted.owner_id.clone().context("decision has no owner")?,
+        };
+        for (position, id) in self.context.hop_ids().iter().enumerate() {
+            let view = recorded
+                .reader
+                .get(&scope, id)?
+                .context("queued decision hop was not durably stored")?;
+            anyhow::ensure!(
+                view.enabled_snapshot
+                    && !view.legacy_v1
+                    && view.prior_decision_id
+                        == position
+                            .checked_sub(1)
+                            .and_then(|n| self.context.hop_ids().get(n))
+                            .copied()
+                    && view.session_key.as_deref() == trusted.session_key.as_deref()
+                    && view.run_id.as_deref() == trusted.run_id.as_deref()
+                    && view.channel.is_none()
+                    && view.policy_version == trusted.policy_version.as_ref()
+                    && view.decision_id == *id,
+                "durable decision chain does not match the pinned turn"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnTerminalReceipt {
     pub terminal_id: String,
@@ -69,11 +327,34 @@ pub struct TurnTerminalReceipt {
     pub delivery_intent: TurnDeliveryIntent,
 }
 
+/// Redaction for reply, error or summary text persisted from a turn (D-053,
+/// D-054).
+///
+/// Every surface persists a turn's reply, its provider outcome and its error
+/// text through [`finalize_turn`], which applies this policy once; the few
+/// writes beside it on a turn path (a fallback projection when the terminal
+/// commit fails, a conversation-turn row, a worker or task result record) use
+/// these same functions, all backed by the one redactor
+/// ([`crate::security::redaction`]). Redaction never truncates: a store that
+/// caps what it keeps does so itself.
+#[must_use]
+pub(crate) fn redact_persisted_text(text: &str) -> String {
+    crate::security::redaction::redact_secrets(text)
+}
+
+/// Redaction for a JSON payload persisted beside a turn: every string is
+/// redacted and values under credential-named keys are replaced.
+#[must_use]
+pub(crate) fn redact_persisted_json(mut value: serde_json::Value) -> serde_json::Value {
+    crate::security::redaction::redact_json_value(&mut value);
+    value
+}
+
 #[must_use]
 pub(crate) fn provider_outcome_from_trace(
     decision: &crate::llm::route_decision::RouteDecision,
     started_at: chrono::DateTime<chrono::Utc>,
-    trace: crate::agent::loop_::ToolLoopTrace,
+    trace: crate::agent::turn_contracts::ToolLoopTrace,
 ) -> ProviderExecutionOutcome {
     if trace.final_model.is_some() && !trace.attempts.is_empty() {
         let final_provider = trace
@@ -101,7 +382,17 @@ pub fn usage_settlement(
     outcome: &ProviderExecutionOutcome,
     cost_config: &CostConfig,
 ) -> Option<MeteredTokenUsageRecord> {
-    MeteredTokenUsageRecord::from_provider_outcome(outcome, cost_config).map(|mut record| {
+    // The settlement is persisted (usage event, cost ledger, a chat session's
+    // usage records when the terminal commit failed), so the serving label
+    // loses its URL userinfo first; `finalize_turn` has already done so for its
+    // own copy (D-054).
+    MeteredTokenUsageRecord::from_parts(
+        &crate::providers::redact_endpoint_userinfo(&outcome.final_provider),
+        &outcome.final_model,
+        &outcome.tokens_used,
+        cost_config,
+    )
+    .map(|mut record| {
         record.settlement_id = Some(terminal_id.to_string());
         record
     })
@@ -110,10 +401,15 @@ pub fn usage_settlement(
 #[derive(Debug, Serialize)]
 struct TurnTerminalPayload<'a> {
     terminal_id: &'a str,
+    decision_id: Option<&'a str>,
     status: TurnTerminalStatus,
     history: &'a Option<TurnHistoryProjection>,
+    history_scope: Option<serde_json::Value>,
+    execution_trace: Option<&'a crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     assistant_event_id: Option<&'a str>,
     provider_outcome: &'a Option<ProviderExecutionOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_auxiliary: Option<&'a served_auxiliary::ServedAuxiliaryProjection>,
     usage_settlement: &'a Option<MeteredTokenUsageRecord>,
     cost_settlement: &'a Option<CostSettlement>,
     telemetry: &'a TurnTerminalTelemetry,
@@ -122,12 +418,42 @@ struct TurnTerminalPayload<'a> {
     lease_epoch: Option<i64>,
 }
 
+/// Stable persisted metadata covered by a terminal claim. Runtime authority
+/// is validated separately and its callback is never serialized.
+fn terminal_semantic_scope(scope: &MessageEventScope) -> serde_json::Value {
+    serde_json::json!({
+        "source": scope.source,
+        "owner_id": scope.owner_id,
+        "channel": scope.channel,
+        "session_key": scope.session_key,
+        "parent_session_key": scope.parent_session_key,
+        "run_id": scope.run_id,
+        "parent_run_id": scope.parent_run_id,
+        "agent_id": scope.agent_id,
+        "persona_id": scope.persona_id,
+        "sender": scope.sender,
+        "recipient": scope.recipient,
+        "subject": scope.subject,
+        "goal_id": scope.goal_id,
+        "causation_event_id": scope.causation_event_id,
+        "correlation_id": scope.correlation_id,
+        "attempt_id": scope.attempt_id,
+        "lease_epoch": scope.lease_epoch,
+        "config_generation_id": scope.config_generation_id,
+        "config_source_revision": scope.config_source_revision,
+        "visibility": scope.visibility,
+    })
+}
+
 /// Finalize one semantic turn.
 ///
 /// The `turn.finalized` marker is deliberately written last. A retry after a
 /// partial failure replays assistant/provider writes through stable idempotency
 /// keys, then closes the transaction with exactly one marker. The marker embeds
 /// the sole metered usage settlement and the requested delivery disposition.
+/// A linked decision retry must reproduce the same terminal facts, including
+/// telemetry timestamps. A changed commit is rejected by its durable claim;
+/// recovery from an already committed marker uses the decision rejoin reader.
 async fn ensure_runtime_authority(scope: &MessageEventScope, phase: &'static str) -> anyhow::Result<()> {
     let Some(authority_guard) = scope.authority_guard.clone() else {
         return Ok(());
@@ -141,14 +467,247 @@ async fn ensure_runtime_authority(scope: &MessageEventScope, phase: &'static str
     Ok(())
 }
 
-pub async fn finalize_turn(
+pub async fn finalize_turn<C>(
+    fabric: &MemoryFabric,
+    commit: C,
+    cost_config: &CostConfig,
+    workspace_dir: &Path,
+) -> anyhow::Result<TurnTerminalReceipt>
+where
+    C: TryInto<TurnTerminalCommit>,
+    C::Error: Into<anyhow::Error>,
+{
+    let commit = commit.try_into().map_err(Into::into)?;
+    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, false).await
+}
+
+#[cfg(test)]
+pub(crate) async fn finalize_turn_stop_after_marker<C>(
+    fabric: &MemoryFabric,
+    commit: C,
+    cost_config: &CostConfig,
+    workspace_dir: &Path,
+) -> anyhow::Result<TurnTerminalReceipt>
+where
+    C: TryInto<TurnTerminalCommit>,
+    C::Error: Into<anyhow::Error>,
+{
+    let commit = commit.try_into().map_err(Into::into)?;
+    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, true).await
+}
+
+async fn finalize_turn_impl(
     fabric: &MemoryFabric,
     commit: TurnTerminalCommit,
     cost_config: &CostConfig,
     workspace_dir: &Path,
+    stop_after_marker: bool,
 ) -> anyhow::Result<TurnTerminalReceipt> {
     anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
     ensure_runtime_authority(&commit.scope, "start").await?;
+    let mut execution_trace = None;
+    let mut prepared_replay = None;
+    commit.decision.validate_terminal_scope(
+        fabric,
+        &commit.scope,
+        commit.history_scope.as_ref(),
+        workspace_dir,
+        cost_config,
+    )?;
+    commit
+        .decision
+        .context
+        .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
+    if let Some(served) = commit.decision.context.served_auxiliary() {
+        anyhow::ensure!(
+            commit.status == TurnTerminalStatus::Completed,
+            "auxiliary reply cannot be attached to an incomplete terminal"
+        );
+        served.validate_reply(
+            &commit
+                .history
+                .as_ref()
+                .context("auxiliary reply projection missing")?
+                .assistant_content,
+        )?;
+    }
+    if commit.decision.is_recorded() {
+        let decision = &commit.decision;
+        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+        decision.validate_durable_chain().await?;
+        let mut prepared = replay::PreparedReplay::capture(decision, &commit).await?;
+        execution_trace = Some(decision.context.terminal_execution_trace());
+        // An idempotency key already committed for another decision must not
+        // authorize even a usage or cost replay under the new decision.
+        let final_key = format!("turn:{}:final", commit.terminal_id);
+        if let Some(existing) = fabric
+            .memory()
+            .find_message_event_by_idempotency_key(fabric.workspace_id(), &final_key)
+            .await?
+        {
+            verify_terminal_replay(
+                fabric.memory().as_ref(),
+                &recorded.reader,
+                &recorded.key,
+                &recorded.store_workspace_id,
+                fabric.workspace_id(),
+                commit.scope.owner_id.as_deref().context("terminal owner is missing")?,
+                &commit.terminal_id,
+                &existing,
+            )
+            .await?;
+            let payload: serde_json::Value = serde_json::from_str(
+                existing
+                    .raw_payload_json
+                    .as_deref()
+                    .context("terminal marker has no payload")?,
+            )?;
+            anyhow::ensure!(
+                existing.role == "event"
+                    && existing.event_type == "turn.finalized"
+                    && existing.source == commit.scope.source
+                    && existing.workspace_id == fabric.workspace_id()
+                    && existing.owner_id == commit.scope.owner_id
+                    && existing.session_key == commit.scope.session_key
+                    && existing.run_id == commit.scope.run_id
+                    && existing.channel == commit.scope.channel
+                    && existing.idempotency_key.as_deref() == Some(final_key.as_str())
+                    && payload.get("terminal_id").and_then(serde_json::Value::as_str)
+                        == Some(commit.terminal_id.as_str())
+                    && payload.get("decision_id").and_then(serde_json::Value::as_str)
+                        == Some(decision.decision_id.to_string().as_str())
+                    && payload.get("status").and_then(serde_json::Value::as_str)
+                        == Some(match commit.status {
+                            TurnTerminalStatus::Completed => "completed",
+                            TurnTerminalStatus::Silent => "silent",
+                            TurnTerminalStatus::Failed => "failed",
+                            TurnTerminalStatus::Cancelled => "cancelled",
+                        }),
+                "existing terminal marker conflicts with the pinned decision or scope"
+            );
+        }
+        // The workspace-scoped idempotency key is unique in the durable
+        // message store. Its insert/readback transaction elects one decision
+        // before any usage, cost or assistant write, including across
+        // processes. A retry of the same decision may reuse the claim.
+        let claim_key = format!("turn:{}:decision-claim", commit.terminal_id);
+        // A keyed, versioned digest binds the facts that can change terminal
+        // side effects. Redaction precedes the digest, and the durable key
+        // prevents offline guessing of short private replies or targets.
+        let mut claim_outcome = commit.provider_outcome.clone();
+        if let Some(outcome) = claim_outcome.as_mut() {
+            outcome.redact_provider_labels();
+        }
+        let trusted = decision
+            .context
+            .audit_hops()
+            .last()
+            .context("decision has no final hop")?
+            .state
+            .trusted
+            .parts();
+        // Version two prevents a valid claim from being transplanted to
+        // another terminal or decision, including across a process restart.
+        // Unsigned and version-one claims cannot authorize this path.
+        let mut semantic = redact_persisted_json(serde_json::json!({
+            "version": 2,
+            "terminal_id": commit.terminal_id,
+            "decision_id": decision.decision_id.to_string(),
+            "execution_trace": execution_trace,
+            "decision_chain": decision.context.hop_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "workspace_id": trusted.workspace_id,
+            "source_event_id": trusted.source_event_id,
+            "catalog_generation": trusted.catalog_generation.to_hex(),
+            "policy_version": trusted.policy_version,
+            "status": commit.status,
+            "scope": terminal_semantic_scope(&commit.scope),
+            "history": commit.history,
+            "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
+            "provider_outcome": claim_outcome,
+            "telemetry": commit.telemetry,
+            "delivery_intent": commit.delivery_intent,
+        }));
+        if let Some(event) = decision
+            .context
+            .served_auxiliary()
+            .and_then(served_auxiliary::ServedAuxiliaryLink::event)
+        {
+            use sha2::Digest;
+            semantic
+                .as_object_mut()
+                .context("terminal claim is not an object")?
+                .insert(
+                    "served_auxiliary".to_owned(),
+                    serde_json::json!({
+                        "event_id": event.event_id,
+                        "sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(event)?)),
+                    }),
+                );
+        }
+        let semantic_bytes = serde_json::to_vec(&semantic)?;
+        let semantic_mac = hex::encode(
+            recorded
+                .key
+                .hmac(KeyDomain::TerminalClaim, &[b"terminal-claim-v2", &semantic_bytes]),
+        );
+        let claim = fabric
+            .record_runtime_event_idempotent(
+                commit.scope.clone(),
+                "turn.decision.claimed",
+                format!("terminal_id={}", commit.terminal_id),
+                Some(
+                    serde_json::json!({
+                        "terminal_id": commit.terminal_id,
+                        "decision_id": decision.decision_id.to_string(),
+                        "semantic_mac_v2": semantic_mac,
+                    })
+                    .to_string(),
+                ),
+                &claim_key,
+            )
+            .await?;
+        let claim_payload: serde_json::Value = serde_json::from_str(
+            claim
+                .raw_payload_json
+                .as_deref()
+                .context("decision claim has no payload")?,
+        )?;
+        anyhow::ensure!(
+            claim.role == "event"
+                && claim.event_type == "turn.decision.claimed"
+                && claim.source == commit.scope.source
+                && claim.workspace_id == fabric.workspace_id()
+                && claim.owner_id == commit.scope.owner_id
+                && claim.session_key == commit.scope.session_key
+                && claim.run_id == commit.scope.run_id
+                && claim.channel == commit.scope.channel
+                && claim.idempotency_key.as_deref() == Some(claim_key.as_str())
+                && claim_payload.get("terminal_id").and_then(serde_json::Value::as_str)
+                    == Some(commit.terminal_id.as_str())
+                && claim_payload.get("decision_id").and_then(serde_json::Value::as_str)
+                    == Some(decision.decision_id.to_string().as_str())
+                && claim_payload.get("semantic_mac_v2").and_then(serde_json::Value::as_str)
+                    == Some(semantic_mac.as_str()),
+            "terminal decision claim conflicts with the pinned decision or scope"
+        );
+        prepared.bind_claim(&recorded.key, &claim)?;
+        prepared_replay = Some(prepared);
+    }
+    // Everything below persists the reply and the outcome (the assistant
+    // message event, usage settlement, cost ledger, attempt events, the
+    // terminal marker). Every surface finalizes here, so both are redacted
+    // once, here, at write: the outcome's provider labels lose their URL
+    // userinfo, and secrets in the reply and in every outcome string (provider
+    // errors included) are replaced by the one redactor, which never
+    // truncates (D-054).
+    let mut commit = commit;
+    if let Some(outcome) = commit.provider_outcome.as_mut() {
+        outcome.redact_provider_labels();
+        *outcome = crate::security::redaction::redact_json_structure(&*outcome)?;
+    }
+    if let Some(history) = commit.history.as_mut() {
+        history.assistant_content = redact_persisted_text(&history.assistant_content);
+    }
 
     let usage_settlement = commit
         .provider_outcome
@@ -214,12 +773,24 @@ pub async fn finalize_turn(
         crate::llm::route_decision::record_provider_outcome_events(fabric, commit.scope.clone(), outcome).await?;
     }
 
+    let decision_id = commit
+        .decision
+        .is_recorded()
+        .then(|| commit.decision.decision_id.to_string());
     let payload = TurnTerminalPayload {
         terminal_id: &commit.terminal_id,
+        decision_id: decision_id.as_deref(),
         status: commit.status,
         history: &commit.history,
+        history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
+        execution_trace: execution_trace.as_ref(),
         assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
         provider_outcome: &commit.provider_outcome,
+        served_auxiliary: commit
+            .decision
+            .context
+            .served_auxiliary()
+            .and_then(served_auxiliary::ServedAuxiliaryLink::projection),
         usage_settlement: &usage_settlement,
         cost_settlement: &cost_settlement,
         telemetry: &commit.telemetry,
@@ -227,7 +798,16 @@ pub async fn finalize_turn(
         attempt_id: commit.scope.attempt_id.as_deref(),
         lease_epoch: commit.scope.lease_epoch,
     };
-    let payload_json = serde_json::to_string(&payload)?;
+    // The marker also carries the telemetry summary and the delivery intent,
+    // which callers fill with error text (and, for sub-agents, the result
+    // text): every string in it passes the same redactor.
+    let mut payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
+    if let Some(prepared) = prepared_replay {
+        let decision = &commit.decision;
+        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+        prepared.seal(&recorded.key, &mut payload_value, assistant_event.as_ref())?;
+    }
+    let payload_json = serde_json::to_string(&payload_value)?;
     ensure_runtime_authority(&commit.scope, "terminal-marker").await?;
     let terminal_event = fabric
         .record_runtime_event_idempotent(
@@ -239,14 +819,94 @@ pub async fn finalize_turn(
         )
         .await?;
 
-    Ok(TurnTerminalReceipt {
+    if commit.decision.is_recorded() {
+        let decision = &commit.decision;
+        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+        verify_terminal_replay(
+            fabric.memory().as_ref(),
+            &recorded.reader,
+            &recorded.key,
+            &recorded.store_workspace_id,
+            fabric.workspace_id(),
+            terminal_event
+                .owner_id
+                .as_deref()
+                .context("terminal owner is missing")?,
+            &commit.terminal_id,
+            &terminal_event,
+        )
+        .await?;
+    }
+    let receipt = TurnTerminalReceipt {
         terminal_id: commit.terminal_id,
         terminal_event,
         assistant_event,
         usage_settlement,
         cost_settlement,
         delivery_intent: commit.delivery_intent,
-    })
+    };
+    if stop_after_marker {
+        return Ok(receipt);
+    }
+    if commit.decision.is_recorded() {
+        let decision = &commit.decision;
+        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+        let facts = TerminalFacts::from_receipt(&decision.context, &receipt)?;
+        anyhow::ensure!(
+            OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued,
+            "decision outcome could not be queued after terminal commit"
+        );
+    }
+    Ok(receipt)
+}
+
+/// Test support for the D-053 per-surface probes: a secret one surface's turn
+/// persisted anywhere under its workspace.
+#[cfg(test)]
+pub(crate) mod persistence_probe {
+    use std::path::Path;
+
+    /// An AWS-key-shaped secret, as a provider may echo it back in a reply or
+    /// an error.
+    pub(crate) const PROBE_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    /// What the redactor writes in place of a secret.
+    const REDACTION_MARKER: &str = "[REDACTED]";
+
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("test: read a probed directory");
+        for entry in entries {
+            let path = entry.expect("test: read a probed directory entry").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+
+    /// Every file under `root` (SQLite databases and their WAL, cost ledgers,
+    /// JSONL traces, session files) is free of [`PROBE_SECRET`], compared
+    /// case-insensitively because full-text indexes store lowercased tokens.
+    /// At least one file must hold the redaction marker, so a probe whose turn
+    /// persisted nothing cannot pass vacuously.
+    pub(crate) fn assert_nothing_under_persists_the_probe_secret(root: &Path) {
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        let needle = PROBE_SECRET.to_ascii_lowercase();
+        let mut redacted_somewhere = false;
+        for file in &files {
+            let bytes = std::fs::read(file).expect("test: read a probed file");
+            let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            assert!(!text.contains(&needle), "{} persisted the probe secret", file.display());
+            redacted_somewhere |= String::from_utf8_lossy(&bytes).contains(REDACTION_MARKER);
+        }
+        assert!(
+            redacted_somewhere,
+            "no file under {} holds a redacted copy: the probe persisted nothing ({files:?})",
+            root.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -256,9 +916,10 @@ mod tests {
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use std::sync::Arc;
 
-    fn completed_commit(terminal_id: &str) -> TurnTerminalCommit {
+    fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
         let started_at = chrono::Utc::now();
-        TurnTerminalCommit {
+        TurnTerminalDraft {
+            decision: None,
             terminal_id: terminal_id.to_string(),
             scope: MessageEventScope::new("agent", MemoryVisibility::Workspace)
                 .with_channel("test")
@@ -271,7 +932,7 @@ mod tests {
             }),
             history_scope: None,
             provider_outcome: Some(ProviderExecutionOutcome::success_for_decision_with_usage(
-                &RouteDecision::single_candidate("provider-a", "model-a"),
+                &RouteDecision::single_candidate("ollama", "prx-local-model"),
                 started_at,
                 crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
             )),
@@ -284,86 +945,508 @@ mod tests {
         }
     }
 
-    fn workspace_principal(workspace_id: &str, session_key: &str) -> MemoryPrincipal {
+    fn boxed_terminal_fixture_turn<'a>(
+        history: &'a mut Vec<crate::providers::ChatMessage>,
+        request: crate::agent::turn_request::TurnRequest<'a>,
+        services: crate::agent::turn_request::TurnServices<'a>,
+        delivery: crate::agent::turn_request::TurnDelivery,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                Output = anyhow::Result<(
+                    crate::agent::turn_contracts::ToolLoopOutcome,
+                    crate::agent::turn_contracts::ToolLoopTrace,
+                )>,
+            > + 'a,
+        >,
+    > {
+        Box::pin(crate::agent::turn_engine::run_turn(
+            history, request, services, delivery,
+        ))
+    }
+
+    struct TerminalFixtureProvider {
+        outcome: ProviderExecutionOutcome,
+        text: String,
+        silent: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for TerminalFixtureProvider {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            anyhow::bail!("terminal fixture requires the actual traced provider path")
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_traced(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(model, self.outcome.final_model);
+            if self.silent {
+                assert!(request.tools.is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|spec| spec.name == crate::tools::STAY_SILENT_TOOL_NAME)
+                }));
+            }
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: (!self.silent).then(|| self.text.clone()),
+                    tool_calls: if self.silent {
+                        vec![crate::providers::ToolCall {
+                            id: "prx_silent_call".into(),
+                            name: crate::tools::STAY_SILENT_TOOL_NAME.into(),
+                            arguments: serde_json::json!({"reason": "no group response needed"}).to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    reasoning_content: None,
+                },
+                attempts: self.outcome.attempts.clone(),
+                final_provider: self.outcome.final_provider.clone(),
+                final_model: self.outcome.final_model.clone(),
+                served_member: None,
+                tokens_used: self.outcome.tokens_used.clone(),
+            })
+        }
+    }
+
+    // Issue actual source authority, seed only that authenticated memory scope,
+    // and let the production decision/turn loop produce its observations.
+    async fn bind_terminal_fixture(
+        workspace: &Path,
+        memory: Arc<dyn Memory>,
+        draft: &mut TurnTerminalDraft,
+        cost_config: &CostConfig,
+    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+        bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true).await
+    }
+
+    async fn bind_terminal_fixture_mode(
+        workspace: &Path,
+        memory: Arc<dyn Memory>,
+        draft: &mut TurnTerminalDraft,
+        cost_config: &CostConfig,
+        enabled: bool,
+    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+        let input = "Use memory_search to explain the saved expression `2 + 2`.";
+        let selection = draft
+            .provider_outcome
+            .as_ref()
+            .map_or(("ollama", "prx-local-model"), |outcome| {
+                (outcome.final_provider.as_str(), outcome.final_model.as_str())
+            });
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.config_path = workspace.join("config.toml");
+        config.causal_tree.enabled = enabled;
+        config.causal_tree.policy.max_decision_hops = 1;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.remote_enabled = false;
+        config.cost = cost_config.clone();
+        config
+            .providers
+            .models
+            .push(crate::config::schema::ProviderModelConfig {
+                provider: selection.0.to_owned(),
+                model: Some(selection.1.to_owned()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
+        let generation = crate::config::new_shared(config).pin();
+        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
+            Box::new(crate::tools::MemorySearchTool::new(
+                workspace.to_path_buf(),
+                Arc::clone(&memory),
+                true,
+            )),
+            Box::new(crate::tools::StaySilentTool::new()),
+        ]);
+        let observer = Arc::new(crate::observability::NoopObserver {});
+        let hooks = Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf()));
+        let service = crate::runtime::turn_publication::TurnDecisionPublication {
+            generation: Arc::clone(&generation),
+            registry: Arc::clone(&registry),
+            mcp_tool: None,
+            security: Arc::new(crate::security::SecurityPolicy::from_config(
+                &generation.effective.autonomy,
+                workspace,
+            )),
+            observer: observer.clone(),
+            hooks: Arc::clone(&hooks),
+            memory: Arc::clone(&memory),
+            plugin_generation: 0,
+        }
+        .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+        .await
+        .unwrap();
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+            &generation,
+            Arc::clone(&memory),
+            input,
+            &draft.terminal_id,
+            selection,
+        )
+        .await;
+        assert!(
+            service.model_can_call_tools(&proof),
+            "fixture's actual traced provider supports verified native tools"
+        );
+        let source = memory
+            .find_owned_message_event(
+                &workspace.to_string_lossy(),
+                proof.owner_id(),
+                proof.source_event_id().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.content, input);
+        assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
+        assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
+        let mut write_scope = proof.memory_scope().clone();
+        write_scope.owner_id = Some(proof.owner_id().to_owned());
+        write_scope.require_owner_match = true;
+        memory
+            .store_with_context_and_metadata(
+                "prx_terminal_fixture_note",
+                "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
+                crate::memory::MemoryCategory::Core,
+                Some(proof.session_key()),
+                Some(&write_scope),
+                crate::memory::MemoryStoreMetadata {
+                    workspace_id: Some(source.workspace_id.clone()),
+                    owner_id: source.owner_id.clone(),
+                    channel: source.channel.clone(),
+                    source_event_id: Some(source.event_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = service
+            .decide_agent_initial(
+                &proof,
+                crate::runtime::turn_decision::AgentTurnKind::Repl,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        if enabled {
+            assert!(
+                matches!(
+                    context.directive(),
+                    crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+                ),
+                "fixture requires real scoped retrieval to authorize Answer"
+            );
+        }
+        if draft.status == TurnTerminalStatus::Silent {
+            let mut spec = service
+                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                .unwrap();
+            let mut cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
+            spec.description.push_str(" changed fixture schema");
+            let changed =
+                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+            let error = service.record_agent_silence(&proof, &context, &changed).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("silence dependency changed after provider request")
+            );
+            let foreign = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                &generation,
+                Arc::clone(&memory),
+                input,
+                &format!("{}-foreign", draft.terminal_id),
+                selection,
+            )
+            .await;
+            let spec = service
+                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                .unwrap();
+            let offered =
+                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+            let error = service.record_agent_silence(&foreign, &context, &offered).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("turn origin does not match the pinned decision service")
+            );
+        }
+        if matches!(draft.status, TurnTerminalStatus::Completed | TurnTerminalStatus::Silent) {
+            let provider = TerminalFixtureProvider {
+                outcome: draft
+                    .provider_outcome
+                    .clone()
+                    .expect("fixture actual provider response"),
+                text: draft
+                    .history
+                    .as_ref()
+                    .map_or_else(|| "done".to_owned(), |history| history.assistant_content.clone()),
+                silent: draft.status == TurnTerminalStatus::Silent,
+                calls: Default::default(),
+            };
+            let mut history = vec![crate::providers::ChatMessage::user(input)];
+            let result = boxed_terminal_fixture_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: Default::default(),
+                    silent: true,
+                    expose_stay_silent: provider.silent,
+                    multimodal: &generation.effective.multimodal,
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 1,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: crate::agent::turn_request::TurnDecision {
+                        service: &service,
+                        context: &context,
+                        proof: &proof,
+                    },
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: proof.provider_name(),
+                    model: proof.model_name(),
+                    temperature: 0.0,
+                    tools_registry: registry,
+                    observer: observer.as_ref(),
+                    hooks: hooks.as_ref(),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                        provider_trace: None,
+                        events: None,
+                        stream_provider: false,
+                        tool_execution_service: None,
+                        tool_execution_context: crate::tools::ToolExecutionContext::new(
+                            crate::runtime::envelope::RuntimeEnvelope::agent(
+                                workspace.to_string_lossy(),
+                                proof.run_id(),
+                            )
+                            .with_config_generation(&generation)
+                            .with_source_message_event_id(proof.source_event_id().unwrap()),
+                            "private",
+                        ),
+                        allowed_tool_names: None,
+                    }),
+                    memory: crate::agent::turn_request::ToolLoopMemory::new(&memory, workspace, None),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: Some(cancellation),
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                matches!(result.0, crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. }),
+                provider.silent
+            );
+            let original = draft.provider_outcome.as_ref().unwrap();
+            assert_eq!(
+                result.1.tokens_used, original.tokens_used,
+                "real silent/text loop must retain complete reported usage"
+            );
+            let route = RouteDecision::single_candidate(&original.final_provider, &original.final_model);
+            let mut actual = provider_outcome_from_trace(&route, original.started_at, result.1);
+            // The upstream fixture's reason remains a redaction probe; execution
+            // status, attempts, serving tuple and usage all come from run_turn.
+            actual.fallback_reason.clone_from(&original.fallback_reason);
+            draft.provider_outcome = Some(actual);
+        }
+        let decision = service.terminal_settlement_ref(context).unwrap();
+        if decision.is_recorded() {
+            decision.validate_durable_chain().await.unwrap();
+        }
+        draft.scope = MessageEventScope::new("agent", MemoryVisibility::Session)
+            .with_owner_id(proof.owner_id())
+            .with_channel("cli")
+            .with_session_key(proof.session_key())
+            .with_run_id(proof.run_id());
+        draft.decision = Some(decision);
+        // The decision writer can enqueue causal events after its own commit.
+        // Establish fixture baselines only after both queues acknowledge.
+        assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+        service
+    }
+
+    fn terminal_fixture_principal(workspace: &Path, scope: &MessageEventScope) -> MemoryPrincipal {
         MemoryPrincipal {
-            require_owner_match: false,
-            workspace_id: workspace_id.to_string(),
+            require_owner_match: true,
+            workspace_id: workspace.to_string_lossy().into_owned(),
             agent_id: None,
             persona_id: None,
-            session_key: Some(session_key.to_string()),
-            channel: Some("test".to_string()),
+            session_key: scope.session_key.clone(),
+            channel: scope.channel.clone(),
             sender: None,
-            owner_id: None,
+            owner_id: scope.owner_id.clone(),
             legacy_session_key: None,
         }
     }
 
     #[tokio::test]
-    async fn logical_workspace_id_uses_explicit_cost_ledger_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
-        let cost_config = CostConfig::default();
-
-        let receipt = finalize_turn(
-            &fabric,
-            completed_commit("logical-workspace-run"),
-            &cost_config,
-            temp.path(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(receipt.cost_settlement, Some(CostSettlement::UnknownPricing));
-        assert!(temp.path().join("state").join("costs.jsonl").parent().unwrap().exists());
-        let events = memory
-            .list_message_events_since(
-                &workspace_principal("logical-workspace", "logical-workspace-run"),
-                0,
-                32,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.event_type == "turn.finalized")
-                .count(),
-            1
-        );
+    async fn inconsistent_silent_status_is_rejected_before_writes_in_recorded_and_disabled_modes() {
+        for enabled in [true, false] {
+            for issued_silent in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+                let fabric = MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy());
+                let mut draft = completed_commit("prx_silent_consistency");
+                if issued_silent {
+                    draft.status = TurnTerminalStatus::Silent;
+                    draft.delivery_intent = TurnDeliveryIntent::None;
+                }
+                let service = bind_terminal_fixture_mode(
+                    temp.path(),
+                    Arc::clone(&memory),
+                    &mut draft,
+                    &CostConfig::default(),
+                    enabled,
+                )
+                .await;
+                let principal = terminal_fixture_principal(temp.path(), &draft.scope);
+                let before = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+                assert!(
+                    before
+                        .iter()
+                        .any(|event| event.role == "user" && event.event_type == "message.created")
+                );
+                draft.status = if issued_silent {
+                    TurnTerminalStatus::Completed
+                } else {
+                    TurnTerminalStatus::Silent
+                };
+                let error = finalize_turn(&fabric, draft, &CostConfig::default(), temp.path())
+                    .await
+                    .unwrap_err();
+                let expected = if issued_silent {
+                    "authorized silence cannot be relabeled"
+                } else {
+                    "silent terminal lacks confirmed runtime execution facts"
+                };
+                assert!(error.to_string().contains(expected), "{error:#}");
+                assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+                let after = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+                assert_eq!(
+                    before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+                    after.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+                    "before event metadata: {:?}; after event metadata: {:?}",
+                    before
+                        .iter()
+                        .map(|event| (&event.event_id, &event.event_type, &event.role))
+                        .collect::<Vec<_>>(),
+                    after
+                        .iter()
+                        .map(|event| (&event.event_id, &event.event_type, &event.role))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    !after
+                        .iter()
+                        .any(|event| event.event_type == "turn.finalized" || event.event_type == "usage.settled")
+                );
+                assert!(!temp.path().join("state/costs.jsonl").exists());
+                service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+            }
+        }
     }
 
     #[tokio::test]
-    async fn invalid_cost_ledger_directory_is_recorded_in_terminal_projection() {
+    async fn foreign_fabric_workspace_cannot_redirect_issued_cost_settlement() {
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
-        let invalid_workspace_dir = temp.path().join("not-a-directory");
-        std::fs::write(&invalid_workspace_dir, "occupied").unwrap();
+        let cost_config = CostConfig::default();
+        let mut commit = completed_commit("foreign-workspace-run");
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+        let before = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|event| event.role == "user" && event.event_type == "message.created")
+        );
+        // Change only the fabric namespace. The real issued scope, backend,
+        // physical settlement directory and cost configuration remain intact.
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "foreign-logical-workspace");
+        let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decision terminal workspace does not match the pinned turn")
+        );
+        assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+        let after = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+        assert_eq!(
+            after.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+            before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+            "before event metadata: {:?}; after event metadata: {:?}",
+            before
+                .iter()
+                .map(|event| (&event.event_id, &event.event_type, &event.role))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|event| (&event.event_id, &event.event_type, &event.role))
+                .collect::<Vec<_>>()
+        );
+        let mut foreign = principal;
+        foreign.workspace_id = "foreign-logical-workspace".to_owned();
+        assert!(
+            memory
+                .list_message_events_since(&foreign, 0, 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!temp.path().join("state/costs.jsonl").exists());
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn occupied_cost_state_directory_is_recorded_in_terminal_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let cost_config = CostConfig::default();
 
-        let receipt = finalize_turn(
-            &fabric,
-            completed_commit("preflight-failure-run"),
-            &cost_config,
-            &invalid_workspace_dir,
-        )
-        .await
-        .unwrap();
+        let mut commit = completed_commit("preflight-failure-run");
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+        std::fs::write(temp.path().join("state"), "occupied").unwrap();
+        let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
 
         assert!(matches!(
             receipt.cost_settlement,
             Some(CostSettlement::Failed { ref error })
-                if error.contains("Failed to open cost storage")
+                if error.contains("failed to create cost state directory")
         ));
-        let events = memory
-            .list_message_events_since(
-                &workspace_principal("logical-workspace", "preflight-failure-run"),
-                0,
-                32,
-            )
-            .await
-            .unwrap();
+        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
             events
                 .iter()
@@ -392,14 +1475,24 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("failed")
         );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
     async fn lost_runtime_authority_fails_before_terminal_or_cost_projection() {
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let mut commit = completed_commit("lost-authority-run");
+        let service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+        let before = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|event| event.role == "user" && event.event_type == "message.created")
+        );
         commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new("lost-authority", || {
             Ok(false)
         }));
@@ -410,12 +1503,23 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("runtime execution authority was lost"));
-        let events = memory
-            .list_message_events_since(&workspace_principal("logical-workspace", "lost-authority-run"), 0, 32)
-            .await
-            .unwrap();
-        assert!(events.is_empty());
+        assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+        assert_eq!(
+            events.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+            before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+            "before event metadata: {:?}; after event metadata: {:?}",
+            before
+                .iter()
+                .map(|event| (&event.event_id, &event.event_type, &event.role))
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| (&event.event_id, &event.event_type, &event.role))
+                .collect::<Vec<_>>()
+        );
         assert!(!temp.path().join("state").join("costs.jsonl").exists());
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -424,9 +1528,12 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let validations = Arc::new(AtomicUsize::new(0));
         let mut commit = completed_commit("mid-finalize-authority-loss");
+        let service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
         commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new(
             "authority-lost-after-usage",
             {
@@ -444,14 +1551,8 @@ mod tests {
                 .to_string()
                 .contains("runtime execution authority was lost during terminal finalization phase projection")
         );
-        let events = memory
-            .list_message_events_since(
-                &workspace_principal("logical-workspace", "mid-finalize-authority-loss"),
-                0,
-                32,
-            )
-            .await
-            .unwrap();
+        assert_eq!(validations.load(Ordering::SeqCst), 2);
+        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
             events
                 .iter()
@@ -473,6 +1574,7 @@ mod tests {
                 .count(),
             0
         );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[cfg(unix)]
@@ -487,10 +1589,10 @@ mod tests {
         std::fs::write(&cost_path, "").unwrap();
         std::fs::set_permissions(&cost_path, std::fs::Permissions::from_mode(0o444)).unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let mut cost_config = CostConfig::default();
         cost_config.prices.insert(
-            "provider-a/model-a".to_string(),
+            "ollama/prx-local-model".to_string(),
             crate::config::schema::ModelPricing {
                 input: 1.0,
                 output: 1.0,
@@ -499,28 +1601,17 @@ mod tests {
             },
         );
 
-        let receipt = finalize_turn(
-            &fabric,
-            completed_commit("cost-write-failure-run"),
-            &cost_config,
-            temp.path(),
-        )
-        .await
-        .unwrap();
+        let mut commit = completed_commit("cost-write-failure-run");
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+        let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
 
         assert!(matches!(
             receipt.cost_settlement,
             Some(CostSettlement::Failed { ref error })
                 if error.contains("Failed to open cost storage")
         ));
-        let events = memory
-            .list_message_events_since(
-                &workspace_principal("logical-workspace", "cost-write-failure-run"),
-                0,
-                32,
-            )
-            .await
-            .unwrap();
+        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
             events
                 .iter()
@@ -535,6 +1626,7 @@ mod tests {
                 .count(),
             1
         );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -550,13 +1642,12 @@ mod tests {
             .truncate(false)
             .open(cost_path.with_extension("jsonl.lock"))
             .unwrap();
-        lock_file.lock().unwrap();
 
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let mut cost_config = CostConfig::default();
         cost_config.prices.insert(
-            "provider-a/model-a".to_string(),
+            "ollama/prx-local-model".to_string(),
             crate::config::schema::ModelPricing {
                 input: 1.0,
                 output: 1.0,
@@ -564,25 +1655,18 @@ mod tests {
                 cache_read: 0.0,
             },
         );
+        let mut commit = completed_commit("cost-lock-liveness");
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+        lock_file.lock().unwrap();
         let workspace_dir = temp.path().to_path_buf();
         let task = tokio::spawn({
             let fabric = fabric.clone();
-            async move {
-                finalize_turn(
-                    &fabric,
-                    completed_commit("cost-lock-liveness"),
-                    &cost_config,
-                    &workspace_dir,
-                )
-                .await
-            }
+            async move { finalize_turn(&fabric, commit, &cost_config, &workspace_dir).await }
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        let events = memory
-            .list_message_events_since(&workspace_principal("logical-workspace", "cost-lock-liveness"), 0, 32)
-            .await
-            .unwrap();
+        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
             events
                 .iter()
@@ -604,24 +1688,26 @@ mod tests {
                 .count(),
             1
         );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
     async fn repeated_finalize_writes_one_terminal_one_assistant_and_one_usage_settlement() {
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-        let fabric = MemoryFabric::new(memory.clone(), "workspace-a");
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
         let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
             .with_channel("test")
             .with_session_key("session-a")
             .with_run_id("run-a");
         let started_at = chrono::Utc::now();
         let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-            &RouteDecision::single_candidate("provider-a", "model-a"),
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
             started_at,
             crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
         );
-        let commit = TurnTerminalCommit {
+        let mut commit = TurnTerminalDraft {
+            decision: None,
             terminal_id: "run-a".to_string(),
             scope,
             status: TurnTerminalStatus::Completed,
@@ -639,6 +1725,10 @@ mod tests {
             delivery_intent: TurnDeliveryIntent::ReturnToCaller,
         };
 
+        let service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+
         let first = finalize_turn(&fabric, commit.clone(), &CostConfig::default(), temp.path())
             .await
             .unwrap();
@@ -655,17 +1745,7 @@ mod tests {
             Some("run-a")
         );
         assert_eq!(first.cost_settlement, Some(CostSettlement::UnknownPricing));
-        let principal = MemoryPrincipal {
-            require_owner_match: false,
-            workspace_id: "workspace-a".to_string(),
-            agent_id: None,
-            persona_id: None,
-            session_key: Some("session-a".to_string()),
-            channel: Some("test".to_string()),
-            sender: None,
-            owner_id: None,
-            legacy_session_key: None,
-        };
+
         let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
             events
@@ -695,6 +1775,7 @@ mod tests {
                 .count(),
             1
         );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -709,7 +1790,7 @@ mod tests {
         {
             let temp = tempfile::tempdir().unwrap();
             let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-            let fabric = MemoryFabric::new(memory.clone(), "workspace-a");
+            let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
             let session_key = format!("non-reply-{index}");
             let terminal_id = format!("terminal-{index}");
             let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
@@ -719,12 +1800,13 @@ mod tests {
             let started_at = chrono::Utc::now();
             let provider_outcome = (status == TurnTerminalStatus::Silent).then(|| {
                 ProviderExecutionOutcome::success_for_decision_with_usage(
-                    &RouteDecision::single_candidate("provider-a", "model-a"),
+                    &RouteDecision::single_candidate("ollama", "prx-local-model"),
                     started_at,
                     crate::llm::route_decision::TokenUsage::reported(Some(4), Some(2), Some(6)),
                 )
             });
-            let commit = TurnTerminalCommit {
+            let mut commit = TurnTerminalDraft {
+                decision: None,
                 terminal_id: terminal_id.clone(),
                 scope,
                 status,
@@ -744,6 +1826,11 @@ mod tests {
                 delivery_intent: TurnDeliveryIntent::None,
             };
 
+            let service =
+                bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+            let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+
+            let issued = commit.decision.clone().unwrap();
             let first = finalize_turn(&fabric, commit.clone(), &CostConfig::default(), temp.path())
                 .await
                 .unwrap();
@@ -751,20 +1838,54 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
+            for receipt in [&first, &second] {
+                let payload: serde_json::Value =
+                    serde_json::from_str(receipt.terminal_event.raw_payload_json.as_deref().unwrap()).unwrap();
+                assert_eq!(payload.get("status"), Some(&serde_json::to_value(status).unwrap()));
+            }
             assert!(first.assistant_event.is_none());
             assert_eq!(first.usage_settlement.is_some(), status == TurnTerminalStatus::Silent);
+            if status == TurnTerminalStatus::Silent {
+                let recorded = issued.recorded.as_ref().unwrap();
+                replay::verify_terminal_replay(
+                    memory.as_ref(),
+                    &recorded.reader,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    fabric.workspace_id(),
+                    principal.owner_id.as_deref().unwrap(),
+                    &terminal_id,
+                    &first.terminal_event,
+                )
+                .await
+                .expect("genuine silent replay authenticates");
+                let mut changed = first.terminal_event.clone();
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(changed.raw_payload_json.as_deref().unwrap()).unwrap();
+                let authorized_silent = payload
+                    .get_mut("execution_trace")
+                    .and_then(|trace| trace.get_mut("authorized_silent"))
+                    .expect("genuine Silent terminal contains its authorization marker");
+                assert_eq!(*authorized_silent, serde_json::Value::Bool(true));
+                *authorized_silent = serde_json::Value::Bool(false);
+                changed.raw_payload_json = Some(serde_json::to_string(&payload).unwrap());
+                assert!(
+                    replay::verify_terminal_replay(
+                        memory.as_ref(),
+                        &recorded.reader,
+                        &recorded.key,
+                        &recorded.store_workspace_id,
+                        fabric.workspace_id(),
+                        principal.owner_id.as_deref().unwrap(),
+                        &terminal_id,
+                        &changed,
+                    )
+                    .await
+                    .is_err(),
+                    "changed marker cannot retain terminal authentication"
+                );
+            }
 
-            let principal = MemoryPrincipal {
-                require_owner_match: false,
-                workspace_id: "workspace-a".to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some(session_key),
-                channel: Some("test".to_string()),
-                sender: None,
-                owner_id: None,
-                legacy_session_key: None,
-            };
             let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
             assert_eq!(
                 events
@@ -782,11 +1903,12 @@ mod tests {
                     .count(),
                 0
             );
+            service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         }
     }
 
     #[tokio::test]
-    async fn all_runtime_entrypoint_kinds_share_one_terminal_and_usage_contract() {
+    async fn unissued_entrypoint_label_drafts_are_rejected_before_side_effects() {
         const ENTRYPOINTS: [&str; 8] = [
             "chat",
             "agent",
@@ -809,13 +1931,14 @@ mod tests {
                 .with_run_id(terminal_id.clone());
             let started_at = chrono::Utc::now();
             let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-                &RouteDecision::single_candidate("provider-a", "model-a"),
+                &RouteDecision::single_candidate("ollama", "prx-local-model"),
                 started_at,
                 crate::llm::route_decision::TokenUsage::reported(Some(3), Some(2), Some(5)),
             );
-            let receipt = finalize_turn(
+            let error = finalize_turn(
                 &fabric,
-                TurnTerminalCommit {
+                TurnTerminalDraft {
+                    decision: None,
                     terminal_id: terminal_id.clone(),
                     scope,
                     status: TurnTerminalStatus::Completed,
@@ -836,14 +1959,8 @@ mod tests {
                 temp.path(),
             )
             .await
-            .unwrap();
-            assert_eq!(
-                receipt
-                    .usage_settlement
-                    .as_ref()
-                    .and_then(|usage| usage.settlement_id.as_deref()),
-                Some(terminal_id.as_str())
-            );
+            .unwrap_err();
+            assert_eq!(error.to_string(), "terminal draft has no service-issued decision");
 
             let principal = MemoryPrincipal {
                 require_owner_match: false,
@@ -857,28 +1974,225 @@ mod tests {
                 legacy_session_key: None,
             };
             let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.event_type == "turn.finalized" && event.content.contains(terminal_id.as_str())
-                    })
-                    .count(),
-                1,
-                "{entrypoint} must have one terminal marker"
+            assert!(events.is_empty(), "unissued {entrypoint} must not persist any event");
+            assert!(!temp.path().join("state/costs.jsonl").exists());
+            assert!(!temp.path().join("self/causal_tree/decisions.db").exists());
+        }
+    }
+
+    /// R-C2BU F-6: persisted outcomes name the provider redacted, but the
+    /// spend of a password-URL provider must still be priced and recorded
+    /// against a `[cost].prices` entry keyed by the configured label.
+    /// D-054: the usage settlement a surface records when its terminal commit
+    /// failed names the serving provider without URL userinfo.
+    #[test]
+    fn a_fallback_usage_settlement_names_no_url_password() {
+        let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate("custom:http://u:USAGE-SECRET-pw@127.0.0.1:1/v1", "prx-local-model"),
+            chrono::Utc::now(),
+            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+        );
+        let record = usage_settlement("run-fallback", &outcome, &CostConfig::default()).expect("test: usage settles");
+        assert!(!format!("{record:?}").contains("USAGE-SECRET-pw"), "{record:?}");
+        assert_eq!(record.settlement_id.as_deref(), Some("run-fallback"));
+    }
+
+    #[tokio::test]
+    async fn spend_through_a_password_url_provider_is_still_priced_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+        let label = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
+        let mut cost_config = CostConfig::default();
+        cost_config.prices.insert(
+            format!("{label}/prx-local-model"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+            .with_channel("test")
+            .with_session_key("session-priced")
+            .with_run_id("run-priced");
+        let started_at = chrono::Utc::now();
+        let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate(label, "prx-local-model"),
+            started_at,
+            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+        );
+        let mut commit = TurnTerminalDraft {
+            decision: None,
+            terminal_id: "run-priced".to_string(),
+            scope,
+            status: TurnTerminalStatus::Completed,
+            history: Some(TurnHistoryProjection {
+                assistant_content: "done".to_string(),
+                history_commit_len: 2,
+            }),
+            history_scope: None,
+            provider_outcome: Some(outcome),
+            telemetry: TurnTerminalTelemetry {
+                summary: "test completed".to_string(),
+                started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: TurnDeliveryIntent::ReturnToCaller,
+        };
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+        let usage = receipt.usage_settlement.as_ref().expect("test: usage settled");
+        assert!(
+            usage.cost_usd.is_some(),
+            "the configured price no longer matches: {usage:?}"
+        );
+        assert!(
+            matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })),
+            "the spend was not recorded against the budget: {:?}",
+            receipt.cost_settlement
+        );
+        assert!(!format!("{usage:?}").contains("SECRET-fixture-pw"));
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    use super::persistence_probe::PROBE_SECRET;
+
+    /// Every event `finalize_turn` wrote for `session_key`, content and raw
+    /// payload, with the secret nowhere in them.
+    async fn assert_no_event_persists_the_probe_secret(memory: &Arc<dyn Memory>, principal: &MemoryPrincipal) {
+        let events = memory
+            .list_message_events_since(principal, 0, 64)
+            .await
+            .expect("test: list the session's events");
+        assert!(
+            events.iter().any(|event| event.event_type == "turn.finalized"),
+            "the probe must reach the terminal marker: {events:?}"
+        );
+        for event in &events {
+            assert!(
+                !event.content.contains(PROBE_SECRET),
+                "{} persisted the secret in its content: {}",
+                event.event_type,
+                event.content
             );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| {
-                        event.event_type == "message.created"
-                            && event.role == "assistant"
-                            && event.content == format!("{entrypoint} done")
-                    })
-                    .count(),
-                1,
-                "{entrypoint} must have one assistant projection"
+            let payload = event.raw_payload_json.as_deref().unwrap_or_default();
+            assert!(
+                !payload.contains(PROBE_SECRET),
+                "{} persisted the secret in its payload: {payload}",
+                event.event_type
             );
         }
+    }
+
+    /// D-053 / REDACT-TURN: every surface finalizes through `finalize_turn`, so
+    /// it redacts what it persists. A completed turn whose reply, provider
+    /// attempt error, fallback reason and telemetry summary carry a secret, and
+    /// a failed turn whose provider error, summary and suppression reason carry
+    /// one, persist it in no event: not the assistant `message.created`, the
+    /// provider attempt and outcome events, `usage.settled`, nor the
+    /// `turn.finalized` marker.
+    #[tokio::test]
+    async fn finalize_turn_persists_no_secret_from_the_reply_or_the_outcome() {
+        let temp = tempfile::tempdir().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite memory"));
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+        let cost_config = CostConfig::default();
+        let leaked = format!("upstream said: key {PROBE_SECRET} rejected");
+
+        let mut completed = completed_commit("run-redact-completed");
+        if let Some(history) = completed.history.as_mut() {
+            history.assistant_content = format!("Your key is {PROBE_SECRET}.");
+        }
+        if let Some(outcome) = completed.provider_outcome.as_mut() {
+            outcome.fallback_reason = Some(leaked.clone());
+            for attempt in &mut outcome.attempts {
+                attempt.error_message = Some(leaked.clone());
+            }
+        }
+        completed.telemetry.summary = leaked.clone();
+        let completed_service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut completed, &cost_config).await;
+        let completed_principal = terminal_fixture_principal(temp.path(), &completed.scope);
+        let receipt = finalize_turn(&fabric, completed, &cost_config, temp.path())
+            .await
+            .expect("test: finalize the completed turn");
+        let assistant = receipt.assistant_event.expect("test: the reply is projected");
+        assert!(
+            assistant.content.contains("[REDACTED]"),
+            "the reply is redacted, not dropped: {}",
+            assistant.content
+        );
+        assert_no_event_persists_the_probe_secret(&memory, &completed_principal).await;
+
+        let started_at = chrono::Utc::now();
+        let mut failed = completed_commit("run-redact-failed");
+        failed.status = TurnTerminalStatus::Failed;
+        failed.history = None;
+        failed.provider_outcome = Some(ProviderExecutionOutcome::failed_for_decision(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            started_at,
+            &anyhow::anyhow!("{leaked}"),
+        ));
+        failed.telemetry.summary = leaked.clone();
+        failed.delivery_intent = TurnDeliveryIntent::Suppress { reason: leaked };
+        completed_service
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await;
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut failed, &cost_config).await;
+        let failed_principal = terminal_fixture_principal(temp.path(), &failed.scope);
+        finalize_turn(&fabric, failed, &cost_config, temp.path())
+            .await
+            .expect("test: finalize the failed turn");
+        assert_no_event_persists_the_probe_secret(&memory, &failed_principal).await;
+        // and nothing else the finalizer wrote (the cost ledger included)
+        super::persistence_probe::assert_nothing_under_persists_the_probe_secret(temp.path());
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// R-C2BUf F-6 / D-027: prices keyed by two credentialed spellings of one
+    /// endpoint and model are ambiguous once redacted. The rule is
+    /// deterministic: an exact key wins; otherwise the unique redacted match,
+    /// and an ambiguous match (which validation refuses) charges the highest
+    /// matching price.
+    #[test]
+    fn a_redacted_price_match_is_used_only_when_it_is_unique() {
+        let pricing = |input: f64| crate::config::schema::ModelPricing {
+            input,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        };
+        let usage = crate::llm::route_decision::TokenUsage::reported(Some(1_000_000), Some(0), Some(1_000_000));
+        let redacted = "custom:http://[redacted]@127.0.0.1:1/v1";
+
+        let mut one = CostConfig::default();
+        one.prices
+            .insert("custom:http://a:x@127.0.0.1:1/v1/m".into(), pricing(3.0));
+        let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &one)
+            .expect("test: usage");
+        assert_eq!(record.cost_usd, Some(3.0));
+
+        let mut two = one.clone();
+        two.prices
+            .insert("custom:http://b:y@127.0.0.1:1/v1/m".into(), pricing(7.0));
+        // D-027: validation refuses such a pair; if it is ever reached at
+        // runtime, the highest matching price is charged, never none.
+        for _ in 0..8 {
+            let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &two)
+                .expect("test: usage");
+            assert_eq!(
+                record.cost_usd,
+                Some(7.0),
+                "an ambiguous match charges the highest price"
+            );
+        }
+
+        let mut exact = two.clone();
+        exact.prices.insert(format!("{redacted}/m"), pricing(5.0));
+        let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &exact)
+            .expect("test: usage");
+        assert_eq!(record.cost_usd, Some(5.0), "an exact key wins");
     }
 }

@@ -81,6 +81,8 @@ pub(super) enum DeliveryOutcome {
 /// Ownership token for one accepted delivery.
 #[derive(Debug)]
 pub(super) struct DeliveryClaim {
+    /// The ledger the claim was taken from, and resolves into.
+    ledger: &'static DeliveryLedger,
     key: String,
     generation: u64,
     /// Whether this attempt reached work that can produce observable side
@@ -103,7 +105,7 @@ impl Drop for DeliveryClaim {
     /// cancelled job, an early return, or a panic all resolve the key the same
     /// way a normal completion does — never by leaving it in flight forever.
     fn drop(&mut self) {
-        let mut state = LEDGER.state.lock();
+        let mut state = self.ledger.state.lock();
         let still_ours = matches!(
             state.entries.get(&self.key),
             Some(DeliveryEntry::InFlight { generation }) if *generation == self.generation
@@ -127,8 +129,15 @@ impl Drop for DeliveryClaim {
 /// arrives after it has expired is indistinguishable from a new message and will
 /// run again.
 pub(super) fn claim(key: String, ttl: Duration) -> DeliveryOutcome {
+    claim_in(&LEDGER, key, ttl)
+}
+
+/// [`claim`] against a given ledger. The process uses the one ledger; a
+/// test that retires entries (a zero TTL purges every handled entry) uses
+/// its own, so it cannot purge another test's entries.
+fn claim_in(ledger: &'static DeliveryLedger, key: String, ttl: Duration) -> DeliveryOutcome {
     let now = Instant::now();
-    let mut state = LEDGER.state.lock();
+    let mut state = ledger.state.lock();
 
     state.entries.retain(|_, entry| match entry {
         DeliveryEntry::InFlight { .. } => true,
@@ -165,6 +174,7 @@ pub(super) fn claim(key: String, ttl: Duration) -> DeliveryOutcome {
         .entries
         .insert(key.clone(), DeliveryEntry::InFlight { generation });
     DeliveryOutcome::Fresh(DeliveryClaim {
+        ledger,
         key,
         generation,
         dispatched: false,
@@ -226,13 +236,17 @@ mod tests {
 
     #[test]
     fn handled_entry_expires_with_the_ttl() {
+        // A zero TTL purges *every* handled entry of the ledger it runs on,
+        // so this test runs on a ledger of its own: on the process ledger it
+        // purged the entry a concurrent test had just recorded.
+        let ledger: &'static DeliveryLedger = Box::leak(Box::default());
         let key = unique_key("expiring");
-        let mut first = expect_fresh(claim(key.clone(), Duration::from_mins(1)));
+        let mut first = expect_fresh(claim_in(ledger, key.clone(), Duration::from_mins(1)));
         first.mark_dispatched();
         drop(first);
 
         // A zero TTL retires the handled entry on the very next claim.
-        let retry = expect_fresh(claim(key, Duration::ZERO));
+        let retry = expect_fresh(claim_in(ledger, key, Duration::ZERO));
         drop(retry);
     }
 

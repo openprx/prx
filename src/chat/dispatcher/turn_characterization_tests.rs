@@ -1,5 +1,6 @@
+#![cfg(test)]
 use super::*;
-use crate::agent::loop_::{ToolLoopOutcome, ToolLoopTrace};
+use crate::agent::turn_contracts::{ToolLoopOutcome, ToolLoopTrace};
 use crate::hooks::HookManager;
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage, TokenUsageSource};
 use crate::observability::NoopObserver;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-const FIXTURE_PROVIDER: &str = "turn-characterization";
+const FIXTURE_PROVIDER: &str = "custom:http://127.0.0.1:1/v1";
 const FIXTURE_MODEL: &str = "fixture-model";
 const FIXTURE_TOOL: &str = "fixture_write";
 const FIXTURE_DRAFT: &str = "step-7-1-draft";
@@ -133,8 +134,12 @@ impl FixtureProvider {
                 },
                 usage,
             ),
-            FixtureStep::ContextOverflow => anyhow::bail!("context_length_exceeded: shared fixture"),
-            FixtureStep::Block => anyhow::bail!("blocking fixture must be awaited by the provider adapter"),
+            FixtureStep::ContextOverflow => {
+                anyhow::bail!("context_length_exceeded: shared fixture")
+            }
+            FixtureStep::Block => {
+                anyhow::bail!("blocking fixture must be awaited by the provider adapter")
+            }
         };
         let now = chrono::Utc::now();
         Ok(ChatTrace {
@@ -151,6 +156,7 @@ impl FixtureProvider {
             }],
             final_provider: FIXTURE_PROVIDER.to_string(),
             final_model: FIXTURE_MODEL.to_string(),
+            served_member: None,
             tokens_used: usage,
         })
     }
@@ -278,6 +284,22 @@ impl Tool for FixtureTool {
     }
 }
 
+fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.causal_tree.enabled = false;
+    config.cost.prices.insert(
+        FIXTURE_MODEL.to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config
+}
+
 fn fixture_tool(calls: Arc<AtomicUsize>, arguments: Arc<Mutex<Vec<serde_json::Value>>>) -> Box<dyn Tool> {
     Box::new(FixtureTool { calls, arguments })
 }
@@ -300,6 +322,197 @@ async fn run_chat_fixture(
     run_chat_fixture_with_history(provider, registry, cancellation, initial_history()).await
 }
 
+pub(super) struct ChatFixtureAdmission {
+    pub(super) binding: Arc<crate::chat::decision_source::ChatTurnBinding>,
+    pub(super) registry: Arc<Vec<Box<dyn Tool>>>,
+    pub(super) service: Arc<ToolExecutionService>,
+    pub(super) context: crate::tools::ToolExecutionContext,
+    pub(super) fabric: crate::memory::MemoryFabric,
+}
+
+pub(super) async fn admit_chat_fixture(
+    provider: Arc<dyn Provider>,
+    registry: Option<Arc<Vec<Box<dyn Tool>>>>,
+    workspace: &std::path::Path,
+    selection: (&str, &str, Option<&str>),
+    source_input: (&str, &str),
+    action_tx: mpsc::Sender<Action>,
+    cancellation: CancellationToken,
+) -> ChatFixtureAdmission {
+    admit_chat_fixture_with_config(
+        provider,
+        registry,
+        admission_config(workspace),
+        selection,
+        source_input,
+        action_tx,
+        cancellation,
+    )
+    .await
+}
+
+pub(super) async fn admit_chat_fixture_with_config(
+    provider: Arc<dyn Provider>,
+    registry: Option<Arc<Vec<Box<dyn Tool>>>>,
+    config: crate::config::Config,
+    selection: (&str, &str, Option<&str>),
+    source_input: (&str, &str),
+    action_tx: mpsc::Sender<Action>,
+    cancellation: CancellationToken,
+) -> ChatFixtureAdmission {
+    admit_chat_fixture_with_mode(
+        provider,
+        registry,
+        config,
+        selection,
+        (
+            source_input.0,
+            source_input.1,
+            crate::agent::turn_contracts::ChatMode::Edit,
+        ),
+        action_tx,
+        cancellation,
+    )
+    .await
+}
+
+async fn admit_chat_fixture_with_mode(
+    provider: Arc<dyn Provider>,
+    registry: Option<Arc<Vec<Box<dyn Tool>>>>,
+    mut config: crate::config::Config,
+    selection: (&str, &str, Option<&str>),
+    source_input: (&str, &str, crate::agent::turn_contracts::ChatMode),
+    action_tx: mpsc::Sender<Action>,
+    cancellation: CancellationToken,
+) -> ChatFixtureAdmission {
+    let workspace_path = config.workspace_dir.clone();
+    let workspace = workspace_path.as_path();
+    let ledger: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace).expect("chat fixture sqlite"));
+    let registry = registry.unwrap_or_else(|| Arc::new(Vec::new()));
+    if let Some(endpoint) = selection.2 {
+        config.api_url = Some(endpoint.to_owned());
+        config.api_key = Some("test-key".to_owned());
+    }
+    config.cost.prices.insert(
+        selection.1.to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider": selection.0, "model": selection.1,
+            "operations": ["chat"], "native_tools": true,
+        }))
+        .expect("fixture model descriptor"),
+    );
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let policy = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace));
+    let service = Arc::new(chat_tool_execution_service(
+        Arc::clone(&registry),
+        Some(Arc::clone(&ledger)),
+        Arc::clone(&policy),
+        Arc::new(ApprovalRouter::new()),
+        action_tx.clone(),
+        cancellation.clone(),
+        None,
+    ));
+    let diagnostics = crate::hooks::HookDiagnostics {
+        configured: false,
+        valid: true,
+        config_path: String::new(),
+        timeout_ms: 0,
+        action_count: 0,
+        events: std::collections::BTreeMap::new(),
+        catalog_digest: None,
+        error: None,
+        runs: false,
+        blocked: None,
+    };
+    let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
+    let decisions = crate::runtime::turn_decision::build_turn_decision_service(
+        crate::causal_tree::state::TurnSurfaceKind::Interactive,
+        crate::runtime::turn_decision::TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry: Arc::clone(&registry),
+            execution: Arc::clone(&service),
+            catalog_sources: crate::tools::capability::catalog::CatalogSources::from_runtime_inputs(
+                generation.id.0.to_string(),
+                &config,
+                Vec::new(),
+                &diagnostics,
+                0,
+            ),
+            surface_policy: crate::tools::capability::catalog::SurfacePolicy {
+                excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
+                direct_names: config
+                    .tool_tiering
+                    .always_include
+                    .iter()
+                    .filter(|name| !config.tool_tiering.always_exclude.contains(name))
+                    .cloned()
+                    .collect(),
+                ..Default::default()
+            },
+            provider_catalog: &provider_catalog,
+            transports: &crate::agent::test_admission::NoExternalTransport,
+            events: Arc::new(crate::agent::test_admission::SilentEvents),
+            memory: Arc::clone(&ledger),
+            security: policy,
+        },
+    )
+    .expect("actual chat decision service");
+    let envelope = crate::chat::chat_runtime_envelope(&workspace.to_string_lossy(), "chat:characterization")
+        .with_config_generation(&generation)
+        .with_run_id(source_input.0.to_owned());
+    let fabric = crate::memory::MemoryFabric::new(Arc::clone(&ledger), workspace.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    let input = source_input.1;
+    let event = fabric
+        .record_inbound_user_message(envelope.message_scope(), input, None, None)
+        .await
+        .expect("recorded chat source");
+    let source = crate::chat::decision_source::ChatSourceReceipt::issue(
+        ledger.as_ref(),
+        &generation,
+        "chat:characterization",
+        source_input.0,
+        input,
+        &event,
+    )
+    .await
+    .expect("durable chat source proof");
+    let selected =
+        crate::chat::decision_source::ChatProviderBinding::capture(&generation, &provider, selection.0, selection.1)
+            .expect("chat model binding")
+            .expect("selected chat model");
+    let binding = source
+        .bind_provider(
+            &selected,
+            crate::chat::decision_source::ChatAdmissionMode::Model(source_input.2),
+        )
+        .expect("source/provider binding");
+    // The scenarios cancel after admission, while the provider turn is running.
+    binding
+        .decide(&decisions, &CancellationToken::new())
+        .await
+        .expect("chat decision");
+    let context = crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private");
+
+    ChatFixtureAdmission {
+        binding,
+        registry,
+        service,
+        context,
+        fabric,
+    }
+}
+
 async fn run_chat_fixture_with_history(
     provider: Arc<FixtureProvider>,
     registry: Option<Arc<Vec<Box<dyn Tool>>>>,
@@ -307,24 +520,27 @@ async fn run_chat_fixture_with_history(
     history: Vec<ChatMessage>,
 ) -> Vec<Action> {
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
-    let policy = Arc::new(SecurityPolicy::default());
-    let context = chat_tool_execution_context(policy.as_ref(), None, None, FIXTURE_DRAFT);
     let ledger_dir = tempfile::TempDir::new().expect("chat fixture ledger");
-    let ledger: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(ledger_dir.path()).expect("chat fixture sqlite"));
-    let service = registry.as_ref().map(|registry| {
-        Arc::new(chat_tool_execution_service(
-            Arc::clone(registry),
-            Some(Arc::clone(&ledger)),
-            Arc::clone(&policy),
-            Arc::new(ApprovalRouter::new()),
-            action_tx.clone(),
-            cancellation.clone(),
-            None,
-        ))
-    });
+    let provider: Arc<dyn Provider> = provider;
+    let input = &history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .expect("source input")
+        .content;
+    let admitted = admit_chat_fixture(
+        Arc::clone(&provider),
+        registry,
+        ledger_dir.path(),
+        (FIXTURE_PROVIDER, FIXTURE_MODEL, None),
+        (FIXTURE_DRAFT, input),
+        action_tx.clone(),
+        cancellation.clone(),
+    )
+    .await;
 
     drive_start_turn_stream(
+        Some(admitted.binding),
         None,
         provider,
         history.clone(),
@@ -335,19 +551,14 @@ async fn run_chat_fixture_with_history(
         cancellation,
         FIXTURE_DRAFT.to_string(),
         action_tx.clone(),
-        registry,
-        service,
-        context,
-        crate::memory::MemoryFabric::new(Arc::clone(&ledger), ledger_dir.path().to_string_lossy()),
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
         None,
-        crate::agent::loop_::ChatMode::Edit,
+        crate::agent::turn_contracts::ChatMode::Edit,
         Arc::new(crate::observability::noop::NoopObserver),
         Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-        crate::tools::intent::SessionToolSurface {
-            tiering: crate::config::ToolTieringConfig::default(),
-            unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
-        },
-        None,
     )
     .await;
 
@@ -359,12 +570,103 @@ async fn run_chat_fixture_with_history(
     actions
 }
 
+#[tokio::test]
+async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed_terminal() {
+    use crate::agent::turn_contracts::ChatMode;
+    let dir = tempfile::tempdir().unwrap();
+    let config = admission_config(dir.path());
+    let provider = Arc::new(FixtureProvider::new(Vec::new()));
+    let provider_port: Arc<dyn Provider> = provider.clone();
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let cancellation = CancellationToken::new();
+    let admitted = admit_chat_fixture_with_mode(
+        provider_port.clone(),
+        None,
+        config.clone(),
+        (FIXTURE_PROVIDER, FIXTURE_MODEL, None),
+        (FIXTURE_DRAFT, "prx queued plan input", ChatMode::Plan),
+        action_tx.clone(),
+        cancellation.clone(),
+    )
+    .await;
+    let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    crate::chat::decision_source::admission_failure_tests::install_fixture_terminal(
+        &admitted.binding,
+        &owner,
+        admitted.fabric.clone(),
+    );
+    assert!(admitted.binding.fixed_reply().unwrap().is_some());
+    drive_start_turn_stream(
+        Some(Arc::clone(&admitted.binding)),
+        None,
+        provider_port,
+        initial_history(),
+        initial_history(),
+        FIXTURE_MODEL.to_owned(),
+        0.0,
+        None,
+        cancellation,
+        FIXTURE_DRAFT.to_owned(),
+        action_tx,
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric.clone(),
+        None,
+        ChatMode::Auto,
+        Arc::new(crate::observability::noop::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(dir.path().to_path_buf())),
+    )
+    .await;
+    let action = action_rx.recv().await.expect("mode mismatch action");
+    let Some(TurnOutcomeKind::Failed { err, retryable }) = extract_turn_outcome(&action) else {
+        panic!("mode mismatch did not produce a failed outcome");
+    };
+    assert!(!retryable);
+    assert_eq!(err, "chat mode changed after admission");
+    assert_eq!(provider.stream_calls(), 0);
+    assert_eq!(provider.traced_calls(), 0);
+    crate::chat::finalize_chat_non_success_turn(
+        Some(&admitted.binding),
+        &admitted.fabric,
+        FIXTURE_DRAFT,
+        admitted.binding.envelope().message_scope(),
+        crate::agent::terminal::TurnTerminalStatus::Failed,
+        None,
+        chrono::Utc::now(),
+        &err,
+        &config.cost,
+        dir.path(),
+    )
+    .await
+    .expect("actual failed terminal owner");
+    let memory = admitted.fabric.memory();
+    let final_event = memory
+        .find_message_event_by_idempotency_key(admitted.fabric.workspace_id(), &format!("turn:{FIXTURE_DRAFT}:final"))
+        .await
+        .unwrap()
+        .expect("one idempotent terminal");
+    assert_eq!(final_event.event_type, "turn.finalized");
+    let payload: serde_json::Value = serde_json::from_str(final_event.raw_payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        payload.get("status").and_then(serde_json::Value::as_str),
+        Some("failed")
+    );
+    assert!(payload.get("provider_outcome").is_none_or(serde_json::Value::is_null));
+    assert!(payload.get("assistant_event_id").is_none_or(serde_json::Value::is_null));
+    drop(admitted.binding);
+    owner
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
 async fn run_agent_fixture(
     provider: Arc<FixtureProvider>,
     tools: Vec<Box<dyn Tool>>,
     cancellation: CancellationToken,
     on_delta: Option<mpsc::Sender<String>>,
-    on_tool_call: Option<mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
+    on_tool_call: Option<mpsc::Sender<crate::agent::turn_contracts::ToolCallNotification>>,
 ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
     run_agent_fixture_with_history(provider, tools, cancellation, on_delta, on_tool_call, initial_history()).await
 }
@@ -374,43 +676,62 @@ async fn run_agent_fixture_with_history(
     tools: Vec<Box<dyn Tool>>,
     cancellation: CancellationToken,
     on_delta: Option<mpsc::Sender<String>>,
-    on_tool_call: Option<mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
+    on_tool_call: Option<mpsc::Sender<crate::agent::turn_contracts::ToolCallNotification>>,
     history: Vec<ChatMessage>,
 ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
     let temp = tempfile::TempDir::new().expect("fixture tempdir");
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
-    let envelope =
-        crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy().to_string(), FIXTURE_DRAFT);
-    let document_ingest = crate::agent::loop_::DocumentIngestRuntime::from_envelope(memory, &envelope);
     let mut history = history;
-    let result = crate::agent::loop_::run_tool_call_loop_outcome(
-        provider.as_ref(),
+    let tools = crate::agent::test_admission::registry_with_search(tools);
+    let admission = crate::agent::test_admission::AdmittedTurn::with_model(
+        admission_config(temp.path()),
+        &history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .expect("source input")
+            .content,
+        Arc::clone(&tools),
+        memory,
+        (FIXTURE_PROVIDER, FIXTURE_MODEL),
+    )
+    .await;
+    let result = crate::agent::turn_engine::run_turn(
         &mut history,
-        Arc::new(tools),
-        &NoopObserver,
-        &HookManager::new(temp.path().to_path_buf()),
-        FIXTURE_PROVIDER,
-        FIXTURE_MODEL,
-        0.0,
-        true,
-        None,
-        "terminal",
-        &crate::config::MultimodalConfig::default(),
-        2,
-        false,
-        Vec::new(),
-        None,
-        Some(cancellation),
-        on_delta,
-        None,
-        on_tool_call,
-        None,
-        crate::agent::loop_::ToolLoopMemory::from_ingest_for_test(document_ingest),
-        crate::agent::loop_::ChatMode::Edit,
-        None,
-        false,
-        None,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "cli",
+            scope: None,
+            mode: crate::agent::turn_contracts::ChatMode::Edit,
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: provider.as_ref(),
+            provider_name: FIXTURE_PROVIDER,
+            model: FIXTURE_MODEL,
+            temperature: 0.0,
+            tools_registry: tools,
+            observer: &NoopObserver,
+            hooks: &HookManager::new(temp.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admission.adapter()),
+            memory: admission.memory_runtime_with_ingest(),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: Some(cancellation),
+            on_delta,
+            on_tool_call,
+        },
     )
     .await;
     (result, history)
@@ -435,7 +756,7 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
     let chat_provider = Arc::new(FixtureProvider::new(tool_then_final_script()));
     let chat_tool_calls = Arc::new(AtomicUsize::new(0));
     let chat_arguments = Arc::new(Mutex::new(Vec::new()));
-    let chat_registry = Arc::new(vec![fixture_tool(
+    let chat_registry = crate::agent::test_admission::registry_with_search(vec![fixture_tool(
         Arc::clone(&chat_tool_calls),
         Arc::clone(&chat_arguments),
     )]);
@@ -562,10 +883,10 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
     let mut agent_finished = 0;
     while let Ok(event) = tool_rx.try_recv() {
         match event {
-            crate::agent::loop_::ToolCallNotification::Started { .. } => agent_started += 1,
-            crate::agent::loop_::ToolCallNotification::Finished { success: true, .. } => agent_finished += 1,
-            crate::agent::loop_::ToolCallNotification::Finished { success: false, .. }
-            | crate::agent::loop_::ToolCallNotification::Progress { .. } => {}
+            crate::agent::turn_contracts::ToolCallNotification::Started { .. } => agent_started += 1,
+            crate::agent::turn_contracts::ToolCallNotification::Finished { success: true, .. } => agent_finished += 1,
+            crate::agent::turn_contracts::ToolCallNotification::Finished { success: false, .. }
+            | crate::agent::turn_contracts::ToolCallNotification::Progress { .. } => {}
         }
     }
     assert_eq!((agent_started, agent_finished), (1, 1));

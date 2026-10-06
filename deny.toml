@@ -17,10 +17,6 @@ unsound = "workspace"
 ignore = [
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
     { id = "RUSTSEC-2025-0141", reason = "bincode: probe-rs transitive dep, project considered complete" },
-    # proc-macro-error2 unmaintained: transitive via matrix-sdk (vodozemac → matrix-pickle-derive)
-    # and aquamarine (matrix-sdk-crypto). No maintained alternative; upstream matrix-sdk tracks this.
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: transitive via matrix-sdk/vodozemac, no maintained alternative, upstream matrix-sdk tracks migration" },
-    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained: transitive via matrix-sdk -> imbl, no direct dependency" },
 ]
 
 # ===== 许可证合规 =====

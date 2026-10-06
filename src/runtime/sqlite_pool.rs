@@ -572,6 +572,28 @@ impl SqliteConnectionPool {
         SqliteWriteGuard { pool: self, guard }
     }
 
+    /// Acquire the writer within a caller-owned deadline. Ordinary writers
+    /// retain the unbounded `write` contract.
+    pub fn write_until(&self, deadline: Instant) -> anyhow::Result<SqliteWriteGuard<'_>> {
+        anyhow::ensure!(Instant::now() < deadline, "SQLite writer deadline elapsed");
+        let started = Instant::now();
+        let guard = if let Some(guard) = self.writer.try_lock() {
+            guard
+        } else {
+            self.metrics.write_waiters.fetch_add(1, Ordering::Relaxed);
+            let guard = self.writer.try_lock_until(deadline);
+            self.metrics.write_waiters.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .contended_write_acquisitions
+                .fetch_add(1, Ordering::Relaxed);
+            PoolMetrics::add_wait(&self.metrics.write_wait_nanos, started.elapsed());
+            guard.ok_or_else(|| anyhow::anyhow!("SQLite writer deadline elapsed"))?
+        };
+        anyhow::ensure!(Instant::now() < deadline, "SQLite writer deadline elapsed");
+        self.metrics.write_acquisitions.fetch_add(1, Ordering::Relaxed);
+        Ok(SqliteWriteGuard { pool: self, guard })
+    }
+
     /// Snapshot the pool counters.
     ///
     /// Nothing here throttles: the numbers exist so saturation is observable

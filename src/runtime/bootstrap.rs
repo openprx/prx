@@ -19,10 +19,10 @@
 //! NOTE (D1 step 2): the first mode wiring (chat::run) now consumes this module
 //! via `RuntimeBootstrap::build` with `BootstrapProfile::{MemoryOnly,Interactive}`.
 //! The `AppContext` core fields (config/observer/security/memory/tools) and those
-//! two profiles are therefore live and carry no `#[allow(dead_code)]`. Items not
-//! yet reached by any wired mode — the `Minimal`/`Server`/`Channel`/`Worker`
-//! profiles, the `workspace_dir` and `router` fields — keep a targeted
-//! `#[allow(dead_code)]` until their owning mode adopts `AppContext`.
+//! two profiles are therefore live. Items not yet reached by any wired mode —
+//! the `Minimal`/`Server`/`Channel`/`Worker` profiles, the `workspace_dir` and
+//! `router` fields — are public API of this module, reserved for the mode that
+//! adopts `AppContext`.
 //!
 //! The gateway does **not** route its core through `RuntimeBootstrap` (its
 //! observer/memory/tools diverge from the generic core, and the OTel-backed
@@ -68,9 +68,6 @@ use crate::tools::{self, Tool};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 
-#[cfg(feature = "llm-router")]
-use crate::causal_tree::CausalTreeEngine;
-
 /// Read-only core: immutable after construction, no interior `Mutex`, shared by
 /// `Arc` clone across modes and child tasks (iron rule 7: `Arc` over deep copy).
 ///
@@ -96,9 +93,7 @@ pub struct AppContext {
     pub hooks: Arc<crate::hooks::HookManager>,
     /// Workspace root as `Arc<Path>` (iron rule 7: no `PathBuf` clone, no
     /// intermediate `String`).
-    // Not yet consumed by a wired mode (chat reads `config.workspace_dir`);
-    // removed when a mode adopts this field.
-    #[allow(dead_code)]
+    // Not yet consumed by a wired mode (chat reads `config.workspace_dir`).
     pub workspace_dir: Arc<Path>,
     /// Memory backend. `None` under `Minimal` (no memory built) — keeps the
     /// `status`/`doctor` etc. early-exit paths free of new failure surface (F4).
@@ -113,6 +108,13 @@ pub struct AppContext {
     /// `base_tools` instead. The "security & memory precede tools" ordering
     /// invariant is preserved either way (see `golden_trace_*` tests).
     pub tools: Option<Arc<Vec<Box<dyn Tool>>>>,
+    /// The MCP instance installed in the finalized registry. The decision
+    /// publisher snapshots this same instance after discovery, so its
+    /// capability generation cannot come from a second MCP construction.
+    pub(crate) mcp_tool: Option<Arc<tools::McpTool>>,
+    /// AgentLoop's decision service published from the same finalized tool
+    /// registry. Interactive appends tools later and publishes at that point.
+    pub(crate) turn_decisions: Option<Arc<super::turn_decision::TurnDecisionService>>,
     /// Owned base tool registry for the `Interactive` (chat) profile only.
     ///
     /// `Box<dyn Tool>` is not `Clone`, so a shared `Arc<Vec<…>>` cannot be
@@ -136,21 +138,9 @@ pub struct AppContext {
     /// Heuristic LLM router. Only built for profiles that need it and only when
     /// the `llm-router` feature is enabled; always constructed after memory
     /// (`agent/agent.rs:446` invariant).
-    // Not yet consumed by a wired mode (chat does not use the router); removed
-    // when a server/channel/worker mode adopts this field.
+    // Not yet consumed by a wired mode (chat does not use the router).
     #[cfg(feature = "llm-router")]
-    #[allow(dead_code)]
     pub router: Option<Arc<RouterEngine>>,
-    /// Speculative branch-prediction engine (CausalTree, CTE). `Some` only under
-    /// the dedicated `AgentLoop` profile AND when `config.causal_tree.enabled`;
-    /// `None` on every other path (including `prx chat` / `Interactive`), so no
-    /// other run mode pays anything for it. Experimental, opt-in. Consumed by
-    /// `loop_::run` (the live agent tool loop) — the sole CTE consumer.
-    // Consumed by `loop_::run` from Commit 3 of this series onward; carries a
-    // temporary dead_code allow until then.
-    #[cfg(feature = "llm-router")]
-    #[allow(dead_code)]
-    pub cte: Option<Arc<CausalTreeEngine>>,
 }
 
 /// Selects which subsystems a given run mode needs, so lightweight commands do
@@ -160,31 +150,23 @@ pub struct AppContext {
 /// paths (survey F4): `status`/`doctor` build only the core, and chat
 /// `--list-sessions` builds memory but not tools/provider/router.
 ///
-/// `MemoryOnly` and `Interactive` are live (consumed by `chat::run`). The
-/// remaining variants are not yet reached by a wired mode and carry a targeted
-/// `#[allow(dead_code)]` removed when their owning mode adopts `AppContext`.
+/// `MemoryOnly` and `Interactive` are live (consumed by `chat::run`), and
+/// `AgentLoop` by `entry::run`. The remaining variants are not yet reached by a
+/// wired mode; they are reserved for the mode that adopts `AppContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapProfile {
     /// `status` / `doctor` / `models` / `providers`: only config/observer/security.
-    #[allow(dead_code)]
     Minimal,
     /// chat `--list-sessions` early-exit: + memory, no tools/router.
     MemoryOnly,
-    /// chat (interactive): full memory + tools, no router, **no CTE**.
+    /// Chat: full memory + tools; publishes decisions after registry finalization.
     Interactive,
-    /// `loop_::run` (the live agent tool loop): the same core as `Interactive`
-    /// (full memory + tools, no router) PLUS the opt-in CausalTreeEngine. This is
-    /// a dedicated variant so that *only* the agent loop pays for CTE — `prx chat`
-    /// (which uses `Interactive`) never builds it. Without this split, attaching
-    /// CTE to the shared `Interactive` profile would assemble the engine on the
-    /// chat path too, where nothing consumes it: dead wiring (iron rule 2) and a
-    /// non-zero cost on a path that gains nothing.
+    /// CLI agent: full memory + tools, no router, with its completed registry
+    /// published as the source-bound turn decision service during bootstrap.
     AgentLoop,
     /// gateway / daemon: full.
-    #[allow(dead_code)]
     Server,
     /// channels: full.
-    #[allow(dead_code)]
     Channel,
     /// Reserved placeholder — **not** used by `session_worker`. The real worker
     /// (`session_worker::run_validated_manifest`) keeps a dedicated, manifest-driven
@@ -195,7 +177,6 @@ pub enum BootstrapProfile {
     /// so the worker is intentionally excluded from `RuntimeBootstrap` under the D1
     /// behavior-unchanged guardrail (see the module-level note). This variant
     /// remains only as a reserved profile, exercised by the unit test below.
-    #[allow(dead_code)]
     Worker,
 }
 
@@ -218,23 +199,11 @@ impl BootstrapProfile {
     /// Whether this profile may construct the LLM router (only relevant when the
     /// `llm-router` feature is enabled). Router needs memory; it is the
     /// agent-builder style full profiles that use it. `AgentLoop` does **not**
-    /// need the router — `loop_::run` resolves a single provider/model directly
+    /// need the router — `entry::run` resolves a single provider/model directly
     /// and never routes.
     #[cfg(feature = "llm-router")]
     const fn needs_router(self) -> bool {
         matches!(self, Self::Server | Self::Channel | Self::Worker)
-    }
-
-    /// Whether this profile attaches the CausalTreeEngine (CTE). It attaches
-    /// **only** to the live agent tool loop (`AgentLoop`), which is the sole
-    /// consumer (`loop_::run`). `Interactive` (chat) must not build it — chat has
-    /// no per-turn CTE consumption point, so building it there would be dead
-    /// wiring with non-zero cost (iron rule 2). `Server`/`Channel` likewise have
-    /// no per-turn CTE consumer wired, and `Worker` is a reserved placeholder
-    /// (session_worker takes a dedicated path, not `RuntimeBootstrap`).
-    #[cfg(feature = "llm-router")]
-    const fn needs_cte(self) -> bool {
-        matches!(self, Self::AgentLoop)
     }
 }
 
@@ -255,9 +224,74 @@ pub(crate) fn build_security_policy(config: &Config) -> Arc<SecurityPolicy> {
     )
 }
 
+/// Configuration owned by the invoking runtime. Scheduled model turns keep
+/// the scheduler's exact generation and manager instead of reconstructing a
+/// generation label from the current configuration file.
+pub(crate) enum AgentRuntimeConfig {
+    Standalone(Box<Config>),
+    Pinned {
+        generation: Arc<crate::config::ConfigGeneration>,
+        manager: crate::config::SharedConfig,
+    },
+}
+
+impl From<Config> for AgentRuntimeConfig {
+    fn from(config: Config) -> Self {
+        Self::Standalone(Box::new(config))
+    }
+}
+
+impl AgentRuntimeConfig {
+    pub(crate) fn effective(&self) -> &Config {
+        match self {
+            Self::Standalone(config) => config,
+            Self::Pinned { generation, .. } => &generation.effective,
+        }
+    }
+}
+
 /// Single construction entry point: all modes obtain their `Arc<AppContext>`
 /// from here.
 pub struct RuntimeBootstrap;
+
+impl AppContext {
+    /// Publish from the finalized registry owned by the ingress. Interactive
+    /// chat calls this only after appending its session tools; the base registry
+    /// is not a capability authority for a running chat session.
+    pub(crate) async fn publish_turn_decisions(
+        &self,
+        registry: Arc<Vec<Box<dyn Tool>>>,
+        surface: crate::causal_tree::state::TurnSurfaceKind,
+    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+        super::turn_publication::TurnDecisionPublication {
+            generation: Arc::clone(&self.config_generation),
+            registry,
+            mcp_tool: self.mcp_tool.clone(),
+            security: Arc::clone(&self.security),
+            observer: Arc::clone(&self.observer),
+            hooks: Arc::clone(&self.hooks),
+            memory: self
+                .memory
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("decision publication requires memory"))?
+                .clone(),
+            plugin_generation: {
+                #[cfg(feature = "wasm-plugins")]
+                {
+                    self.plugin_runtime
+                        .as_ref()
+                        .map_or(0, |runtime| runtime.generation_id())
+                }
+                #[cfg(not(feature = "wasm-plugins"))]
+                {
+                    0
+                }
+            },
+        }
+        .publish(surface)
+        .await
+    }
+}
 
 impl RuntimeBootstrap {
     /// Build the read-only core for `profile`, constructing subsystems in the
@@ -265,12 +299,96 @@ impl RuntimeBootstrap {
     /// (iron rules 1/6: no `unwrap`/`expect`/`panic`; fail-fast on subsystem
     /// construction errors).
     pub async fn build(config: Config, profile: BootstrapProfile) -> Result<Arc<AppContext>> {
+        Self::build_inner(
+            config.into(),
+            profile,
+            crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            None,
+        )
+        .await
+    }
+
+    /// Publish once for the actual agent ingress, using the same effective
+    /// policy as the scheduled execution adapter. This does not issue a turn
+    /// source proof or turn a task into a local human approval surface.
+    pub(crate) async fn build_agent(
+        config_source: AgentRuntimeConfig,
+        envelope: Option<&crate::runtime::envelope::RuntimeEnvelope>,
+        scheduled: Option<&crate::tools::execution::ScheduledToolScope>,
+    ) -> Result<Arc<AppContext>> {
+        use crate::causal_tree::state::TurnSurfaceKind;
+        use crate::runtime::envelope::RuntimeSource;
+        let config = config_source.effective();
+        if let AgentRuntimeConfig::Pinned { generation, .. } = &config_source
+            && let Some(envelope) = envelope
+        {
+            anyhow::ensure!(
+                envelope.config_generation_id == Some(generation.id.0)
+                    && envelope.config_source_revision.as_deref()
+                        == Some(generation.source_revision.fingerprint_sha256.as_str()),
+                "scheduled source does not match its pinned configuration"
+            );
+        }
+        let surface = match envelope.map(|envelope| envelope.source) {
+            None | Some(RuntimeSource::Agent) => TurnSurfaceKind::AgentLoop,
+            Some(RuntimeSource::Cron) => TurnSurfaceKind::Cron,
+            Some(RuntimeSource::Xin) => TurnSurfaceKind::Xin,
+            Some(_) => anyhow::bail!("unsupported scoped agent ingress"),
+        };
+        let policy = scheduled
+            .map(|scheduled| {
+                let source =
+                    envelope.ok_or_else(|| anyhow::anyhow!("scheduled execution requires its runtime source"))?;
+                let execution = &scheduled.context.envelope;
+                anyhow::ensure!(
+                    matches!(source.source, RuntimeSource::Cron | RuntimeSource::Xin)
+                        && execution.source == source.source
+                        && execution.workspace_id == source.workspace_id
+                        && execution.session_key == source.session_key
+                        && execution.run_id == source.run_id
+                        && execution.task_id == source.task_id
+                        && execution.attempt_id == source.attempt_id
+                        && execution.lease_epoch == source.lease_epoch
+                        && execution.authority_guard == source.authority_guard
+                        && execution.parent_run_id == source.parent_run_id
+                        && execution.agent_id == source.agent_id
+                        && execution.persona_id == source.persona_id
+                        && execution.topic_id == source.topic_id
+                        && execution.source_message_event_id == source.source_message_event_id
+                        && execution.config_generation_id == source.config_generation_id
+                        && execution.config_source_revision == source.config_source_revision
+                        && source
+                            .owner_id
+                            .as_ref()
+                            .is_none_or(|owner| execution.owner_id.as_ref() == Some(owner))
+                        && (!source.owner_isolated || execution.owner_isolated)
+                        && scheduled.policy.workspace_dir == config.workspace_dir,
+                    "scheduled policy and execution scope do not belong to this run"
+                );
+                Ok::<_, anyhow::Error>(Arc::clone(&scheduled.policy))
+            })
+            .transpose()?;
+        Self::build_inner(config_source, BootstrapProfile::AgentLoop, surface, policy).await
+    }
+
+    async fn build_inner(
+        config_source: AgentRuntimeConfig,
+        profile: BootstrapProfile,
+        agent_surface: crate::causal_tree::state::TurnSurfaceKind,
+        security_override: Option<Arc<SecurityPolicy>>,
+    ) -> Result<Arc<AppContext>> {
         // Wrap config once so all downstream users share the same allocation
         // (iron rule 7: Arc over deep copy). Arc<Config> deref-coerces to &Config
         // everywhere a borrow is needed. The bootstrap also owns the one
         // process-level generation manager used by every config-aware tool.
-        let config_manager = crate::config::new_shared(config);
-        let config_generation = config_manager.pin();
+        let (config_manager, config_generation) = match config_source {
+            AgentRuntimeConfig::Standalone(config) => {
+                let manager = crate::config::new_shared(*config);
+                let generation = manager.pin();
+                (manager, generation)
+            }
+            AgentRuntimeConfig::Pinned { generation, manager } => (manager, generation),
+        };
         let config = Arc::clone(&config_generation.effective);
 
         // 1. observer — first, no dependencies beyond config.
@@ -278,8 +396,10 @@ impl RuntimeBootstrap {
 
         // 2. security (with audit) — single source of truth; always carries the
         //    configured `security.audit` block (dev-plan §2.1, collapses 17 sites).
-        let security = build_security_policy(&config);
-        let hooks = Arc::new(crate::hooks::HookManager::new(config.workspace_dir.clone()));
+        let security = security_override.unwrap_or_else(|| build_security_policy(&config));
+        let hooks = Arc::new(
+            crate::hooks::HookManager::new(config.workspace_dir.clone()).with_config(Arc::clone(&config_manager)),
+        );
 
         // workspace_dir as Arc<Path>: borrow the config path, no String detour.
         let workspace_dir: Arc<Path> = Arc::from(config.workspace_dir.as_path());
@@ -307,10 +427,10 @@ impl RuntimeBootstrap {
         let memory: Option<Arc<dyn Memory>> = if profile.needs_memory() {
             let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
                 &config.memory,
-                &config.embedding_routes,
+                &config.embedding_routes_with_references(),
                 Some(&config.storage.provider.config),
                 &config.workspace_dir,
-                config.api_key.as_deref(),
+                memory::EmbeddingRootCredential::from_config(&config),
                 &config.identity_bindings,
                 &config.user_policies,
             )?);
@@ -359,43 +479,23 @@ impl RuntimeBootstrap {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("memory backend must be set before enabling router"))?;
             let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-            let router_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
+            let (router_embedder, local_history) = match memory::create_configured_embedder(&config) {
+                memory::ConfiguredEmbedding::LocalHash(embedder) => (None, Some(embedder)),
+                memory::ConfiguredEmbedding::Other(embedder) => (Some(embedder), None),
+            };
             let engine = RouterEngine::new(
                 config.router.clone(),
                 provider_name.to_string(),
                 config.model_routes.clone(),
                 mem.clone(),
-                Some(router_embedder),
+                router_embedder,
             )
             .await?;
+            let engine = match local_history {
+                Some(embedder) => engine.with_local_hash_history(embedder)?,
+                None => engine,
+            };
             Some(Arc::new(engine))
-        } else {
-            None
-        };
-
-        // 5b. causal_tree (CTE) — experimental, opt-in. Only the dedicated
-        //     `AgentLoop` profile (consumed by `loop_::run`) attaches CTE; every
-        //     other path leaves it `None` and pays nothing. CTE depends only on the
-        //     observer (built in step 1) + config, so it is constructed here after
-        //     the router and before tools. Short-circuit on `needs_cte() &&
-        //     config.causal_tree.enabled`: when disabled, `CausalTreeEngine::new`
-        //     and all five sub-engines are never constructed (zero allocation).
-        #[cfg(feature = "llm-router")]
-        let cte: Option<Arc<CausalTreeEngine>> = if profile.needs_cte() && config.causal_tree.enabled {
-            Some(Arc::new(CausalTreeEngine::new(
-                Arc::new(crate::causal_tree::expander::DefaultTreeExpander::new()),
-                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
-                Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
-                Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
-                Arc::new(crate::causal_tree::feedback::SelfSystemFeedbackWriter::new(
-                    &config.workspace_dir,
-                )),
-                // Reuse the single context observer (matches the legacy
-                // `cte_observer = observer.clone()` wiring) so CTE telemetry lands
-                // on the same backend as the rest of the run.
-                observer.clone(),
-                config.causal_tree.clone(),
-            )))
         } else {
             None
         };
@@ -408,6 +508,7 @@ impl RuntimeBootstrap {
         // provider/channel exist) and leaves `tools` as `None`; every other
         // tools-bearing profile keeps the shared `Arc` in `tools`.
         let mut tools: Option<Arc<Vec<Box<dyn Tool>>>> = None;
+        let mut mcp_tool: Option<Arc<tools::McpTool>> = None;
         let mut base_tools: Option<parking_lot::Mutex<Option<Vec<Box<dyn Tool>>>>> = None;
         if profile.needs_tools() {
             // runtime is always Some when needs_tools() is true (built in step 4).
@@ -430,7 +531,7 @@ impl RuntimeBootstrap {
             if let Some(plugin_runtime) = &plugin_runtime {
                 extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
             }
-            let registry = tools::all_tools_with_runtime_ext_and_extensions(
+            let registry_result = tools::all_tools_with_runtime_ext_and_extensions(
                 Arc::clone(&config),
                 Arc::clone(&config_manager),
                 &security,
@@ -441,12 +542,13 @@ impl RuntimeBootstrap {
                 &config.browser,
                 &config.http_request,
                 &config.workspace_dir,
-                &config.agents,
+                &config.agents_with_references(),
                 config.api_key.as_deref(),
                 &config,
                 extensions,
-            )
-            .tools;
+            );
+            mcp_tool = registry_result.mcp_tool;
+            let registry = registry_result.tools;
             if matches!(profile, BootstrapProfile::Interactive) {
                 base_tools = Some(parking_lot::Mutex::new(Some(registry)));
             } else {
@@ -454,7 +556,7 @@ impl RuntimeBootstrap {
             }
         }
 
-        Ok(Arc::new(AppContext {
+        let mut context = AppContext {
             config_manager,
             config_generation,
             config,
@@ -464,19 +566,33 @@ impl RuntimeBootstrap {
             workspace_dir,
             memory,
             tools,
+            mcp_tool,
+            turn_decisions: None,
             base_tools,
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime,
             #[cfg(feature = "llm-router")]
             router,
-            #[cfg(feature = "llm-router")]
-            cte,
-        }))
+        };
+        if matches!(profile, BootstrapProfile::AgentLoop) {
+            let registry = context
+                .tools
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("AgentLoop decision publication requires its tool registry"))?;
+            context.turn_decisions = Some(
+                context
+                    .publish_turn_decisions(Arc::clone(registry), agent_surface)
+                    .await?,
+            );
+        }
+        Ok(Arc::new(context))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    mod decision_feature_contract;
+
     use super::*;
 
     fn assert_model_managed_capability_surface(tools: &[Box<dyn Tool>]) {
@@ -517,6 +633,8 @@ mod tests {
         let mut config = Config::default();
         config.workspace_dir = workspace.to_path_buf();
         config.config_path = workspace.join("config.toml");
+        // These profile fixtures assert the explicitly disabled/off contract.
+        config.causal_tree.enabled = false;
         // Keep the observer cheap and deterministic in tests.
         config.observability.backend = "noop".into();
         config
@@ -594,74 +712,26 @@ mod tests {
 
         assert!(ctx.memory.is_some(), "AgentLoop must build memory");
         assert!(ctx.tools.is_some(), "AgentLoop must build tools");
+        assert!(
+            ctx.mcp_tool.is_some(),
+            "AgentLoop must retain its registry MCP instance"
+        );
+        assert!(
+            ctx.turn_decisions.is_some(),
+            "AgentLoop must publish its decision service"
+        );
+        assert!(
+            !tmp.path().join("self/causal_tree/.decision_key").exists(),
+            "disabled AgentLoop publication must not create a decision key"
+        );
+        assert!(
+            !tmp.path().join("self/causal_tree/decisions.db").exists(),
+            "disabled AgentLoop publication must not create a decision database"
+        );
         assert_model_managed_capability_surface(ctx.tools.as_deref().expect("AgentLoop tools"));
         // AgentLoop has the same router footprint as Interactive: never routes.
         #[cfg(feature = "llm-router")]
         assert!(ctx.router.is_none(), "AgentLoop must not build router");
-    }
-
-    // --- CTE attachment: only AgentLoop + enabled builds it (Codex condition #1) -
-
-    /// Critical: the shared `Interactive` profile (used by `prx chat`) must NEVER
-    /// build CTE, even when `config.causal_tree.enabled` is true — chat has no CTE
-    /// consumer, so wiring it there would be dead code with non-zero cost.
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn interactive_profile_never_builds_cte_even_when_enabled() {
-        let tmp = tempfile::tempdir().expect("test: create temp dir");
-        let mut config = test_config(tmp.path());
-        config.causal_tree.enabled = true;
-        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Interactive)
-            .await
-            .expect("test: interactive build");
-        assert!(
-            ctx.cte.is_none(),
-            "Interactive (chat) must not attach CTE even with causal_tree.enabled=true"
-        );
-    }
-
-    /// `AgentLoop` + `enabled = false` (the default) → no CTE, zero cost.
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn agent_loop_profile_disabled_has_no_cte() {
-        let tmp = tempfile::tempdir().expect("test: create temp dir");
-        let config = test_config(tmp.path());
-        // test_config leaves causal_tree.enabled at its default (false).
-        assert!(!config.causal_tree.enabled, "test precondition: CTE default off");
-        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
-            .await
-            .expect("test: agent-loop build (CTE off)");
-        assert!(ctx.cte.is_none(), "AgentLoop with enabled=false must not attach CTE");
-    }
-
-    /// `AgentLoop` + `enabled = true` → CTE attached (`Some`).
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn agent_loop_profile_enabled_attaches_cte() {
-        let tmp = tempfile::tempdir().expect("test: create temp dir");
-        let mut config = test_config(tmp.path());
-        config.causal_tree.enabled = true;
-        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
-            .await
-            .expect("test: agent-loop build (CTE on)");
-        assert!(ctx.cte.is_some(), "AgentLoop with enabled=true must attach CTE");
-        let cte = ctx.cte.as_ref().expect("test: cte present");
-        assert!(cte.is_enabled(), "attached CTE engine must report enabled");
-    }
-
-    /// Lightweight profiles never attach CTE regardless of config.
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn lightweight_profiles_never_attach_cte() {
-        for profile in [BootstrapProfile::Minimal, BootstrapProfile::MemoryOnly] {
-            let tmp = tempfile::tempdir().expect("test: create temp dir");
-            let mut config = test_config(tmp.path());
-            config.causal_tree.enabled = true;
-            let ctx = RuntimeBootstrap::build(config, profile)
-                .await
-                .unwrap_or_else(|e| panic!("test: build {profile:?}: {e}"));
-            assert!(ctx.cte.is_none(), "{profile:?}: must not attach CTE");
-        }
     }
 
     #[tokio::test]
@@ -833,13 +903,12 @@ mod tests {
     ///   - `session_worker/runner.rs`: manifest-driven divergent core
     ///     (`manifest.workspace_dir`-bound security); intentionally NOT routed through
     ///     `RuntimeBootstrap` under the D1 behavior-unchanged guardrail (see module note).
-    ///   - `agent/loop_.rs`: `process_message` path, not yet converged (later D-series).
     ///   - `cron/scheduler.rs`: cron job path, not yet converged.
     ///
     /// A8 (2026-06-03): the legacy `Agent::from_config` in `agent/agent.rs` — the
     /// only production `.with_audit_config(` site in that file — was removed when the
     /// dead legacy `Agent::run` / `from_config` / `run_interactive` shell was deleted
-    /// (the live path is `loop_::run`). `agent/agent.rs` was therefore REMOVED from
+    /// (the live path is `entry::run`). `agent/agent.rs` was therefore REMOVED from
     /// this whitelist to keep the gate tight (`gate_whitelist_entries_are_all_live`).
     ///
     /// D2 (2026-06-02): the four gateway authorization sites — `gateway/mod.rs`
@@ -849,7 +918,10 @@ mod tests {
     /// were all converged onto `build_security_policy` and so were REMOVED from this
     /// whitelist. They no longer hand-write the audit-config wiring, which keeps the
     /// gate tight (`gate_whitelist_entries_are_all_live`).
-    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &["session_worker/runner.rs", "agent/loop_.rs", "cron/scheduler.rs"];
+    ///
+    /// E2 (2026-09-23): `agent/loop_.rs` was REMOVED from this whitelist with the
+    /// library-only `process_message`, its only hand-wired site.
+    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &["session_worker/runner.rs", "cron/scheduler.rs"];
 
     /// Recursively collect every `.rs` file under `dir`.
     fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -865,42 +937,61 @@ mod tests {
         }
     }
 
-    /// Count `.with_audit_config(` occurrences in `src`, ignoring lines inside any
-    /// `#[cfg(test)]` module. The stripper is line-based: when it sees a
-    /// `#[cfg(test)]` attribute it skips to the matching closing brace of the block
-    /// that follows (a `mod tests { ... }` / `fn ... { ... }`), tracking brace depth.
-    /// This is intentionally conservative — it is the same shape used by the test
-    /// modules in this codebase (`#[cfg(test)]\nmod tests {`).
+    /// The production/test rule the architecture scanners use, from the one
+    /// shared copy: `is_test_only_file` (the file-level `#![cfg(test)]` marker,
+    /// nested block comments honoured) and `strip_cfg_test_items` (every
+    /// `#[cfg(test)]` construct blanked, extents computed on comment- and
+    /// literal-blanked text).
+    // Scanner code shared with `tests/architecture_boundaries.rs`: every index
+    // is bounded by its loop condition.
+    #[allow(clippy::indexing_slicing)]
+    mod cfg_test_scan {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/cfg_test_scan.rs"));
+    }
+    use cfg_test_scan::{is_test_only_file, strip_cfg_test_items};
+
+    /// Count the lines of `src` that hand-write `.with_audit_config(` outside
+    /// test code (see `cfg_test_scan`). A test-only file has none.
     fn count_production_handwired_audit(src: &str) -> usize {
-        let mut count = 0usize;
-        let mut lines = src.lines();
-        while let Some(line) = lines.next() {
-            if line.trim_start().starts_with("#[cfg(test)]") {
-                // Skip until the brace opened by the following item is closed.
-                // Advance to the first line containing an opening brace, then balance.
-                let mut depth: i32 = 0;
-                let mut started = false;
-                // Consume the attribute's target item line-by-line.
-                for next in lines.by_ref() {
-                    for ch in next.chars() {
-                        if ch == '{' {
-                            depth += 1;
-                            started = true;
-                        } else if ch == '}' {
-                            depth -= 1;
-                        }
-                    }
-                    if started && depth <= 0 {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if line.contains(".with_audit_config(") {
-                count += 1;
-            }
+        strip_cfg_test_items(src)
+            .lines()
+            .filter(|line| line.contains(".with_audit_config("))
+            .count()
+    }
+
+    /// The file-level marker, and only the marker, makes a file test code for
+    /// this gate; the same production text without it is still counted.
+    #[test]
+    fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
+        let site = "fn build() {\n    let _ = SecurityPolicy::from_config(&c).with_audit_config(a);\n}\n";
+        for marked in [
+            format!("//! Tests of a production module.\n\n#![cfg(test)]\n#![allow(clippy::unwrap_used)]\n\n{site}"),
+            format!("/* leading block comment */\n#![cfg(test)] // trailing comment\n{site}"),
+        ] {
+            assert!(is_test_only_file(&marked), "{marked}");
+            assert_eq!(count_production_handwired_audit(&marked), 0, "{marked}");
         }
-        count
+        for unmarked in [
+            site.to_string(),
+            format!("use super::*;\n#![cfg(test)]\n{site}"),
+            format!("#![allow(clippy::unwrap_used)]\n#![cfg(test)]\n{site}"),
+            format!("#![cfg(any(test, feature = \"probe\"))]\n{site}"),
+            format!("#![cfg(not(test))]\n{site}"),
+            format!("/* a comment that mentions\n#![cfg(test)]\n*/\n{site}"),
+            format!("{site}#[cfg(test)]\nmod tests {{}}\n"),
+            format!("#[cfg(test)]\nconst LIMIT: usize = 3;\n#[cfg(test)]\nmod probe_tests;\n{site}"),
+            // A nested block comment around the marker is still a comment.
+            format!("/* a /* b */\n#![cfg(test)]\n*/\n{site}"),
+            // Brackets inside a test item's literals and comments move nothing.
+            format!("#[cfg(test)]\nfn helper() {{\n    let _ = \"(\";\n    let _ = '[';\n    // (\n}}\n{site}"),
+            // A comma-terminated test construct ends at its comma.
+            "fn wire(\n    #[cfg(test)] probe: u8,\n    real: u8,\n) {\n    let _ = \
+             SecurityPolicy::from_config(&c).with_audit_config(a);\n}\n"
+                .to_string(),
+        ] {
+            assert!(!is_test_only_file(&unmarked), "{unmarked}");
+            assert_eq!(count_production_handwired_audit(&unmarked), 1, "{unmarked}");
+        }
     }
 
     #[test]

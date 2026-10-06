@@ -1,8 +1,8 @@
 use super::{AppState, extract_resource_auth_token};
-use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope, build_runtime_system_prompt,
-    run_tool_call_loop_traced, select_prompt_skills,
-};
+use crate::agent::document_ingest::DocumentIngestRuntime;
+use crate::agent::runtime_prompt::build_runtime_system_prompt;
+use crate::agent::turn_contracts::ScopeContext;
+use crate::agent::turn_engine::run_turn;
 use crate::gateway::jobs;
 use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
@@ -159,27 +159,147 @@ fn console_runtime_envelope_for_workspace(
         .with_sender(sender.to_string())
 }
 
+/// D-037 grants authenticated API tokens full operator access to the selected
+/// transcript. This read principal never enters the turn envelope or tool scope.
+fn operator_history_principal(
+    _authenticated: &super::ApiPrincipal,
+    envelope: &RuntimeEnvelope,
+) -> crate::memory::MemoryPrincipal {
+    let mut principal = envelope.memory_principal();
+    principal.owner_id = Some("system:*".to_owned());
+    principal.agent_id = Some("system".to_owned());
+    principal.require_owner_match = false;
+    principal
+}
+
+async fn recover_console_history(
+    state: &AppState,
+    runtime: &crate::gateway::TurnRuntimeGeneration,
+    _authenticated: &super::ApiPrincipal,
+    session_key: &str,
+) -> anyhow::Result<()> {
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return Ok(());
+    }
+    let workspace = runtime.config_generation.effective.workspace_dir.to_string_lossy();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut cleanup = None;
+    let recovery = async {
+        let mut cursor = 0;
+        loop {
+            anyhow::ensure!(
+                !cancellation.is_cancelled(),
+                "Console recovery cancelled during shutdown"
+            );
+            let events = state
+                .mem
+                .list_console_terminal_events(&workspace, session_key, cursor, 128)
+                .await?;
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                anyhow::ensure!(
+                    event.id > cursor
+                        && event.workspace_id == workspace
+                        && event.session_key.as_deref() == Some(session_key)
+                        && event.source == crate::memory::MessageEventSource::Console
+                        && event.event_type == "turn.finalized",
+                    "Console recovery returned an invalid marker"
+                );
+                cursor = event.id;
+                let payload: serde_json::Value = serde_json::from_str(
+                    event
+                        .raw_payload_json
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Console terminal payload missing"))?,
+                )?;
+                if payload.get("decision_id").is_none_or(serde_json::Value::is_null)
+                    && payload.get("terminal_replay_v1").is_none()
+                    && payload.get("terminal_replay_mac_v1").is_none()
+                {
+                    // A stripped marker must not masquerade as a legacy turn
+                    // when a durable decision claim still identifies the run.
+                    let claim = if let Some(run) = event.run_id.as_deref() {
+                        state
+                            .mem
+                            .find_message_event_by_idempotency_key(&workspace, &format!("turn:{run}:decision-claim"))
+                            .await?
+                    } else {
+                        None
+                    };
+                    if claim.is_none() {
+                        continue;
+                    }
+                }
+                if cleanup.is_none() {
+                    cleanup = Some(runtime.decision_slot.cleanup.register(cancellation.clone())?);
+                }
+                let terminal_id = event
+                    .run_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Console terminal run missing"))?;
+                anyhow::ensure!(
+                    event.idempotency_key.as_deref() == Some(format!("turn:{terminal_id}:final").as_str()),
+                    "Console recovery marker identity changed"
+                );
+                let owner = event
+                    .owner_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Console terminal owner missing"))?;
+                let service = runtime.decision_slot.publish(runtime, state).await?;
+                service.rejoin_terminal(terminal_id, owner).await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), recovery)
+        .await
+        .map_err(|_| anyhow::anyhow!("Console history recovery timed out; retry required"))??;
+    if let Some(ticket) = cleanup {
+        ticket.finish(true);
+    }
+    Ok(())
+}
+
 async fn append_console_turn(
     state: &AppState,
     envelope: &RuntimeEnvelope,
     role: &str,
     content: &str,
     record_message_event: bool,
+    durable_projection: bool,
 ) -> anyhow::Result<String> {
+    // The console persists its reply twice, as a message event and as the
+    // transcript turn: both are redacted like the terminal commit (D-053).
+    let content: std::borrow::Cow<'_, str> = if role == "assistant" {
+        std::borrow::Cow::Owned(crate::agent::terminal::redact_persisted_text(content))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    };
     let event = if record_message_event {
         let fabric = MemoryFabric::new(state.mem.clone(), envelope.workspace_id.clone());
         Some(if role == "assistant" {
             fabric
-                .record_assistant_message(envelope.message_scope(), content)
+                .record_assistant_message(envelope.message_scope(), &*content)
                 .await?
         } else {
             fabric
-                .record_inbound_user_message(envelope.message_scope(), content, None, None)
+                .record_inbound_user_message(envelope.message_scope(), &*content, None, None)
                 .await?
         })
     } else {
         None
     };
+    if durable_projection {
+        let event = event
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Console projection requires a recorded event"))?;
+        state.mem.project_console_message(event).await?;
+        return Ok(event.event_id.clone());
+    }
     let owner_id = envelope.resolved_owner_id();
 
     state
@@ -189,7 +309,7 @@ async fn append_console_turn(
             envelope.channel.as_deref().unwrap_or("console"),
             envelope.sender.as_deref().unwrap_or("console-user"),
             role,
-            content,
+            &content,
             None,
             event.as_ref().map(|event| event.event_id.as_str()),
             Some(owner_id.as_str()),
@@ -201,32 +321,69 @@ async fn append_console_turn(
 
 struct ConsoleTurnResult {
     reply: String,
-    trace: crate::agent::loop_::ToolLoopTrace,
+    awaiting_approval: bool,
+    trace: crate::agent::turn_contracts::ToolLoopTrace,
     route_decision: crate::llm::route_decision::RouteDecision,
     provider_started_at: chrono::DateTime<chrono::Utc>,
     history_commit_len: usize,
     envelope: RuntimeEnvelope,
 }
 
-async fn run_console_runtime_turn(
-    state: &AppState,
+struct ConsoleDecisionTurn<'a> {
+    service: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    context: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    proof: &'a crate::gateway::decision_source::GatewayTurnProof,
+    cancellation: tokio_util::sync::CancellationToken,
+    provider_trace: Option<(
+        std::sync::Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
+        std::sync::Arc<crate::llm::route_decision::RouteDecision>,
+    )>,
+}
+
+fn console_route_decision(
+    runtime: &crate::gateway::TurnRuntimeGeneration,
     envelope: &RuntimeEnvelope,
+    message: &str,
+) -> anyhow::Result<crate::llm::route_decision::RouteDecision> {
+    let provider = runtime
+        .provider_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Console provider binding missing"))?;
+    Ok(crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        provider.provider_name().to_string(),
+        runtime.model.clone(),
+        envelope.resolved_owner_id(),
+        envelope.session_key.clone(),
+        envelope.source_message_event_id.clone(),
+        None,
+        "console_message",
+        u32::try_from(message.chars().count() / 4).unwrap_or(u32::MAX),
+        !runtime.tools_registry.is_empty(),
+        false,
+    ))
+}
+
+async fn run_console_runtime_turn(
+    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    state: &AppState,
     visible_message: &str,
     previous_turns: Vec<crate::memory::ConversationTurn>,
-    source_message_event_id: Option<String>,
+    decision: &ConsoleDecisionTurn<'_>,
 ) -> anyhow::Result<ConsoleTurnResult> {
+    decision.proof.verify_runtime_input(&turn_runtime, visible_message)?;
+    let turn_envelope = decision.proof.envelope().clone();
     // D2: this runtime turn rebuilds a `SecurityPolicy` (below) that gates tool
     // side-effects for the turn, so the config snapshot it derives from MUST be the
     // pinned TurnRuntimeGeneration, not an independently cached config owner. This
     // makes a reloaded autonomy / security.audit take effect for console-driven
     // turns without a restart; all non-security fields used for the prompt come from
     // the same snapshot, so the turn stays internally consistent.
-    let turn_runtime = state.pin_turn_runtime();
     let config_snapshot = (*turn_runtime.config_generation.effective).clone();
-    let provider_label = config_snapshot
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter")
+    let provider_label = turn_runtime
+        .provider_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Console provider binding missing"))?
+        .provider_name()
         .to_string();
     let native_tools = turn_runtime
         .provider
@@ -235,35 +392,16 @@ async fn run_console_runtime_turn(
             crate::providers::traits::ProviderRequestMode::NonStreaming,
         )
         .native_tool_calling;
-    let skill_embedder =
-        crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
-    let skills = crate::skills::load_skills_with_embeddings(
-        &config_snapshot.workspace_dir,
-        &config_snapshot,
-        skill_embedder.as_ref(),
-    )
-    .await?;
-    let selected_skills =
-        select_prompt_skills(visible_message, &skills, &config_snapshot, skill_embedder.as_ref()).await;
+    let selected_skills = decision
+        .service
+        .agent_prompt_skills(decision.proof, &decision.context)?;
     let system_prompt =
         build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools);
 
-    let mut turn_envelope = envelope
-        .clone()
-        .with_run_id(uuid::Uuid::new_v4().to_string())
-        .with_config_generation(&turn_runtime.config_generation);
-    if let Some(event_id) = source_message_event_id.as_ref() {
-        turn_envelope = turn_envelope.with_source_message_event_id(event_id.clone());
-    }
-    let semantic_scope = turn_envelope.memory_write_context("private");
-    let mem_context = build_context_with_shared_events_and_scope(
-        state.mem.as_ref(),
-        turn_envelope.memory_principal(),
-        visible_message,
-        config_snapshot.memory.min_relevance_score,
-        Some(&semantic_scope),
-    )
-    .await;
+    let mem_context = crate::agent::context_recall::RecalledMemoryContext {
+        preamble: crate::agent::memory_loader::format_selected_context(None, decision.context.retrieved()?)?,
+        ids: Vec::new(),
+    };
     let enriched_message = if mem_context.preamble.is_empty() {
         visible_message.to_string()
     } else {
@@ -272,11 +410,13 @@ async fn run_console_runtime_turn(
 
     let mut history = Vec::with_capacity(previous_turns.len() + 2);
     history.push(ChatMessage::system(system_prompt));
-    history.extend(previous_turns.into_iter().map(|turn| ChatMessage {
-        role: turn.role,
-        content: turn.content,
-    }));
-    history.push(ChatMessage::user(enriched_message));
+    // stored console turns are neutralised like fresh input
+    history.extend(
+        previous_turns
+            .into_iter()
+            .map(|turn| crate::agent::turn_contracts::stored_turn_message(turn.role, turn.content)),
+    );
+    history.push(crate::agent::turn_contracts::inbound_user_message(&enriched_message));
 
     // D2 / FIX-P1-31: build via the shared `build_security_policy` helper so this
     // per-turn gateway authz site cannot drift from (or forget) the audit-config
@@ -301,99 +441,108 @@ async fn run_console_runtime_turn(
     };
     let noop_observer = NoopObserver;
 
-    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-        provider_label.clone(),
-        turn_runtime.model.clone(),
-        scope_owner_id.clone(),
-        turn_envelope.session_key.clone(),
-        source_message_event_id.clone(),
-        None,
-        "console_message",
-        u32::try_from(visible_message.chars().count() / 4).unwrap_or(u32::MAX),
-        !turn_runtime.tools_registry.is_empty(),
-        false,
-    );
-    let provider_started_at = chrono::Utc::now();
-    let loop_result = run_tool_call_loop_traced(
-        turn_runtime.provider.as_ref(),
-        &mut history,
-        std::sync::Arc::clone(&turn_runtime.tools_registry),
-        &noop_observer,
-        state.hooks.as_ref(),
+    let route_decision = match &decision.provider_trace {
+        Some((_, route)) => route.as_ref().clone(),
+        None => console_route_decision(&turn_runtime, &turn_envelope, visible_message)?,
+    };
+    // OQ-23 / R5: budget on the *effective* window of the model this turn
+    // serves (the `[[router.models]]` / built-in `max_context` and
+    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
+    // webhook resolve with, so one request is trimmed the same way on every
+    // surface of this process.
+    let mut effective_compaction = crate::router::resolve_effective_compaction_config(
+        &config_snapshot.agent.compaction,
         &provider_label,
         &turn_runtime.model,
-        turn_runtime.temperature,
-        true,
-        None,
-        "console",
-        &config_snapshot.multimodal,
-        config_snapshot.agent.read_only_tool_concurrency_window,
-        config_snapshot.agent.priority_scheduling_enabled,
-        config_snapshot.agent.low_priority_tools.clone(),
-        Some(&config_snapshot.agent.compaction),
-        None,
-        None,
-        Some(&scope_ctx),
-        None,
-        Some(&config_snapshot.tool_tiering),
-        crate::agent::loop_::ToolLoopMemory::new(
-            &state.mem,
-            &config_snapshot.workspace_dir,
-            Some(
-                DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
-                    .with_source_message_event_id(source_message_event_id),
-            ),
-        )
-        .with_event_fabric(
-            MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
-                .with_event_recording(config_snapshot.memory.event_recording_config()),
-        )
-        .with_request_event_scope(turn_envelope.message_scope())
-        .with_routing_input(visible_message.to_string()),
-        crate::agent::loop_::ChatMode::default(),
+        &config_snapshot.router,
+        &config_snapshot.model_routes,
+    );
+    effective_compaction.config = decision.context.main_compaction().clone();
+    crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+    let provider_started_at = chrono::Utc::now();
+    let loop_result = run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "console",
+            scope: Some(&scope_ctx),
+            mode: crate::agent::turn_contracts::ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &config_snapshot.multimodal,
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: config_snapshot.agent.read_only_tool_concurrency_window,
+                priority_scheduling_enabled: config_snapshot.agent.priority_scheduling_enabled,
+                low_priority_tool_names: config_snapshot.agent.low_priority_tools.clone(),
+            },
+            compaction: Some(&effective_compaction.config),
+            decision: crate::agent::turn_request::TurnDecision {
+                service: &decision.service,
+                context: &decision.context,
+                proof: decision.proof,
+            },
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: turn_runtime.provider.as_ref(),
+            provider_name: &provider_label,
+            model: &turn_runtime.model,
+            temperature: turn_runtime.temperature,
+            tools_registry: std::sync::Arc::clone(&turn_runtime.tools_registry),
+            observer: &noop_observer,
+            hooks: state.hooks.as_ref(),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                provider_trace: decision
+                    .provider_trace
+                    .as_ref()
+                    .map(|(trace, _)| std::sync::Arc::clone(trace)),
+                events: None,
+                stream_provider: false,
+                tool_execution_service: None,
+                tool_execution_context: crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
+                    .with_chat_id(&turn_envelope.session_key),
+                allowed_tool_names: None,
+            }),
+            memory: crate::agent::turn_request::ToolLoopMemory::new(
+                &state.mem,
+                &config_snapshot.workspace_dir,
+                Some(
+                    DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
+                        .with_source_message_event_id(turn_envelope.source_message_event_id.clone()),
+                ),
+            )
+            .with_event_fabric(
+                MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
+                    .with_event_recording(config_snapshot.memory.event_recording_config()),
+            )
+            .with_request_event_scope(turn_envelope.message_scope()),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: Some(decision.cancellation.clone()),
+            on_delta: None,
+            on_tool_call: None,
+        },
     )
     .await;
-    let (reply, trace) = match loop_result {
-        Ok(result) => result,
-        Err(error) => {
-            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                &route_decision,
-                provider_started_at,
-                &error,
-            );
-            let terminal_id = turn_envelope
-                .run_id
-                .clone()
-                .unwrap_or_else(|| provider_outcome.decision_id.clone());
-            let fabric = MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone());
-            if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
-                &fabric,
-                crate::agent::terminal::TurnTerminalCommit {
-                    terminal_id,
-                    scope: turn_envelope.message_scope(),
-                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
-                    history: None,
-                    history_scope: None,
-                    provider_outcome: Some(provider_outcome),
-                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                        summary: error.to_string(),
-                        started_at: provider_started_at,
-                        finished_at: chrono::Utc::now(),
-                    },
-                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-                },
-                &config_snapshot.cost,
-                &config_snapshot.workspace_dir,
-            )
-            .await
-            {
-                tracing::warn!(error = %finalize_error, "Failed to commit failed console terminal event");
-            }
-            return Err(error);
-        }
-    };
+    let (outcome, trace) = loop_result?;
+    let awaiting_approval = matches!(
+        &outcome,
+        crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { .. }
+    );
+    if decision.context.approval_collection_proof().is_some() {
+        anyhow::ensure!(
+            awaiting_approval,
+            "Console collection returned without a durable pending approval"
+        );
+    }
+    let reply = outcome.into_text();
+    anyhow::ensure!(
+        trace.execution_trace.as_ref() == Some(&decision.context.terminal_execution_trace()),
+        "console execution trace differs from owning decision"
+    );
     Ok(ConsoleTurnResult {
         reply,
+        awaiting_approval,
         trace,
         route_decision,
         provider_started_at,
@@ -691,6 +840,7 @@ pub async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Query(query): Query<SessionMessagesQuery>,
+    axum::Extension(api_principal): axum::Extension<super::ApiPrincipal>,
 ) -> impl IntoResponse {
     let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
         Ok(session) => session,
@@ -712,10 +862,21 @@ pub async fn get_session_messages(
 
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
-    let principal = console_runtime_envelope(&state, &session_id, &session.channel, &session.sender).memory_principal();
+    let runtime = state.pin_turn_runtime();
+    if let Err(error) = recover_console_history(&state, &runtime, &api_principal, &session_id).await {
+        tracing::error!(error = %error, "Console history recovery failed");
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Console history recovery is incomplete",
+        );
+    }
+    let principal = operator_history_principal(
+        &api_principal,
+        &console_runtime_envelope(&state, &session_id, &session.channel, &session.sender),
+    );
     let turns = match state
         .mem
-        .list_conversation_turns(&principal, &session_id, limit, offset)
+        .list_console_conversation_turns(&principal, &session_id, limit, offset)
         .await
     {
         Ok(turns) => turns,
@@ -742,11 +903,193 @@ pub async fn get_session_messages(
     Json(response).into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DecisionApprovalRequest {
+    approved: bool,
+}
+
+pub(super) async fn get_decision_approval(
+    State(state): State<AppState>,
+    Path((session_id, decision_id)): Path<(String, String)>,
+    axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+) -> Response {
+    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+        Ok(id) => id,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
+    };
+    let runtime = state.pin_turn_runtime();
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cleanup =
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+            Ok(cleanup) => cleanup,
+            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+        };
+    let result = cleanup
+        .run(Box::pin(async {
+            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            service
+                .inspect_pending_decision_approval(&principal.owner_id, &session_id, decision_id)
+                .await
+        }))
+        .await;
+    result.map_or_else(
+        |_| json_error(StatusCode::CONFLICT, "Decision approval is unavailable or expired"),
+        |view| Json(view).into_response(),
+    )
+}
+
+pub(super) async fn post_decision_approval(
+    State(state): State<AppState>,
+    Path((session_id, decision_id)): Path<(String, String)>,
+    axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+    Json(request): Json<DecisionApprovalRequest>,
+) -> Response {
+    change_decision_approval(
+        state,
+        session_id,
+        decision_id,
+        principal,
+        DecisionApprovalChange::Review(request.approved),
+    )
+    .await
+}
+
+pub(super) async fn delete_decision_approval(
+    State(state): State<AppState>,
+    Path((session_id, decision_id)): Path<(String, String)>,
+    axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+) -> Response {
+    change_decision_approval(
+        state,
+        session_id,
+        decision_id,
+        principal,
+        DecisionApprovalChange::Revoke,
+    )
+    .await
+}
+
+enum DecisionApprovalChange {
+    Review(bool),
+    Revoke,
+}
+
+// This control-plane check does not grant permission to execute a file effect.
+// Only the existing signed review issuer and exact-call resume consumer do that.
+#[derive(Clone, Copy, Debug)]
+enum ConsoleDecisionControl {
+    Review,
+    Reject,
+    Revoke,
+    Resume,
+}
+
+fn console_decision_control_policy(config: &crate::config::Config) -> Result<(), &'static str> {
+    crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+        .enforce_tool_operation(crate::security::policy::ToolOperation::Act, "console decision control")
+        .map_err(|_| "Decision control is not permitted by policy")
+}
+
+async fn authorize_console_decision_control(
+    service: &crate::runtime::turn_decision::TurnDecisionService,
+    principal: &super::ApiPrincipal,
+    session: &str,
+    decision_id: crate::causal_tree::ids::DecisionId,
+    action: ConsoleDecisionControl,
+) -> anyhow::Result<()> {
+    // Authenticate the durable pending record, its original source and decision
+    // chain under the same pinned publication; an API identity alone is insufficient.
+    if matches!(action, ConsoleDecisionControl::Reject | ConsoleDecisionControl::Revoke) {
+        service
+            .load_pending_decision_approval(&principal.owner_id, session, decision_id)
+            .await?;
+    } else {
+        service
+            .inspect_pending_decision_approval(&principal.owner_id, session, decision_id)
+            .await?;
+    }
+    tracing::info!(
+        owner = %principal.owner_id,
+        decision_id = %decision_id,
+        action = ?action,
+        "Authenticated owner decision control request authorized; execution not granted"
+    );
+    Ok(())
+}
+
+async fn change_decision_approval(
+    state: AppState,
+    session_id: String,
+    decision_id: String,
+    principal: super::ApiPrincipal,
+    change: DecisionApprovalChange,
+) -> Response {
+    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+        Ok(id) => id,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
+    };
+    let runtime = state.pin_turn_runtime();
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    }
+    if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
+        return json_error(StatusCode::FORBIDDEN, message);
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cleanup =
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+            Ok(cleanup) => cleanup,
+            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+        };
+    let result = cleanup
+        .run(Box::pin(async {
+            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            let action = match change {
+                DecisionApprovalChange::Review(true) => ConsoleDecisionControl::Review,
+                DecisionApprovalChange::Review(false) => ConsoleDecisionControl::Reject,
+                DecisionApprovalChange::Revoke => ConsoleDecisionControl::Revoke,
+            };
+            authorize_console_decision_control(&service, &principal, &session_id, decision_id, action).await?;
+            let receipt = match change {
+                DecisionApprovalChange::Review(approved) => serde_json::to_value(
+                    service
+                        .review_pending_decision_approval(&principal.owner_id, &session_id, decision_id, approved)
+                        .await?,
+                )?,
+                DecisionApprovalChange::Revoke => serde_json::to_value(
+                    service
+                        .revoke_pending_decision_approval(&principal.owner_id, &session_id, decision_id)
+                        .await?,
+                )?,
+            };
+            Ok::<_, anyhow::Error>(receipt)
+        }))
+        .await;
+    match result {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "Decision approval change failed");
+            json_error(
+                StatusCode::CONFLICT,
+                "Decision approval is unavailable, expired, or already resolved",
+            )
+        }
+    }
+}
+
 pub async fn post_session_message(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     request: Request,
 ) -> impl IntoResponse {
+    let Some(api_principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
+        return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
+    };
+    let turn_runtime = state.pin_turn_runtime();
     let headers = request.headers().clone();
     let async_mode = jobs::wants_async(request.uri().query(), &headers);
     let message = match parse_message_from_request(&state, request).await {
@@ -754,6 +1097,309 @@ pub async fn post_session_message(
         Err(error_response) => return error_response,
     };
 
+    submit_console_message(
+        state,
+        session_id,
+        api_principal,
+        turn_runtime,
+        message,
+        async_mode,
+        ConsoleTurnMode::Message,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsoleTurnMode {
+    Message,
+    Resume,
+}
+
+#[cfg_attr(
+    test,
+    expect(
+        clippy::large_enum_variant,
+        reason = "Test-only source variant must not add indirection to production admission"
+    )
+)]
+enum ConsoleTurnSource {
+    #[cfg(test)]
+    Message(crate::gateway::decision_source::GatewayTurnProof),
+    Admitted {
+        mode: ConsoleTurnMode,
+        proof: crate::gateway::decision_source::GatewayTurnProof,
+        guard: crate::gateway::decision_source::GatewayAdmissionGuard,
+    },
+}
+
+struct ConsolePendingInput {
+    state: AppState,
+    runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    principal: super::ApiPrincipal,
+    envelope: RuntimeEnvelope,
+    ticket: crate::runtime::turn_cleanup::CleanupTicket,
+}
+
+impl ConsolePendingInput {
+    async fn record(
+        self,
+        message: String,
+    ) -> anyhow::Result<(
+        crate::gateway::decision_source::GatewayTurnProof,
+        crate::gateway::decision_source::GatewayAdmissionGuard,
+    )> {
+        let run = self
+            .envelope
+            .run_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Console input run is missing"))?;
+        let key = format!("console:{run}:input");
+        let recording = self.runtime.config_generation.effective.memory.event_recording_config();
+        let fabric = MemoryFabric::new(self.state.mem.clone(), self.envelope.workspace_id.clone())
+            .with_event_recording(recording)
+            .with_ingress_recovery(&self.runtime.config_generation.effective, &self.ticket)
+            .await?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut ticket = Some(self.ticket);
+            let mut admission = None;
+            let operation = async {
+                let event = fabric
+                    .record_inbound_user_message(
+                        self.envelope.message_scope(),
+                        message.clone(),
+                        Some(key.clone()),
+                        None,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    event.id <= 0
+                        || (event.idempotency_key.as_deref() == Some(key.as_str())
+                            && event.workspace_id == self.envelope.workspace_id
+                            && event.owner_id.as_deref() == Some(self.principal.owner_id.as_str())),
+                    "Console input identity changed during persistence"
+                );
+                let event_id = if event.id > 0 { event.event_id.as_str() } else { "" };
+                let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                    self.state.mem.as_ref(),
+                    &self.runtime,
+                    &self.principal,
+                    &self.envelope,
+                    &message,
+                    event_id,
+                )
+                .await?;
+                anyhow::ensure!(
+                    event.id <= 0
+                        || proof.envelope().source_message_event_id.as_deref() == Some(event.event_id.as_str()),
+                    "Console durable receipt lost its original input"
+                );
+                admission = Some(crate::gateway::decision_source::GatewayAdmissionGuard::new(
+                    &proof,
+                    fabric.clone(),
+                    ticket
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("Console input cleanup ticket missing"))?,
+                    None,
+                ));
+                if recording.enabled && recording.record_user_messages {
+                    if self.runtime.config_generation.effective.causal_tree.enabled {
+                        self.state.mem.project_console_message(&event).await?;
+                    } else {
+                        self.state
+                            .mem
+                            .append_conversation_turn(
+                                &self.envelope.session_key,
+                                self.envelope.channel.as_deref().unwrap_or("console"),
+                                self.envelope.sender.as_deref().unwrap_or("console-user"),
+                                "user",
+                                &message,
+                                None,
+                                Some(&event.event_id),
+                                Some(&self.envelope.resolved_owner_id()),
+                            )
+                            .await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(proof)
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)
+                .await
+                .map_err(|_| anyhow::anyhow!("Console input persistence timed out"))
+                .and_then(std::convert::identity);
+            let result = match result {
+                Ok(proof) => admission
+                    .take()
+                    .map(|guard| (proof, guard))
+                    .ok_or_else(|| anyhow::anyhow!("Console input owner did not issue a guard")),
+                Err(_error) if fabric.ingress_already_accepted() => {
+                    if let Some(ticket) = ticket.take() {
+                        ticket.finish(true);
+                    }
+                    Err(crate::runtime::ingress_recovery::AlreadyAccepted.into())
+                }
+                Err(error) => {
+                    if admission.is_none() {
+                        let recovery = async {
+                            let event = self
+                                .state
+                                .mem
+                                .find_owned_message_event_by_idempotency_key(
+                                    &self.envelope.workspace_id,
+                                    &self.principal.owner_id,
+                                    &key,
+                                )
+                                .await?
+                                .ok_or_else(|| anyhow::anyhow!("Console input commit is unconfirmed"))?;
+                            anyhow::ensure!(
+                                event.id > 0
+                                    && !event.event_id.is_empty()
+                                    && event.idempotency_key.as_deref() == Some(key.as_str())
+                                    && event.workspace_id == self.envelope.workspace_id
+                                    && event.owner_id.as_deref() == Some(self.principal.owner_id.as_str()),
+                                "Console recovery input identity changed"
+                            );
+                            let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                                self.state.mem.as_ref(),
+                                &self.runtime,
+                                &self.principal,
+                                &self.envelope,
+                                &message,
+                                &event.event_id,
+                            )
+                            .await?;
+                            anyhow::ensure!(
+                                proof.envelope().source_message_event_id.as_deref() == Some(event.event_id.as_str()),
+                                "Console recovery input is not durable"
+                            );
+                            Ok::<_, anyhow::Error>(proof)
+                        };
+                        if let Ok(Ok(proof)) = tokio::time::timeout(std::time::Duration::from_secs(15), recovery).await
+                            && let Some(ticket) = ticket.take()
+                        {
+                            admission = Some(crate::gateway::decision_source::GatewayAdmissionGuard::new(
+                                &proof, fabric, ticket, None,
+                            ));
+                        }
+                    }
+                    if let Some(mut guard) = admission {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            guard.finish_failure(sender.is_closed(), "Console input admission failed"),
+                        )
+                        .await;
+                    } else if let Some(ticket) = ticket {
+                        ticket.finish(false);
+                    }
+                    Err(error)
+                }
+            };
+            // A disconnected HTTP request drops the guard carried by this
+            // response, retaining cleanup ownership even before job launch.
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("Console input owner ended without a receipt"))?
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DecisionResumeRequest {
+    Stored(StoredDecisionResumeRequest),
+    Explicit(ExplicitDecisionResumeRequest),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDecisionResumeRequest {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplicitDecisionResumeRequest {
+    tool: String,
+    arguments: serde_json::Value,
+}
+
+pub(super) async fn post_decision_resume(
+    State(state): State<AppState>,
+    Path((session_id, decision_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
+        return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
+    };
+    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+        Ok(id) => id,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
+    };
+    let runtime = state.pin_turn_runtime();
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    }
+    if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
+        return json_error(StatusCode::FORBIDDEN, message);
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cleanup =
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+            Ok(cleanup) => cleanup,
+            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+        };
+    let authorization = cleanup
+        .run(Box::pin(async {
+            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            authorize_console_decision_control(
+                &service,
+                &principal,
+                &session_id,
+                decision_id,
+                ConsoleDecisionControl::Resume,
+            )
+            .await
+        }))
+        .await;
+    if authorization.is_err() {
+        return json_error(StatusCode::CONFLICT, "Decision resume is unavailable or not permitted");
+    }
+    let async_mode = jobs::wants_async(request.uri().query(), request.headers());
+    let Json(body) = match Json::<DecisionResumeRequest>::from_request(request, &state).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let message = match body {
+        DecisionResumeRequest::Stored(_) => serde_json::json!({
+            "decision_id": decision_id.to_string(),
+        }),
+        DecisionResumeRequest::Explicit(body) => serde_json::json!({
+            "decision_id": decision_id.to_string(),
+            "tool": body.tool,
+            "arguments": body.arguments,
+        }),
+    }
+    .to_string();
+    submit_console_message(
+        state,
+        session_id,
+        principal,
+        runtime,
+        message,
+        async_mode,
+        ConsoleTurnMode::Resume,
+    )
+    .await
+}
+
+async fn submit_console_message(
+    state: AppState,
+    session_id: String,
+    api_principal: super::ApiPrincipal,
+    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    message: String,
+    async_mode: bool,
+    mode: ConsoleTurnMode,
+) -> Response {
     let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
         Ok(session) => session,
         Err(error) => {
@@ -771,12 +1417,33 @@ pub async fn post_session_message(
         )
             .into_response();
     };
-    let runtime_envelope = console_runtime_envelope(&state, &session_id, &session.channel, &session.sender);
+    let runtime_envelope = console_runtime_envelope_for_workspace(
+        turn_runtime
+            .config_generation
+            .effective
+            .workspace_dir
+            .to_string_lossy()
+            .to_string(),
+        &session_id,
+        &session.channel,
+        &session.sender,
+    )
+    .with_owner_id(api_principal.owner_id.clone())
+    .with_owner_isolation()
+    .with_run_id(uuid::Uuid::new_v4().to_string())
+    .with_config_generation(&turn_runtime.config_generation);
 
-    let principal = runtime_envelope.memory_principal();
+    if let Err(error) = recover_console_history(&state, &turn_runtime, &api_principal, &session_id).await {
+        tracing::error!(error = %error, "Console history recovery failed");
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Console history recovery is incomplete",
+        );
+    }
+    let principal = operator_history_principal(&api_principal, &runtime_envelope);
     let turns = match state
         .mem
-        .list_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)
+        .list_console_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)
         .await
     {
         Ok(turns) => turns,
@@ -796,17 +1463,43 @@ pub async fn post_session_message(
         return error.into_response();
     }
 
-    let user_message_event_id = match append_console_turn(&state, &runtime_envelope, "user", &message, true).await {
-        Ok(event_id) => event_id,
-        Err(error) => {
-            tracing::error!("Failed to persist user session turn: {error}");
-            return (
+    let input_cancellation = tokio_util::sync::CancellationToken::new();
+    let ticket = match turn_runtime.decision_slot.cleanup.register(input_cancellation) {
+        Ok(ticket) => ticket,
+        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Console input admission is closed"),
+    };
+    let pending = ConsolePendingInput {
+        state: state.clone(),
+        runtime: std::sync::Arc::clone(&turn_runtime),
+        principal: api_principal,
+        envelope: runtime_envelope,
+        ticket,
+    };
+    let (proof, mut guard) = match pending.record(message.clone()).await {
+        Ok(admission) => admission,
+        Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "Input already accepted; execution was not repeated and outcome remains unconfirmed",
+            );
+        }
+        Err(_) => {
+            return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to persist session message" })),
-            )
-                .into_response();
+                "Console input persistence is unconfirmed",
+            );
         }
     };
+    // Establish monitor ownership synchronously, before constructing work that
+    // cancellation or registry abortion can drop without ever polling.
+    let (cleanup_sender, cleanup_receiver) = tokio::sync::oneshot::channel();
+    if guard.attach_acknowledgement(cleanup_sender).is_err() {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Console input cleanup ownership is unconfirmed",
+        );
+    }
+    let source = ConsoleTurnSource::Admitted { mode, proof, guard };
 
     // Everything up to here is bounded bookkeeping. What follows is the agent
     // turn itself, which has no upper bound — tool chains, sub-agents, and
@@ -816,10 +1509,11 @@ pub async fn post_session_message(
     // turn mid-flight, after its side effects had already begun. It therefore
     // runs as a detached job: visible in `prx tasks list`, killable by id, and
     // still there when the client comes back.
-    let job = jobs::submit(
+    let job = jobs::submit_with_cleanup(
         jobs::KIND_SESSION_MESSAGE,
         format!("gateway:session_message:{session_id}"),
-        run_console_message_job(state, runtime_envelope, message, turns, user_message_event_id),
+        run_console_message_job(turn_runtime, state, message, turns, source),
+        Some(cleanup_receiver),
     );
 
     if async_mode {
@@ -833,80 +1527,439 @@ pub async fn post_session_message(
 /// Returns the exact `(status, body)` the synchronous handler used to produce,
 /// so waiting clients see no contract change and polling clients see the same
 /// payload under `result`.
-async fn run_console_message_job(
+fn run_console_message_job(
+    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
     state: AppState,
-    runtime_envelope: RuntimeEnvelope,
     message: String,
     turns: Vec<crate::memory::ConversationTurn>,
-    user_message_event_id: String,
+    source: ConsoleTurnSource,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<jobs::JobOutput, String>> + Send>> {
+    // Keep the owned Console work out of the generic job submitter's stack.
+    // Construction does not poll it; the same input guard retains its sender.
+    Box::pin(run_console_message_job_work(
+        turn_runtime,
+        state,
+        message,
+        turns,
+        source,
+    ))
+}
+
+async fn run_console_message_job_work(
+    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    state: AppState,
+    message: String,
+    turns: Vec<crate::memory::ConversationTurn>,
+    source: ConsoleTurnSource,
 ) -> Result<jobs::JobOutput, String> {
-    let turn =
-        match run_console_runtime_turn(&state, &runtime_envelope, &message, turns, Some(user_message_event_id)).await {
-            Ok(turn) => turn,
-            Err(error) => return Err(crate::providers::sanitize_api_error(&error.to_string())),
-        };
-    let reply = turn.reply.clone();
-
-    if let Err((status, body)) =
-        super::authorize_resource_mutation(&state, "gateway_api:sessions:assistant_message", ResourceRiskLevel::Low)
-    {
-        return Ok(jobs::JobOutput::new(status, body.0));
-    }
-
-    let provider_outcome =
-        crate::agent::terminal::provider_outcome_from_trace(&turn.route_decision, turn.provider_started_at, turn.trace);
-    let terminal_id = turn
-        .envelope
-        .run_id
-        .clone()
-        .unwrap_or_else(|| provider_outcome.decision_id.clone());
-    let terminal_fabric = MemoryFabric::new(state.mem.clone(), turn.envelope.workspace_id.clone());
-    let (cost_config, workspace_dir) = {
-        let config = state.config.load();
-        (config.cost.clone(), config.workspace_dir.clone())
+    let (mode, source_proof, input_guard) = match source {
+        #[cfg(test)]
+        ConsoleTurnSource::Message(proof) => (ConsoleTurnMode::Message, proof, None),
+        ConsoleTurnSource::Admitted { mode, proof, guard } => (mode, proof, Some(guard)),
     };
-    let terminal_committed = match crate::agent::terminal::finalize_turn(
-        &terminal_fabric,
-        crate::agent::terminal::TurnTerminalCommit {
-            terminal_id,
-            scope: turn.envelope.message_scope(),
-            status: crate::agent::terminal::TurnTerminalStatus::Completed,
-            history: Some(crate::agent::terminal::TurnHistoryProjection {
-                assistant_content: reply.clone(),
-                history_commit_len: turn.history_commit_len,
-            }),
-            history_scope: None,
-            provider_outcome: Some(provider_outcome),
-            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                summary: "console turn completed".to_string(),
-                started_at: turn.provider_started_at,
-                finished_at: chrono::Utc::now(),
-            },
-            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-        },
-        &cost_config,
-        &workspace_dir,
-    )
-    .await
-    {
-        Ok(_) => true,
-        Err(error) => {
-            tracing::warn!(error = %error, "Failed to commit shared console terminal event");
-            false
+    let runtime_envelope = source_proof.envelope().clone();
+    let cancellation =
+        jobs::current_cancellation().map_or_else(tokio_util::sync::CancellationToken::new, |token| token.child_token());
+    let _cancel_guard = cancellation.clone().drop_guard();
+    let config = &turn_runtime.config_generation.effective;
+    let cleanup_ticket = turn_runtime
+        .decision_slot
+        .cleanup
+        .register(cancellation.clone())
+        .map_err(|_| "Console turn admission is closed".to_owned())?;
+    // Register the job's cancellation/acknowledgement owner before releasing
+    // the HTTP input ticket. This transfer has no await or unowned interval.
+    let inherited_fabric = input_guard.as_ref().map(|guard| guard.ingress_fabric());
+    let admission_acknowledgement = if let Some(input_guard) = input_guard {
+        let (input_ticket, acknowledgement) = input_guard
+            .into_terminal_parts()
+            .map_err(|_| "Console input ownership transfer failed".to_owned())?;
+        input_ticket.finish(true);
+        acknowledgement
+    } else {
+        jobs::register_terminal_cleanup()
+    };
+    let admission_fabric = inherited_fabric.unwrap_or_else(|| {
+        MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
+            .with_event_recording(config.memory.event_recording_config())
+    });
+    let mut admission_guard = crate::gateway::decision_source::GatewayAdmissionGuard::new(
+        &source_proof,
+        admission_fabric,
+        cleanup_ticket,
+        admission_acknowledgement,
+    );
+    // Prediction transport accounting and later work retain the same owner.
+    // Register its monitor acknowledgement before the first admission await.
+    let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
+        Some(&turn_runtime.decision_slot.cleanup),
+        cancellation.child_token(),
+    ) {
+        Ok(scope) => scope.with_acknowledgement(jobs::register_terminal_cleanup()),
+        Err(_) => {
+            let error = "Console child cleanup admission is closed";
+            admission_guard
+                .finish_failure(cancellation.is_cancelled(), error)
+                .await
+                .map_err(|_| "Console admission failure persistence is unconfirmed".to_owned())?;
+            return Err(error.to_owned());
         }
     };
+    let decision = {
+        let proof = &source_proof;
+        let admission = child_cleanup
+            .scope_admission(Box::pin(async {
+                let admitted: Result<_, String> = async {
+                    proof
+                        .verify_runtime_input(&turn_runtime, &message)
+                        .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
+                    let service = turn_runtime
+                        .decision_slot
+                        .publish(&turn_runtime, &state)
+                        .await
+                        .map_err(|_| "Console decision publication failed".to_owned())?;
+                    let kind = crate::runtime::turn_decision::AgentTurnKind::SingleShot;
+                    let context = match mode {
+                        ConsoleTurnMode::Message => service.decide_agent_initial(proof, kind, &cancellation).await,
+                        ConsoleTurnMode::Resume => service.decide_agent_resume(proof, kind, &cancellation).await,
+                    }
+                    .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
+                    Ok::<_, String>((service, context))
+                }
+                .await;
+                admitted.map_err(anyhow::Error::msg)
+            }))
+            .await;
+        let (service, context) = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // No future is still polling admission. Close/drain its owned
+                // attempts before acknowledging the failed input terminal.
+                let admission_error = crate::providers::sanitize_api_error(&format!("{error:#}"));
+                let drained = child_cleanup.run(Box::pin(async { Err::<(), _>(error) })).await;
+                let error = match drained {
+                    Err(error) if error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>() => format!(
+                        "{admission_error}; Console admission cleanup is unconfirmed: {}",
+                        crate::providers::sanitize_api_error(&format!("{error:#}")),
+                    ),
+                    _ => admission_error,
+                };
+                if admission_guard
+                    .finish_failure(cancellation.is_cancelled(), &error)
+                    .await
+                    .is_err()
+                {
+                    return Err(format!("{error}; Console admission failure persistence is unconfirmed"));
+                }
+                return Err(error);
+            }
+        };
+        let provider_trace = if context.approval_collection_proof().is_some() {
+            Some((
+                std::sync::Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default()),
+                std::sync::Arc::new(
+                    console_route_decision(&turn_runtime, &runtime_envelope, &message)
+                        .map_err(|error| error.to_string())?,
+                ),
+            ))
+        } else {
+            None
+        };
+        ConsoleDecisionTurn {
+            service: std::sync::Arc::clone(service),
+            provider_trace,
+            context,
+            proof,
+            cancellation: cancellation.clone(),
+        }
+    };
+    let (cleanup_ticket, admission_acknowledgement) = admission_guard
+        .into_terminal_parts()
+        .map_err(|error| error.to_string())?;
+    let terminal_guard = crate::gateway::decision_runtime::GatewayTerminalGuard::new(
+        cleanup_ticket,
+        std::sync::Arc::clone(&decision.service),
+        std::sync::Arc::clone(&decision.context),
+        MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone()),
+        std::sync::Arc::clone(config),
+        runtime_envelope.clone(),
+        admission_acknowledgement,
+    )
+    .map_err(|error| error.to_string())?;
+    let terminal_guard = if let Some((trace, route)) = &decision.provider_trace {
+        terminal_guard.with_provider_trace(std::sync::Arc::clone(trace), route.as_ref().clone())
+    } else {
+        terminal_guard
+    };
+    let work = async {
+        match decision.context.disposition().map_err(|error| error.to_string())? {
+            crate::runtime::turn_decision::TurnDisposition::Close { reply } => {
+                let ports = crate::gateway::decision_runtime::GatewayDecisionClose {
+                    resource: "gateway_api:sessions:assistant_message",
+                    history_commit_len: turns.len() + 2,
+                    terminal_guard: &terminal_guard,
+                    service: &decision.service,
+                    config,
+                    envelope: &runtime_envelope,
+                    started_at: chrono::Utc::now(),
+                };
+                decision
+                    .service
+                    .close_agent_directive_turn(
+                        decision.proof,
+                        std::sync::Arc::clone(&decision.context),
+                        &ports,
+                        &cancellation,
+                    )
+                    .await
+                    .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
+                if !config.causal_tree.enabled {
+                    append_console_turn(&state, &runtime_envelope, "assistant", &reply, false, false)
+                        .await
+                        .map_err(|_| "Failed to persist assistant response".to_owned())?;
+                }
+                // Enabled terminal rejoin already projected the transcript.
+                return Ok(jobs::JobOutput::new(
+                    StatusCode::OK,
+                    serde_json::json!({ "status": "ok", "reply": reply }),
+                ));
+            }
+            crate::runtime::turn_decision::TurnDisposition::Run => {}
+            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments => {
+                if mode != ConsoleTurnMode::Message || decision.provider_trace.is_none() {
+                    return Err("Console collection requires the owning main-turn trace".to_owned());
+                }
+            }
+        }
+        if mode == ConsoleTurnMode::Resume {
+            crate::gateway::authorize_gateway_config_resource_mutation(
+                config,
+                "gateway_api:sessions:assistant_message",
+                ResourceRiskLevel::Low,
+            )
+            .map_err(|_| "Console resume history authorization denied".to_owned())?;
+            return run_console_resume(&decision, &terminal_guard, turns.len() + 2, &cancellation)
+                .await
+                .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()));
+        }
+        let turn = match run_console_runtime_turn(
+            std::sync::Arc::clone(&turn_runtime),
+            &state,
+            &message,
+            turns,
+            &decision,
+        )
+        .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                // A stable HTTP error response still represents a failed turn.
+                // Finalize it before returning a successful job transport result.
+                {
+                    terminal_guard
+                        .finish_failure(&error, cancellation.is_cancelled())
+                        .await
+                        .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+                }
+                if let Some(tools) = crate::providers::tool_schema_refused_tools(&error) {
+                    // A configuration problem, not a failed job: the caller
+                    // gets a stable code with every refused tool, and the log
+                    // keeps the whole refusal, unclipped.
+                    tracing::error!(
+                        error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                        "Console turn refused before transport: the provider cannot accept some offered tool schemas"
+                    );
+                    return Ok(jobs::JobOutput::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({
+                            "error": "tool_schema_refused",
+                            "tools": tools,
+                            "message": "The configured provider cannot accept some of the tool schemas this turn \
+                                        offered, so nothing was sent. The gateway log names the configuration \
+                                        to change.",
+                        }),
+                    ));
+                }
+                return Err(crate::providers::sanitize_api_error(&error.to_string()));
+            }
+        };
+        let reply = turn.reply.clone();
 
-    if let Err(error) = append_console_turn(&state, &turn.envelope, "assistant", &reply, !terminal_committed).await {
-        tracing::error!("Failed to persist assistant session turn: {error}");
-        return Err("Failed to persist assistant response".to_string());
+        if let Err((status, body)) = crate::gateway::authorize_gateway_config_resource_mutation(
+            config,
+            "gateway_api:sessions:assistant_message",
+            ResourceRiskLevel::Low,
+        ) {
+            {
+                terminal_guard
+                    .finish_error(&anyhow::anyhow!("Console assistant persistence authorization denied"))
+                    .await
+                    .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+            }
+            return Ok(jobs::JobOutput::new(status, body.0));
+        }
+
+        let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
+            &turn.route_decision,
+            turn.provider_started_at,
+            turn.trace,
+        );
+        let terminal_id = turn
+            .envelope
+            .run_id
+            .clone()
+            .ok_or_else(|| "Console admitted run missing".to_owned())?;
+        let terminal_fabric = MemoryFabric::new(state.mem.clone(), turn.envelope.workspace_id.clone());
+        let config = &turn_runtime.config_generation.effective;
+        let settlement = decision
+            .service
+            .terminal_settlement_ref(std::sync::Arc::clone(&decision.context))
+            .map_err(|error| error.to_string())?;
+        match crate::gateway::decision_runtime::commit_terminal(
+            Some(&terminal_guard),
+            &terminal_fabric,
+            crate::agent::terminal::TurnTerminalDraft {
+                decision: Some(settlement),
+                terminal_id,
+                scope: turn.envelope.message_scope(),
+                status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                history: Some(crate::agent::terminal::TurnHistoryProjection {
+                    assistant_content: reply.clone(),
+                    history_commit_len: turn.history_commit_len,
+                }),
+                history_scope: None,
+                provider_outcome: Some(provider_outcome),
+                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                    summary: if turn.awaiting_approval {
+                        "console turn awaiting human approval"
+                    } else {
+                        "console turn completed"
+                    }
+                    .to_string(),
+                    started_at: turn.provider_started_at,
+                    finished_at: chrono::Utc::now(),
+                },
+                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+            },
+            config,
+        )
+        .await
+        {
+            Ok(_) => (),
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to commit shared console terminal event");
+                return Err("Console terminal persistence is unconfirmed".to_owned());
+            }
+        };
+
+        if !config.causal_tree.enabled {
+            if let Err(error) = append_console_turn(&state, &turn.envelope, "assistant", &reply, false, false).await {
+                tracing::error!("Failed to persist assistant session turn: {error}");
+                return Err("Failed to persist assistant response".to_string());
+            }
+        }
+
+        let body = if turn.awaiting_approval {
+            serde_json::json!({
+                "status": "awaiting_approval",
+                "reply": reply,
+                "decision_id": decision.context.decision_id().to_string(),
+            })
+        } else {
+            serde_json::to_value(SendMessageResponse {
+                status: "ok".to_string(),
+                reply,
+            })
+            .map_err(|error| format!("Failed to encode session reply: {error}"))?
+        };
+        Ok(jobs::JobOutput::new(StatusCode::OK, body))
+    };
+    let result = child_cleanup
+        .run(Box::pin(async {
+            let result: Result<jobs::JobOutput, String> = work.await;
+            result.map_err(anyhow::Error::msg)
+        }))
+        .await
+        .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()));
+    if let Err(error) = &result {
+        terminal_guard
+            .finish_failure(&anyhow::anyhow!(error.clone()), cancellation.is_cancelled())
+            .await
+            .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
     }
+    result
+}
 
-    let body = serde_json::to_value(SendMessageResponse {
-        status: "ok".to_string(),
-        reply,
-    })
-    .map_err(|error| format!("Failed to encode session reply: {error}"))?;
-    Ok(jobs::JobOutput::new(StatusCode::OK, body))
+async fn run_console_resume(
+    decision: &ConsoleDecisionTurn<'_>,
+    guard: &crate::gateway::decision_runtime::GatewayTerminalGuard,
+    history_commit_len: usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<jobs::JobOutput> {
+    use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
+    use crate::tools::ToolExecutionStatus;
+    let envelope = decision.proof.envelope();
+    let started_at = Utc::now();
+    let outcome = decision
+        .service
+        .execute_agent_resume(
+            decision.proof,
+            &decision.context,
+            &crate::tools::ToolExecutionContext::new(envelope.clone(), "private").with_chat_id(&envelope.session_key),
+            cancellation,
+        )
+        .await?;
+    let (status, reply) = match outcome.status {
+        ToolExecutionStatus::Succeeded => (
+            TurnTerminalStatus::Completed,
+            crate::security::redaction::redact_secrets(&outcome.model_content),
+        ),
+        ToolExecutionStatus::Cancelled => (
+            TurnTerminalStatus::Cancelled,
+            "Approved operation was cancelled.".to_owned(),
+        ),
+        _ => (
+            TurnTerminalStatus::Failed,
+            "Approved operation could not be completed.".to_owned(),
+        ),
+    };
+    guard
+        .commit(TurnTerminalDraft {
+            decision: Some(
+                decision
+                    .service
+                    .settlement_ref(std::sync::Arc::clone(&decision.context))?,
+            ),
+            terminal_id: envelope
+                .run_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Resume run missing"))?,
+            scope: envelope.message_scope(),
+            status,
+            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: reply.clone(),
+                history_commit_len,
+            }),
+            history_scope: None,
+            // The approved call runs directly. Decision-stage model usage is
+            // already recorded by that stage; no provider turn is fabricated.
+            provider_outcome: None,
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: "console approved operation finished".to_owned(),
+                started_at,
+                finished_at: Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+        })
+        .await?;
+    Ok(jobs::JobOutput::new(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": if status == TurnTerminalStatus::Completed { "ok" } else { "failed" },
+            "execution_status": outcome.status,
+            "reply": reply,
+        }),
+    ))
 }
 
 pub async fn get_session_media(
@@ -973,6 +2026,7 @@ pub async fn get_session_media(
 
 #[cfg(test)]
 mod tests {
+    mod collection;
     use super::*;
     use crate::config::Config;
     use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
@@ -1142,7 +2196,10 @@ mod tests {
         fn rollback(&mut self) {}
     }
 
-    fn test_app_state(config: Config, provider: Arc<dyn Provider>) -> AppState {
+    fn test_app_state(mut config: Config, provider: Arc<dyn Provider>) -> AppState {
+        config.default_provider.get_or_insert_with(|| "ollama".to_owned());
+        config.default_model.get_or_insert_with(|| "test-model".to_owned());
+        config.causal_tree.enabled = false;
         static PARTICIPANT: std::sync::OnceLock<Arc<dyn crate::config::ConfigGenerationParticipant>> =
             std::sync::OnceLock::new();
         let config = crate::config::new_shared(config);
@@ -1180,18 +2237,76 @@ mod tests {
         }
     }
 
+    async fn console_test_source(
+        state: &mut AppState,
+        envelope: RuntimeEnvelope,
+        input: &str,
+    ) -> (
+        Arc<crate::gateway::TurnRuntimeGeneration>,
+        RuntimeEnvelope,
+        String,
+        crate::gateway::decision_source::GatewayTurnProof,
+    ) {
+        if state.mem.name() == "test" {
+            state.mem =
+                Arc::new(crate::memory::SqliteMemory::new(&state.config.pin().effective.workspace_dir).unwrap());
+        }
+        let mut runtime = state.pin_turn_runtime();
+        let config = &runtime.config_generation.effective;
+        let provider_name = config.default_provider.as_deref().unwrap();
+        let catalog = crate::providers::selection::catalog_for(config);
+        let resolved = crate::providers::selection::check_with(
+            config,
+            &catalog,
+            provider_name,
+            &runtime.model,
+            crate::providers::selection::credential_for(config, provider_name),
+            &crate::providers::catalog::Requirement::chat(),
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .unwrap();
+        let binding = crate::gateway::decision_source::GatewayProviderBinding::new(runtime.provider.clone(), resolved);
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let mutable = Arc::get_mut(&mut runtime).unwrap();
+        mutable.provider_binding = Some(Arc::new(binding));
+        mutable.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(security, 0));
+        let principal = super::super::ApiPrincipal::of_token("prx-test-token");
+        let envelope = envelope
+            .with_run_id(uuid::Uuid::new_v4().to_string())
+            .with_config_generation(&runtime.config_generation)
+            .with_owner_id(principal.owner_id.clone())
+            .with_owner_isolation();
+        let event_id = append_console_turn(state, &envelope, "user", input, true, false)
+            .await
+            .unwrap();
+        let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+            state.mem.as_ref(),
+            &runtime,
+            &principal,
+            &envelope,
+            input,
+            &event_id,
+        )
+        .await
+        .unwrap();
+        (runtime, proof.envelope().clone(), event_id, proof)
+    }
+
     #[tokio::test]
     async fn console_runtime_turn_uses_shared_tool_loop_history() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
         let provider_impl = Arc::new(CapturingProvider::default());
-        let state = test_app_state(config, provider_impl.clone());
+        let mut state = test_app_state(config, provider_impl.clone());
         let envelope = console_runtime_envelope_for_workspace(
             tmp.path().to_string_lossy().to_string(),
             "console-session",
             "console",
-            "alice",
+            "prx_user",
         );
         let previous_turns = vec![ConversationTurn {
             id: 1,
@@ -1202,16 +2317,46 @@ mod tests {
             message_id: Some("previous-event".to_string()),
         }];
 
-        let turn = run_console_runtime_turn(
-            &state,
-            &envelope,
-            "current question",
-            previous_turns,
-            Some("user-event".into()),
-        )
-        .await
-        .unwrap();
+        let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "current question").await;
+        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = service
+            .decide_agent_initial(
+                &proof,
+                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let decision = ConsoleDecisionTurn {
+            service: service.clone(),
+            context,
+            proof: &proof,
+            cancellation,
+            provider_trace: None,
+        };
+        assert!(
+            run_console_runtime_turn(
+                runtime.clone(),
+                &state,
+                "different unadmitted input",
+                Vec::new(),
+                &decision,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            provider_impl.requests.lock().is_empty(),
+            "source mismatch must fail before provider transport"
+        );
+        let turn = run_console_runtime_turn(runtime, &state, "current question", previous_turns, &decision)
+            .await
+            .unwrap();
 
+        service
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .await;
         assert_eq!(turn.reply, "console-runtime-ok");
         let requests = provider_impl.requests.lock();
         assert_eq!(requests.len(), 1);
@@ -1224,6 +2369,407 @@ mod tests {
         );
         assert_eq!(history.last().map(|m| m.role.as_str()), Some("user"));
         assert!(history.last().is_some_and(|m| m.content.contains("current question")));
+    }
+
+    // ── R5 / OQ-23: the Console turn budgets on the model's effective window ──
+
+    const CONSOLE_BULKY_TOOL: &str = "console_bulky_probe";
+    const CONSOLE_BULKY_MARKER: &str = "CONSOLE-BULKY";
+    const CONSOLE_WINDOW_MODEL: &str = "narrow-window-model";
+    const CONSOLE_WINDOW_PROVIDER: &str = "ollama";
+    const CONSOLE_ROUTER_WINDOW: usize = 6_000;
+
+    /// A read-only tool whose output overruns a 6,000-token window but fits the
+    /// 128,000-token base window and the unbudgeted inline cap.
+    struct ConsoleBulkyTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for ConsoleBulkyTool {
+        fn name(&self) -> &str {
+            CONSOLE_BULKY_TOOL
+        }
+
+        fn description(&self) -> &str {
+            "Return a large diagnostic payload."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            use std::fmt::Write as _;
+            let mut output = String::with_capacity(40_000);
+            let mut index = 0usize;
+            while output.len() < 40_000 {
+                let _ = write!(output, "{CONSOLE_BULKY_MARKER}-{index} ");
+                index += 1;
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output,
+                error: None,
+            })
+        }
+    }
+
+    /// Native-tool spy: asks for the bulky tool on its first call, answers in
+    /// text afterwards, and records every request it serves.
+    #[derive(Default)]
+    struct ToolRoundSpyProvider {
+        requests: parking_lot::Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ToolRoundSpyProvider {
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("summary".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let call_index = {
+                let mut requests = self.requests.lock();
+                requests.push(request.messages.to_vec());
+                requests.len()
+            };
+            let tool_calls = if call_index == 1 {
+                vec![crate::providers::ToolCall {
+                    id: "call-console-bulky-1".into(),
+                    name: CONSOLE_BULKY_TOOL.into(),
+                    arguments: "{}".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(ChatResponse {
+                text: tool_calls.is_empty().then(|| "done".to_string()),
+                tool_calls,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Base config: the default 128,000-token window (not set explicitly), and
+    /// a `[[router.models]]` entry that gives the served model a 6,000-token
+    /// window. Only the effective resolution sees the router entry.
+    fn narrow_router_window_config(workspace: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.default_provider = Some(CONSOLE_WINDOW_PROVIDER.to_string());
+        config.default_model = Some(CONSOLE_WINDOW_MODEL.to_string());
+        config.agent.compaction = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        config.router.models = vec![crate::config::RouterModelConfig {
+            model_id: CONSOLE_WINDOW_MODEL.to_string(),
+            provider: CONSOLE_WINDOW_PROVIDER.to_string(),
+            cost_per_million_tokens: 1.0,
+            max_context: CONSOLE_ROUTER_WINDOW,
+            reserved_output_tokens: Some(256),
+            latency_ms: 1_000,
+            categories: vec!["conversation".to_string()],
+            elo_rating: 1_000.0,
+        }];
+        config.tool_tiering.always_include = vec![CONSOLE_BULKY_TOOL.to_string()];
+        config
+    }
+
+    /// A Console turn budgets on the served model's effective window, the one
+    /// the CLI, TUI and webhook budget on (OQ-23 / R5).
+    ///
+    /// The base config keeps the 128,000-token default, so a turn budgeted on
+    /// the base window forwards the whole 40,000-character tool payload to the
+    /// follow-up request. The router entry gives the served model a
+    /// 6,000-token window; budgeted on that, the follow-up must fit it.
+    ///
+    /// MUTATION GUARD: pass `Some(&config_snapshot.agent.compaction)` to the
+    /// loop again and the follow-up request carries the whole payload.
+    #[tokio::test]
+    async fn console_turn_budgets_on_the_served_models_effective_window() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let config = narrow_router_window_config(tmp.path());
+        let provider_impl = Arc::new(ToolRoundSpyProvider::default());
+        let mut state = test_app_state(config, provider_impl.clone());
+        state.model = CONSOLE_WINDOW_MODEL.into();
+        state.tools_registry = Arc::new(vec![Box::new(ConsoleBulkyTool)]);
+        let envelope = console_runtime_envelope_for_workspace(
+            tmp.path().to_string_lossy().to_string(),
+            "console-window-session",
+            "console",
+            "prx_user",
+        );
+
+        let (runtime, _, _, proof) =
+            console_test_source(&mut state, envelope, "summarise the console bulky probe").await;
+        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = service
+            .decide_agent_initial(
+                &proof,
+                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let decision = ConsoleDecisionTurn {
+            service: service.clone(),
+            context,
+            proof: &proof,
+            cancellation,
+            provider_trace: None,
+        };
+        let turn = run_console_runtime_turn(
+            runtime,
+            &state,
+            "summarise the console bulky probe",
+            Vec::new(),
+            &decision,
+        )
+        .await
+        .expect("test: console turn completes");
+        service
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(turn.reply, "done");
+
+        let requests = provider_impl.requests.lock().clone();
+        assert_eq!(requests.len(), 2, "one tool round, then the answer");
+        let follow_up = requests.get(1).expect("test: the follow-up request was recorded");
+        let payload_occurrences: usize = follow_up
+            .iter()
+            .map(|message| message.content.matches(CONSOLE_BULKY_MARKER).count())
+            .sum();
+        assert!(
+            payload_occurrences < 500,
+            "the follow-up request must be budgeted on the model's {CONSOLE_ROUTER_WINDOW}-token window, \
+             not the 128,000-token base window; found {payload_occurrences} payload segments"
+        );
+        let follow_up_chars: usize = follow_up.iter().map(|message| message.content.chars().count()).sum();
+        assert!(
+            follow_up_chars < CONSOLE_ROUTER_WINDOW * 4,
+            "the follow-up request must fit the effective window; it has {follow_up_chars} characters"
+        );
+        assert!(
+            follow_up
+                .iter()
+                .any(|message| message.role == "user" && message.content.contains("summarise the console bulky probe")),
+            "the turn's own request must survive the budget (D-011)"
+        );
+    }
+
+    /// C2b-2: the console session API returns a tool-schema refusal as a
+    /// stable code with every refused tool. Before, the job failed with the
+    /// aggregate clipped to 200 characters, which cut the tool list.
+    #[tokio::test]
+    async fn a_console_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let mut state = test_app_state(
+            config,
+            Arc::new(crate::providers::tool_schema_refusal_tests::RefusingProvider),
+        );
+        let envelope = console_runtime_envelope_for_workspace(
+            tmp.path().to_string_lossy().to_string(),
+            "console-session",
+            "console",
+            "prx_user",
+        );
+
+        let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "hello").await;
+        let output = match run_console_message_job(
+            runtime,
+            state,
+            "hello".to_string(),
+            Vec::new(),
+            ConsoleTurnSource::Message(proof),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(message) => panic!("the refusal must be answered with a stable code, not a failed job: {message}"),
+        };
+        assert_eq!(output.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            output.body.get("error"),
+            Some(&serde_json::json!("tool_schema_refused")),
+            "{}",
+            output.body
+        );
+        assert_eq!(
+            output.body.get("tools"),
+            Some(&serde_json::json!(["fixture_conditional", "fixture_alternatives"])),
+            "{}",
+            output.body
+        );
+    }
+
+    // ── D-053 / REDACT-TURN: console turns persist no provider secret ──
+
+    /// Answers every structured chat with a reply that echoes a secret.
+    struct SecretReplyProvider;
+
+    #[async_trait]
+    impl Provider for SecretReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("console runtime should use structured Provider::chat");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let secret = crate::agent::terminal::persistence_probe::PROBE_SECRET;
+            Ok(ChatResponse {
+                text: Some(format!("Here is the key {secret} you asked for")),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Fails every structured chat with an error that echoes a secret.
+    struct SecretErrorProvider;
+
+    #[async_trait]
+    impl Provider for SecretErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("console runtime should use structured Provider::chat");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let secret = crate::agent::terminal::persistence_probe::PROBE_SECRET;
+            anyhow::bail!("upstream rejected key {secret}");
+        }
+    }
+
+    /// A console state whose memory is a real SQLite store and whose
+    /// workspace (cost ledger, skills) is the same tempdir, so everything the
+    /// turn persists lands under `tmp`. The user turn is recorded first, as
+    /// `post_session_message` does, and its event id returned.
+    async fn console_probe_state(
+        tmp: &tempfile::TempDir,
+        provider: Arc<dyn Provider>,
+        session_id: &str,
+    ) -> (
+        AppState,
+        Arc<crate::gateway::TurnRuntimeGeneration>,
+        RuntimeEnvelope,
+        String,
+        crate::gateway::decision_source::GatewayTurnProof,
+    ) {
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let mut state = test_app_state(config, provider);
+        state.mem = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let envelope = console_runtime_envelope_for_workspace(
+            tmp.path().to_string_lossy().to_string(),
+            session_id,
+            "console",
+            "prx_user",
+        );
+        let (runtime, envelope, event_id, proof) = console_test_source(&mut state, envelope, "what is my key?").await;
+        (state, runtime, envelope, event_id, proof)
+    }
+
+    /// D-053 / REDACT-TURN probe: drives `run_console_message_job` through the
+    /// completed `finalize_turn` commit and the assistant `append_console_turn`
+    /// with a reply that echoes a secret; it must fail before the REDACT-TURN commits.
+    #[tokio::test]
+    async fn console_persists_no_secret_from_a_reply() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let session_id = "console-probe-reply";
+        let (state, runtime, envelope, _, proof) =
+            console_probe_state(&tmp, Arc::new(SecretReplyProvider), session_id).await;
+        let mem = Arc::clone(&state.mem);
+        let principal = envelope.memory_principal();
+
+        let output = run_console_message_job(
+            runtime,
+            state,
+            "what is my key?".to_string(),
+            Vec::new(),
+            ConsoleTurnSource::Message(proof),
+        )
+        .await
+        .expect("test: the console turn completes");
+        assert_eq!(output.status, axum::http::StatusCode::OK, "{}", output.body);
+
+        let turns = mem
+            .list_conversation_turns(&principal, session_id, 50, 0)
+            .await
+            .expect("test: list the console turns");
+        assert!(
+            turns
+                .iter()
+                .any(|turn| turn.role == "assistant" && turn.content.contains("[REDACTED]")),
+            "the reply must be persisted as a redacted assistant turn: {turns:?}"
+        );
+
+        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
+    }
+
+    /// D-053 / REDACT-TURN probe: drives `run_console_message_job` into the
+    /// failed `finalize_turn` commit of `run_console_runtime_turn` with a provider
+    /// error that echoes a secret; it must fail before the REDACT-TURN commits.
+    #[tokio::test]
+    async fn console_persists_no_secret_from_a_provider_error() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let (state, runtime, _, _, proof) =
+            console_probe_state(&tmp, Arc::new(SecretErrorProvider), "console-probe-error").await;
+
+        let result = run_console_message_job(
+            runtime,
+            state,
+            "what is my key?".to_string(),
+            Vec::new(),
+            ConsoleTurnSource::Message(proof),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the provider failure must fail the console job, not answer it"
+        );
+
+        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
     }
 
     /// Gateway authorization reads the active ConfigGeneration, so a config
@@ -1316,6 +2862,8 @@ mod tests {
         // POST a delta that does NOT touch default_temperature.
         let resp = post_config(
             axum::extract::State(state.clone()),
+            axum::extract::Query(crate::gateway::api::config::ConfigWriteQuery::default()),
+            axum::http::HeaderMap::new(),
             axum::Json(serde_json::json!({ "auto_save": true })),
         )
         .await;

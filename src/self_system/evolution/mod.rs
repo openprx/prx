@@ -1,6 +1,7 @@
 //! Evolution subsystem record/storage/config/trace primitives.
 
 pub mod analyzer;
+pub mod commit;
 pub mod config;
 pub mod cycle_types;
 pub mod engine;
@@ -32,11 +33,11 @@ pub use cycle_types::{
     EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 #[allow(unused_imports)]
-pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycle};
+pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, FileChange, PendingChange, run_engine_cycle};
 pub use memory_evolution::MemoryEvolutionEngine;
 #[allow(unused_imports)]
 pub use memory_safety::{MemorySafetyFilter, SafetyIssueKind, SourceMetadata};
-pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
+pub use pipeline::{CommitDecision, EvolutionPipeline, EvolutionTrigger, JudgeOutcome, PipelineRunReport};
 pub use prompt_evolution::PromptEvolutionEngine;
 #[allow(unused_imports)]
 pub use proposal::{

@@ -444,8 +444,10 @@ async fn int_ts_07_http_request_readonly_is_not_a_gate() {
 
     let tool = HttpRequestTool::new(security, vec![], 1_000_000, 10);
 
+    // A closed loopback port: whatever refuses the request, it must not be the
+    // read-only level, and no request leaves the machine (D-081).
     let result = tool
-        .execute(json!({"url": "https://example.com"}))
+        .execute(json!({"url": "http://127.0.0.1:9/"}))
         .await
         .expect("test: ReadOnly HTTP should return ToolResult");
 

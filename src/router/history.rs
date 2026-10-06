@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::memory::embeddings::EmbeddingProvider;
+use crate::memory::embeddings::{EmbeddingProvider, LocalHashEmbedding};
 
 use super::knn::{KnnStore, MIN_RECORDS_FOR_KNN, QueryRecord, weighted_model_score};
 
@@ -17,6 +17,7 @@ const DEFAULT_KNN_K: usize = 7;
 pub struct RouterHistory {
     store: KnnStore,
     embedder: Arc<dyn EmbeddingProvider>,
+    local_embedder: Option<Arc<LocalHashEmbedding>>,
     knn_k: usize,
     knn_min_records: usize,
     query_timeout: Duration,
@@ -27,10 +28,139 @@ impl RouterHistory {
         Self {
             store,
             embedder,
+            local_embedder: None,
             knn_k: knn_k.max(1),
             knn_min_records: knn_min_records.max(MIN_RECORDS_FOR_KNN),
             query_timeout: DEFAULT_KNN_TIMEOUT,
         }
+    }
+
+    /// Retain the concrete instance supplied by the caller. A dynamic
+    /// provider's name is never accepted as proof of local, uncharged work.
+    pub fn new_local_hash(
+        store: KnnStore,
+        embedder: Arc<LocalHashEmbedding>,
+        knn_k: usize,
+        knn_min_records: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=2048).contains(&embedder.dimensions())
+                && !embedder.model().is_empty()
+                && embedder.model().len() <= 512,
+            "Router local embedding descriptor exceeds capacity"
+        );
+        anyhow::ensure!(
+            knn_k <= 1024 && knn_min_records <= 1024,
+            "Router history policy exceeds capacity"
+        );
+        Ok(Self {
+            store,
+            embedder: embedder.clone(),
+            local_embedder: Some(embedder),
+            knn_k: knn_k.max(1),
+            knn_min_records: knn_min_records.max(MIN_RECORDS_FOR_KNN),
+            query_timeout: DEFAULT_KNN_TIMEOUT,
+        })
+    }
+
+    pub(crate) fn query_deadline(&self, turn_deadline: std::time::Instant) -> Result<std::time::Instant> {
+        let local = std::time::Instant::now()
+            .checked_add(self.query_timeout)
+            .ok_or_else(|| anyhow::anyhow!("Router history deadline overflow"))?;
+        Ok(local.min(turn_deadline))
+    }
+
+    pub(crate) fn policy_descriptor(&self) -> Result<(&str, usize, usize, usize, u128)> {
+        let embedder = self.admitted_embedder()?;
+        Ok((
+            embedder.model(),
+            embedder.dimensions(),
+            self.knn_k,
+            self.knn_min_records,
+            self.query_timeout.as_nanos(),
+        ))
+    }
+
+    pub(crate) const fn local_embedder_if_present(&self) -> Option<&Arc<LocalHashEmbedding>> {
+        self.local_embedder.as_ref()
+    }
+
+    pub(crate) fn admitted_embedder(&self) -> Result<&dyn EmbeddingProvider> {
+        if let Some(local) = self.local_embedder.as_ref() {
+            return Ok(local.as_ref());
+        }
+        anyhow::ensure!(
+            self.embedder.supports_attempt_accounting(),
+            "Router paid embedder lacks physical accounting"
+        );
+        anyhow::ensure!(
+            (1..=2048).contains(&self.embedder.dimensions())
+                && !self.embedder.model().is_empty()
+                && self.embedder.model().len() <= 512
+                && self.knn_k <= 1024
+                && self.knn_min_records <= 1024,
+            "Router paid embedding descriptor exceeds capacity"
+        );
+        Ok(self.embedder.as_ref())
+    }
+
+    /// Rank a complete authorized history domain, keeping provider/model pairs
+    /// distinct. Failed records still count toward the original KNN threshold.
+    pub(crate) async fn scoped_similarity(
+        &self,
+        read: &crate::memory::RouterHistoryRead,
+        domain: &crate::memory::RouterHistoryDomain,
+        vector: &[f32],
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<HashMap<(String, String), f32>> {
+        read.validate(domain)?;
+        anyhow::ensure!(
+            vector.len() == usize::from(domain.dimensions) && vector.iter().all(|value| value.is_finite()),
+            "invalid Router query embedding"
+        );
+        anyhow::ensure!(
+            !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+            "Router history ranking cancelled or expired"
+        );
+        if read.rows.len() < self.knn_min_records {
+            return Ok(HashMap::new());
+        }
+        let mut neighbors = Vec::new();
+        for row in &read.rows {
+            tokio::task::yield_now().await;
+            anyhow::ensure!(
+                !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+                "Router history ranking cancelled or expired"
+            );
+            if !row.success {
+                continue;
+            }
+            let similarity = crate::memory::vector::cosine_similarity(vector, &row.embedding);
+            anyhow::ensure!(similarity.is_finite(), "invalid Router history cosine");
+            if similarity > 0.0 {
+                neighbors.push((row, 1.0 - similarity));
+            }
+        }
+        neighbors.sort_by(|left, right| left.1.total_cmp(&right.1));
+        neighbors.truncate(self.knn_k);
+        let mut scores = HashMap::new();
+        let mut total = 0.0_f32;
+        for (row, distance) in neighbors {
+            let weight = 1.0 / distance.max(1.0e-6);
+            total += weight;
+            *scores.entry((row.provider.clone(), row.model.clone())).or_insert(0.0) += weight;
+        }
+        if total > 0.0 {
+            for value in scores.values_mut() {
+                *value = (*value / total).clamp(0.0, 1.0);
+            }
+        }
+        anyhow::ensure!(
+            !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+            "Router history ranking cancelled or expired"
+        );
+        Ok(scores)
     }
 
     #[cfg(test)]
@@ -63,8 +193,8 @@ impl RouterHistory {
     pub async fn similarity_scores(&self, message: &str) -> HashMap<String, f32> {
         let record_count = match self.store.count().await {
             Ok(count) => count,
-            Err(err) => {
-                tracing::warn!("Router KNN count failed: {err}");
+            Err(_) => {
+                tracing::warn!("Router KNN count failed");
                 return HashMap::new();
             }
         };
@@ -79,8 +209,9 @@ impl RouterHistory {
 
         let neighbors = match timeout(self.query_timeout, lookup).await {
             Ok(Ok(neighbors)) => neighbors,
-            Ok(Err(err)) => {
-                tracing::warn!("Router KNN lookup failed: {err}");
+            Ok(Err(_)) => {
+                // Backend errors may echo the query or credentials.
+                tracing::warn!("Router KNN lookup failed");
                 return HashMap::new();
             }
             Err(_) => {

@@ -2,7 +2,6 @@ use crate::auth::codex_auth::default_codex_auth_json_path;
 use crate::config::files::{build_split_tables, read_merged_toml_with_gate};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
-use directories::UserDirs;
 use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::de::IntoDeserializer;
@@ -45,9 +44,17 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
+    "decision.compatible_http",
 ];
 
-const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
+    "provider.*",
+    "channel.*",
+    "tool.*",
+    "memory.*",
+    "tunnel.*",
+    "decision.*",
+];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> = OnceLock::new();
@@ -197,6 +204,18 @@ fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Option<&Path>
             tracing::warn!(path = %path.join("."), "Ignoring removed module gate; capability availability is no longer switch-controlled");
         }
     }
+    // Keys a `Config::save` wrote into `[causal_tree]` before the decision
+    // plane map to their new homes before the unknown-path check, keeping
+    // operator values; one without a faithful home stops the load.
+    let locate = |path: &[&str]| config_path.and_then(|main| crate::config::deprecations::file_holding(main, path));
+    let causal = crate::causal_tree::config::migrate_legacy(root, &locate)?;
+    if causal.found_legacy_keys() {
+        tracing::warn!(
+            moved = ?causal.moved,
+            dropped = ?causal.dropped,
+            "Mapped legacy causal_tree keys; the next save writes the new form"
+        );
+    }
     // Retired keys are dropped *here*, before the unknown-path check below, so
     // that a config written against an older prx keeps loading with a warning
     // instead of failing to start. Only the paths on the published list are
@@ -208,6 +227,48 @@ fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Option<&Path>
 }
 
 // ── Top-level config ──────────────────────────────────────────────
+
+/// Every set of duplicate `[[embedding_routes]]` hints already reported by
+/// `validate`, so a configuration that is validated again warns once.
+static REPORTED_DUPLICATE_EMBEDDING_HINTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<Vec<String>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// One sentence per `[[embedding_routes]]` entry whose hint an earlier entry
+/// already uses, with the fix. Empty when every hint names one route.
+#[must_use]
+pub fn duplicate_embedding_route_hints(config: &Config) -> Vec<String> {
+    config
+        .embedding_routes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, route)| {
+            config
+                .embedding_routes
+                .iter()
+                .take(i)
+                .position(|earlier| earlier.hint.trim() == route.hint.trim())
+                .map(|first| {
+                    format!(
+                        "embedding_routes[{i}] and embedding_routes[{first}] both use hint '{}'; only the first is \
+                         used. Give each route its own hint, or remove one",
+                        route.hint.trim()
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Whether the `[[providers.tool_dialects]]` deprecation was reported in
+/// this process (once is enough; every load and reload validates).
+static REPORTED_TOOL_DIALECTS_DEPRECATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Every set of unused `[[providers.tool_dialects]]` entries (index and
+/// redacted provider) already reported by `validate`, so a configuration that
+/// is validated again warns once.
+static REPORTED_UNUSED_TOOL_DIALECTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<Vec<(usize, String)>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 /// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
@@ -222,7 +283,9 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `OPENPRX_API_KEY / OPENPRX_API_KEY`, or `API_KEY` env vars.
+    /// API key for the selected provider. No environment variable sets or
+    /// overrides it; when it is unset, the key stored for the provider with
+    /// `prx auth paste-token --provider <name>` is used.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -413,8 +476,9 @@ pub struct Config {
     #[serde(default)]
     pub media: MediaConfig,
 
-    /// Causal Tree Engine configuration (`[causal_tree]`).
-    /// Default: disabled. Enable via `enabled = true` in config.
+    /// Decision-plane configuration (`[causal_tree]`).
+    /// Default: enabled locally; remote processing remains explicit opt-in.
+    /// A versioned `enabled = false` preserves an explicit disable.
     #[serde(default)]
     pub causal_tree: crate::causal_tree::CausalTreeConfig,
 
@@ -431,73 +495,99 @@ pub struct Config {
     pub tool_tiering: ToolTieringConfig,
 }
 
+// Every serialized field is rendered, masked, under `settings`; the lint
+// cannot see through the serde rendering.
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for Config {
+    /// The serialized settings with every secret path of the registry masked
+    /// (`crate::config::secret_paths`), plus the two path fields that are not
+    /// serialized.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
+        let mut debug = f.debug_struct("Config");
+        debug
             .field("workspace_dir", &self.workspace_dir)
-            .field("config_path", &self.config_path)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("api_url", &self.api_url)
-            .field("default_provider", &self.default_provider)
-            .field("default_model", &self.default_model)
-            .field("default_temperature", &self.default_temperature)
-            .field("providers", &self.providers)
-            .field("observability", &self.observability)
-            .field("autonomy", &self.autonomy)
-            .field("runtime", &self.runtime)
-            .field("reliability", &self.reliability)
-            .field("scheduler", &self.scheduler)
-            .field("agent", &self.agent)
-            .field("sessions_spawn", &self.sessions_spawn)
-            .field("chat", &self.chat)
-            .field("self_system", &self.self_system)
-            .field("skills", &self.skills)
-            .field("skill_rag", &self.skill_rag)
-            .field("model_routes", &self.model_routes)
-            .field("embedding_routes", &self.embedding_routes)
-            .field("query_classification", &self.query_classification)
-            .field("task_routing", &self.task_routing)
-            .field("router", &self.router)
-            .field("smart_group", &self.smart_group)
-            .field("heartbeat", &self.heartbeat)
-            .field("xin", &self.xin)
-            .field("cron", &self.cron)
-            .field("channels_config", &self.channels_config)
-            .field("memory", &self.memory)
-            .field("identity_bindings", &self.identity_bindings)
-            .field("user_policies", &self.user_policies)
-            .field("storage", &self.storage)
-            .field("tunnel", &self.tunnel)
-            .field("gateway", &self.gateway)
-            .field("webhook", &self.webhook)
-            .field("composio", &self.composio)
-            .field("mcp", &self.mcp)
-            .field("mcp_server", &self.mcp_server)
-            .field("a2a", &self.a2a)
-            .field("auth", &self.auth)
-            .field("secrets", &self.secrets)
-            .field("browser", &self.browser)
-            .field("http_request", &self.http_request)
-            .field("multimodal", &self.multimodal)
-            .field("web_search", &self.web_search)
-            .field("proxy", &self.proxy)
-            .field("identity", &self.identity)
-            .field("cost", &self.cost)
-            .field("nodes", &self.nodes)
-            .field("agents", &self.agents)
-            .field("media", &self.media)
-            .field("causal_tree", &self.causal_tree)
-            .field("security", &self.security)
-            .field("compliance", &self.compliance)
-            .field("tool_tiering", &self.tool_tiering)
-            .finish()
+            .field("config_path", &self.config_path);
+        match serde_json::to_value(self) {
+            Ok(mut settings) => {
+                crate::config::secret_paths::redact(&mut settings);
+                debug.field("settings", &settings);
+            }
+            // Never fall back to the derived field output: it would print
+            // secrets.
+            Err(_) => {
+                debug.field("settings", &"<unserializable>");
+            }
+        }
+        debug.finish()
     }
+}
+
+/// `Debug` for configuration sub-structs that hold a secret or an endpoint
+/// URL: the serialized settings with every secret and URL userinfo masked
+/// (`secret_paths::debug_redacted`), never the derived field output. The
+/// path is where the struct sits in the configuration.
+macro_rules! redacted_debug {
+    ($($ty:ident => $path:literal),* $(,)?) => {
+        $(
+            impl std::fmt::Debug for $ty {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    crate::config::secret_paths::debug_redacted(f, stringify!($ty), self, $path)
+                }
+            }
+        )*
+    };
+}
+
+redacted_debug! {
+    DelegateAgentConfig => "agents.<name>",
+    ModelRouteConfig => "model_routes[]",
+    EmbeddingRouteConfig => "embedding_routes[]",
+    ReliabilityConfig => "reliability",
+    ComposioConfig => "composio",
+    BrowserComputerUseConfig => "browser.computer_use",
+    WebSearchConfig => "web_search",
+    StorageProviderConfig => "storage.provider.config",
+    GatewayConfig => "gateway",
+    McpServerConfig => "mcp.servers.<name>",
+    TelegramConfig => "channels_config.telegram",
+    DiscordConfig => "channels_config.discord",
+    SlackConfig => "channels_config.slack",
+    MattermostConfig => "channels_config.mattermost",
+    DingTalkConfig => "channels_config.dingtalk",
+    IrcConfig => "channels_config.irc",
+    LarkConfig => "channels_config.lark",
+    LinqConfig => "channels_config.linq",
+    MatrixConfig => "channels_config.matrix",
+    NextcloudTalkConfig => "channels_config.nextcloud_talk",
+    QQConfig => "channels_config.qq",
+    WacliConfig => "channels_config.wacli",
+    WebhookConfig => "channels_config.webhook",
+    WhatsAppConfig => "channels_config.whatsapp",
+    SignalConfig => "channels_config.signal",
+    MemoryWebhookConfig => "webhook",
+    CloudflareTunnelConfig => "tunnel.cloudflare",
+    NgrokTunnelConfig => "tunnel.ngrok",
+    CustomTunnelConfig => "tunnel.custom",
+    ChatDaemonConfig => "chat.daemon",
+    RemoteNodeConfig => "nodes.nodes[]",
+    NodeServerConfig => "nodes.server",
+    ProxyConfig => "proxy",
+    ObservabilityConfig => "observability",
+    MediaConfig => "media",
+    McpServerRuntimeConfig => "mcp_server",
+    A2aConfig => "a2a",
+    RouterModelConfig => "router.models[]",
+    ProviderModelConfig => "providers.models[]",
+    ProviderToolDialectConfig => "providers.tool_dialects[]",
+    MemoryConfig => "memory",
+    SmartGroupConfig => "smart_group",
+    CostConfig => "cost",
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
     pub provider: String,
@@ -509,6 +599,12 @@ pub struct DelegateAgentConfig {
     /// Optional API key override
     #[serde(default)]
     pub api_key: Option<String>,
+    /// A credential reference (`cred-<name>`, `prx providers credential
+    /// set`) issued for this agent's provider, used instead of an inline
+    /// `api_key`. The reference is resolved from the encrypted auth-profile
+    /// store only when its owner is this provider; setting both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     /// Temperature override
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -683,7 +779,7 @@ impl RouterConfig {
 }
 
 /// Static router metadata for one model candidate.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RouterModelConfig {
     /// Model identifier without provider prefix.
     pub model_id: String,
@@ -715,6 +811,164 @@ pub struct ProvidersConfig {
     /// Ollama-specific request options (`[providers.ollama]`).
     #[serde(default)]
     pub ollama: OllamaProviderConfig,
+    /// Operator declarations of which tool-schema dialect and which textual
+    /// tool-call grammar an OpenAI-compatible endpoint accepts
+    /// (`[[providers.tool_dialects]]`).
+    ///
+    /// Nothing is inferred from a URL: an endpoint with no entry is offered the
+    /// published tool schemas unchanged (`raw`) and only its native
+    /// `tool_calls` array is read (`native`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_dialects: Vec<ProviderToolDialectConfig>,
+    /// Operator declarations of what a provider's models can do
+    /// (`[[providers.models]]`): the curated source of the per-(provider,
+    /// model) descriptor the model resolver consults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ProviderModelConfig>,
+}
+
+/// One `[[providers.tool_dialects]]` entry: what one OpenAI-compatible
+/// endpoint, or one model behind it, accepts.
+///
+/// The entry is the `(provider, optional model)` key plus two capability
+/// fields of the per-(provider, model) descriptor that will replace it (P1-B).
+/// The descriptor now reads this table as operator declarations alongside
+/// `[[providers.models]]` (`tool_schema` / `tool_call` there are
+/// `tool_schema_dialect` / `tool_call_dialect`); the table stays accepted,
+/// and moving its rows into `[[providers.models]]` is a later migration step.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderToolDialectConfig {
+    /// The provider, spelled as in `default_provider`, `fallback_providers` or
+    /// `--provider`: a `custom:<url>` endpoint, or one of the catalog entries
+    /// that address a server the operator runs (`vllm`, `llamacpp`,
+    /// `lmstudio`, `litellm`). Every spelling of the same provider identity is
+    /// the same entry: `custom:http://h:8080/v1/` and `CUSTOM:http://h:8080/v1`
+    /// are one endpoint, a different port or path is another.
+    pub provider: String,
+    /// The model this entry applies to (compared ignoring ASCII case), or every
+    /// model of the provider when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The tool-schema dialect the endpoint accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema: Option<ToolSchemaDialectSetting>,
+    /// The textual tool-call grammar the endpoint emits. Provider-wide entries
+    /// only: the response parser has no model, so a model-scoped grammar would
+    /// silently apply to every model of the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ToolCallDialectSetting>,
+}
+
+/// One `[[providers.models]]` entry: an operator declaration of what one
+/// model of a provider — or every model of it — can do.
+///
+/// It is the curated source of the per-(provider, model) descriptor the
+/// resolver consults. Every field but `provider` is optional and declares
+/// nothing when omitted. A declaration settles what discovery left unknown;
+/// it never lifts what the provider's adapter cannot execute, and negative
+/// catalog evidence still wins over it.
+///
+/// `tool_schema_dialect` and `tool_call_dialect` are the same declarations as
+/// `[[providers.tool_dialects]]` `tool_schema` / `tool_call`, which stays
+/// accepted; one `(provider, model)` may declare a dialect in only one of the
+/// two tables.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderModelConfig {
+    /// The provider, spelled as in `default_provider` (any alias, or a
+    /// `custom:<url>` endpoint). Every spelling of one provider identity is the
+    /// same provider.
+    pub provider: String,
+    /// The model (compared ignoring ASCII case), or every model of the
+    /// provider when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The complete list of operations the model executes; every operation not
+    /// listed is unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<ModelOperationSetting>>,
+    /// Whether the model accepts native tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
+    /// Whether the model accepts image input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_input: Option<bool>,
+    /// Whether the model streams responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    /// Whether the model honours a JSON-schema response format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<bool>,
+    /// The tool-schema dialect the endpoint accepts for this model. Only for a
+    /// provider that reads dialect declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_dialect: Option<ToolSchemaDialectSetting>,
+    /// The textual tool-call grammar the endpoint emits. Entries without
+    /// `model` only: the response parser cannot tell models apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_dialect: Option<ToolCallDialectSetting>,
+    /// The model's context window in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+}
+
+impl ProviderModelConfig {
+    /// Whether the entry declares anything at all.
+    #[must_use]
+    pub const fn declares_anything(&self) -> bool {
+        self.operations.is_some()
+            || self.native_tools.is_some()
+            || self.vision_input.is_some()
+            || self.streaming.is_some()
+            || self.structured_output.is_some()
+            || self.tool_schema_dialect.is_some()
+            || self.tool_call_dialect.is_some()
+            || self.context_window.is_some()
+    }
+}
+
+/// The operations a `[[providers.models]]` entry may list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOperationSetting {
+    Chat,
+    Embedding,
+    DecisionEndpoint,
+    Rerank,
+    ImageGeneration,
+    AudioGeneration,
+    VideoGeneration,
+}
+
+/// The tool-schema dialects an operator may declare for an endpoint.
+///
+/// `gemini` and `anthropic` are deliberately absent: they name the fixed
+/// rewrite of a provider family, which the constructed provider already
+/// reports, and declaring one for a single model of an endpoint would make
+/// argument validation looser than the document that model was shown.
+/// Adding a stripping dialect here would make the model-less
+/// `OpenAiCompatibleProvider::tool_schema_dialect` (still read by callers
+/// that do not know the model) answer `Raw` for endpoints that mix it with
+/// undeclared models; callers that know the model are exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaDialectSetting {
+    /// The published document, byte for byte (the default).
+    Raw,
+    /// The endpoint rejects `allOf`/`anyOf`/`oneOf` at the root of a tool
+    /// schema: a root `allOf` of plain object fragments is merged losslessly,
+    /// and a request carrying any other root combinator fails before transport.
+    NoRootCombinators,
+}
+
+/// The tool-call grammars an operator may declare for an endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDialectSetting {
+    /// Only the native `tool_calls` array is a tool call (the default).
+    Native,
+    /// Additionally read `<function=NAME>{json}</function>` from the content,
+    /// for a tool name the request registered.
+    XmlFunctionTags,
 }
 
 /// Ollama-specific request options (`[providers.ollama]`).
@@ -783,19 +1037,6 @@ pub struct RemoteNodeConfig {
     pub retry_max: Option<u8>,
 }
 
-impl std::fmt::Debug for RemoteNodeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteNodeConfig")
-            .field("id", &self.id)
-            .field("endpoint", &self.endpoint)
-            .field("bearer_token", &"[REDACTED]")
-            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "[REDACTED]"))
-            .field("timeout_ms", &self.timeout_ms)
-            .field("retry_max", &self.retry_max)
-            .finish()
-    }
-}
-
 /// Node daemon runtime config used by `prx-node`.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeServerConfig {
@@ -843,26 +1084,6 @@ pub struct NodeServerConfig {
     /// TLS private key path (PEM).
     #[serde(default)]
     pub tls_key: Option<String>,
-}
-
-impl std::fmt::Debug for NodeServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeServerConfig")
-            .field("listen_addr", &self.listen_addr)
-            .field("bearer_token", &"[REDACTED]")
-            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "[REDACTED]"))
-            .field("sandbox_root", &self.sandbox_root)
-            .field("exec_timeout_ms", &self.exec_timeout_ms)
-            .field("max_output_bytes", &self.max_output_bytes)
-            .field("max_concurrent_tasks", &self.max_concurrent_tasks)
-            .field("task_result_ttl_ms", &self.task_result_ttl_ms)
-            .field("allowed_commands", &self.allowed_commands)
-            .field("blocked_commands", &self.blocked_commands)
-            .field("tls_required", &self.tls_required)
-            .field("tls_cert", &self.tls_cert)
-            .field("tls_key", &self.tls_key)
-            .finish()
-    }
 }
 
 fn default_node_server_listen_addr() -> String {
@@ -920,7 +1141,7 @@ impl Default for NodeServerConfig {
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
-    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
+    /// When true: bootstrap_max_chars=6000. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
@@ -1159,6 +1380,12 @@ pub struct SelfSystemConfig {
     /// Enable debug raw output for evolution (replaces OPENPRX_EVOLUTION_DEBUG_RAW / ZEROCLAW_EVOLUTION_DEBUG_RAW)
     #[serde(default)]
     pub evolution_debug_raw: bool,
+
+    /// Seconds one evolution judge call may take (1 to 3600, default 180).
+    /// A judge that has not answered by then gives no verdict, so an applied
+    /// change is rolled back.
+    #[serde(default = "default_self_system_evolution_judge_timeout_secs")]
+    pub evolution_judge_timeout_secs: u64,
 }
 
 /// Calendar schedule, evidence thresholds, and retention for fitness v2.
@@ -1233,6 +1460,13 @@ const fn default_self_system_evolution_interval_hours() -> u32 {
     24
 }
 
+const fn default_self_system_evolution_judge_timeout_secs() -> u64 {
+    180
+}
+
+/// Upper bound on `self_system.evolution_judge_timeout_secs`: one hour.
+const MAX_EVOLUTION_JUDGE_TIMEOUT_SECS: u64 = 3600;
+
 impl Default for SelfSystemConfig {
     fn default() -> Self {
         Self {
@@ -1241,6 +1475,7 @@ impl Default for SelfSystemConfig {
             evolution_interval_hours: default_self_system_evolution_interval_hours(),
             evolution_config_path: None,
             evolution_debug_raw: false,
+            evolution_judge_timeout_secs: default_self_system_evolution_judge_timeout_secs(),
         }
     }
 }
@@ -1393,7 +1628,7 @@ impl Default for MultimodalConfig {
 ///
 /// Controls STT transcription for audio and video frame extraction.
 /// Aligns with OpenClaw's media-understanding architecture.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MediaConfig {
     /// Audio STT provider: "ollama" | "cli" | "none". Default: "none".
     #[serde(default = "default_audio_provider")]
@@ -1495,7 +1730,7 @@ impl Default for IdentityConfig {
 // ── Cost tracking and budget enforcement ───────────────────────────
 
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
     /// Daily spending limit in USD (default: 10.00)
     #[serde(default = "default_daily_limit")]
@@ -1519,7 +1754,7 @@ pub struct CostConfig {
 }
 
 /// Per-model pricing entry (USD per 1M tokens).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPricing {
     /// Input price per 1M tokens
     #[serde(default)]
@@ -1536,6 +1771,16 @@ pub struct ModelPricing {
     /// Cache read input price per 1M tokens.
     #[serde(default)]
     pub cache_read: f64,
+}
+
+impl ModelPricing {
+    /// An invalid component must not cancel another component into a free
+    /// estimate or be treated as an unpriced local model.
+    pub(crate) fn is_finite_nonnegative(&self) -> bool {
+        [self.input, self.output, self.cache_write, self.cache_read]
+            .into_iter()
+            .all(|price| price.is_finite() && price >= 0.0)
+    }
 }
 
 const fn default_daily_limit() -> f64 {
@@ -1741,7 +1986,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayConfig {
     /// Gateway port (default: 16830)
     #[serde(default = "default_gateway_port")]
@@ -1771,8 +2016,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_api_rate_limit")]
     pub api_rate_limit_per_minute: u32,
 
-    /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
-    /// Disabled by default; enable only behind a trusted reverse proxy.
+    /// Trust headers that a reverse proxy in front of the gateway asserts: the
+    /// client IP (`X-Forwarded-For`, `X-Real-IP`) for rate limiting, and the
+    /// caller identity of MCP tool calls (`X-Client-Cert-Subject`,
+    /// `X-Forwarded-Client-Cert`, `X-Spiffe-Id`, `X-Spiffe-Svid`,
+    /// `X-Client-Cert-Pem`). Disabled by default. Enable only when every request
+    /// reaches the gateway through a proxy that removes or overwrites all of
+    /// these headers; otherwise any client can claim any identity.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
 
@@ -1859,7 +2109,7 @@ impl Default for GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWebhookConfig {
     /// Socket address for the receiver (e.g. "0.0.0.0:16899").
     #[serde(default = "default_memory_webhook_bind")]
@@ -1897,7 +2147,7 @@ impl MemoryWebhookConfig {
 /// Composio managed OAuth tools integration (`[composio]` section).
 ///
 /// Provides access to 1000+ OAuth-connected tools via the Composio platform.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
@@ -1933,13 +2183,46 @@ pub struct McpConfig {
     /// Named MCP server definitions
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
+    /// Which new servers a workspace `mcp.json` may add (D-085 F-1). A
+    /// workspace file may always narrow a server defined here (leave it out,
+    /// or expose fewer of its tools); anything else it says about such a
+    /// server is ignored. `off` (the default) adds nothing, `http_only` adds
+    /// HTTP servers, `stdio` adds HTTP and stdio servers (a stdio server is a
+    /// program run as PRX's user). Widening this is a high-risk change.
+    #[serde(default, skip_serializing_if = "WorkspaceMcpServers::is_off")]
+    pub workspace_servers: WorkspaceMcpServers,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             servers: HashMap::new(),
+            workspace_servers: WorkspaceMcpServers::Off,
         }
+    }
+}
+
+/// Which new MCP servers a workspace `mcp.json` may add
+/// (`mcp.workspace_servers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMcpServers {
+    /// None: a workspace file may only narrow the servers defined in
+    /// `config.toml`.
+    #[default]
+    Off,
+    /// HTTP servers (still refused when they target a private address).
+    HttpOnly,
+    /// HTTP servers and stdio servers started with a bare launcher from the
+    /// fixed list, in the cleared launch environment.
+    Stdio,
+}
+
+impl WorkspaceMcpServers {
+    /// Whether this is the default (`off`).
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
     }
 }
 
@@ -1949,7 +2232,7 @@ impl McpConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerRuntimeConfig {
     /// Advertised bind address. The gateway may still be started with a CLI port override.
     #[serde(default = "default_mcp_server_bind")]
@@ -1957,12 +2240,16 @@ pub struct McpServerRuntimeConfig {
     /// Require an authenticated external identity for mutating calls.
     #[serde(default = "default_true")]
     pub require_auth: bool,
-    /// Tools exposed to MCP discovery.
+    /// Tools exposed to external MCP callers.
     ///
-    /// The defaults are all read-only. An operator may add a tool that carries
-    /// side effects; it is then advertised with its real effect by
-    /// `GET /mcp/v1/tools/list` and warned about at config load, and a retry-safe
-    /// call of it needs an `Idempotency-Key`.
+    /// The defaults are all read-only. Every external MCP caller runs
+    /// owner-isolated, so only names on the owner-isolation-aware list
+    /// (`crate::tools::execution::OWNER_ISOLATION_AWARE_TOOLS`) can run; any
+    /// other name is not advertised, is refused with HTTP 403, and is warned
+    /// about at config load. An admissible tool with side effects
+    /// (`memory_forget`, `memory_store`, `document_ingest`) is advertised with its real effect by
+    /// `GET /mcp/v1/tools/list`, and a retry-safe call of it needs an
+    /// `Idempotency-Key`.
     #[serde(default = "default_mcp_server_exposed_tools")]
     pub exposed_tools: Vec<String>,
     /// Allowed browser origins for future streamable HTTP clients.
@@ -2047,16 +2334,41 @@ impl McpServerRuntimeConfig {
     ///
     /// Exposing one is a deliberate operator action rather than a config error:
     /// the gateway MCP endpoint drives every call through the shared execution
-    /// service, so such a tool is still policy-gated, approval-gated (fail-closed)
-    /// and, with an `Idempotency-Key`, ledger-protected. Rejecting the list here
-    /// would make that supported path unreachable, so the contract is a warning
-    /// plus honest advertisement instead.
+    /// service, so such a tool is still policy-gated and, with an
+    /// `Idempotency-Key`, ledger-protected. Approval is consulted only at
+    /// `AutonomyLevel::Supervised` (and is then fail-closed, since a remote
+    /// client cannot answer a prompt); at the default `Full` it is not, so for
+    /// external callers the boundary is the owner-isolation-aware list — see
+    /// [`Self::refused_exposed_tools`].
     #[must_use]
     pub fn side_effecting_exposed_tools(&self) -> Vec<&str> {
         self.exposed_tools
             .iter()
             .map(String::as_str)
             .filter(|name| !crate::security::policy::is_read_only_tool(name))
+            .collect()
+    }
+
+    /// Exposed tools an external MCP caller can run: those on the
+    /// owner-isolation-aware list, in configured order.
+    #[must_use]
+    pub fn admissible_exposed_tools(&self) -> Vec<&str> {
+        self.exposed_tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| crate::tools::execution::is_owner_isolation_aware_tool(name))
+            .collect()
+    }
+
+    /// Exposed tools every external MCP caller is refused because they do not
+    /// enforce per-owner isolation (V02-R9 / OQ-21). Such an entry is inert: it
+    /// is not advertised and a call of it answers 403.
+    #[must_use]
+    pub fn refused_exposed_tools(&self) -> Vec<&str> {
+        self.exposed_tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !crate::tools::execution::is_owner_isolation_aware_tool(name))
             .collect()
     }
 }
@@ -2080,7 +2392,7 @@ impl Default for McpServerRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct A2aConfig {
     /// Advertised bind address.
     #[serde(default = "default_a2a_bind")]
@@ -2127,6 +2439,10 @@ pub struct A2aConfig {
     /// validity / trust-domain verification is rejected. When false (default),
     /// verification failures are logged but fall back to header-asserted trust
     /// (suitable for a trusted front proxy terminating mTLS).
+    ///
+    /// For MCP tool calls, SPIFFE headers (and the fall-back) are considered
+    /// only when `gateway.trust_forwarded_headers` is true; otherwise they are
+    /// ignored and the caller must authenticate with a bearer JWT.
     #[serde(default)]
     pub spiffe_strict_validation: bool,
 }
@@ -2183,7 +2499,7 @@ impl Default for McpTransport {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerConfig {
     /// Transport type: stdio or http
     #[serde(default)]
@@ -2215,6 +2531,12 @@ pub struct McpServerConfig {
     /// Optional deny-list of exposed tools
     #[serde(default)]
     pub deny_tools: Vec<String>,
+    /// Working directory of a stdio server (absolute). Unset: a dedicated
+    /// empty directory `mcp/<server>` beside `config.toml`, never the
+    /// directory PRX was started from (D-088 C-3). Changing it is a launch
+    /// change (high risk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 const fn default_mcp_startup_timeout_ms() -> u64 {
@@ -2242,6 +2564,7 @@ impl Default for McpServerConfig {
             tool_name_prefix: default_mcp_tool_name_prefix(),
             allow_tools: Vec::new(),
             deny_tools: Vec::new(),
+            working_dir: None,
         }
     }
 }
@@ -2289,7 +2612,7 @@ impl Default for AuthConfig {
 /// The computer-use / agent-browser automation tools were removed (agents use
 /// `shell` instead). Only `api_key` is retained, because the config secret
 /// encryption/migration path still references it.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BrowserComputerUseConfig {
     /// Optional bearer token (retained only for config secret handling).
     #[serde(default)]
@@ -2345,7 +2668,7 @@ const fn default_http_timeout_secs() -> u64 {
 // ── Web search ───────────────────────────────────────────────────
 
 /// Web search tool configuration (`[web_search]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
@@ -2411,7 +2734,7 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProxyConfig {
     /// Proxy URL for HTTP requests (supports http, https, socks5, socks5h).
     #[serde(default)]
@@ -2774,6 +3097,16 @@ fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
 pub(crate) fn set_runtime_proxy_config(config: ProxyConfig) {
     *runtime_proxy_state().write() = config;
     clear_runtime_proxy_client_cache();
+    RUNTIME_PROXY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Bumped by every [`set_runtime_proxy_config`]: a client cache outside
+/// this module keys its clients by it, so a proxy change rebuilds them.
+static RUNTIME_PROXY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime proxy generation, bumped by every runtime proxy change.
+pub fn runtime_proxy_generation() -> u64 {
+    RUNTIME_PROXY_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn runtime_proxy_config() -> ProxyConfig {
@@ -2838,7 +3171,7 @@ pub struct StorageProviderSection {
 }
 
 /// Storage provider backend configuration (e.g. postgres connection details).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StorageProviderConfig {
     /// Storage engine key (e.g. "postgres", "sqlite").
     #[serde(default)]
@@ -2905,7 +3238,7 @@ impl Default for StorageProviderConfig {
 ///
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
 /// and memory snapshot/hydration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
@@ -3326,7 +3659,7 @@ fn default_user_policy_visibility_ceiling() -> String {
 // ── Observability ─────────────────────────────────────────────────
 
 /// Observability backend configuration (`[observability]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
     pub backend: String,
@@ -3449,8 +3782,48 @@ pub struct ScopeRule {
     pub assign_deny: Vec<String>,
 }
 
-fn default_scope_action() -> String {
-    "allow".to_string()
+/// What `autonomy.scopes` does with a tool call no rule matches.
+///
+/// Parsed once, at load: `allow` or `deny` after trimming and ignoring case,
+/// and nothing else (D-050). The runtime (`SecurityPolicy::from_config`) and
+/// the configuration plan (`config::manage::plan`) read this one value, so a
+/// spelling such as `"deny "` can never mean deny to the plan and allow at
+/// runtime. An unknown value is refused when the configuration loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeDefault {
+    /// Unmatched tool calls are allowed (the default).
+    #[default]
+    Allow,
+    /// Unmatched tool calls are refused.
+    Deny,
+}
+
+impl ScopeDefault {
+    /// The canonical reading of a configured value, or `None` when it is
+    /// neither `allow` nor `deny`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    /// Whether a tool call no rule matches is allowed.
+    #[must_use]
+    pub const fn allows_unmatched(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScopeDefault {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom("autonomy.scopes.default must be \"allow\" or \"deny\""))
+    }
 }
 
 /// Scope-based tool access control configuration (`[autonomy.scopes]`).
@@ -3478,8 +3851,8 @@ fn default_scope_action() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScopeConfig {
     /// Default action when no rule matches: "allow" (default) or "deny".
-    #[serde(default = "default_scope_action")]
-    pub default: String,
+    #[serde(default)]
+    pub default: ScopeDefault,
     /// Ordered list of scope rules evaluated top-to-bottom.
     #[serde(default)]
     pub rules: Vec<ScopeRule>,
@@ -3504,7 +3877,7 @@ pub struct ScopeConfig {
 impl Default for ScopeConfig {
     fn default() -> Self {
         Self {
-            default: default_scope_action(),
+            default: ScopeDefault::default(),
             rules: Vec::new(),
             assign_owners: Vec::new(),
         }
@@ -3856,7 +4229,7 @@ impl Default for RuntimeConfig {
 /// Reliability and supervision configuration (`[reliability]` section).
 ///
 /// Controls provider retries, fallback chains, API key rotation, and channel restart backoff.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReliabilityConfig {
     /// Retries per provider before failing over.
     #[serde(default = "default_provider_retries")]
@@ -3888,7 +4261,9 @@ pub struct ReliabilityConfig {
     /// Scheduler polling cadence in seconds.
     #[serde(default = "default_scheduler_poll_secs")]
     pub scheduler_poll_secs: u64,
-    /// Max retries for cron job execution attempts.
+    /// Max retries for cron shell attempts and Agent startup before decision admission.
+    /// Admitted Agent turns are not replanned automatically; provider request retries
+    /// remain controlled by `provider_retries`.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
 }
@@ -3982,7 +4357,7 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
@@ -3993,6 +4368,12 @@ pub struct ModelRouteConfig {
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// A credential reference (`cred-<name>`, `prx providers credential
+    /// set`) issued for this route's provider, used instead of an inline
+    /// `api_key`. The reference is resolved from the encrypted auth-profile
+    /// store only when its owner is this provider; setting both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
@@ -4009,7 +4390,7 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
@@ -4023,6 +4404,12 @@ pub struct EmbeddingRouteConfig {
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// A credential reference (`cred-<name>`, `prx providers credential
+    /// set`) issued for this embedding route's provider, used instead of an inline
+    /// `api_key`. The reference is resolved from the encrypted auth-profile
+    /// store only when its owner is this provider; setting both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 // ── Query Classification ─────────────────────────────────────────
@@ -4244,7 +4631,7 @@ const fn default_pre_gate_max_context_messages() -> usize {
 /// @-mentions, DMs, and non-smart modes NEVER reach the pre-gate. The pre-gate
 /// is fail-open: any classifier error/timeout enters the loop (it must never
 /// silently drop a message that should have been answered).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SmartGroupConfig {
     /// Provider id/alias for the Tier-2 classifier. When empty, the channel's
     /// own routed provider is reused (no extra provider construction).
@@ -4355,7 +4742,7 @@ impl Default for TunnelConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CloudflareTunnelConfig {
     /// Cloudflare Tunnel token (from Zero Trust dashboard)
     pub token: String,
@@ -4370,7 +4757,7 @@ pub struct TailscaleTunnelConfig {
     pub hostname: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NgrokTunnelConfig {
     /// ngrok auth token
     pub auth_token: String,
@@ -4378,7 +4765,7 @@ pub struct NgrokTunnelConfig {
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CustomTunnelConfig {
     /// Command template to start the tunnel. Use {port} and {host} placeholders.
     /// Example: "bore local {port} --to bore.pub"
@@ -4477,7 +4864,7 @@ const fn default_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
     /// Telegram Bot API token (from @BotFather).
     pub bot_token: String,
@@ -4506,7 +4893,7 @@ pub struct TelegramConfig {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
     /// Discord bot token (from Discord Developer Portal).
     pub bot_token: String,
@@ -4532,7 +4919,7 @@ pub struct DiscordConfig {
 }
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
     /// Slack bot OAuth token (xoxb-...).
     pub bot_token: String,
@@ -4549,7 +4936,7 @@ pub struct SlackConfig {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MattermostConfig {
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
@@ -4571,7 +4958,7 @@ pub struct MattermostConfig {
 }
 
 /// Webhook channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
     /// Port to listen on for incoming webhooks.
     pub port: u16,
@@ -4590,7 +4977,7 @@ pub struct IMessageConfig {
 }
 
 /// Matrix channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
@@ -4662,7 +5049,7 @@ impl Default for SignalStormProtectionConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
     /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:16866").
     /// In "native" mode this is ignored; the daemon is spawned on `daemon_http_port`.
@@ -4776,7 +5163,7 @@ impl SignalConfig {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
     /// Access token from Meta Business Suite (Cloud API mode)
     #[serde(default)]
@@ -4842,7 +5229,7 @@ pub struct WhatsAppConfig {
     pub read_pool_size: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
     pub api_token: String,
@@ -4860,7 +5247,7 @@ pub struct LinqConfig {
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. "https://cloud.example.com").
     pub base_url: String,
@@ -4939,7 +5326,7 @@ impl WhatsAppConfig {
 /// allowed_from = ["*"]
 /// group_reply_mode = "smart"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WacliConfig {
     /// Address the inbound webhook server binds to (default: "127.0.0.1:16868").
     #[serde(default = "default_wacli_webhook_listen")]
@@ -5156,7 +5543,7 @@ impl WacliConfig {
 }
 
 /// IRC channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IrcConfig {
     /// IRC server hostname
     pub server: String,
@@ -5204,7 +5591,7 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LarkConfig {
     /// App ID from Lark/Feishu developer console
     pub app_id: String,
@@ -5232,6 +5619,24 @@ pub struct LarkConfig {
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,
+}
+
+impl LarkConfig {
+    /// Webhook mode authenticates every event by `verification_token`, so a
+    /// webhook-mode channel without one is refused at load, not only when its
+    /// listener starts (LARK, D-060 L-4). WebSocket mode does not use it.
+    pub fn validate(&self) -> Result<()> {
+        if self.receive_mode == LarkReceiveMode::Webhook {
+            anyhow::ensure!(
+                self.verification_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty()),
+                "channels_config.lark.verification_token must be set when channels_config.lark.receive_mode = \
+                 \"webhook\": without it every event would be accepted"
+            );
+        }
+        Ok(())
+    }
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -5388,6 +5793,35 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+    /// Whether the command hooks of the workspace `hooks.json` run
+    /// (HOOKS-ENV, D-085 O-1). `hooks.json` lives in the agent's workspace,
+    /// where the workspace file tools can write it, and each hook runs a
+    /// program as PRX's user; so they run only when the operator turns them
+    /// `on` here. Turning it on is a high-risk change. WASM plugin hooks are
+    /// not affected.
+    #[serde(default, skip_serializing_if = "WorkspaceHooks::is_off")]
+    pub workspace_hooks: WorkspaceHooks,
+}
+
+/// Whether workspace `hooks.json` command hooks run
+/// (`security.workspace_hooks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceHooks {
+    /// They do not run (the default); `prx doctor` and `hooks_status` say so.
+    #[default]
+    Off,
+    /// They run, in a cleared environment and a dedicated directory beside
+    /// `config.toml`.
+    On,
+}
+
+impl WorkspaceHooks {
+    /// Whether this is the default (`off`).
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
 }
 
 /// Operations/development tools hidden from IM channel sessions by default.
@@ -5421,23 +5855,23 @@ pub const DEFAULT_CHANNEL_EXCLUDED_TOOLS: &[&str] = &[
     "document_ingest",
 ];
 
-/// Tool tiering configuration — controls which tools are surfaced to the LLM based on intent.
+/// Tool surface policy consumed by capability publication and decision admission.
 ///
-/// When `enabled = true`, the agent narrows the tool list before each LLM call using the
-/// intent classifier result. `always_include` / `always_exclude` act as permanent overrides.
+/// Explicit exclusions take precedence over direct-publication preferences.
+/// The selected decision constrains the tools supplied to each model call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ToolTieringConfig {
-    /// Tool names to always include regardless of intent classification.
+    /// Tool names preferred for direct publication, subject to admission gates.
     pub always_include: Vec<String>,
-    /// Tool names to always exclude regardless of intent classification.
+    /// Tool names excluded from capability publication.
     pub always_exclude: Vec<String>,
     /// Tool names hidden from IM channel sessions only, on top of `always_exclude`.
     /// Defaults to [`DEFAULT_CHANNEL_EXCLUDED_TOOLS`]; set to `[]` to expose the
     /// full operator surface on channels again.
     pub channel_exclude: Vec<String>,
     /// Optional exact-model tool allowlists. When a model key is present, only
-    /// matching tools from the ordinary intent-selected set are exposed.
+    /// matching tools from the decision-selected set are exposed.
     pub model_allowlists: HashMap<String, Vec<String>>,
 }
 
@@ -5462,9 +5896,10 @@ impl ToolTieringConfig {
     /// separate stage so that every consumer of this config — capability routing,
     /// the prompt compilers' `core_dependency_is_available`, and the model
     /// allowlist intersection — sees one boundary instead of three. An operator
-    /// who re-enables a tool through `always_include` keeps it: that list is
-    /// consulted before the exclusion inside [`crate::tools::intent`], so the
-    /// default is a default and not a ceiling.
+    /// who re-enables a `channel_exclude` tool through `always_include` keeps
+    /// it: such a name is not folded in here, so the default is a default and
+    /// not a ceiling. `always_include` never overrides `always_exclude`, which
+    /// capability publication applies first on every surface.
     #[must_use]
     pub fn for_channel_surface(&self) -> Self {
         if self.channel_exclude.is_empty() {
@@ -5486,17 +5921,17 @@ impl ToolTieringConfig {
 /// Audit logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuditConfig {
-    /// Path to audit log file (relative to openprx dir)
+    /// Path to the audit log file, relative to the workspace directory and
+    /// kept inside it: a path that could leave it, or a symlink at the file
+    /// or its `.lock`, skips audit records with an error (D-055).
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
-    /// Maximum log size in MB before rotation
+    /// Maximum log size in MB before rotation (at least 1: a size of 0 would
+    /// rotate on every record and keep only the last few, so it is refused
+    /// at load).
     #[serde(default = "default_audit_max_size_mb")]
     pub max_size_mb: u32,
-
-    /// Sign events with HMAC for tamper evidence
-    #[serde(default)]
-    pub sign_events: bool,
 }
 
 fn default_audit_log_path() -> String {
@@ -5512,13 +5947,12 @@ impl Default for AuditConfig {
         Self {
             log_path: default_audit_log_path(),
             max_size_mb: default_audit_max_size_mb(),
-            sign_events: false,
         }
     }
 }
 
 /// DingTalk configuration for Stream Mode messaging
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DingTalkConfig {
     /// Client ID (AppKey) from DingTalk developer console
     pub client_id: String,
@@ -5533,7 +5967,7 @@ pub struct DingTalkConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
     /// App ID from QQ Bot developer console
     pub app_id: String,
@@ -5584,7 +6018,7 @@ const fn default_chat_max_concurrent_visible_turns() -> usize {
 /// asks the daemon to deliver. That is an ordinary authenticated call to the
 /// daemon's control plane, so it needs the same address and token `prx tasks`
 /// uses.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatDaemonConfig {
     /// Base URL of the daemon gateway. Empty (the default) derives it from
     /// `[gateway] host`/`port`, which is right whenever both run on this host.
@@ -5628,7 +6062,7 @@ impl ChatDaemonConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home = UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
+        let home = user_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let openprx_dir = preferred_user_config_dir(&home);
 
         Self {
@@ -5707,10 +6141,102 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = user_home_dir().context("Could not find home directory")?;
     Ok(preferred_user_config_dir(&home))
+}
+
+/// The user's home directory. Every location under the home (the default
+/// `~/.openprx`, other tools' credential files, `~` in a path) is resolved
+/// through here (D-070, D-071).
+#[cfg(not(test))]
+pub fn user_home_dir() -> Option<PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+}
+
+/// The home a test installed with [`set_test_home`], if any.
+#[cfg(test)]
+static TEST_HOME: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
+
+/// Mirror a test's change of `HOME` into [`user_home_dir`]. Call it before
+/// changing the variable. A home a test sets is installed; restoring the
+/// `HOME` the process started with, or removing it, goes back to the scratch
+/// home, so the process's own `HOME` is never installed, even when it lies
+/// under the temp directory.
+#[cfg(test)]
+pub(crate) fn follow_test_home_env(value: Option<&std::ffi::OsStr>) {
+    let original = original_process_home();
+    *TEST_HOME.write() = value.filter(|home| Some(*home) != original).map(PathBuf::from);
+}
+
+/// The `HOME` the lib-test process started with. Every in-crate change of
+/// `HOME` goes through [`follow_test_home_env`] first, so the first call
+/// reads the variable before any test changed it.
+#[cfg(test)]
+pub(crate) fn original_process_home() -> Option<&'static std::ffi::OsStr> {
+    static ORIGINAL_HOME: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    ORIGINAL_HOME.get_or_init(|| std::env::var_os("HOME")).as_deref()
+}
+
+/// The lib-test binary never resolves the operator's real home, and never
+/// reads `HOME`: a test that forgets to point its config, workspace or key
+/// material at a temporary directory lands in a per-process scratch home
+/// instead of reading or writing the real `~/.openprx` (D-070). A test that
+/// needs a home of its own sets `HOME` through a helper that calls
+/// [`follow_test_home_env`].
+#[cfg(test)]
+pub fn user_home_dir() -> Option<PathBuf> {
+    static SCRATCH_HOME: OnceLock<PathBuf> = OnceLock::new();
+    let installed = TEST_HOME.read().clone();
+    if installed.is_some() {
+        return installed;
+    }
+    Some(
+        SCRATCH_HOME
+            .get_or_init(|| {
+                let scratch = std::env::temp_dir().join(format!("openprx-lib-test-home-{}", std::process::id()));
+                if let Err(error) = std::fs::create_dir_all(&scratch) {
+                    tracing::warn!(
+                        "could not create the lib-test scratch home {}: {error}",
+                        scratch.display()
+                    );
+                }
+                scratch
+            })
+            .clone(),
+    )
+}
+
+/// The default OpenPRX directory under the user's home (`~/.openprx`),
+/// without consulting a published `--config-dir`.
+pub fn default_openprx_dir() -> Option<PathBuf> {
+    user_home_dir().map(|home| preferred_user_config_dir(&home))
+}
+
+/// `path` with a leading `~` (alone or followed by a separator) replaced by
+/// [`user_home_dir`]; any other path, or a `~` with no resolvable home, is
+/// returned unchanged. `~user` forms are not expanded.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::Normal(first)) if first == "~" => {
+            user_home_dir().map_or_else(|| path.to_path_buf(), |home| home.join(components.as_path()))
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The platform's per-user configuration directory for OpenPRX (for example
+/// `~/Library/Application Support/openprx` on macOS), derived from
+/// [`user_home_dir`] in the lib-test binary so no test reaches the real one.
+#[cfg(not(test))]
+pub fn platform_config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "openprx").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// See the non-test variant: under the lib-test home instead.
+#[cfg(test)]
+pub fn platform_config_dir() -> Option<PathBuf> {
+    user_home_dir().map(|home| home.join(".platform-config").join("openprx"))
 }
 
 fn preferred_user_config_dir(home: &Path) -> PathBuf {
@@ -6137,40 +6663,6 @@ pub async fn resolve_init_target_dir(
     Ok(openprx_dir)
 }
 
-fn decrypt_optional_secret(
-    store: &crate::security::SecretStore,
-    value: &mut Option<String>,
-    field_name: &str,
-) -> Result<()> {
-    if let Some(raw) = value.clone() {
-        if crate::security::SecretStore::is_encrypted(&raw) {
-            *value = Some(
-                store
-                    .decrypt(&raw)
-                    .with_context(|| format!("Failed to decrypt {field_name}"))?,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn encrypt_optional_secret(
-    store: &crate::security::SecretStore,
-    value: &mut Option<String>,
-    field_name: &str,
-) -> Result<()> {
-    if let Some(raw) = value.clone() {
-        if !crate::security::SecretStore::is_encrypted(&raw) {
-            *value = Some(
-                store
-                    .encrypt(&raw)
-                    .with_context(|| format!("Failed to encrypt {field_name}"))?,
-            );
-        }
-    }
-    Ok(())
-}
-
 fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \
@@ -6179,34 +6671,13 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
-fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()> {
-    let store = crate::security::SecretStore::new(openprx_dir, config.secrets.encrypt);
-    decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-    decrypt_optional_secret(&store, &mut config.composio.api_key, "config.composio.api_key")?;
-
-    decrypt_optional_secret(
-        &store,
-        &mut config.browser.computer_use.api_key,
-        "config.browser.computer_use.api_key",
-    )?;
-
-    decrypt_optional_secret(
-        &store,
-        &mut config.web_search.brave_api_key,
-        "config.web_search.brave_api_key",
-    )?;
-
-    decrypt_optional_secret(
-        &store,
-        &mut config.storage.provider.config.db_url,
-        "config.storage.provider.config.db_url",
-    )?;
-
-    for agent in config.agents.values_mut() {
-        decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-    }
-
-    Ok(())
+/// Whether a stored tree asks for secrets to be encrypted (`secrets.encrypt`,
+/// default `true`).
+fn stored_tree_encrypts_secrets(tree: &toml::Value) -> bool {
+    tree.get("secrets")
+        .and_then(|secrets| secrets.get("encrypt"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
 }
 
 /// Scan all config secret fields for legacy `enc:` values and migrate them to the secure
@@ -6220,55 +6691,52 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
         .config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    let store = crate::security::SecretStore::new(openprx_dir, config.secrets.encrypt);
+    // Never a downgrade: with encryption off, an upgrade would rewrite a
+    // legacy `enc:` value as plaintext (D-101 F-5). The value keeps loading
+    // (it is decrypted on load); it is upgraded once encryption is on.
+    if !config.secrets.encrypt {
+        tracing::debug!("secrets.encrypt is off; legacy enc: values are not rewritten");
+        return Ok(());
+    }
+    let store = crate::security::SecretStore::new(openprx_dir, true);
 
-    // Re-read the raw TOML to obtain the still-encrypted forms of secrets (the loaded
-    // `config` struct already has them decrypted to plaintext).
-    let raw_toml = fs::read_to_string(&config.config_path).await.with_context(|| {
-        format!(
-            "Failed to read config for legacy-secret migration: {}",
-            config.config_path.display()
-        )
-    })?;
+    // One writer at a time in this process, and the files are committed only
+    // if nothing changed them since they were read (a guarded commit), so a
+    // concurrent write is never overwritten with older content; on a
+    // conflict the upgrade waits for the next start (D-101 F-5).
+    let lock = crate::config::manage::transaction::transaction_lock(&config.config_path);
+    let _serialized = lock.lock().await;
+    let revision = crate::config::files::current_config_revision(&config.config_path)
+        .context("Failed to read the configuration revision for legacy-secret migration")?;
 
-    let mut raw_config: Config =
-        toml::from_str(&raw_toml).context("Failed to parse raw config for legacy-secret migration")?;
-    raw_config.config_path = config.config_path.clone();
-    raw_config.workspace_dir = config.workspace_dir.clone();
-
-    // Migrate the fixed (non-agent) secret fields.
-    let mut fixed: Vec<Option<String>> = vec![
-        raw_config.api_key.clone(),
-        raw_config.composio.api_key.clone(),
-        raw_config.browser.computer_use.api_key.clone(),
-        raw_config.web_search.brave_api_key.clone(),
-        raw_config.storage.provider.config.db_url.clone(),
-    ];
-    let mut total_migrated = store.migrate_legacy_secrets(&mut fixed)?;
-    raw_config.api_key = fixed.get(0).cloned().flatten();
-    raw_config.composio.api_key = fixed.get(1).cloned().flatten();
-    raw_config.browser.computer_use.api_key = fixed.get(2).cloned().flatten();
-    raw_config.web_search.brave_api_key = fixed.get(3).cloned().flatten();
-    raw_config.storage.provider.config.db_url = fixed.get(4).cloned().flatten();
-
-    // Migrate per-agent api_key fields.  Use a sorted key list to avoid relying on
-    // HashMap iteration order when mapping results back.
-    let agent_keys: Vec<String> = {
-        let mut keys: Vec<String> = raw_config.agents.keys().cloned().collect();
-        keys.sort();
-        keys
-    };
-    let mut agent_values: Vec<Option<String>> = agent_keys
-        .iter()
-        .filter_map(|k| raw_config.agents.get(k).map(|a| a.api_key.clone()))
-        .collect();
-
-    total_migrated += store.migrate_legacy_secrets(&mut agent_values)?;
-
-    for (key, new_val) in agent_keys.iter().zip(agent_values) {
-        if let Some(agent) = raw_config.agents.get_mut(key) {
-            agent.api_key = new_val;
+    // Re-read every stored file — `config.toml` and each `config.d`
+    // fragment — to obtain the still-encrypted forms of secrets (the loaded
+    // `config` already holds them decrypted). Each tree is migrated in place
+    // and a changed file is written back as it was otherwise, so no default
+    // is injected into a file that shares its settings with fragments
+    // (PMMA F-10: fragments were decrypted on load but never upgraded).
+    let mut image = crate::config::files::current_before_image(&config.config_path)
+        .context("Failed to read the configuration for legacy-secret migration")?;
+    let mut total_migrated = 0_usize;
+    for file in &mut image.files {
+        let Some(raw_toml) = file.contents.as_deref() else {
+            continue;
+        };
+        let mut stored: toml::Value = toml::from_str(raw_toml)
+            .with_context(|| format!("Failed to parse {} for legacy-secret migration", file.relative_path))?;
+        // Every encrypted-at-rest path of the secret registry, the provider
+        // route and rotation keys included.
+        let migrated = crate::config::secret_paths::migrate_legacy_at_rest(&mut stored, &store)?;
+        if migrated == 0 {
+            continue;
         }
+        total_migrated += migrated;
+        // The values are already in enc2: form, so this must not go through
+        // to_stored_toml_value(); write the migrated tree as it is.
+        file.contents = Some(
+            toml::to_string_pretty(&stored)
+                .with_context(|| format!("Failed to render the migrated {}", file.relative_path))?,
+        );
     }
 
     if total_migrated == 0 {
@@ -6276,23 +6744,74 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
         return Ok(());
     }
 
-    tracing::info!(
-        count = total_migrated,
-        "Migrated legacy XOR-encrypted secrets to ChaCha20-Poly1305; saving config"
-    );
-
-    // Serialize and persist.  The values are already in enc2: form so we must NOT
-    // call to_stored_toml_value() (which would double-encrypt them).  Serialize
-    // directly and write atomically.
-    let toml_str =
-        toml::to_string_pretty(&toml::Value::try_from(&raw_config).context("Failed to serialize migrated config")?)
-            .context("Failed to convert migrated config to TOML string")?;
-    let plan = crate::config::files::plan_main_file_mutation(&config.config_path, &config.workspace_dir, toml_str)
+    // Unchanged files are written back byte for byte; the whole tree is
+    // staged and validated, and committed through the journaled writer.
+    let plan = crate::config::files::plan_before_image_restore(&config.config_path, &config.workspace_dir, &image)
         .context("Failed to plan migrated config")?;
-    crate::config::files::commit_mutation_atomically(plan)
-        .await
-        .context("Failed to write migrated config")?;
+    match crate::config::files::commit_mutation_guarded(plan, Some(&revision), |_| Ok(())).await {
+        Ok(_) => {
+            tracing::info!(
+                count = total_migrated,
+                "Migrated legacy XOR-encrypted secrets to ChaCha20-Poly1305"
+            );
+            Ok(())
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::config::files::ConfigRevisionConflict>()
+                .is_some() =>
+        {
+            tracing::info!("The configuration changed while legacy secrets were upgraded; retrying at the next start");
+            Ok(())
+        }
+        Err(error) => Err(error).context("Failed to write migrated config"),
+    }
+}
 
+/// Every `credential_ref` names a credential reference id (`cred-<name>`),
+/// and a route, embedding route or agent sets either an inline `api_key` or a
+/// `credential_ref`, never both: which one is sent would otherwise depend on
+/// the reader. Whether the reference exists, and was issued for the
+/// selection's provider, is checked when a change is planned (the store is
+/// not read at load).
+fn validate_credential_references(config: &Config) -> Result<()> {
+    let holders = config
+        .model_routes
+        .iter()
+        .enumerate()
+        .map(|(index, route)| {
+            (
+                format!("model_routes[{index}]"),
+                route.api_key.as_deref(),
+                route.credential_ref.as_deref(),
+            )
+        })
+        .chain(config.embedding_routes.iter().enumerate().map(|(index, route)| {
+            (
+                format!("embedding_routes[{index}]"),
+                route.api_key.as_deref(),
+                route.credential_ref.as_deref(),
+            )
+        }))
+        .chain(config.agents.iter().map(|(name, agent)| {
+            (
+                format!("agents.{name}"),
+                agent.api_key.as_deref(),
+                agent.credential_ref.as_deref(),
+            )
+        }));
+    for (path, api_key, reference) in holders {
+        let Some(reference) = reference else {
+            continue;
+        };
+        crate::config::manage::credentials::CredentialReferences::reference(reference.trim())
+            .map_err(|error| anyhow::anyhow!("{path}.credential_ref: {error}"))?;
+        anyhow::ensure!(
+            api_key.is_none_or(|key| key.trim().is_empty()),
+            "{path} sets both api_key and credential_ref; keep one (the reference keeps the key in the \
+             encrypted credential store)"
+        );
+    }
     Ok(())
 }
 
@@ -6325,7 +6844,7 @@ impl Config {
         migrate_legacy_config_keys(&mut merged, config_path)?;
 
         let mut unknown_paths = Vec::new();
-        let config = serde_ignored::deserialize(merged.into_deserializer(), |path| {
+        let config: Self = serde_ignored::deserialize(merged.into_deserializer(), |path| {
             unknown_paths.push(path.to_string());
         })
         .context("Failed to deserialize merged config")?;
@@ -6375,6 +6894,25 @@ impl Config {
 
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml_with_gate(config_path)?;
+        Self::from_stored_tree(merged, config_path, workspace_dir)
+    }
+
+    /// Load a merged stored tree that belongs to `config_path` exactly as
+    /// [`load_from_path`](Self::load_from_path) loads the files: secrets are
+    /// decrypted with that directory's key, then the tree is deserialized
+    /// and validated. Used to check a staged candidate before it is written.
+    pub(crate) fn from_stored_tree(
+        mut merged: toml::Value,
+        config_path: &Path,
+        workspace_dir: PathBuf,
+    ) -> Result<Self> {
+        let openprx_dir = config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = crate::security::SecretStore::new(openprx_dir, stored_tree_encrypts_secrets(&merged));
+        crate::config::secret_paths::decrypt_at_rest(&mut merged, &store)?;
+        crate::config::secret_paths::warn_on_stored_masks(&merged);
+
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
         let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
@@ -6382,11 +6920,6 @@ impl Config {
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
-
-        let openprx_dir = config_path
-            .parent()
-            .context("Config path must have a parent directory")?;
-        decrypt_config_secrets(&mut config, openprx_dir)?;
         config.validate()?;
         Ok(config)
     }
@@ -6421,6 +6954,36 @@ impl Config {
             "Config loaded read-only"
         );
         Ok(config)
+    }
+
+    /// The configuration for a command that only reads (D-101 F-5): the
+    /// existing one, loaded read-only; with none yet, the built-in defaults
+    /// in memory, at the paths a first write would use. Nothing is written
+    /// and no directory is created either way; the caller says the defaults
+    /// are shown when `config_path` does not exist.
+    ///
+    /// # Errors
+    ///
+    /// When the directories cannot be resolved, or an existing configuration
+    /// does not load.
+    pub async fn load_existing_or_defaults_read_only(explicit_config_dir: Option<&str>) -> Result<Self> {
+        let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let (openprx_dir, workspace_dir, resolution_source) =
+            resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir, explicit_config_dir).await?;
+        let config_path = openprx_dir.join("config.toml");
+        if config_path.is_file() {
+            return Self::load_existing_read_only_with_config_dir(explicit_config_dir).await;
+        }
+        tracing::info!(
+            path = %config_path.display(),
+            source = resolution_source.as_str(),
+            "No config yet; showing the built-in defaults read-only"
+        );
+        Ok(Self {
+            workspace_dir,
+            config_path,
+            ..Self::default()
+        })
     }
 
     pub async fn load_or_init_with_config_dir(explicit_config_dir: Option<&str>) -> Result<Self> {
@@ -6498,11 +7061,296 @@ impl Config {
         }
     }
 
+    /// `[cost].prices` keys that spell a provider with URL credentials must stay
+    /// distinct once those credentials are redacted (D-027).
+    ///
+    /// Usage records name the provider redacted, so the price of a turn is
+    /// found by the redacted spelling. Two keys that redact alike (two
+    /// accounts on one endpoint, same model) would make that lookup ambiguous
+    /// and would show as one entry in `GET /api/config`, so a round trip could
+    /// copy one price onto the other. Like a duplicate tool-dialect entry, this
+    /// is an error, never "last wins". The error names the keys only in their
+    /// redacted form.
+    fn validate_cost_price_keys(&self) -> Result<()> {
+        let mut entries: Vec<_> = self.cost.prices.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        for (index, (_, price)) in entries.into_iter().enumerate() {
+            for (field, value) in [
+                ("input", price.input),
+                ("output", price.output),
+                ("cache_write", price.cache_write),
+                ("cache_read", price.cache_read),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!("cost.prices entry {index} {field} must be finite and nonnegative");
+                }
+            }
+        }
+        let mut by_redacted: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for key in self.cost.prices.keys() {
+            if let std::borrow::Cow::Owned(redacted) = crate::providers::redact_endpoint_userinfo(key) {
+                *by_redacted.entry(redacted).or_insert(0) += 1;
+            }
+        }
+        if let Some((redacted, count)) = by_redacted.into_iter().find(|(_, count)| *count > 1) {
+            let listed = vec![format!("`{redacted}`"); count].join(" and ");
+            anyhow::bail!(
+                "cost.prices: the keys {listed} name the same provider and model once their URL userinfo is \
+                 redacted, so a turn's price would be ambiguous. Keep one key per endpoint and model (prefer a \
+                 key without credentials; put them in `api_key`)."
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse a `[[providers.tool_dialects]]` entry that would be ignored,
+    /// ambiguous or silently widened, naming the entry by index.
+    ///
+    /// Only providers whose constructor reads the declaration are accepted, so
+    /// an accepted entry is never a silently ignored key. Two entries are the
+    /// same when the provider identity (C1's canonical key) and the model
+    /// (ignoring ASCII case) match; a duplicate is an error, never "last wins".
+    fn validate_provider_tool_dialects(&self) -> Result<()> {
+        let mut seen: Vec<(String, Option<String>, usize)> = Vec::with_capacity(self.providers.tool_dialects.len());
+        for (index, entry) in self.providers.tool_dialects.iter().enumerate() {
+            let at = format!("providers.tool_dialects[{index}]");
+            let provider = entry.provider.trim();
+            if provider.is_empty() {
+                anyhow::bail!("{at}.provider must not be empty");
+            }
+            if !crate::providers::accepts_tool_dialect_declarations(provider) {
+                // The URL may carry `user:password@`; it never reaches an error.
+                let provider = crate::providers::redact_endpoint_userinfo(provider);
+                anyhow::bail!(
+                    "{at}.provider '{provider}' does not take a tool dialect declaration: only a \
+                     `custom:<http(s) url>` endpoint and the catalog entries for a server the operator \
+                     runs ({}) read one in this release",
+                    crate::providers::TOOL_DIALECT_DECLARABLE_CATALOG.join(", ")
+                );
+            }
+            if entry.tool_schema.is_none() && entry.tool_call.is_none() {
+                anyhow::bail!("{at} declares nothing: set `tool_schema`, `tool_call`, or both");
+            }
+            let model = match entry.model.as_deref().map(str::trim) {
+                Some("") => anyhow::bail!("{at}.model must not be empty; omit it to cover every model"),
+                Some(model) => Some(model.to_ascii_lowercase()),
+                None => None,
+            };
+            if model.is_some() && entry.tool_call.is_some() {
+                anyhow::bail!(
+                    "{at}: `tool_call` applies to every model of an endpoint (the response parser cannot tell \
+                     models apart), so it must be declared on an entry without `model`"
+                );
+            }
+            let key = crate::providers::canonical_provider_key(provider);
+            if let Some((_, _, first)) = seen
+                .iter()
+                .find(|(seen_key, seen_model, _)| *seen_key == key && *seen_model == model)
+            {
+                let shown = crate::providers::redact_endpoint_userinfo(provider);
+                anyhow::bail!(
+                    "{at} duplicates providers.tool_dialects[{first}]: both declare provider '{shown}' for {}",
+                    model
+                        .as_deref()
+                        .map_or_else(|| "every model".to_string(), |m| format!("model '{m}'"))
+                );
+            }
+            seen.push((key, model, index));
+        }
+        let unused: Vec<(usize, String)> = crate::providers::unused_tool_dialect_entries(self)
+            .into_iter()
+            .filter_map(|index| {
+                self.providers.tool_dialects.get(index).map(|entry| {
+                    (
+                        index,
+                        crate::providers::redact_endpoint_userinfo(entry.provider.trim()).into_owned(),
+                    )
+                })
+            })
+            .collect();
+        // The C2-K key keeps loading for one release; its rows belong in
+        // `[[providers.models]]` (SP-PMM §2.7, PMM-H).
+        if !self.providers.tool_dialects.is_empty()
+            && !REPORTED_TOOL_DIALECTS_DEPRECATION.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                entries = self.providers.tool_dialects.len(),
+                "[[providers.tool_dialects]] is deprecated and will stop loading in a later release; \
+                 `prx providers migrate --apply` moves each entry into [[providers.models]] \
+                 (tool_schema -> tool_schema_dialect, tool_call -> tool_call_dialect)"
+            );
+        }
+        // A configuration is validated at every load and reload; the same set
+        // of unused entries is reported once per process (INT-2B a37).
+        if !unused.is_empty() && REPORTED_UNUSED_TOOL_DIALECTS.lock().insert(unused.clone()) {
+            for (index, provider) in &unused {
+                tracing::warn!(
+                    entry = %format!("providers.tool_dialects[{index}]"),
+                    provider = %provider,
+                    "tool dialect declaration names a provider nothing in this configuration uses \
+                     (not the default, a fallback, a model route, a router model or an agent); \
+                     check the URL, port and path, or ignore this if the provider is given on the \
+                     command line (`--provider`)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a `[[providers.models]]` entry that would be ignored, ambiguous
+    /// or in conflict with `[[providers.tool_dialects]]`, naming it by index.
+    ///
+    /// Two entries are the same when the provider identity and the model
+    /// (ignoring ASCII case) match; a duplicate is an error, never "last
+    /// wins". A dialect may be declared for one `(provider, model)` in only one
+    /// of the two tables. Every error redacts URL userinfo.
+    fn validate_provider_models(&self) -> Result<()> {
+        type Key = (crate::providers::ProviderId, Option<String>);
+        let mut seen: Vec<(Key, usize)> = Vec::with_capacity(self.providers.models.len());
+        for (index, entry) in self.providers.models.iter().enumerate() {
+            let at = format!("providers.models[{index}]");
+            let provider = entry.provider.trim();
+            if provider.is_empty() {
+                anyhow::bail!("{at}.provider must not be empty");
+            }
+            let shown = crate::providers::redact_endpoint_userinfo(provider);
+            let id = crate::providers::ProviderId::of(provider);
+            if !id.is_resolvable() {
+                anyhow::bail!(
+                    "{at}.provider '{shown}' names no provider this build can construct; use a name from \
+                     `prx providers` or `custom:<url>`"
+                );
+            }
+            let model = match entry.model.as_deref().map(str::trim) {
+                Some("") => anyhow::bail!("{at}.model must not be empty; omit it to cover every model"),
+                Some(model) => Some(model.to_ascii_lowercase()),
+                None => None,
+            };
+            if !entry.declares_anything() {
+                anyhow::bail!(
+                    "{at} declares nothing: set `operations`, a feature (`native_tools`, `vision_input`, \
+                     `streaming`, `structured_output`), a dialect or `context_window`"
+                );
+            }
+            if entry.operations.as_ref().is_some_and(Vec::is_empty) {
+                anyhow::bail!("{at}.operations must list at least one operation; omit it to declare none");
+            }
+            if entry.context_window == Some(0) {
+                anyhow::bail!("{at}.context_window must be greater than zero");
+            }
+            let declares_dialect = entry.tool_schema_dialect.is_some() || entry.tool_call_dialect.is_some();
+            if declares_dialect && !crate::providers::accepts_tool_dialect_declarations(provider) {
+                anyhow::bail!(
+                    "{at}.provider '{shown}' does not take a tool dialect declaration: only a \
+                     `custom:<http(s) url>` endpoint and the catalog entries for a server the operator \
+                     runs ({}) read one in this release",
+                    crate::providers::TOOL_DIALECT_DECLARABLE_CATALOG.join(", ")
+                );
+            }
+            if model.is_some() && entry.tool_call_dialect.is_some() {
+                anyhow::bail!(
+                    "{at}: `tool_call_dialect` applies to every model of an endpoint (the response parser \
+                     cannot tell models apart), so it must be declared on an entry without `model`"
+                );
+            }
+            // Compared ignoring case, shown as the operator wrote it.
+            let scope = entry
+                .model
+                .as_deref()
+                .map(str::trim)
+                .map_or_else(|| "every model".to_string(), |m| format!("model '{m}'"));
+            let key: Key = (id, model);
+            if let Some((_, first)) = seen.iter().find(|(seen_key, _)| *seen_key == key) {
+                anyhow::bail!("{at} duplicates providers.models[{first}]: both declare provider '{shown}' for {scope}");
+            }
+            for (other, dialects) in self.providers.tool_dialects.iter().enumerate() {
+                let same_key = crate::providers::ProviderId::of(&dialects.provider) == key.0
+                    && dialects.model.as_deref().map(|m| m.trim().to_ascii_lowercase()) == key.1;
+                let overlaps = (entry.tool_schema_dialect.is_some() && dialects.tool_schema.is_some())
+                    || (entry.tool_call_dialect.is_some() && dialects.tool_call.is_some());
+                if same_key && overlaps {
+                    anyhow::bail!(
+                        "{at} and providers.tool_dialects[{other}] both declare a tool dialect for provider \
+                         '{shown}' and {scope}; declare it in one table"
+                    );
+                }
+            }
+            seen.push((key, index));
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.causal_tree.validate()?;
+        // The JWKS URI is published in the public, signed Agent Card: a
+        // `user:password@` there would be handed to every peer.
+        if let Some(uri) = self.a2a.card_jwks_uri.as_deref() {
+            anyhow::ensure!(
+                matches!(
+                    crate::providers::redact_endpoint_userinfo(uri),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "a2a.card_jwks_uri is published in the public Agent Card and must not carry user:password@"
+            );
+        }
+        // Runtime-interpreted enumerations are read once, canonically, and an
+        // unknown value is refused here rather than falling back silently
+        // (D-050). `autonomy.scopes.default` is typed (`ScopeDefault`).
+        // A zero size rotates the audit trail on every record, keeping only
+        // the last few (D-052).
+        anyhow::ensure!(
+            self.security.audit.max_size_mb >= 1,
+            "security.audit.max_size_mb must be at least 1"
+        );
+        // The audit log is written only through real directories (every
+        // component is opened without following a link, D-055), so a
+        // `log_path` through a symlinked directory skips every record. This
+        // is a warning, not a load error (D-063 G-1): the check reads the
+        // workspace, which the agent can write, and a planted link must not
+        // be able to block every configuration load, reload and write. The
+        // audit logger itself still refuses to write through the link.
+        #[cfg(unix)]
+        if let Some(link) =
+            crate::security::audit::symlinked_log_directory(&self.workspace_dir, &self.security.audit.log_path)
+        {
+            tracing::warn!(
+                log_path = %self.security.audit.log_path,
+                link = %link.display(),
+                "security.audit.log_path runs through a symbolic link; the audit log is written only through \
+                 real directories inside the workspace, so audit records are skipped until log_path names the \
+                 real directory"
+            );
+        }
+        // `tunnel.provider` is compared literally by the gateway's public-bind
+        // guard (`== "none"`) and by the tunnel factory, so only the canonical
+        // spellings are accepted: an empty or padded value would pass the
+        // guard as "a tunnel" and start none.
+        anyhow::ensure!(
+            matches!(
+                self.tunnel.provider.as_str(),
+                "none" | "cloudflare" | "tailscale" | "ngrok" | "custom"
+            ),
+            "tunnel.provider must be one of none, cloudflare, tailscale, ngrok, custom"
+        );
+        if let Some(lark) = &self.channels_config.lark {
+            lark.validate()?;
+        }
+        validate_credential_references(self)?;
+        for (index, policy) in self.user_policies.iter().enumerate() {
+            anyhow::ensure!(
+                crate::memory::principal::Role::parse(&policy.role).is_some(),
+                "user_policies[{index}].role must be one of owner, member, guest, anonymous"
+            );
+            anyhow::ensure!(
+                crate::memory::principal::Visibility::parse(&policy.visibility_ceiling).is_some(),
+                "user_policies[{index}].visibility_ceiling must be one of system, owner, private, user, group, \
+                 project, public"
+            );
+        }
         self.self_system
             .fitness
             .timezone
@@ -6519,6 +7367,11 @@ impl Config {
                 self.self_system.fitness.run_at
             )
         })?;
+        anyhow::ensure!(
+            (1..=MAX_EVOLUTION_JUDGE_TIMEOUT_SECS).contains(&self.self_system.evolution_judge_timeout_secs),
+            "self_system.evolution_judge_timeout_secs must be between 1 and {MAX_EVOLUTION_JUDGE_TIMEOUT_SECS}, got {}",
+            self.self_system.evolution_judge_timeout_secs
+        );
         anyhow::ensure!(
             self.self_system.fitness.min_samples > 0,
             "self_system.fitness.min_samples must be greater than zero"
@@ -6667,11 +7520,35 @@ impl Config {
             if route.hint.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].hint must not be empty");
             }
+            // The router looks a hint up exactly while the model check trims,
+            // so a hint with whitespace is matched unreliably: `hint:fast`
+            // passes every check against a route "fast " and then fails on
+            // each request (R-PMMCh H-1).
+            if route.hint.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "model_routes[{i}].hint '{}' contains whitespace, which `hint:<name>` does not reliably select; \
+                     write the hint without whitespace",
+                    route.hint.escape_debug()
+                );
+            }
             if route.provider.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].provider must not be empty");
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].model must not be empty");
+            }
+            // Two routes with one hint are ambiguous: the model check and the
+            // router could pick different ones (D-035).
+            if let Some(first) = self
+                .model_routes
+                .iter()
+                .take(i)
+                .position(|earlier| earlier.hint.trim() == route.hint.trim())
+            {
+                anyhow::bail!(
+                    "model_routes[{i}] and model_routes[{first}] both use hint '{}'; each hint must name one route",
+                    route.hint.trim()
+                );
             }
         }
 
@@ -6685,6 +7562,9 @@ impl Config {
         }
 
         self.router.validate()?;
+        self.validate_provider_tool_dialects()?;
+        self.validate_provider_models()?;
+        self.validate_cost_price_keys()?;
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
@@ -6696,6 +7576,17 @@ impl Config {
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+        // One hint should name one embedding route, as for model routes
+        // (D-035). An existing configuration with two still loads (an upgrade
+        // never stops PRX from starting over it): it is reported once per
+        // process here and by `prx doctor`, and a change to the embedding
+        // routes that keeps a duplicate is refused (D-104 C-1).
+        let duplicates = duplicate_embedding_route_hints(self);
+        if !duplicates.is_empty() && REPORTED_DUPLICATE_EMBEDDING_HINTS.lock().insert(duplicates.clone()) {
+            for note in &duplicates {
+                tracing::warn!("{note}");
             }
         }
 
@@ -6745,6 +7636,21 @@ impl Config {
         // Chat's link to the daemon it borrows channels from.
         self.chat.validate()?;
 
+        // A stdio MCP server's `working_dir` is absolute (D-095 N-4); whether
+        // it exists is checked when a change sets it (the configuration
+        // transaction), not at every load.
+        let mut servers = self.mcp.servers.iter().collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.0.cmp(right.0));
+        for (name, server) in servers {
+            if let Some(dir) = server.working_dir.as_deref() {
+                anyhow::ensure!(
+                    std::path::Path::new(dir.trim()).is_absolute(),
+                    "mcp.servers.{}.working_dir must be an absolute path",
+                    name.escape_default()
+                );
+            }
+        }
+
         // The MCP caller identity is `agent:{issuer}:{subject}` and the owner id
         // wraps it, and that string is an authorization boundary. The issuer
         // component is only ever one of the fixed origin names or this single
@@ -6776,55 +7682,35 @@ impl Config {
                 "mcp_server.exposed_tools exposes tools with side effects; they are advertised with their real effect and need an Idempotency-Key to be retry-safe"
             );
         }
+        // A warning, not an error: an entry that became inert must not stop an
+        // existing daemon from starting.
+        let refused = self.mcp_server.refused_exposed_tools();
+        if !refused.is_empty() {
+            tracing::warn!(
+                tools = refused.join(", "),
+                "mcp_server.exposed_tools lists tools that do not enforce per-owner isolation; external MCP callers are refused them"
+            );
+        }
 
         Ok(())
     }
 
     pub async fn save(&self) -> Result<()> {
-        if crate::config::files::has_managed_fragments(&self.config_path)? {
-            crate::config::files::write_split_config(self, false).await?;
-            return Ok(());
-        }
-
-        let toml_str = self.to_stored_toml_string()?;
-        let plan = crate::config::files::plan_mutation(&self.config_path, &self.workspace_dir, toml_str, Vec::new())?;
+        let plan = crate::config::files::plan_structured_save(self)?;
         crate::config::files::commit_mutation_atomically(plan).await
     }
 
+    /// The stored form of this configuration: every encrypted-at-rest path of
+    /// the secret registry is encrypted when `secrets.encrypt = true`.
     pub fn to_stored_toml_value(&self) -> Result<toml::Value> {
-        let mut config_to_save = self.clone();
         let openprx_dir = self
             .config_path
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::security::SecretStore::new(openprx_dir, self.secrets.encrypt);
-
-        encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
-        encrypt_optional_secret(&store, &mut config_to_save.composio.api_key, "config.composio.api_key")?;
-
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.browser.computer_use.api_key,
-            "config.browser.computer_use.api_key",
-        )?;
-
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.web_search.brave_api_key,
-            "config.web_search.brave_api_key",
-        )?;
-
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.storage.provider.config.db_url,
-            "config.storage.provider.config.db_url",
-        )?;
-
-        for agent in config_to_save.agents.values_mut() {
-            encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-        }
-
-        toml::Value::try_from(&config_to_save).context("Failed to convert config into TOML value")
+        let mut value = toml::Value::try_from(self).context("Failed to convert config into TOML value")?;
+        crate::config::secret_paths::encrypt_at_rest(&mut value, &store)?;
+        Ok(value)
     }
 
     pub(crate) fn to_stored_toml_string(&self) -> Result<String> {
@@ -6997,9 +7883,48 @@ mod tests {
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReadDirStream;
 
+    #[test]
+    async fn invalid_cost_tariff_is_rejected_without_disclosing_key() {
+        for (field, invalid) in [
+            ("input", -1.0),
+            ("output", f64::NAN),
+            ("cache_write", f64::INFINITY),
+            ("cache_read", -0.5),
+        ] {
+            let mut config = Config::default();
+            let mut price = ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            };
+            match field {
+                "input" => price.input = invalid,
+                "output" => price.output = invalid,
+                "cache_write" => price.cache_write = invalid,
+                _ => price.cache_read = invalid,
+            }
+            config.cost.prices.insert(
+                "custom:http://prx_user:placeholder@example.com/v1/model".to_string(),
+                price,
+            );
+            let error = config
+                .validate()
+                .expect_err("invalid tariff must fail validation")
+                .to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(!error.contains("placeholder"), "{error}");
+        }
+    }
+
     /// Helper to set env vars in tests (unsafe in edition 2024).
     #[allow(unsafe_code)]
     fn test_set_env(key: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>) {
+        // The lib-test home resolver never reads `HOME`; it follows a test's
+        // own home here (D-070).
+        if key.as_ref() == "HOME" {
+            follow_test_home_env(Some(value.as_ref()));
+        }
         // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
         unsafe { std::env::set_var(key, value) }
     }
@@ -7007,6 +7932,9 @@ mod tests {
     /// Helper to remove env vars in tests (unsafe in edition 2024).
     #[allow(unsafe_code)]
     fn test_remove_env(key: impl AsRef<std::ffi::OsStr>) {
+        if key.as_ref() == "HOME" {
+            follow_test_home_env(None);
+        }
         // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
         unsafe { std::env::remove_var(key) }
     }
@@ -7044,6 +7972,7 @@ mod tests {
             model: "model-test".into(),
             system_prompt: None,
             api_key: None,
+            credential_ref: None,
             temperature: None,
             max_depth: 3,
             agentic: true,
@@ -7063,6 +7992,65 @@ mod tests {
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("agents.worker.allowed_tools must not be empty"));
+    }
+
+    /// PMM-H: a route, an embedding route or an agent names either an inline
+    /// `api_key` or a `credential_ref` (`cred-<name>`), never both, and a
+    /// `credential_ref` must be a reference id.
+    #[test]
+    async fn a_selection_names_an_inline_key_or_a_credential_reference() {
+        let mut config = Config::default();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            api_key: None,
+            credential_ref: Some("cred-route-key".into()),
+        });
+        config.validate().expect("a reference alone is valid");
+
+        if let Some(route) = config.model_routes.first_mut() {
+            route.api_key = Some("inline-sentinel".into());
+        }
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("model_routes[0] sets both api_key and credential_ref"),
+            "{error}"
+        );
+        assert!(!error.contains("inline-sentinel"), "{error}");
+
+        if let Some(route) = config.model_routes.first_mut() {
+            route.api_key = None;
+            route.credential_ref = Some("openai:default".into());
+        }
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("model_routes[0].credential_ref"), "{error}");
+    }
+
+    /// D-104 C-1 (ruling): two embedding routes sharing a hint still load
+    /// (an upgrade never stops PRX over them); they are named, with the fix.
+    #[test]
+    async fn duplicate_embedding_route_hints_load_and_are_reported() {
+        let route = |model: &str| EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: model.into(),
+            dimensions: None,
+            api_key: None,
+            credential_ref: None,
+        };
+        let mut config = Config::default();
+        config.embedding_routes = vec![route("text-embedding-3-small"), route("text-embedding-3-large")];
+        config.validate().expect("an existing duplicate still loads");
+        let notes = duplicate_embedding_route_hints(&config);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes.first().is_some_and(|note| {
+                note.contains("embedding_routes[1] and embedding_routes[0] both use hint 'semantic'")
+                    && note.contains("Give each route its own hint")
+            }),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -7579,6 +8567,32 @@ min_chars = 12
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
         assert!(parsed.channels_config.telegram.is_some());
         assert_eq!(parsed.channels_config.telegram.unwrap().bot_token, "123:ABC");
+    }
+
+    /// D-044: the evolution judge call is bounded; the bound is validated so
+    /// it can be neither zero (every verdict deferred) nor effectively
+    /// unbounded.
+    #[test]
+    async fn evolution_judge_timeout_is_validated() {
+        let with_timeout = |secs: u64| {
+            let raw = format!(
+                "workspace_dir = \"/tmp/ws\"\nconfig_path = \"/tmp/config.toml\"\ndefault_temperature = 0.7\n\
+                 [self_system]\nevolution_judge_timeout_secs = {secs}\n"
+            );
+            toml::from_str::<Config>(&raw).expect("test: config parses")
+        };
+        for secs in [0, 3601] {
+            let error = with_timeout(secs)
+                .validate()
+                .expect_err("an out-of-range judge timeout is a configuration error");
+            assert!(
+                format!("{error:#}").contains("self_system.evolution_judge_timeout_secs"),
+                "{secs}: {error:#}"
+            );
+        }
+        for secs in [1, 180, 3600] {
+            with_timeout(secs).validate().expect("test: an in-range timeout loads");
+        }
     }
 
     #[test]
@@ -8371,6 +9385,7 @@ model = "override-beta"
                 model: "test-model".into(),
                 system_prompt: Some("delegate".into()),
                 api_key: Some("agent-secret".into()),
+                credential_ref: None,
                 temperature: Some(0.2),
                 max_depth: 4,
                 agentic: true,
@@ -8456,6 +9471,7 @@ model = "override-beta"
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
+                credential_ref: None,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -8994,6 +10010,22 @@ channel_id = "C123"
         assert_eq!(wc.backend_type(), "web");
     }
 
+    /// A zero audit size would rotate the trail on every record (D-052).
+    #[tokio::test]
+    async fn audit_max_size_zero_is_rejected() {
+        let mut config = Config::default();
+        config.security.audit.max_size_mb = 0;
+        let err = config.validate().expect_err("test: a zero audit size must be rejected");
+        assert!(
+            err.to_string()
+                .contains("security.audit.max_size_mb must be at least 1"),
+            "test: unexpected error: {err}"
+        );
+
+        config.security.audit.max_size_mb = 1;
+        assert!(config.validate().is_ok(), "test: the smallest non-zero size loads");
+    }
+
     #[tokio::test]
     async fn whatsapp_read_pool_size_zero_is_rejected() {
         let mut config = Config::default();
@@ -9446,6 +10478,51 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
+    /// D-101 F-5 ruling: a read-only command on a machine with no
+    /// configuration sees the built-in defaults and writes nothing: no file
+    /// and no directory under the (temporary) home.
+    #[test]
+    async fn read_only_defaults_without_a_config_create_nothing() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = tempfile::TempDir::new().expect("test: temp home");
+        let original_home = std::env::var("HOME").ok();
+        let original_workspace = std::env::var("OPENPRX_WORKSPACE").ok();
+        let original_config_dir = std::env::var("OPENPRX_CONFIG_DIR").ok();
+        test_set_env("HOME", temp_home.path());
+        test_remove_env("OPENPRX_WORKSPACE");
+        test_remove_env("OPENPRX_CONFIG_DIR");
+
+        let config = Config::load_existing_or_defaults_read_only(None).await;
+
+        let created = std::fs::read_dir(temp_home.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(home) = original_home {
+            test_set_env("HOME", home);
+        } else {
+            test_remove_env("HOME");
+        }
+        if let Some(workspace) = original_workspace {
+            test_set_env("OPENPRX_WORKSPACE", workspace);
+        }
+        if let Some(config_dir) = original_config_dir {
+            test_set_env("OPENPRX_CONFIG_DIR", config_dir);
+        }
+        let config = config.expect("test: defaults without a config");
+        assert!(
+            config.config_path.starts_with(temp_home.path()),
+            "{}",
+            config.config_path.display()
+        );
+        assert!(!config.config_path.exists());
+        assert!(created.is_empty(), "a read-only load created {created:?}");
+    }
+
     #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
@@ -9716,8 +10793,14 @@ default_model = "legacy-model"
         build_runtime_proxy_client_with_timeouts(&service_key, 30, 5).expect("test: proxy client with timeouts build");
         assert!(runtime_proxy_cache_contains(&cache_key));
 
+        let generation = runtime_proxy_generation();
         set_runtime_proxy_config(ProxyConfig::default());
         assert!(!runtime_proxy_cache_contains(&cache_key));
+        // Caches outside this module (the decision clients) key by it.
+        assert!(
+            runtime_proxy_generation() > generation,
+            "a proxy change moves the generation"
+        );
     }
 
     #[test]
@@ -9814,6 +10897,45 @@ allowed_from = ["*"]
         assert_eq!(parsed.app_id, "cli_123456");
         assert_eq!(parsed.app_secret, "secret_abc");
         assert!(!parsed.use_feishu);
+    }
+
+    /// D-060 L-4: a webhook-mode Lark channel without a verification token
+    /// used to load and then fail at every listener start (retried with
+    /// backoff forever). It is refused when the configuration loads, naming
+    /// the setting; WebSocket mode without a token still loads.
+    #[test]
+    async fn a_lark_webhook_without_a_verification_token_fails_config_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.7\n\n[channels_config]\ncli = true\n\n[channels_config.lark]\napp_id = \"cli_a\"\napp_secret = \"s\"\n\
+             receive_mode = \"webhook\"\nport = 9898\n",
+        )
+        .unwrap();
+        let error = Config::load_from_path(&config_path, dir.path().join("workspace"))
+            .expect_err("test: webhook mode without a token must not load");
+        assert!(
+            format!("{error:#}").contains("channels_config.lark.verification_token"),
+            "the error names the setting: {error:#}"
+        );
+
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.7\n\n[channels_config]\ncli = true\n\n[channels_config.lark]\napp_id = \"cli_a\"\napp_secret = \"s\"\n\
+             receive_mode = \"websocket\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace"))
+            .expect("test: websocket mode needs no token");
+        assert!(loaded.channels_config.lark.is_some());
+
+        let mut lark = loaded.channels_config.lark.expect("test: lark section");
+        lark.receive_mode = LarkReceiveMode::Webhook;
+        lark.verification_token = Some("  ".into());
+        assert!(lark.validate().is_err(), "a blank token counts as unset");
+        lark.verification_token = Some("tok".into());
+        assert!(lark.validate().is_ok());
     }
 
     #[test]
@@ -10339,7 +11461,7 @@ classifier_timeout_secs = 8
 
     fn scope_config_with(send_allow: &[&str], send_deny: &[&str]) -> ScopeConfig {
         ScopeConfig {
-            default: "allow".into(),
+            default: ScopeDefault::Allow,
             rules: vec![ScopeRule {
                 send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
                 send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
@@ -10364,7 +11486,7 @@ classifier_timeout_secs = 8
     #[test]
     async fn scope_config_rejects_a_shadowed_send_allow() {
         let cfg = ScopeConfig {
-            default: "allow".into(),
+            default: ScopeDefault::Allow,
             rules: vec![
                 scope_rule_with(None, None, &["telegram:*"]),
                 scope_rule_with(Some("wacli"), None, &["wacli:1234@s.whatsapp.net"]),
@@ -10382,7 +11504,7 @@ classifier_timeout_secs = 8
     #[test]
     async fn scope_config_accepts_a_narrower_rule_that_is_not_shadowed() {
         let ordered = ScopeConfig {
-            default: "allow".into(),
+            default: ScopeDefault::Allow,
             rules: vec![
                 scope_rule_with(Some("wacli"), None, &["wacli:*"]),
                 scope_rule_with(Some("telegram"), None, &["telegram:*"]),
@@ -10392,7 +11514,7 @@ classifier_timeout_secs = 8
         ordered.validate().expect("disjoint criteria never shadow");
 
         let narrowing = ScopeConfig {
-            default: "allow".into(),
+            default: ScopeDefault::Allow,
             rules: vec![
                 scope_rule_with(Some("wacli"), Some("group"), &["wacli:*"]),
                 scope_rule_with(Some("wacli"), None, &["wacli:1234@s.whatsapp.net"]),
@@ -10409,7 +11531,7 @@ classifier_timeout_secs = 8
     #[test]
     async fn scope_config_accepts_a_send_allow_below_a_tools_only_rule() {
         let cfg = ScopeConfig {
-            default: "allow".into(),
+            default: ScopeDefault::Allow,
             rules: vec![
                 ScopeRule {
                     tools_deny: vec!["shell".into()],
@@ -10740,6 +11862,72 @@ classifier_timeout_secs = 8
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
+    /// D-070, RED before: `Config::default()` and the key-material fallbacks
+    /// resolved the operator's real `~/.openprx`, so a lib test that did not
+    /// point its config at a temporary directory read the real auth profiles
+    /// and wrote the session-worker secret, the witness key, the audit log and
+    /// the tool ledger into the real home. After: the lib-test binary resolves
+    /// every default location under the system temp directory.
+    #[test]
+    async fn the_lib_tests_never_resolve_the_real_home() {
+        let temp = std::env::temp_dir();
+        let config = Config::default();
+        assert!(
+            config.config_path.starts_with(&temp),
+            "{}",
+            config.config_path.display()
+        );
+        assert!(
+            config.workspace_dir.starts_with(&temp),
+            "{}",
+            config.workspace_dir.display()
+        );
+        let home = user_home_dir().expect("test: a home is always resolved");
+        assert!(home.starts_with(&temp), "{}", home.display());
+        // Meaningful under the guard too, which starts the run with `HOME`
+        // itself under the temp directory (D-072 L-8).
+        assert_ne!(
+            Some(home.as_os_str()),
+            original_process_home(),
+            "the process's own HOME"
+        );
+        let openprx = default_openprx_dir().expect("test: a default dir is always resolved");
+        assert!(openprx.starts_with(&temp), "{}", openprx.display());
+        assert!(default_config_dir().is_ok_and(|dir| dir.starts_with(&temp)));
+        // D-071: other tools' credential stores and `~` paths as well.
+        assert!(expand_home(Path::new("~/.claude/.credentials.json")).starts_with(&temp));
+        assert!(platform_config_dir().is_some_and(|dir| dir.starts_with(&temp)));
+    }
+
+    #[test]
+    async fn expand_home_replaces_only_a_leading_tilde_component() {
+        let home = user_home_dir().expect("test: a home is always resolved");
+        assert_eq!(expand_home(Path::new("~")), home);
+        assert_eq!(
+            expand_home(Path::new("~/.codex/auth.json")),
+            home.join(".codex/auth.json")
+        );
+        assert_eq!(expand_home(Path::new("~user/x")), PathBuf::from("~user/x"));
+        assert_eq!(expand_home(Path::new("/etc/~/x")), PathBuf::from("/etc/~/x"));
+        assert_eq!(expand_home(Path::new("relative/~")), PathBuf::from("relative/~"));
+    }
+
+    /// D-070: the guard runs the suite with `HOME` pointed under the temp
+    /// directory. A test that restores that `HOME` must not install it as its
+    /// own home, or every later test would write into it.
+    #[test]
+    async fn restoring_the_process_home_never_installs_it() {
+        let _env_guard = env_override_lock().await;
+        let original = std::env::var_os("HOME");
+        follow_test_home_env(original.as_deref());
+        let resolved = user_home_dir();
+        follow_test_home_env(None);
+        assert!(
+            original.is_none_or(|home| resolved != Some(PathBuf::from(home))),
+            "{resolved:?}"
+        );
+    }
+
     #[test]
     async fn process_config_dir_keeps_the_first_published_directory() {
         let _lock = process_config_dir_test_lock();
@@ -10749,5 +11937,535 @@ classifier_timeout_secs = 8
         let observed = process_config_dir();
         swap_process_config_dir_for_tests(previous);
         assert_eq!(observed, Some(PathBuf::from("/tmp/openprx-first")));
+    }
+
+    // ── D-050 item 1: one canonical reading of runtime enumerations ──────
+
+    /// RED before SECRETS-i (R-SECRETSfg H-1, P20): `autonomy.scopes.default`
+    /// was a string the plan read trimmed and the runtime read untrimmed, so
+    /// `"deny "` was deny to the plan and allow at runtime. It is parsed once
+    /// now: case and padding do not matter, and the runtime policy built
+    /// from it denies an unmatched tool.
+    #[test]
+    async fn scope_default_is_read_once_and_the_runtime_agrees() {
+        for raw in ["deny", "deny ", " DENY", "Deny"] {
+            let scopes: ScopeConfig =
+                toml::from_str(&format!("default = \"{raw}\"\n")).expect("test: scope default parses");
+            assert_eq!(scopes.default, ScopeDefault::Deny, "{raw:?}");
+            let mut autonomy = AutonomyConfig::default();
+            autonomy.scopes = scopes;
+            let policy = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+            assert!(
+                !policy.is_tool_allowed("shell", "uuid:someone", "signal", "direct"),
+                "{raw:?} must deny an unmatched tool at runtime"
+            );
+        }
+        let scopes: ScopeConfig = toml::from_str("default = \" allow\"\n").expect("test: allow");
+        assert_eq!(scopes.default, ScopeDefault::Allow);
+        assert_eq!(
+            toml::to_string(&scopes).expect("test: render").lines().next(),
+            Some("default = \"allow\""),
+            "the stored form is canonical"
+        );
+    }
+
+    /// D-050 item 1: an unknown value of a runtime-interpreted enumeration is
+    /// refused when the configuration loads, never read as a fallback.
+    #[test]
+    async fn unknown_enumeration_values_are_refused_at_load() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let path = dir.path().join("config.toml");
+        for (body, needle) in [
+            ("[autonomy.scopes]\ndefault = \"allwo\"\n", "autonomy.scopes.default"),
+            (
+                "[[user_policies]]\nuser_id = \"u1\"\nrole = \"admin\"\n",
+                "user_policies[0].role",
+            ),
+            (
+                "[[user_policies]]\nuser_id = \"u1\"\nrole = \"member\"\nvisibility_ceiling = \"everyone\"\n",
+                "user_policies[0].visibility_ceiling",
+            ),
+            ("[tunnel]\nprovider = \"\"\n", "tunnel.provider"),
+            ("[tunnel]\nprovider = \"None\"\n", "tunnel.provider"),
+        ] {
+            std::fs::write(&path, format!("default_temperature = 0.7\n\n{body}")).expect("test: write config");
+            let error = Config::load_from_path(&path, dir.path().join("workspace"))
+                .expect_err("test: an unknown value must not load");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(needle), "{body}: {rendered}");
+        }
+        std::fs::write(
+            &path,
+            "default_temperature = 0.7\n\n[[user_policies]]\nuser_id = \"u1\"\nrole = \" Owner\"\nvisibility_ceiling = \"PUBLIC\"\n",
+        )
+        .expect("test: write config");
+        Config::load_from_path(&path, dir.path().join("workspace")).expect("test: known values in any case load");
+    }
+
+    /// A log capture for the INT-2B B2 tests: every event `f` emits, as text.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+        (result, logs)
+    }
+
+    /// INT-2B a37 (R-C2Kf S-3), RED before: the unused-dialect warning was
+    /// emitted on every `validate()`, so a configuration validated twice
+    /// warned twice. After: once per distinct entry set, and the text says
+    /// the warning can be ignored when the provider is given on the command
+    /// line.
+    #[test]
+    async fn an_unused_tool_dialect_entry_is_warned_about_once() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let mut config = Config {
+            default_provider: Some("custom:http://127.0.0.1:1/v1".to_string()),
+            ..Config::default()
+        };
+        // A unique endpoint, so no other test has already seen this entry set.
+        config.providers.tool_dialects.push(ProviderToolDialectConfig {
+            provider: format!("custom:http://127.0.0.1:9/a37-{}", uuid::Uuid::new_v4().simple()),
+            model: None,
+            tool_schema: Some(ToolSchemaDialectSetting::NoRootCombinators),
+            tool_call: None,
+        });
+        let (outcome, logs) = capture_logs(|| config.validate().and_then(|()| config.validate()));
+        outcome.expect("test: an unused entry is a warning, not an error");
+        let warnings = logs.matches("nothing in this configuration uses").count();
+        assert_eq!(warnings, 1, "one warning per entry set: {logs}");
+        assert!(logs.contains("command line"), "{logs}");
+    }
+
+    /// INT-2B AUDIT-SIGN (D-056 DC-2), RED before: `security.audit.sign_events`
+    /// was never implemented and loaded silently. After: it is accepted at
+    /// load with a deprecation warning naming it, and ignored.
+    #[test]
+    async fn a_stored_sign_events_setting_loads_with_a_deprecation_warning() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let path = dir.path().join("config.toml");
+        for value in ["true", "false"] {
+            std::fs::write(
+                &path,
+                format!("default_temperature = 0.7\n\n[security.audit]\nmax_size_mb = 7\nsign_events = {value}\n"),
+            )
+            .expect("test: write config");
+            let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+            let loaded = loaded.expect("test: a stored sign_events still loads");
+            assert_eq!(loaded.security.audit.max_size_mb, 7);
+            assert!(
+                logs.contains("security.audit.sign_events") && logs.contains("Ignoring removed configuration key"),
+                "sign_events = {value} must be reported as removed: {logs}"
+            );
+        }
+    }
+
+    /// INT-2B CONSOLE-OBS-2 (D-056 DC-3), RED before: the default
+    /// `auth.codex_auth_json_path` was the absolute home path, which a save
+    /// wrote into `identity.toml` and the raw file API served. After: the
+    /// default is stored as `~/.codex/auth.json` and expanded when read.
+    #[test]
+    async fn the_default_codex_auth_path_is_stored_home_relative() {
+        let stored = Config::default().to_stored_toml_string().expect("test: stored form");
+        assert!(
+            stored.contains("codex_auth_json_path = \"~/.codex/auth.json\""),
+            "{stored}"
+        );
+        if let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().display().to_string()) {
+            assert!(!stored.contains(&format!("{home}/.codex")), "{stored}");
+        }
+    }
+
+    /// INT-2B a43 (R-C2Kf S-4): a `[[providers.*]]` declaration table is read
+    /// from `config.toml` or from a managed `config.d/` fragment, and a
+    /// structured save writes it back to `config.toml`, because no managed
+    /// fragment owns `[providers]`. An unmanaged fragment is not read.
+    #[test]
+    async fn a_provider_table_in_a_managed_fragment_moves_to_config_toml_on_save() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_temperature = 0.7\n").expect("test: write config");
+        let fragments = dir.path().join("config.d");
+        std::fs::create_dir_all(&fragments).expect("test: config.d");
+        let table = "[[providers.tool_dialects]]\nprovider = \"vllm\"\ntool_schema = \"raw\"\n";
+        std::fs::write(fragments.join("cost.toml"), table).expect("test: managed fragment");
+        std::fs::write(
+            fragments.join("extra.toml"),
+            "[[providers.models]]\nprovider = \"vllm\"\n",
+        )
+        .expect("test: unmanaged fragment");
+
+        let config = Config::load_from_path(&path, dir.path().join("workspace")).expect("test: load");
+        assert_eq!(config.providers.tool_dialects.len(), 1, "a managed fragment is read");
+        assert!(config.providers.models.is_empty(), "an unmanaged fragment is not read");
+
+        config.save().await.expect("test: structured save");
+        let main = std::fs::read_to_string(&path).expect("test: read config.toml");
+        assert!(main.contains("tool_dialects"), "the table moves to config.toml: {main}");
+        let cost = std::fs::read_to_string(fragments.join("cost.toml")).unwrap_or_default();
+        assert!(
+            !cost.contains("tool_dialects"),
+            "the fragment no longer declares it: {cost}"
+        );
+        let reloaded = Config::load_from_path(&path, dir.path().join("workspace")).expect("test: reload");
+        assert_eq!(reloaded.providers.tool_dialects.len(), 1);
+    }
+
+    /// D-063 G-1, RED before (B2f F-3 refused the load): a
+    /// `security.audit.log_path` through a symlinked directory in the
+    /// workspace must not block configuration load, since the agent can plant
+    /// such a link. After: the configuration loads with a warning naming the
+    /// setting and the link, and the audit logger built from it still
+    /// refuses to write through the link (the record is skipped, nothing is
+    /// written in the link's target).
+    #[cfg(unix)]
+    #[test]
+    async fn an_audit_log_path_through_a_symlinked_directory_loads_with_a_warning() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("real")).expect("test: real dir");
+        std::os::unix::fs::symlink(workspace.join("real"), workspace.join("alias")).expect("test: link");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_temperature = 0.7\n\n[security.audit]\nlog_path = \"alias/audit.log\"\n",
+        )
+        .expect("test: write config");
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, workspace.clone()));
+        let loaded = loaded.expect("test: a planted link does not block the load");
+        assert!(
+            logs.contains("security.audit.log_path runs through a symbolic link") && logs.contains("alias"),
+            "the load warns, naming the link: {logs}"
+        );
+
+        let logger =
+            crate::security::audit::AuditLogger::new(&loaded.security.audit, workspace.clone()).expect("test: logger");
+        let event = crate::security::audit::AuditEvent::new(crate::security::audit::AuditEventType::SecurityEvent);
+        assert!(logger.log(&event).is_err(), "the logger still refuses the link");
+        assert!(
+            !workspace.join("real/audit.log").exists(),
+            "nothing is written through the link"
+        );
+    }
+}
+
+/// The decision-plane configuration through the real load, validate and save
+/// paths (CDP-03; SP-CDP-A 5.3 red-before rows; V8.06).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod causal_tree_config_tests {
+    use super::*;
+
+    /// The exact `[causal_tree]` block a `Config::save` wrote at `8a5d160d`.
+    const SAVED_BY_8A5D160D: &str = r#"
+default_temperature = 0.7
+
+[causal_tree]
+enabled = false
+w_confidence = 0.5
+w_cost = 0.25
+w_latency = 0.25
+write_decision_log = true
+write_metrics = true
+
+[causal_tree.policy]
+max_branches = 3
+commit_threshold = 0.6200000047683716
+extra_token_ratio_limit = 0.3499999940395355
+extra_latency_budget_ms = 300
+rehearsal_timeout_ms = 5000
+default_side_effect_mode = "ReadOnly"
+circuit_breaker_threshold = 5
+circuit_breaker_cooldown_secs = 60
+"#;
+
+    fn load(text: &str) -> (tempfile::TempDir, Result<Config>) {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).expect("test: write config");
+        let loaded = Config::load_from_path(&path, dir.path().join("workspace"));
+        (dir, loaded)
+    }
+
+    fn saved_text(dir: &Path) -> String {
+        let mut text = std::fs::read_to_string(dir.join("config.toml")).expect("test: main file");
+        if let Ok(entries) = std::fs::read_dir(dir.join("config.d")) {
+            for entry in entries {
+                let path = entry.expect("test: entry").path();
+                text.push_str(&std::fs::read_to_string(path).expect("test: fragment"));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_backend_table_loads() {
+        let (_dir, loaded) = load(
+            "default_temperature = 0.7\n\n[causal_tree]\nenabled = true\n\n[causal_tree.backend]\nkind = \"auto\"\n\n\
+             [causal_tree.backend.circuit_breaker]\nfailure_threshold = 7\n\n[causal_tree.rehearsal]\ntimeout_ms = 80\n",
+        );
+        let loaded = loaded.expect("test: loads");
+        assert!(loaded.causal_tree.enabled);
+        assert_eq!(
+            loaded.causal_tree.backend.kind,
+            crate::causal_tree::config::BackendSelection::Auto
+        );
+        assert_eq!(
+            loaded.causal_tree.backend.circuit_breaker.failure_threshold, 7,
+            "the configured threshold survives load"
+        );
+        assert_eq!(loaded.causal_tree.rehearsal.timeout_ms, 80);
+    }
+
+    #[test]
+    fn a_config_saved_by_8a5d160d_loads_and_maps() {
+        let (_dir, loaded) = load(SAVED_BY_8A5D160D);
+        let loaded = loaded.expect("test: the legacy save loads");
+        assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        assert!(!loaded.causal_tree.enabled, "the default stays off until CDP-31");
+    }
+
+    /// V8.06: upgraded configs keep operator values.
+    #[test]
+    fn legacy_non_default_values_move_to_their_new_home() {
+        let text = SAVED_BY_8A5D160D
+            .replace("max_branches = 3", "max_branches = 5")
+            .replace("circuit_breaker_threshold = 5", "circuit_breaker_threshold = 9")
+            .replace("w_cost = 0.25", "w_cost = 0.4000000059604645");
+        let (_dir, loaded) = load(&text);
+        let causal = loaded.expect("test: loads").causal_tree;
+        assert_eq!(causal.policy.max_candidates, 5);
+        assert_eq!(causal.backend.circuit_breaker.failure_threshold, 9);
+        assert_eq!(causal.scoring.weights.w_cost, Some(0.400_000_005_960_464_5));
+    }
+
+    #[test]
+    fn legacy_w_confidence_non_default_fails_with_a_precise_error() {
+        let (dir, loaded) = load(&SAVED_BY_8A5D160D.replace("w_confidence = 0.5", "w_confidence = 0.7123"));
+        let message = format!("{:#}", loaded.expect_err("test: refused"));
+        assert!(
+            message.contains(&dir.path().join("config.toml").display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("causal_tree.w_confidence"), "{message}");
+        assert!(message.contains("[causal_tree.scoring.weights]"), "{message}");
+        assert!(!message.contains("0.7123"), "{message}");
+    }
+
+    /// A naive move of the legacy 5000 ms rehearsal timeout would fail the
+    /// budget rule on every upgraded config.
+    #[test]
+    fn a_legacy_rehearsal_timeout_default_does_not_fail_the_budget_rule() {
+        let (_dir, loaded) = load(SAVED_BY_8A5D160D);
+        let causal = loaded.expect("test: loads").causal_tree;
+        assert_eq!(causal.rehearsal.timeout_ms, 100);
+        assert_eq!(causal.policy.extra_latency_budget_ms, 500);
+
+        let (_dir, loaded) =
+            load(&SAVED_BY_8A5D160D.replace("rehearsal_timeout_ms = 5000", "rehearsal_timeout_ms = 900"));
+        let message = format!("{:#}", loaded.expect_err("test: over the budget"));
+        assert!(
+            message.contains("causal_tree.rehearsal.timeout_ms must be at most"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_backend_stops_the_load_without_echoing_the_endpoint() {
+        let (_dir, loaded) = load(
+            "default_temperature = 0.7\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+             endpoint = \"https://decider:hunter2pw@decisions.example.com/v1\"\n",
+        );
+        let message = format!("{:#}", loaded.expect_err("test: refused"));
+        assert!(message.contains("causal_tree.backend.endpoint"), "{message}");
+        assert!(!message.contains("hunter2pw"), "{message}");
+
+        // A hosted service loads only with one exact model version (CDP-13).
+        let (_dir, loaded) =
+            load("default_temperature = 0.7\n\n[causal_tree.backend]\nkind = \"typesafe\"\nmodel = \"jev-latest\"\n");
+        let message = format!("{:#}", loaded.expect_err("test: refused"));
+        assert!(message.contains("hosted decision service"), "{message}");
+        let (_dir, loaded) =
+            load("default_temperature = 0.7\n\n[causal_tree.backend]\nkind = \"typesafe\"\nmodel = \"jev-1.13.0\"\n");
+        loaded.expect("test: a pinned hosted model loads");
+    }
+
+    #[tokio::test]
+    async fn migration_is_idempotent_and_save_writes_no_legacy_key() {
+        let text = SAVED_BY_8A5D160D.replace("max_branches = 3", "max_branches = 5");
+        let (dir, loaded) = load(&text);
+        let loaded = loaded.expect("test: loads");
+        crate::config::files::write_split_config(&loaded, false)
+            .await
+            .expect("test: save");
+        let saved = saved_text(dir.path());
+        for legacy in [
+            "w_confidence",
+            "w_cost",
+            "w_latency",
+            "write_decision_log",
+            "write_metrics",
+            "max_branches",
+            "rehearsal_timeout_ms",
+            "default_side_effect_mode",
+            "circuit_breaker_threshold",
+            "circuit_breaker_cooldown_secs",
+        ] {
+            assert!(!saved.contains(legacy), "{legacy} in {saved}");
+        }
+        assert!(saved.contains("max_candidates = 5"), "{saved}");
+        assert!(
+            saved.contains("enabled = false"),
+            "`enabled` is always written: {saved}"
+        );
+
+        assert!(
+            saved.contains("schema_version = 1"),
+            "the version is always written: {saved}"
+        );
+
+        let reloaded = Config::load_from_path(&dir.path().join("config.toml"), dir.path().join("workspace"))
+            .expect("test: reload");
+        assert_eq!(reloaded.causal_tree, loaded.causal_tree);
+    }
+
+    /// The BASE split layout keeps `[causal_tree]` in `config.d/agent.toml`
+    /// (P2-1): writes `files` under a temp dir and loads it.
+    fn load_split(files: &[(&str, &str)]) -> (tempfile::TempDir, Result<Config>) {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        std::fs::create_dir_all(dir.path().join("config.d")).expect("test: config.d");
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).expect("test: write");
+        }
+        let loaded = Config::load_from_path(&dir.path().join("config.toml"), dir.path().join("workspace"));
+        (dir, loaded)
+    }
+
+    /// D-074: a migration error names the file that holds the key, here the
+    /// `config.d/agent.toml` fragment of the BASE layout, and a legacy key
+    /// split from its replacement names both files.
+    #[test]
+    fn a_migration_error_names_the_fragment_that_holds_the_key() {
+        let block = SAVED_BY_8A5D160D
+            .replace("default_temperature = 0.7\n", "")
+            .replace("w_confidence = 0.5", "w_confidence = 0.7123");
+        let (dir, loaded) = load_split(&[
+            ("config.toml", "default_temperature = 0.7\n"),
+            ("config.d/agent.toml", &block),
+        ]);
+        let message = format!("{:#}", loaded.expect_err("test: refused"));
+        let agent = dir.path().join("config.d").join("agent.toml").display().to_string();
+        assert!(
+            message.contains(&format!("{agent}: causal_tree.w_confidence")),
+            "{message}"
+        );
+        assert!(!message.contains("0.7123"), "{message}");
+
+        let (dir, loaded) = load_split(&[
+            (
+                "config.toml",
+                "default_temperature = 0.7\n\n[causal_tree.policy]\nmax_candidates = 6\n",
+            ),
+            ("config.d/agent.toml", "[causal_tree.policy]\nmax_branches = 5\n"),
+        ]);
+        let message = format!("{:#}", loaded.expect_err("test: refused"));
+        let agent = dir.path().join("config.d").join("agent.toml").display().to_string();
+        let main = dir.path().join("config.toml").display().to_string();
+        assert!(
+            message.contains(&format!(
+                "{agent}: causal_tree.policy.max_branches is set together with"
+            )) && message.contains(&format!("causal_tree.policy.max_candidates (in {main})")),
+            "{message}"
+        );
+    }
+
+    /// D-074 with X-3: the `[causal_tree]` block of the BASE `prx init` full
+    /// template (a bare `enabled = false` in `config.d/agent.toml`) is the
+    /// old serialized default and reads as unset; the first save writes the
+    /// versioned form, after which it is the operator's.
+    #[tokio::test]
+    async fn a_base_init_install_reads_its_disable_as_unset_until_saved() {
+        const BASE_INIT_AGENT_BLOCK: &str = "# Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs\n\
+             # speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)\n\
+             # before each turn. Default off; runtime evidence appears as observer CteRun events.\n\
+             [causal_tree]\n\
+             enabled = false\n";
+        let (dir, loaded) = load_split(&[
+            ("config.toml", "default_temperature = 0.7\n"),
+            ("config.d/agent.toml", BASE_INIT_AGENT_BLOCK),
+        ]);
+        let loaded = loaded.expect("test: loads");
+        assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        let mut root: toml::Value = toml::from_str(BASE_INIT_AGENT_BLOCK).expect("test: toml");
+        let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
+        assert_eq!(report.dropped, ["enabled"], "the template's disable is the old default");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.d/agent.toml")).expect("test: read"),
+            BASE_INIT_AGENT_BLOCK,
+            "loading never stamps the marker on a file it only mapped in memory"
+        );
+        crate::config::files::write_split_config(&loaded, false)
+            .await
+            .expect("test: save");
+        let saved = saved_text(dir.path());
+        assert!(
+            saved.contains("schema_version = 1") && saved.contains("enabled = false"),
+            "{saved}"
+        );
+    }
+
+    /// D-073: in a file saved with the versioned schema, an explicit
+    /// `extra_latency_budget_ms = 300` and `enabled = false` survive load,
+    /// save and reload; the same budget in a pre-1.7 file takes the new
+    /// default.
+    #[tokio::test]
+    async fn an_explicit_value_in_a_versioned_file_is_never_rewritten() {
+        let (_legacy_dir, legacy) = load(SAVED_BY_8A5D160D);
+        assert_eq!(
+            legacy.expect("test: loads").causal_tree.policy.extra_latency_budget_ms,
+            500
+        );
+
+        let (dir, loaded) = load(
+            "default_temperature = 0.7\n\n[causal_tree]\nschema_version = 1\nenabled = false\n\n\
+             [causal_tree.policy]\nextra_latency_budget_ms = 300\n",
+        );
+        let loaded = loaded.expect("test: loads");
+        assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 300);
+        assert!(!loaded.causal_tree.enabled);
+        crate::config::files::write_split_config(&loaded, false)
+            .await
+            .expect("test: save");
+        assert!(saved_text(dir.path()).contains("extra_latency_budget_ms = 300"));
+        let reloaded = Config::load_from_path(&dir.path().join("config.toml"), dir.path().join("workspace"))
+            .expect("test: reload");
+        assert_eq!(reloaded.causal_tree.policy.extra_latency_budget_ms, 300);
+        assert_eq!(reloaded.causal_tree, loaded.causal_tree);
     }
 }

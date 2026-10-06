@@ -832,57 +832,97 @@ impl Channel for LarkChannel {
     }
 }
 
+/// Why the Lark webhook listener refuses to start.
+#[derive(Debug, thiserror::Error)]
+pub enum LarkWebhookError {
+    /// Webhook mode authenticates every event by its `token`; with no
+    /// configured token there is nothing to compare against, and an empty
+    /// token used to match every event that carried none.
+    #[error(
+        "Lark webhook mode requires `channels_config.lark.verification_token`; without it every event would be accepted"
+    )]
+    MissingVerificationToken,
+    /// Webhook mode listens on `channels_config.lark.port`.
+    #[error("Lark webhook mode requires `port` to be set in [channels_config.lark]")]
+    MissingPort,
+}
+
+/// State shared by the webhook handler.
+#[derive(Clone)]
+struct LarkWebhookState {
+    verification_token: Arc<str>,
+    channel: Arc<LarkChannel>,
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+}
+
+/// The verification token an event presents.
+///
+/// A schema 2.0 callback (every message event PRX parses) carries it in
+/// `header.token`; the `url_verification` challenge and schema 1.0 events
+/// carry a top-level `token`. A 2.0 event is judged by its header token only.
+fn presented_webhook_token(payload: &serde_json::Value) -> &str {
+    let token = if payload.get("schema").and_then(serde_json::Value::as_str) == Some("2.0") {
+        payload.pointer("/header/token")
+    } else {
+        payload.get("token")
+    };
+    token.and_then(serde_json::Value::as_str).unwrap_or("")
+}
+
+/// Whether `payload` carries the configured verification token.
+///
+/// An empty configured token matches nothing, and the comparison is
+/// constant-time, so the answer does not depend on how much of a guess
+/// matched.
+fn webhook_event_token_matches(expected: &str, payload: &serde_json::Value) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    crate::security::pairing::constant_time_eq(presented_webhook_token(payload), expected)
+}
+
+async fn handle_webhook_event(
+    axum::extract::State(state): axum::extract::State<LarkWebhookState>,
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Verify token on ALL events, not just challenge
+    if !webhook_event_token_matches(&state.verification_token, &payload) {
+        tracing::warn!("Lark webhook: invalid verification token");
+        return (StatusCode::FORBIDDEN, "invalid token").into_response();
+    }
+
+    // URL verification challenge
+    if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
+        let resp = serde_json::json!({ "challenge": challenge });
+        return (StatusCode::OK, axum::Json(resp)).into_response();
+    }
+
+    // Parse event messages
+    let messages = state.channel.parse_event_payload(&payload);
+    for msg in messages {
+        if state.tx.send(msg).await.is_err() {
+            tracing::warn!("Lark: message channel closed");
+            break;
+        }
+    }
+
+    (StatusCode::OK, "ok").into_response()
+}
+
 impl LarkChannel {
-    /// HTTP callback server (legacy — requires a public endpoint).
-    /// Use `listen()` (WS long-connection) for new deployments.
-    pub async fn listen_http(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        use axum::{Json, Router, extract::State, routing::post};
-
-        #[derive(Clone)]
-        struct AppState {
-            verification_token: String,
-            channel: Arc<LarkChannel>,
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    /// The webhook routes, or the reason webhook mode cannot run.
+    ///
+    /// A missing (or blank) `verification_token` is refused here rather than
+    /// served: it is the only thing that authenticates an event.
+    fn webhook_router(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<axum::Router, LarkWebhookError> {
+        if self.verification_token.trim().is_empty() {
+            return Err(LarkWebhookError::MissingVerificationToken);
         }
-
-        async fn handle_event(
-            State(state): State<AppState>,
-            Json(payload): Json<serde_json::Value>,
-        ) -> axum::response::Response {
-            use axum::http::StatusCode;
-            use axum::response::IntoResponse;
-
-            // Verify token on ALL events, not just challenge
-            let event_token = payload.get("token").and_then(|t| t.as_str()).unwrap_or("");
-            if event_token != state.verification_token {
-                tracing::warn!("Lark webhook: invalid verification token");
-                return (StatusCode::FORBIDDEN, "invalid token").into_response();
-            }
-
-            // URL verification challenge
-            if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-                let resp = serde_json::json!({ "challenge": challenge });
-                return (StatusCode::OK, Json(resp)).into_response();
-            }
-
-            // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
-            for msg in messages {
-                if state.tx.send(msg).await.is_err() {
-                    tracing::warn!("Lark: message channel closed");
-                    break;
-                }
-            }
-
-            (StatusCode::OK, "ok").into_response()
-        }
-
-        let port = self
-            .port
-            .ok_or_else(|| anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]"))?;
-
-        let state = AppState {
-            verification_token: self.verification_token.clone(),
+        let state = LarkWebhookState {
+            verification_token: Arc::from(self.verification_token.as_str()),
             channel: Arc::new(Self::new(
                 self.app_id.clone(),
                 self.app_secret.clone(),
@@ -892,14 +932,27 @@ impl LarkChannel {
             )),
             tx,
         };
+        Ok(axum::Router::new()
+            .route("/lark", axum::routing::post(handle_webhook_event))
+            .with_state(state))
+    }
 
-        let app = Router::new().route("/lark", post(handle_event)).with_state(state);
+    /// HTTP callback server (legacy — requires a public endpoint).
+    /// Use `listen()` (WS long-connection) for new deployments.
+    ///
+    /// # Errors
+    ///
+    /// [`LarkWebhookError`] when `verification_token` or `port` is not set,
+    /// and the bind or serve error otherwise.
+    pub async fn listen_http(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let app = self.webhook_router(tx)?;
+        let port = self.port.ok_or(LarkWebhookError::MissingPort)?;
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         tracing::info!("Lark event callback server listening on {addr}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        super::webhook_server::serve_until_dropped(listener, app).await?;
 
         Ok(())
     }
@@ -1393,5 +1446,209 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
+    }
+    /// A loopback port nothing listens on right now.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .map(|addr| addr.port())
+            .expect("test: free port")
+    }
+
+    /// POST `body` to the webhook on `port`; `None` while nothing answers.
+    async fn post_event(port: u16, body: &serde_json::Value) -> Option<reqwest::StatusCode> {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/lark"))
+            .json(body)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status())
+    }
+
+    /// LARK (D-049 F, R-SECRETSfg F-H): an unset `verification_token` became
+    /// `""`, and an event without `token` compared equal to it, so a
+    /// webhook-mode channel with no token accepted every event. Webhook mode
+    /// now refuses to start without a token, naming the setting.
+    #[tokio::test]
+    async fn a_webhook_channel_without_a_verification_token_accepts_no_event() {
+        use crate::config::schema::{LarkConfig, LarkReceiveMode};
+
+        let port = free_port();
+        let cfg = LarkConfig {
+            app_id: "cli_app".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(port),
+            mention_only: false,
+        };
+        let channel = Arc::new(LarkChannel::from_config(&cfg));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let server = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { channel.listen_http(tx).await }
+        });
+
+        let mut status = None;
+        for _ in 0..60 {
+            if server.is_finished() {
+                break;
+            }
+            status = post_event(port, &serde_json::json!({})).await;
+            if status.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if server.is_finished() {
+            let error = server
+                .await
+                .expect("test: join")
+                .expect_err("test: webhook mode without a token must not start");
+            assert!(
+                error.to_string().contains("channels_config.lark.verification_token"),
+                "the refusal names the setting: {error}"
+            );
+        } else {
+            server.abort();
+            assert_eq!(
+                status,
+                Some(reqwest::StatusCode::FORBIDDEN),
+                "an event without a token was accepted by a channel with no verification token"
+            );
+        }
+    }
+
+    /// Serve the webhook routes of `channel` on a loopback port.
+    async fn serve_webhook(channel: &LarkChannel) -> (u16, tokio::sync::mpsc::Receiver<ChannelMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let app = channel.webhook_router(tx).expect("test: token is set");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let port = listener.local_addr().expect("test: addr").port();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("test webhook server stopped: {error}");
+            }
+        });
+        (port, rx)
+    }
+
+    /// LARK: the configured token still admits its events (a challenge is
+    /// answered), and a wrong token of the same length is refused. The
+    /// constant-time compare itself is not observable here; the call site is.
+    #[tokio::test]
+    async fn the_configured_token_is_accepted_and_a_same_length_guess_refused() {
+        let channel = make_channel();
+        let (port, _rx) = serve_webhook(&channel).await;
+
+        let accepted = post_event(
+            port,
+            &serde_json::json!({ "token": "test_verification_token", "challenge": "c-1" }),
+        )
+        .await;
+        assert_eq!(accepted, Some(reqwest::StatusCode::OK));
+
+        let guess = "test_verification_tokeX";
+        assert_eq!(guess.len(), "test_verification_token".len());
+        let refused = post_event(port, &serde_json::json!({ "token": guess, "challenge": "c-2" })).await;
+        assert_eq!(refused, Some(reqwest::StatusCode::FORBIDDEN));
+
+        let missing = post_event(port, &serde_json::json!({ "challenge": "c-3" })).await;
+        assert_eq!(missing, Some(reqwest::StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn an_empty_configured_token_matches_no_event() {
+        assert!(!webhook_event_token_matches("", &serde_json::json!({})));
+        assert!(!webhook_event_token_matches("", &serde_json::json!({ "token": "" })));
+        assert!(webhook_event_token_matches(
+            "tok",
+            &serde_json::json!({ "token": "tok" })
+        ));
+        assert!(!webhook_event_token_matches(
+            "tok",
+            &serde_json::json!({ "token": "toK" })
+        ));
+        assert!(matches!(
+            LarkChannel::new("a".into(), "s".into(), "  ".into(), Some(1), vec![])
+                .webhook_router(tokio::sync::mpsc::channel(1).0),
+            Err(LarkWebhookError::MissingVerificationToken)
+        ));
+    }
+
+    /// A schema 2.0 `im.message.receive_v1` callback as Lark/Feishu sends it:
+    /// the verification token is `header.token`, not a top-level `token`.
+    fn schema_v2_message_event(header_token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "5e3702a84e847582be8db7fb73283c02",
+                "event_type": "im.message.receive_v1",
+                "create_time": "1608725989000",
+                "token": header_token,
+                "app_id": "cli_test_app_id",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "union_id": "on_8ed6aa67826108097d9ee143816345",
+                        "user_id": "e33ggbyz",
+                        "open_id": "ou_testuser123"
+                    },
+                    "sender_type": "user",
+                    "tenant_key": "2ca1d211f64f6438"
+                },
+                "message": {
+                    "message_id": "om_5ce6d572455d361153b7cb51da133945",
+                    "root_id": "",
+                    "parent_id": "",
+                    "create_time": "1609073151345",
+                    "chat_id": "oc_5ce6d572455d361153b7cb51da133945",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello from a real 2.0 callback\"}",
+                    "mentions": []
+                }
+            }
+        })
+    }
+
+    /// LARK (R-INT2BB1 M-1): schema 2.0 callbacks, the only message events
+    /// `parse_event_payload` handles, carry the verification token in
+    /// `header.token`. Reading only the top-level `token` answered 403 to
+    /// every real message event even with the token configured.
+    #[tokio::test]
+    async fn a_schema_v2_message_event_with_the_header_token_is_delivered() {
+        let channel = make_channel();
+        let (port, mut rx) = serve_webhook(&channel).await;
+
+        let accepted = post_event(port, &schema_v2_message_event("test_verification_token")).await;
+        assert_eq!(accepted, Some(reqwest::StatusCode::OK));
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("test: a message within 2 s")
+            .expect("test: channel open");
+        assert_eq!(message.content, "hello from a real 2.0 callback");
+        assert_eq!(message.sender, "oc_5ce6d572455d361153b7cb51da133945");
+
+        let guess = "test_verification_tokeX";
+        assert_eq!(guess.len(), "test_verification_token".len());
+        let refused = post_event(port, &schema_v2_message_event(guess)).await;
+        assert_eq!(refused, Some(reqwest::StatusCode::FORBIDDEN));
+
+        // A 2.0 event is judged by its header token only: a correct top-level
+        // `token` beside a wrong header token does not admit it.
+        let mut mixed = schema_v2_message_event(guess);
+        mixed["token"] = serde_json::json!("test_verification_token");
+        let refused = post_event(port, &mixed).await;
+        assert_eq!(refused, Some(reqwest::StatusCode::FORBIDDEN));
+        assert!(rx.try_recv().is_err(), "no refused event reaches the channel");
     }
 }

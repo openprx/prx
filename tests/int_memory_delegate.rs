@@ -207,6 +207,7 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
             model: "test-model".to_string(),
             system_prompt: None,
             api_key: None,
+            credential_ref: None,
             temperature: None,
             max_depth: 3,
             agentic: false,
@@ -217,7 +218,7 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
         },
     );
 
-    let delegate = DelegateTool::new(agents, None, security.clone());
+    let delegate = DelegateTool::new(agents, security.clone());
 
     // The delegate tool itself should be named "delegate"
     assert_eq!(delegate.name(), "delegate", "tool name should be 'delegate'");
@@ -237,7 +238,7 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
     };
     let readonly_security = Arc::new(readonly_policy);
 
-    let readonly_delegate = DelegateTool::new(HashMap::new(), None, readonly_security.clone());
+    let readonly_delegate = DelegateTool::new(HashMap::new(), readonly_security.clone());
 
     assert!(
         readonly_security
@@ -273,6 +274,7 @@ async fn int_das_02_delegate_respects_max_depth() {
             model: "test-model".to_string(),
             system_prompt: None,
             api_key: None,
+            credential_ref: None,
             temperature: None,
             max_depth: 2,
             agentic: false,
@@ -284,7 +286,7 @@ async fn int_das_02_delegate_respects_max_depth() {
     );
 
     // Create delegate at depth=2, which equals max_depth=2 → should be blocked
-    let delegate_at_max = DelegateTool::with_depth(agents.clone(), None, security.clone(), 2);
+    let delegate_at_max = DelegateTool::with_depth(agents.clone(), security.clone(), 2);
 
     let result = delegate_at_max
         .execute(json!({"agent": "deep-agent", "prompt": "go deeper"}))
@@ -304,7 +306,7 @@ async fn int_das_02_delegate_respects_max_depth() {
 
     // Create delegate at depth=1, which is less than max_depth=2 → should pass depth check
     // (will fail for other reasons since "test" provider doesn't exist, but depth check passes)
-    let delegate_under_max = DelegateTool::with_depth(agents.clone(), None, security.clone(), 1);
+    let delegate_under_max = DelegateTool::with_depth(agents.clone(), security.clone(), 1);
 
     let result = delegate_under_max
         .execute(json!({"agent": "deep-agent", "prompt": "shallower delegation"}))

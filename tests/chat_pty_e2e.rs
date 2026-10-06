@@ -66,9 +66,14 @@ use expectrl::session::Session;
 use serial_test::serial;
 use tempfile::TempDir;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const TURN_TIMEOUT: Duration = Duration::from_secs(6);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(4);
+// D-071: every wait below ends on an event (the expected output, the process
+// exiting, the peer recording a call). These limits only turn a hang into a
+// failure: they are far above anything a loaded machine needs, and no test
+// asserts that something happens *quickly*. A wait for output also fails at
+// once when the process has exited.
+const STARTUP_TIMEOUT: Duration = Duration::from_mins(3);
+const TURN_TIMEOUT: Duration = Duration::from_mins(2);
+const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Synthetic reply to ESC[6n (Device Status Report → Report Cursor Position).
 /// Real terminals respond with `ESC [ row ; col R`; we always answer 1;1.
@@ -80,7 +85,7 @@ const DSR_QUERY: &[u8] = b"\x1b[6n";
 /// late writes by the chat process land inside the sandbox (and clean up
 /// when the test ends).
 struct HarnessGuard {
-    _tempdir: TempDir,
+    tempdir: Option<TempDir>,
     config_dir: PathBuf,
     workspace_dir: PathBuf,
     home_dir: PathBuf,
@@ -94,6 +99,220 @@ struct HarnessGuard {
 /// `CARGO_BIN_EXE_<bin-name>` during `cargo test`.
 fn prx_binary() -> &'static str {
     env!("CARGO_BIN_EXE_prx")
+}
+
+/// A chat `-p` override owns a non-root connection. A process child inherits
+/// that source and completes instead of claiming the configured root URL/key.
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_provider_override_process_child_keeps_non_root_connection() {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let guard = new_harness_guard().expect("isolated chat paths");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+    listener.set_nonblocking(true).expect("nonblocking loopback");
+    let address = listener.local_addr().expect("loopback address");
+    let root_provider = format!("custom:http://{address}/root/v1");
+    let override_provider = format!("custom:http://{address}/override/v1");
+    let mut config = openprx::config::Config {
+        config_path: guard.config_dir.join("config.toml"),
+        workspace_dir: guard.workspace_dir.clone(),
+        default_provider: Some(root_provider),
+        default_model: Some("probe-model".to_string()),
+        api_key: Some("PRX-CHAT-ROOT-KEY".to_string()),
+        ..openprx::config::Config::default()
+    };
+    config.sessions_spawn.process_memory_strategy = "isolated_private".to_string();
+    config.tool_tiering.always_include.push("sessions_spawn".to_string());
+    std::fs::write(
+        &config.config_path,
+        toml::to_string_pretty(&config).expect("serialize chat config"),
+    )
+    .expect("write chat config");
+
+    let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_seen = Arc::clone(&seen);
+    let server_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        while !server_stop.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("loopback accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let head_end = loop {
+                let read = stream.read(&mut chunk).expect("request read");
+                if read == 0 {
+                    break None;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(offset) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break Some(offset + 4);
+                }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&bytes[..head_end]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while bytes.len().saturating_sub(head_end) < length {
+                let read = stream.read(&mut chunk).expect("body read");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body = String::from_utf8_lossy(&bytes[head_end..]).to_string();
+            server_seen
+                .lock()
+                .expect("request sink")
+                .push((head.clone(), body.clone()));
+            let parent_count = server_seen
+                .lock()
+                .expect("request sink")
+                .iter()
+                .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
+                .count();
+            let message = if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
+                serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call-prx-chat-spawn","type":"function","function":{
+                        "name":"sessions_spawn","arguments":serde_json::json!({
+                            "action":"spawn_batch","mode":"process","tasks":["PRX_CHAT_CHILD"]
+                        }).to_string()
+                    }
+                }]})
+            } else if body.contains("PRX_CHAT_PARENT") && parent_count == 2 {
+                let start = body.find("batch-").expect("batch id in parent request");
+                let batch_id = &body[start..start + 42];
+                serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call-prx-chat-join","type":"function","function":{
+                        "name":"sessions_spawn","arguments":serde_json::json!({"action":"join","batch_id":batch_id}).to_string()
+                    }
+                }]})
+            } else {
+                serde_json::json!({"role":"assistant","content":"PRX-CHAT-OVERRIDE-OK"})
+            };
+            let payload = serde_json::json!({
+                "id":"chatcmpl-prx-override","object":"chat.completion","created":1,
+                "model":"probe-model","choices":[{"index":0,"message":message,"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            })
+            .to_string();
+            let (content_type, payload) = if body.contains("\"stream\":true") {
+                let (delta, finish_reason) = message.get("tool_calls").map_or_else(
+                    || (serde_json::json!({"content":message["content"]}), "stop"),
+                    |calls| {
+                        let mut calls = calls.as_array().expect("tool calls array").clone();
+                        for (index, call) in calls.iter_mut().enumerate() {
+                            call["index"] = serde_json::json!(index);
+                        }
+                        (serde_json::json!({"tool_calls":calls}), "tool_calls")
+                    },
+                );
+                let chunk = serde_json::json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let finish = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]});
+                (
+                    "text/event-stream",
+                    format!("data: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+                )
+            } else {
+                ("application/json", payload)
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            stream.write_all(response.as_bytes()).expect("loopback reply");
+        }
+    });
+
+    let mut command = Command::new(prx_binary());
+    command
+        .arg("--config-dir")
+        .arg(&guard.config_dir)
+        .arg("chat")
+        .arg("--plain")
+        .arg("-p")
+        .arg(&override_provider)
+        .arg("--model")
+        .arg("probe-model")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &guard.home_dir)
+        .env("XDG_DATA_HOME", &guard.xdg_data)
+        .env("XDG_CACHE_HOME", &guard.xdg_cache)
+        .env("XDG_STATE_HOME", &guard.xdg_state)
+        .env("XDG_CONFIG_HOME", &guard.xdg_config)
+        .env("PRX_TUI", "0")
+        .env("NO_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("RUST_LOG", "off")
+        .env("SESSION_WORKER_SECRET", "PRX-CHAT-ISOLATED-SECRET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("chat binary");
+    child
+        .stdin
+        .take()
+        .expect("chat stdin")
+        .write_all(b"PRX_CHAT_PARENT\n/exit\n")
+        .expect("chat script");
+    let output = child.wait_with_output().expect("chat output");
+    stop.store(true, Ordering::Relaxed);
+    server.join().expect("loopback server");
+    assert!(
+        output.status.success(),
+        "chat stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = seen.lock().expect("request sink");
+    let joined = requests.iter().any(|(_, body)| {
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+        request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+            .any(|result| {
+                result["total"] == 1
+                    && result["completed"].as_array().is_some_and(|items| items.len() == 1)
+                    && result["failed"] == serde_json::json!([])
+                    && result["killed"] == serde_json::json!([])
+                    && result["no_result"] == serde_json::json!([])
+            })
+    });
+    assert!(joined, "parent did not observe one completed child");
+    assert!(
+        requests.iter().any(|(_, body)| body.contains("PRX_CHAT_CHILD")),
+        "process child never called the override"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(head, _)| head.contains("/override/v1") && !head.contains("PRX-CHAT-ROOT-KEY"))
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PRX-CHAT-OVERRIDE-OK"));
 }
 
 /// Build a fully-isolated `Command` for `prx chat`, redirecting every path the
@@ -124,7 +343,7 @@ fn new_harness_guard() -> std::io::Result<HarnessGuard> {
     }
 
     Ok(HarnessGuard {
-        _tempdir: tempdir,
+        tempdir: Some(tempdir),
         config_dir,
         workspace_dir,
         home_dir,
@@ -218,25 +437,66 @@ fn spawn_chat_command(cmd: Command) -> Session {
     };
     // Fixed PTY geometry avoids width-dependent wrapping noise.
     if let Err(e) = session.get_process_mut().set_window_size(120, 40) {
-        eprintln!("warning: set_window_size failed: {e}; continuing with default size");
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: set_window_size failed: {e}; continuing with default size"
+        );
     }
     session.set_expect_timeout(Some(TURN_TIMEOUT));
     session
 }
 
-/// RAII wrapper: guarantees `cleanup` runs even if the test panics during
-/// expect/assert. Dropping the guard sends SIGKILL to any still-alive child
-/// and drains the PTY stream so the OS releases the slave fd.
+/// Own the actual PTY child through status polling and bounded cleanup.
+/// Unknown cleanup retains the session and fixture paths and fails the test.
+struct TrackedSession {
+    inner: Session,
+    reaped: Option<expectrl::WaitStatus>,
+}
+
+impl TrackedSession {
+    fn confirmed_exit(&mut self) -> std::io::Result<bool> {
+        if self.reaped.is_some() {
+            return Ok(true);
+        }
+        match self.inner.get_process().status() {
+            Ok(status @ (expectrl::WaitStatus::Exited(_, _) | expectrl::WaitStatus::Signaled(_, _, _))) => {
+                self.reaped = Some(status);
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            // In particular, first ECHILD/ESRCH is unknown, never evidence.
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    }
+}
+
+impl std::ops::Deref for TrackedSession {
+    type Target = Session;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for TrackedSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 struct SessionGuard {
-    inner: Option<Session>,
+    inner: Option<TrackedSession>,
 }
 
 impl SessionGuard {
     fn new(session: Session) -> Self {
-        Self { inner: Some(session) }
+        Self {
+            inner: Some(TrackedSession {
+                inner: session,
+                reaped: None,
+            }),
+        }
     }
 
-    fn session(&mut self) -> &mut Session {
+    fn session(&mut self) -> &mut TrackedSession {
         // Invariant: `inner` is only `None` after explicit `into_session()` (none here)
         // or after `Drop` runs (no further access possible).
         self.inner.as_mut().expect("SessionGuard accessed after drop")
@@ -245,12 +505,48 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        if let Some(mut session) = self.inner.take() {
-            if session.is_alive().unwrap_or(false) {
-                let _ = session.get_process_mut().signal(expectrl::Signal::SIGKILL);
+        let Some(mut session) = self.inner.take() else { return };
+        let still_owned = match session.confirmed_exit() {
+            Ok(true) => return,
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        // First ECHILD/ESRCH is unknown: do not signal a potentially reused PID.
+        if still_owned {
+            let _ = session.get_process_mut().signal(expectrl::Signal::SIGKILL);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                match session.confirmed_exit() {
+                    Ok(true) => return,
+                    Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
             }
-            let mut sink = Vec::new();
-            let _ = session.get_stream_mut().read_to_end(&mut sink);
+        }
+        // Dependency Drop has its own signal/sleep retries and may panic.
+        // Retain unknown ownership instead of entering that implicit path.
+        std::mem::forget(session);
+        let _ = writeln!(
+            std::io::stderr(),
+            "PTY cleanup UNKNOWN; scratch retained; no descendant-exit claim"
+        );
+        assert!(
+            std::thread::panicking(),
+            "PTY cleanup did not confirm direct-child reap"
+        );
+    }
+}
+
+impl Drop for HarnessGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(root) = self.tempdir.take()
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "PTY failure scratch retained: {}",
+                root.keep().display()
+            );
         }
     }
 }
@@ -262,10 +558,12 @@ impl Drop for SessionGuard {
 ///
 /// Returns the complete accumulated buffer on success. On timeout panics
 /// with the captured buffer so the failure message is actionable.
-fn read_until_with_dsr(session: &mut Session, needle: &str, total: Duration) -> String {
+fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Duration) -> String {
     let deadline = Instant::now() + total;
     let mut accum: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
+    // Set once the process has exited; the next empty read then ends the wait.
+    let mut exited = false;
     loop {
         // 1. drain any pending bytes
         match session.try_read(&mut buf) {
@@ -296,7 +594,13 @@ fn read_until_with_dsr(session: &mut Session, needle: &str, total: Duration) -> 
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data right now — yield.
+                if exited {
+                    let s = String::from_utf8_lossy(&accum).into_owned();
+                    panic!("the chat process exited before `{needle}` appeared. Captured:\n----\n{s}\n----");
+                }
+                // No data right now: check the process is still there (one
+                // more read drains what it wrote before exiting), then yield.
+                exited = matches!(session.confirmed_exit(), Ok(true));
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
@@ -322,7 +626,7 @@ fn read_until_with_dsr(session: &mut Session, needle: &str, total: Duration) -> 
 /// A single read can return several DSR queries back-to-back (reedline prints
 /// a few during init); replying only once leaves the others unanswered and
 /// reedline parks forever.
-fn ack_all_dsr_with_pending(session: &mut Session, chunk: &[u8], pending: &mut String) {
+fn ack_all_dsr_with_pending(session: &mut TrackedSession, chunk: &[u8], pending: &mut String) {
     // Append fresh bytes to the cross-chunk accumulation buffer.
     pending.push_str(&String::from_utf8_lossy(chunk));
 
@@ -359,7 +663,7 @@ fn ack_all_dsr_with_pending(session: &mut Session, chunk: &[u8], pending: &mut S
 ///
 /// Uses a persistent `pending` buffer across chunks so that DSR queries
 /// straddling read boundaries are never missed.
-fn drain_with_dsr(session: &mut Session, total: Duration) {
+fn drain_with_dsr(session: &mut TrackedSession, total: Duration) {
     let deadline = Instant::now() + total;
     let mut buf = [0u8; 4096];
     let mut pending = String::new();
@@ -385,15 +689,15 @@ fn window(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Wait up to `total` for the child process to exit. Returns true only when
-/// the process has genuinely terminated (verified via `is_alive()` returning
-/// `false`), not merely because the PTY fd produced a read error.
+/// the owner has recorded Exited/Signaled, not merely because the PTY fd
+/// produced a read error or a wait returned ECHILD without recorded evidence.
 ///
 /// Previously, any non-WouldBlock read error was treated as "process exited",
 /// which could hide hang regressions: a live process that triggers a transient
 /// I/O error (e.g. EPIPE on the slave PTY side) would falsely look like it
 /// exited. We now keep draining for DSR purposes but authoritative exit
-/// detection is done exclusively via `is_alive()`.
-fn wait_for_exit(session: &mut Session, total: Duration) -> bool {
+/// detection uses owner-recorded Exited/Signaled status.
+fn wait_for_exit(session: &mut TrackedSession, total: Duration) -> bool {
     let deadline = Instant::now() + total;
     let mut pending_dsr = String::new();
     while Instant::now() < deadline {
@@ -402,26 +706,26 @@ fn wait_for_exit(session: &mut Session, total: Duration) -> bool {
         let mut buf = [0u8; 4096];
         match session.try_read(&mut buf) {
             Ok(0) => {
-                // EOF on the PTY stream — still need to confirm via is_alive().
+                // EOF on the PTY stream — still need to confirm via owner status.
             }
             Ok(n) => ack_all_dsr_with_pending(session, &buf[..n], &mut pending_dsr),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 // Log the error but do NOT treat it as proof of exit — the
                 // process may still be alive with a broken PTY stream.
-                eprintln!("wait_for_exit: PTY read error ({e}); continuing is_alive check");
+                eprintln!("wait_for_exit: PTY read error ({e}); continuing owner status check");
             }
         }
         // Authoritative exit check: ask the OS whether the child is still alive.
-        match session.is_alive() {
-            Ok(false) => return true,
-            Ok(true) => std::thread::sleep(Duration::from_millis(40)),
+        match session.confirmed_exit() {
+            Ok(true) => return true,
+            Ok(false) => std::thread::sleep(Duration::from_millis(40)),
             Err(e) => {
                 // A transient waitpid/PTY race here is not proof of a clean
                 // process exit. Keep polling until the deadline so SessionGuard
                 // does not kill a still-flushing chat process before session
                 // persistence reaches disk.
-                eprintln!("wait_for_exit: is_alive() error ({e}); continuing until deadline");
+                eprintln!("wait_for_exit: status error ({e}); continuing until deadline");
                 std::thread::sleep(Duration::from_millis(40));
             }
         }
@@ -566,7 +870,7 @@ fn test_chat_exit_command_clean() {
     // We accept any non-signal exit because the surface differs across
     // platforms; the regression we care about is the process not exiting
     // at all on /exit.
-    if let Ok(status) = session.get_process().wait() {
+    if let Some(status) = session.reaped {
         match status {
             expectrl::WaitStatus::Exited(_, code) => {
                 assert_eq!(code, 0, "non-zero exit code after /exit: {code}");
@@ -646,7 +950,7 @@ fn test_chat_double_ctrl_c_exit() {
     // bounds that wait via `runtime.shutdown_timeout` (see main.rs's
     // `RUNTIME_SHUTDOWN_TIMEOUT`). If this assertion fails, the hang bug
     // has regressed.
-    let exit_deadline = Duration::from_secs(6);
+    let exit_deadline = EXIT_TIMEOUT;
     assert!(
         wait_for_exit(session, exit_deadline),
         "process did NOT exit within {exit_deadline:?} after double Ctrl-C \
@@ -1216,7 +1520,7 @@ fn test_chat_session_resume_last_restores_saved_turns() {
         captured.contains(first_response),
         "first scripted chat process should complete turn before resume test. captured:\n{captured}"
     );
-    let before_stdout = wait_for_session_list_containing(&guard, &first_message, Duration::from_secs(3));
+    let before_stdout = wait_for_session_list_containing(&guard, &first_message, TURN_TIMEOUT);
     assert!(
         before_stdout.contains(&first_message) && before_stdout.contains("2 turns"),
         "first session should be saved with one user/assistant pair. stdout:\n{before_stdout}"
@@ -1233,7 +1537,7 @@ fn test_chat_session_resume_last_restores_saved_turns() {
         "resumed scripted chat process should complete follow-up turn. captured:\n{captured2}"
     );
 
-    let after_stdout = wait_for_session_list_containing(&guard, &first_message, Duration::from_secs(3));
+    let after_stdout = wait_for_session_list_containing(&guard, &first_message, TURN_TIMEOUT);
     assert!(
         after_stdout.contains(&first_message) && after_stdout.contains("4 turns"),
         "`--session last` should append the follow-up to the original saved session. stdout:\n{after_stdout}"
@@ -1264,7 +1568,7 @@ fn test_chat_pure_double_ctrl_c_exits_cleanly() {
         captured.contains("Exiting..."),
         "a double Ctrl+C must print Exiting... in Pure mode; captured:\n{captured}"
     );
-    let exit_deadline = Duration::from_secs(6);
+    let exit_deadline = EXIT_TIMEOUT;
     assert!(
         wait_for_exit(session, exit_deadline),
         "a double Ctrl+C must exit within {exit_deadline:?} in Pure mode"
@@ -1424,7 +1728,7 @@ fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
 
-    let exit_deadline = Duration::from_secs(6);
+    let exit_deadline = EXIT_TIMEOUT;
     assert!(
         wait_for_exit(session, exit_deadline),
         "a double Ctrl+C on the real ratatui path must exit within {exit_deadline:?}"
@@ -1746,6 +2050,20 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
 struct FakeDaemon {
     base_url: String,
     state: std::sync::Arc<std::sync::Mutex<FakeDaemonState>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(server) = self.server.take() {
+            let failed = server.join().is_err();
+            if !std::thread::panicking() {
+                assert!(!failed, "fake daemon thread failed before cleanup");
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1790,16 +2108,34 @@ impl FakeDaemon {
             pending,
             ..FakeDaemonState::default()
         }));
-        let served = std::sync::Arc::clone(&state);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                serve_one(stream, &served);
+        let shared_state = std::sync::Arc::clone(&state);
+        listener.set_nonblocking(true).expect("nonblocking fake daemon");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("daemon read timeout");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .expect("daemon write timeout");
+                        serve_one(stream, &shared_state, &server_stop);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fake daemon accept failed: {error}"),
+                }
             }
         });
         Self {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
             state,
+            stop,
+            server: Some(server),
         }
     }
 
@@ -1839,10 +2175,17 @@ impl FakeDaemon {
 
 /// Read one request, answer it, close. Keep-alive is deliberately not offered:
 /// one exchange per connection keeps this parser trivial and correct.
-fn serve_one(mut stream: std::net::TcpStream, state: &std::sync::Mutex<FakeDaemonState>) {
+fn serve_one(
+    mut stream: std::net::TcpStream,
+    state: &std::sync::Mutex<FakeDaemonState>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         match stream.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => {
@@ -1865,6 +2208,9 @@ fn serve_one(mut stream: std::net::TcpStream, state: &std::sync::Mutex<FakeDaemo
         })
         .unwrap_or(0);
     while raw.len() < head_end + content_length {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -2029,7 +2375,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     );
 
     // The assignment arrives without anybody typing, is announced, and runs.
-    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(15)));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
     assert!(
         transcript.contains("Assigned by wacli"),
         "assigned work must never be silent; captured:\n{transcript}"
@@ -2040,7 +2386,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     );
 
     // The answer goes back, and it is the reply the turn produced.
-    daemon.wait_for("the result", Duration::from_secs(15), |state| !state.results.is_empty());
+    daemon.wait_for("the result", TURN_TIMEOUT, |state| !state.results.is_empty());
     let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
     assert_eq!(id, "assign-1");
     assert_eq!(status, "completed");
@@ -2051,7 +2397,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
 
     // Acknowledgement rides the *next* pull, never the one that delivered it:
     // a client that acknowledged on receipt and then died would destroy the work.
-    daemon.wait_for("the acknowledging pull", Duration::from_secs(15), |state| {
+    daemon.wait_for("the acknowledging pull", TURN_TIMEOUT, |state| {
         state.pull_acks.iter().any(|ack| ack.contains(&"assign-1".to_string()))
     });
     let acks = daemon.snapshot(|state| state.pull_acks.clone());
@@ -2068,7 +2414,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     // Exiting withdraws the session: nothing on the daemon reaps it on a clock.
     session.send("/exit\r").expect("send /exit");
     assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
-    daemon.wait_for("deregistration", Duration::from_secs(10), |state| state.deregistered);
+    daemon.wait_for("deregistration", TURN_TIMEOUT, |state| state.deregistered);
 }
 
 /// A chat that no daemon will accept still starts, and says why it cannot be
@@ -2090,7 +2436,7 @@ fn test_chat_starts_normally_when_it_cannot_enrol_with_a_daemon() {
 
     // The chat is fully usable: a failed enrolment costs one capability.
     session.send("hello\r").expect("send prompt");
-    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(15)));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
     assert!(
         transcript.contains("cannot be assigned work"),
         "a failed enrolment must be stated, not swallowed; captured:\n{transcript}"
@@ -2129,20 +2475,18 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
     });
     // Wait until this chat is actually polling, so the restart lands on a
     // session the daemon really had rather than on one still being set up.
-    daemon.wait_for("the first pull", Duration::from_secs(15), |state| {
-        !state.pull_acks.is_empty()
-    });
+    daemon.wait_for("the first pull", TURN_TIMEOUT, |state| !state.pull_acks.is_empty());
 
     // The daemon restarts, and has work waiting for whoever registers next.
     // Nobody touches the chat from here on.
     daemon.restart_holding("assign-after-restart", "count the crates");
 
-    daemon.wait_for("the chat to register again", Duration::from_secs(20), |state| {
+    daemon.wait_for("the chat to register again", TURN_TIMEOUT, |state| {
         state.registrations == 2
     });
 
     // Being registered again is not the claim; being able to take work is.
-    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(20)));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
     assert!(
         transcript.contains("registered again"),
         "a chat that re-enrolled must say so; captured:\n{transcript}"
@@ -2151,7 +2495,7 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
         transcript.contains("count the crates"),
         "the assignment handed to the new registration must arrive; captured:\n{transcript}"
     );
-    daemon.wait_for("the result", Duration::from_secs(20), |state| !state.results.is_empty());
+    daemon.wait_for("the result", TURN_TIMEOUT, |state| !state.results.is_empty());
     let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
     assert_eq!(id, "assign-after-restart");
     assert_eq!(status, "completed");

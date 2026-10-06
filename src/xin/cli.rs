@@ -6,8 +6,8 @@ use super::{runner, store};
 use crate::config::Config;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::types::{
-    ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
-    XinTaskPatch,
+    ExecutionMode, GoalStatus, JobOrigin, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority,
+    TaskStatus, XinTaskPatch,
 };
 use crate::{XinCommands, XinGoalCommands, XinStepCommands};
 use anyhow::{Result, bail};
@@ -113,7 +113,9 @@ pub async fn handle_command(command: XinCommands, config: &Config) -> Result<()>
                 bail!("Recurring tasks require --interval-secs >= 60");
             }
             let mode = execution_mode(&mode);
-            let task = store::add_task(
+            // The `prx xin` CLI is reached only by the local operator, so the
+            // task is the operator's own (D-107 amendment).
+            let task = store::add_task_with_origin_and_creator(
                 config,
                 &NewXinTask {
                     owner_id: None,
@@ -131,6 +133,8 @@ pub async fn handle_command(command: XinCommands, config: &Config) -> Result<()>
                     interval_secs,
                     max_failures: 0,
                 },
+                &JobOrigin::LocalOperator,
+                crate::cron::JobCreator::OperatorCli,
             )?;
             println!("Created xin task {} ({})", task.id, task.name);
             Ok(())
@@ -170,10 +174,19 @@ pub async fn handle_command(command: XinCommands, config: &Config) -> Result<()>
                     payload,
                     interval_secs,
                     approval_grant_json,
+                    created_via: Some(crate::cron::JobCreator::OperatorCli),
                     ..XinTaskPatch::default()
                 },
             )?;
             println!("Updated xin task {} ({})", task.id, task.name);
+            Ok(())
+        }
+        XinCommands::MarkOperator { id } => {
+            // Only the local operator reaches the `prx xin` CLI.
+            let task = store::get_task(config, &id)?;
+            store::mark_task_operator(config, &id)?;
+            println!("Marked xin task {id} as the operator's own: its shell command may run git (hardened)");
+            println!("  Payload: {}", task.payload);
             Ok(())
         }
         XinCommands::Remove { id } => {
@@ -259,7 +272,7 @@ fn handle_goal_command(command: XinGoalCommands, config: &Config) -> Result<()> 
                         .map_err(anyhow::Error::new)
                 })
                 .transpose()?;
-            let goal = store::add_goal(
+            let goal = store::add_goal_with_origin(
                 config,
                 &NewXinGoal {
                     owner_id: None,
@@ -273,6 +286,7 @@ fn handle_goal_command(command: XinGoalCommands, config: &Config) -> Result<()> 
                     target_completion_at,
                     initial_steps: Vec::new(),
                 },
+                &JobOrigin::LocalOperator,
             )?;
             println!("Created xin goal {} ({})", goal.id, goal.name);
         }

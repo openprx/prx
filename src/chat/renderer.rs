@@ -3,6 +3,7 @@
 //! Uses `syntect` for 200+ language syntax highlighting in terminal output.
 //! Gated behind the `terminal-tui` feature.
 
+use crate::markdown::CodeFence;
 use std::borrow::Cow;
 use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
@@ -343,8 +344,10 @@ fn split_eol(line: &str) -> (&str, &str) {
 
 /// Render markdown text with code block highlighting.
 ///
-/// Detects fenced code blocks (``` or ~~~), highlights them, and returns
-/// the full text with code blocks replaced by highlighted versions.
+/// Fenced code blocks are recognised with the shared `CodeFence` model, so
+/// the renderer agrees with the response cleaner about the fence character, the
+/// run length, the three-space indent allowance and the info string. A block
+/// that is never closed runs to the end of the text and is still framed.
 ///
 /// Maintains an [`AnsiState`] across segments so that adjacent highlighted
 /// blocks (or a block immediately followed by plain text) do not accumulate
@@ -354,45 +357,52 @@ fn split_eol(line: &str) -> (&str, &str) {
 pub fn render_markdown_with_highlighting(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut state = AnsiState::default();
-    let mut in_code_block = false;
+    let mut fence: Option<CodeFence> = None;
     let mut code_language: Option<String> = None;
     let mut code_buffer = String::new();
 
     for line in text.lines() {
-        if !in_code_block && (line.starts_with("```") || line.starts_with("~~~")) {
-            // Start of code block
-            in_code_block = true;
-            let fence = if line.starts_with("```") { "```" } else { "~~~" };
-            let lang = line[fence.len()..].trim();
-            code_language = if lang.is_empty() { None } else { Some(lang.to_string()) };
-            code_buffer.clear();
-            // Print a visual separator (plain text — does not alter ANSI state).
-            state.push(&mut result, "  ┌─");
-            if let Some(ref lang) = code_language {
-                state.push(&mut result, lang);
-                state.push(&mut result, "─");
+        match fence {
+            Some(open) if open.closes(line) => {
+                // End of code block — highlight and append.
+                emit_highlighted_block(&mut result, &mut state, &code_buffer, code_language.as_deref());
+                fence = None;
+                code_language = None;
             }
-            state.push(&mut result, "\n");
-        } else if in_code_block && (line.starts_with("```") || line.starts_with("~~~")) {
-            // End of code block — highlight and append.
-            emit_highlighted_block(&mut result, &mut state, &code_buffer, code_language.as_deref());
-            in_code_block = false;
-            code_language = None;
-        } else if in_code_block {
-            code_buffer.push_str(line);
-            code_buffer.push('\n');
-        } else {
-            // Regular markdown line — apply basic formatting. `render_inline_markdown`
-            // may insert `\x1b[33m...\x1b[0m` pairs (always reset-terminated) for
-            // inline code; for plain prose it returns text unchanged.
-            let formatted = render_inline_markdown(line);
-            state.push(&mut result, &formatted);
-            state.push(&mut result, "\n");
+            Some(_) => {
+                code_buffer.push_str(line);
+                code_buffer.push('\n');
+            }
+            None => {
+                if let Some(open) = CodeFence::open(line) {
+                    // Start of code block
+                    fence = Some(open);
+                    let lang = open.info(line);
+                    code_language = if lang.is_empty() { None } else { Some(lang.to_string()) };
+                    code_buffer.clear();
+                    // Print a visual separator (plain text — does not alter ANSI state).
+                    state.push(&mut result, "  ┌─");
+                    if let Some(ref lang) = code_language {
+                        state.push(&mut result, lang);
+                        state.push(&mut result, "─");
+                    }
+                } else {
+                    // Regular markdown line — apply basic formatting. `render_inline_markdown`
+                    // may insert `\x1b[33m...\x1b[0m` pairs (always reset-terminated) for
+                    // inline code; for plain prose it returns text unchanged.
+                    let formatted = render_inline_markdown(line);
+                    state.push(&mut result, &formatted);
+                }
+                // Both the opening border and a prose line end the output line.
+                state.push(&mut result, "\n");
+            }
         }
     }
 
-    // Handle unclosed code block.
-    if in_code_block && !code_buffer.is_empty() {
+    // An unclosed block is still framed, empty body included: the opening
+    // border is already written, so leaving it unmatched would paint a
+    // dangling box on every streaming tick.
+    if fence.is_some() {
         emit_highlighted_block(&mut result, &mut state, &code_buffer, code_language.as_deref());
     }
 
@@ -1110,5 +1120,249 @@ mod tests {
         assert!(out.contains("\x1b[33m"), "inline code colour missing");
         // The fenced block border must still appear.
         assert!(out.contains("┌─rust"), "opening border missing");
+    }
+
+    // ---------------------------------------------------------------
+    // CommonMark fence fixtures
+    //
+    // The border vocabulary comes from `emit_highlighted_block`: the
+    // opener is `  ┌─`, every body line carries the prefix `  │ `, and the
+    // closer is `  └─`. The assertions below talk about those visible
+    // spans, so they are independent of which SGR codes syntect chooses
+    // for a given theme.
+    // ---------------------------------------------------------------
+
+    /// `text` with its ANSI escape sequences removed, so a fixture can assert
+    /// on the visible layout instead of on highlighter colour codes.
+    fn plain(text: &str) -> String {
+        let mut visible = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(escape) = rest.find('\u{1b}') {
+            visible.push_str(&rest[..escape]);
+            let sequence = &rest[escape..];
+            // A CSI sequence ends at its first alphabetic byte (`m` for SGR);
+            // everything before it is digits and separators.
+            match sequence.find(|byte: char| byte.is_ascii_alphabetic()) {
+                Some(end) => rest = &sequence[end + 1..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        visible.push_str(rest);
+        visible
+    }
+
+    /// The code lines of `rendered`, with the `  │ ` border prefix stripped.
+    fn body_lines(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("  │ "))
+            .map(str::trim_end)
+            .collect()
+    }
+
+    /// The lines of `rendered` that are outside every highlighted block.
+    fn prose_lines(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with("  │ ") && !line.starts_with("  ┌─") && !line.starts_with("  └─"))
+            .map(str::trim_end)
+            .collect()
+    }
+
+    #[test]
+    fn longer_outer_fence_keeps_a_shorter_inner_fence_as_content() {
+        let out = plain(&render_markdown_with_highlighting(
+            "````text\ninner\n```\nmore\n````\ntail\n",
+        ));
+        assert_eq!(count_occurrences(&out, "  ┌─"), 1, "expected one block: {out:?}");
+        assert_eq!(count_occurrences(&out, "  └─"), 1, "expected one block: {out:?}");
+        let body = body_lines(&out);
+        for content in ["inner", "```", "more"] {
+            assert!(
+                body.contains(&content),
+                "{content:?} must stay inside the block: {out:?}"
+            );
+        }
+        assert!(
+            prose_lines(&out).contains(&"tail"),
+            "tail must render as prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn tilde_fence_keeps_an_inner_backtick_line_as_content() {
+        let out = plain(&render_markdown_with_highlighting(
+            "~~~text\n```example\nstill code\n~~~\nprose after\n",
+        ));
+        assert_eq!(count_occurrences(&out, "  ┌─"), 1, "expected one block: {out:?}");
+        assert_eq!(count_occurrences(&out, "  └─"), 1, "expected one block: {out:?}");
+        let body = body_lines(&out);
+        for content in ["```example", "still code"] {
+            assert!(
+                body.contains(&content),
+                "{content:?} must stay inside the block: {out:?}"
+            );
+        }
+        assert!(
+            prose_lines(&out).contains(&"prose after"),
+            "text after the block must render as prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn closing_run_shorter_than_the_opener_does_not_close_the_block() {
+        let out = plain(&render_markdown_with_highlighting(
+            "````rust\nlet prx_value = 1;\n```\n",
+        ));
+        assert!(
+            out.lines().any(|line| line == "  ┌─rust─"),
+            "header must carry the clean info string: {out:?}"
+        );
+        assert_eq!(count_occurrences(&out, "  └─"), 1, "expected one block: {out:?}");
+        let body = body_lines(&out);
+        for content in ["let prx_value = 1;", "```"] {
+            assert!(
+                body.contains(&content),
+                "{content:?} must stay inside the block: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fence_indented_four_spaces_is_not_a_fence() {
+        let out = plain(&render_markdown_with_highlighting("    ```rust\n    body\n"));
+        assert_eq!(
+            count_occurrences(&out, "  ┌─"),
+            0,
+            "four spaces of indent make the line content, not a fence: {out:?}"
+        );
+    }
+
+    #[test]
+    fn info_string_with_attributes_is_kept_verbatim_in_the_header() {
+        let out = plain(&render_markdown_with_highlighting(
+            "```rust,ignore title=\"demo\"\nlet prx_value = 1;\n```\n",
+        ));
+        assert!(
+            out.lines().any(|line| line == "  ┌─rust,ignore title=\"demo\"─"),
+            "the whole trimmed info string belongs in the header: {out:?}"
+        );
+        assert_eq!(count_occurrences(&out, "  └─"), 1, "expected one block: {out:?}");
+    }
+
+    #[test]
+    fn unterminated_fence_with_a_body_emits_a_closed_block() {
+        let out = plain(&render_markdown_with_highlighting("```rust\npartial line"));
+        assert_eq!(count_occurrences(&out, "  ┌─"), 1, "expected one block: {out:?}");
+        assert_eq!(
+            count_occurrences(&out, "  └─"),
+            1,
+            "an unterminated fence must still be closed: {out:?}"
+        );
+        assert!(
+            body_lines(&out).contains(&"partial line"),
+            "the partial line belongs inside the block: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_empty_fence_emits_a_closed_block() {
+        let out = plain(&render_markdown_with_highlighting("```rust\n"));
+        assert!(
+            out.lines().any(|line| line == "  ┌─rust─"),
+            "header must be emitted: {out:?}"
+        );
+        assert_eq!(
+            count_occurrences(&out, "  └─"),
+            1,
+            "an unterminated empty fence must render a closed box, not a dangling border: {out:?}"
+        );
+    }
+
+    #[test]
+    fn two_consecutive_fences_render_as_two_blocks() {
+        let out = plain(&render_markdown_with_highlighting(
+            "```rust\nfn a() {}\n```\n```python\nprint(1)\n```\ntail\n",
+        ));
+        assert_eq!(count_occurrences(&out, "  ┌─"), 2, "expected two blocks: {out:?}");
+        assert_eq!(count_occurrences(&out, "  └─"), 2, "expected two blocks: {out:?}");
+        for header in ["  ┌─rust─", "  ┌─python─"] {
+            assert!(
+                out.lines().any(|line| line == header),
+                "{header:?} must be one of the headers: {out:?}"
+            );
+        }
+        assert!(
+            prose_lines(&out).contains(&"tail"),
+            "tail must render as prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fence_inside_a_list_item_up_to_three_spaces_is_still_a_fence() {
+        let out = plain(&render_markdown_with_highlighting(
+            "- item\n   ```rust\n   let prx_value = 1;\n   ```\nafter\n",
+        ));
+        assert!(
+            out.lines().any(|line| line == "  ┌─rust─"),
+            "three spaces of indent still open a fence: {out:?}"
+        );
+        assert_eq!(count_occurrences(&out, "  └─"), 1, "expected one block: {out:?}");
+        assert!(
+            body_lines(&out).iter().any(|line| line.trim() == "let prx_value = 1;"),
+            "the indented body belongs inside the block: {out:?}"
+        );
+        for prose in ["- item", "after"] {
+            assert!(
+                prose_lines(&out).contains(&prose),
+                "{prose:?} must render outside the block: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backtick_in_a_backtick_fence_info_string_leaves_the_line_as_prose() {
+        // CommonMark: an opening backtick fence's info string may not contain a
+        // backtick, so this line is an ordinary paragraph and nothing after it
+        // is code. `CodeFence::open` refuses it, and the renderer must not draw
+        // a border of any kind.
+        let out = plain(&render_markdown_with_highlighting("```rust `x`\nprose line\n"));
+        assert_eq!(
+            count_occurrences(&out, "  ┌─"),
+            0,
+            "no block may be opened by that line: {out:?}"
+        );
+        assert_eq!(count_occurrences(&out, "  └─"), 0, "and none may be closed: {out:?}");
+        assert!(
+            prose_lines(&out).contains(&"prose line"),
+            "the following line must stay prose: {out:?}"
+        );
+
+        // The rule is specific to the backtick marker: a tilde fence's info
+        // string may carry a backtick, so this one does open a block.
+        let tilde = plain(&render_markdown_with_highlighting(
+            "~~~rust `x`\nlet prx_value = 1;\n~~~\nafter\n",
+        ));
+        assert_eq!(
+            count_occurrences(&tilde, "  ┌─"),
+            1,
+            "a tilde fence still opens: {tilde:?}"
+        );
+        assert_eq!(
+            count_occurrences(&tilde, "  └─"),
+            1,
+            "a tilde fence still closes: {tilde:?}"
+        );
+        assert!(
+            body_lines(&tilde).contains(&"let prx_value = 1;"),
+            "the body belongs inside the block: {tilde:?}"
+        );
+        assert!(
+            prose_lines(&tilde).contains(&"after"),
+            "text after the block must render as prose: {tilde:?}"
+        );
     }
 }

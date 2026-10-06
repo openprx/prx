@@ -309,7 +309,11 @@ fn shared_config_direct_store_authz_flip() {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("test: create workspace");
 
+    // Both configs live in the tempdir: the default paths name the real
+    // `~/.openprx`, whose config files the generation owner reads (D-070).
     let supervised = Config {
+        config_path: tmp.path().join("config.toml"),
+        workspace_dir: workspace.clone(),
         autonomy: openprx::config::AutonomyConfig {
             level: AutonomyLevel::Supervised,
             ..openprx::config::AutonomyConfig::default()
@@ -333,6 +337,8 @@ fn shared_config_direct_store_authz_flip() {
 
     // Publish ReadOnly through the sole generation owner.
     let read_only = Config {
+        config_path: tmp.path().join("config.toml"),
+        workspace_dir: workspace.clone(),
         autonomy: openprx::config::AutonomyConfig {
             level: AutonomyLevel::ReadOnly,
             ..openprx::config::AutonomyConfig::default()

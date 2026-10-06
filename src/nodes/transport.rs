@@ -45,7 +45,10 @@ impl H2Transport {
     }
 
     pub fn validate_endpoint(endpoint: &str) -> Result<()> {
-        let url = reqwest::Url::parse(endpoint).with_context(|| format!("invalid node endpoint URL: {endpoint}"))?;
+        // Messages name the endpoint without its userinfo: they reach logs
+        // and the model through the `nodes` tool.
+        let shown = crate::providers::redact_endpoint_userinfo(endpoint);
+        let url = reqwest::Url::parse(endpoint).with_context(|| format!("invalid node endpoint URL: {shown}"))?;
 
         if url.scheme() == "https" {
             return Ok(());
@@ -62,7 +65,7 @@ impl H2Transport {
         }
 
         Err(anyhow!(
-            "insecure node endpoint '{endpoint}': use https://, or loopback http://localhost / http://127.0.0.1 only"
+            "insecure node endpoint '{shown}': use https://, or loopback http://localhost / http://127.0.0.1 only"
         ))
     }
 

@@ -20,13 +20,12 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use openprx::agent::agent::Agent;
+#[path = "support/embedded_agent.rs"]
+mod embedded_agent;
+use embedded_agent::EmbeddedAgentFixture;
 use openprx::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-use openprx::agent::memory_loader::MemoryLoader;
-use openprx::config::MemoryConfig;
-use openprx::memory;
+use openprx::agent::memory_loader::SelectedMemoryFormatter;
 use openprx::memory::Memory;
-use openprx::observability::{NoopObserver, Observer};
 use openprx::providers::traits::ChatMessage;
 use openprx::providers::{ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderRuntimeOptions, ToolCall};
 use openprx::tools::{Tool, ToolResult};
@@ -162,6 +161,10 @@ impl RecordingProvider {
 
 #[async_trait]
 impl Provider for RecordingProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -187,42 +190,84 @@ impl Provider for RecordingProvider {
     }
 }
 
-/// Mock memory loader that returns a static context string,
-/// simulating RAG recall without a real memory backend.
-struct StaticMemoryLoader {
-    context: String,
-}
-
-impl StaticMemoryLoader {
-    fn new(context: &str) -> Self {
-        Self {
-            context: context.to_string(),
-        }
+/// Presentation only: every supplied summary must come from selected retrieval.
+struct SelectedContextFormatter;
+impl SelectedMemoryFormatter for SelectedContextFormatter {
+    fn format_context(&self, summaries: &[&str]) -> Result<String> {
+        anyhow::ensure!(!summaries.is_empty(), "selected memory is required");
+        Ok(format!("[Memory context]\n{}\n\n", summaries.join("\n")))
     }
 }
 
-#[async_trait]
-impl MemoryLoader for StaticMemoryLoader {
-    async fn load_context(&self, _memory: &dyn Memory, _user_message: &str) -> Result<String> {
-        Ok(self.context.clone())
-    }
+async fn build_selected_memory_agent(provider: RecordingProvider, content: &str) -> EmbeddedAgentFixture {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = openprx::config::Config {
+        workspace_dir: workspace.path().to_owned(),
+        config_path: workspace.path().join("config.toml"),
+        default_model: Some("prx-local-model".to_owned()),
+        ..openprx::config::Config::default()
+    };
+    config.causal_tree.enabled = false;
+    config.memory.auto_save = false;
+    config.autonomy.level = openprx::security::AutonomyLevel::ReadOnly;
+    config.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        openprx::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    // RecordingProvider accepts structured ChatRequest messages and tool specs.
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    let memory = Arc::new(openprx::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let envelope =
+        openprx::runtime::envelope::RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_fixture_seed")
+            .with_channel("agent_api")
+            .with_sender("embedded-caller");
+    let owner = envelope.resolved_owner_id();
+    let mut scope = envelope.memory_write_context("private");
+    scope.owner_id = Some(owner.clone());
+    scope.require_owner_match = true;
+    memory
+        .store_with_context_and_metadata(
+            "prx_selected_fact",
+            content,
+            openprx::memory::MemoryCategory::Core,
+            None,
+            Some(&scope),
+            openprx::memory::MemoryStoreMetadata {
+                workspace_id: Some(envelope.workspace_id.clone()),
+                owner_id: Some(owner),
+                channel: Some("agent_api".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let shared: Arc<dyn Memory> = memory;
+    let tool =
+        openprx::tools::memory_search::MemorySearchTool::new(workspace.path().to_owned(), Arc::clone(&shared), true);
+    let builder = openprx::agent::agent::Agent::builder()
+        .runtime_config(config, "ollama")
+        .provider(Box::new(provider))
+        .tools(vec![Box::new(tool)])
+        .memory(shared)
+        .observer(Arc::new(openprx::observability::NoopObserver {}))
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .selected_memory_formatter(Box::new(SelectedContextFormatter));
+    EmbeddedAgentFixture::finish(builder, workspace)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-fn make_memory() -> Arc<dyn Memory> {
-    let cfg = MemoryConfig {
-        backend: "none".into(),
-        ..MemoryConfig::default()
-    };
-    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
-}
-
-fn make_observer() -> Arc<dyn Observer> {
-    Arc::from(NoopObserver {})
-}
 
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
@@ -241,48 +286,19 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     }
 }
 
-fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .build()
-        .unwrap()
+fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
+    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(NativeToolDispatcher));
+    EmbeddedAgentFixture::finish(builder, workspace)
 }
 
-fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(XmlToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .build()
-        .unwrap()
+fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
+    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(XmlToolDispatcher));
+    EmbeddedAgentFixture::finish(builder, workspace)
 }
 
-fn build_recording_agent(
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
-) -> Agent {
-    let mut builder = Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir());
-
-    if let Some(loader) = memory_loader {
-        builder = builder.memory_loader(loader);
-    }
-
-    builder.build().unwrap()
+fn build_recording_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
+    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(NativeToolDispatcher));
+    EmbeddedAgentFixture::finish(builder, workspace)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -450,7 +466,7 @@ async fn e2e_multi_turn_history_fidelity() {
         text_response("response 3"),
     ]);
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![], None);
+    let mut agent = build_recording_agent(Box::new(provider), vec![]);
 
     let r1 = agent.turn("msg 1").await.unwrap();
     assert_eq!(r1, "response 1");
@@ -502,16 +518,13 @@ async fn e2e_multi_turn_history_fidelity() {
     assert!(matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3"));
 }
 
-/// Validates that a custom `MemoryLoader` injects RAG context into user
-/// messages before they reach the provider.
+/// Validates that source-scoped `SQLite` evidence selected by the builtin decision
+/// is formatted into the user message before it reaches the provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("enriched response")]);
 
-    let memory_context = "[Memory context]\n- user_name: test_user\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
-
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_selected_memory_agent(provider, "hello user_name: test_user").await;
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "enriched response");
@@ -553,10 +566,7 @@ async fn e2e_memory_enrichment_injects_context() {
 async fn e2e_multi_turn_with_memory_enrichment() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: openprx\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
-
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_selected_memory_agent(provider, "first second question project: openprx").await;
 
     let r1 = agent.turn("first question").await.unwrap();
     assert_eq!(r1, "answer 1");
@@ -594,14 +604,22 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(agent.history().len(), 5);
 }
 
-/// Validates that empty memory context passes user message through unmodified.
+/// Without selected memory, the formatter is not called and raw input passes through unchanged.
 #[tokio::test]
 async fn e2e_empty_memory_context_passthrough() {
+    struct UnexpectedMemoryFormatter;
+    impl openprx::agent::memory_loader::SelectedMemoryFormatter for UnexpectedMemoryFormatter {
+        fn format_context(&self, _: &[&str]) -> Result<String> {
+            anyhow::bail!("memory formatter must not run without selected memory")
+        }
+    }
     let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
 
-    let loader = StaticMemoryLoader::new("");
-
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let (builder, workspace) = embedded_agent::prepare(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
+    let mut agent = EmbeddedAgentFixture::finish(
+        builder.selected_memory_formatter(Box::new(UnexpectedMemoryFormatter)),
+        workspace,
+    );
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "plain response");

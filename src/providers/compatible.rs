@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 /// streaming path.
 const STREAM_DECODER_LABEL: &str = "OpenAI-compatible";
 
+/// Highest streamed `tool_calls[].index` accepted. The index sizes the
+/// per-call buffer, and it is chosen by the server; one SSE line naming a huge
+/// index must not allocate a buffer entry for every slot below it.
+const MAX_STREAMED_TOOL_CALL_INDEX: usize = 128;
+
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -39,6 +44,49 @@ pub struct OpenAiCompatibleProvider {
     /// to the first `user` message, then drop the system messages.
     /// Required for providers that reject `role: system` (e.g. MiniMax).
     merge_system_into_user: bool,
+    /// When true, a missing credential is a valid configuration: requests go
+    /// out with no authorization header at all. Only bring-your-own endpoints
+    /// set this; every named provider keeps the hard refusal.
+    allows_anonymous: bool,
+    /// What this endpoint accepts in a tool schema, as declared by an operator.
+    ///
+    /// Each entry is a model — or `None` for every model of this provider —
+    /// and the dialect to lower tool schemas to. Empty means
+    /// [`ToolSchemaDialect::Raw`](crate::tools::ToolSchemaDialect::Raw): PRX
+    /// knows nothing about an arbitrary OpenAI-compatible endpoint, and a URL
+    /// is not evidence, so the published document goes out unchanged and the
+    /// validator holds the model to all of it.
+    tool_schema_dialects: Vec<(Option<String>, crate::tools::ToolSchemaDialect)>,
+    /// Which textual tool-call grammar this endpoint was declared to emit.
+    ///
+    /// Empty means [`ToolCallDialect::Native`](super::ToolCallDialect::Native):
+    /// only the provider's `tool_calls` array is read, and prose stays prose.
+    tool_call_dialects: Vec<(Option<String>, super::ToolCallDialect)>,
+    /// The provider label this endpoint was constructed from, set when a
+    /// `[[providers.tool_dialects]]` entry applies to it (the entry names the
+    /// same provider identity). `name` is a display name (`"Custom"` for every
+    /// bring-your-own endpoint), so a refusal names this instead: it is how the
+    /// operator finds the entry to edit.
+    declaration_provider: Option<String>,
+    /// The provider label this endpoint was constructed from, with URL
+    /// userinfo redacted, whether or not a declaration applies. A diagnostic
+    /// that names the declaration to add prints it.
+    configured_label: Option<String>,
+}
+
+/// An endpoint nobody declared a dialect for rejected a root combinator in a
+/// tool schema, with the sentence naming the declaration that would fix it.
+///
+/// Typed so the failover summary can clip the upstream body, as it does every
+/// upstream body, while keeping the hint whole: the hint holds only the
+/// redacted provider label and the model.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{upstream}{hint}")]
+pub struct RootCombinatorRejection {
+    /// The upstream error, as every other non-2xx is rendered.
+    pub upstream: String,
+    /// The declaration hint, starting with a space.
+    pub hint: String,
 }
 
 /// How the provider expects the API key to be sent.
@@ -95,6 +143,24 @@ impl OpenAiCompatibleProvider {
         Self::new_with_options(name, base_url, credential, auth_style, true, None, false)
     }
 
+    /// Same as `new`, for an endpoint the operator runs that may legitimately
+    /// require no authentication.
+    ///
+    /// With a credential the behaviour is identical to `new`. Without one, the
+    /// request carries no authorization header — never a placeholder, which
+    /// would be a credential-shaped value on the wire that no one issued.
+    pub fn new_optional_credential(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
+        Self {
+            allows_anonymous: true,
+            ..Self::new(name, base_url, credential, auth_style)
+        }
+    }
+
     /// Same as `new` but skips the /v1/responses fallback on 404.
     /// Use for providers (e.g. GLM) that only support chat completions.
     pub fn new_no_responses_fallback(
@@ -148,7 +214,219 @@ impl OpenAiCompatibleProvider {
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
+            allows_anonymous: false,
+            tool_schema_dialects: Vec::new(),
+            tool_call_dialects: Vec::new(),
+            declaration_provider: None,
+            configured_label: None,
         }
+    }
+
+    /// Attach every `[[providers.tool_dialects]]` declaration that applies to
+    /// `provider`, the label this endpoint was constructed from.
+    ///
+    /// Declarations are matched by provider identity (see
+    /// [`ProviderRuntimeOptions::declared_tool_schema_dialects`](super::ProviderRuntimeOptions::declared_tool_schema_dialects)),
+    /// and a refusal names `provider` as the entry to edit.
+    #[must_use]
+    pub(crate) fn with_declared_tool_dialects(self, provider: &str, options: &super::ProviderRuntimeOptions) -> Self {
+        // A `custom:` URL may carry `user:password@`, and this label is
+        // printed into refusals and hints.
+        let label = super::redact_endpoint_userinfo(provider.trim()).into_owned();
+        let schema = options.declared_tool_schema_dialects(provider);
+        let call = options.declared_tool_call_dialects(provider);
+        if schema.is_empty() && call.is_empty() {
+            return Self {
+                configured_label: Some(label),
+                ..self
+            };
+        }
+        Self {
+            declaration_provider: Some(label.clone()),
+            configured_label: Some(label),
+            ..self.with_tool_schema_dialects(schema).with_tool_call_dialects(call)
+        }
+    }
+
+    /// Attach the operator's declaration of what this endpoint accepts in a
+    /// tool schema.
+    ///
+    /// Each entry is `(model, dialect)`, with `None` standing for every model
+    /// of this provider. The factory fills it from `[[providers.tool_dialects]]`
+    /// through [`with_declared_tool_dialects`](Self::with_declared_tool_dialects).
+    #[must_use]
+    pub fn with_tool_schema_dialects(
+        mut self,
+        declarations: Vec<(Option<String>, crate::tools::ToolSchemaDialect)>,
+    ) -> Self {
+        self.tool_schema_dialects = declarations;
+        self
+    }
+
+    /// Attach the operator's declaration of which textual tool-call grammar
+    /// this endpoint emits.
+    ///
+    /// Each entry is `(model, dialect)`, with `None` standing for every model
+    /// of this provider. Undeclared endpoints read only native `tool_calls`.
+    #[must_use]
+    pub fn with_tool_call_dialects(mut self, declarations: Vec<(Option<String>, super::ToolCallDialect)>) -> Self {
+        self.tool_call_dialects = declarations;
+        self
+    }
+
+    /// Which textual tool-call grammar this endpoint was declared to emit.
+    ///
+    /// The response parser has no model to key on, and every declared model of
+    /// this endpoint could have produced the response, so a declaration on any
+    /// of them enables the grammar for this provider.
+    fn tool_call_dialect(&self) -> super::ToolCallDialect {
+        if self
+            .tool_call_dialects
+            .iter()
+            .any(|(_, dialect)| *dialect == super::ToolCallDialect::XmlFunctionTags)
+        {
+            super::ToolCallDialect::XmlFunctionTags
+        } else {
+            super::ToolCallDialect::Native
+        }
+    }
+
+    /// The declaration that applies to `model`, most specific first, or `None`
+    /// when nothing was declared for it.
+    fn tool_schema_declaration_for_model(
+        &self,
+        model: &str,
+    ) -> Option<&(Option<String>, crate::tools::ToolSchemaDialect)> {
+        self.tool_schema_dialects
+            .iter()
+            .find(|(declared, _)| declared.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(model)))
+            .or_else(|| {
+                self.tool_schema_dialects
+                    .iter()
+                    .find(|(declared, _)| declared.is_none())
+            })
+    }
+
+    /// The dialect declared for `model`, most specific declaration first.
+    fn tool_schema_dialect_for_model(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+        self.tool_schema_declaration_for_model(model)
+            .map_or(crate::tools::ToolSchemaDialect::Raw, |(_, dialect)| *dialect)
+    }
+
+    /// Where the dialect a refusal was made under was declared, in the words
+    /// of the line the operator would edit.
+    fn tool_schema_dialect_source(&self, model: &str) -> String {
+        let Some(provider) = self.declaration_provider.as_deref() else {
+            return format!(
+                "the tool-schema dialect declared for provider '{}' model '{model}'",
+                self.name
+            );
+        };
+        let scope = match self.tool_schema_declaration_for_model(model) {
+            Some((Some(declared), _)) => format!("model '{declared}'"),
+            _ => "every model".to_string(),
+        };
+        format!("`[[providers.tool_dialects]]` (provider '{provider}', {scope})")
+    }
+
+    /// The label a diagnostic names this endpoint by: the configured provider
+    /// (redacted) when the factory built it, else its display name.
+    fn diagnostic_label(&self) -> &str {
+        self.declaration_provider
+            .as_deref()
+            .or(self.configured_label.as_deref())
+            .unwrap_or(&self.name)
+    }
+
+    /// Whether an upstream error reads as a rejection of a root combinator in
+    /// a tool schema: a 400/422 whose body names `allOf`, `anyOf` or `oneOf`
+    /// next to "tool" or "schema".
+    fn names_a_root_combinator_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+        if !matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return false;
+        }
+        let lower = body.to_ascii_lowercase();
+        ["allof", "anyof", "oneof"]
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+            && (lower.contains("tool") || lower.contains("schema"))
+    }
+
+    /// The sentence naming the declaration that would stop `model` from being
+    /// sent a root combinator, or `None` when one is already declared.
+    ///
+    /// Only an undeclared (`raw`) model can have sent a root combinator. The
+    /// hint changes no behaviour and infers no capability: the operator
+    /// decides whether to declare.
+    fn root_combinator_declaration_hint(&self, model: &str) -> Option<String> {
+        (self.tool_schema_dialect_for_model(model) == crate::tools::ToolSchemaDialect::Raw).then(|| {
+            let (provider, credentialed) = super::pasteable_provider_label(self.diagnostic_label());
+            format!(
+                " If this endpoint rejects a root `allOf`, `anyOf` or `oneOf` in tool schemas, declare \
+                 `[[providers.tool_dialects]]` provider = \"{provider}\" model = \"{model}\" \
+                 tool_schema = \"no_root_combinators\" ({}).",
+                if credentialed {
+                    "write the provider exactly as in your configuration, replacing <user>:<password> with the \
+                     credentials it carries"
+                } else {
+                    "spell the provider as in your configuration"
+                }
+            )
+        })
+    }
+
+    /// Lower every published tool schema to what `model` accepts, or refuse.
+    ///
+    /// This replaces forwarding `tool.parameters` verbatim. A tool whose root
+    /// combinator has no lossless lowering is named in the returned error and
+    /// the request is not made: the alternative — quietly omitting the tool —
+    /// would leave the model unable to do the work and nothing in the logs to
+    /// say why.
+    fn convert_tool_specs(
+        &self,
+        model: &str,
+        tools: Option<&[crate::tools::ToolSpec]>,
+    ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+        let Some(items) = tools else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect_for_model(model);
+        let lowered = dialect
+            .lower_all(items.iter().map(|tool| (tool.name.as_str(), &tool.parameters)))
+            .map_err(|refused| {
+                let source = self.tool_schema_dialect_source(model);
+                super::ToolSchemaRefusalError {
+                    provider: self.name.clone(),
+                    refusals: crate::tools::ToolSchemaRefusals {
+                        dialect,
+                        refusals: refused
+                            .into_iter()
+                            .map(|refusal| refusal.with_descriptor_source(source.clone()))
+                            .collect(),
+                        provider: self.diagnostic_label().to_string(),
+                        model: model.to_string(),
+                        descriptor_source: source,
+                    },
+                }
+            })?;
+        let converted = items
+            .iter()
+            .zip(lowered)
+            .map(|(tool, parameters)| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": parameters,
+                    }
+                })
+            })
+            .collect();
+        Ok(Some(converted))
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -635,6 +913,19 @@ struct StreamChunkResponse {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<OpenAiCompatibleUsage>,
+    /// A failure reported inside a stream that already answered 200.
+    #[serde(default)]
+    error: Option<StreamErrorObject>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamErrorObject {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -778,6 +1069,16 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
 
     // Parse JSON delta
     let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+    if let Some(error) = chunk.error {
+        // An in-stream error ends the turn. Parsed as an empty chunk, it used
+        // to be skipped, and the end-of-stream flush then ran a half call.
+        return Err(super::reliable::in_stream_error_object(
+            "OpenAI-compatible",
+            error.kind,
+            error.code,
+            error.message,
+        ));
+    }
 
     let usage = chunk.usage.and_then(OpenAiCompatibleUsage::into_reported);
     let Some(choice) = chunk.choices.into_iter().next() else {
@@ -824,11 +1125,25 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
 /// `id` is sourced from whichever delta first carried it; when no provider id
 /// ever arrives, a UUID is minted lazily on the flush path and recorded back
 /// into the buffer so the matching `Completed` chunk shares the same id.
-fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) -> Vec<ToolCallChunk> {
+///
+/// The buffer is indexed by the server-supplied `index`, so an index above
+/// [`MAX_STREAMED_TOOL_CALL_INDEX`] is refused as malformed SSE instead of
+/// growing the buffer to whatever the upstream names.
+fn apply_tool_call_deltas(
+    buf: &mut Vec<ToolCallBuffer>,
+    deltas: Vec<StreamSseToolCall>,
+) -> StreamResult<Vec<ToolCallChunk>> {
     let mut streaming = Vec::with_capacity(deltas.len());
 
     for delta in deltas {
         let slot = delta.index;
+        if slot > MAX_STREAMED_TOOL_CALL_INDEX {
+            return Err(super::reliable::tool_call_index_over_limit(
+                "OpenAI-compatible",
+                slot,
+                MAX_STREAMED_TOOL_CALL_INDEX,
+            ));
+        }
         while buf.len() <= slot {
             buf.push(ToolCallBuffer::default());
         }
@@ -901,7 +1216,7 @@ fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseTo
         }
     }
 
-    streaming
+    Ok(streaming)
 }
 
 /// Flush the tool_call buffer into terminal `Completed` chunks.
@@ -952,7 +1267,7 @@ pub(crate) fn sse_bytes_to_chunks(
     // Create a channel to send chunks
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    tokio::spawn(async move {
+    crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
         // Buffer for incomplete lines
         let mut buffer = String::new();
         // Byte-level decoder: HTTP chunk boundaries do not respect UTF-8
@@ -967,6 +1282,7 @@ pub(crate) fn sse_bytes_to_chunks(
         // argument fragments split across multiple `data:` lines aggregate
         // correctly before flush.
         let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
+        let mut saw_done = false;
 
         // Get response body as bytes stream
         match response.error_for_status_ref() {
@@ -979,7 +1295,18 @@ pub(crate) fn sse_bytes_to_chunks(
 
         let mut bytes_stream = response.bytes_stream();
 
-        while let Some(item) = bytes_stream.next().await {
+        loop {
+            // Stop reading as soon as nobody consumes the stream (the turn
+            // ended, for example by the idle guard). The streaming client has
+            // no whole-request deadline, so otherwise this task and its
+            // connection would wait on a silent server indefinitely.
+            let next = tokio::select! {
+                () = tx.closed() => return,
+                next = bytes_stream.next() => next,
+            };
+            let Some(item) = next else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     // Decode bytes into the line buffer, carrying any character
@@ -1006,6 +1333,7 @@ pub(crate) fn sse_bytes_to_chunks(
                                 saw_sse_event = true;
                                 // `[DONE]` carries no payload; nothing else to emit.
                                 if event.done_sentinel {
+                                    saw_done = true;
                                     continue;
                                 }
                                 if let Some(usage) = event.usage {
@@ -1038,7 +1366,14 @@ pub(crate) fn sse_bytes_to_chunks(
                                     }
                                 }
                                 if !event.tool_call_deltas.is_empty() {
-                                    let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                                    let streaming = match apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas)
+                                    {
+                                        Ok(streaming) => streaming,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(e)).await;
+                                            return;
+                                        }
+                                    };
                                     if !streaming.is_empty()
                                         && tx.send(Ok(StreamChunk::tool_call_chunk(streaming))).await.is_err()
                                     {
@@ -1046,6 +1381,46 @@ pub(crate) fn sse_bytes_to_chunks(
                                     }
                                 }
                                 if let Some(finish) = event.finish_reason {
+                                    // Cut by the output cap or a filter while a
+                                    // call is buffered: the call is unfinished,
+                                    // even if `[DONE]` follows. Never flush it.
+                                    if finish == "content_filter" && !tool_buf.is_empty() {
+                                        let _ = tx
+                                            .send(Err(super::reliable::content_filter_stop(
+                                                "OpenAI-compatible",
+                                                "finish_reason content_filter inside a tool call; it was not run",
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if finish == "length" && !tool_buf.is_empty() {
+                                        let _ = tx
+                                            .send(Err(StreamError::Provider(
+                                                "OpenAI-compatible stream ended (finish_reason length) inside a tool \
+                                                 call; it was not run"
+                                                    .to_string(),
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    // Any other finish with a call that got its
+                                    // name but not one argument byte: downstream
+                                    // it cannot be told apart from a no-argument
+                                    // call and would run as `{}`. Mirrors the
+                                    // direct OpenAI rule.
+                                    if finish != "tool_calls"
+                                        && tool_buf
+                                            .iter()
+                                            .any(|entry| !entry.name.is_empty() && entry.arguments.trim().is_empty())
+                                    {
+                                        let _ = tx
+                                            .send(Err(StreamError::Provider(format!(
+                                                "OpenAI-compatible stream ended (finish_reason {finish}) with an \
+                                                 incomplete tool call; it was not run"
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
                                     if finish == "tool_calls" && !tool_buf.is_empty() {
                                         let calls = flush_tool_call_buffer(&tool_buf);
                                         tool_buf.clear();
@@ -1098,6 +1473,36 @@ pub(crate) fn sse_bytes_to_chunks(
             return;
         }
 
+        // A body that ended without `[DONE]` while calls were still buffered
+        // was cut, possibly in the middle of their arguments: fail instead of
+        // flushing half a call.
+        if !saw_done && !tool_buf.is_empty() {
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(
+                    "OpenAI-compatible stream ended before [DONE] with a tool call still open".to_string(),
+                )))
+                .await;
+            return;
+        }
+
+        // Calls still buffered here never got a `finish_reason`. A call that
+        // got its name but not one argument byte cannot be told apart from a
+        // no-argument call downstream and would run as `{}`: fail the stream
+        // (parity with the direct OpenAI `[DONE]` rule).
+        if tool_buf
+            .iter()
+            .any(|entry| !entry.name.is_empty() && entry.arguments.trim().is_empty())
+        {
+            let _ = tx
+                .send(Err(StreamError::Provider(
+                    "OpenAI-compatible stream ended ([DONE] without finish_reason) with an incomplete tool call; \
+                     it was not run"
+                        .to_string(),
+                )))
+                .await;
+            return;
+        }
+
         // Defensive flush: if the stream ended without an explicit
         // `finish_reason == "tool_calls"` marker (some providers omit it for
         // single-call turns), surface the buffered tool calls anyway so the
@@ -1123,6 +1528,53 @@ pub(crate) fn sse_bytes_to_chunks(
 
     // Convert channel receiver to stream
     stream::unfold(rx, |mut rx| async { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+}
+
+/// Spawn a provider streaming task that is dropped as soon as nobody reads
+/// its output.
+///
+/// The task waits in places that are not chunk reads: the HTTP send until the
+/// server answers with headers, reading an error body, rate-limit and backoff
+/// waits. A streaming client has no whole-request deadline, so a server that
+/// accepts a request and never answers held the task and its connection
+/// forever once the turn was abandoned. Racing the whole task against
+/// `tx.closed()` drops it, and with it the in-flight request and connection,
+/// the moment the last receiver is gone. While the consumer still holds the
+/// stream `closed()` cannot fire, so no output is lost.
+pub(crate) fn spawn_until_closed<F>(tx: tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tx.closed() => {}
+            () = task => {}
+        }
+    });
+}
+
+/// Forward `chunks` into `tx` until the stream ends or nobody reads `tx`.
+///
+/// A forwarding task that only notices a dropped receiver on its next send
+/// keeps the inner stream, and with it the provider's connection, alive for
+/// as long as a silent server stays silent. Racing the next chunk against
+/// `tx.closed()` drops the inner stream as soon as the consumer is gone.
+pub(crate) async fn forward_stream_until_closed(
+    mut chunks: stream::BoxStream<'static, StreamResult<StreamChunk>>,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+) {
+    loop {
+        let next = tokio::select! {
+            () = tx.closed() => return,
+            next = chunks.next() => next,
+        };
+        let Some(chunk) = next else {
+            return;
+        };
+        if tx.send(chunk).await.is_err() {
+            return;
+        }
+    }
 }
 
 fn first_nonempty(text: Option<&str>) -> Option<String> {
@@ -1221,8 +1673,48 @@ fn parse_responses_response_body(provider_name: &str, body: &str) -> anyhow::Res
 }
 
 impl OpenAiCompatibleProvider {
-    fn apply_auth_header(&self, req: reqwest::RequestBuilder, credential: &str) -> reqwest::RequestBuilder {
-        match &self.auth_header {
+    /// The credential to present on an outbound request.
+    ///
+    /// `Ok(None)` means the endpoint was configured without one and accepts
+    /// anonymous requests. Every named provider still refuses here, before any
+    /// socket is opened.
+    fn outbound_credential(&self) -> anyhow::Result<Option<&str>> {
+        match self.credential.as_deref() {
+            Some(credential) => Ok(Some(credential)),
+            None if self.allows_anonymous => Ok(None),
+            None => anyhow::bail!(
+                "{} API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider <provider>`.",
+                self.name
+            ),
+        }
+    }
+
+    /// The streaming variant of [`Self::outbound_credential`]. The stream
+    /// surfaces report this condition as a `StreamError::Provider` and own the
+    /// credential, because the request is built inside a spawned task.
+    fn outbound_credential_for_stream(&self) -> Result<Option<String>, String> {
+        match self.credential.as_deref() {
+            Some(credential) => Ok(Some(credential.to_string())),
+            None if self.allows_anonymous => Ok(None),
+            None => Err(format!("{} API key not set", self.name)),
+        }
+    }
+
+    fn apply_auth_header(&self, req: reqwest::RequestBuilder, credential: Option<&str>) -> reqwest::RequestBuilder {
+        Self::apply_auth_header_with_style(req, &self.auth_header, credential)
+    }
+
+    /// Apply the configured auth style, or nothing at all when the endpoint is
+    /// running without a credential.
+    fn apply_auth_header_with_style(
+        req: reqwest::RequestBuilder,
+        auth_header: &AuthStyle,
+        credential: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let Some(credential) = credential else {
+            return req;
+        };
+        match auth_header {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
             AuthStyle::Custom(header) => req.header(header, credential),
@@ -1231,7 +1723,7 @@ impl OpenAiCompatibleProvider {
 
     async fn chat_via_responses(
         &self,
-        credential: &str,
+        credential: Option<&str>,
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
@@ -1252,13 +1744,18 @@ impl OpenAiCompatibleProvider {
 
         let url = self.responses_url();
 
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await?;
+        let response = super::attempt_accounting::send_json(
+            self.apply_auth_header(self.http_client().post(&url), credential),
+            model,
+            &url,
+            credential,
+            &request,
+            super::attempt_accounting::PhysicalKind::Chat,
+        )
+        .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
+            let error = super::sanitize_api_error(&response.error_body().await);
             anyhow::bail!("{} Responses API error: {error}", self.name);
         }
 
@@ -1266,24 +1763,6 @@ impl OpenAiCompatibleProvider {
         let responses = parse_responses_response_body(&self.name, &body)?;
 
         extract_responses_text(responses).ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
-    }
-
-    fn convert_tool_specs(tools: Option<&[crate::tools::ToolSpec]>) -> Option<Vec<serde_json::Value>> {
-        tools.map(|items| {
-            items
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    })
-                })
-                .collect()
-        })
     }
 
     fn parse_assistant_tool_calls(value: &serde_json::Value) -> Option<Vec<ToolCall>> {
@@ -1460,7 +1939,17 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
+    /// Read the tool calls out of one response.
+    ///
+    /// The native `tool_calls` array is always read. The textual
+    /// `<function=NAME>…</function>` grammar is read only where an operator
+    /// declared that this endpoint emits it: it is a chat-template dialect, and
+    /// turning prose into an executed tool call on every OpenAI-compatible
+    /// endpoint is a capability PRX never declared. A declared endpoint whose
+    /// block fails the registered-name or JSON check is reported once, redacted
+    /// — dropping it silently is why the behaviour took a live session to see.
     fn parse_native_response(
+        &self,
         message: ResponseMessage,
         registered_tools: Option<&[crate::tools::ToolSpec]>,
     ) -> ProviderChatResponse {
@@ -1480,32 +1969,51 @@ impl OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        if tool_calls.is_empty() {
-            if let Some(content) = message.content.as_deref() {
-                let allowed = registered_tools.map(|tools| {
-                    tools
-                        .iter()
-                        .map(|tool| tool.name.as_str())
-                        .collect::<std::collections::HashSet<_>>()
-                });
-                let mut rest = content;
-                while let Some(start) = rest.find("<function=") {
-                    let after = &rest[start + "<function=".len()..];
-                    let Some(name_end) = after.find('>') else { break };
-                    let name = &after[..name_end];
-                    let body = &after[name_end + 1..];
-                    let Some(end) = body.find("</function>") else { break };
-                    let arguments = &body[..end];
-                    let registered = allowed.as_ref().is_none_or(|names| names.contains(name));
-                    if registered && serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
-                        tool_calls.push(ProviderToolCall {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            name: name.to_string(),
-                            arguments: arguments.to_string(),
-                        });
-                    }
-                    rest = &body[end + "</function>".len()..];
+        if tool_calls.is_empty()
+            && self.tool_call_dialect() == super::ToolCallDialect::XmlFunctionTags
+            && let Some(content) = message.content.as_deref()
+        {
+            // A request that registered no tools has no name a textual block
+            // could legitimately carry, so "no registry" is "nothing is
+            // registered" and every block is rejected. Reading the absence as
+            // "every name is allowed" would turn any `<function=NAME>` in prose
+            // into a call with an arbitrary name.
+            let allowed = registered_tools
+                .unwrap_or(&[])
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut rest = content;
+            while let Some(start) = rest.find("<function=") {
+                let after = &rest[start + "<function=".len()..];
+                let Some(name_end) = after.find('>') else { break };
+                let name = &after[..name_end];
+                let body = &after[name_end + 1..];
+                let Some(end) = body.find("</function>") else { break };
+                let arguments = &body[..end];
+                if !allowed.contains(name) {
+                    tracing::warn!(
+                        provider = %self.name,
+                        tool = %sanitize_tool_call_log_preview(name),
+                        reason = "tool name is not registered for this request",
+                        "declared textual tool-call block rejected"
+                    );
+                } else if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+                    tool_calls.push(ProviderToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    });
+                } else {
+                    tracing::warn!(
+                        provider = %self.name,
+                        tool = %sanitize_tool_call_log_preview(name),
+                        reason = "body is not JSON",
+                        body = %sanitize_tool_call_log_preview(arguments),
+                        "declared textual tool-call block rejected"
+                    );
                 }
+                rest = &body[end + "</function>".len()..];
             }
         }
 
@@ -1522,15 +2030,15 @@ impl OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
         options: StreamOptions,
-    ) -> NativeChatRequest {
+    ) -> anyhow::Result<NativeChatRequest> {
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
         };
-        let tools = Self::convert_tool_specs(options.tools.as_deref());
+        let tools = self.convert_tool_specs(model, options.tools.as_deref())?;
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
-        NativeChatRequest {
+        Ok(NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages),
             temperature: self.effective_temperature(temperature),
@@ -1542,7 +2050,7 @@ impl OpenAiCompatibleProvider {
             } else {
                 None
             },
-        }
+        })
     }
 
     async fn chat_metered(
@@ -1551,14 +2059,9 @@ impl OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.outbound_credential()?;
 
-        let tools = Self::convert_tool_specs(request.tools);
+        let tools = self.convert_tool_specs(model, request.tools)?;
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -1577,22 +2080,27 @@ impl OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&native_request), credential)
-            .send()
-            .await
+        let response = match super::attempt_accounting::send_json(
+            self.apply_auth_header(self.http_client().post(&url), credential),
+            model,
+            &url,
+            credential,
+            &native_request,
+            super::attempt_accounting::PhysicalKind::Chat,
+        )
+        .await
         {
             Ok(response) => response,
             // A transport failure is not endpoint discovery. The upstream may
             // already have processed the request, so replaying it through the
             // Responses API risks duplicate model work and tool side effects.
             // Only an explicit HTTP 404 below is safe evidence for fallback.
-            Err(chat_error) => return Err(chat_error.into()),
+            Err(chat_error) => return Err(chat_error),
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await?;
+            let error = response.error_body().await;
             let sanitized = super::sanitize_api_error(&error);
 
             tracing::warn!(
@@ -1635,6 +2143,9 @@ impl OpenAiCompatibleProvider {
                         )
                     })
                     .map_err(|responses_err| {
+                        if super::attempt_accounting::is_local_refusal(&responses_err) {
+                            return responses_err;
+                        }
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
                             self.name
@@ -1642,13 +2153,16 @@ impl OpenAiCompatibleProvider {
                     });
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            let upstream = format!("{} API error ({status}): {sanitized}", self.name);
+            if Self::names_a_root_combinator_rejection(status, &sanitized)
+                && let Some(hint) = self.root_combinator_declaration_hint(model)
+            {
+                return Err(RootCombinatorRejection { upstream, hint }.into());
+            }
+            anyhow::bail!("{upstream}");
         }
 
-        let response_bytes = response.bytes().await?;
-        let response_str = String::from_utf8_lossy(&response_bytes);
-        let native_response: ApiChatResponse = serde_json::from_slice(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}\nBody: {response_str}"))?;
+        let native_response: ApiChatResponse = response.parse_native().await?;
         let usage = native_response.usage.and_then(OpenAiCompatibleUsage::into_reported);
         let message = native_response
             .choices
@@ -1657,7 +2171,7 @@ impl OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let response = Self::parse_native_response(message, request.tools);
+        let response = self.parse_native_response(message, request.tools);
         let tokens_used = usage.unwrap_or_else(|| {
             let chars = response.text.as_deref().unwrap_or("").chars().count()
                 + response.reasoning_content.as_deref().unwrap_or("").chars().count();
@@ -1698,8 +2212,67 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// How much of a rejected tool-call block reaches the log.
+const TOOL_CALL_LOG_PREVIEW_CHARS: usize = 200;
+
+/// Redact and truncate text from a model response before it is logged.
+///
+/// A rejected block is model output: it can carry anything the model was shown
+/// or invented, so known secret shapes are scrubbed and the remainder is capped
+/// at a preview. The point of the log is to name what was rejected and why, not
+/// to reproduce it.
+fn sanitize_tool_call_log_preview(input: &str) -> String {
+    let scrubbed = crate::security::redaction::redact_secrets(input);
+    if scrubbed.chars().count() <= TOOL_CALL_LOG_PREVIEW_CHARS {
+        return scrubbed;
+    }
+    scrubbed.chars().take(TOOL_CALL_LOG_PREVIEW_CHARS).collect()
+}
+
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
+    fn accounting_targets(&self, model: &str) -> Option<super::AccountingTargets> {
+        let mut endpoints = vec![self.chat_completions_url()];
+        if self.supports_responses_fallback {
+            endpoints.push(self.responses_url());
+        }
+        Some(super::AccountingTargets::chat(
+            model,
+            endpoints,
+            self.outbound_credential().ok()?,
+        ))
+    }
+
+    fn supports_attempt_accounting(&self) -> bool {
+        true
+    }
+
+    /// The dialect this endpoint lowers every model's tool schemas to, when
+    /// they all agree.
+    ///
+    /// The hook carries no model. Every model this endpoint could serve is
+    /// covered: the declared ones, and any undeclared model at the
+    /// provider-wide declaration (or `Raw` when there is none). If they agree
+    /// the answer is exact; if they differ it is `Raw`, the published
+    /// document, because a per-model rewrite is not what the other models
+    /// were shown. A caller that knows the model asks
+    /// [`tool_schema_dialect_for`](Self::tool_schema_dialect_for).
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        let undeclared_models = self
+            .tool_schema_dialects
+            .iter()
+            .find(|(model, _)| model.is_none())
+            .map_or(crate::tools::ToolSchemaDialect::Raw, |(_, dialect)| *dialect);
+        super::traits::unanimous_dialect(
+            std::iter::once(undeclared_models).chain(self.tool_schema_dialects.iter().map(|(_, dialect)| *dialect)),
+        )
+    }
+
+    /// The dialect declared for exactly `model`, most specific first.
+    fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+        self.tool_schema_dialect_for_model(model)
+    }
+
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         // Vision support detection for OpenAI-compatible providers.
         // Most frontier models in 2026 support vision natively.
@@ -1769,12 +2342,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.outbound_credential()?;
 
         let mut messages = Vec::new();
 
@@ -1831,7 +2399,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await?;
+            let error = super::read_error_body(response).await;
             let sanitized = super::sanitize_api_error(&error);
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
@@ -1877,12 +2445,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.outbound_credential()?;
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1908,13 +2471,18 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await
+        let response = match super::attempt_accounting::send_json(
+            self.apply_auth_header(self.http_client().post(&url), credential),
+            model,
+            &url,
+            credential,
+            &request,
+            super::attempt_accounting::PhysicalKind::Chat,
+        )
+        .await
         {
             Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
+            Err(chat_error) => return Err(chat_error),
         };
 
         if !response.status().is_success() {
@@ -1926,6 +2494,9 @@ impl Provider for OpenAiCompatibleProvider {
                     .chat_via_responses(credential, &effective_messages, model)
                     .await
                     .map_err(|responses_err| {
+                        if super::attempt_accounting::is_local_refusal(&responses_err) {
+                            return responses_err;
+                        }
                         anyhow::anyhow!(
                             "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
                             self.name
@@ -1933,7 +2504,7 @@ impl Provider for OpenAiCompatibleProvider {
                     });
             }
 
-            return Err(super::api_error(&self.name, response).await);
+            return Err(response.api_error(&self.name).await);
         }
 
         let body = response.text().await?;
@@ -1963,12 +2534,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.outbound_credential()?;
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -2093,6 +2659,7 @@ impl Provider for OpenAiCompatibleProvider {
             }],
             final_provider: self.name.clone(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used,
         })
     }
@@ -2113,14 +2680,10 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!("{} API key not set", provider_name)))
-                })
-                .boxed();
+        let credential = match self.outbound_credential_for_stream() {
+            Ok(credential) => credential,
+            Err(message) => {
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
             }
         };
 
@@ -2158,16 +2721,12 @@ impl Provider for OpenAiCompatibleProvider {
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
             // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => req_builder.header("Authorization", format!("Bearer {}", credential)),
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = Self::apply_auth_header_with_style(req_builder, &auth_header, credential.as_deref());
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -2194,11 +2753,8 @@ impl Provider for OpenAiCompatibleProvider {
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
                 let mut fallback_builder = client.post(&url).json(&fallback_request);
-                fallback_builder = match &auth_header {
-                    AuthStyle::Bearer => fallback_builder.header("Authorization", format!("Bearer {}", credential)),
-                    AuthStyle::XApiKey => fallback_builder.header("x-api-key", &credential),
-                    AuthStyle::Custom(header) => fallback_builder.header(header, &credential),
-                };
+                fallback_builder =
+                    Self::apply_auth_header_with_style(fallback_builder, &auth_header, credential.as_deref());
                 fallback_builder = fallback_builder.header("Accept", "text/event-stream");
                 response = match fallback_builder.send().await {
                     Ok(r) => r,
@@ -2218,12 +2774,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
-            while let Some(chunk) = chunk_stream.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break; // Receiver dropped
-                }
-            }
+            forward_stream_until_closed(sse_bytes_to_chunks(response, options.count_tokens), &tx).await;
         });
 
         // Convert channel receiver to stream
@@ -2237,33 +2788,39 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!("{} API key not set", provider_name)))
-                })
-                .boxed();
+        let credential = match self.outbound_credential_for_stream() {
+            Ok(credential) => credential,
+            Err(message) => {
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
             }
         };
 
         let count_tokens = options.count_tokens;
-        let request = self.build_streaming_history_request(messages, model, temperature, options);
+        // Built before the connection is opened, so a tool this endpoint cannot
+        // be offered ends the turn with the reason rather than an upstream 400.
+        let request = match self.build_streaming_history_request(messages, model, temperature, options) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let url = self.chat_completions_url();
         let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let provider_name = self.name.clone();
+        // Only a request that offered tools can be rejected for their schema.
+        let declaration_hint = request
+            .tools
+            .is_some()
+            .then(|| self.root_combinator_declaration_hint(model))
+            .flatten();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let mut req_builder = client.post(&url).json(&request);
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => req_builder.header("Authorization", format!("Bearer {}", credential)),
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = Self::apply_auth_header_with_style(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let mut response = match req_builder.send().await {
@@ -2287,11 +2844,8 @@ impl Provider for OpenAiCompatibleProvider {
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
                 let mut fallback_builder = client.post(&url).json(&fallback_request);
-                fallback_builder = match &auth_header {
-                    AuthStyle::Bearer => fallback_builder.header("Authorization", format!("Bearer {}", credential)),
-                    AuthStyle::XApiKey => fallback_builder.header("x-api-key", &credential),
-                    AuthStyle::Custom(header) => fallback_builder.header(header, &credential),
-                };
+                fallback_builder =
+                    Self::apply_auth_header_with_style(fallback_builder, &auth_header, credential.as_deref());
                 fallback_builder = fallback_builder.header("Accept", "text/event-stream");
                 response = match fallback_builder.send().await {
                     Ok(r) => r,
@@ -2304,18 +2858,21 @@ impl Provider for OpenAiCompatibleProvider {
 
             // FIX-P0-33: 429/503 carry a structured Retry-After.
             if !response.status().is_success() {
-                let _ = tx
-                    .send(Err(super::stream_api_error(&provider_name, response).await))
-                    .await;
+                let status = response.status();
+                let error = match super::stream_api_error(&provider_name, response).await {
+                    StreamError::Provider(message) => match declaration_hint.as_deref() {
+                        Some(hint) if Self::names_a_root_combinator_rejection(status, &message) => {
+                            StreamError::Provider(format!("{message}{hint}"))
+                        }
+                        _ => StreamError::Provider(message),
+                    },
+                    other => other,
+                };
+                let _ = tx.send(Err(error)).await;
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
-            while let Some(chunk) = chunk_stream.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
-            }
+            forward_stream_until_closed(sse_bytes_to_chunks(response, count_tokens), &tx).await;
         });
 
         stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
@@ -2332,7 +2889,7 @@ impl Provider for OpenAiCompatibleProvider {
             // the goal is TLS handshake and HTTP/2 negotiation.
             let url = self.chat_completions_url();
             let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
+                .apply_auth_header(self.http_client().get(&url), Some(credential.as_str()))
                 .send()
                 .await?;
         }
@@ -2353,6 +2910,277 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
+
+    /// The `<function=NAME>...</function>` grammar is a chat-template dialect,
+    /// not a declared provider capability. An endpoint nobody declared it for
+    /// must not have it parsed out of its prose: only the native `tool_calls`
+    /// array is a tool call there.
+    #[test]
+    fn a_textual_function_call_is_not_executed_on_an_undeclared_endpoint() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer);
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+        let message = ResponseMessage {
+            content: Some(r#"<function=shell>{"command":"date"}</function>"#.to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let parsed = provider.parse_native_response(message, Some(&tools));
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "an undeclared endpoint had a textual tool call executed: {:?}",
+            parsed.tool_calls
+        );
+    }
+
+    /// The same body on an endpoint that was declared to emit the grammar is
+    /// still parsed, so declaring it is the whole of the behaviour change.
+    #[test]
+    fn a_textual_function_call_is_executed_on_a_declared_endpoint() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .with_tool_call_dialects(vec![(None, super::super::ToolCallDialect::XmlFunctionTags)]);
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+        let message = ResponseMessage {
+            content: Some(r#"<function=shell>{"command":"date"}</function>"#.to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let parsed = provider.parse_native_response(message, Some(&tools));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"command":"date"}"#);
+    }
+
+    /// A declared endpoint whose request registered no tool set has nothing a
+    /// textual block could legitimately name. Treating "no registry" as "every
+    /// name is allowed" turns any `<function=anything>{json}</function>` in
+    /// prose into a tool call with an arbitrary name; the check must be that a
+    /// registered name was matched, not that no registry contradicted it.
+    #[test]
+    fn a_declared_endpoint_with_no_registered_tools_refuses_every_textual_call() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .with_tool_call_dialects(vec![(None, super::super::ToolCallDialect::XmlFunctionTags)]);
+        let message = ResponseMessage {
+            content: Some(r#"<function=anything>{"command":"date"}</function>"#.to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .finish();
+        let parsed = tracing::subscriber::with_default(subscriber, || provider.parse_native_response(message, None));
+
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "a request with no registered tools executed a textual call: {:?}",
+            parsed.tool_calls
+        );
+        let logged = String::from_utf8(captured.lock().clone()).expect("test: log is utf-8");
+        assert_eq!(
+            logged.matches("textual tool-call block").count(),
+            1,
+            "the refusal must be reported exactly once: {logged}"
+        );
+
+        // An empty registry is the same statement as no registry at all.
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .with_tool_call_dialects(vec![(None, super::super::ToolCallDialect::XmlFunctionTags)]);
+        let message = ResponseMessage {
+            content: Some(r#"<function=anything>{"command":"date"}</function>"#.to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let parsed = provider.parse_native_response(message, Some(&[]));
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "an empty registry executed a textual call: {:?}",
+            parsed.tool_calls
+        );
+    }
+
+    /// A body the declared grammar cannot parse must say so once, redacted.
+    /// Silently skipping it is why F6 needed a live session to notice.
+    #[test]
+    fn an_unparseable_textual_function_call_is_reported_not_dropped() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .with_tool_call_dialects(vec![(None, super::super::ToolCallDialect::XmlFunctionTags)]);
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+        let message = ResponseMessage {
+            // The Qwen chat-template spelling: parameters as nested tags, not JSON.
+            content: Some(
+                "<function=shell><parameter=command>date sk-0123456789abcdef</parameter></function>".to_string(),
+            ),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || CaptureWriter(sink.clone()))
+            .finish();
+        let parsed =
+            tracing::subscriber::with_default(subscriber, || provider.parse_native_response(message, Some(&tools)));
+
+        assert!(parsed.tool_calls.is_empty(), "an unparseable body must not execute");
+        let logged = String::from_utf8(captured.lock().clone()).expect("test: log is utf-8");
+        assert!(
+            logged.contains("shell") && logged.contains("body is not JSON"),
+            "the rejected body was not reported: {logged}"
+        );
+        assert_eq!(
+            logged.matches("textual tool-call block").count(),
+            1,
+            "the rejection must be reported exactly once: {logged}"
+        );
+        assert!(
+            !logged.contains("sk-0123456789abcdef"),
+            "the rejected body was logged unredacted: {logged}"
+        );
+    }
+
+    /// A `tracing` writer that appends into a shared buffer.
+    struct CaptureWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A tool schema this endpoint cannot accept must stop the request here,
+    /// not at the endpoint.
+    ///
+    /// The provider is pointed at a port nothing listens on, so a request that
+    /// were actually sent would fail with a transport error. The assertion is
+    /// that the error is the lowering diagnostic instead: the tool is named,
+    /// the keyword is named, and no connection was attempted.
+    #[tokio::test]
+    async fn a_tool_that_cannot_be_lowered_fails_before_the_request_is_sent() {
+        let provider = OpenAiCompatibleProvider::new(
+            "Fixture",
+            // Port 1 is reserved and refuses connections, so reaching the
+            // transport is observable as a different error.
+            "http://127.0.0.1:1/v1",
+            Some("fixture-key"),
+            AuthStyle::Bearer,
+        )
+        .with_tool_schema_dialects(vec![(None, crate::tools::ToolSchemaDialect::NoRootCombinators)]);
+
+        let tools = vec![crate::tools::ToolSpec {
+            name: "fixture_alternatives".to_string(),
+            description: "Requires one of two argument sets".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "key": {"type": "string"}},
+                "anyOf": [{"required": ["path"]}, {"required": ["key"]}]
+            }),
+        }];
+        let messages = vec![ChatMessage::user("go")];
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "fixture-model",
+                0.0,
+            )
+            .await
+            .expect_err("test: an unlowerable tool must fail closed");
+        let rendered = error.to_string();
+        for fragment in [
+            "fixture_alternatives",
+            "anyOf",
+            "no_root_combinators",
+            "tool_schema_dialect",
+        ] {
+            assert!(
+                rendered.contains(fragment),
+                "the pre-transport refusal does not name '{fragment}': {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "the request reached the transport instead of failing closed: {rendered}"
+        );
+    }
+
+    /// The same endpoint with no declaration keeps every tool and every byte.
+    #[test]
+    fn an_undeclared_endpoint_keeps_the_published_document() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer);
+        assert_eq!(
+            provider.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::Raw,
+            "an endpoint nobody declared anything about must keep the strongest contract"
+        );
+        let tools = vec![crate::tools::ToolSpec {
+            name: "fixture_alternatives".to_string(),
+            description: "Requires one of two argument sets".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "key": {"type": "string"}},
+                "anyOf": [{"required": ["path"]}, {"required": ["key"]}]
+            }),
+        }];
+        let converted = provider
+            .convert_tool_specs("fixture-model", Some(&tools))
+            .expect("test: an undeclared endpoint refuses nothing")
+            .expect("test: tools present");
+        assert_eq!(converted[0]["function"]["parameters"], tools[0].parameters);
+    }
+
+    /// A declaration for one model does not reach another model of the same
+    /// endpoint.
+    #[test]
+    fn a_model_scoped_declaration_applies_only_to_that_model() {
+        let provider = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .with_tool_schema_dialects(vec![(
+                Some("small-context".to_string()),
+                crate::tools::ToolSchemaDialect::NoRootCombinators,
+            )]);
+        let tools = vec![crate::tools::ToolSpec {
+            name: "fixture_alternatives".to_string(),
+            description: "Requires one of two argument sets".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "anyOf": [{"required": ["path"]}]
+            }),
+        }];
+        assert!(
+            provider.convert_tool_specs("small-context", Some(&tools)).is_err(),
+            "the declared model must get the declared dialect"
+        );
+        assert!(
+            provider.convert_tool_specs("other-model", Some(&tools)).is_ok(),
+            "an undeclared model of the same endpoint must keep the published document"
+        );
+    }
 
     /// **UTF-8 streaming regression** — the byte-level decoder used by this
     /// provider's stream loop must carry a character that the transport split
@@ -2448,65 +3276,130 @@ mod tests {
         assert!(!message.contains("responses fallback"), "got: {message}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn buffered_response_survives_past_the_old_two_minute_deadline() {
-        use axum::Json;
+    /// A buffered (non-streaming) response that arrives after the two-minute
+    /// whole-response deadline this client used to carry still reaches the
+    /// caller.
+    ///
+    /// The server runs on its own thread and runtime and holds the response
+    /// until the test releases it. The client connects and sends on the real
+    /// clock; once the server has the request, the client's clock is paused and
+    /// advanced 121 s before the response is released, so any client-side
+    /// deadline of 121 s or less has expired by the time the response can
+    /// arrive, and fails the request — without the test waiting two minutes.
+    ///
+    /// It used to run as `#[tokio::test(start_paused = true)]` with the server
+    /// on the same runtime and waited for the server-side rendezvous with no
+    /// bound and without watching the request itself. Any request that ended
+    /// before reaching the server therefore hung the test — and the suite —
+    /// forever: nothing was left to wake the paused runtime. The client picks
+    /// up the process-wide runtime proxy (`apply_runtime_proxy_to_builder`),
+    /// and config-generation tests running in the same process publish
+    /// `all_proxy = http://127.0.0.1:8080` for a moment; a request built in
+    /// that window is refused by the absent proxy (reproduced: the old body
+    /// under that proxy hangs until killed). A paused clock can also
+    /// auto-advance to the 10 s `connect_timeout` while the loopback connect
+    /// is still in flight, which ends the request the same way. Now the
+    /// request is watched alongside the rendezvous, every wait is bounded in
+    /// real time, and the test is `serial` with the other tests that publish
+    /// a proxy, so a failure is reported, never a hang.
+    ///
+    /// MUTATION GUARD: give the buffered client a whole-response
+    /// `.timeout(Duration::from_secs(120))` again and this goes red.
+    #[test]
+    #[serial_test::serial]
+    fn buffered_response_survives_past_the_old_two_minute_deadline() {
         use axum::Router;
-        use axum::extract::State;
         use axum::routing::post;
         use std::sync::Arc;
-        use tokio::net::TcpListener;
+        use std::time::Duration;
         use tokio::sync::Notify;
 
-        #[derive(Clone)]
-        struct SlowServerState {
-            request_started: Arc<Notify>,
-            delay_armed: Arc<Notify>,
-        }
+        /// Real-time bound on the whole test, enforced from outside its
+        /// runtimes so that no paused clock can stretch or skip it.
+        const WHOLE_TEST: Duration = Duration::from_mins(1);
+        /// Real-time bound on the request reaching the server.
+        const REQUEST_ARRIVES: Duration = Duration::from_secs(30);
+        /// One second past the whole-response deadline the client used to set.
+        const PAST_THE_OLD_DEADLINE: Duration = Duration::from_secs(121);
 
-        async fn slow_but_healthy(State(state): State<SlowServerState>) -> Json<serde_json::Value> {
-            state.request_started.notify_one();
-            let delay = tokio::time::sleep(std::time::Duration::from_secs(121));
-            tokio::pin!(delay);
-            std::future::poll_fn(|context| {
-                // Signal only after polling the timer once, which registers it
-                // with Tokio's paused clock before the test advances time.
-                state.delay_armed.notify_one();
-                delay.as_mut().poll(context)
-            })
-            .await;
-            Json(serde_json::json!({
-                "choices": [{"message": {"content": "slow but healthy"}}]
-            }))
-        }
+        let request_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let stop = Arc::new(Notify::new());
 
-        let state = SlowServerState {
-            request_started: Arc::new(Notify::new()),
-            delay_armed: Arc::new(Notify::new()),
-        };
-        let app = Router::new()
-            .route("/chat/completions", post(slow_but_healthy))
-            .with_state(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test: bind");
+        listener.set_nonblocking(true).expect("test: nonblocking listener");
         let addr = listener.local_addr().expect("test: addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+        {
+            let request_started = Arc::clone(&request_started);
+            let release = Arc::clone(&release);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test: server runtime");
+                runtime.block_on(async move {
+                    let app = Router::new().route(
+                        "/chat/completions",
+                        post(move || {
+                            let request_started = Arc::clone(&request_started);
+                            let release = Arc::clone(&release);
+                            async move {
+                                request_started.notify_one();
+                                release.notified().await;
+                                axum::Json(serde_json::json!({
+                                    "choices": [{"message": {"content": "slow but healthy"}}]
+                                }))
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::from_std(listener).expect("test: adopt listener");
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move { stop.notified().await })
+                        .await
+                        .expect("test: serve");
+                });
+            });
+        }
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test: client runtime");
+            let outcome = runtime.block_on(async move {
+                let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
+                let mut request =
+                    tokio::spawn(async move { provider.chat_with_system(None, "hello", "test-model", 0.0).await });
+                tokio::select! {
+                    arrived = tokio::time::timeout(REQUEST_ARRIVES, request_started.notified()) => {
+                        if arrived.is_err() {
+                            return Err(format!("the request did not reach the server within {REQUEST_ARRIVES:?}"));
+                        }
+                    }
+                    early = &mut request => {
+                        return Err(format!("the request ended before the server saw it: {early:?}"));
+                    }
+                }
+                tokio::time::pause();
+                tokio::time::advance(PAST_THE_OLD_DEADLINE).await;
+                release.notify_one();
+                request
+                    .await
+                    .map_err(|error| format!("the request task failed: {error}"))?
+                    .map_err(|error| format!("a healthy buffered response has no whole-response deadline: {error:#}"))
+            });
+            // The receiver is gone only if the test already failed on time.
+            let _ = done.send(outcome);
         });
 
-        let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
-        let request = tokio::spawn(async move { provider.chat_with_system(None, "hello", "test-model", 0.0).await });
-        // Let the client task start its local connection before waiting on the
-        // server-side rendezvous under Tokio's paused clock.
-        tokio::task::yield_now().await;
-        state.request_started.notified().await;
-        state.delay_armed.notified().await;
-        tokio::time::advance(std::time::Duration::from_secs(121)).await;
-        let response = request
-            .await
-            .expect("test: buffered request task joins")
-            .expect("test: a healthy buffered response has no whole-response deadline");
-
-        assert_eq!(response, "slow but healthy");
+        let outcome = finished.recv_timeout(WHOLE_TEST);
+        stop.notify_one();
+        let response = outcome.unwrap_or_else(|timed_out| {
+            panic!("the buffered request did not finish within {WHOLE_TEST:?} of real time ({timed_out})")
+        });
+        assert_eq!(response.as_deref(), Ok("slow but healthy"));
     }
 
     #[test]
@@ -2689,11 +3582,33 @@ mod tests {
         assert_eq!(input[3].content, "step 2");
     }
 
+    /// DC-6: the Responses API fallback's error is the sanitized upstream
+    /// body, like every other provider error; it quoted the raw body.
+    #[tokio::test]
+    async fn a_responses_api_error_body_is_sanitized() {
+        let stub = crate::providers::label_redaction_tests::spawn_fixed_status_stub(
+            "401 Unauthorized",
+            r#"{"error":{"message":"bad key sk-proj-FIXTURE0SECRET0responses1 rejected"}}"#,
+        )
+        .await;
+        let provider = make_provider("custom", &format!("http://{}", stub.addr), Some("test-key"));
+        let error = provider
+            .chat_via_responses(Some("test-key"), &[ChatMessage::user("hi")], "gpt-test")
+            .await
+            .expect_err("a 401 is an error");
+        let text = error.to_string();
+        assert!(text.contains("Responses API error"), "{text}");
+        assert!(
+            !text.contains("FIXTURE0SECRET0responses1"),
+            "the raw body reached the error: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn chat_via_responses_requires_non_system_message() {
         let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
         let err = provider
-            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .chat_via_responses(Some("test-key"), &[ChatMessage::system("policy")], "gpt-test")
             .await
             .expect_err("system-only fallback payload should fail");
 
@@ -2863,7 +3778,8 @@ mod tests {
             reasoning_content: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
+        let parsed = OpenAiCompatibleProvider::new("Fixture", "http://127.0.0.1:1/v1", None, AuthStyle::Bearer)
+            .parse_native_response(message, None);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -3013,7 +3929,9 @@ mod tests {
             ChatMessage::user("second user"),
         ];
 
-        let request = provider.build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true));
+        let request = provider
+            .build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true))
+            .expect("test: streaming request builds");
         let value = serde_json::to_value(&request).unwrap();
         let serialized_messages = value["messages"].as_array().unwrap();
 
@@ -3049,12 +3967,9 @@ mod tests {
             }),
         }];
 
-        let request = provider.build_streaming_history_request(
-            &messages,
-            "kimi-k2",
-            0.3,
-            StreamOptions::new(true).with_tools(tools),
-        );
+        let request = provider
+            .build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true).with_tools(tools))
+            .expect("test: streaming request builds");
         let value = serde_json::to_value(&request).unwrap();
         let tools = value["tools"].as_array().unwrap();
 
@@ -3070,7 +3985,9 @@ mod tests {
         let provider = make_provider("kimi-code", "https://api.kimi.com/coding/v1", Some("test-key"));
         let messages = vec![ChatMessage::user("hello")];
 
-        let request = provider.build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true));
+        let request = provider
+            .build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true))
+            .expect("test: streaming request builds");
         let value = serde_json::to_value(&request).unwrap();
 
         assert!(value["tools"].is_null());
@@ -3087,7 +4004,9 @@ mod tests {
         );
         let messages = vec![ChatMessage::system("core policy"), ChatMessage::user("hello")];
 
-        let request = provider.build_streaming_history_request(&messages, "abab", 0.7, StreamOptions::new(true));
+        let request = provider
+            .build_streaming_history_request(&messages, "abab", 0.7, StreamOptions::new(true))
+            .expect("test: streaming request builds");
         let value = serde_json::to_value(&request).unwrap();
         let serialized_messages = value["messages"].as_array().unwrap();
 
@@ -3620,7 +4539,7 @@ mod tests {
         let event = parse_sse_line(frame1)
             .expect("frame1 parses")
             .expect("frame1 yields event");
-        emitted.extend(apply_tool_call_deltas(&mut buf, event.tool_call_deltas));
+        emitted.extend(apply_tool_call_deltas(&mut buf, event.tool_call_deltas).expect("test: in-range index"));
 
         // Frame 2-4: argument fragments. The fragments are the raw decoded
         // strings the parser will surface (each piece concatenates into
@@ -3635,7 +4554,7 @@ mod tests {
             let ev = parse_sse_line(&line)
                 .expect("fragment parses")
                 .expect("fragment yields event");
-            emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+            emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas).expect("test: in-range index"));
         }
 
         // Frame 5: finish_reason flushes Completed
@@ -3687,17 +4606,17 @@ mod tests {
         // Frame 1: open call #0 (search)
         let f1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"search","arguments":""}}]}}]}"#;
         let ev = parse_sse_line(f1).expect("ok").expect("event");
-        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas).expect("test: in-range index"));
 
         // Frame 2: open call #1 (lookup) + fragment for #0 in same frame
         let f2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}},{"index":0,"function":{"arguments":"{\"q\":1}"}}]}}]}"#;
         let ev = parse_sse_line(f2).expect("ok").expect("event");
-        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas).expect("test: in-range index"));
 
         // Frame 3: fragment for #1
         let f3 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"k\":2}"}}]}}]}"#;
         let ev = parse_sse_line(f3).expect("ok").expect("event");
-        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas).expect("test: in-range index"));
 
         // Flush
         let finish = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
@@ -3820,7 +4739,7 @@ mod tests {
 
         let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x"}]}}]}"#;
         let ev = parse_sse_line(line).expect("ok").expect("event");
-        let emitted = apply_tool_call_deltas(&mut buf, ev.tool_call_deltas);
+        let emitted = apply_tool_call_deltas(&mut buf, ev.tool_call_deltas).expect("test: in-range index");
         assert!(emitted.is_empty(), "no name => no streaming chunk yet");
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0].id, "call_x");
@@ -3830,7 +4749,7 @@ mod tests {
         // Now name arrives; expect the leading open chunk.
         let line2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"fetch"}}]}}]}"#;
         let ev2 = parse_sse_line(line2).expect("ok").expect("event");
-        let emitted2 = apply_tool_call_deltas(&mut buf, ev2.tool_call_deltas);
+        let emitted2 = apply_tool_call_deltas(&mut buf, ev2.tool_call_deltas).expect("test: in-range index");
         assert_eq!(emitted2.len(), 1);
         assert_eq!(emitted2[0].name, "fetch");
         assert_eq!(emitted2[0].id, "call_x");
@@ -3888,5 +4807,246 @@ mod tests {
         assert!((p.effective_temperature(0.7) - 0.7_f64).abs() < f64::EPSILON);
         assert!((p.effective_temperature(0.0) - 0.0_f64).abs() < f64::EPSILON);
         assert!((p.effective_temperature(2.0) - 2.0_f64).abs() < f64::EPSILON);
+    }
+
+    /// STREAM-f: loopback stub answering `/chat/completions` with `body` as SSE.
+    async fn compatible_stream_results(body: &'static str) -> Vec<StreamResult<StreamChunk>> {
+        use axum::{Router, http::header, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], body) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let messages = vec![ChatMessage::user("write x".to_string())];
+        let results = provider
+            .stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+        results
+    }
+
+    fn compatible_completed_calls(results: &[StreamResult<StreamChunk>]) -> Vec<&ToolCallChunk> {
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|c| c.tool_calls.iter())
+            .filter(|c| c.status == ToolCallChunkStatus::Completed)
+            .collect()
+    }
+
+    /// STREAM-f: a body cut in the middle of a call's arguments, with no
+    /// `[DONE]`, must fail the stream instead of flushing the half call.
+    #[tokio::test]
+    async fn compatible_stream_cut_mid_tool_arguments_ends_in_an_error() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{\\\"value\\\":\"}}]}}]}\n\n",
+        ))
+        .await;
+        let error = results
+            .last()
+            .and_then(|r| r.as_ref().err())
+            .expect("test: the stream must end in an error");
+        assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
+        assert!(error.to_string().contains("[DONE]"), "got {error}");
+        assert!(
+            compatible_completed_calls(&results).is_empty(),
+            "the half call must not be flushed"
+        );
+        assert!(!results.iter().filter_map(|r| r.as_ref().ok()).any(|c| c.is_final));
+    }
+
+    /// STREAM-f guard: an endpoint that omits `finish_reason` but ends the
+    /// stream properly with `[DONE]` still has its calls flushed.
+    #[tokio::test]
+    async fn compatible_stream_done_without_finish_reason_still_flushes_calls() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert!(results.iter().all(Result::is_ok), "no error on a complete stream");
+        let completed = compatible_completed_calls(&results);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].args, r#"{"value":"x"}"#);
+    }
+
+    /// STREAM-g (F-2): `length` or `content_filter` while a call is buffered
+    /// means the call is unfinished, even when `[DONE]` follows; flushing it
+    /// would run a name-only call with `{}`.
+    #[tokio::test]
+    async fn compatible_stream_length_or_filter_with_a_buffered_call_ends_in_an_error() {
+        for body in [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+                "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+                "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        ] {
+            let results = compatible_stream_results(body).await;
+            let error = results
+                .iter()
+                .find_map(|r| r.as_ref().err())
+                .expect("test: an unfinished call must fail the stream");
+            assert!(matches!(error, StreamError::Provider(_)), "got {error:?}");
+            assert!(
+                compatible_completed_calls(&results).is_empty(),
+                "the call must not be flushed"
+            );
+        }
+    }
+
+    /// COMPAT-STREAM (R-2): an in-stream `{"error":…}` object is a stream error,
+    /// even when `[DONE]` follows. It used to parse as an empty chunk, and the
+    /// defensive end-of-stream flush then ran the name-only call with `{}`.
+    #[tokio::test]
+    async fn compatible_stream_error_object_mid_call_ends_in_a_provider_error() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"error\":{\"message\":\"The server is overloaded\",\"type\":\"server_error\"}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let error = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("test: the upstream error must surface");
+        assert!(matches!(error, StreamError::Provider(_)), "got {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("server_error"), "got {message}");
+        assert!(message.contains("The server is overloaded"), "got {message}");
+        assert!(
+            compatible_completed_calls(&results).is_empty(),
+            "the call must not be flushed"
+        );
+    }
+
+    /// COMPAT-STREAM (R-2): a call that got its name but no argument bytes, then
+    /// `finish_reason: stop` and `[DONE]`, must not be flushed as `{}`. Mirrors
+    /// the direct OpenAI rule.
+    #[tokio::test]
+    async fn compatible_stream_stop_with_a_name_only_call_ends_in_an_error() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let error = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("test: a name-only call ended by stop must fail the stream");
+        assert!(error.to_string().contains("incomplete"), "got {error}");
+        assert!(compatible_completed_calls(&results).is_empty());
+    }
+
+    /// Guard: a complete call ended by `stop` (a server quirk) still runs.
+    #[tokio::test]
+    async fn compatible_stream_stop_with_a_complete_call_still_flushes_it() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        let completed = compatible_completed_calls(&results);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].args, r#"{"value":"x"}"#);
+    }
+
+    /// COMPAT-STREAM: the server-controlled tool-call index sizes the buffer,
+    /// so an index past the cap ends the stream instead of allocating up to it.
+    #[tokio::test]
+    async fn compatible_stream_rejects_an_out_of_range_tool_call_index() {
+        let results = compatible_stream_results(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1000,\"id\":\"call_far\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let error = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("test: an out-of-range index must end the stream");
+        assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
+        assert!(error.to_string().contains("1000"), "got {error}");
+        assert!(compatible_completed_calls(&results).is_empty());
+    }
+
+    /// COMPAT-STREAM: once the consumer drops the stream, the background task
+    /// lets go of the connection instead of waiting on a silent server.
+    #[tokio::test]
+    async fn compatible_stream_releases_the_connection_when_the_consumer_goes_away() {
+        let (base, released, server) =
+            crate::providers::reliable::stream_release_probe::spawn_silent_after_first_record_stub(
+                "/chat/completions",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            )
+            .await;
+        let provider = make_provider("custom", &base, Some("test-key"));
+        let messages = vec![ChatMessage::user("hi".to_string())];
+        let mut stream = provider.stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true));
+        let first = stream.next().await.expect("test: first chunk");
+        assert_eq!(first.expect("test: first chunk is ok").delta, "hel");
+        drop(stream);
+        let was_released = crate::providers::reliable::stream_release_probe::wait_released(&released).await;
+        server.abort();
+        assert!(
+            was_released,
+            "the provider task must close the connection once nobody reads the stream"
+        );
+    }
+
+    /// COMPATf (N-1): a name-only call with no `finish_reason`, then `[DONE]`,
+    /// must fail the stream, alone or next to a complete call. The defensive
+    /// flush used to run it as `{}`. Parity with direct OpenAI.
+    #[tokio::test]
+    async fn compatible_stream_done_without_finish_reason_refuses_a_name_only_call() {
+        for body in [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",",
+                "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}]}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+                "{\"index\":0,\"id\":\"call_ok\",\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\"}},",
+                "{\"index\":1,\"id\":\"call_s1\",\"function\":{\"name\":\"fixture_write\",\"arguments\":\"\"}}",
+                "]}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        ] {
+            let results = compatible_stream_results(body).await;
+            let error = results
+                .iter()
+                .find_map(|r| r.as_ref().err())
+                .expect("test: a name-only call without finish_reason must fail the stream");
+            assert!(error.to_string().contains("incomplete"), "got {error}");
+            assert!(
+                compatible_completed_calls(&results).is_empty(),
+                "no call may be flushed"
+            );
+        }
     }
 }

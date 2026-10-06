@@ -1,0 +1,13 @@
+{
+  "state": "limit probe",
+  "model": "jev-1.13.0",
+  "questions": {
+    "pick": {
+      "type": "choice",
+      "instructions": "Which option applies?",
+      "criteria": {
+        "only": null
+      }
+    }
+  }
+}

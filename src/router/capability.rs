@@ -262,6 +262,7 @@ mod tests {
             provider: provider.to_string(),
             model: model_name.to_string(),
             api_key: None,
+            credential_ref: None,
         }
     }
 
@@ -411,4 +412,35 @@ mod tests {
         let successes = load_recent_successes(&memory, "test-model").await;
         assert!(successes.is_empty());
     }
+}
+
+/// Construct learning authority only from the actual source-bound terminal
+/// consumer. The backend rechecks durable receipt equality, not its public Rust type.
+pub(crate) fn local_learning_evidence(
+    receipt: &crate::agent::terminal::TurnTerminalReceipt,
+    source: &dyn crate::runtime::turn_source::TurnSourceProof,
+    metadata: &crate::agent::embedded_source::VerifiedEmbeddedInputMetadata,
+    policy: String,
+) -> Result<crate::memory::traits::RouterLearningEvidence> {
+    let event = &receipt.terminal_event;
+    anyhow::ensure!(
+        receipt.terminal_id == source.run_id()
+            && event.run_id.as_deref() == Some(source.run_id())
+            && event.workspace_id == source.workspace_id()
+            && event.owner_id.as_deref() == Some(source.owner_id())
+            && event.session_key.as_deref() == Some(source.session_key()),
+        "Router terminal receipt differs from recorded source"
+    );
+    crate::memory::traits::RouterLearningEvidence::from_terminal(
+        event,
+        source
+            .source_event_id()
+            .ok_or_else(|| anyhow::anyhow!("Router learning requires durable source"))?
+            .to_owned(),
+        source.routing_input(),
+        metadata.verified_raw_for(source)?,
+        source.config_generation_id(),
+        source.config_source_revision(),
+        policy,
+    )
 }

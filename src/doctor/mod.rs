@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,12 +62,20 @@ impl DiagItem {
     fn unknown(category: &'static str, msg: impl Into<String>) -> Self {
         Self::with_state(Severity::Warn, DiagnosticState::Unknown, category, msg)
     }
+    /// Every item is built here, so this is the one place a message is made
+    /// safe to print: doctor quotes configured provider labels and endpoint
+    /// URLs, and a `custom:` URL may carry `user:password@`.
     fn with_state(severity: Severity, state: DiagnosticState, category: &'static str, msg: impl Into<String>) -> Self {
+        let message = msg.into();
+        let message = match crate::security::redaction::redact_url_components(&message) {
+            std::borrow::Cow::Borrowed(_) => message,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
         Self {
             severity,
             state,
             category,
-            message: msg.into(),
+            message,
         }
     }
     fn warn(category: &'static str, msg: impl Into<String>) -> Self {
@@ -167,8 +175,15 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     let mut items: Vec<DiagItem> = Vec::new();
 
     check_config_semantics(config, &mut items);
+    check_model_selection(config, &mut items);
+    check_persisted_selections(config, &mut items);
+    check_decision_plane(config, &mut items);
     check_workspace(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
+    check_workspace_mcp_servers(config, &mut items);
+    check_workspace_hooks(config, &mut items);
+    check_unowned_shell_jobs(config, &mut items);
+    check_unfinished_config_changes(config, &mut items);
     check_daemon_state(config, &mut items);
     check_daemon_process_path(config, &mut items);
     check_environment(&mut items);
@@ -187,6 +202,228 @@ pub fn diagnose_memory(config: &Config) -> DoctorReport {
     check_memory_diagnostics(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
     DoctorReport::new("OpenPRX Doctor - Memory", items)
+}
+
+/// Workspace command hooks (HOOKS-ENV): a `hooks.json` whose commands do
+/// not run because `security.workspace_hooks` is off is named, with the one
+/// line that allows them. Reads the file only.
+fn check_workspace_hooks(config: &Config, items: &mut Vec<DiagItem>) {
+    let category = "hooks";
+    match crate::hooks::workspace_hook_actions(&config.workspace_dir) {
+        Ok(None | Some(0)) => items.push(DiagItem::healthy(category, "no workspace command hooks")),
+        Ok(Some(actions)) if config.security.workspace_hooks == crate::config::WorkspaceHooks::On => {
+            items.push(DiagItem::ok(
+                category,
+                format!(
+                    "{actions} workspace command hook(s) run (security.workspace_hooks = \"on\"), in a cleared \
+                     environment and a dedicated directory beside config.toml"
+                ),
+            ))
+        }
+        Ok(Some(actions)) => {
+            if let Some(note) = crate::hooks::blocked_hooks_note(actions) {
+                items.push(DiagItem::warn(category, note));
+            }
+        }
+        Err(error) => items.push(DiagItem::warn(
+            category,
+            format!("the workspace hooks.json is not valid: {error:#}"),
+        )),
+    }
+}
+
+/// Shell jobs stored before PRX recorded who creates them (D-107
+/// amendment): they count as agent-created, so a command that runs git is
+/// refused. Each is named with the one command that vouches for it. Opens
+/// the stores read-only and runs no migration: a store whose table predates
+/// the `created_via` column has only such rows.
+fn check_unowned_shell_jobs(config: &Config, items: &mut Vec<DiagItem>) {
+    let category = "git";
+    let cron_in_postgres = config
+        .storage
+        .provider
+        .config
+        .provider
+        .trim()
+        .eq_ignore_ascii_case("postgres");
+    let mut sources = vec![(
+        "xin shell task",
+        "prx xin mark-operator",
+        config.workspace_dir.join("xin").join("tasks.db"),
+        "xin_tasks",
+        "SELECT id, payload FROM xin_tasks
+         WHERE execution_mode = 'shell' AND kind <> 'system' AND created_via IS NULL ORDER BY id",
+        "SELECT id, payload FROM xin_tasks WHERE execution_mode = 'shell' AND kind <> 'system' ORDER BY id",
+    )];
+    if cron_in_postgres {
+        items.push(DiagItem::ok(
+            category,
+            "cron jobs are stored in Postgres and not inspected here; a shell job created before PRX recorded its \
+             creator runs no git until `prx cron mark-operator <id>`",
+        ));
+    } else {
+        sources.push((
+            "cron shell job",
+            "prx cron mark-operator",
+            config.workspace_dir.join("cron").join("jobs.db"),
+            "cron_jobs",
+            "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' AND created_via IS NULL ORDER BY id",
+            "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' ORDER BY id",
+        ));
+    }
+    let mut found = 0_usize;
+    for (what, mark, db_path, table, unowned_sql, legacy_sql) in sources {
+        match read_only_unowned_rows(&db_path, table, unowned_sql, legacy_sql) {
+            Ok(rows) => {
+                for (id, _) in rows {
+                    found += 1;
+                    items.push(DiagItem::warn(
+                        category,
+                        format!(
+                            "{what} {id} predates creator tracking and counts as agent-created, so git in it is \
+                             refused; if you created it: `{mark} {id}`"
+                        ),
+                    ));
+                }
+            }
+            Err(error) => items.push(DiagItem::warn(
+                category,
+                format!("the {what}s could not be read: {error:#}"),
+            )),
+        }
+    }
+    if found == 0 {
+        items.push(DiagItem::healthy(category, "every shell job records who created it"));
+    }
+}
+
+/// `(id, command)` of the shell rows of `table` whose `created_via` is NULL
+/// (`unowned_sql`), or all of them (`legacy_sql`) when the column does not
+/// exist yet; read-only, and empty when the database or the table is
+/// missing.
+fn read_only_unowned_rows(
+    db_path: &Path,
+    table: &str,
+    unowned_sql: &str,
+    legacy_sql: &str,
+) -> Result<Vec<(String, String)>> {
+    if !db_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let has_creator: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'created_via')",
+        [table],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(if has_creator { unowned_sql } else { legacy_sql })?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Unfinished configuration changes (SP-PMM §2.6, D-095 L-3): a `pending`
+/// history record (the process stopped between commit and activation) or a
+/// `not_restored` one (a refused change whose restore failed). Nothing is
+/// applied automatically; the operator decides. Reads the history only.
+fn check_unfinished_config_changes(config: &Config, items: &mut Vec<DiagItem>) {
+    use crate::config::manage::{ConfigHistory, RecordStatus};
+    let category = "config";
+    let records = match ConfigHistory::for_config(&config.config_path).and_then(|history| history.list()) {
+        Ok(records) => records,
+        Err(error) => {
+            items.push(DiagItem::warn(
+                category,
+                format!("configuration history could not be read: {error:#}"),
+            ));
+            return;
+        }
+    };
+    // A change `prx` wrote that a later write replaced before a running PRX
+    // settled it (D-101 F-7): superseded, never activated.
+    let current = crate::config::files::current_config_revision(&config.config_path).ok();
+    for record in records.iter().filter(|record| {
+        record.status == RecordStatus::Superseded
+            || (record.status == RecordStatus::ActivationDeferred
+                && current.is_some()
+                && record.committed_revision != current)
+    }) {
+        items.push(DiagItem::warn(
+            category,
+            format!(
+                "configuration change {} written by `prx` was replaced by a later write before a running PRX \
+                 settled it (superseded); inspect it with `prx config history show {}`",
+                record.id, record.id
+            ),
+        ));
+    }
+    let unfinished = records
+        .iter()
+        .filter(|record| matches!(record.status, RecordStatus::Pending | RecordStatus::NotRestored))
+        .collect::<Vec<_>>();
+    if unfinished.is_empty() {
+        items.push(DiagItem::healthy(category, "no unfinished configuration change"));
+        return;
+    }
+    for record in unfinished {
+        items.push(DiagItem::warn(
+            category,
+            format!(
+                "configuration change {} is {} (the process stopped, or a restore failed); it is never applied \
+                 automatically: inspect it with `prx config history show {}` and restore the configuration from \
+                 before it with `prx config rollback {} --yes`",
+                record.id,
+                record.status.as_str(),
+                record.id,
+                record.id
+            ),
+        ));
+    }
+}
+
+/// Every workspace `mcp.json` entry that did not start as written (blocked
+/// by `mcp.workspace_servers`, disabled, or trimmed), with its one-line
+/// remedy (D-088 C-7). Reads the file only; starts nothing.
+fn check_workspace_mcp_servers(config: &Config, items: &mut Vec<DiagItem>) {
+    let category = "mcp";
+    let notes = crate::tools::mcp::workspace_server_notes(&config.mcp, &config.workspace_dir);
+    if notes.is_empty() {
+        items.push(DiagItem::healthy(
+            category,
+            "no workspace mcp.json server is blocked or disabled",
+        ));
+    }
+    for note in notes {
+        items.push(DiagItem::warn(category, note));
+    }
+    // An operator's `working_dir` inside the agent's workspace lets the
+    // workspace file tools plant files the server loads at start (a
+    // `.npmrc`, a shadowing module): allowed, but worth saying (D-095 N-4).
+    let mut servers = config.mcp.servers.iter().collect::<Vec<_>>();
+    servers.sort_by(|left, right| left.0.cmp(right.0));
+    for (name, server) in servers {
+        if let Some(dir) = server.working_dir.as_deref() {
+            if std::path::Path::new(dir.trim()).starts_with(&config.workspace_dir) {
+                items.push(DiagItem::warn(
+                    category,
+                    format!(
+                        "server '{}' starts in {}, inside the agent's workspace: the workspace file tools can \
+                         change what it loads there; prefer a directory outside the workspace, or leave \
+                         `working_dir` unset for its dedicated one",
+                        name.escape_default(),
+                        dir.trim()
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 fn check_legacy_fitness_telemetry(config: &Config, items: &mut Vec<DiagItem>) {
@@ -419,7 +656,10 @@ fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     ));
 
     let address = format!("{}:{}", config.gateway.host, config.gateway.port);
-    match address.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
+    match crate::tools::http_request::lookup_host_blocking(&config.gateway.host, config.gateway.port)
+        .ok()
+        .and_then(|addrs| addrs.into_iter().next())
+    {
         Some(socket) => match TcpStream::connect_timeout(&socket, Duration::from_millis(300)) {
             Ok(_) => items.push(DiagItem::ok(cat, format!("gateway port reachable at {socket}"))),
             Err(error) => items.push(DiagItem::warn(
@@ -895,7 +1135,7 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
         format!("workspace path {}", config.workspace_dir.display()),
     ));
 
-    let embedder = crate::memory::create_embedder_from_config(config, config.api_key.as_deref());
+    let embedder = crate::memory::create_embedder_from_config(config);
     if embedder.name() == "none" || embedder.dimensions() == 0 {
         items.push(DiagItem::warn(
             "embedding",
@@ -1015,7 +1255,10 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     let mut error_count = 0usize;
 
     for provider_name in &targets {
-        println!("  [{}]", provider_name);
+        println!(
+            "  [{}]",
+            crate::security::redaction::redact_provider_text(provider_name)
+        );
 
         match crate::onboard::run_models_probe_read_only(config, Some(provider_name), use_cache) {
             Ok(()) => {
@@ -1023,7 +1266,8 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
                 println!("    ✅ model catalog check passed");
             }
             Err(error) => {
-                let error_text = format_error_chain(&error);
+                let error_text =
+                    crate::security::redaction::redact_url_components(&format_error_chain(&error)).into_owned();
                 match classify_model_probe_error(&error_text) {
                     ModelProbeOutcome::Skipped => {
                         skipped_count += 1;
@@ -1065,6 +1309,67 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 }
 
 // ── Config semantic validation ───────────────────────────────────
+
+/// Resolve the configured default for chat the way every surface does:
+/// refused is an error (it will not start), id-only is a warning (it runs,
+/// unverified), verified is fine.
+fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "models";
+    match crate::providers::selection::default_status(config) {
+        Ok((true, line)) => items.push(DiagItem::ok(cat, line)),
+        Ok((false, line)) => items.push(DiagItem::warn(cat, line)),
+        Err(line) => items.push(DiagItem::error(cat, line)),
+    }
+}
+
+/// Every persisted selection besides the default (routes, agents,
+/// fallbacks, embeddings, ...) resolved as an operator's selection (SP-PMM
+/// H-4): one warning per selection the evidence does not verify, and an
+/// error when one no longer resolves. The default is reported by
+/// [`check_model_selection`]. Local only; no credential is read.
+fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "models";
+    // Two embedding routes sharing a hint load, but only the first is used
+    // (D-104 C-1 ruling): name each with the fix.
+    for note in crate::config::schema::duplicate_embedding_route_hints(config) {
+        items.push(DiagItem::warn(cat, note));
+    }
+    match crate::config::manage::validate::check_affected_selections(
+        None,
+        config,
+        crate::providers::catalog::UnknownPolicy::OperatorSelection,
+    ) {
+        Ok(warnings) => {
+            let unverified = warnings
+                .into_iter()
+                .filter(|warning| !warning.starts_with("default model "))
+                .collect::<Vec<_>>();
+            if unverified.is_empty() {
+                items.push(DiagItem::healthy(cat, "every persisted selection is verified"));
+            }
+            for warning in unverified {
+                items.push(DiagItem::warn(cat, warning));
+            }
+        }
+        Err(refused) => items.push(DiagItem::error(
+            cat,
+            format!("a persisted selection no longer resolves: {refused}"),
+        )),
+    }
+}
+
+/// The decision plane reports refused backends and orphaned references.
+fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "decision";
+    if let Some(warning) = crate::config::manage::validate::decision_startup_check(config) {
+        items.push(DiagItem::warn(cat, warning));
+    }
+    if config.causal_tree.enabled
+        && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(config)
+    {
+        items.push(DiagItem::warn(cat, warning));
+    }
+}
 
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
@@ -1174,6 +1479,30 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             items.push(DiagItem::warn(
                 cat,
                 format!("fallback provider \"{fb}\" is invalid: {reason}"),
+            ));
+        }
+        // A self-hosted fallback answers only `model_fallbacks` entries that
+        // name a model repository (D-076 N-1); without one it is never used.
+        let default_is_same = config
+            .default_provider
+            .as_deref()
+            .is_some_and(|default| default.trim().eq_ignore_ascii_case(fb.trim()));
+        if crate::providers::is_self_hosted_model_server(fb)
+            && !default_is_same
+            && !config
+                .reliability
+                .model_fallbacks
+                .values()
+                .flatten()
+                .any(|model| crate::providers::names_model_repository(model))
+        {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "fallback provider \"{fb}\" is never used: as a fallback it answers only \
+                     reliability.model_fallbacks entries that name one of its model repositories \
+                     (org/repository), and none does"
+                ),
             ));
         }
     }
@@ -1381,8 +1710,9 @@ fn active_auth_profile_credential_status(config: &Config, provider: &str) -> Aut
     let canonical_provider = crate::providers::canonical_china_provider_name(provider)
         .unwrap_or(provider)
         .to_string();
+    // Read-only: a diagnosis never rewrites the profiles file (D-084 E-3).
     let store = crate::auth::profiles::AuthProfilesStore::new(openprx_dir, config.secrets.encrypt);
-    let data = match store.load() {
+    let data = match store.load_read_only() {
         Ok(data) => data,
         Err(error) => return AuthProfileCredentialStatus::Unreadable(error.to_string()),
     };
@@ -1419,18 +1749,30 @@ fn model_has_reachable_provider(
     route_providers: &HashSet<String>,
     model: &str,
 ) -> bool {
-    if crate::providers::provider_matches_model_prefix(default_provider, model) {
+    // As the failover chain decides (D-075): a self-hosted model server
+    // serves any repository on its own route (the default provider, a model
+    // route) and never answers as a fallback for another provider's route.
+    let serves_own_route = |provider: &str| {
+        if crate::providers::is_self_hosted_model_server(provider) {
+            crate::providers::provider_serves_configured_model(provider, model)
+        } else {
+            crate::providers::provider_matches_model_prefix(provider, model)
+        }
+    };
+    if serves_own_route(default_provider) {
         return true;
     }
-    if fallback_providers
-        .iter()
-        .any(|provider| crate::providers::provider_matches_model_prefix(provider, model))
-    {
+    if fallback_providers.iter().any(|provider| {
+        if crate::providers::is_self_hosted_model_server(provider) {
+            // A fallback model is a `model_fallbacks` entry (D-076 N-1).
+            crate::providers::names_model_repository(model)
+        } else {
+            crate::providers::provider_matches_model_prefix(provider, model)
+        }
+    }) {
         return true;
     }
-    route_providers
-        .iter()
-        .any(|provider| crate::providers::provider_matches_model_prefix(provider, model))
+    route_providers.iter().any(|provider| serves_own_route(provider))
 }
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
@@ -1842,7 +2184,7 @@ fn required_daemon_path_dirs(daemon_binary: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    if let Some(home) = directories::UserDirs::new().map(|user| user.home_dir().to_path_buf()) {
+    if let Some(home) = crate::config::user_home_dir() {
         let cargo_bin = home.join(".cargo").join("bin");
         if cargo_bin.is_dir() {
             dirs.push(canonical_or_owned(&cargo_bin));
@@ -2097,6 +2439,56 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// D-094 C-1, C-5: the doctor names a refused decision backend (which
+    /// runs builtin-only) and every decision credential nothing references,
+    /// by id, never by value.
+    #[test]
+    fn the_doctor_reports_a_refused_decision_backend_and_orphaned_credentials() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".to_string();
+        config.causal_tree.backend.model = "undeclared-model".to_string();
+        let orphan = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .unwrap()
+            .set(
+                "custom:http://127.0.0.1:8900/v1",
+                "decision-compatible-http-0badc0de",
+                "sk-DOCTOR-ORPHAN-SENTINEL-01",
+            )
+            .unwrap();
+        let mut items = Vec::new();
+        check_decision_plane(&config, &mut items);
+        let text = items
+            .iter()
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(items.len(), 2, "{text}");
+        assert!(text.contains("builtin-only") && text.contains(&orphan.id), "{text}");
+        assert!(text.contains("prx providers credential remove <id>"), "{text}");
+        // Disabled, the credential store is not opened: a held lock does not
+        // delay the doctor, and nothing is reported from the store.
+        config.causal_tree.enabled = false;
+        std::fs::write(temp.path().join("auth-profiles.lock"), "pid=1\n").unwrap();
+        let started = std::time::Instant::now();
+        let mut items = Vec::new();
+        check_decision_plane(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "{:?}",
+            items.iter().map(|item| &item.message).collect::<Vec<_>>()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
+
     #[test]
     fn memory_diagnostics_flag_vector_recall_inherited_from_the_flipped_default() {
         let temp = TempDir::new().unwrap();
@@ -2123,6 +2515,322 @@ mod tests {
                 .any(|item| item.message.contains("embedding_provider not set")),
             "an explicit provider must not be reported as an inherited default"
         );
+    }
+
+    /// D-088 C-7: `prx doctor` names each blocked workspace MCP server with
+    /// the one-line opt-in, instead of leaving it to a log line.
+    #[test]
+    fn doctor_reports_a_workspace_mcp_server_blocked_by_the_opt_in() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        std::fs::write(
+            temp.path().join("mcp.json"),
+            r#"{"mcpServers": {"legacy": {"command": "npx", "args": ["some-mcp"]}}}"#,
+        )
+        .unwrap();
+        let mut items = Vec::new();
+        check_workspace_mcp_servers(&config, &mut items);
+        let blocked = items
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("workspace server 'legacy' (stdio) is not started")
+            })
+            .expect("doctor must report the blocked workspace server");
+        assert_eq!(blocked.severity, Severity::Warn);
+        assert!(
+            blocked.message.contains("workspace_servers = \"stdio\""),
+            "{}",
+            blocked.message
+        );
+
+        std::fs::remove_file(temp.path().join("mcp.json")).unwrap();
+        let mut items = Vec::new();
+        check_workspace_mcp_servers(&config, &mut items);
+        assert!(items.iter().all(|item| item.severity != Severity::Warn));
+    }
+
+    /// D-095 N-4: an operator `working_dir` inside the workspace is named.
+    #[test]
+    fn doctor_warns_about_a_working_dir_inside_the_workspace() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.mcp.servers.insert(
+            "inside".into(),
+            crate::config::McpServerConfig {
+                command: Some("npx".into()),
+                working_dir: Some(temp.path().join("tools").display().to_string()),
+                ..crate::config::McpServerConfig::default()
+            },
+        );
+        let mut items = Vec::new();
+        check_workspace_mcp_servers(&config, &mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.severity == Severity::Warn && item.message.contains("inside the agent's workspace")),
+            "{:?}",
+            items.iter().map(|item| &item.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// RED before PMME-h (D-095 L-3): a `pending` configuration record was
+    /// listed by `prx config status` but not by `prx doctor`.
+    #[test]
+    fn doctor_reports_an_unfinished_configuration_change() {
+        let temp = TempDir::new().unwrap();
+        let config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        let record_dir = temp
+            .path()
+            .join(".config-history")
+            .join("0190a000-0000-7000-8000-000000000001");
+        std::fs::create_dir_all(&record_dir).unwrap();
+        let summary = crate::config::manage::ConfigChangeSummary::between(Some(&config), &config).unwrap();
+        let now = chrono::Utc::now();
+        let record = crate::config::manage::HistoryRecord {
+            version: 1,
+            id: "0190a000-0000-7000-8000-000000000001".into(),
+            created_at: now,
+            updated_at: now,
+            actor: crate::config::manage::ConfigActor::Cli,
+            status: crate::config::manage::RecordStatus::Pending,
+            base_revision: None,
+            committed_revision: None,
+            restores: None,
+            summary,
+            active_generation: None,
+            restart_required: Vec::new(),
+            reason: None,
+        };
+        std::fs::write(record_dir.join("record.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let mut items = Vec::new();
+        check_unfinished_config_changes(&config, &mut items);
+        let pending = items
+            .iter()
+            .find(|item| item.message.contains("0190a000-0000-7000-8000-000000000001"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "doctor must report the pending record: {:?}",
+                    items.iter().map(|item| &item.message).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(pending.severity, Severity::Warn);
+        assert!(pending.message.contains("prx config rollback"), "{}", pending.message);
+    }
+
+    /// D-107 amendment: a shell job stored before PRX recorded its creator
+    /// is named with the command that vouches for it; one with a recorded
+    /// creator is not; the check writes nothing.
+    #[test]
+    fn doctor_names_shell_jobs_without_a_recorded_creator() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        let legacy = crate::cron::add_shell_job(
+            &config,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "git pull project_payload_marker",
+        )
+        .unwrap();
+        let recorded = crate::cron::add_shell_job(
+            &config,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo recorded",
+        )
+        .unwrap();
+        let db_path = temp.path().join("cron").join("jobs.db");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE cron_jobs SET created_via = NULL WHERE id = ?1",
+                [legacy.id.as_str()],
+            )
+            .unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+
+        let mut items = Vec::new();
+        check_unowned_shell_jobs(&config, &mut items);
+        let warnings = items
+            .iter()
+            .filter(|item| item.category == "git" && item.severity == Severity::Warn)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings.first().map(|item| item.message.as_str()).unwrap_or_default();
+        assert!(
+            warning.contains(&format!("prx cron mark-operator {}", legacy.id)),
+            "{warning}"
+        );
+        assert!(!warning.contains(&recorded.id), "{warning}");
+        assert!(!warning.contains("project_payload_marker"), "{warning}");
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            before,
+            "doctor wrote to the cron store"
+        );
+
+        crate::cron::mark_job_operator(&config, &legacy.id).unwrap();
+        let mut items = Vec::new();
+        check_unowned_shell_jobs(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.category == "git" && item.severity == Severity::Warn),
+            "{items:?}"
+        );
+    }
+
+    /// SP-PMM H-4: a `pending` history record is reported with its
+    /// recovery commands and never applied (loading the configuration and
+    /// running the checks leave the files and the record as they were); a
+    /// persisted selection the evidence does not verify is listed by name.
+    #[tokio::test]
+    async fn a_pending_record_is_reported_never_applied_and_unverified_selections_are_listed() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-4o".into()),
+            ..Config::default()
+        };
+        config.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "fast".into(),
+            provider: "openai".into(),
+            model: "pmmh-unlisted-route-model".into(),
+            api_key: None,
+            credential_ref: None,
+        });
+        config.save().await.unwrap();
+        let history = crate::config::manage::ConfigHistory::for_config(&config.config_path).unwrap();
+        let mut other = config.clone();
+        other.default_temperature = 0.1;
+        let before = crate::config::files::current_before_image(&config.config_path).unwrap();
+        let record = history
+            .create_pending(
+                crate::config::manage::history::NewRecord {
+                    actor: crate::config::manage::ConfigActor::Cli,
+                    base_revision: None,
+                    restores: None,
+                    summary: crate::config::manage::ConfigChangeSummary::between(Some(&config), &other).unwrap(),
+                },
+                &before,
+            )
+            .unwrap();
+        let config_bytes = std::fs::read(&config.config_path).unwrap();
+        let record_bytes = std::fs::read(history.dir().join(&record.id).join("record.json")).unwrap();
+
+        let loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+        let mut items = Vec::new();
+        check_unfinished_config_changes(&loaded, &mut items);
+        check_persisted_selections(&loaded, &mut items);
+
+        let pending = items
+            .iter()
+            .find(|item| item.message.contains(&record.id))
+            .expect("the pending record is reported");
+        assert!(
+            pending.message.contains("is pending") && pending.message.contains("never applied"),
+            "{}",
+            pending.message
+        );
+        let unverified = items
+            .iter()
+            .find(|item| item.message.contains("model route `hint:fast`"))
+            .expect("the unverified route is reported");
+        assert_eq!(unverified.severity, Severity::Warn);
+        assert!(
+            unverified.message.contains("pmmh-unlisted-route-model"),
+            "{}",
+            unverified.message
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).unwrap(),
+            config_bytes,
+            "a pending record was applied"
+        );
+        assert_eq!(
+            std::fs::read(history.dir().join(&record.id).join("record.json")).unwrap(),
+            record_bytes,
+            "the pending record was rewritten"
+        );
+        assert_eq!(
+            history.get(&record.id).unwrap().status,
+            crate::config::manage::RecordStatus::Pending
+        );
+    }
+
+    /// D-104 C-1 ruling: `prx doctor` names two embedding routes sharing a
+    /// hint, with the fix.
+    #[test]
+    fn doctor_reports_duplicate_embedding_route_hints() {
+        let route = |model: &str| crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: model.into(),
+            dimensions: None,
+            api_key: None,
+            credential_ref: None,
+        };
+        let mut config = Config::default();
+        config.embedding_routes = vec![route("text-embedding-3-small"), route("text-embedding-3-large")];
+        let mut items = Vec::new();
+        check_persisted_selections(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|item| item.message.contains("both use hint 'semantic'"))
+            .expect("the duplicate is reported");
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("Give each route its own hint"),
+            "{}",
+            item.message
+        );
+    }
+
+    /// HOOKS-ENV: `prx doctor` names blocked workspace hooks with the
+    /// one-line opt-in, and says when they run.
+    #[test]
+    fn doctor_reports_blocked_workspace_hooks_with_the_opt_in() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        std::fs::write(
+            temp.path().join("hooks.json"),
+            r#"{"hooks": {"turn_complete": [{"command": "true"}]}}"#,
+        )
+        .unwrap();
+        let mut items = Vec::new();
+        check_workspace_hooks(&config, &mut items);
+        let blocked = items
+            .iter()
+            .find(|item| item.category == "hooks")
+            .expect("test: a hooks item");
+        assert_eq!(blocked.severity, Severity::Warn);
+        assert!(
+            blocked.message.contains(crate::hooks::WORKSPACE_HOOKS_OPT_IN),
+            "{}",
+            blocked.message
+        );
+
+        config.security.workspace_hooks = crate::config::WorkspaceHooks::On;
+        let mut items = Vec::new();
+        check_workspace_hooks(&config, &mut items);
+        assert!(items.iter().all(|item| item.severity != Severity::Warn));
     }
 
     #[test]
@@ -2164,6 +2872,9 @@ mod tests {
         #[allow(unsafe_code)]
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
+            if key == "HOME" {
+                crate::config::schema::follow_test_home_env(value.map(std::ffi::OsStr::new));
+            }
             // SAFETY: test-only env manipulation; tests that use this must be serialized.
             unsafe {
                 match value {
@@ -2178,6 +2889,9 @@ mod tests {
     impl Drop for EnvGuard {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
+            if self.key == "HOME" {
+                crate::config::schema::follow_test_home_env(self.original.as_deref().map(std::ffi::OsStr::new));
+            }
             // SAFETY: test-only env manipulation; restoring previous value.
             unsafe {
                 if let Some(original) = self.original.as_deref() {
@@ -2379,6 +3093,7 @@ mod tests {
                 model: "model-test".into(),
                 system_prompt: None,
                 api_key: None,
+                credential_ref: None,
                 temperature: None,
                 max_depth: 3,
                 agentic: true,
@@ -2665,6 +3380,117 @@ mod tests {
         assert_eq!(mismatch.unwrap().severity, Severity::Warn);
     }
 
+    /// D-072 L-9 / D-075: doctor mirrors the failover chain. A llama.cpp
+    /// fallback never answers another provider's route, so a fallback model
+    /// only it could serve is a route mismatch; on its own route it serves
+    /// any repository, so no warning there.
+    #[test]
+    fn config_validation_follows_llamacpp_route_identity() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let base = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        let warning = |config: &Config, needle: &str| {
+            let mut items = Vec::new();
+            check_config_semantics(config, &mut items);
+            items.into_iter().find(|item| item.message.contains(needle))
+        };
+
+        // D-076 N-1: a llama.cpp fallback with nothing it may serve is never used.
+        let mut unused = base.clone();
+        unused.default_provider = Some("anthropic".into());
+        unused.reliability.fallback_providers = vec!["llamacpp".into()];
+        assert!(
+            warning(&unused, "\"llamacpp\" is never used").is_some_and(|item| item.severity == Severity::Warn),
+            "a llama.cpp fallback without a repository entry is dead config"
+        );
+        unused
+            .reliability
+            .model_fallbacks
+            .insert("anthropic/claude-sonnet-5".into(), vec!["claude-haiku-5".into()]);
+        assert!(
+            warning(&unused, "\"llamacpp\" is never used").is_some(),
+            "a bare id is routed to another provider"
+        );
+
+        // Named in model_fallbacks: the fallback serves it; no warning.
+        let mut named = base.clone();
+        named.default_provider = Some("anthropic".into());
+        named.reliability.fallback_providers = vec!["llamacpp".into()];
+        named.reliability.model_fallbacks.insert(
+            "anthropic/claude-sonnet-5".into(),
+            vec!["ggml-org/gpt-oss-20b-GGUF".into()],
+        );
+        assert!(warning(&named, "is never used").is_none());
+        assert!(warning(&named, "model_fallbacks route mismatch").is_none());
+
+        // A `<provider>/…` fallback model only the llama.cpp fallback could
+        // take is routed to another provider: a mismatch.
+        let mut elsewhere = named.clone();
+        elsewhere.reliability.model_fallbacks.insert(
+            "anthropic/claude-sonnet-5".into(),
+            vec!["openai/gpt-5".into(), "ggml-org/gpt-oss-20b-GGUF".into()],
+        );
+        assert!(
+            warning(&elsewhere, "model_fallbacks route mismatch").is_some_and(|item| item.severity == Severity::Warn)
+        );
+
+        // On its own route llama.cpp serves any repository.
+        let mut own_route = base;
+        own_route.default_provider = Some("llamacpp".into());
+        own_route.default_model = Some("ggml-org/gpt-oss-20b-GGUF".into());
+        own_route.reliability.model_fallbacks.insert(
+            "ggml-org/gpt-oss-20b-GGUF".into(),
+            vec!["google/gemma-3-27b-it-GGUF".into()],
+        );
+        assert!(warning(&own_route, "model_fallbacks route mismatch").is_none());
+    }
+
+    /// PMM-C: doctor resolves the configured default: refused is an error,
+    /// id-only is a warning (D-018 Q1: it keeps running, unverified),
+    /// declared is fine.
+    #[test]
+    fn doctor_reports_how_the_default_model_resolves() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.default_provider = Some("openrouter".to_string());
+        config.api_key = Some("PMMC-DOCTOR-ROOT".to_string());
+        let models_item = |config: &Config| {
+            diagnose(config)
+                .items
+                .into_iter()
+                .find(|item| item.category == "models" && item.message.contains("default model"))
+        };
+
+        config.default_model = Some("jev-decision-test".to_string());
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"openrouter\"\nmodel = \"jev-decision-test\"\noperations = [\"decision_endpoint\"]\n",
+            )
+            .expect("test: declaration"),
+        );
+        let item = models_item(&config).expect("a refused default is reported");
+        assert_eq!(item.severity, Severity::Error, "{}", item.message);
+        assert!(item.message.contains("cannot be used for chat"), "{}", item.message);
+        assert!(!item.message.contains("PMMC-DOCTOR-ROOT"));
+
+        config.default_model = Some("vendor/id-only".to_string());
+        let item = models_item(&config).expect("an unverified default is reported");
+        assert_eq!(item.severity, Severity::Warn, "{}", item.message);
+        assert!(item.message.contains("unverified"), "{}", item.message);
+
+        config.providers.models.push(
+            toml::from_str("provider = \"openrouter\"\nmodel = \"vendor/id-only\"\noperations = [\"chat\"]\n")
+                .expect("test: declaration"),
+        );
+        let item = models_item(&config).expect("a verified default is reported");
+        assert_eq!(item.severity, Severity::Ok, "{}", item.message);
+    }
+
     #[test]
     fn config_validation_warns_empty_model_route() {
         let mut config = Config::default();
@@ -2673,6 +3499,7 @@ mod tests {
             provider: "groq".into(),
             model: String::new(),
             api_key: None,
+            credential_ref: None,
         }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -2690,6 +3517,7 @@ mod tests {
             model: String::new(),
             dimensions: Some(1536),
             api_key: None,
+            credential_ref: None,
         }];
 
         let mut items = Vec::new();
@@ -2710,6 +3538,7 @@ mod tests {
             model: "text-embedding-3-small".into(),
             dimensions: None,
             api_key: None,
+            credential_ref: None,
         }];
 
         let mut items = Vec::new();
@@ -2821,6 +3650,7 @@ mod tests {
                 model: "model-z".into(),
                 system_prompt: None,
                 api_key: None,
+                credential_ref: None,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -2837,6 +3667,7 @@ mod tests {
                 model: "model-a".into(),
                 system_prompt: None,
                 api_key: None,
+                credential_ref: None,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -3258,6 +4089,98 @@ mod tests {
             items[0].message.contains("environ"),
             "skip message must name the unreadable source, got: {}",
             items[0].message
+        );
+    }
+
+    /// USERINFO-2: `prx doctor` prints every configured provider label. Each
+    /// may be a `custom:` URL carrying `user:password@`.
+    #[test]
+    fn doctor_names_every_provider_without_url_userinfo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let label = |port: u16| format!("custom:http://u:SECRET-fixture-pw@127.0.0.1:{port}/v1");
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            default_provider: Some(label(1)),
+            ..Config::default()
+        };
+        // An unparseable fallback and route make doctor print "invalid" lines too.
+        config.reliability.fallback_providers =
+            vec![label(2), "custom:http://u:SECRET-fixture-pw@127.0.0.1:99999/v1".into()];
+        config.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "fast".into(),
+            provider: "custom:http://u:SECRET-fixture-pw@127.0.0.1:99998/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            credential_ref: None,
+        }];
+        let report = diagnose(&config);
+        let rendered = report
+            .items
+            .iter()
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("[redacted]@127.0.0.1"),
+            "doctor no longer names the endpoints: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SECRET-fixture-pw"),
+            "doctor printed URL userinfo: {rendered}"
+        );
+    }
+
+    /// R-C2BUg G-1: doctor messages that start with a URL keep none of their
+    /// credentials.
+    #[test]
+    fn doctor_messages_redact_every_url_in_url_first_text() {
+        crate::providers::label_redaction_tests::assert_every_url_redacted("doctor", &|text| {
+            DiagItem::warn("fixture", text).message
+        });
+    }
+
+    /// D-063, RED before: the gateway probe resolved `(host, port)`, and a
+    /// bracketed IPv6 `gateway.host = "[::1]"` (the spelling a URL uses) did
+    /// not resolve, so doctor reported "cannot resolve gateway bind address".
+    /// After: the brackets are removed before resolution.
+    #[test]
+    fn the_gateway_probe_resolves_a_bracketed_ipv6_host() {
+        for host in ["[::1]", "::1", "127.0.0.1"] {
+            let mut config = Config::default();
+            config.gateway.host = host.to_string();
+            config.gateway.port = 9;
+            let mut items = Vec::new();
+            check_gateway_runtime(&config, &mut items);
+            let messages: Vec<&str> = items.iter().map(|item| item.message.as_str()).collect();
+            assert!(
+                !messages.iter().any(|message| message.contains("cannot resolve")),
+                "{host}: {messages:?}"
+            );
+        }
+    }
+
+    /// RED before PMMDtail-j (D-084 E-3): `prx doctor`'s auth-profile check
+    /// loaded through the migrating load, rewriting auth-profiles.json.
+    #[test]
+    fn doctor_never_rewrites_the_profiles_file() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let path = crate::auth::profiles::write_legacy_token_profile(tmp.path(), "moonshot", "sentinel-moonshot");
+        let before = std::fs::read_to_string(&path).expect("test: read");
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.secrets.encrypt = true;
+
+        let status = active_auth_profile_credential_status(&config, "moonshot");
+
+        assert!(
+            matches!(status, AuthProfileCredentialStatus::Present { .. }),
+            "{status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("test: read"),
+            before,
+            "the file was rewritten"
         );
     }
 }

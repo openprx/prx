@@ -23,6 +23,7 @@
 //!  - pause / resume — enable/disable a job without removing it
 //!  - status — show cron subsystem status
 
+use super::execution::scope_is_local_process_operator;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget};
@@ -68,6 +69,96 @@ impl CronTool {
             });
         }
         None
+    }
+
+    /// A job's model set by the model (`add`, or `update`/`patch` with
+    /// `patch.model`) is a model-made durable selection (D-034/D-035): it
+    /// must be verified on the default provider the job runs on.
+    fn refuse_unverified_model(cfg: &Config, model: &str) -> Option<ToolResult> {
+        crate::providers::selection::check(
+            cfg,
+            crate::providers::selection::default_provider(cfg),
+            model,
+            &crate::providers::catalog::Requirement::chat(),
+            crate::providers::catalog::UnknownPolicy::DurableSelection,
+        )
+        .err()
+        .map(|refusal| ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("The job's model is refused: {refusal}")),
+        })
+    }
+
+    /// Refuse `job_id` to a caller that may not change or run it (CRON-ORIGIN).
+    ///
+    /// A job's origin decides whose authority its runs have, so the job must
+    /// not be rewritable by anyone else: a webhook caller that could `update`
+    /// the prompt of an operator-created agent job would be running its own
+    /// text with the operator's authority. The local-process operator (the
+    /// terminal UI and `prx agent`, [`scope_is_local_process_operator`]) may
+    /// manage every job and never adopts one by doing so — the origin is not
+    /// changed by any update. Any other trusted caller may manage only jobs
+    /// whose stored owner is its own owner (the same owner
+    /// [`cron::lineage_from_trusted_scope`] records at creation); a job with no
+    /// stored owner belongs to no such caller. A call without a
+    /// runtime-authored scope bypassed the execution service entirely (an
+    /// in-process call) and keeps the unrestricted behavior it always had,
+    /// as `RunOwnerScope::from_args` does.
+    ///
+    /// A job that does not exist is left to the action itself to report.
+    fn refuse_unless_caller_may_manage(cfg: &Config, args: &serde_json::Value, job_id: &str) -> Option<ToolResult> {
+        let caller = CallerScope::from_args(cfg, args);
+        let job = cron::get_job(cfg, job_id).ok()?;
+        if caller.admits(&job) {
+            return None;
+        }
+        Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "cron job '{job_id}' was created by another principal; only its creator or the local operator can change or run it"
+            )),
+        })
+    }
+
+    /// Hide `job_id` from a caller that may not read it (R-CRON F-3): the
+    /// answer is the one a missing job gets, so a read cannot confirm that
+    /// another principal's job exists. (The manage actions answer differently:
+    /// [`Self::refuse_unless_caller_may_manage`] says the job belongs to
+    /// another principal.) Same admission rule as that method.
+    ///
+    /// A job that cannot be read is hidden from an owner-scoped caller too
+    /// (R-CRONf N-1). `runs`/`history`/`events` would otherwise go on to the
+    /// run and event tables, which answer `[]` for an id that never existed
+    /// and keep a removed job's events, so the two answers would tell a
+    /// missing id apart from another principal's job. The local operator (and
+    /// an in-process call) still reads a removed job's events.
+    fn hide_unless_caller_may_read(cfg: &Config, args: &serde_json::Value, job_id: &str) -> Option<ToolResult> {
+        let caller = CallerScope::from_args(cfg, args);
+        let admitted = match cron::get_job(cfg, job_id) {
+            Ok(job) => caller.admits(&job),
+            Err(error) => {
+                if matches!(caller, CallerScope::Unrestricted) {
+                    return None;
+                }
+                // The caller sees only "not found"; keep the cause for the
+                // operator. A job that does not exist is the ordinary answer;
+                // anything else (a row that cannot be decoded, a store
+                // failure) is worth a warning.
+                if error.to_string() == format!("Cron job '{job_id}' not found") {
+                    tracing::debug!(job_id, "cron job not found for an owner-scoped read");
+                } else {
+                    tracing::warn!(job_id, %error, "cron job unreadable for an owner-scoped read");
+                }
+                false
+            }
+        };
+        (!admitted).then(|| ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("Job '{job_id}' not found")),
+        })
     }
 
     /// Create a recurring (or `at`/`every`) job from the `add`/`schedule` action.
@@ -229,10 +320,20 @@ impl CronTool {
                         None => SessionTarget::Isolated,
                     }
                 };
+                // Stored as the check resolves it (R-PMMCh C-2).
                 let model = args
                     .get("model")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                    .map(|model| model.trim().to_string());
+                // A job the model creates is a model-made durable selection
+                // (D-034/D-035): its model must be verified, not merely known
+                // by id, or no job is written.
+                if let Some(refused) = model
+                    .as_deref()
+                    .and_then(|model| Self::refuse_unverified_model(cfg, model))
+                {
+                    return Ok(refused);
+                }
                 let delivery = match args.get("delivery") {
                     Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
                         Ok(delivery_cfg) => Some(delivery_cfg),
@@ -293,6 +394,41 @@ struct RunView {
     duration_ms: Option<i64>,
     attempt_id: Option<String>,
     worker_id: Option<String>,
+}
+
+/// Which jobs a caller may see, change or run (CRON-ORIGIN, R-CRON F-3).
+///
+/// The local-process operator (the terminal UI and `prx agent`,
+/// [`scope_is_local_process_operator`]) reaches every job. Any other trusted
+/// caller reaches only jobs whose stored owner is its own owner (the owner
+/// [`cron::lineage_from_trusted_scope`] records at creation); a caller with no
+/// owner, or a job with none, matches nothing. A call without a
+/// runtime-authored scope bypassed the execution service (an in-process call)
+/// and stays unrestricted, as `RunOwnerScope::from_args` does.
+enum CallerScope {
+    Unrestricted,
+    Owner(Option<String>),
+}
+
+impl CallerScope {
+    fn from_args(cfg: &Config, args: &serde_json::Value) -> Self {
+        let trusted = args
+            .get("_zc_scope_trusted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !trusted || scope_is_local_process_operator(args) {
+            return Self::Unrestricted;
+        }
+        Self::Owner(cron::lineage_from_trusted_scope(cfg, args).owner_id)
+    }
+
+    fn admits(&self, job: &cron::CronJob) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Owner(Some(owner)) => job.owner_id.as_deref() == Some(owner.as_str()),
+            Self::Owner(None) => false,
+        }
+    }
 }
 
 fn truncate_str(input: &str, max_chars: usize) -> String {
@@ -551,7 +687,10 @@ impl Tool for CronTool {
                 if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
-                match cron::list_jobs(&cfg) {
+                let caller = CallerScope::from_args(&cfg, &args);
+                match cron::list_jobs(&cfg)
+                    .map(|jobs| jobs.into_iter().filter(|job| caller.admits(job)).collect::<Vec<_>>())
+                {
                     Ok(jobs) => {
                         if jobs.is_empty() {
                             return Ok(ToolResult {
@@ -632,6 +771,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(hidden) = Self::hide_unless_caller_may_read(&cfg, &args, job_id) {
+                    return Ok(hidden);
+                }
                 match cron::get_job(&cfg, job_id) {
                     Ok(job) => {
                         let detail = json!({
@@ -664,7 +806,12 @@ impl Tool for CronTool {
                 if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
-                let jobs = cron::list_jobs(&cfg).unwrap_or_default();
+                let caller = CallerScope::from_args(&cfg, &args);
+                let jobs = cron::list_jobs(&cfg)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|job| caller.admits(job))
+                    .collect::<Vec<_>>();
                 let terminal_count = jobs.iter().filter(|job| job.terminal_state.is_some()).count();
                 let enabled_count = jobs
                     .iter()
@@ -703,6 +850,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(hidden) = Self::hide_unless_caller_may_read(&cfg, &args, job_id) {
+                    return Ok(hidden);
+                }
                 let limit = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
@@ -752,6 +902,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(hidden) = Self::hide_unless_caller_may_read(&cfg, &args, job_id) {
+                    return Ok(hidden);
+                }
                 match cron::list_job_events(&cfg, job_id) {
                     Ok(events) => Ok(ToolResult {
                         success: true,
@@ -882,6 +1035,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
+                    return Ok(refused);
+                }
                 match cron::remove_job(&cfg, job_id) {
                     Ok(()) => Ok(ToolResult {
                         success: true,
@@ -910,6 +1066,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
+                    return Ok(refused);
+                }
                 let patch_val = match args.get("patch") {
                     Some(v) => v.clone(),
                     None => {
@@ -930,6 +1089,19 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                // Stored as the check resolves it (R-PMMCh C-2).
+                if let Some(model) = patch.model.as_mut() {
+                    *model = model.trim().to_string();
+                }
+                // A model the patch sets gets the same check as on `add`, so a
+                // job cannot be switched to an unverified model after creation.
+                if let Some(refused) = patch
+                    .model
+                    .as_deref()
+                    .and_then(|model| Self::refuse_unverified_model(&cfg, model))
+                {
+                    return Ok(refused);
+                }
                 // Re-anchor the delivery principal whenever the patch rewrites
                 // `delivery`. The stored identity is what the scheduler
                 // authorizes the announcement as, so leaving the original
@@ -981,6 +1153,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
+                    return Ok(refused);
+                }
                 if !self.security.can_act() {
                     return Ok(ToolResult {
                         success: false,
@@ -1061,6 +1236,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
+                    return Ok(refused);
+                }
                 match cron::pause_job(&cfg, job_id) {
                     Ok(_) => Ok(ToolResult {
                         success: true,
@@ -1089,6 +1267,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
+                    return Ok(refused);
+                }
                 match cron::resume_job(&cfg, job_id) {
                     Ok(_) => Ok(ToolResult {
                         success: true,
@@ -1327,6 +1508,98 @@ mod tests {
         let result = tool.execute(json!({"action": "status"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1 total"));
+    }
+
+    /// INT2C-N3 (R-INT2C N-3): an owner-scoped read of a job row that cannot
+    /// be decoded answers `not found`, which is right for the caller, but the
+    /// cause was logged at `debug!` and so was invisible by default. It is a
+    /// warning now, naming the job; a job that simply does not exist stays
+    /// quiet.
+    #[tokio::test]
+    async fn an_unreadable_job_row_is_logged_at_warn_for_an_owner_scoped_read() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let alice = json!({ "sender": "alice", "channel": "telegram", "chat_type": "direct" });
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "_zc_scope_trusted": true,
+                "_zc_scope": alice
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job_id = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job")
+            .id;
+        let db = cfg_snap.workspace_dir.join("cron").join("jobs.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE cron_jobs SET next_run = 'not-a-timestamp' WHERE id = ?1",
+                [&job_id],
+            )
+            .unwrap();
+
+        let read_args = json!({ "_zc_scope_trusted": true, "_zc_scope": alice });
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let (unreadable, missing) = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            (
+                CronTool::hide_unless_caller_may_read(&cfg_snap, &read_args, &job_id),
+                CronTool::hide_unless_caller_may_read(&cfg_snap, &read_args, "no-such-job"),
+            )
+        });
+        let unreadable = unreadable.expect("test: an unreadable job reads as not found");
+        assert_eq!(
+            unreadable.error.as_deref(),
+            Some(format!("Job '{job_id}' not found").as_str())
+        );
+        assert!(missing.is_some(), "a missing job reads as not found");
+
+        let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+        let warned = logs
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains(job_id.as_str()))
+            .count();
+        assert_eq!(warned, 1, "one WARN naming the unreadable job: {logs}");
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("WARN") && line.contains("no-such-job")),
+            "a job that does not exist is not a warning: {logs}"
+        );
     }
 
     #[tokio::test]
@@ -1646,12 +1919,19 @@ mod tests {
 
     /// Rewriting `delivery` re-anchors the principal onto the caller doing the
     /// rewrite; a patch that leaves `delivery` alone leaves the identity alone.
+    /// Since CRON-ORIGIN only the creator or the local operator may rewrite a
+    /// job, so the rewriting caller here is the operator (`prx agent`) and an
+    /// unrelated principal is refused outright.
     #[tokio::test]
     async fn patching_delivery_re_anchors_the_principal_onto_the_updating_caller() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let operator_scope = json!({
+            "sender": "agent", "channel": "cli", "chat_type": "private",
+            "chat_id": "agent:local", "runtime_source": "chat"
+        });
 
         let add = tool
             .execute(json!({
@@ -1672,13 +1952,25 @@ mod tests {
             .expect("test: one job")
             .id;
 
+        let stranger = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": job_id,
+                "patch": { "delivery": { "mode": "announce", "channel": "signal", "to": "+15550009999" } },
+                "_zc_scope_trusted": true,
+                "_zc_scope": { "sender": "bob", "channel": "signal", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(!stranger.success, "another principal may not rewrite alice's job");
+
         let unrelated = tool
             .execute(json!({
                 "action": "update",
                 "job_id": job_id,
                 "patch": { "enabled": false },
                 "_zc_scope_trusted": true,
-                "_zc_scope": { "sender": "bob", "channel": "signal", "chat_type": "direct" }
+                "_zc_scope": operator_scope
             }))
             .await
             .unwrap();
@@ -1695,7 +1987,7 @@ mod tests {
                 "job_id": job_id,
                 "patch": { "delivery": { "mode": "announce", "channel": "signal", "to": "+15550009999" } },
                 "_zc_scope_trusted": true,
-                "_zc_scope": { "sender": "bob", "channel": "signal", "chat_type": "direct" }
+                "_zc_scope": operator_scope
             }))
             .await
             .unwrap();
@@ -1703,10 +1995,150 @@ mod tests {
         let job = cron::get_job(&cfg_snap, &job_id).unwrap();
         assert_eq!(
             job.delivery_principal.sender(),
-            "bob",
+            "agent",
             "test: whoever writes the destination is who the delivery is authorized as"
         );
-        assert_eq!(job.delivery_principal.channel(), "signal");
+        assert_eq!(job.delivery_principal.channel(), "cli");
+    }
+
+    /// A test configuration in which `model` is a declared chat model of the
+    /// default provider, so a model-created job may select it (D-035).
+    async fn test_config_declaring(tmp: &TempDir, model: &str) -> SharedConfig {
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = \"openrouter\"\nmodel = \"{model}\"\noperations = [\"chat\"]\n"
+            ))
+            .unwrap(),
+        );
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
+        new_shared(config)
+    }
+
+    /// D-035 / R-PMMCf R-5: a job the model creates is a model-made durable
+    /// selection, so its `model` must be verified: an id-only model is
+    /// refused and no job is written.
+    #[tokio::test]
+    async fn add_agent_refuses_an_unverified_model() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "model": "vendor/never-seen"
+            }))
+            .await
+            .unwrap();
+        assert!(!add.success, "a model-created job selected an unverified model");
+        assert!(add.error.unwrap_or_default().contains("not verified"));
+        assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty(), "no job is written");
+    }
+
+    /// R-PMMCg C-1: `update`/`patch` with `patch.model` is the same
+    /// model-made durable selection as `add`: an unverified model is refused
+    /// and the stored job keeps its model; a verified one is accepted.
+    #[tokio::test]
+    async fn update_refuses_an_unverified_model() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config_declaring(&tmp, "claude-test-model").await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "model": "claude-test-model"
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job_id = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job")
+            .id;
+
+        for action in ["update", "patch"] {
+            let refused = tool
+                .execute(json!({
+                    "action": action,
+                    "job_id": job_id,
+                    "patch": { "model": "vendor/never-seen" }
+                }))
+                .await
+                .unwrap();
+            assert!(!refused.success, "{action} stored an unverified model");
+            assert!(refused.error.unwrap_or_default().contains("not verified"));
+            let job = cron::get_job(&cfg_snap, &job_id).unwrap();
+            assert_eq!(job.model.as_deref(), Some("claude-test-model"));
+        }
+
+        let accepted = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": job_id,
+                "patch": { "model": "claude-test-model", "prompt": "brief me again" }
+            }))
+            .await
+            .unwrap();
+        assert!(accepted.success, "{:?}", accepted.error);
+        assert_eq!(
+            cron::get_job(&cfg_snap, &job_id).unwrap().prompt.as_deref(),
+            Some("brief me again")
+        );
+    }
+
+    /// R-PMMCh C-2: the model a job stores is the trimmed name the check
+    /// resolved, on `add` and on `update`/`patch`.
+    #[tokio::test]
+    async fn a_job_stores_its_model_trimmed() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config_declaring(&tmp, "claude-test-model").await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "model": "  claude-test-model \t"
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job");
+        assert_eq!(job.model.as_deref(), Some("claude-test-model"));
+
+        let patched = tool
+            .execute(json!({
+                "action": "patch",
+                "job_id": job.id,
+                "patch": { "model": " claude-test-model " }
+            }))
+            .await
+            .unwrap();
+        assert!(patched.success, "{:?}", patched.error);
+        assert_eq!(
+            cron::get_job(&cfg_snap, &job.id).unwrap().model.as_deref(),
+            Some("claude-test-model")
+        );
     }
 
     /// `prompt` is used when no `payload` is given (job_type=agent), and `name`,
@@ -1714,7 +2146,7 @@ mod tests {
     #[tokio::test]
     async fn add_agent_named_with_model_and_delivery() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp).await;
+        let cfg = test_config_declaring(&tmp, "claude-test-model").await;
         let cfg_snap = cfg.load_full();
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
@@ -2084,7 +2516,13 @@ mod tests {
             "job_id": job.id,
             RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(&wire_grant).unwrap(),
             "_zc_scope_trusted": true,
-            "_zc_scope": {"principal_id": "test:cron-user"},
+            // The local operator (`prx agent`): the job has no creator of its
+            // own, so only the operator may run it (CRON-ORIGIN).
+            "_zc_scope": {
+                "principal_id": "test:cron-user",
+                "sender": "agent", "channel": "cli", "chat_type": "private",
+                "chat_id": "agent:local", "runtime_source": "chat"
+            },
         });
         let tool = CronTool::new(Arc::clone(&cfg), Arc::clone(&security));
 
@@ -2239,5 +2677,339 @@ mod tests {
             .next()
             .expect("test: one job");
         assert!(matches!(job.schedule, Schedule::Every { every_ms: 30000 }));
+    }
+
+    /// CRON-ORIGIN: every creating action records who created the job, from
+    /// the service-authored scope only. A network surface is recorded as
+    /// itself with its owner, the `prx agent` CLI and terminal UI as the local
+    /// operator, and a scope the runtime did not author as nobody. An update
+    /// never changes the origin.
+    ///
+    /// MUTATION GUARD: drop `origin` from `lineage_from_trusted_scope` and the
+    /// webhook and operator rows go red.
+    #[tokio::test]
+    async fn creating_actions_record_the_creating_origin() {
+        use crate::cron::origin_test_support::{Surface, WEBHOOK_OWNER, execute_as, surface_context};
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = || Box::new(CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap)));
+        let agent_add = json!({
+            "action": "add",
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "job_type": "agent",
+            "prompt": "brief me"
+        });
+        let shell_once = json!({"action": "once", "delay": "10m", "command": "echo once"});
+
+        for (surface, args) in [
+            (Surface::Webhook, agent_add.clone()),
+            (Surface::Webhook, shell_once.clone()),
+            (Surface::AgentCli, agent_add.clone()),
+            (Surface::Terminal, shell_once.clone()),
+        ] {
+            let before = cron::list_jobs(&cfg_snap).unwrap().len();
+            let created = execute_as(tool(), surface_context(&cfg_snap, surface), args).await;
+            assert!(created.success, "{surface:?}: {created:?}");
+            let jobs = cron::list_jobs(&cfg_snap).unwrap();
+            assert_eq!(jobs.len(), before + 1);
+            let job = jobs.iter().max_by_key(|job| job.created_at).expect("test: the new job");
+            match surface {
+                Surface::Webhook => {
+                    assert_eq!(
+                        job.origin,
+                        cron::JobOrigin::Principal {
+                            channel: "webhook".to_string(),
+                            sender: "client-a".to_string(),
+                            chat_type: "gateway".to_string(),
+                            owner_id: Some(WEBHOOK_OWNER.to_string()),
+                            owner_isolated: false,
+                        }
+                    );
+                    assert_eq!(job.owner_id.as_deref(), Some(WEBHOOK_OWNER));
+                }
+                Surface::AgentCli | Surface::Terminal => {
+                    assert_eq!(job.origin, cron::JobOrigin::LocalOperator, "{surface:?}");
+                }
+            }
+        }
+
+        // Called without the execution service: no runtime-authored scope.
+        let direct = tool().execute(agent_add).await.unwrap();
+        assert!(direct.success, "{:?}", direct.error);
+        let unattributed = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .max_by_key(|job| job.created_at)
+            .expect("test: the direct job");
+        assert_eq!(unattributed.origin, cron::JobOrigin::Unattributed);
+
+        // The operator rewriting the prompt of that job does not adopt it.
+        let rewritten = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Terminal),
+            json!({"action": "update", "job_id": unattributed.id, "patch": {"prompt": "operator text"}}),
+        )
+        .await;
+        assert!(rewritten.success, "{rewritten:?}");
+        assert_eq!(
+            cron::get_job(&cfg_snap, &unattributed.id).unwrap().origin,
+            cron::JobOrigin::Unattributed
+        );
+    }
+
+    /// CRON-ORIGIN: an origin is only meaningful if nobody else can rewrite
+    /// the job. Without a check, a webhook caller could `update` the prompt of
+    /// an agent job the operator created — and that prompt then runs with the
+    /// operator's authority — or remove, pause, resume or run it. A caller that
+    /// is not the local operator may now change or run only jobs its own owner
+    /// created; the operator may manage every job, and doing so never adopts
+    /// it (the origin is unchanged).
+    ///
+    /// MUTATION GUARD: drop the `caller_may_manage` check from any of the five
+    /// actions and its row goes red.
+    #[tokio::test]
+    async fn only_the_creator_or_the_local_operator_may_change_or_run_a_job() {
+        use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = || Box::new(CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap)));
+        let add = |prompt: &str| {
+            json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": prompt
+            })
+        };
+        let newest = || {
+            cron::list_jobs(&cfg_snap)
+                .unwrap()
+                .into_iter()
+                .max_by_key(|job| job.created_at)
+                .expect("test: a job")
+        };
+
+        let created = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Terminal),
+            add("operator prompt"),
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let operator_job = newest();
+
+        for args in [
+            json!({"action": "update", "job_id": operator_job.id, "patch": {"prompt": "webhook text"}}),
+            json!({"action": "patch", "job_id": operator_job.id, "patch": {"prompt": "webhook text"}}),
+            json!({"action": "pause", "job_id": operator_job.id}),
+            json!({"action": "resume", "job_id": operator_job.id}),
+            json!({"action": "run", "job_id": operator_job.id}),
+            json!({"action": "remove", "job_id": operator_job.id}),
+            json!({"action": "cancel", "job_id": operator_job.id}),
+        ] {
+            let refused = execute_as(tool(), surface_context(&cfg_snap, Surface::Webhook), args.clone()).await;
+            assert!(
+                !refused.success
+                    && refused
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("only its creator or the local operator")),
+                "a webhook caller must not manage an operator job: {args} -> {refused:?}"
+            );
+        }
+        let untouched = cron::get_job(&cfg_snap, &operator_job.id).expect("test: the operator job survives");
+        assert_eq!(untouched.prompt.as_deref(), Some("operator prompt"));
+        assert!(untouched.enabled);
+
+        // The creator manages its own job; the operator manages it too.
+        let created = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Webhook),
+            add("webhook prompt"),
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let webhook_job = newest();
+        let own = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Webhook),
+            json!({"action": "update", "job_id": webhook_job.id, "patch": {"prompt": "webhook prompt 2"}}),
+        )
+        .await;
+        assert!(own.success, "the creator may change its own job: {own:?}");
+        let paused = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::AgentCli),
+            json!({"action": "pause", "job_id": webhook_job.id}),
+        )
+        .await;
+        assert!(paused.success, "the operator may manage every job: {paused:?}");
+        let removed = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Webhook),
+            json!({"action": "remove", "job_id": webhook_job.id}),
+        )
+        .await;
+        assert!(removed.success, "the creator may remove its own job: {removed:?}");
+    }
+
+    /// R-CRON F-3 (CRON-READ-SCOPE): `list`, `get`, `runs`/`history`,
+    /// `events` and `status` answered every trusted caller with every job —
+    /// operator shell commands (often carrying tokens) and run outputs
+    /// included. A caller that is not the local operator now sees only the
+    /// jobs its own owner created, as `xin` does; a job it may not see reads
+    /// exactly like one that does not exist. The operator sees every job.
+    ///
+    /// MUTATION GUARD: drop the read check from any of the five actions and
+    /// its assertion goes red.
+    #[tokio::test]
+    async fn a_caller_reads_only_its_own_jobs_and_the_operator_reads_all() {
+        use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+        const SECRET: &str = "curl -H 'Authorization: Bearer CRON-READ-SECRET' https://example.invalid";
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = || Box::new(CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap)));
+        let add_shell = |command: &str| json!({"action": "add", "expression": "0 9 * * *", "command": command});
+
+        let created = execute_as(tool(), surface_context(&cfg_snap, Surface::Terminal), add_shell(SECRET)).await;
+        assert!(created.success, "{created:?}");
+        let created = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Webhook),
+            add_shell("echo mine"),
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let jobs = cron::list_jobs(&cfg_snap).unwrap();
+        let operator_job = jobs
+            .iter()
+            .find(|job| job.command == SECRET)
+            .expect("test: operator job")
+            .id
+            .clone();
+        let own_job = jobs
+            .iter()
+            .find(|job| job.command == "echo mine")
+            .expect("test: own job")
+            .id
+            .clone();
+
+        let as_webhook =
+            |args: serde_json::Value| execute_as(tool(), surface_context(&cfg_snap, Surface::Webhook), args);
+        let listed = as_webhook(json!({"action": "list"})).await;
+        assert!(listed.success, "{listed:?}");
+        assert!(listed.output.contains(&own_job), "{}", listed.output);
+        assert!(
+            !listed.output.contains(&operator_job) && !listed.output.contains("CRON-READ-SECRET"),
+            "{}",
+            listed.output
+        );
+        let status = as_webhook(json!({"action": "status"})).await;
+        assert!(status.output.contains("Jobs:     1 total"), "{}", status.output);
+        for action in ["get", "runs", "history", "events"] {
+            let denied = as_webhook(json!({"action": action, "job_id": operator_job})).await;
+            assert!(!denied.success, "{action}: {denied:?}");
+            assert_eq!(
+                denied.error.as_deref(),
+                Some(format!("Job '{operator_job}' not found").as_str()),
+                "{action}: indistinguishable from a missing job"
+            );
+            let own = as_webhook(json!({"action": action, "job_id": own_job})).await;
+            assert!(own.success, "{action}: the creator reads its own job: {own:?}");
+        }
+
+        let as_operator = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::AgentCli),
+            json!({"action": "list"}),
+        )
+        .await;
+        assert!(
+            as_operator.output.contains(&operator_job) && as_operator.output.contains(&own_job),
+            "{}",
+            as_operator.output
+        );
+        let operator_get = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::Terminal),
+            json!({"action": "get", "job_id": own_job}),
+        )
+        .await;
+        assert!(operator_get.success, "{operator_get:?}");
+    }
+
+    /// R-CRONf N-1: `runs`/`history`/`events` looked the job up only to
+    /// refuse another principal's, and a job id that resolved to nothing fell
+    /// through to the run and event tables, which answer `[]` — or, for a
+    /// removed job, its surviving event rows. An owner-scoped caller could
+    /// therefore tell a missing id from another principal's job. Both now read
+    /// the same `not found`. The local operator still reads a removed job's
+    /// events, which outlive the job.
+    #[tokio::test]
+    async fn an_owner_scoped_caller_reads_a_missing_job_exactly_like_a_foreign_one() {
+        use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = || Box::new(CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap)));
+
+        let created = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::AgentCli),
+            json!({"action": "add", "expression": "0 9 * * *", "command": "echo removed-later"}),
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let removed_job = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.command == "echo removed-later")
+            .expect("test: the operator's job")
+            .id;
+        let removed = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::AgentCli),
+            json!({"action": "remove", "job_id": removed_job}),
+        )
+        .await;
+        assert!(removed.success, "{removed:?}");
+        let never_existed = uuid::Uuid::new_v4().to_string();
+
+        for job_id in [removed_job.as_str(), never_existed.as_str()] {
+            for action in ["get", "runs", "history", "events"] {
+                let answer = execute_as(
+                    tool(),
+                    surface_context(&cfg_snap, Surface::Webhook),
+                    json!({"action": action, "job_id": job_id}),
+                )
+                .await;
+                assert!(!answer.success, "{action} {job_id}: {answer:?}");
+                assert_eq!(
+                    answer.error.as_deref(),
+                    Some(format!("Job '{job_id}' not found").as_str()),
+                    "{action} {job_id}: a missing job must read exactly like another principal's"
+                );
+            }
+        }
+
+        let operator_events = execute_as(
+            tool(),
+            surface_context(&cfg_snap, Surface::AgentCli),
+            json!({"action": "events", "job_id": removed_job}),
+        )
+        .await;
+        assert!(operator_events.success, "{operator_events:?}");
+        assert!(
+            operator_events.output.contains(&removed_job),
+            "the operator still reads a removed job's events: {}",
+            operator_events.output
+        );
     }
 }

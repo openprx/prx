@@ -60,7 +60,7 @@ impl RouterProvider {
                     None => {
                         tracing::warn!(
                             hint = hint,
-                            provider = route.provider_name,
+                            provider = %super::redact_endpoint_userinfo(&route.provider_name),
                             "Route references unknown provider, skipping"
                         );
                         None
@@ -109,6 +109,41 @@ impl Provider for RouterProvider {
             })
     }
 
+    /// Forward the dialect of the routed providers.
+    ///
+    /// The route is chosen per request from the model parameter, which this
+    /// hook does not receive. Destinations that all declare one dialect resolve
+    /// to it — holding a routed Gemini turn to keywords Gemini never saw is the
+    /// bug the trait default `Raw` caused here. Destinations of different
+    /// families resolve to `Raw` (see
+    /// [`unanimous_dialect`](super::traits::unanimous_dialect)).
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        super::traits::unanimous_dialect(
+            self.providers
+                .iter()
+                .map(|(_, provider)| provider.tool_schema_dialect()),
+        )
+    }
+
+    /// The dialect of the destination `model` routes to, for the model it
+    /// routes to. A model that does not route answers the model-less hook.
+    fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+        let Ok((provider_idx, resolved_model)) = self.resolve(model) else {
+            return self.tool_schema_dialect();
+        };
+        self.providers.get(provider_idx).map_or_else(
+            || self.tool_schema_dialect(),
+            |(_, provider)| provider.tool_schema_dialect_for(&resolved_model),
+        )
+    }
+
+    /// The destination chain holding the member that served answers for it.
+    fn tool_schema_dialect_of_member(&self, member: &str, model: &str) -> Option<crate::tools::ToolSchemaDialect> {
+        self.providers
+            .iter()
+            .find_map(|(_, provider)| provider.tool_schema_dialect_of_member(member, model))
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -120,7 +155,7 @@ impl Provider for RouterProvider {
 
         let (provider_name, provider) = &self.providers[provider_idx];
         tracing::info!(
-            provider = provider_name.as_str(),
+            provider = %super::redact_endpoint_userinfo(provider_name),
             model = resolved_model.as_str(),
             "Router dispatching request"
         );
@@ -271,9 +306,13 @@ impl Provider for RouterProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up routed provider");
+            tracing::info!(provider = %super::redact_endpoint_userinfo(name), "Warming up routed provider");
             if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+                tracing::warn!(
+                    provider = %super::redact_endpoint_userinfo(name),
+                    "Warmup failed (non-fatal): {}",
+                    super::redact_endpoint_userinfo(&e.to_string())
+                );
             }
         }
         Ok(())
@@ -674,6 +713,7 @@ impl Provider for MockEnvProvider {
                     usage: None,
                     tool_calls: Vec::new(),
                     route_attempt: None,
+                    served_member: None,
                 }),
                 Ok(StreamChunk::final_chunk()),
             ],
@@ -1116,6 +1156,7 @@ mod tests {
                 }],
                 final_provider: self.provider_label.to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }

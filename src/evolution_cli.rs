@@ -300,22 +300,24 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     // never reached on a deny decision.
     let security_policy = crate::runtime::bootstrap::build_security_policy(config);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir)
-        .with_security_policy(security_policy);
+        .with_security_policy(security_policy)
+        .with_judge_timeout(std::time::Duration::from_secs(
+            config.self_system.evolution_judge_timeout_secs,
+        ));
 
     let report = match selected_layer {
         EvolutionLayer::Memory => {
             let memory: Arc<dyn crate::memory::Memory> =
                 Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
                     &config.memory,
-                    &config.embedding_routes,
+                    &config.embedding_routes_with_references(),
                     Some(&config.storage.provider.config),
                     &config.workspace_dir,
-                    config.api_key.as_deref(),
+                    crate::memory::EmbeddingRootCredential::from_config(&config),
                     &config.identity_bindings,
                     &config.user_policies,
                 )?);
-            let mut engine =
-                MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer_for_engine.clone()))?.with_memory(memory);
+            let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?.with_memory(memory);
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -391,7 +393,7 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     println!("layer  : {}", debug_value(&payload.layer));
     println!("id     : {}", payload.report.experiment_id);
     println!("shadow : {}", bool_flag(payload.report.shadow_mode));
-    println!("rolled : {}", bool_flag(payload.report.rolled_back));
+    println!("commit : {:?}", payload.report.commit);
     if !payload.report.errors.is_empty() {
         println!("errors : {}", payload.report.errors.join(" | "));
     }
@@ -493,8 +495,11 @@ fn infer_circuit_state(
     let threshold = cfg.rollback.circuit_breaker_threshold.max(1) as usize;
     let cooldown_secs = cfg.rollback.cooldown_after_rollback_hours.max(1) * 3600;
 
+    // A deferred cycle wrote nothing and says nothing about regression
+    // (D-046); it neither counts nor ends a failure streak.
     let failures = evolution_logs
         .iter()
+        .filter(|item| item.result != Some(EvolutionResult::Deferred))
         .take_while(|item| {
             matches!(
                 item.result,

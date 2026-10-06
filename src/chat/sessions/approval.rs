@@ -21,7 +21,7 @@
 //! ## Cross-task wake-up
 //!
 //! The resolver runs **inside** the background sub-agent's spawned tokio task
-//! (deep in `run_tool_call_loop`). The `/approve` handler runs on the **chat
+//! (deep in `run_turn`). The `/approve` handler runs on the **chat
 //! main loop** task. They rendezvous through [`PendingApprovals`]: the resolver
 //! registers a [`tokio::sync::oneshot::Sender`] keyed by run id and awaits the
 //! receiver; `/approve` / `/deny` looks the run id up and sends the decision.
@@ -37,7 +37,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::event::SessionEvent;
 use super::id::SessionId;
-use crate::agent::loop_::{ApprovalDecision, ApprovalResolver, SpawnApprovalResolverFactory};
+use crate::agent::turn_contracts::{ApprovalDecision, ApprovalResolver};
+use crate::agent::turn_request::SpawnApprovalResolverFactory;
 use crate::approval::ApprovalRequest;
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 
@@ -55,7 +56,18 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
 /// section, so it never blocks the runtime.
 #[derive(Clone, Default)]
 pub struct PendingApprovals {
-    inner: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    inner: Arc<Mutex<PendingApprovalState>>,
+}
+
+#[derive(Default)]
+struct PendingApprovalState {
+    sequence: u64,
+    waiters: HashMap<String, ApprovalWaiter>,
+}
+
+struct ApprovalWaiter {
+    sequence: u64,
+    sender: Option<oneshot::Sender<ApprovalDecision>>,
 }
 
 impl PendingApprovals {
@@ -69,13 +81,34 @@ impl PendingApprovals {
     ///
     /// If a stale waiter already exists for this run id it is dropped (its
     /// receiver resolves to `Err`, which the prior resolver treats as a timeout
-    /// / safe-deny). Returns the fresh receiver.
-    fn register(&self, run_id: &str) -> oneshot::Receiver<ApprovalDecision> {
+    /// / safe-deny). Returns a unique registration and its receiver. Exhaustion
+    /// refuses the new registration without replacing any existing waiter.
+    fn register(&self, run_id: &str) -> Option<(u64, oneshot::Receiver<ApprovalDecision>)> {
+        let mut state = self.inner.lock();
+        let sequence = state.sequence.checked_add(1)?;
+        state.sequence = sequence;
         let (tx, rx) = oneshot::channel();
-        // Replacing any previous sender drops it; the old waiter (if any) sees a
-        // closed channel and falls back to its safe default.
-        self.inner.lock().insert(run_id.to_string(), tx);
-        rx
+        state.waiters.insert(
+            run_id.to_string(),
+            ApprovalWaiter {
+                sequence,
+                sender: Some(tx),
+            },
+        );
+        Some((sequence, rx))
+    }
+
+    fn remove_registration(&self, run_id: &str, sequence: u64) -> bool {
+        let mut state = self.inner.lock();
+        if state
+            .waiters
+            .get(run_id)
+            .is_none_or(|waiter| waiter.sequence != sequence)
+        {
+            return false;
+        }
+        state.waiters.remove(run_id);
+        true
     }
 
     /// Remove the waiter for `run_id` (resolver cleanup after it wakes).
@@ -86,7 +119,7 @@ impl PendingApprovals {
     /// Dropping the removed sender (if present) closes the channel, so any waiter
     /// still parked on the receiver wakes with the safe-deny fallback.
     pub fn remove(&self, run_id: &str) {
-        self.inner.lock().remove(run_id);
+        self.inner.lock().waiters.remove(run_id);
     }
 
     /// Deliver a decision to the run's pending waiter.
@@ -96,7 +129,15 @@ impl PendingApprovals {
     /// timed out, killed, or never suspended).
     #[must_use]
     pub fn resolve(&self, run_id: &str, decision: ApprovalDecision) -> bool {
-        let Some(tx) = self.inner.lock().remove(run_id) else {
+        // Retain registration identity until its resolver cleans up. Taking
+        // only the sender makes delivery one-use without losing ownership.
+        let Some(tx) = self
+            .inner
+            .lock()
+            .waiters
+            .get_mut(run_id)
+            .and_then(|waiter| waiter.sender.take())
+        else {
             return false;
         };
         // `send` only fails if the resolver's receiver was already dropped (the
@@ -108,7 +149,11 @@ impl PendingApprovals {
     /// Whether a run currently has a pending approval waiter.
     #[must_use]
     pub fn is_pending(&self, run_id: &str) -> bool {
-        self.inner.lock().contains_key(run_id)
+        self.inner
+            .lock()
+            .waiters
+            .get(run_id)
+            .is_some_and(|waiter| waiter.sender.is_some())
     }
 }
 
@@ -149,92 +194,99 @@ struct SuspendingApprovalResolver {
 
 impl SuspendingApprovalResolver {
     /// Set the run's registry status to [`SubAgentStatus::AwaitingInput`].
-    async fn mark_awaiting(&self, prompt: &str) {
+    async fn mark_awaiting(&self, prompt: &str, sequence: u64) -> bool {
         let mut runs = self.active_runs.write().await;
+        let pending = self.pending.inner.lock();
+        if pending
+            .waiters
+            .get(&self.run_id)
+            .is_none_or(|waiter| waiter.sequence != sequence)
+        {
+            return false;
+        }
         if let Some(run) = runs.iter_mut().find(|r| r.id == self.run_id) {
             run.status = SubAgentStatus::AwaitingInput {
                 prompt: prompt.to_string(),
             };
         }
-    }
-
-    /// Restore the run's registry status to [`SubAgentStatus::Running`] **only**
-    /// if it is still `AwaitingInput` (do not clobber a concurrent kill / failure
-    /// that already moved it to a terminal state).
-    async fn mark_running(&self) {
-        let mut runs = self.active_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == self.run_id) {
-            if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {
-                run.status = SubAgentStatus::Running;
-            }
+        // 3. Surface a NeedsInput event to the chat main loop (non-intrusive
+        //    banner + status refresh). The registry status already reflects
+        //    the suspension; if the bounded UI channel is full, log the missed
+        //    banner instead of discarding it invisibly.
+        if let Err(error) = self.event_tx.try_send(SessionEvent::NeedsInput {
+            id: self.session_id.clone(),
+            prompt: prompt.to_owned(),
+        }) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                session_id = %self.session_id,
+                error = %error,
+                "failed to enqueue NeedsInput banner"
+            );
         }
+
+        true
     }
 }
 
-/// RAII cleanup guard for a suspended approval.
-///
-/// Created right after the resolver registers its pending waiter. On `Drop` —
-/// whether the resolver returns normally, its `await` is cancelled by the loop's
-/// cancellation token, or the whole spawned task is `abort()`ed / dropped — it:
-///
-/// 1. removes the run's entry from [`PendingApprovals`] (drops the sender,
-///    closing the channel — no stale waiter is ever left in the registry), and
-/// 2. best-effort restores the run's registry status from `AwaitingInput` back
-///    to `Running` so no zombie "needs-input" run is left behind, and
-/// 3. best-effort emits a [`SessionEvent::Resumed`] so the suspend banner clears.
-///
-/// Step 1 is the leak fix (`PendingApprovals` can never retain a stale sender).
-/// Steps 2–3 are best-effort because `Drop` cannot `.await`: the status restore
-/// uses `try_write()` on the async registry lock (skipped if contended — a
-/// concurrent kill/teardown is already mutating it to a terminal state, which we
-/// must not clobber), and the event send uses the non-blocking `try_send`.
+/// Cleanup for one exact registration, including cancellation/task abort.
+/// Replaced registrations cannot remove the new waiter, restore its status,
+/// or clear its banner. Under run-lock contention the parent cancellation path
+/// retains responsibility for restoring status; Drop removes only its own entry.
 struct ApprovalCleanupGuard {
+    sequence: u64,
     run_id: String,
     session_id: SessionId,
     pending: PendingApprovals,
     active_runs: Arc<tokio::sync::RwLock<Vec<SubAgentRun>>>,
     event_tx: mpsc::Sender<SessionEvent>,
-    /// Set to `true` once the resolver has performed its own async cleanup on the
-    /// normal decision path, so `Drop` only needs to guarantee the pending entry
-    /// is gone (the status / event were already handled with full `.await`).
+    /// Normal async cleanup already finished; Drop must not act again.
     handled: bool,
+}
+
+impl ApprovalCleanupGuard {
+    /// Hold the run lock across registration removal, status restore and the
+    /// resume notification. A replacement cannot publish AwaitingInput between
+    /// the ownership check and this older registration's cleanup.
+    fn finish(&self, runs: &mut [SubAgentRun]) -> bool {
+        if !self.pending.remove_registration(&self.run_id, self.sequence) {
+            return false;
+        }
+        if let Some(run) = runs.iter_mut().find(|run| run.id == self.run_id) {
+            if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {
+                run.status = SubAgentStatus::Running;
+            }
+        }
+        let _ = self.event_tx.try_send(SessionEvent::Resumed {
+            id: self.session_id.clone(),
+        });
+        true
+    }
 }
 
 impl Drop for ApprovalCleanupGuard {
     fn drop(&mut self) {
-        // (1) Always clear the pending entry — the core leak fix. Idempotent.
-        self.pending.remove(&self.run_id);
         if self.handled {
-            // Normal path already restored status + emitted Resumed with full
-            // `.await`; nothing more to do.
             return;
         }
-        // (2) Best-effort status restore without awaiting. Only downgrade
-        //     `AwaitingInput` -> `Running`; never clobber a terminal state set by
-        //     a concurrent kill/failure. If the lock is contended right now,
-        //     skip: whoever holds it is mutating the run already.
-        //
-        //     NOTE: this is a *fallback* only. `Drop` cannot `.await`, so this
-        //     `try_write` is skipped under contention — which previously left a
-        //     zombie `AwaitingInput` run that was in fact running again. The
-        //     authoritative, contention-proof restore now lives on the async
-        //     cancel-and-resume path (`run_sub_agent_task::restore_running`,
-        //     `tools/sessions_spawn.rs`), which always re-runs after the resolver
-        //     future is dropped on cancel. This `try_write` is retained as a
-        //     harmless, idempotent best-effort for any path that wakes the banner
-        //     before that async restore runs; both only do `AwaitingInput` ->
-        //     `Running`, so they can never conflict or double-apply.
         if let Ok(mut runs) = self.active_runs.try_write() {
-            if let Some(run) = runs.iter_mut().find(|r| r.id == self.run_id) {
-                if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {
-                    run.status = SubAgentStatus::Running;
-                }
+            self.finish(&mut runs);
+        } else {
+            // The parent cancellation path owns the contention-proof status
+            // restore. Keep the registration lock through notification so a
+            // replacement cannot publish its banner before this resume event.
+            let mut pending = self.pending.inner.lock();
+            if pending
+                .waiters
+                .get(&self.run_id)
+                .is_some_and(|waiter| waiter.sequence == self.sequence)
+            {
+                pending.waiters.remove(&self.run_id);
+                let _ = self.event_tx.try_send(SessionEvent::Resumed {
+                    id: self.session_id.clone(),
+                });
             }
         }
-        // (3) Best-effort resume banner clear.
-        let _ = self.event_tx.try_send(SessionEvent::Resumed {
-            id: self.session_id.clone(),
-        });
     }
 }
 
@@ -263,7 +315,9 @@ impl ApprovalResolver for SuspendingApprovalResolver {
 
         // 1. Register the waiter BEFORE announcing, so an immediate `/approve`
         //    after the NeedsInput banner always finds a live waiter.
-        let rx = self.pending.register(&self.run_id);
+        let Some((sequence, rx)) = self.pending.register(&self.run_id) else {
+            return ApprovalDecision::Deny;
+        };
 
         // 1b. Install the RAII cleanup guard immediately. From here on, no early
         //     return / cancellation / task-abort can leak the pending entry or
@@ -272,6 +326,7 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         //     loop `select!`s it against its cancellation token, or the spawned
         //     task is `abort()`ed mid-await), this guard still runs.
         let mut guard = ApprovalCleanupGuard {
+            sequence,
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
             pending: self.pending.clone(),
@@ -282,22 +337,8 @@ impl ApprovalResolver for SuspendingApprovalResolver {
 
         // 2. Flip registry status -> AwaitingInput (drives the `❓` glyph + the
         //    status-line `needs-input` counter via `project_status`).
-        self.mark_awaiting(&prompt).await;
-
-        // 3. Surface a NeedsInput event to the chat main loop (non-intrusive
-        //    banner + status refresh). The registry status already reflects
-        //    the suspension; if the bounded UI channel is full, log the missed
-        //    banner instead of discarding it invisibly.
-        if let Err(error) = self.event_tx.try_send(SessionEvent::NeedsInput {
-            id: self.session_id.clone(),
-            prompt: prompt.clone(),
-        }) {
-            tracing::warn!(
-                run_id = %self.run_id,
-                session_id = %self.session_id,
-                error = %error,
-                "failed to enqueue NeedsInput banner"
-            );
+        if !self.mark_awaiting(&prompt, sequence).await {
+            return ApprovalDecision::Deny;
         }
 
         tracing::info!(run_id = %self.run_id, tool = %request.tool_name, "background sub-agent suspended awaiting approval");
@@ -324,14 +365,14 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         //    (no-op if `/approve` already took it), restore Running status, and
         //    signal resume so the suspend banner clears. Mark the guard handled
         //    so its `Drop` only needs to guarantee the pending entry is gone.
-        self.pending.remove(&self.run_id);
-        self.mark_running().await;
-        let _ = self.event_tx.try_send(SessionEvent::Resumed {
-            id: self.session_id.clone(),
-        });
-        guard.handled = true;
+        let still_owned = {
+            let mut runs = self.active_runs.write().await;
+            let owned = guard.finish(&mut runs);
+            guard.handled = true;
+            owned
+        };
 
-        decision
+        if still_owned { decision } else { ApprovalDecision::Deny }
     }
 }
 
@@ -368,6 +409,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -541,14 +583,14 @@ mod tests {
     #[test]
     fn resolve_unknown_run_is_false() {
         let pending = PendingApprovals::new();
-        assert!(!pending.resolve("nope", ApprovalDecision::Allow));
+        assert!(!pending.resolve("nope", ApprovalDecision::Grant));
     }
 
     #[tokio::test]
     async fn register_then_resolve_delivers_decision() {
         // The resolver-side registration must hand the decision to a live waiter.
         let pending = PendingApprovals::new();
-        let mut rx = pending.register("r-rt");
+        let (_, mut rx) = pending.register("r-rt").unwrap();
         assert!(pending.is_pending("r-rt"));
         assert!(pending.resolve("r-rt", ApprovalDecision::Grant));
         let got = rx.try_recv().expect("test: decision delivered");
@@ -563,12 +605,123 @@ mod tests {
         // A second suspension for the same run id replaces the prior waiter; the
         // old receiver must observe a closed channel (resolver falls back to deny).
         let pending = PendingApprovals::new();
-        let mut stale = pending.register("r-dup");
-        let _fresh = pending.register("r-dup");
+        let (_, mut stale) = pending.register("r-dup").unwrap();
+        let _fresh = pending.register("r-dup").unwrap();
         // The stale sender was dropped on re-register -> Err on the old receiver.
         assert!(stale.try_recv().is_err());
         // The fresh waiter is the one that resolves.
-        assert!(pending.resolve("r-dup", ApprovalDecision::Allow));
+        assert!(pending.resolve("r-dup", ApprovalDecision::Grant));
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_does_not_remove_or_resume_replacement() {
+        let pending = PendingApprovals::new();
+        let runs = Arc::new(RwLock::new(vec![make_run("prx-approval-run")]));
+        let (events, mut rx_events) = mpsc::channel(8);
+        let (old_sequence, _old_rx) = pending.register("prx-approval-run").unwrap();
+        let stale_guard = ApprovalCleanupGuard {
+            sequence: old_sequence,
+            run_id: "prx-approval-run".into(),
+            session_id: SessionId::from_run_id("prx-approval-run"),
+            pending: pending.clone(),
+            active_runs: Arc::clone(&runs),
+            event_tx: events,
+            handled: false,
+        };
+        let (new_sequence, new_rx) = pending.register("prx-approval-run").unwrap();
+        runs.write().await.first_mut().unwrap().status = SubAgentStatus::AwaitingInput {
+            prompt: "new request".into(),
+        };
+        drop(stale_guard);
+        assert!(pending.is_pending("prx-approval-run"));
+        assert!(matches!(
+            first_status(&runs).await,
+            SubAgentStatus::AwaitingInput { .. }
+        ));
+        assert!(rx_events.try_recv().is_err());
+        assert!(pending.resolve("prx-approval-run", ApprovalDecision::Grant));
+        assert!(matches!(new_rx.await.unwrap(), ApprovalDecision::Grant));
+        assert!(!pending.remove_registration("prx-approval-run", old_sequence));
+        assert!(pending.remove_registration("prx-approval-run", new_sequence));
+    }
+
+    #[tokio::test]
+    async fn contended_cleanup_emits_resume_only_for_its_own_registration() {
+        for replaced in [false, true] {
+            let pending = PendingApprovals::new();
+            let runs = Arc::new(RwLock::new(vec![make_run("prx-contended-run")]));
+            let (events, mut rx_events) = mpsc::channel(8);
+            let (sequence, _receiver) = pending.register("prx-contended-run").unwrap();
+            let guard = ApprovalCleanupGuard {
+                sequence,
+                run_id: "prx-contended-run".into(),
+                session_id: SessionId::from_run_id("prx-contended-run"),
+                pending: pending.clone(),
+                active_runs: Arc::clone(&runs),
+                event_tx: events,
+                handled: false,
+            };
+            let _replacement = replaced.then(|| pending.register("prx-contended-run").unwrap());
+            let lock = runs.write().await;
+            drop(guard);
+            assert_eq!(pending.is_pending("prx-contended-run"), replaced);
+            if replaced {
+                assert!(rx_events.try_recv().is_err());
+            } else {
+                assert!(matches!(rx_events.try_recv().unwrap(), SessionEvent::Resumed { .. }));
+            }
+            drop(lock);
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_resolver_denies_and_preserves_new_approval() {
+        let pending = PendingApprovals::new();
+        let runs = Arc::new(RwLock::new(vec![make_run("prx-approval-run")]));
+        let (events, mut rx_events) = mpsc::channel(8);
+        let resolver = SuspendingApprovalResolver {
+            run_id: "prx-approval-run".into(),
+            session_id: SessionId::from_run_id("prx-approval-run"),
+            event_tx: events,
+            active_runs: Arc::clone(&runs),
+            pending: pending.clone(),
+            timeout: Duration::from_secs(30),
+        };
+        let old = ApprovalRequest {
+            tool_name: "file_write".into(),
+            arguments: json!({"path":"old"}),
+        };
+        let new = ApprovalRequest {
+            tool_name: "file_write".into(),
+            arguments: json!({"path":"new"}),
+        };
+        let mut old_future = Box::pin(resolver.resolve(&old, "cli"));
+        assert!(futures::poll!(old_future.as_mut()).is_pending());
+        assert!(matches!(rx_events.try_recv().unwrap(), SessionEvent::NeedsInput { .. }));
+        let mut new_future = Box::pin(resolver.resolve(&new, "cli"));
+        assert!(futures::poll!(new_future.as_mut()).is_pending());
+        assert!(matches!(rx_events.try_recv().unwrap(), SessionEvent::NeedsInput { .. }));
+        assert!(matches!(old_future.await, ApprovalDecision::Deny));
+        assert!(pending.is_pending("prx-approval-run"));
+        assert!(matches!(
+            first_status(&runs).await,
+            SubAgentStatus::AwaitingInput { .. }
+        ));
+        assert!(rx_events.try_recv().is_err());
+        assert!(pending.resolve("prx-approval-run", ApprovalDecision::Grant));
+        assert!(matches!(new_future.await, ApprovalDecision::Grant));
+        assert!(matches!(first_status(&runs).await, SubAgentStatus::Running));
+        assert!(matches!(rx_events.try_recv().unwrap(), SessionEvent::Resumed { .. }));
+    }
+
+    #[test]
+    fn exhausted_registration_sequence_does_not_replace_existing_waiter() {
+        let pending = PendingApprovals::new();
+        let (_, mut original) = pending.register("prx-run").unwrap();
+        pending.inner.lock().sequence = u64::MAX;
+        assert!(pending.register("prx-run").is_none());
+        assert!(pending.resolve("prx-run", ApprovalDecision::Deny));
+        assert!(matches!(original.try_recv().unwrap(), ApprovalDecision::Deny));
     }
 
     #[test]

@@ -23,6 +23,8 @@
 //!  18. Conversation history fidelity (tool call → tool result → assistant)
 //!  19. Builder validation (missing required fields)
 //!  20. Idempotent system prompt insertion
+
+#![cfg(test)]
 // Test module: JSON indexing and vector indexing in assertions are intentional.
 #![allow(
     clippy::indexing_slicing,
@@ -287,20 +289,59 @@ fn make_observer() -> Arc<dyn Observer> {
     Arc::from(NoopObserver {})
 }
 
+/// Own the workspace for at least as long as the Agent and its SQLite pool.
+struct TestAgent {
+    agent: Agent,
+    workspace: tempfile::TempDir,
+}
+impl std::ops::Deref for TestAgent {
+    type Target = Agent;
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+impl std::ops::DerefMut for TestAgent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.agent
+    }
+}
+
+fn fixture_runtime_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut runtime = crate::config::Config::default();
+    runtime.workspace_dir = workspace.to_owned();
+    runtime.config_path = workspace.join("config.toml");
+    runtime.default_model = Some("prx-local-model".to_owned());
+    runtime.causal_tree.enabled = false;
+    runtime.memory.auto_save = false;
+    runtime.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+    runtime.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    runtime
+}
+
 fn build_agent_with(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
     dispatcher: Box<dyn ToolDispatcher>,
-) -> Agent {
-    Agent::builder()
+) -> TestAgent {
+    let (memory, workspace) = make_sqlite_memory();
+    let agent = Agent::builder()
+        .runtime_config(fixture_runtime_config(workspace.path()), "ollama")
         .provider(provider)
         .tools(tools)
-        .memory(make_memory())
+        .memory(memory)
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
-        .workspace_dir(std::env::temp_dir())
         .build()
-        .unwrap()
+        .unwrap();
+    TestAgent { agent, workspace }
 }
 
 fn build_agent_with_memory(
@@ -308,30 +349,35 @@ fn build_agent_with_memory(
     tools: Vec<Box<dyn Tool>>,
     mem: Arc<dyn Memory>,
     auto_save: bool,
+    workspace: &std::path::Path,
 ) -> Agent {
+    let runtime = fixture_runtime_config(workspace);
     Agent::builder()
+        .runtime_config(runtime, "ollama")
         .provider(provider)
         .tools(tools)
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
+        .workspace_dir(workspace.to_owned())
         .auto_save(auto_save)
         .build()
         .unwrap()
 }
 
-fn build_agent_with_config(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>, config: AgentConfig) -> Agent {
-    Agent::builder()
+fn build_agent_with_config(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>, config: AgentConfig) -> TestAgent {
+    let (memory, workspace) = make_sqlite_memory();
+    let agent = Agent::builder()
+        .runtime_config(fixture_runtime_config(workspace.path()), "ollama")
         .provider(provider)
         .tools(tools)
-        .memory(make_memory())
+        .memory(memory)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
         .config(config)
         .build()
-        .unwrap()
+        .unwrap();
+    TestAgent { agent, workspace }
 }
 
 /// Helper: create a ChatResponse with tool calls (native format).
@@ -373,20 +419,45 @@ async fn turn_returns_text_when_no_tools_called() {
     let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
     let response = agent.turn("hi").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty text response from provider");
+    assert_eq!(response, "Hello world");
+    // The public API must persist its own source, not borrow CLI authority.
+    let conn = rusqlite::Connection::open_with_flags(
+        agent.workspace.path().join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    let source: (String, String, String, String, String, String) = conn.query_row(
+        "SELECT source, channel, sender, content, session_key, owner_id FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        (&*source.0, &*source.1, &*source.2, &*source.3),
+        ("agent", "agent_api", "embedded-caller", "hi")
+    );
+    assert!(source.4.starts_with("agent_api:"));
+    assert!(!source.5.is_empty());
 }
 
 #[tokio::test]
 async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let provider = Box::new(FailingProvider);
+    let (memory, workspace) = make_sqlite_memory();
     let mut agent = Agent::builder()
+        .runtime_config(fixture_runtime_config(workspace.path()), "ollama")
         .provider(provider)
         .tools(vec![Box::new(MockSessionsSpawnTool { calls: calls.clone() })])
-        .memory(make_memory())
+        .memory(memory)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
         .task_routing_config(TaskRoutingConfig {
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![TaskRoutingRule {
@@ -587,7 +658,7 @@ async fn history_is_not_trimmed_by_an_arbitrary_message_count() {
 
 #[tokio::test]
 async fn auto_save_stores_only_user_messages_in_memory() {
-    let (mem, _tmp) = make_sqlite_memory();
+    let (mem, workspace) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![text_response("I remember everything")]));
 
     let mut agent = build_agent_with_memory(
@@ -595,6 +666,7 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         vec![],
         mem.clone(),
         true, // auto_save enabled
+        workspace.path(),
     );
 
     let user_message = "Remember this deployment fact for the next maintenance window";
@@ -604,13 +676,13 @@ async fn auto_save_stores_only_user_messages_in_memory() {
     let count = mem.list(Some(&MemoryCategory::Conversation), None).await.unwrap().len();
     assert_eq!(count, 1, "Expected exactly 1 user memory entry, got {count}");
 
-    let stored = mem.get("user_msg").await.unwrap();
-    assert!(stored.is_some(), "Expected user_msg key to be present");
+    let entries = mem.list(Some(&MemoryCategory::Conversation), None).await.unwrap();
+    assert!(entries[0].key.starts_with("user_msg:"));
     assert_eq!(
-        stored.unwrap().content,
-        user_message,
-        "Stored memory should match the original user message"
+        entries[0].content, user_message,
+        "Stored memory must match original user input"
     );
+    assert!(entries[0].session_id.as_deref().unwrap().starts_with("agent_api:"));
 
     let assistant = mem.get("assistant_resp").await.unwrap();
     assert!(assistant.is_none(), "assistant_resp should not be auto-saved anymore");
@@ -618,7 +690,7 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 
 #[tokio::test]
 async fn auto_save_disabled_does_not_store() {
-    let (mem, _tmp) = make_sqlite_memory();
+    let (mem, workspace) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![text_response("hello")]));
 
     let mut agent = build_agent_with_memory(
@@ -626,14 +698,17 @@ async fn auto_save_disabled_does_not_store() {
         vec![],
         mem.clone(),
         false, // auto_save disabled
+        workspace.path(),
     );
 
-    let _ = agent.turn("test message").await.unwrap();
-
-    let stored = mem.get("user_msg").await.unwrap();
+    let _ = agent
+        .turn("Remember this deployment fact for the next maintenance window")
+        .await
+        .unwrap();
+    let entries = mem.list(Some(&MemoryCategory::Conversation), None).await.unwrap();
     assert!(
-        stored.is_none(),
-        "Expected no auto-saved user_msg entry with auto_save off"
+        entries.is_empty(),
+        "No semantic user memory may be saved when auto_save is off"
     );
 }
 

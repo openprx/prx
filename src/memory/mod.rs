@@ -6,6 +6,7 @@ pub mod embeddings;
 pub mod fabric;
 pub mod filter;
 pub mod hygiene;
+pub mod ingress_recovery;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
@@ -13,6 +14,7 @@ pub mod owner_predicate;
 pub mod postgres;
 pub mod principal;
 pub mod retrieval;
+mod router_history;
 pub mod session_predicate;
 pub mod snapshot;
 pub mod sqlite;
@@ -32,6 +34,10 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use principal::MemoryWriteContext;
+pub use router_history::{
+    RouterHistoryCommitReceipt, RouterHistoryDomain, RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryRow,
+    RouterHistoryWriteEvidence,
+};
 pub use sqlite::SqliteMemory;
 pub use traits::LifecycleState;
 pub use traits::Memory;
@@ -107,6 +113,9 @@ struct ResolvedEmbeddingConfig {
     model: String,
     dimensions: usize,
     api_key: Option<String>,
+    /// The base URL `api_key` belongs to, when it is the root key and the
+    /// embedder honours a base URL. `None` means the vendor's default host.
+    api_url: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedEmbeddingConfig {
@@ -116,24 +125,110 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_url", &self.api_url)
             .finish()
     }
+}
+
+/// The root credential and the provider it was issued for.
+///
+/// The memory embedder may be a different vendor from the chat provider
+/// (`[memory] embedding_provider`, or an `[[embedding_routes]]` entry), so the
+/// root `api_key` is released to it only when it is the same provider
+/// identity as the one the key was configured for. A route's own `api_key` is
+/// that route's credential and is always used. No `Debug`: it holds a secret.
+#[derive(Clone, Copy, Default)]
+pub struct EmbeddingRootCredential<'a> {
+    owner: Option<&'a str>,
+    api_key: Option<&'a str>,
+    api_url: Option<&'a str>,
+}
+
+impl<'a> EmbeddingRootCredential<'a> {
+    /// The root `api_key`, issued for the configured default provider (with
+    /// the same `"openrouter"` fallback the provider resolution uses).
+    #[must_use]
+    pub fn from_config(config: &'a crate::config::Config) -> Self {
+        Self {
+            owner: Some(config.default_provider.as_deref().unwrap_or("openrouter")),
+            api_key: config.api_key.as_deref(),
+            api_url: config.api_url.as_deref(),
+        }
+    }
+
+    /// A credential the caller vouches was issued for `provider`.
+    #[must_use]
+    pub const fn issued_for(provider: &'a str, api_key: Option<&'a str>) -> Self {
+        Self {
+            owner: Some(provider),
+            api_key,
+            api_url: None,
+        }
+    }
+
+    /// No root credential at all.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            owner: None,
+            api_key: None,
+            api_url: None,
+        }
+    }
+
+    /// The root key and the base URL it belongs to, if `embedding_provider` is
+    /// the provider the key was issued for.
+    ///
+    /// The URL is attached where the embedder honours one, which is the
+    /// `openai` embedder, as the `openai` chat provider does. Every other
+    /// embedder addresses the same host the chat provider of that identity
+    /// does without the root URL (`openrouter`) or carries it in its name
+    /// (`custom:<url>`), so the key is never detached from its endpoint.
+    fn release_to(&self, embedding_provider: &str) -> (Option<String>, Option<String>) {
+        let Some(key) =
+            crate::providers::credential_for_provider_identity(embedding_provider, &[(self.owner, self.api_key)])
+        else {
+            return (None, None);
+        };
+        let honours_base_url =
+            crate::providers::ProviderId::of(embedding_provider) == crate::providers::ProviderId::of("openai");
+        let url = honours_base_url
+            .then_some(self.api_url)
+            .flatten()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+        (Some(key.to_string()), url)
+    }
+}
+
+/// The provider and model the memory embedder of `config` selects, after
+/// its `hint:` embedding route: the embedding default the configuration
+/// transaction validates (PMM-D-5, D-078 T-3). No credential is read. An
+/// embedding hint no route carries comes back unresolved (`hint:<x>`).
+#[must_use]
+pub(crate) fn configured_embedder(config: &crate::config::Config) -> (String, String) {
+    let resolved = resolve_embedding_config(
+        &config.memory,
+        &config.embedding_routes,
+        EmbeddingRootCredential::none(),
+    );
+    (resolved.provider, resolved.model)
 }
 
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
-    api_key: Option<&str>,
+    root: EmbeddingRootCredential<'_>,
 ) -> ResolvedEmbeddingConfig {
-    let fallback_api_key = api_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let fallback_provider = config.embedding_provider.trim();
+    let (fallback_key, fallback_url) = root.release_to(fallback_provider);
     let fallback = ResolvedEmbeddingConfig {
-        provider: config.embedding_provider.trim().to_string(),
+        provider: fallback_provider.to_string(),
         model: config.embedding_model.trim().to_string(),
         dimensions: config.embedding_dimensions,
-        api_key: fallback_api_key.clone(),
+        api_key: fallback_key,
+        api_url: fallback_url,
     };
 
     let Some(hint) = config
@@ -171,25 +266,115 @@ fn resolve_embedding_config(
         .filter(|value: &&str| !value.is_empty())
         .map(|value| value.to_string());
 
+    // A route's own key is presented alone; otherwise the root key and its
+    // base URL travel together or not at all.
+    let (api_key, api_url) = routed_api_key.map_or_else(|| root.release_to(provider), |key| (Some(key), None));
     ResolvedEmbeddingConfig {
         provider: provider.to_string(),
         model: model.to_string(),
         dimensions,
-        api_key: routed_api_key.or(fallback_api_key),
+        api_key,
+        api_url,
     }
 }
 
-pub fn create_embedder_from_config(
+/// Preserve concrete local computation authority for Router admission. Other
+/// providers remain ordinary dynamic embedders and gain no local-call permit.
+pub(crate) enum ConfiguredEmbedding {
+    LocalHash(Arc<embeddings::LocalHashEmbedding>),
+    Other(Arc<dyn embeddings::EmbeddingProvider>),
+}
+
+pub(crate) fn create_configured_embedder(config: &crate::config::Config) -> ConfiguredEmbedding {
+    let resolved = resolve_embedding_config(
+        &config.memory,
+        &config.embedding_routes_with_references(),
+        EmbeddingRootCredential::from_config(config),
+    );
+    let catalog = crate::providers::selection::catalog_for(config);
+    if resolved.provider.trim().eq_ignore_ascii_case("local")
+        && crate::providers::selection::check_embedder(&catalog, &resolved.provider, &resolved.model).is_ok()
+    {
+        ConfiguredEmbedding::LocalHash(Arc::new(embeddings::LocalHashEmbedding::new(
+            &resolved.model,
+            resolved.dimensions,
+        )))
+    } else {
+        ConfiguredEmbedding::Other(Arc::from(build_embedder(&resolved, &catalog)))
+    }
+}
+
+/// A paid Router target produced from exactly the memory embedding resolver.
+/// Credential ownership stays in that resolver and the concrete provider.
+#[cfg(feature = "llm-router")]
+pub(crate) struct ConfiguredPaidEmbedding {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub embedder: Arc<dyn embeddings::EmbeddingProvider>,
+}
+
+#[cfg(feature = "llm-router")]
+pub(crate) fn configured_paid_embedder(
     config: &crate::config::Config,
-    api_key: Option<&str>,
-) -> Arc<dyn embeddings::EmbeddingProvider> {
-    let resolved = resolve_embedding_config(&config.memory, &config.embedding_routes, api_key);
-    Arc::from(embeddings::create_embedding_provider(
+    catalog: &crate::providers::catalog::CatalogView,
+) -> anyhow::Result<ConfiguredPaidEmbedding> {
+    let resolved = resolve_embedding_config(
+        &config.memory,
+        &config.embedding_routes_with_references(),
+        EmbeddingRootCredential::from_config(config),
+    );
+    anyhow::ensure!(
+        !crate::providers::selection::is_prx_embedder(&resolved.provider),
+        "Router paid embedding target is not paid"
+    );
+    crate::providers::selection::check_embedder(catalog, &resolved.provider, &resolved.model)?;
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(build_embedder(&resolved, catalog));
+    anyhow::ensure!(
+        embedder.supports_attempt_accounting()
+            && embedder.model() == resolved.model
+            && embedder.dimensions() == resolved.dimensions,
+        "Router configured embedding target is not instrumented"
+    );
+    Ok(ConfiguredPaidEmbedding {
+        provider: resolved.provider,
+        model: resolved.model,
+        dimensions: resolved.dimensions,
+        embedder,
+    })
+}
+
+pub fn create_embedder_from_config(config: &crate::config::Config) -> Arc<dyn embeddings::EmbeddingProvider> {
+    match create_configured_embedder(config) {
+        ConfiguredEmbedding::LocalHash(embedder) => embedder,
+        ConfiguredEmbedding::Other(embedder) => embedder,
+    }
+}
+
+/// Build the embedder `resolved` selects, after resolving it for embeddings
+/// against `catalog`. A selection the resolver refuses — a provider with no
+/// embedding adapter, a model the evidence rules out for embeddings — is
+/// reported and builds the no-op embedder (memory then recalls by keyword),
+/// which is what an unknown embedder always built, now with the reason.
+fn build_embedder(
+    resolved: &ResolvedEmbeddingConfig,
+    catalog: &crate::providers::catalog::CatalogView,
+) -> Box<dyn embeddings::EmbeddingProvider> {
+    if let Err(refusal) = crate::providers::selection::check_embedder(catalog, &resolved.provider, &resolved.model) {
+        tracing::warn!(
+            provider = %crate::providers::redact_endpoint_userinfo(&resolved.provider),
+            model = %resolved.model,
+            "embedder refused, memory recall falls back to keywords: {refusal}"
+        );
+        return Box::new(embeddings::NoopEmbedding);
+    }
+    embeddings::create_embedding_provider_with_base_url(
         &resolved.provider,
         resolved.api_key.as_deref(),
+        resolved.api_url.as_deref(),
         &resolved.model,
         resolved.dimensions,
-    ))
+    )
 }
 
 /// File name of the dedicated tool-execution ledger, opened inside the
@@ -251,13 +436,17 @@ pub fn dedicated_tool_execution_ledger(workspace_dir: &Path) -> Option<Arc<dyn M
     }
 }
 
-/// Factory: create the right memory backend from config
+/// Factory: create the right memory backend from config.
+///
+/// `api_key`, when given, must be a credential issued for
+/// `config.embedding_provider` itself; it is never another provider's key.
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes_with_acl(config, &[], None, workspace_dir, api_key, &[], &[])
+    let root = EmbeddingRootCredential::issued_for(&config.embedding_provider, api_key);
+    create_memory_with_storage_and_routes_with_acl(config, &[], None, workspace_dir, root, &[], &[])
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -265,9 +454,9 @@ pub fn create_memory_with_storage(
     config: &MemoryConfig,
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
+    root: EmbeddingRootCredential<'_>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes_with_acl(config, &[], storage_provider, workspace_dir, api_key, &[], &[])
+    create_memory_with_storage_and_routes_with_acl(config, &[], storage_provider, workspace_dir, root, &[], &[])
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
@@ -276,14 +465,14 @@ pub fn create_memory_with_storage_and_routes(
     embedding_routes: &[EmbeddingRouteConfig],
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
+    root: EmbeddingRootCredential<'_>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     create_memory_with_storage_and_routes_with_acl(
         config,
         embedding_routes,
         storage_provider,
         workspace_dir,
-        api_key,
+        root,
         &[],
         &[],
     )
@@ -296,7 +485,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     embedding_routes: &[EmbeddingRouteConfig],
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
+    root: EmbeddingRootCredential<'_>,
     identity_bindings: &[IdentityBindingConfig],
     user_policies: &[UserPolicyConfig],
 ) -> anyhow::Result<Box<dyn Memory>> {
@@ -307,18 +496,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
             .ok_or_else(|| anyhow::anyhow!("WASM storage backend '{backend_name}' is not loaded in this process"));
     }
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
-
-    // Best-effort memory hygiene/retention pass (throttled by state file).
-    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!("memory hygiene skipped: {e}");
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
-        if let Err(e) = snapshot::export_snapshot(workspace_dir) {
-            tracing::warn!("memory snapshot skipped: {e}");
-        }
-    }
+    let resolved_embedding = resolve_embedding_config(config, embedding_routes, root);
 
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
@@ -344,11 +522,11 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(embeddings::create_embedding_provider(
-            &resolved_embedding.provider,
-            resolved_embedding.api_key.as_deref(),
-            &resolved_embedding.model,
-            resolved_embedding.dimensions,
+        // The memory builders see `[memory]` only, so the evidence here is the
+        // adapter table; operator declarations reach `create_embedder_from_config`.
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(build_embedder(
+            resolved_embedding,
+            &crate::providers::catalog::CatalogView::default(),
         ));
 
         #[allow(clippy::cast_possible_truncation)]
@@ -382,11 +560,11 @@ pub fn create_memory_with_storage_and_routes_with_acl(
             .filter(|value| !value.is_empty())
             .context("memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)")?;
 
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(embeddings::create_embedding_provider(
-            &resolved_embedding.provider,
-            resolved_embedding.api_key.as_deref(),
-            &resolved_embedding.model,
-            resolved_embedding.dimensions,
+        // The memory builders see `[memory]` only, so the evidence here is the
+        // adapter table; operator declarations reach `create_embedder_from_config`.
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(build_embedder(
+            resolved_embedding,
+            &crate::providers::catalog::CatalogView::default(),
         ));
 
         #[allow(clippy::cast_possible_truncation)]
@@ -419,6 +597,27 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         },
         "",
     )?;
+
+    // Hygiene and the snapshot export read the memory tables, so they run
+    // after the backend exists: on a fresh workspace whose `brain.db` another
+    // store created first (the Xin or cron tables), running them earlier
+    // failed with "no such table: memories" (D-067). Hydration above still
+    // runs before the backend, because it restores a missing database.
+    // Best-effort memory hygiene/retention pass (throttled by state file).
+    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
+        tracing::warn!(
+            "memory hygiene skipped: {}",
+            crate::security::redaction::redact_secrets(&format!("{e:#}"))
+        );
+    }
+    if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
+        if let Err(e) = snapshot::export_snapshot(workspace_dir) {
+            tracing::warn!(
+                "memory snapshot skipped: {}",
+                crate::security::redaction::redact_secrets(&format!("{e:#}"))
+            );
+        }
+    }
 
     if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies) {
@@ -521,6 +720,34 @@ mod tests {
     use super::*;
     use crate::config::{EmbeddingRouteConfig, StorageProviderConfig};
     use tempfile::TempDir;
+
+    /// D-067, RED before: on a fresh workspace whose `brain.db` another store
+    /// had already created (without the `memories` table), hygiene and the
+    /// snapshot export ran before the sqlite backend created its tables, so
+    /// hygiene failed with "no such table: memories" and never recorded its
+    /// run. After: they run once the tables exist; hygiene completes and
+    /// writes its state file.
+    #[test]
+    fn hygiene_and_snapshot_run_after_the_schema_exists_on_a_fresh_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        // Another store's table, as `xin` or `cron` create first.
+        Connection::open(memory_dir.join("brain.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE other_store (id TEXT PRIMARY KEY);")
+            .unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "sqlite");
+        assert!(
+            tmp.path().join("state").join("memory_hygiene_state.json").is_file(),
+            "hygiene completed and recorded its run"
+        );
+    }
 
     #[test]
     fn factory_sqlite() {
@@ -626,7 +853,7 @@ mod tests {
             ..StorageProviderConfig::default()
         };
 
-        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
+        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), EmbeddingRootCredential::none())
             .err()
             .expect("postgres without db_url should be rejected");
         assert!(error.to_string().contains("db_url"));
@@ -641,7 +868,11 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let resolved = resolve_embedding_config(&cfg, &[], Some("base-key"));
+        let resolved = resolve_embedding_config(
+            &cfg,
+            &[],
+            EmbeddingRootCredential::issued_for("openai", Some("base-key")),
+        );
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
@@ -649,6 +880,7 @@ mod tests {
                 model: "text-embedding-3-small".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
+                api_url: None,
             }
         );
     }
@@ -667,9 +899,14 @@ mod tests {
             model: "custom-embed-v2".into(),
             dimensions: Some(1024),
             api_key: Some("route-key".into()),
+            credential_ref: None,
         }];
 
-        let resolved = resolve_embedding_config(&cfg, &routes, Some("base-key"));
+        let resolved = resolve_embedding_config(
+            &cfg,
+            &routes,
+            EmbeddingRootCredential::issued_for("openai", Some("base-key")),
+        );
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
@@ -677,6 +914,7 @@ mod tests {
                 model: "custom-embed-v2".into(),
                 dimensions: 1024,
                 api_key: Some("route-key".into()),
+                api_url: None,
             }
         );
     }
@@ -690,7 +928,11 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let resolved = resolve_embedding_config(&cfg, &[], Some("base-key"));
+        let resolved = resolve_embedding_config(
+            &cfg,
+            &[],
+            EmbeddingRootCredential::issued_for("openai", Some("base-key")),
+        );
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
@@ -698,6 +940,7 @@ mod tests {
                 model: "hint:semantic".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
+                api_url: None,
             }
         );
     }
@@ -716,9 +959,14 @@ mod tests {
             model: "text-embedding-3-small".into(),
             dimensions: Some(0),
             api_key: None,
+            credential_ref: None,
         }];
 
-        let resolved = resolve_embedding_config(&cfg, &routes, Some("base-key"));
+        let resolved = resolve_embedding_config(
+            &cfg,
+            &routes,
+            EmbeddingRootCredential::issued_for("openai", Some("base-key")),
+        );
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
@@ -726,6 +974,7 @@ mod tests {
                 model: "hint:semantic".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
+                api_url: None,
             }
         );
     }
@@ -766,6 +1015,281 @@ mod tests {
         assert!(
             tool_execution_ledger(&memory, &blocked).is_none(),
             "an unopenable ledger must stay absent so side effects keep being refused"
+        );
+    }
+}
+
+/// C0-D: the root key belongs to the configured default provider. The
+/// embedder, whether chosen by `[memory] embedding_provider` or by an
+/// `[[embedding_routes]]` entry, receives it only when it is that provider.
+/// Driven through the production embedder factory and a loopback endpoint;
+/// every credential is a sentinel.
+#[cfg(test)]
+mod embedder_credential_tests {
+    use crate::config::Config;
+    use crate::providers::credential_probe::CredentialProbe;
+
+    const ROOT_SENTINEL: &str = "C0-EMBED-ROOT-SENTINEL";
+    const ROUTE_SENTINEL: &str = "C0-EMBED-ROUTE-SENTINEL";
+
+    fn root_config(temp: &tempfile::TempDir) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.default_provider = Some("openai".to_string());
+        config.api_key = Some(ROOT_SENTINEL.to_string());
+        config.memory.embedding_model = "probe-embed".to_string();
+        config.memory.embedding_dimensions = 3;
+        config
+    }
+
+    #[tokio::test]
+    async fn an_embedding_provider_other_than_the_default_does_not_receive_the_root_key() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start().await;
+        let mut config = root_config(&temp);
+        config.memory.embedding_provider = probe.custom_provider();
+
+        let embedder = super::create_embedder_from_config(&config);
+        let _vectors = embedder.embed(&["probe"]).await;
+
+        assert_eq!(probe.requests().len(), 1);
+        assert!(
+            !probe.saw(ROOT_SENTINEL),
+            "the root key reached another embedding vendor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyless_embedding_route_does_not_inherit_the_root_key() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start().await;
+        let mut config = root_config(&temp);
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            provider: probe.custom_provider(),
+            model: "probe-embed".to_string(),
+            dimensions: Some(3),
+            api_key: None,
+            credential_ref: None,
+        }];
+
+        let embedder = super::create_embedder_from_config(&config);
+        let _vectors = embedder.embed(&["probe"]).await;
+
+        assert_eq!(probe.requests().len(), 1);
+        assert!(
+            !probe.saw(ROOT_SENTINEL),
+            "the root key reached a keyless embedding route"
+        );
+    }
+
+    /// Guard: the default provider's own embedder keeps the root key, and a
+    /// route's own key is still presented.
+    #[tokio::test]
+    async fn own_credentials_still_reach_their_embedders() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let own = CredentialProbe::start().await;
+        let routed = CredentialProbe::start().await;
+        let mut config = root_config(&temp);
+        config.default_provider = Some(own.custom_provider());
+        config.memory.embedding_provider = own.custom_provider();
+
+        let embedder = super::create_embedder_from_config(&config);
+        let _vectors = embedder.embed(&["probe"]).await;
+        assert!(own.saw(ROOT_SENTINEL));
+
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            provider: routed.custom_provider(),
+            model: "probe-embed".to_string(),
+            dimensions: Some(3),
+            api_key: Some(ROUTE_SENTINEL.to_string()),
+            credential_ref: None,
+        }];
+        let embedder = super::create_embedder_from_config(&config);
+        let _vectors = embedder.embed(&["probe"]).await;
+        assert!(routed.saw(ROUTE_SENTINEL) && !routed.saw(ROOT_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn migrated_embedding_routes_send_each_stored_key_only_to_its_route() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let first = CredentialProbe::start().await;
+        let second = CredentialProbe::start().await;
+        let mut config = root_config(&temp);
+        config.secrets.encrypt = false;
+        config.memory.embedding_model = "hint:first".to_string();
+        config.embedding_routes = [
+            (&first, "first", "PRX-EMBED-FIRST-KEY"),
+            (&second, "second", "PRX-EMBED-SECOND-KEY"),
+        ]
+        .into_iter()
+        .map(|(probe, hint, key)| crate::config::EmbeddingRouteConfig {
+            hint: hint.to_string(),
+            provider: probe.custom_provider(),
+            model: "probe-embed".to_string(),
+            dimensions: Some(3),
+            api_key: Some(key.to_string()),
+            credential_ref: None,
+        })
+        .collect();
+
+        let report = crate::config::manage::migrate::report(&config).expect("test: migration report");
+        let values = crate::config::manage::migrate::inline_values(&config, &report);
+        let references =
+            crate::config::manage::credentials::CredentialReferences::for_config(&config).expect("test: references");
+        for key in &report.inline_keys {
+            if key.path.starts_with("embedding_routes[") {
+                references
+                    .set(
+                        &key.provider,
+                        &key.reference_name,
+                        values.get(&key.path).expect("test: inline route key"),
+                    )
+                    .expect("test: store migrated route key");
+            }
+        }
+        let mut migrated = crate::config::manage::migrate::migrated(&config, &report);
+        assert!(migrated.embedding_routes.iter().all(|route| route.api_key.is_none()));
+        assert_ne!(
+            migrated
+                .embedding_routes
+                .first()
+                .and_then(|route| route.credential_ref.as_ref()),
+            migrated
+                .embedding_routes
+                .get(1)
+                .and_then(|route| route.credential_ref.as_ref())
+        );
+
+        super::create_embedder_from_config(&migrated)
+            .embed(&["probe"])
+            .await
+            .expect("test: first migrated embedding request");
+        assert_eq!(first.requests().len(), 1);
+        assert!(
+            first
+                .requests()
+                .first()
+                .is_some_and(|request| request.path.ends_with("/embeddings"))
+        );
+        assert!(first.saw("PRX-EMBED-FIRST-KEY"));
+        assert!(!first.saw("PRX-EMBED-SECOND-KEY"));
+        assert!(!first.saw(ROOT_SENTINEL));
+        assert!(second.requests().is_empty());
+
+        migrated.memory.embedding_model = "hint:second".to_string();
+        super::create_embedder_from_config(&migrated)
+            .embed(&["probe"])
+            .await
+            .expect("test: second migrated embedding request");
+        assert_eq!(second.requests().len(), 1);
+        assert!(
+            second
+                .requests()
+                .first()
+                .is_some_and(|request| request.path.ends_with("/embeddings"))
+        );
+        assert!(second.saw("PRX-EMBED-SECOND-KEY"));
+        assert!(!second.saw("PRX-EMBED-FIRST-KEY"));
+        assert!(!second.saw(ROOT_SENTINEL));
+    }
+
+    /// C0-f F-8: the root key of an `openai` default configured with its own
+    /// base URL travels with that URL; it is never presented at the vendor's
+    /// default host.
+    #[test]
+    fn the_root_key_reaches_the_embedder_only_with_its_base_url() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let mut config = root_config(&temp);
+        config.api_url = Some("https://gateway.corp.example/v1".to_string());
+        config.memory.embedding_provider = "openai".to_string();
+
+        let resolved = super::resolve_embedding_config(
+            &config.memory,
+            &config.embedding_routes,
+            super::EmbeddingRootCredential::from_config(&config),
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some(ROOT_SENTINEL));
+        assert_eq!(resolved.api_url.as_deref(), Some("https://gateway.corp.example/v1"));
+    }
+
+    /// On the wire: the embedder posts to the root URL with the root key.
+    #[tokio::test]
+    async fn f8_wire_the_openai_embedder_uses_the_root_url() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start().await;
+        let mut config = root_config(&temp);
+        config.api_url = Some(probe.base_url());
+        config.memory.embedding_provider = "openai".to_string();
+
+        let embedder = super::create_embedder_from_config(&config);
+        let _vectors = embedder.embed(&["probe"]).await;
+
+        assert_eq!(probe.requests().len(), 1);
+        assert!(probe.saw(ROOT_SENTINEL));
+    }
+}
+
+/// PMM-C (embedding surface): the embedder a configuration selects is
+/// resolved for embeddings before it is built.
+#[cfg(test)]
+mod embedder_selection_tests {
+    use super::create_embedder_from_config;
+    use crate::config::{Config, EmbeddingRouteConfig};
+
+    fn config_with(provider: &str, model: &str) -> Config {
+        let mut config = Config::default();
+        config.memory.embedding_provider = provider.to_string();
+        config.memory.embedding_model = model.to_string();
+        config.memory.embedding_dimensions = 8;
+        config
+    }
+
+    #[test]
+    fn an_embedding_route_to_a_chat_only_model_builds_no_embedder() {
+        let mut config = config_with("none", "hint:semantic");
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            dimensions: Some(8),
+            api_key: Some("PMMC-EMBED-KEY".into()),
+            credential_ref: None,
+        }];
+        config.providers.models.push(
+            toml::from_str("provider = \"openai\"\nmodel = \"gpt-4o\"\noperations = [\"chat\"]\n")
+                .expect("test: declaration"),
+        );
+        assert_eq!(
+            create_embedder_from_config(&config).name(),
+            "none",
+            "a model declared chat-only was built as an embedder"
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_an_embedding_provider_builds_its_embedder() {
+        assert_eq!(
+            create_embedder_from_config(&config_with("OpenAI", "text-embedding-3-small")).name(),
+            "openai"
+        );
+        assert_eq!(
+            create_embedder_from_config(&config_with(" openai ", "text-embedding-3-small")).name(),
+            "openai"
+        );
+        assert_eq!(
+            create_embedder_from_config(&config_with("local", "prx-local-hash-v1")).name(),
+            "local"
+        );
+        assert_eq!(create_embedder_from_config(&config_with("none", "x")).name(), "none");
+        assert_eq!(
+            create_embedder_from_config(&config_with("anthropic", "claude-embed")).name(),
+            "none",
+            "no embedding adapter"
         );
     }
 }

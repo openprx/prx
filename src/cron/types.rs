@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use crate::tools::execution::JobOrigin;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum JobType {
@@ -251,6 +253,46 @@ pub struct CronJob {
     /// written outside the tool path, which authorizes them as `unknown`.
     #[serde(default)]
     pub delivery_principal: DeliveryPrincipal,
+    /// Who created this job, and so whose authority an agent run of it
+    /// executes under (CRON-ORIGIN). Fixed at creation; a row stored before
+    /// the column existed reads as [`JobOrigin::Unattributed`].
+    #[serde(default)]
+    pub origin: JobOrigin,
+}
+
+/// Which surface created a job (D-107 amendment): decides whether its shell
+/// command may run git (hardened) or not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JobCreator {
+    /// The operator's own command: `prx cron`/`prx xin`, an authenticated
+    /// operator write through the gateway, or `prx cron mark-operator`.
+    OperatorCli,
+    /// An agent tool, or a row stored before the creator was recorded
+    /// (fail-safe).
+    #[default]
+    AgentTool,
+}
+
+impl JobCreator {
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OperatorCli => "operator_cli",
+            Self::AgentTool => "agent_tool",
+        }
+    }
+
+    /// Read a stored value; anything but `operator_cli` (NULL included) is
+    /// `agent_tool`.
+    #[must_use]
+    pub fn from_stored(value: Option<&str>) -> Self {
+        if value == Some("operator_cli") {
+            Self::OperatorCli
+        } else {
+            Self::AgentTool
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +304,13 @@ pub struct CronJobLineage {
     /// Creator identity carried alongside the lineage so every `add_*` entry
     /// point persists it without growing another argument.
     pub delivery_principal: DeliveryPrincipal,
+    /// Creating origin (CRON-ORIGIN). The default is
+    /// [`JobOrigin::Unattributed`], so an entry point that does not say who
+    /// created the job never grants it operator authority.
+    pub origin: JobOrigin,
+    /// Which surface created the job (D-107 amendment); the default is
+    /// [`JobCreator::AgentTool`].
+    pub created_via: JobCreator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,4 +364,10 @@ pub struct CronJobPatch {
     /// clears the previous owner's identity instead of inheriting it.
     #[serde(skip)]
     pub delivery_principal: Option<DeliveryPrincipal>,
+    /// Which surface rewrote the command (D-107 amendment), set only by the
+    /// runtime (`#[serde(skip)]`, like the principal). A command change
+    /// records it, and `None` records [`JobCreator::AgentTool`]: an agent tool
+    /// that rewrites an operator job's command makes it an agent job.
+    #[serde(skip)]
+    pub created_via: Option<JobCreator>,
 }

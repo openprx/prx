@@ -43,6 +43,15 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Whether `character` is a combining mark (Unicode General_Category Mark:
+/// Mn, Mc, Me), such as the accent of a decomposed (NFD) letter or a virama.
+/// The decision module reads the class through here: its AG-22 guard
+/// (no repairing a value) scans for the stem of the crate name.
+#[must_use]
+pub fn is_combining_mark(character: char) -> bool {
+    unicode_normalization::char::is_combining_mark(character)
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),

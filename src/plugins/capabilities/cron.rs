@@ -2,28 +2,102 @@
 //!
 //! Cron plugins declare a schedule in their manifest and export a `run`
 //! function that is called by the scheduler when the schedule fires.
+//!
+//! # Trap recovery
+//!
+//! The adapter's store is owned by a [`Supervisor`]: a trapped job is rebuilt
+//! on a brand-new `Store` by its next run, rebuilds are budgeted inside a
+//! rolling window, and once the budget is spent the job is quarantined until
+//! the next plugin generation replaces it. A run that cannot complete returns
+//! an error and is not retried before its next occurrence; a job never reports
+//! output it did not produce. A rebuild starts the guest with empty linear
+//! memory, so state a job kept there (a run counter, say) starts over.
 
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
+use super::recovery::{CallOutcome, CapabilityKind, GuestOp, Respawn, Supervisor};
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
+use crate::plugins::host::HostState;
 use crate::plugins::manifest::PluginManifest;
 
 /// A loaded cron plugin instance.
 pub struct WasmCronJob {
     plugin_name: String,
     schedule: String,
-    inner: Arc<Mutex<WasmCronInner>>,
-    timeout_ms: u64,
+    supervisor: Arc<Supervisor>,
 }
 
-struct WasmCronInner {
-    store: wasmtime::Store<HostState>,
-    instance: wasmtime::component::Instance,
+/// One call of the guest's `run` export.
+struct RunCall {
+    plugin_name: String,
+}
+
+impl GuestOp for RunCall {
+    type Output = String;
+
+    fn operation(&self) -> &'static str {
+        "run"
+    }
+
+    fn invoke<'a>(
+        self,
+        store: &'a mut wasmtime::Store<HostState>,
+        instance: &'a wasmtime::component::Instance,
+    ) -> futures_util::future::BoxFuture<'a, CallOutcome<String>>
+    where
+        Self: 'a,
+    {
+        Box::pin(self.run(store, instance))
+    }
+}
+
+impl RunCall {
+    async fn run(
+        self,
+        store: &mut wasmtime::Store<HostState>,
+        instance: &wasmtime::component::Instance,
+    ) -> CallOutcome<String> {
+        let plugin_name = self.plugin_name;
+        // Navigate to the exported interface: prx:plugin/cron-exports@0.1.0
+        let Some(iface_idx) = instance.get_export_index(store.as_context_mut(), None, "prx:plugin/cron-exports@0.1.0")
+        else {
+            return CallOutcome::GuestError(PluginError::Runtime(
+                "plugin does not export prx:plugin/cron-exports@0.1.0".to_string(),
+            ));
+        };
+
+        let Some(func_idx) = instance.get_export_index(store.as_context_mut(), Some(&iface_idx), "run") else {
+            return CallOutcome::GuestError(PluginError::Runtime("run not found in cron-exports".to_string()));
+        };
+
+        let Some(func) = instance.get_func(store.as_context_mut(), &func_idx) else {
+            return CallOutcome::GuestError(PluginError::Runtime("run is not a function".to_string()));
+        };
+
+        let mut results = [wasmtime::component::Val::Bool(false)];
+        if let Err(e) = func.call_async(&mut *store, &[], &mut results).await {
+            return super::recovery::unwound(store, &e, || format!("cron '{plugin_name}' run error: {e}"));
+        }
+        match results.first() {
+            Some(wasmtime::component::Val::Result(r)) => match r.as_ref() {
+                Ok(Some(b)) => match b.as_ref() {
+                    wasmtime::component::Val::String(s) => CallOutcome::Completed(s.to_string()),
+                    _ => CallOutcome::Completed(String::new()),
+                },
+                Err(Some(b)) => match b.as_ref() {
+                    wasmtime::component::Val::String(e) => CallOutcome::GuestError(PluginError::Runtime(format!(
+                        "cron '{plugin_name}' returned error: {e}"
+                    ))),
+                    _ => CallOutcome::Completed(String::new()),
+                },
+                _ => CallOutcome::Completed(String::new()),
+            },
+            _ => CallOutcome::Completed(String::new()),
+        }
+    }
 }
 
 impl WasmCronJob {
@@ -39,101 +113,34 @@ impl WasmCronJob {
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
-        let timeout_ms = manifest.resources.max_execution_time_ms;
-
-        let granted = granted_permissions;
-        let optional = manifest.permissions.optional.iter().cloned().collect();
-        let mut host_state = HostState::new(
-            manifest.plugin.name.clone(),
-            manifest.config.clone(),
-            granted,
-            optional,
-            manifest.permissions.http_allowlist.clone(),
-            timeout_ms,
-            manifest.resources.max_kv_storage_mb,
+        let respawn = Respawn::new(
+            CapabilityKind::Cron,
+            engine,
+            component,
+            manifest,
+            granted_permissions,
+            memory,
+            event_bus,
+            Self::register_host_functions,
         );
-        if let Some(memory) = memory {
-            host_state = host_state.with_memory(memory);
-        }
-        if let Some(bus) = event_bus {
-            host_state = host_state.with_event_bus(bus);
-        }
-
-        let mut store = wasmtime::Store::new(engine, host_state);
-        apply_store_resource_limits(&mut store, manifest.resources.max_memory_mb);
-        store
-            .set_fuel(manifest.resources.max_fuel)
-            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
-        apply_store_epoch_deadline(&mut store, timeout_ms);
-
-        let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
-        Self::register_host_functions(&mut linker)?;
-
-        let instance = linker
-            .instantiate_async(&mut store, component)
-            .await
-            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate cron: {e}")))?;
+        let live = respawn.instantiate().await?;
 
         Ok(Self {
             plugin_name: manifest.plugin.name.clone(),
             schedule,
-            inner: Arc::new(Mutex::new(WasmCronInner { store, instance })),
-            timeout_ms,
+            supervisor: Arc::new(Supervisor::new(respawn, live)),
         })
     }
 
     /// Execute the cron job's `run` function.
     pub async fn run(&self) -> PluginResult<String> {
-        let mut inner = self.inner.lock().await;
-        let WasmCronInner { store, instance } = &mut *inner;
-
-        // Navigate to the exported interface: prx:plugin/cron-exports@0.1.0
-        let iface_idx = instance
-            .get_export_index(store.as_context_mut(), None, "prx:plugin/cron-exports@0.1.0")
-            .ok_or_else(|| PluginError::Runtime("plugin does not export prx:plugin/cron-exports@0.1.0".to_string()))?;
-
-        let func_idx = instance
-            .get_export_index(store.as_context_mut(), Some(&iface_idx), "run")
-            .ok_or_else(|| PluginError::Runtime("run not found in cron-exports".to_string()))?;
-
-        let func = instance
-            .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| PluginError::Runtime("run is not a function".to_string()))?;
-
-        let params = [];
-        let mut results = [wasmtime::component::Val::Bool(false)];
-
-        apply_store_epoch_deadline(store, self.timeout_ms);
-        let call_result = tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms),
-            func.call_async(&mut *store, &params, &mut results),
-        )
-        .await;
-
-        match call_result {
-            Err(_) => Err(PluginError::Timeout(self.timeout_ms)),
-            Ok(Err(e)) => Err(PluginError::Runtime(format!(
-                "cron '{}' run error: {e}",
-                self.plugin_name
-            ))),
-            Ok(Ok(())) => match &results[0] {
-                wasmtime::component::Val::Result(r) => match r.as_ref() {
-                    Ok(Some(b)) => match b.as_ref() {
-                        wasmtime::component::Val::String(s) => Ok(s.to_string()),
-                        _ => Ok(String::new()),
-                    },
-                    Err(Some(b)) => match b.as_ref() {
-                        wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
-                            "cron '{}' returned error: {e}",
-                            self.plugin_name
-                        ))),
-                        _ => Ok(String::new()),
-                    },
-                    _ => Ok(String::new()),
-                },
-                _ => Ok(String::new()),
-            },
-        }
+        // Detached: a cancelled `cron_run` call cannot drop a run it handed
+        // over; the scheduler's own runs are never cancelled mid-run.
+        self.supervisor
+            .call_detached(RunCall {
+                plugin_name: self.plugin_name.clone(),
+            })
+            .await
     }
 
     pub fn plugin_name(&self) -> &str {
@@ -142,6 +149,18 @@ impl WasmCronJob {
 
     pub fn schedule(&self) -> &str {
         &self.schedule
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.supervisor.is_quarantined()
+    }
+
+    /// Per-adapter health for `wasm_plugins_status`.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        self.supervisor.diagnostics(serde_json::json!({
+            "plugin": self.plugin_name,
+            "schedule": self.schedule,
+        }))
     }
 
     /// Register host functions for cron plugins.
@@ -173,14 +192,15 @@ impl WasmCronManager {
 
     /// Adapter inventory used by runtime status and management surfaces.
     pub fn adapters(&self) -> Vec<serde_json::Value> {
+        self.jobs.iter().map(WasmCronJob::diagnostics).collect()
+    }
+
+    /// Jobs that spent their restart budget and no longer run.
+    pub fn quarantined_plugins(&self) -> Vec<String> {
         self.jobs
             .iter()
-            .map(|job| {
-                serde_json::json!({
-                    "plugin": job.plugin_name(),
-                    "schedule": job.schedule(),
-                })
-            })
+            .filter(|job| job.is_quarantined())
+            .map(|job| job.plugin_name().to_string())
             .collect()
     }
 
@@ -260,8 +280,12 @@ impl WasmCronManager {
                 Ok(output) => {
                     tracing::info!(plugin = %name, output = %output, "WASM cron job completed");
                 }
+                // The adapter logs state transitions, a bounded number of
+                // failures and the first refusal while quarantined, and keeps
+                // the totals in its status; a quarantined job due every 30
+                // seconds must not add a warning per occurrence here.
                 Err(error) => {
-                    tracing::warn!(plugin = %name, error = %error, "WASM cron job failed");
+                    tracing::debug!(plugin = %name, error = %error, "WASM cron job did not complete");
                 }
             }
         }
@@ -297,4 +321,152 @@ fn is_cron_due(
 
     let check_from = last_run.unwrap_or_else(|| now - chrono::Duration::seconds(60));
     matches!(cron_sched.after(&check_from).next(), Some(next) if next <= now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE_MANIFEST: &str = r#"
+[plugin]
+name = "counter-cron"
+version = "0.1.0"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "cron"
+name = "counter"
+schedule = "*/30 * * * * *"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 30000
+"#;
+
+    /// The committed `counter-cron` component. Its `run` takes no input and
+    /// calls no host function, so no committed trigger can make it trap once
+    /// fuel is metered per call; these tests drive the state machine with an
+    /// injected fault instead. Its run counter lives in guest linear memory,
+    /// which makes a rebuild on a fresh store directly observable.
+    async fn counter_cron() -> WasmCronJob {
+        let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasmtime engine");
+        let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/counter-cron/plugin.wasm");
+        let bytes = std::fs::read(wasm).expect("test: the committed cron fixture is readable");
+        let component =
+            wasmtime::component::Component::from_binary(&engine, &bytes).expect("test: the fixture is a component");
+        let manifest: PluginManifest = toml::from_str(FIXTURE_MANIFEST).expect("test: fixture manifest parses");
+        WasmCronJob::new(
+            &engine,
+            &component,
+            &manifest,
+            std::collections::HashSet::new(),
+            "*/30 * * * * *".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("test: the fixture instantiates")
+    }
+
+    fn counter(job: &WasmCronJob, field: &str) -> Option<u64> {
+        job.diagnostics().get(field).and_then(serde_json::Value::as_u64)
+    }
+
+    #[tokio::test]
+    async fn a_faulted_cron_job_reruns_on_a_fresh_store() {
+        let job = counter_cron().await;
+        assert_eq!(job.run().await.expect("test: first run"), "counter-cron-run-1");
+        assert_eq!(job.run().await.expect("test: second run"), "counter-cron-run-2");
+
+        job.supervisor.inject_fault("wasm trap: unreachable").await;
+        assert_eq!(
+            job.run().await.expect("test: the next run rebuilds"),
+            "counter-cron-run-1",
+            "a rebuilt job starts with empty guest memory, so its counter starts over"
+        );
+        assert_eq!(counter(&job, "restart_count"), Some(1));
+        assert_eq!(counter(&job, "failure_count"), Some(1));
+        assert_eq!(
+            job.diagnostics().get("state").and_then(serde_json::Value::as_str),
+            Some("live")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cron_job_that_keeps_faulting_is_quarantined_and_skipped() {
+        let job = counter_cron().await;
+        for fault in 1..=MAX_FAULTS_BEFORE_QUARANTINE {
+            job.supervisor.inject_fault("wasm trap: unreachable").await;
+            let rerun = job.run().await;
+            if fault < MAX_FAULTS_BEFORE_QUARANTINE {
+                assert!(rerun.is_ok(), "fault {fault} is inside the budget: {rerun:?}");
+            } else {
+                assert!(
+                    matches!(rerun, Err(PluginError::Quarantined { .. })),
+                    "the fault past the budget must quarantine: {rerun:?}"
+                );
+            }
+        }
+        assert!(job.is_quarantined());
+
+        let mut manager = WasmCronManager::new();
+        manager.add(job);
+        assert_eq!(manager.quarantined_plugins(), vec!["counter-cron".to_string()]);
+        let mut last_triggered = HashMap::new();
+        manager.run_due_jobs(&mut last_triggered, chrono::Utc::now()).await;
+        let skipped = manager
+            .adapters()
+            .first()
+            .and_then(|adapter| adapter.get("skipped_quarantined").and_then(serde_json::Value::as_u64));
+        assert_eq!(
+            skipped,
+            Some(2),
+            "the refused manual run and the due occurrence are both counted"
+        );
+        assert!(
+            matches!(
+                manager.run_job("counter-cron").await,
+                Err(PluginError::Quarantined { .. })
+            ),
+            "a quarantined job never reports output it did not produce"
+        );
+    }
+
+    /// Three charged rebuilds, then the fourth fault quarantines.
+    const MAX_FAULTS_BEFORE_QUARANTINE: usize = super::super::recovery::MAX_RESTARTS_PER_WINDOW + 1;
+
+    /// D-023: a caller that gives up on a run — a cancelled `cron_run` tool
+    /// call — no longer decides whether the run happens. The run was handed
+    /// over, so it completes on its own task.
+    #[tokio::test]
+    async fn an_abandoned_cron_run_still_runs() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let job = counter_cron().await;
+        {
+            let guard = job.supervisor.lock().await;
+            {
+                let mut run = std::pin::pin!(job.run());
+                assert!(
+                    run.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                    "the run must be waiting for the store"
+                );
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            drop(guard);
+        }
+        assert_eq!(
+            job.run().await.expect("test: the next run"),
+            "counter-cron-run-2",
+            "the abandoned run must have run first"
+        );
+    }
 }

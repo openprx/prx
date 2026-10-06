@@ -5,5 +5,6 @@ pub mod cron;
 pub mod hook;
 pub mod middleware;
 pub mod provider;
+pub mod recovery;
 pub mod storage;
 pub mod tool;

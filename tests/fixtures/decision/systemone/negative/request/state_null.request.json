@@ -1,0 +1,10 @@
+{
+  "state": null,
+  "model": "jev-1.13.0",
+  "questions": {
+    "q": {
+      "type": "noul",
+      "instructions": "Is it?"
+    }
+  }
+}

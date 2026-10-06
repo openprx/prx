@@ -22,6 +22,16 @@ pub struct EffectiveCompactionConfig {
     pub selected_model: String,
 }
 
+impl EffectiveCompactionConfig {
+    /// The selected provider as logs and traces show it: a `custom:` label's
+    /// `user:password@` is redacted (INT-2B USERINFO-3). The provider itself
+    /// is always addressed with `selected_provider`.
+    #[must_use]
+    pub fn shown_provider(&self) -> std::borrow::Cow<'_, str> {
+        crate::providers::redact_endpoint_userinfo(&self.selected_provider)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactionResolver {
     base: AgentCompactionConfig,
@@ -113,7 +123,7 @@ pub fn resolve_effective_compaction_config(
 
 pub fn trace_effective_compaction_resolution(resolution: &EffectiveCompactionConfig) {
     tracing::debug!(
-        provider = resolution.selected_provider.as_str(),
+        provider = %resolution.shown_provider(),
         model = resolution.selected_model.as_str(),
         max_context_tokens = resolution.config.max_context_tokens,
         requested_context_tokens = resolution.requested_context_tokens,
@@ -231,6 +241,16 @@ fn model_matches(model_id: &str, selected_model: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AgentCompactionConfig, AutomixConfig, RouterModelConfig};
+
+    /// INT-2B B4f M-1: the value the per-turn compaction line prints for the
+    /// selected provider carries no URL userinfo; the provider itself is kept.
+    #[test]
+    fn the_shown_provider_redacts_url_userinfo() {
+        let label = "custom:http://u:CONTEXT-SECRET-pw@127.0.0.1:1/v1";
+        let resolution = CompactionResolver::from_base(AgentCompactionConfig::default()).resolve(label, "m");
+        assert_eq!(resolution.selected_provider, label);
+        assert_eq!(resolution.shown_provider(), "custom:http://[redacted]@127.0.0.1:1/v1");
+    }
 
     fn router_with_model(provider: &str, model_id: &str, max_context: usize) -> RouterConfig {
         router_with_models(vec![RouterModelConfig {
@@ -441,6 +461,7 @@ mod tests {
             provider: "openrouter".to_string(),
             model: "wide".to_string(),
             api_key: None,
+            credential_ref: None,
         }];
         let result = resolve_effective_compaction_config(
             &AgentCompactionConfig::default(),

@@ -1,4 +1,4 @@
-use crate::security::audit::redact_secrets;
+use crate::security::redaction::redact_secrets;
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -378,6 +378,7 @@ pub enum ToolDecision {
 ///
 /// [`decide`]: SecurityPolicy::decide
 pub const READ_ONLY_TOOLS: &[&str] = &[
+    "capability_search",
     // Filesystem / memory reads.
     "file_read",
     "memory_recall",
@@ -757,6 +758,15 @@ impl ApprovalGrant {
         let Some(grant) = self.v2.as_ref() else {
             return Err("missing v2 grant".to_string());
         };
+        if grant.decision_binding.is_some() {
+            return super::decision_approval::verify_claimed_decision(
+                grant,
+                &self.tool,
+                op_id,
+                risk,
+                self.caller_principal_id.as_deref(),
+            );
+        }
         let keyring = match crate::acl::approval_grant::WitnessKeyring::global() {
             Ok(keyring) => keyring,
             Err(error) => {
@@ -1738,35 +1748,18 @@ impl SecurityPolicy {
         }
 
         // Expand tilde for comparison
-        let expanded = path.strip_prefix("~/").map_or_else(
-            || path.to_string(),
-            |stripped| {
-                std::env::var("HOME").ok().map(PathBuf::from).map_or_else(
-                    || path.to_string(),
-                    |home| home.join(stripped).to_string_lossy().to_string(),
-                )
-            },
-        );
+        let expanded = crate::config::expand_home(Path::new(path));
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(&expanded).is_absolute() {
+        if self.workspace_only && expanded.is_absolute() {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
-        let expanded_path = Path::new(&expanded);
+        let expanded_path = expanded.as_path();
         for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = forbidden.strip_prefix("~/").map_or_else(
-                || forbidden.clone(),
-                |stripped| {
-                    std::env::var("HOME").ok().map(PathBuf::from).map_or_else(
-                        || forbidden.clone(),
-                        |home| home.join(stripped).to_string_lossy().to_string(),
-                    )
-                },
-            );
-            let forbidden_path = Path::new(&forbidden_expanded);
-            if expanded_path.starts_with(forbidden_path) {
+            let forbidden_expanded = crate::config::expand_home(Path::new(forbidden));
+            if expanded_path.starts_with(&forbidden_expanded) {
                 return false;
             }
         }
@@ -1833,7 +1826,7 @@ impl SecurityPolicy {
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             scope_rules: autonomy_config.scopes.rules.clone(),
-            scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
+            scope_default_allow: autonomy_config.scopes.default.allows_unmatched(),
             assign_owners: autonomy_config.scopes.assign_owners.clone(),
             // Default audit config; callers that have the real `security.audit`
             // block attach it via [`Self::with_audit_config`] so the gate audit
@@ -4584,7 +4577,7 @@ mod tests {
     fn scope_config_from_autonomy_config() {
         let autonomy = crate::config::AutonomyConfig {
             scopes: crate::config::ScopeConfig {
-                default: "allow".into(),
+                default: crate::config::ScopeDefault::Allow,
                 rules: vec![crate::config::ScopeRule {
                     user: None,
                     channel: Some("signal".into()),

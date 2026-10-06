@@ -302,6 +302,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -359,6 +362,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -379,6 +385,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -440,6 +449,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -496,6 +508,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -560,6 +575,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Private,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();

@@ -8,11 +8,15 @@
 //!
 //! An [`AuditLogger`] records security-relevant events for forensic review.
 
+pub(crate) mod approval_operation;
 pub mod audit;
+pub(crate) mod decision_approval;
+pub mod git_launch;
 pub mod inbound_gate;
 pub mod op_id;
 pub mod pairing;
 pub mod policy;
+pub mod redaction;
 pub mod secrets;
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 pub use secrets::SecretStore;

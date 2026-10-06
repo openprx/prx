@@ -56,6 +56,7 @@ pub struct MemoryFabric {
     memory: Arc<dyn Memory>,
     workspace_id: String,
     event_recording: MemoryEventRecording,
+    ingress: Option<Arc<crate::runtime::ingress_recovery::IngressRecorder>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -151,6 +152,24 @@ pub struct MessageEventScope {
     pub visibility: MemoryVisibility,
 }
 
+/// A sender or recipient as it is stored.
+///
+/// Only a model counterpart, `<provider label>/<model>` with a
+/// bring-your-own label (`custom:` or `anthropic-custom:`), has its URL
+/// userinfo redacted at write. Every other value is an identity (a platform
+/// subject, a webhook `reply_target`) that private reads match on, so it is
+/// stored exactly as given. Rows written before this existed are not
+/// rewritten.
+fn redact_provider_label(value: String) -> String {
+    if crate::providers::byo_dialect_of(&value).is_none() {
+        return value;
+    }
+    match crate::providers::redact_endpoint_userinfo(&value) {
+        std::borrow::Cow::Borrowed(_) => value,
+        std::borrow::Cow::Owned(redacted) => redacted,
+    }
+}
+
 impl MessageEventScope {
     #[must_use]
     pub fn new(source: impl Into<crate::memory::MessageEventSource>, visibility: MemoryVisibility) -> Self {
@@ -241,6 +260,7 @@ impl MemoryFabric {
             memory,
             workspace_id: workspace_id.into(),
             event_recording: MemoryEventRecording::default(),
+            ingress: None,
         }
     }
 
@@ -248,6 +268,49 @@ impl MemoryFabric {
     pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
         self.event_recording = event_recording;
         self
+    }
+
+    pub(crate) async fn with_ingress_recovery(
+        mut self,
+        config: &Arc<crate::config::Config>,
+        ticket: &crate::runtime::turn_cleanup::CleanupTicket,
+    ) -> anyhow::Result<Self> {
+        let recording = config.memory.event_recording_config();
+        if !config.causal_tree.enabled || !recording.enabled || !recording.record_user_messages {
+            return Ok(self);
+        }
+        anyhow::ensure!(
+            self.workspace_id == config.workspace_dir.to_string_lossy(),
+            "ingress fabric workspace differs from its pinned configuration"
+        );
+        let ownership = ticket.owner().register(tokio_util::sync::CancellationToken::new())?;
+        let memory = Arc::clone(&self.memory);
+        let config = Arc::clone(config);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = crate::runtime::ingress_recovery::IngressRecorder::prepare(memory, &config, &ownership).await;
+            ownership.finish(result.is_ok());
+            let _ = sent.send(result);
+        });
+        self.ingress = received
+            .await
+            .map_err(|_| anyhow::anyhow!("ingress preparation ended without receipt"))??;
+        Ok(self)
+    }
+    pub(crate) fn verify_ingress_input(&self, event: &MessageEvent) -> anyhow::Result<()> {
+        match &self.ingress {
+            Some(ingress) => ingress.verify_receipt(event),
+            None => {
+                anyhow::ensure!(
+                    event.raw_payload_json.is_none(),
+                    "input metadata has no issued ingress verifier"
+                );
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn ingress_already_accepted(&self) -> bool {
+        self.ingress.as_ref().is_some_and(|ingress| ingress.duplicate())
     }
 
     #[must_use]
@@ -655,37 +718,43 @@ impl MemoryFabric {
                 raw_payload_json,
             ));
         }
-        self.memory
-            .append_message_event(MessageEventInput {
-                event_id: None,
-                idempotency_key,
-                workspace_id: self.workspace_id.clone(),
-                owner_id: scope.owner_id,
-                source: scope.source,
-                channel: scope.channel,
-                session_key: scope.session_key,
-                parent_session_key: scope.parent_session_key,
-                run_id: scope.run_id,
-                parent_run_id: scope.parent_run_id,
-                agent_id: scope.agent_id,
-                persona_id: scope.persona_id,
-                sender: scope.sender,
-                recipient: scope.recipient,
-                role: role.to_string(),
-                event_type: event_type.to_string(),
-                subject: scope.subject,
-                goal_id: scope.goal_id,
-                causation_event_id: scope.causation_event_id,
-                correlation_id: scope.correlation_id,
-                attempt_id: scope.attempt_id,
-                lease_epoch: scope.lease_epoch,
-                config_generation_id: scope.config_generation_id,
-                config_source_revision: scope.config_source_revision,
-                content,
-                raw_payload_json,
-                visibility: scope.visibility,
-            })
-            .await
+        let input = MessageEventInput {
+            event_id: None,
+            idempotency_key,
+            workspace_id: self.workspace_id.clone(),
+            owner_id: scope.owner_id,
+            source: scope.source,
+            channel: scope.channel,
+            session_key: scope.session_key,
+            parent_session_key: scope.parent_session_key,
+            run_id: scope.run_id,
+            parent_run_id: scope.parent_run_id,
+            agent_id: scope.agent_id,
+            persona_id: scope.persona_id,
+            // Callers name a model counterpart `<provider>/<model>`, and a
+            // provider label may be a URL carrying `user:password@`.
+            sender: scope.sender.map(redact_provider_label),
+            recipient: scope.recipient.map(redact_provider_label),
+            role: role.to_string(),
+            event_type: event_type.to_string(),
+            subject: scope.subject,
+            goal_id: scope.goal_id,
+            causation_event_id: scope.causation_event_id,
+            correlation_id: scope.correlation_id,
+            attempt_id: scope.attempt_id,
+            lease_epoch: scope.lease_epoch,
+            config_generation_id: scope.config_generation_id,
+            config_source_revision: scope.config_source_revision,
+            content,
+            raw_payload_json,
+            visibility: scope.visibility,
+        };
+        if role == "user" && event_type == "message.created" {
+            if let Some(ingress) = &self.ingress {
+                return ingress.append(input).await;
+            }
+        }
+        self.memory.append_message_event(input).await
     }
 
     fn should_record_role(&self, role: &str) -> bool {
@@ -725,8 +794,8 @@ impl MemoryFabric {
             parent_run_id: scope.parent_run_id,
             agent_id: scope.agent_id,
             persona_id: scope.persona_id,
-            sender: scope.sender,
-            recipient: scope.recipient,
+            sender: scope.sender.map(redact_provider_label),
+            recipient: scope.recipient.map(redact_provider_label),
             role: role.to_string(),
             event_type: event_type.to_string(),
             subject: scope.subject,

@@ -93,213 +93,9 @@ impl NodesTool {
         nodes.iter().find(|node| node.id == id)
     }
 
-    fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<Arc<RemoteNodeClient>> {
-        let cfg = self.config.load_full();
-        self.node_manager
-            .client_for(node, cfg.nodes.request_timeout_ms, cfg.nodes.retry_max)
-    }
-
-    fn require_string_arg<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
-        args.get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("Missing or invalid '{key}' parameter"))
-    }
-
-    fn optional_u64_arg(args: &Value, key: &str) -> anyhow::Result<Option<u64>> {
-        args.get(key)
-            .map(|value| {
-                value
-                    .as_u64()
-                    .ok_or_else(|| anyhow!("'{key}' must be an unsigned integer"))
-            })
-            .transpose()
-    }
-
-    fn optional_bool_arg(args: &Value, key: &str) -> anyhow::Result<Option<bool>> {
-        args.get(key)
-            .map(|value| value.as_bool().ok_or_else(|| anyhow!("'{key}' must be a boolean")))
-            .transpose()
-    }
-
-    fn lineage_from_trusted_scope(args: &Value) -> NodeLineage {
-        let trusted = args.get("_zc_scope_trusted").and_then(Value::as_bool).unwrap_or(false);
-        if !trusted {
-            return NodeLineage::default();
-        }
-        let Some(scope) = args.get("_zc_scope").and_then(Value::as_object) else {
-            return NodeLineage::default();
-        };
-        NodeLineage {
-            owner_id: scope
-                .get("owner_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            topic_id: scope
-                .get("topic_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            parent_task_id: scope
-                .get("task_id")
-                .or_else(|| scope.get("parent_task_id"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            source_message_event_id: scope
-                .get("message_event_id")
-                .or_else(|| scope.get("source_message_event_id"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        }
-    }
-
-    async fn record_remote_task_event(
-        &self,
-        node_id: &str,
-        task_id: &str,
-        event_type: &str,
-        lineage: &NodeLineage,
-        detail: Value,
-    ) {
-        let Some(fabric) = self.memory_fabric() else {
-            return;
-        };
-        let mut scope = MessageEventScope::new("nodes", crate::memory::MemoryVisibility::Workspace)
-            .with_session_key(format!("nodes:{node_id}"))
-            .with_run_id(task_id.to_string());
-        if let Some(owner_id) = lineage.owner_id.as_deref() {
-            scope = scope.with_owner_id(owner_id);
-        }
-        if let Some(parent_task_id) = lineage.parent_task_id.as_deref() {
-            scope = scope.with_parent_run_id(parent_task_id);
-        }
-        let subject_id = format!("{node_id}:{task_id}");
-        let payload = json!({
-            "node_id": node_id,
-            "task_id": task_id,
-            "owner_id": lineage.owner_id,
-            "topic_id": lineage.topic_id,
-            "parent_task_id": lineage.parent_task_id,
-            "source_message_event_id": lineage.source_message_event_id,
-            "detail": detail
-        });
-        if let Err(error) = fabric
-            .record_task_event(scope, subject_id, event_type.to_string(), Some(payload.to_string()))
-            .await
-        {
-            tracing::warn!(
-                node_id,
-                task_id,
-                event_type,
-                "failed to record remote node task event: {error}"
-            );
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for NodesTool {
-    fn name(&self) -> &str {
-        "nodes"
-    }
-
-    fn description(&self) -> &str {
-        "Remote node management over HTTP/2 JSON-RPC: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command on one, 'read' and 'write' transfer a file, and 'cancel' aborts a running task."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "status", "exec", "read", "write", "cancel"],
-                        "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
-                    },
-                    "node": {
-                        "type": "string",
-                        "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command; required for 'exec'"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Timeout override in milliseconds"
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "Working directory for 'exec'"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path; required for 'read' and 'write'"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Byte offset for 'read'"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Byte limit for 'read'"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "File content; required for 'write'"
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Create parent directories for 'write'"
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task ID; required for 'cancel'"
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "status",
-                    required: &["node"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "exec",
-                    required: &["node", "command"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "read",
-                    required: &["node", "path"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "write",
-                    required: &["node", "path", "content"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "cancel",
-                    required: &["node", "task_id"],
-                },
-            ],
-        )
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute_action(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = Self::require_string_arg(&args, "action")?;
+
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         let nodes = self.load_nodes();
 
@@ -315,7 +111,9 @@ impl Tool for NodesTool {
                     .map(|node| {
                         json!({
                             "id": node.id,
-                            "endpoint": node.endpoint,
+                            // `nodes.nodes[].endpoint` is a URL-userinfo path
+                            // of the secret registry: shown without it.
+                            "endpoint": crate::providers::redact_endpoint_userinfo(&node.endpoint),
                         })
                     })
                     .collect();
@@ -494,6 +292,233 @@ impl Tool for NodesTool {
                 bail!("Unknown action '{other}'. Use: list, status, exec, read, write, cancel")
             }
         }
+    }
+
+    fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<Arc<RemoteNodeClient>> {
+        let cfg = self.config.load_full();
+        self.node_manager
+            .client_for(node, cfg.nodes.request_timeout_ms, cfg.nodes.retry_max)
+    }
+
+    fn require_string_arg<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Missing or invalid '{key}' parameter"))
+    }
+
+    fn optional_u64_arg(args: &Value, key: &str) -> anyhow::Result<Option<u64>> {
+        args.get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("'{key}' must be an unsigned integer"))
+            })
+            .transpose()
+    }
+
+    fn optional_bool_arg(args: &Value, key: &str) -> anyhow::Result<Option<bool>> {
+        args.get(key)
+            .map(|value| value.as_bool().ok_or_else(|| anyhow!("'{key}' must be a boolean")))
+            .transpose()
+    }
+
+    fn lineage_from_trusted_scope(args: &Value) -> NodeLineage {
+        let trusted = args.get("_zc_scope_trusted").and_then(Value::as_bool).unwrap_or(false);
+        if !trusted {
+            return NodeLineage::default();
+        }
+        let Some(scope) = args.get("_zc_scope").and_then(Value::as_object) else {
+            return NodeLineage::default();
+        };
+        NodeLineage {
+            owner_id: scope
+                .get("owner_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            topic_id: scope
+                .get("topic_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            parent_task_id: scope
+                .get("task_id")
+                .or_else(|| scope.get("parent_task_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            source_message_event_id: scope
+                .get("message_event_id")
+                .or_else(|| scope.get("source_message_event_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    async fn record_remote_task_event(
+        &self,
+        node_id: &str,
+        task_id: &str,
+        event_type: &str,
+        lineage: &NodeLineage,
+        detail: Value,
+    ) {
+        let Some(fabric) = self.memory_fabric() else {
+            return;
+        };
+        let mut scope = MessageEventScope::new("nodes", crate::memory::MemoryVisibility::Workspace)
+            .with_session_key(format!("nodes:{node_id}"))
+            .with_run_id(task_id.to_string());
+        if let Some(owner_id) = lineage.owner_id.as_deref() {
+            scope = scope.with_owner_id(owner_id);
+        }
+        if let Some(parent_task_id) = lineage.parent_task_id.as_deref() {
+            scope = scope.with_parent_run_id(parent_task_id);
+        }
+        let subject_id = format!("{node_id}:{task_id}");
+        let payload = json!({
+            "node_id": node_id,
+            "task_id": task_id,
+            "owner_id": lineage.owner_id,
+            "topic_id": lineage.topic_id,
+            "parent_task_id": lineage.parent_task_id,
+            "source_message_event_id": lineage.source_message_event_id,
+            "detail": detail
+        });
+        if let Err(error) = fabric
+            .record_task_event(scope, subject_id, event_type.to_string(), Some(payload.to_string()))
+            .await
+        {
+            tracing::warn!(
+                node_id,
+                task_id,
+                event_type,
+                "failed to record remote node task event: {error}"
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NodesTool {
+    fn name(&self) -> &str {
+        "nodes"
+    }
+
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        use sha2::Digest;
+        let config = self.config.load_full();
+        config
+            .nodes
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let bytes = serde_json::to_vec(node).ok()?;
+                Some((node.id.clone(), sha2::Sha256::digest(bytes).into()))
+            })
+            .collect()
+    }
+
+    fn description(&self) -> &str {
+        "Remote node management over HTTP/2 JSON-RPC: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command on one, 'read' and 'write' transfer a file, and 'cancel' aborts a running task."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "status", "exec", "read", "write", "cancel"],
+                        "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command; required for 'exec'"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Timeout override in milliseconds"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for 'exec'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File path; required for 'read' and 'write'"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Byte offset for 'read'"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Byte limit for 'read'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content; required for 'write'"
+                    },
+                    "create_dirs": {
+                        "type": "boolean",
+                        "description": "Create parent directories for 'write'"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID; required for 'cancel'"
+                    }
+                },
+                "required": ["action"]
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "status",
+                    required: &["node"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "exec",
+                    required: &["node", "command"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "read",
+                    required: &["node", "path"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "write",
+                    required: &["node", "path", "content"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "cancel",
+                    required: &["node", "task_id"],
+                },
+            ],
+        )
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // A transport error can quote the node URL, userinfo included
+        // (`error sending request for url (...)`); the model never sees it.
+        self.execute_action(args)
+            .await
+            .map_err(|error| anyhow!(crate::providers::redact_endpoint_userinfo(&format!("{error:#}")).into_owned()))
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Extended
@@ -890,5 +915,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    /// R-SECRETS F2, RED before SECRETS-f: `list` returned a node endpoint's
+    /// `user:password@` to the model verbatim, and a refused endpoint's
+    /// error quoted it. After: the endpoint is shown with only its userinfo
+    /// replaced, and no error carries it.
+    #[tokio::test]
+    async fn node_endpoint_userinfo_never_reaches_the_model() {
+        const PASSWORD: &str = "userinfo-sentinel-node-pw";
+        let mut listed = test_node("edge");
+        listed.endpoint = format!("https://node-user:{PASSWORD}@node.invalid:8787");
+        let mut insecure = test_node("plain");
+        insecure.endpoint = format!("http://node-user:{PASSWORD}@10.0.0.2:8787");
+        let tool = make_tool_with_nodes(vec![listed, insecure], AutonomyLevel::Full);
+
+        let result = tool.execute(json!({"action": "list"})).await.expect("test: list");
+        assert!(result.success);
+        assert!(!result.output.contains(PASSWORD), "list leaked: {}", result.output);
+        assert!(
+            result.output.contains("https://[redacted]@node.invalid:8787"),
+            "{}",
+            result.output
+        );
+
+        let error = tool
+            .execute(json!({"action": "status", "node": "plain"}))
+            .await
+            .expect_err("test: an insecure endpoint is refused");
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains(PASSWORD), "the error leaked: {rendered}");
+        assert!(
+            rendered.contains("10.0.0.2"),
+            "the error still names the host: {rendered}"
+        );
     }
 }

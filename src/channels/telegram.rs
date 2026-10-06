@@ -5,7 +5,6 @@ use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
-use directories::UserDirs;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
@@ -389,6 +388,8 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
+    /// The Bot API origin: Telegram's, or a local listener in a test.
+    api_base: String,
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
@@ -404,7 +405,31 @@ pub struct TelegramChannel {
     bot_username: Mutex<Option<String>>,
 }
 
+/// Telegram's Bot API origin.
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// The Bot API origin a channel starts with.
+#[cfg(not(test))]
+const fn default_api_base() -> &'static str {
+    TELEGRAM_API_BASE
+}
+
+/// The Bot API origin a channel starts with in a test build: a loopback port
+/// nothing listens on, so a test's Bot API call fails at once and never
+/// reaches Telegram (D-081).
+#[cfg(test)]
+const fn default_api_base() -> &'static str {
+    "http://127.0.0.1:9"
+}
+
 impl TelegramChannel {
+    /// Send every Bot API call to `api_base` instead.
+    #[cfg(test)]
+    fn with_api_base(mut self, api_base: &str) -> Self {
+        api_base.clone_into(&mut self.api_base);
+        self
+    }
+
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
@@ -420,6 +445,7 @@ impl TelegramChannel {
 
         Self {
             bot_token,
+            api_base: default_api_base().to_string(),
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
             client: reqwest::Client::new(),
@@ -489,12 +515,7 @@ impl TelegramChannel {
     async fn load_config_without_env() -> anyhow::Result<Config> {
         let openprx_dir = match crate::config::process_config_dir() {
             Some(dir) => dir,
-            None => {
-                let home = UserDirs::new()
-                    .map(|u| u.home_dir().to_path_buf())
-                    .context("Could not find home directory")?;
-                home.join(".openprx")
-            }
+            None => crate::config::default_openprx_dir().context("Could not find home directory")?,
         };
         let config_path = openprx_dir.join("config.toml");
 
@@ -562,7 +583,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.bot_token)
+        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -2233,7 +2254,7 @@ mod tests {
 
     #[test]
     fn telegram_api_url() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(ch.api_url("getMe"), "https://api.telegram.org/bot123:ABC/getMe");
     }
 
@@ -2544,7 +2565,7 @@ mod tests {
 
     #[test]
     fn telegram_api_url_send_document() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(
             ch.api_url("sendDocument"),
             "https://api.telegram.org/bot123:ABC/sendDocument"
@@ -2553,25 +2574,25 @@ mod tests {
 
     #[test]
     fn telegram_api_url_send_photo() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(ch.api_url("sendPhoto"), "https://api.telegram.org/bot123:ABC/sendPhoto");
     }
 
     #[test]
     fn telegram_api_url_send_video() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(ch.api_url("sendVideo"), "https://api.telegram.org/bot123:ABC/sendVideo");
     }
 
     #[test]
     fn telegram_api_url_send_audio() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(ch.api_url("sendAudio"), "https://api.telegram.org/bot123:ABC/sendAudio");
     }
 
     #[test]
     fn telegram_api_url_send_voice() {
-        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false).with_api_base(TELEGRAM_API_BASE);
         assert_eq!(ch.api_url("sendVoice"), "https://api.telegram.org/bot123:ABC/sendVoice");
     }
 

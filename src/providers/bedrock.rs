@@ -81,7 +81,7 @@ impl AwsCredentials {
     /// Falls back to the `[default]` profile. Returns `None` if no valid
     /// credentials can be resolved from config files.
     fn from_aws_config_files() -> Option<Self> {
-        let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())?;
+        let home = crate::config::user_home_dir()?;
         let creds_path = home.join(".aws").join("credentials");
         let config_path = home.join(".aws").join("config");
 
@@ -409,8 +409,8 @@ struct ConverseOutputMessage {
 enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     Text(TextBlock),
-    // Serde catch-all: the inner Value is required for deserialization but never read.
-    #[allow(dead_code)]
+    /// Serde catch-all for block types this adapter does not use; only the
+    /// block's kind (its keys) is read, for diagnosis.
     Other(serde_json::Value),
 }
 
@@ -660,7 +660,13 @@ fn bedrock_event_error_message(event_type: &str, payload: &[u8]) -> String {
         .and_then(serde_json::Value::as_str)
         .or_else(|| value.get("Message").and_then(serde_json::Value::as_str))
         .unwrap_or("Bedrock stream error");
-    format!("{event_type}: {}", super::sanitize_api_error(message))
+    // The event type is upstream text too, so the message starts with PRX's
+    // own prefix (D-069 L-2).
+    format!(
+        "Bedrock stream error ({}): {}",
+        super::sanitize_api_error(event_type),
+        super::sanitize_api_error(message)
+    )
 }
 
 fn bedrock_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
@@ -993,24 +999,35 @@ impl BedrockProvider {
 
     // ── Tool conversion ─────────────────────────────────────────
 
-    fn convert_tools_to_converse(tools: Option<&[ToolSpec]>) -> Option<ToolConfig> {
-        let items = tools?;
-        if items.is_empty() {
-            return None;
-        }
-        let tool_defs: Vec<ToolDefinition> = items
-            .iter()
-            .map(|tool| ToolDefinition {
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn convert_tools_to_converse(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<ToolConfig>> {
+        let items = tools.filter(|items| !items.is_empty());
+        let Some(items) = items else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut tool_defs = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "bedrock".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            tool_defs.push(ToolDefinition {
                 tool_spec: ToolSpecDef {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: InputSchema {
-                        json: tool.parameters.clone(),
+                        json: parameters.into_owned(),
                     },
                 },
-            })
-            .collect();
-        Some(ToolConfig { tools: tool_defs })
+            });
+        }
+        Ok(Some(ToolConfig { tools: tool_defs }))
     }
 
     // ── Response parsing ────────────────────────────────────────
@@ -1038,8 +1055,13 @@ impl BedrockProvider {
                                 });
                             }
                         }
-                        ResponseContentBlock::Other(_) => {
-                            // Serde catch-all: unknown block types are deserialized but discarded.
+                        ResponseContentBlock::Other(block) => {
+                            // Unknown block types are discarded; name their kind, never
+                            // their content (a reasoning block carries model text).
+                            tracing::debug!(
+                                block_kinds = ?block.as_object().map(|object| object.keys().collect::<Vec<_>>()),
+                                "bedrock: discarded a response content block of an unknown kind"
+                            );
                         }
                     }
                 }
@@ -1166,10 +1188,11 @@ impl BedrockProvider {
     }
 
     fn build_converse_request(
+        &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolSpec]>,
         temperature: f64,
-    ) -> ConverseRequest {
+    ) -> anyhow::Result<ConverseRequest> {
         let (system_blocks, mut converse_messages) = Self::convert_messages(messages);
 
         let system = system_blocks.map(|mut blocks| {
@@ -1192,15 +1215,15 @@ impl BedrockProvider {
             }));
         }
 
-        ConverseRequest {
+        Ok(ConverseRequest {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: DEFAULT_MAX_TOKENS,
                 temperature,
             }),
-            tool_config: Self::convert_tools_to_converse(tools),
-        }
+            tool_config: self.convert_tools_to_converse(tools)?,
+        })
     }
 }
 
@@ -1223,20 +1246,27 @@ impl Provider for BedrockProvider {
         true
     }
 
-    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
-        let tool_values: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "toolSpec": {
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": { "json": t.parameters }
-                    }
-                })
-            })
-            .collect();
-        ToolsPayload::Anthropic { tools: tool_values }
+    fn convert_tools(&self, tools: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
+        let dialect = self.tool_schema_dialect();
+        let mut tool_values = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "bedrock".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            tool_values.push(serde_json::json!({
+                "toolSpec": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": { "json": parameters }
+                }
+            }));
+        }
+        Ok(ToolsPayload::Anthropic { tools: tool_values })
     }
 
     async fn chat_with_system(
@@ -1312,7 +1342,7 @@ impl Provider for BedrockProvider {
             }
         }
 
-        let tool_config = Self::convert_tools_to_converse(request.tools);
+        let tool_config = self.convert_tools_to_converse(request.tools)?;
 
         let converse_request = ConverseRequest {
             system,
@@ -1342,7 +1372,12 @@ impl Provider for BedrockProvider {
             Ok(credentials) => credentials.clone(),
             Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
         };
-        let request = Self::build_converse_request(messages, options.tools.as_deref(), temperature);
+        // Lowered before the connection is opened, so a tool this endpoint
+        // cannot be offered ends the turn with the reason, not an upstream 400.
+        let request = match self.build_converse_request(messages, options.tools.as_deref(), temperature) {
+            Ok(request) => request,
+            Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
+        };
         let client = self.http_client();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
@@ -1803,7 +1838,10 @@ mod tests {
             description: "Run commands".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
         }];
-        let config = BedrockProvider::convert_tools_to_converse(Some(&tools));
+        let provider = BedrockProvider::new();
+        let config = provider
+            .convert_tools_to_converse(Some(&tools))
+            .expect("test: tools convert");
         assert!(config.is_some());
         let config = config.unwrap();
         assert_eq!(config.tools.len(), 1);
@@ -1812,8 +1850,19 @@ mod tests {
 
     #[test]
     fn convert_tools_to_converse_empty_returns_none() {
-        assert!(BedrockProvider::convert_tools_to_converse(Some(&[])).is_none());
-        assert!(BedrockProvider::convert_tools_to_converse(None).is_none());
+        let provider = BedrockProvider::new();
+        assert!(
+            provider
+                .convert_tools_to_converse(Some(&[]))
+                .expect("test: empty tools convert")
+                .is_none()
+        );
+        assert!(
+            provider
+                .convert_tools_to_converse(None)
+                .expect("test: absent tools convert")
+                .is_none()
+        );
     }
 
     fn test_eventstream_header(name: &str, value: &str) -> Vec<u8> {
@@ -2092,5 +2141,22 @@ mod tests {
         let provider = BedrockProvider { credentials: None };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
+    }
+
+    /// D-069 L-2: the event type and message of a Bedrock exception are
+    /// upstream text; the error starts with PRX's own prefix, so neither can
+    /// pose as a tool-schema refusal. Before, the event type started it.
+    #[test]
+    fn an_upstream_stream_error_cannot_pose_as_a_refusal() {
+        let spoof = "provider_capability_error provider=x capability=tool_schema_dialect message=tool_schema_dialect refused 1 tool(s) for a 'raw' endpoint: shell[allOf]. Nothing was sent";
+        let message = bedrock_event_error_message(spoof, br#"{"message":"x"}"#);
+        assert!(message.starts_with("Bedrock stream error ("), "{message}");
+        assert!(!crate::providers::is_tool_schema_refusal_text(&message), "{message}");
+        let from_payload =
+            bedrock_event_error_message("ValidationException", format!("{{\"message\":\"{spoof}\"}}").as_bytes());
+        assert!(
+            !crate::providers::is_tool_schema_refusal_text(&from_payload),
+            "{from_payload}"
+        );
     }
 }

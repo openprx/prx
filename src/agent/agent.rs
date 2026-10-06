@@ -1,65 +1,80 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::agent::dispatcher::{ParsedToolCall, ToolDispatcher, ToolExecutionResult};
-use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::hooks::{HookEvent, HookManager, payload_error};
-use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{Observer, ObserverEvent};
-use crate::providers::{ChatMessage, ChatRequest, ConversationMessage, Provider};
+#[path = "embedded_turn.rs"]
+mod embedded_turn;
+
+use crate::agent::dispatcher::ToolDispatcher;
+#[cfg(test)]
+use crate::agent::dispatcher::{ParsedToolCall, ToolExecutionResult};
+use crate::agent::memory_loader::{MemoryLoader, SelectedMemoryFormatter};
+use crate::agent::prompt::SystemPromptBuilder;
+use crate::hooks::HookManager;
+#[cfg(test)]
+use crate::hooks::{HookEvent, payload_error};
+use crate::memory::Memory;
+#[cfg(test)]
+use crate::memory::MemoryCategory;
+use crate::observability::Observer;
+#[cfg(test)]
+use crate::observability::ObserverEvent;
+#[cfg(test)]
+use crate::providers::ChatRequest;
+use crate::providers::{ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
-#[cfg(feature = "llm-router")]
-use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_escalate};
-use crate::runtime::control_ladder::{ControlLadderSnapshot, ControlLadderTrace, append_control_ladder_trace};
-#[cfg(feature = "llm-router")]
+use crate::runtime::control_ladder::ControlLadderSnapshot;
+#[cfg(test)]
+use crate::runtime::control_ladder::ControlLadderTrace;
+#[cfg(all(test, feature = "llm-router"))]
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
-use crate::tools::{Tool, filter_tool_specs_for_exposure};
+use crate::tools::Tool;
 use anyhow::Result;
-#[cfg(feature = "llm-router")]
+#[cfg(all(test, feature = "llm-router"))]
 use chrono::Utc;
-use std::io::Write as IoWrite;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Instant;
-#[cfg(feature = "llm-router")]
+#[cfg(all(test, feature = "llm-router"))]
 use uuid::Uuid;
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
+    embedded_binding: Option<Arc<super::embedded_source::EmbeddedAgentBinding>>,
+    runtime_generation: Option<Arc<crate::config::ConfigGeneration>>,
+    cleanup_state: embedded_turn::CleanupState,
+    security: Arc<crate::security::SecurityPolicy>,
+    mcp_tool: Option<Arc<crate::tools::McpTool>>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     /// The one gate every tool call on this shell passes through: autonomy
     /// policy, approval, published-schema validation and the audit record.
+    #[cfg(test)]
     tool_execution: Arc<crate::tools::ToolExecutionService>,
     /// Session key stamped on this agent's runtime envelope, minted once so a
     /// whole conversation audits under one key.
+    #[cfg(test)]
     session_key: String,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
+    selected_memory_formatter: Option<Box<dyn SelectedMemoryFormatter>>,
+    memory_loader: Option<Arc<dyn MemoryLoader>>,
     _config: crate::config::AgentConfig,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
-    skills: Vec<crate::skills::Skill>,
-    auto_save: bool,
     history: Vec<ConversationMessage>,
-    classification_config: crate::config::QueryClassificationConfig,
-    task_routing_config: crate::config::TaskRoutingConfig,
-    tool_tiering: crate::config::ToolTieringConfig,
-    available_hints: Vec<String>,
-    control_ladder: ControlLadderSnapshot,
     #[cfg(feature = "llm-router")]
-    model_routes: Vec<crate::config::ModelRouteConfig>,
-    #[cfg(feature = "llm-router")]
-    router: Option<RouterEngine>,
+    router: Option<Arc<RouterEngine>>,
 }
 
 pub struct AgentBuilder {
     provider: Option<Box<dyn Provider>>,
+    runtime_config: Option<(crate::config::Config, String)>,
+    route_providers: Vec<super::embedded_source::EmbeddedProviderInput>,
+    mcp_tool: Option<Arc<crate::tools::McpTool>>,
     tools: Option<Vec<Box<dyn Tool>>>,
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
@@ -67,6 +82,7 @@ pub struct AgentBuilder {
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
+    selected_memory_formatter: Option<Box<dyn SelectedMemoryFormatter>>,
     config: Option<crate::config::AgentConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
@@ -90,6 +106,9 @@ impl AgentBuilder {
     pub fn new() -> Self {
         Self {
             provider: None,
+            runtime_config: None,
+            route_providers: Vec::new(),
+            mcp_tool: None,
             tools: None,
             memory: None,
             observer: None,
@@ -97,6 +116,7 @@ impl AgentBuilder {
             prompt_builder: None,
             tool_dispatcher: None,
             memory_loader: None,
+            selected_memory_formatter: None,
             config: None,
             model_name: None,
             temperature: None,
@@ -119,6 +139,20 @@ impl AgentBuilder {
 
     pub fn provider(mut self, provider: Box<dyn Provider>) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// Supply the complete runtime configuration and the exact provider label
+    /// for an embedded Agent. Explicit builder overrides are applied before
+    /// the generation is pinned; the supplied provider instance is retained.
+    pub fn runtime_config(mut self, config: crate::config::Config, provider_name: impl Into<String>) -> Self {
+        self.runtime_config = Some((config, provider_name.into()));
+        self
+    }
+
+    /// Retain the same MCP metadata owner used by the registered tool backend.
+    pub fn mcp_tool(mut self, tool: Arc<crate::tools::McpTool>) -> Self {
+        self.mcp_tool = Some(tool);
         self
     }
 
@@ -160,8 +194,32 @@ impl AgentBuilder {
         self
     }
 
+    /// Bind an additional actual provider instance for configured model routes.
+    /// The declared selection must resolve to this exact provider connection.
+    pub fn route_provider(mut self, provider_name: String, model_name: String, provider: Box<dyn Provider>) -> Self {
+        self.route_providers
+            .push(super::embedded_source::EmbeddedProviderInput {
+                provider_name,
+                model_name,
+                provider: Arc::from(provider),
+            });
+        self
+    }
+
+    /// Run custom retrieval only after the source-bound decision selects Memory.
+    /// The callback receives a read-only view supporting bounded recall; writes,
+    /// key/list reads require migration. Explicit session filters must match
+    /// the source session. Recall returns stored ids/keys/categories/timestamps;
+    /// semantic scores and ancillary metadata are unavailable in this path.
     pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
         self.memory_loader = Some(memory_loader);
+        self
+    }
+
+    /// Customize the display of decision-selected memory without opening a
+    /// second retrieval path. Not invoked when no memory evidence is selected.
+    pub fn selected_memory_formatter(mut self, formatter: Box<dyn SelectedMemoryFormatter>) -> Self {
+        self.selected_memory_formatter = Some(formatter);
         self
     }
 
@@ -237,8 +295,77 @@ impl AgentBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Agent> {
-        let tools = Arc::new(self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?);
+    fn pin_runtime_config(&mut self) -> Result<Option<(Arc<crate::config::ConfigGeneration>, String)>> {
+        let Some((mut config, provider_name)) = self.runtime_config.take() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !provider_name.trim().is_empty(),
+            "embedded Agent requires an explicit provider label"
+        );
+        config.workspace_dir = self
+            .workspace_dir
+            .get_or_insert_with(|| config.workspace_dir.clone())
+            .clone();
+        config.agent = self.config.get_or_insert_with(|| config.agent.clone()).clone();
+        config.identity = self
+            .identity_config
+            .get_or_insert_with(|| config.identity.clone())
+            .clone();
+        config.tool_tiering = self
+            .tool_tiering
+            .get_or_insert_with(|| config.tool_tiering.clone())
+            .clone();
+        config.query_classification = self
+            .classification_config
+            .get_or_insert_with(|| config.query_classification.clone())
+            .clone();
+        config.task_routing = self
+            .task_routing_config
+            .get_or_insert_with(|| config.task_routing.clone())
+            .clone();
+        config.default_temperature = *self.temperature.get_or_insert(config.default_temperature);
+        config.memory.auto_save = *self.auto_save.get_or_insert(config.memory.auto_save);
+        let model = self
+            .model_name
+            .get_or_insert_with(|| crate::providers::selection::default_model(&config).to_owned())
+            .clone();
+        config.default_model = Some(model);
+        config.default_provider = Some(provider_name.clone());
+        #[cfg(feature = "llm-router")]
+        {
+            config.model_routes = self
+                .model_routes
+                .get_or_insert_with(|| config.model_routes.clone())
+                .clone();
+        }
+        Ok(Some((crate::config::new_shared(config).pin(), provider_name)))
+    }
+
+    pub fn build(mut self) -> Result<Agent> {
+        // Legacy callbacks cannot run outside the source-bound decision graph,
+        // and accepting them without invoking them silently changes behavior.
+        // Reject before pinning configuration or constructing runtime services.
+        anyhow::ensure!(
+            self.memory_loader.is_none() || self.runtime_config.is_some(),
+            "embedded Agent custom MemoryLoader requires runtime_config for selected retrieval"
+        );
+        if self.runtime_config.is_some() {
+            anyhow::ensure!(
+                self.skills.as_ref().is_none_or(Vec::is_empty),
+                "embedded Agent skills must come from the workspace capability catalog; injected skill bodies cannot bypass selected skill_read"
+            );
+        }
+        anyhow::ensure!(
+            self.runtime_config.is_some() || self.route_providers.is_empty(),
+            "embedded Agent route providers require runtime_config"
+        );
+        let runtime = self.pin_runtime_config()?;
+        let mut tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
+        if runtime.is_some() && !tools.iter().any(|tool| tool.name() == "capability_search") {
+            tools.push(Box::new(crate::tools::capability::search_tool::CapabilitySearchTool));
+        }
+        let tools = Arc::new(tools);
         let workspace_dir = self.workspace_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
         let hooks = self
             .hooks
@@ -250,33 +377,78 @@ impl AgentBuilder {
         // than auto-approved.
         let policy = self.security_policy.unwrap_or_else(|| {
             Arc::new(crate::security::SecurityPolicy::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &runtime
+                    .as_ref()
+                    .map(|(generation, _)| generation.effective.autonomy.clone())
+                    .unwrap_or_default(),
                 &workspace_dir,
             ))
         });
+        #[cfg(test)]
         let tool_execution = Arc::new(crate::tools::ToolExecutionService::from_shared_boxed_registry(
             Arc::clone(&tools),
-            Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
+            Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&policy))),
             Arc::new(crate::tools::DenyApprovalStrategy),
             Arc::new(crate::tools::AdapterOwnedPreparation),
             Arc::new(crate::tools::TracingToolExecutionAudit),
         ));
 
+        let provider: Arc<dyn Provider> =
+            Arc::from(self.provider.ok_or_else(|| anyhow::anyhow!("provider is required"))?);
+        let memory = self.memory.ok_or_else(|| anyhow::anyhow!("memory is required"))?;
+        #[cfg(feature = "llm-router")]
+        if let Some(router) = &self.router {
+            let (generation, provider_name) = runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("embedded Router requires runtime_config"))?;
+            router.validate_embedded_binding(&generation.effective, provider_name, &memory)?;
+        }
+        let embedded_binding = runtime
+            .as_ref()
+            .map(|(generation, provider_name)| {
+                anyhow::ensure!(
+                    policy.workspace_dir == workspace_dir,
+                    "embedded Agent security workspace differs from its pinned configuration"
+                );
+                super::embedded_source::EmbeddedAgentBinding::capture_with_providers(
+                    Arc::clone(generation),
+                    Arc::clone(&provider),
+                    (
+                        provider_name,
+                        self.model_name
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("embedded Agent runtime model is missing"))?,
+                    ),
+                    Arc::clone(&memory),
+                    std::mem::take(&mut self.route_providers),
+                )
+            })
+            .transpose()?;
+        // Legacy adapter hints are accepted for API compatibility. Shared turns
+        // obtain routes and control policy from the pinned runtime generation.
+        drop(self.available_hints);
+        drop(self.control_ladder);
         Ok(Agent {
-            provider: self.provider.ok_or_else(|| anyhow::anyhow!("provider is required"))?,
+            provider,
+            embedded_binding,
+            runtime_generation: runtime.map(|(generation, _)| generation),
+            cleanup_state: embedded_turn::CleanupState::default(),
+            security: policy,
+            mcp_tool: self.mcp_tool,
             tools,
+            #[cfg(test)]
             tool_execution,
+            #[cfg(test)]
             session_key: format!("agent:{}", uuid::Uuid::now_v7()),
-            memory: self.memory.ok_or_else(|| anyhow::anyhow!("memory is required"))?,
+            memory,
             observer: self.observer.ok_or_else(|| anyhow::anyhow!("observer is required"))?,
             hooks,
             prompt_builder: self.prompt_builder.unwrap_or_else(SystemPromptBuilder::with_defaults),
             tool_dispatcher: self
                 .tool_dispatcher
                 .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
+            selected_memory_formatter: self.selected_memory_formatter,
+            memory_loader: self.memory_loader.map(Arc::from),
             _config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
@@ -284,18 +456,9 @@ impl AgentBuilder {
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir,
             identity_config: self.identity_config.unwrap_or_default(),
-            skills: self.skills.unwrap_or_default(),
-            auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
-            classification_config: self.classification_config.unwrap_or_default(),
-            task_routing_config: self.task_routing_config.unwrap_or_default(),
-            tool_tiering: self.tool_tiering.unwrap_or_default(),
-            available_hints: self.available_hints.unwrap_or_default(),
-            control_ladder: self.control_ladder.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
-            model_routes: self.model_routes.unwrap_or_default(),
-            #[cfg(feature = "llm-router")]
-            router: self.router,
+            router: self.router.map(Arc::new),
         })
     }
 }
@@ -313,76 +476,16 @@ impl Agent {
         self.history.clear();
     }
 
-    fn append_control_ladder_trace(&self, trace: &ControlLadderTrace) {
-        if let Err(error) = append_control_ladder_trace(&self.workspace_dir, trace) {
-            tracing::warn!("failed to append control ladder trace: {error}");
-        }
-    }
-
-    fn build_system_prompt(&self) -> Result<String> {
-        self.build_system_prompt_for_model(&self.model_name)
-    }
-
-    /// Build the system prompt for an arbitrary model name rather than the agent's
-    /// statically-configured `model_name` (FIX-P1-14). When the router/Automix/
-    /// fallback selects a different model than the one the leading system message
-    /// was rendered for, the prompt must be rebuilt with the new model so the
-    /// model-specific guidance and identity are correct.
-    fn build_system_prompt_for_model(&self, model_name: &str) -> Result<String> {
-        let skills = if crate::tools::intent::core_dependency_is_available("skill_read", model_name, &self.tool_tiering)
-        {
-            self.skills.as_slice()
-        } else {
-            &[]
-        };
-        let ctx = PromptContext {
-            workspace_dir: &self.workspace_dir,
-            model_name,
-            skills,
-            identity_config: Some(&self.identity_config),
-            bootstrap_max_chars: None,
-            native_tools: self.tool_dispatcher.should_send_tool_specs(),
-        };
-        self.prompt_builder.build(&ctx)
-    }
-
-    /// Rebuild the leading `system` message in `self.history` for `effective_model`
-    /// when it differs from the agent's configured model (FIX-P1-14). The system
-    /// prompt is rendered once at turn start from `self.model_name`; if routing
-    /// then picks a different model, the leading system message would otherwise
-    /// describe the wrong model. Best-effort: a render failure leaves the existing
-    /// prompt in place rather than failing the turn.
-    fn resync_system_prompt_for_model(&mut self, effective_model: &str) {
-        // Normalize the effective model: strip a leading "provider/" so we compare
-        // and render with the bare model name the prompt builder expects.
-        let bare_model = effective_model
-            .rsplit_once('/')
-            .map_or(effective_model, |(_, model)| model);
-        if bare_model == self.model_name || bare_model.is_empty() {
-            return;
-        }
-        let new_prompt = match self.build_system_prompt_for_model(bare_model) {
-            Ok(prompt) => prompt,
-            Err(err) => {
-                tracing::warn!("failed to rebuild system prompt for switched model: {err}");
-                return;
-            }
-        };
-        // Replace the first leading system message (built at turn start) in place.
-        if let Some(ConversationMessage::Chat(chat)) = self.history.first_mut() {
-            if chat.role == "system" {
-                chat.content = new_prompt;
-                tracing::debug!(model = bare_model, "rebuilt system prompt for switched model");
-            }
-        }
-    }
-
     /// The runtime envelope this shell stamps on every tool call.
     ///
     /// The scope is deliberately *not* the local-operator tuple: nobody is at a
     /// keyboard answering for this path, so `is_local_operator` stays false and
     /// the destructive-action guard keeps refusing.
-    fn tool_execution_context(&self) -> crate::tools::ToolExecutionContext {
+    /// The execution context for tool calls answered by `model`: arguments are
+    /// validated in the dialect of the model the turn actually sent to
+    /// (after classification, routing or escalation), not the configured one.
+    #[cfg(test)]
+    fn tool_execution_context(&self, model: &str) -> crate::tools::ToolExecutionContext {
         let envelope = crate::runtime::envelope::RuntimeEnvelope::chat_terminal(
             self.workspace_dir.to_string_lossy().to_string(),
             self.session_key.clone(),
@@ -392,7 +495,7 @@ impl Agent {
         .with_channel("agent");
         crate::tools::ToolExecutionContext::new(envelope, "private")
             .with_chat_id("agent:local")
-            .with_schema_dialect(self.provider.tool_schema_dialect())
+            .with_schema_dialect(self.provider.tool_schema_dialect_for(model))
     }
 
     /// Run one parsed tool call through [`crate::tools::ToolExecutionService`].
@@ -403,10 +506,12 @@ impl Agent {
     /// record — a second execution path with its own rules. It now shares the
     /// single pipeline, so the contract a tool advertises is the contract it is
     /// held to on every entry point.
+    #[cfg(test)]
     async fn execute_tool_call(
         &self,
         call: &ParsedToolCall,
         compiled_tools: &crate::agent::turn_context::CompiledToolContext,
+        model: &str,
     ) -> ToolExecutionResult {
         let start = Instant::now();
         self.hooks
@@ -457,7 +562,7 @@ impl Agent {
         let command = crate::tools::ToolExecutionCommand::new(call.name.clone(), call.arguments.clone());
         let outcome = self
             .tool_execution
-            .execute(command, self.tool_execution_context(), None)
+            .execute(command, self.tool_execution_context(model), None)
             .await;
         let success = outcome.succeeded();
         let output = match outcome.result {
@@ -515,104 +620,15 @@ impl Agent {
         }
     }
 
-    /// Tool calls of a single iteration always run concurrently. There is no
-    /// switch that forces them back to serial: unbounded concurrency is the
-    /// runtime contract, and serialization used to be the only lane that also
-    /// dropped the execution deadline.
-    async fn execute_tools(
-        &self,
-        calls: &[ParsedToolCall],
-        compiled_tools: &crate::agent::turn_context::CompiledToolContext,
-    ) -> Vec<ToolExecutionResult> {
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call, compiled_tools))
-            .collect();
-        futures::future::join_all(futs).await
-    }
-
-    fn classify_model(&self, user_message: &str) -> String {
-        if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
-            return self.resolve_model_target(&hint);
-        }
-        self.model_name.clone()
-    }
-
-    fn resolve_model_target(&self, target: &str) -> String {
-        if self.available_hints.contains(&target.to_string()) {
-            tracing::info!(hint = target, "Auto-classified query");
-            return format!("hint:{target}");
-        }
-
-        target.to_string()
-    }
-
-    #[cfg(feature = "llm-router")]
-    fn resolve_router_target(&self, provider: &str, model: &str) -> String {
-        if let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.provider == provider && route.model == model)
-        {
-            return format!("hint:{}", route.hint);
-        }
-
-        if provider == "ollama" && model == "*" {
-            if let Some(default_model) = self
-                .model_name
-                .strip_prefix("ollama/")
-                .filter(|value| !value.is_empty())
-            {
-                return format!("{provider}/{default_model}");
-            }
-        }
-
-        format!("{provider}/{model}")
-    }
-
-    #[cfg(feature = "llm-router")]
-    fn estimate_text_tokens(text: &str) -> usize {
-        crate::agent::loop_::count_tokens(text)
-    }
-
-    /// Compact the agent's conversation history in place for context-overflow
-    /// recovery (FIX-P1-12). Mirrors the policy of
-    /// [`crate::recovery::overflow::compact_history_in_place`] but operates on
-    /// the agent's `Vec<ConversationMessage>`: a contiguous run of leading
-    /// `system` / `developer` chat messages is pinned, the most recent
-    /// `keep_recent` messages are preserved, and the oldest messages in between
-    /// are dropped. Returns the number of messages removed (0 when nothing is
-    /// safely droppable, so the caller can stop retrying).
-    fn compact_conversation_history(history: &mut Vec<ConversationMessage>, keep_recent: usize) -> usize {
-        let keep_recent = keep_recent.max(1);
-        let leading = history
-            .iter()
-            .take_while(|m| match m {
-                ConversationMessage::Chat(cm) => {
-                    let role = cm.role.as_str();
-                    role == "system" || role == "developer"
-                }
-                ConversationMessage::AssistantToolCalls { .. } | ConversationMessage::ToolResults(_) => false,
-            })
-            .count();
-        let original_len = history.len();
-        if original_len <= leading + keep_recent {
-            return 0;
-        }
-        let drop_count = original_len - leading - keep_recent;
-        if drop_count == 0 {
-            return 0;
-        }
-        history.drain(leading..leading + drop_count);
-        drop_count
-    }
-
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(test, feature = "llm-router"))]
     async fn append_router_cost_event(&self, event: &RouterCostEvent) {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let key = format!("router/cost/{date}/{}", Uuid::new_v4());
 
         if let Ok(payload) = serde_json::to_string(event) {
+            // The model targets may be `<provider label>/<model>`, and a
+            // `custom:` label may carry `user:password@`.
+            let payload = crate::providers::redact_endpoint_userinfo(&payload);
             if let Err(err) = self
                 .memory
                 .store(
@@ -628,572 +644,18 @@ impl Agent {
         }
     }
 
-    async fn spawn_delegate_task(&self, user_message: &str, sub_agent_model: Option<&str>) -> Result<String> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|tool| tool.supports_name("sessions_spawn"))
-            .ok_or_else(|| anyhow::anyhow!("sessions_spawn tool is not registered"))?;
-
-        let mut args = serde_json::json!({
-            "action": "spawn",
-            "task": user_message,
-            "mode": "process",
-        });
-
-        if let Some(model) = sub_agent_model.map(str::trim).filter(|value| !value.is_empty()) {
-            if let Some(m) = args.as_object_mut() {
-                m.insert("model".to_string(), serde_json::Value::String(model.to_string()));
-            }
-        }
-
-        let result = tool.execute_named("sessions_spawn", args).await?;
-        if !result.success {
-            anyhow::bail!(
-                "{}",
-                result
-                    .error
-                    .unwrap_or_else(|| "sessions_spawn delegation failed".to_string())
-            );
-        }
-
-        // Prefer structured run_id from JSON output; fall back to text parsing
-        // only if the tool does not return a machine-readable envelope.
-        let run_id: Option<String> = serde_json::from_str::<serde_json::Value>(&result.output).map_or(None, |json| {
-            json.get("run_id")
-                .or_else(|| json.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
-
-        let run_id = run_id.or_else(|| {
-            // Legacy text parsing — emit a warning so future regressions surface.
-            // Log only a bounded, sanitized summary to avoid leaking task content.
-            let preview: String = result.output.chars().take(80).collect();
-            tracing::warn!(
-                output_preview = preview.as_str(),
-                output_len = result.output.len(),
-                "spawn_delegate_task: run_id not found in structured output; \
-                 falling back to text parsing. Consider returning structured metadata \
-                 from sessions_spawn."
-            );
-            result
-                .output
-                .split("(run_id: ")
-                .nth(1)
-                .and_then(|rest| rest.split(')').next())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-        });
-
-        // Return a generic error — do not embed raw tool output which may
-        // contain sensitive task content or internal details.
-        run_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "spawn_delegate_task: sessions_spawn succeeded but returned no parseable \
-                 run_id. Check sessions_spawn output format."
-            )
-        })
+    // Forward the existing future without another generator/poll frame. All
+    // admission, execution and cleanup still begin only when it is polled.
+    pub fn turn(&mut self, user_message: &str) -> impl std::future::Future<Output = Result<String>> {
+        embedded_turn::run(self, user_message)
     }
 
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        #[cfg(feature = "llm-router")]
-        let turn_start = Instant::now();
-        if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(system_prompt)));
-        }
-
-        if self.auto_save && memory::should_autosave_content(user_message) {
-            let _ = self
-                .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        let context = self
-            .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
-            .await
-            .unwrap_or_default();
-
-        let enriched = if context.is_empty() {
-            user_message.to_string()
-        } else {
-            format!("{context}{user_message}")
-        };
-
-        let classify_result = super::classifier::classify_intent(&self.task_routing_config, user_message);
-        tracing::info!(
-            intent = ?classify_result.intent,
-            reason = classify_result.reason.as_str(),
-            "Task routing classified incoming message"
-        );
-        // #26: run_id must be per-turn, not per-Agent. Generate a fresh turn_id
-        // here so the control-ladder trace and memory events for this turn share
-        // one correlation id (EU AI Act Art.12 traceability).
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let control_ladder_run_id = Some(turn_id.clone());
-        let mut control_ladder_trace = self.control_ladder.build_trace("agent.turn", control_ladder_run_id);
-
-        if classify_result.intent == super::classifier::TaskIntent::Delegate {
-            // Record user message in history before delegating so follow-up
-            // turns can see that delegation happened.
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::user(enriched.clone())));
-            let task_id = self
-                .spawn_delegate_task(user_message, classify_result.model_hint.as_deref())
-                .await?;
-            let ack =
-                format!("Accepted; running in the background as task {task_id}. I will report back when it finishes.");
-            // Record acknowledgment in history as well.
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));
-            control_ladder_trace.mark_active(
-                "task_pool",
-                "delegate_task_spawned",
-                serde_json::json!({
-                    "task_id": task_id,
-                    "model_hint": classify_result.model_hint,
-                }),
-            );
-            self.append_control_ladder_trace(&control_ladder_trace);
-            return Ok(ack);
-        }
-
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        // NOTE: CTE (speculative branch prediction) is no longer assembled or
-        // consumed on this legacy `Agent` path. It was parasitically wired here
-        // (a path the live binary never executes — see agent/mod.rs `pub use
-        // loop_::run`). CTE now attaches to the active agent loop via the
-        // `AgentLoop` bootstrap profile and runs in `loop_::run`. The legacy
-        // `Agent` shell itself is slated for removal under A8.
-
-        #[allow(unused_mut)]
-        let mut effective_model = {
-            #[cfg(feature = "llm-router")]
-            {
-                if let Some(router) = &self.router {
-                    if classify_result.model_hint.is_none() {
-                        let result = router.select_model(user_message, &classify_result.intent).await;
-                        if let (Some(provider), Some(model)) =
-                            (result.chosen_provider.as_deref(), result.chosen_model.as_deref())
-                        {
-                            tracing::info!(
-                                chosen = model,
-                                provider = provider,
-                                score = result.score,
-                                "Router selected model"
-                            );
-                            control_ladder_trace.mark_active(
-                                "router",
-                                "model_selected",
-                                serde_json::json!({
-                                    "provider": provider,
-                                    "model": model,
-                                    "score": result.score,
-                                    "intent": result.intent,
-                                    "estimated_tokens": result.estimated_tokens,
-                                }),
-                            );
-                            self.resolve_router_target(provider, model)
-                        } else {
-                            control_ladder_trace.mark_fallback(
-                                "router",
-                                "router_no_candidate",
-                                serde_json::json!({
-                                    "fallback": "classifier_or_default_model",
-                                    "intent": result.intent,
-                                    "estimated_tokens": result.estimated_tokens,
-                                }),
-                            );
-                            self.classify_model(user_message)
-                        }
-                    } else if let Some(target) = classify_result.model_hint.as_deref() {
-                        control_ladder_trace.mark_skipped(
-                            "router",
-                            "explicit_model_hint",
-                            serde_json::json!({"target": target}),
-                        );
-                        self.resolve_model_target(target)
-                    } else {
-                        control_ladder_trace.mark_fallback(
-                            "router",
-                            "router_unavailable",
-                            serde_json::json!({"fallback": "classifier_or_default_model"}),
-                        );
-                        self.classify_model(user_message)
-                    }
-                } else {
-                    control_ladder_trace.mark_fallback(
-                        "router",
-                        "router_unavailable",
-                        serde_json::json!({"fallback": "classifier_or_default_model"}),
-                    );
-                    classify_result
-                        .model_hint
-                        .as_deref()
-                        .map(|target| self.resolve_model_target(target))
-                        .unwrap_or_else(|| self.classify_model(user_message))
-                }
-            }
-            #[cfg(not(feature = "llm-router"))]
-            {
-                classify_result
-                    .model_hint
-                    .as_deref()
-                    .map(|target| self.resolve_model_target(target))
-                    .unwrap_or_else(|| self.classify_model(user_message))
-            }
-        };
-        #[cfg(feature = "llm-router")]
-        let mut cost_event = RouterCostEvent::new(&effective_model);
-        // NOTE: CTE branch consumption removed from this legacy path; CTE now runs
-        // in `loop_::run` (see the note above where the prediction block was).
-
-        control_ladder_trace.mark_active(
-            "runtime",
-            "l0_turn_execution",
-            serde_json::json!({
-                "effective_model": effective_model.clone(),
-                "intent": format!("{:?}", classify_result.intent),
-            }),
-        );
-        // FIX-P1-14: routing may have resolved a model different from the one the
-        // leading system message was rendered for at turn start; rebuild the prompt
-        // for the resolved model so model-specific guidance matches what will serve
-        // the turn.
-        self.resync_system_prompt_for_model(&effective_model);
-
-        // FIX-P1-13 (#25): stamp a RouteDecision id onto the agent-turn trace so it
-        // joins the routing timeline (the chat path already does this), and persist
-        // the decision under the per-turn run id (#26) as a durable join target.
-        let (rd_provider, rd_model) = effective_model
-            .split_once('/')
-            .unwrap_or(("default", effective_model.as_str()));
-        let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-            rd_provider,
-            rd_model,
-            "owner:agent",
-            format!("agent:{turn_id}"),
-            None,
-            None,
-            "agent.turn",
-            0,
-            true,
-            false,
-        );
-        control_ladder_trace.set_decision_id(route_decision.decision_id.clone());
-        // Persist the RouteDecision under the per-turn run id (#26) so the
-        // decision_id stamped on the trace has a durable join target (FIX-P1-13 /
-        // EU AI Act Art.12). Best-effort: telemetry must never fail a turn.
-        match serde_json::to_string(&route_decision) {
-            Ok(payload) => {
-                if let Err(err) = self
-                    .memory
-                    .store(
-                        &format!("router/decision/{turn_id}"),
-                        &payload,
-                        MemoryCategory::Custom("router".to_string()),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!("failed to persist per-turn route decision: {err}");
-                }
-            }
-            Err(err) => tracing::warn!("failed to serialize route decision for turn trace: {err}"),
-        }
-
-        self.append_control_ladder_trace(&control_ladder_trace);
-
-        // Context-overflow retries on this direct path are progress-based: each
-        // retry must remove history, so a minimal history cannot spin forever.
-        loop {
-            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            // Select first, then refresh only the capabilities this turn will
-            // expose. Otherwise an unrelated direct-agent request is blocked by
-            // cold dynamic backends (notably stdio MCP servers started by npx).
-            let last_user_msg = self
-                .history
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    ConversationMessage::Chat(cm)
-                        if cm.role == "user" && !cm.content.is_empty() && !cm.content.starts_with("[Tool") =>
-                    {
-                        Some(cm.content.as_str())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            // No session-level exposure memory on this path, so an unrouted
-            // turn publishes everything operator policy allows.
-            let selected_tools = crate::tools::intent::resolve_tools_for_intent(
-                &self.tools,
-                last_user_msg,
-                &self.tool_tiering.always_include,
-                &self.tool_tiering.always_exclude,
-                crate::tools::intent::UnroutedToolPolicy::PublishEverything,
-            );
-            let selected_tools = crate::tools::intent::apply_model_tool_allowlist(
-                selected_tools,
-                &effective_model,
-                &self.tool_tiering.model_allowlists,
-            );
-            for tool in &selected_tools {
-                let _ = tool.refresh().await;
-            }
-            self.hooks
-                .emit(
-                    HookEvent::LlmRequest,
-                    serde_json::json!({
-                        "provider": "configured",
-                        "model": self.model_name,
-                        "messages_count": messages.len(),
-                    }),
-                )
-                .await;
-            let mut dynamic_tool_specs: Vec<_> =
-                crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied()).tool_specs();
-            // Agent::turn is never a smart-group-reply turn; stay_silent must not be
-            // advertised to the model on this path (expose_stay_silent = false).
-            filter_tool_specs_for_exposure(&mut dynamic_tool_specs, false);
-            let compiled_tools = crate::agent::turn_context::CompiledToolContext::new(
-                self.tool_dispatcher.should_send_tool_specs(),
-                dynamic_tool_specs,
-            );
-            compiled_tools.apply_to_messages(&mut messages);
-            #[allow(unused_mut)]
-            let mut response = match self
-                .provider
-                .chat(
-                    ChatRequest {
-                        messages: &messages,
-                        tools: compiled_tools.native_tool_specs(),
-                    },
-                    &effective_model,
-                    self.temperature,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => {
-                    // FIX-P1-12: the direct `Agent::turn` tool loop is the third
-                    // LLM-call path. It previously aborted on any error. It now
-                    // routes provider errors through the shared overflow detector
-                    // (`recovery::overflow::is_context_overflow_error`): a context
-                    // overflow compacts the oldest non-system turns out of
-                    // `self.history` and retries while compaction makes progress.
-                    // Non-overflow errors or an already-minimal history propagate.
-                    if crate::recovery::overflow::is_context_overflow_error(&err)
-                        && Self::compact_conversation_history(&mut self.history, 2) > 0
-                    {
-                        tracing::warn!("agent.turn: context overflow, compacted history and retrying");
-                        continue;
-                    }
-                    #[cfg(feature = "llm-router")]
-                    if let Some(router) = &self.router {
-                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
-                        let success = false;
-                        let latency = turn_start.elapsed().as_millis() as u64;
-                        if let Err(record_err) = router
-                            .record_outcome(user_message, &effective_model, success, latency)
-                            .await
-                        {
-                            tracing::warn!("Router record_outcome failed: {record_err}");
-                        }
-                        cost_event.primary_model = effective_model.clone();
-                        cost_event.total_cost_usd = router
-                            .model_cost_per_million_tokens(&effective_model)
-                            .map(|rate| rate * cost_event.primary_prompt_tokens as f32 / 1_000_000.0)
-                            .unwrap_or(0.0);
-                        self.append_router_cost_event(&cost_event).await;
-                    }
-                    self.hooks
-                        .emit(HookEvent::Error, payload_error("llm", &err.to_string()))
-                        .await;
-                    return Err(err);
-                }
-            };
-            self.hooks
-                .emit(
-                    HookEvent::LlmResponse,
-                    serde_json::json!({
-                        "provider": "configured",
-                        "model": self.model_name,
-                        "success": true,
-                    }),
-                )
-                .await;
-
-            #[allow(unused_mut)]
-            let mut parsed = self.tool_dispatcher.parse_response(&response);
-            #[cfg(feature = "llm-router")]
-            if parsed.1.is_empty() {
-                if let Some(router) = &self.router {
-                    if let Some(automix) = router.automix_config() {
-                        let initial_text = if parsed.0.is_empty() {
-                            response.text.clone().unwrap_or_default()
-                        } else {
-                            parsed.0.clone()
-                        };
-                        cost_event.primary_model = effective_model.clone();
-                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
-                        cost_event.primary_completion_tokens += Self::estimate_text_tokens(&initial_text);
-
-                        if !automix.premium_model_id.trim().is_empty()
-                            && is_cheap_model_target(&effective_model, &automix.cheap_model_tiers)
-                        {
-                            let confidence = ConfidenceChecker::check_rules(&initial_text, user_message);
-                            cost_event.confidence = confidence;
-
-                            if should_escalate(confidence, automix.confidence_threshold) {
-                                let premium_model = self.resolve_model_target(&automix.premium_model_id);
-                                tracing::info!(
-                                    confidence,
-                                    escalate_to = premium_model.as_str(),
-                                    "Automix: escalating to premium model"
-                                );
-                                let premium_response = match self
-                                    .provider
-                                    .chat(
-                                        ChatRequest {
-                                            messages: &messages,
-                                            tools: compiled_tools.native_tool_specs(),
-                                        },
-                                        &premium_model,
-                                        self.temperature,
-                                    )
-                                    .await
-                                {
-                                    Ok(resp) => {
-                                        cost_event.escalated = true;
-                                        cost_event.escalation_model = Some(premium_model.clone());
-                                        cost_event.escalation_prompt_tokens += Self::estimate_text_tokens(user_message);
-                                        let premium_text = resp.text.clone().unwrap_or_default();
-                                        cost_event.escalation_completion_tokens +=
-                                            Self::estimate_text_tokens(&premium_text);
-                                        effective_model = premium_model;
-                                        resp
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            model = premium_model.as_str(),
-                                            "Automix escalation failed, falling back to cheap response: {err}"
-                                        );
-                                        cost_event.escalated = false;
-                                        cost_event.escalation_failed = true;
-                                        response
-                                    }
-                                };
-                                response = premium_response;
-                                parsed = self.tool_dispatcher.parse_response(&response);
-                            } else {
-                                tracing::info!(
-                                    confidence,
-                                    threshold = automix.confidence_threshold,
-                                    "Automix: confidence sufficient"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            let (text, calls) = parsed;
-            if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(final_text.clone())));
-
-                // Note: assistant responses are intentionally NOT auto-saved here.
-                // Only user messages are persisted via auto_save to avoid storing
-                // AI-generated content as if it were factual user input.
-                self.hooks
-                    .emit(
-                        HookEvent::TurnComplete,
-                        serde_json::json!({
-                            "mode": "agent",
-                            "response_chars": final_text.chars().count(),
-                        }),
-                    )
-                    .await;
-                #[cfg(feature = "llm-router")]
-                if let Some(router) = &self.router {
-                    let success = !final_text.is_empty();
-                    let latency = turn_start.elapsed().as_millis() as u64;
-                    // d04 §7 / G3: the learning signal MUST be keyed on the model
-                    // that actually served the request, not the originally
-                    // intended model. When Automix escalates, the premium model
-                    // (`cost_event.escalation_model`) produced the final answer,
-                    // so the outcome must be attributed to it; otherwise the
-                    // un-escalated `effective_model` is the served model.
-                    let served_model: &str = if cost_event.escalated {
-                        cost_event.escalation_model.as_deref().unwrap_or(&effective_model)
-                    } else {
-                        &effective_model
-                    };
-                    if let Err(err) = router
-                        .record_outcome(user_message, served_model, success, latency)
-                        .await
-                    {
-                        tracing::warn!("Router record_outcome failed: {err}");
-                    }
-                    cost_event.total_cost_usd = router
-                        .model_cost_per_million_tokens(&cost_event.primary_model)
-                        .map(|rate| {
-                            rate * (cost_event.primary_prompt_tokens + cost_event.primary_completion_tokens) as f32
-                                / 1_000_000.0
-                        })
-                        .unwrap_or(0.0);
-                    if let Some(model) = &cost_event.escalation_model {
-                        if let Some(rate) = router.model_cost_per_million_tokens(model) {
-                            cost_event.total_cost_usd += rate
-                                * (cost_event.escalation_prompt_tokens + cost_event.escalation_completion_tokens)
-                                    as f32
-                                / 1_000_000.0;
-                        }
-                    }
-                }
-                #[cfg(feature = "llm-router")]
-                self.append_router_cost_event(&cost_event).await;
-                return Ok(final_text);
-            }
-
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(text.clone())));
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-            });
-
-            let results = self.execute_tools(&calls, &compiled_tools).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-        }
-    }
-
-    pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+    pub fn run_single(&mut self, message: &str) -> impl std::future::Future<Output = Result<String>> {
+        self.turn(message)
     }
 }
 
-#[cfg(feature = "llm-router")]
+#[cfg(all(test, feature = "llm-router"))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct RouterCostEvent {
     primary_model: String,
@@ -1208,7 +670,31 @@ struct RouterCostEvent {
     total_cost_usd: f32,
 }
 
-#[cfg(feature = "llm-router")]
+/// The `RouteDecision` a legacy agent turn stamps on its trace and persists
+/// (FIX-P1-13). The target is `<provider>/<model>`, and a `custom:` provider
+/// label may carry `user:password@`, so it is redacted before the split
+/// (INT-2B B4f): the persisted decision never holds the credential. The split
+/// at the first `/` is unchanged (it still mis-splits a `custom:` URL; the
+/// decision is a join record, not an address).
+#[cfg(test)]
+fn turn_route_decision(effective_model: &str, turn_id: &str) -> crate::llm::route_decision::RouteDecision {
+    let target = crate::providers::redact_endpoint_userinfo(effective_model);
+    let (provider, model) = target.split_once('/').unwrap_or(("default", &*target));
+    crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        provider,
+        model,
+        "owner:agent",
+        format!("agent:{turn_id}"),
+        None,
+        None,
+        "agent.turn",
+        0,
+        true,
+        false,
+    )
+}
+
+#[cfg(all(test, feature = "llm-router"))]
 impl RouterCostEvent {
     fn new(primary_model: &str) -> Self {
         Self {
@@ -1241,12 +727,14 @@ mod tests {
     use super::*;
     use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
     use crate::config::Config;
+    use crate::tools::{ToolCategory, ToolTier};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     #[cfg(feature = "llm-router")]
     use std::collections::HashMap;
     #[cfg(feature = "llm-router")]
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -1373,6 +861,639 @@ mod tests {
             .expect("agent build should succeed in test")
     }
 
+    fn embedded_builder(workspace: &std::path::Path) -> AgentBuilder {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_owned();
+        config.config_path = workspace.join("config.toml");
+        config.default_model = Some("prx-local-model".to_owned());
+        config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config.causal_tree.enabled = false;
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        Agent::builder()
+            .runtime_config(config, "ollama")
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(Vec::new())
+            .memory(Arc::new(crate::memory::SqliteMemory::new(workspace).unwrap()))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+    }
+
+    // These provider fixtures use the genuine selected Memory read at hop 0
+    // and the fresh-evidence terminal at hop 1, with a stricter hop budget.
+    fn embedded_provider_builder(workspace: &std::path::Path) -> AgentBuilder {
+        let mut builder = embedded_builder(workspace);
+        let config = &mut builder.runtime_config.as_mut().unwrap().0;
+        config.causal_tree.policy.max_decision_hops = 1;
+        // G7 requires verified NativeTools even for a selected Memory read.
+        // These declarations describe only the controlled fixture models.
+        for model in ["prx-local-model", "prx-selected-model"] {
+            config.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"ollama\"\nmodel = \"{model}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+                ))
+                .unwrap(),
+            );
+            let resolved = crate::providers::selection::check(
+                config,
+                "ollama",
+                model,
+                &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+                crate::providers::catalog::UnknownPolicy::Invocation,
+            )
+            .expect("controlled fixture model must satisfy the real PMM tool requirement");
+            assert_eq!(
+                resolved.verification(),
+                &crate::providers::catalog::Verification::Verified
+            );
+        }
+        let memory = Arc::clone(builder.memory.as_ref().unwrap());
+        builder.tools(vec![Box::new(crate::tools::memory_search::MemorySearchTool::new(
+            workspace.to_owned(),
+            memory,
+            true,
+        ))])
+    }
+
+    impl Agent {
+        // A real ingress receipt establishes the private chat scope. This
+        // anchor is not a model turn and grants no decision or execution.
+        pub(crate) async fn seed_scoped_query_memory_for_test(&self, content: &str) {
+            use crate::runtime::turn_source::TurnSourceProof;
+            let source = self
+                .embedded_binding
+                .as_ref()
+                .unwrap()
+                .record("fixture scope anchor")
+                .await
+                .unwrap();
+            let envelope = source.envelope();
+            let owner = envelope.resolved_owner_id();
+            let event = self
+                .memory
+                .find_owned_message_event(&envelope.workspace_id, &owner, source.source_event_id().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.role, "user");
+            assert_eq!(event.channel, envelope.channel);
+            assert_eq!(event.sender, envelope.sender);
+            assert_eq!(event.recipient.as_deref(), Some(envelope.session_key.as_str()));
+            assert_eq!(event.owner_id.as_deref(), Some(owner.as_str()));
+            assert_eq!(event.workspace_id, envelope.workspace_id);
+            assert_eq!(event.session_key.as_deref(), Some(envelope.session_key.as_str()));
+            let mut scope = envelope.memory_write_context("private");
+            assert_eq!(scope.chat_id.as_deref(), Some(envelope.session_key.as_str()));
+            scope.owner_id = Some(owner.clone());
+            scope.require_owner_match = true;
+            self.memory
+                .store_with_context_and_metadata(
+                    "prx_provider_fixture_note",
+                    content,
+                    MemoryCategory::Core,
+                    Some(&envelope.session_key),
+                    Some(&scope),
+                    crate::memory::MemoryStoreMetadata {
+                        workspace_id: Some(envelope.workspace_id.clone()),
+                        owner_id: Some(owner),
+                        channel: envelope.channel.clone(),
+                        source_event_id: source.source_event_id().map(str::to_owned),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    const PROVIDER_QUERY_NOTE: &str = "memory_search: Explain `2 + 2`. Explain `3 + 3`. Give a quick explanation of `2 + 2`. Explain the saved expression `2 + 2`. The expressions add integers.";
+
+    #[tokio::test]
+    async fn embedded_builder_pins_overrides_before_binding_the_actual_source() {
+        use crate::runtime::turn_source::TurnSourceProof;
+        let workspace = tempfile::tempdir().unwrap();
+        let agent = embedded_builder(workspace.path())
+            .model_name("prx-overridden-model".to_owned())
+            .build()
+            .unwrap();
+        let generation = agent.runtime_generation.as_ref().unwrap();
+        assert_eq!(
+            generation.effective.default_model.as_deref(),
+            Some("prx-overridden-model")
+        );
+        assert_eq!(agent.security.autonomy, crate::security::AutonomyLevel::ReadOnly);
+        let binding = agent.embedded_binding.as_ref().unwrap();
+        binding.verify(generation, &agent.provider, &agent.model_name).unwrap();
+        let source = binding.record("original embedded input").await.unwrap();
+        assert_eq!(source.model_name(), "prx-overridden-model");
+        assert_eq!(source.workspace_id(), workspace.path().to_string_lossy());
+        let event = agent
+            .memory
+            .find_owned_message_event(
+                source.workspace_id(),
+                source.owner_id(),
+                source.source_event_id().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.content, "original embedded input");
+        assert_eq!(event.channel.as_deref(), Some("agent_api"));
+    }
+
+    struct ModelSpy(Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait]
+    impl Provider for ModelSpy {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, model: &str, _: f64) -> Result<String> {
+            self.0.lock().unwrap().push(model.to_owned());
+            Ok("done".to_owned())
+        }
+        async fn chat(&self, _: ChatRequest<'_>, model: &str, _: f64) -> Result<crate::providers::ChatResponse> {
+            self.0.lock().unwrap().push(model.to_owned());
+            Ok(crate::providers::ChatResponse {
+                text: Some("done".to_owned()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_sends_the_selected_concrete_model_to_the_bound_provider() {
+        let workspace = tempfile::tempdir().unwrap();
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = embedded_provider_builder(workspace.path())
+            .provider(Box::new(ModelSpy(Arc::clone(&models))))
+            .classification_config(crate::config::QueryClassificationConfig {
+                rules: vec![crate::config::schema::ClassificationRule {
+                    hint: "prx-selected-model".to_owned(),
+                    keywords: vec!["quick".to_owned()],
+                    ..Default::default()
+                }],
+            });
+        builder.runtime_config.as_mut().unwrap().0.cost.prices.insert(
+            "prx-selected-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let mut agent = builder.build().unwrap();
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        assert_eq!(
+            agent
+                .turn("memory_search: Give a quick explanation of `2 + 2`.")
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(agent.turn("memory_search: Explain `3 + 3`.").await.unwrap(), "done");
+        assert_eq!(*models.lock().unwrap(), ["prx-selected-model", "prx-local-model"]);
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_routes_to_the_registered_instance_and_returns_to_default() {
+        for route_key in [None, Some("prx-test-route-key")] {
+            let workspace = tempfile::tempdir().unwrap();
+            let primary_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let routed_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let endpoint = "custom:http://127.0.0.1:19999/v1";
+            let mut builder = embedded_builder(workspace.path())
+                .provider(Box::new(ModelSpy(Arc::clone(&primary_calls))))
+                .route_provider(
+                    endpoint.to_owned(),
+                    "hint:other".to_owned(),
+                    Box::new(ModelSpy(Arc::clone(&routed_calls))),
+                )
+                .classification_config(crate::config::QueryClassificationConfig {
+                    rules: vec![crate::config::schema::ClassificationRule {
+                        hint: "other".to_owned(),
+                        keywords: vec!["switch".to_owned()],
+                        ..Default::default()
+                    }],
+                });
+            let config = &mut builder.runtime_config.as_mut().unwrap().0;
+            config.model_routes.push(crate::config::ModelRouteConfig {
+                hint: "other".to_owned(),
+                provider: endpoint.to_owned(),
+                model: "prx-other-model".to_owned(),
+                api_key: route_key.map(str::to_owned),
+                credential_ref: None,
+            });
+            config.cost.prices.insert(
+                "prx-other-model".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+            let mut agent = builder.build().unwrap();
+            assert_eq!(agent.turn("switch model").await.unwrap(), "done");
+            assert!(primary_calls.lock().unwrap().is_empty());
+            assert_eq!(*routed_calls.lock().unwrap(), ["prx-other-model"]);
+            assert_eq!(agent.turn("ordinary input").await.unwrap(), "done");
+            assert_eq!(*primary_calls.lock().unwrap(), ["prx-local-model"]);
+            assert_eq!(*routed_calls.lock().unwrap(), ["prx-other-model"]);
+            let conn = rusqlite::Connection::open_with_flags(
+                workspace.path().join("memory/brain.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = conn
+                .prepare("SELECT raw_payload_json FROM message_events WHERE event_type = 'turn.finalized' ORDER BY id")
+                .unwrap();
+            let outcomes: Vec<crate::llm::route_decision::ProviderExecutionOutcome> = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|row| {
+                    let raw = row.unwrap();
+                    assert!(!raw.contains("prx-test-route-key"));
+                    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    serde_json::from_value(payload["provider_outcome"].clone()).unwrap()
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 2);
+            for (outcome, provider, model) in [
+                (&outcomes[0], endpoint, "prx-other-model"),
+                (&outcomes[1], "ollama", "prx-local-model"),
+            ] {
+                assert_eq!(outcome.final_provider, provider);
+                assert_eq!(outcome.final_model, model);
+                assert!(!outcome.attempts.is_empty());
+                assert!(
+                    outcome
+                        .attempts
+                        .iter()
+                        .all(|attempt| attempt.provider == provider && attempt.model == model)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_builder_rejects_duplicate_provider_connections() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = embedded_builder(workspace.path())
+            .route_provider(
+                "ollama".to_owned(),
+                "prx-other-model".to_owned(),
+                Box::new(ModelSpy(Arc::new(std::sync::Mutex::new(Vec::new())))),
+            )
+            .build();
+        assert!(matches!(result, Err(error) if error.to_string().contains("connection is already bound")));
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_does_not_invoke_formatter_without_selected_memory() {
+        struct UnexpectedFormatter;
+        impl SelectedMemoryFormatter for UnexpectedFormatter {
+            fn format_context(&self, _: &[&str]) -> Result<String> {
+                anyhow::bail!("formatter must not run without admitted memory")
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = embedded_builder(workspace.path())
+            .selected_memory_formatter(Box::new(UnexpectedFormatter))
+            .build()
+            .unwrap();
+        assert_eq!(agent.turn("hello").await.unwrap(), "done");
+    }
+
+    #[test]
+    fn embedded_builder_rejects_unpublished_skill_bodies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill = crate::skills::Skill {
+            name: "prx_fixture_skill".to_owned(),
+            description: "Fixture capability".to_owned(),
+            version: "1".to_owned(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["PRX_UNSELECTED_SKILL_BODY".to_owned()],
+            location: None,
+            embedding: None,
+        };
+        let result = embedded_builder(workspace.path()).skills(vec![skill]).build();
+        assert!(matches!(result, Err(error) if error.to_string().contains("workspace capability catalog")));
+        assert!(embedded_builder(workspace.path()).skills(Vec::new()).build().is_ok());
+    }
+
+    #[test]
+    fn embedded_builder_rejects_ignored_custom_memory_loader() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = embedded_builder(workspace.path())
+            .memory_loader(Box::new(RecalledBrowserContextLoader))
+            .build();
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("custom MemoryLoader requires selected-retrieval integration"))
+        );
+        // Reject before even resolving required fields in the legacy builder.
+        let result = Agent::builder()
+            .memory_loader(Box::new(RecalledBrowserContextLoader))
+            .build();
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("custom MemoryLoader requires selected-retrieval integration"))
+        );
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn embedded_builder_rejects_ignored_injected_router() {
+        let workspace = tempfile::tempdir().unwrap();
+        let router = RouterEngine::new(
+            automix_router_config(true),
+            "openai".to_owned(),
+            Vec::new(),
+            Arc::new(TestMemory::default()),
+            None,
+        )
+        .await
+        .unwrap();
+        let result = embedded_builder(workspace.path()).router(router).build();
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("injected RouterEngine requires source-bound model routing integration"))
+        );
+    }
+
+    #[test]
+    fn embedded_builder_rejects_security_policy_from_another_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            other.path(),
+        ));
+        let result = embedded_builder(workspace.path()).security_policy(policy).build();
+        assert!(matches!(result, Err(error) if error.to_string().contains("security workspace differs")));
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_requires_runtime_authority_before_mutating_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_over(&workspace, Vec::new());
+        let error = agent.turn("unbound input").await.unwrap_err();
+        assert!(error.to_string().contains("AgentBuilder::runtime_config"));
+        assert!(agent.history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_uses_shared_execution_across_two_source_bound_turns() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = embedded_provider_builder(workspace.path()).build().unwrap();
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        let source = agent
+            .embedded_binding
+            .as_ref()
+            .unwrap()
+            .record("fixture scope anchor")
+            .await
+            .unwrap();
+        let principal = source.envelope().memory_principal();
+        for (index, input) in ["memory_search: Explain `2 + 2`.", "memory_search: Explain `3 + 3`."]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(agent.turn(input).await.unwrap(), "done");
+            let events = agent
+                .memory
+                .list_message_events_since(&principal, 0, 100)
+                .await
+                .unwrap();
+            let terminals: Vec<_> = events
+                .iter()
+                .filter(|event| event.event_type == "turn.finalized")
+                .collect();
+            assert_eq!(terminals.len(), index + 1);
+            let terminal = terminals.iter().max_by_key(|event| event.id).unwrap();
+            let payload: serde_json::Value =
+                serde_json::from_str(terminal.raw_payload_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                payload["history"]["history_commit_len"].as_u64(),
+                Some(agent.history().len() as u64)
+            );
+        }
+        let history = agent.tool_dispatcher.to_provider_messages(agent.history());
+        assert_eq!(history.iter().filter(|message| message.role == "user").count(), 2);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == "done")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_next_turn_waits_for_cancelled_turn_cleanup() {
+        struct HoldingProvider {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+            ticket: Arc<std::sync::Mutex<Option<crate::runtime::turn_cleanup::CleanupTicket>>>,
+        }
+        impl HoldingProvider {
+            async fn reply(&self) -> Result<String> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let owner = crate::runtime::turn_cleanup::current_tracker().unwrap();
+                    *self.ticket.lock().unwrap() = Some(owner.register(tokio_util::sync::CancellationToken::new())?);
+                    self.entered.notify_one();
+                    std::future::pending().await
+                } else {
+                    Ok("done".to_owned())
+                }
+            }
+        }
+        #[async_trait]
+        impl Provider for HoldingProvider {
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> Result<String> {
+                self.reply().await
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> Result<crate::providers::ChatResponse> {
+                Ok(crate::providers::ChatResponse {
+                    text: Some(self.reply().await?),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let ticket = Arc::new(std::sync::Mutex::new(None));
+        let mut agent = embedded_provider_builder(workspace.path())
+            .provider(Box::new(HoldingProvider {
+                calls: Arc::clone(&calls),
+                entered: Arc::clone(&entered),
+                ticket: Arc::clone(&ticket),
+            }))
+            .build()
+            .unwrap();
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        let parent =
+            crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new()).unwrap();
+        parent
+            .run(async {
+                {
+                    let first = agent.turn("memory_search: Explain `2 + 2`.");
+                    tokio::pin!(first);
+                    tokio::select! {
+                        result = &mut first => panic!("first provider should remain pending: {result:?}"),
+                        reached = tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()) => {
+                            reached.expect("first provider entry");
+                        }
+                    }
+                }
+                let second = agent.turn("memory_search: Explain `3 + 3`.");
+                tokio::pin!(second);
+                assert!(futures::poll!(&mut second).is_pending());
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                ticket
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("pending cleanup ticket")
+                    .finish(true);
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(10), &mut second)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    "done"
+                );
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_embedded_turn_preserves_the_inflight_user_history() {
+        const INPUT: &str = "memory_search: Explain the saved expression `2 + 2`.";
+        struct WaitingProvider {
+            entered: Arc<tokio::sync::Notify>,
+            user_messages: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Provider for WaitingProvider {
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> Result<String> {
+                anyhow::bail!("fixture requires the actual provider message request")
+            }
+            async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> Result<crate::providers::ChatResponse> {
+                self.user_messages.lock().push(
+                    request
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .unwrap()
+                        .content
+                        .clone(),
+                );
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let user_messages = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = embedded_provider_builder(workspace.path())
+            .provider(Box::new(WaitingProvider {
+                entered: Arc::clone(&entered),
+                user_messages: Arc::clone(&user_messages),
+            }))
+            .build()
+            .unwrap();
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        // A real non-model ingress supplies this same Agent's exact read scope.
+        let anchor = agent
+            .embedded_binding
+            .as_ref()
+            .unwrap()
+            .record("fixture raw source scope")
+            .await
+            .unwrap();
+        let principal = anchor.envelope().memory_principal();
+        let cleanup =
+            crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new()).unwrap();
+        cleanup
+            .run(async {
+                {
+                    let turn = agent.turn(INPUT);
+                    tokio::pin!(turn);
+                    tokio::select! {
+                        result = &mut turn => panic!("provider should still be pending: {result:?}"),
+                        reached = tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()) => {
+                            reached.expect("actual provider entry before dropping turn");
+                        }
+                    }
+                    // Drop the pending turn, without returning from its await.
+                }
+                let history = agent.tool_dispatcher.to_provider_messages(agent.history());
+                assert_eq!(history.iter().filter(|message| message.role == "user").count(), 1);
+                let captured = user_messages.lock().clone();
+                assert_eq!(captured.len(), 1, "exactly one actual provider request");
+                assert!(captured[0].ends_with(INPUT));
+                assert_ne!(captured[0], INPUT, "the genuine selected-memory context is retained");
+                assert_eq!(
+                    history.iter().find(|message| message.role == "user").unwrap().content,
+                    captured[0]
+                );
+                let events = agent
+                    .memory
+                    .list_message_events_since(&principal, 0, 100)
+                    .await
+                    .unwrap();
+                let inputs: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.role == "user" && event.content == INPUT)
+                    .collect();
+                assert_eq!(
+                    inputs.len(),
+                    1,
+                    "the actual durable source retains raw input exactly once"
+                );
+                assert_eq!(inputs[0].event_type, "message.created");
+                assert!(history.iter().all(|message| message.role != "assistant"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedded_turn_promotes_only_original_user_input_when_enabled() {
+        let input = "The project uses a weekly release schedule with a separate review window.";
+        for enabled in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent = embedded_builder(workspace.path()).auto_save(enabled).build().unwrap();
+            assert_eq!(agent.turn(input).await.unwrap(), "done");
+            let entries = agent
+                .memory
+                .list(Some(&MemoryCategory::Conversation), None)
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), usize::from(enabled));
+            if enabled {
+                assert!(entries[0].key.starts_with("user_msg:"));
+                assert_eq!(entries[0].content, input);
+                assert!(entries[0].session_id.as_deref().unwrap().starts_with("agent_api:"));
+            }
+        }
+    }
+
     fn all_tools_exposed(agent: &Agent) -> crate::agent::turn_context::CompiledToolContext {
         crate::agent::turn_context::CompiledToolContext::new(
             false,
@@ -1401,7 +1522,7 @@ mod tests {
         };
 
         let compiled_tools = all_tools_exposed(&agent);
-        let result = agent.execute_tool_call(&call, &compiled_tools).await;
+        let result = agent.execute_tool_call(&call, &compiled_tools, &agent.model_name).await;
 
         assert!(result.success, "tool should execute: {}", result.output);
         assert!(
@@ -1492,7 +1613,7 @@ mod tests {
                 arguments,
                 tool_call_id: None,
             };
-            let result = agent.execute_tool_call(&call, &compiled_tools).await;
+            let result = agent.execute_tool_call(&call, &compiled_tools, &agent.model_name).await;
             assert!(!result.success, "contract violation must fail: {}", result.output);
             assert!(
                 result.output.contains(expected),
@@ -1518,10 +1639,133 @@ mod tests {
                 arguments,
                 tool_call_id: None,
             };
-            let result = agent.execute_tool_call(&call, &compiled_tools).await;
+            let result = agent.execute_tool_call(&call, &compiled_tools, &agent.model_name).await;
             assert!(result.success, "valid call must run: {}", result.output);
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// INT-2B USERINFO-3, RED before: when the router picked a model, the
+    /// legacy agent logged the provider label raw and wrote it raw into the
+    /// control-ladder trace, so a `custom:` URL with `user:password@` reached
+    /// the log and `runtime/control_ladder_traces.*.jsonl`. After: both carry
+    /// the redacted label.
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn a_router_selection_never_logs_or_traces_url_userinfo() {
+        // Log-capturing tests share per-callsite interest process-wide.
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        const LABEL: &str = "custom:http://u:AGENT-ROUTER-SECRET-pw@127.0.0.1:1/v1";
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let router_config = crate::config::RouterConfig {
+            models: vec![crate::config::RouterModelConfig {
+                model_id: "model-a".into(),
+                provider: LABEL.into(),
+                cost_per_million_tokens: 1.0,
+                max_context: 128_000,
+                reserved_output_tokens: None,
+                latency_ms: 1_000,
+                categories: vec!["conversation".into(), "analysis".into()],
+                elo_rating: 1_500.0,
+            }],
+            ..crate::config::RouterConfig::default()
+        };
+        let router = crate::router::RouterEngine::new(router_config, LABEL.into(), Vec::new(), Arc::clone(&mem), None)
+            .await
+            .expect("test: router");
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .control_ladder(ControlLadderSnapshot::from_config(&config))
+            .router(router)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let _ = agent.turn("hello, please analyse this").await;
+
+        // The trace proves the router branch ran (deterministic); the log
+        // capture can miss events another test's subscriber shaped, so the
+        // log is checked for absence only.
+        let traces: String = std::fs::read_dir(workspace.path().join("runtime"))
+            .expect("test: runtime trace dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+            .collect();
+        assert!(traces.contains("model_selected"), "the router branch ran: {traces}");
+        assert!(!traces.contains("AGENT-ROUTER-SECRET-pw"), "{traces}");
+        let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+        assert!(!logs.contains("AGENT-ROUTER-SECRET-pw"), "{logs}");
+        // Nothing the turn stored (memory, router metrics, cost events)
+        // carries it either.
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut stored = Vec::new();
+        files(workspace.path(), &mut stored);
+        for path in stored {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("AGENT-ROUTER-SECRET-pw"),
+                "{} carries the password",
+                path.display()
+            );
+        }
+    }
+
+    /// INT-2B B4f (R-INT2BB4 L-3), RED before: the per-turn route decision
+    /// was built from the raw `<provider>/<model>` target, so a `custom:`
+    /// label's `user:password@` would be persisted with it (the write fails
+    /// today for an unrelated reason, but the payload was already built).
+    /// After: the payload never holds it.
+    #[test]
+    fn the_turn_route_decision_payload_carries_no_url_userinfo() {
+        let decision = turn_route_decision("custom:http://u:RD-SECRET-pw@127.0.0.1:1/v1/model-a", "turn-1");
+        let payload = serde_json::to_string(&decision).expect("test: serialize");
+        assert!(!payload.contains("RD-SECRET-pw"), "{payload}");
+        assert!(payload.contains("[redacted]@127.0.0.1:1"), "{payload}");
+        let plain = serde_json::to_string(&turn_route_decision("openrouter/model-b", "turn-2")).expect("test");
+        assert!(plain.contains("openrouter") && plain.contains("model-b"), "{plain}");
     }
 
     #[tokio::test]
@@ -1630,6 +1874,396 @@ mod tests {
                 .history()
                 .iter()
                 .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
+        );
+    }
+
+    /// A native-tool mock whose wire document is Gemini's (no `minimum`) for
+    /// the classified model `hint:fast` and raw otherwise.
+    struct PerModelDialectMock {
+        responses: Mutex<Vec<crate::providers::ChatResponse>>,
+    }
+
+    #[async_trait]
+    impl Provider for PerModelDialectMock {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+            if model == "hint:fast" {
+                crate::tools::ToolSchemaDialect::Gemini
+            } else {
+                crate::tools::ToolSchemaDialect::Raw
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            let mut guard = self.responses.lock();
+            if guard.is_empty() {
+                return Ok(crate::providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                });
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    struct BoundedTool {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for BoundedTool {
+        fn name(&self) -> &str {
+            "bounded_probe"
+        }
+
+        fn description(&self) -> &str {
+            "probe"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1}},
+                "required": ["limit"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// D-065 L-1: the shell validates a tool call in the dialect of the model
+    /// it actually sent the turn to (here the classified `hint:fast`), not
+    /// the configured `model_name`. That model was shown the Gemini document
+    /// (no `minimum`), so `{"limit": 0}` is a valid call and runs.
+    #[tokio::test]
+    async fn turn_validates_tool_calls_in_the_dialect_of_the_model_it_sent_to() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Box::new(PerModelDialectMock {
+            responses: Mutex::new(vec![
+                crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "bounded_probe".into(),
+                        arguments: "{\"limit\": 0}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+                crate::providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                },
+            ]),
+        });
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(BoundedTool {
+                executions: Arc::clone(&executions),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("base-model".to_string())
+            .classification_config(crate::config::QueryClassificationConfig {
+                rules: vec![crate::config::schema::ClassificationRule {
+                    hint: "fast".to_string(),
+                    keywords: vec!["probe".to_string()],
+                    ..crate::config::schema::ClassificationRule::default()
+                }],
+            })
+            .available_hints(vec!["fast".to_string()])
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = agent.turn("run the probe").await.unwrap();
+        assert_eq!(response, "done");
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a call valid against the document the served model was shown was refused"
+        );
+    }
+
+    /// A loader that always recalls a line naming the browser/MCP surface, so
+    /// the enriched user message and the turn's own text disagree about which
+    /// capabilities this turn wants.
+    struct RecalledBrowserContextLoader;
+
+    #[async_trait]
+    impl MemoryLoader for RecalledBrowserContextLoader {
+        async fn load_context(&self, _memory: &dyn Memory, _user_message: &str) -> Result<String> {
+            Ok("Relevant memory from an older turn: use MCP to operate the browser.\n\n".to_string())
+        }
+    }
+
+    struct RefreshCountingTool {
+        name: &'static str,
+        category: ToolCategory,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for RefreshCountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counts dynamic capability refreshes"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+
+        async fn refresh(&self) -> Result<()> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Extended
+        }
+
+        fn categories(&self) -> &'static [ToolCategory] {
+            match self.category {
+                ToolCategory::System => &[ToolCategory::System],
+                ToolCategory::Automation => &[ToolCategory::Automation],
+                _ => &[],
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_selected_memory_preserves_original_source_input() {
+        use crate::runtime::turn_source::TurnSourceProof;
+
+        struct SourceContextProvider;
+        #[async_trait]
+        impl Provider for SourceContextProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> Result<String> {
+                anyhow::bail!("fixture requires structured provider messages")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+            ) -> Result<crate::providers::ChatResponse> {
+                let user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .unwrap();
+                assert!(user.content.contains("PRX_RECALLED_BROWSER_INSTRUCTION"));
+                assert!(user.content.ends_with("Find the archived project note."));
+                let specs = request.tools.expect("native tool surface must be supplied");
+                assert!(!specs.is_empty());
+                assert!(specs.iter().all(|spec| spec.name != "mcp_probe"));
+                Ok(crate::providers::ChatResponse {
+                    text: Some("done".to_owned()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut builder = embedded_builder(workspace.path());
+        let config = &mut builder.runtime_config.as_mut().unwrap().0;
+        config.memory.auto_save = false;
+        config.tool_tiering.always_exclude.push("mcp_probe".to_owned());
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let memory = Arc::clone(builder.memory.as_ref().unwrap());
+        let envelope =
+            crate::runtime::envelope::RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_fixture_seed")
+                .with_channel("agent_api")
+                .with_sender("embedded-caller");
+        let owner = envelope.resolved_owner_id();
+        let mut scope = envelope.memory_write_context("private");
+        scope.owner_id = Some(owner.clone());
+        scope.require_owner_match = true;
+        memory
+            .store_with_context_and_metadata(
+                "prx_source_separation",
+                "Archived project note: PRX_RECALLED_BROWSER_INSTRUCTION use MCP to operate the browser.",
+                MemoryCategory::Core,
+                None,
+                Some(&scope),
+                crate::memory::MemoryStoreMetadata {
+                    workspace_id: Some(envelope.workspace_id.clone()),
+                    owner_id: Some(owner),
+                    channel: Some("agent_api".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let mut agent = builder
+            .provider(Box::new(SourceContextProvider))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .tools(vec![
+                Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                    workspace.path().to_owned(),
+                    Arc::clone(&memory),
+                    true,
+                )),
+                Box::new(RefreshCountingTool {
+                    name: "mcp_probe",
+                    category: ToolCategory::Automation,
+                    refreshes: Arc::clone(&refreshes),
+                }),
+            ])
+            .build()
+            .unwrap();
+        let input = "Find the archived project note.";
+        // The anchor supplies the exact owner/session read principal; it does
+        // not supply the input or any recalled text to the subsequent turn.
+        let anchor = agent
+            .embedded_binding
+            .as_ref()
+            .unwrap()
+            .record("fixture anchor")
+            .await
+            .unwrap();
+        let principal = anchor.envelope().memory_principal();
+        assert_eq!(agent.turn(input).await.unwrap(), "done");
+        let events = memory.list_message_events_since(&principal, 0, 100).await.unwrap();
+        let inputs: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "message.created"
+                    && event.role == "user"
+                    && event.event_id != anchor.source_event_id().unwrap()
+            })
+            .collect();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].content, input);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_turn_routes_on_the_user_message_parameter() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_refreshes = Arc::new(AtomicUsize::new(0));
+        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("test: memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![
+                Box::new(RefreshCountingTool {
+                    name: "skill_probe",
+                    category: ToolCategory::System,
+                    refreshes: Arc::clone(&skill_refreshes),
+                }),
+                Box::new(RefreshCountingTool {
+                    name: "mcp_probe",
+                    category: ToolCategory::Automation,
+                    refreshes: Arc::clone(&mcp_refreshes),
+                }),
+            ])
+            .memory(mem)
+            .observer(observer)
+            .memory_loader(Box::new(RecalledBrowserContextLoader))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("test: agent builder should succeed with valid config");
+
+        let response = agent
+            .turn("use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
+            .await
+            .unwrap();
+
+        assert_eq!(response, "done");
+        assert_eq!(
+            skill_refreshes.load(Ordering::SeqCst),
+            1,
+            "the turn's own text asks for the skill surface, so it must be published"
+        );
+        assert_eq!(
+            mcp_refreshes.load(Ordering::SeqCst),
+            0,
+            "Agent::turn must not acquire the MCP/browser surface from the recalled preamble its own \
+             enrichment pushed into the history"
         );
     }
 
@@ -2109,3 +2743,6 @@ mod tests {
         assert_eq!(unique_keys.len(), 5);
     }
 }
+
+#[cfg(all(test, feature = "llm-router"))]
+mod automix_integration_tests;

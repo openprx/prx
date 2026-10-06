@@ -1,46 +1,13 @@
 //! Privacy sanitization and output truncation for session persistence.
 //!
 //! Applied before storing chat sessions to avoid persisting secrets
-//! or excessively large tool outputs.
+//! or excessively large tool outputs. Secrets are redacted by the one
+//! redactor, [`crate::security::redaction`]; this module adds chat's caps.
 
-use regex::Regex;
-use std::sync::LazyLock;
+use crate::security::redaction::redact_secrets;
 
 /// Maximum tool output size (bytes) before truncation.
 const MAX_TOOL_OUTPUT_BYTES: usize = 10 * 1024; // 10KB
-
-/// Patterns that look like secrets (API keys, tokens, passwords).
-static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    // These patterns are intentionally broad — false positives are acceptable
-    // because redaction in persisted sessions is a safety measure.
-    [
-        r"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|bearer)\s*[:=]\s*\S{8,}",
-        r"(?i)(password|passwd|pwd)\s*[:=]\s*\S{4,}",
-        r#"(?i)\"(password|passwd|pwd)\"\s*:\s*\"[^\"]+\""#,
-        r"(?i)authorization\s*:\s*bearer\s+\S+",
-        r"sk-proj-[a-zA-Z0-9_-]{16,}",
-        r"sk-[a-zA-Z0-9]{20,}",      // OpenAI-style keys
-        r"sk-ant-[a-zA-Z0-9-]{20,}", // Anthropic keys
-        r"ghp_[a-zA-Z0-9]{36}",      // GitHub PAT
-        r"gho_[a-zA-Z0-9]{36}",      // GitHub OAuth
-        r"glpat-[a-zA-Z0-9_-]{20,}", // GitLab PAT
-        r"xoxb-[a-zA-Z0-9-]+",       // Slack bot tokens
-        r"xoxp-[a-zA-Z0-9-]+",       // Slack user tokens
-        r"AKIA[0-9A-Z]{16}",         // AWS access key IDs
-    ]
-    .iter()
-    .filter_map(|p| Regex::new(p).ok())
-    .collect()
-});
-
-/// Redact known secret patterns in text.
-pub fn redact_secrets(text: &str) -> String {
-    let mut result = text.to_string();
-    for pattern in SECRET_PATTERNS.iter() {
-        result = pattern.replace_all(&result, "[REDACTED]").to_string();
-    }
-    result
-}
 
 /// Truncate content if it exceeds the maximum size, appending a hash reference.
 pub fn truncate_large_output(content: &str) -> String {
@@ -85,41 +52,18 @@ pub fn sanitize_text_or_json(content: &str) -> String {
     }
 }
 
-fn sensitive_json_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase();
-    [
-        "password",
-        "passwd",
-        "pwd",
-        "authorization",
-        "api_key",
-        "api-key",
-        "token",
-        "secret",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+/// Redact every JSON string and credential-named value (the one redactor),
+/// then cap each string like stored session content.
+pub fn sanitize_json_value(value: &mut serde_json::Value) {
+    crate::security::redaction::redact_json_value(value);
+    cap_json_strings(value);
 }
 
-/// Recursively sanitize every JSON string while replacing values under
-/// sensitive keys even when the value is too short to match a token pattern.
-pub fn sanitize_json_value(value: &mut serde_json::Value) {
+fn cap_json_strings(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object {
-                if sensitive_json_key(key) && child.is_string() {
-                    *child = serde_json::Value::String("[REDACTED]".to_string());
-                } else {
-                    sanitize_json_value(child);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sanitize_json_value(item);
-            }
-        }
-        serde_json::Value::String(text) => *text = sanitize_for_persistence(text),
+        serde_json::Value::Object(object) => object.values_mut().for_each(cap_json_strings),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(cap_json_strings),
+        serde_json::Value::String(text) => *text = truncate_large_output(text),
         _ => {}
     }
 }

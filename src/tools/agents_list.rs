@@ -71,7 +71,8 @@ impl Tool for AgentsListTool {
                 };
                 format!(
                     "• **{name}**{agentic_tag}\n  Identity dir: {identity_dir}\n  Spawn enabled: {spawn_enabled}{model_line}\n  Provider: {}\n  Max depth: {}",
-                    cfg.provider, cfg.max_depth
+                    crate::providers::redact_endpoint_userinfo(&cfg.provider),
+                    cfg.max_depth
                 )
             })
             .collect();
@@ -109,6 +110,7 @@ mod tests {
             model: model.to_string(),
             system_prompt: None,
             api_key: None,
+            credential_ref: None,
             temperature: None,
             max_depth: 3,
             agentic: false,

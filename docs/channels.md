@@ -113,6 +113,20 @@ refreshed throughout. Both are reports: neither can end anything.
 
 ## Tools On Channel Turns
 
+In the current local candidate, an admitted channel input is recorded before
+its source-bound decision. Smart-group pre-gates still run first. Selected
+Memory/Document/Session evidence supplies enrichment; recalled text does not
+replace the original input or grant tools. Provider execution consumes the
+same constrained decision and execution bindings as other admitted surfaces.
+This is candidate behavior, with full entrypoint parity still under verification.
+
+Approval requirements are durable and bound to the original owner, session,
+operation and capability definition. A channel without an authenticated
+approval surface leaves the action pending or refuses it. A conversational
+reply such as "yes" does not manufacture a grant, and lack of an approval UI
+does not authorize automatic execution. Review/revoke/resume behavior is
+specified in the [decision-plane reference](decision-plane.md).
+
 A channel message is written by a conversation partner, not by the operator at
 the host, so a channel turn runs under a narrower tool policy than terminal chat
 or the gateway. On top of ordinary per-turn capability routing, the
@@ -214,3 +228,22 @@ an `activity` object:
 ✅ channel:linq fresh (18s ago, push-only, idle 903s)
 ❌ channel:telegram listener stalled (no receive activity for 240s)
 ```
+
+## Signal image preflight availability
+
+Signal image preflight checks outbound authorization and identity-notice
+acknowledgement before preparing image inputs or making an extra request. The
+admitted turn supplies its actual selected provider, original deadline and
+remaining token/money allowance. Supported physical transports reserve each send
+and retain unknown liability across timeout or cancellation. A main-turn decision
+alone is not a reusable permit for this additional request.
+
+Preparation and sending obey cancellation and the original deadline. A valid
+report requires status `ok`, a finite confidence of at least 0.60 and a nonempty
+summary. Its context remains untrusted user content; the recorded original input
+is preserved. Refusal, incomplete reports and unsupported transports keep the
+existing uncertainty fallback. Non-image messages retain their normal path.
+
+The terminal owner retains auxiliary observations and their physical accounting
+scope. Aggregate vision traces do not create a second cost charge. This candidate
+still requires real scoped validation and fixed-budget acceptance.

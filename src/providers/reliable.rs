@@ -19,9 +19,21 @@ use std::time::Duration;
 // the retry loop continues, falls back to the next provider, or aborts
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
+/// Whether `err` is a tool-schema refusal: the endpoint's declared dialect
+/// cannot carry a tool the request offered, so nothing was sent.
+///
+/// Typed, never matched on text: the refusal is deterministic, and a text
+/// heuristic both missed it (it was retried with backoff) and could
+/// misclassify an unrelated error whose tool or model name happened to
+/// contain a matching word.
+fn is_tool_schema_refusal(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<super::ToolSchemaRefusalError>().is_some())
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
-    if is_context_window_exceeded(err) {
+    if is_context_window_exceeded(err) || is_tool_schema_refusal(err) {
         return true;
     }
 
@@ -269,10 +281,115 @@ const fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str
 }
 
 fn compact_error_detail(err: &anyhow::Error) -> String {
-    super::sanitize_api_error(&err.to_string())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // A tool-schema refusal carries no upstream body, only tool names,
+    // keywords, the model and the (redacted) provider label, and every part of
+    // it is needed to act on it: the 200-character clip used to cut the tool
+    // list and always cut the configuration to add. It is scrubbed but not
+    // clipped.
+    // Likewise the declaration hint on an upstream root-combinator
+    // rejection: the upstream body is clipped as usual, the hint is kept.
+    let detail = if is_tool_schema_refusal(err) {
+        crate::security::redaction::redact_secrets(&err.to_string())
+    } else if let Some(rejection) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::compatible::RootCombinatorRejection>())
+    {
+        format!(
+            "{}{}",
+            super::sanitize_api_error(&rejection.upstream),
+            crate::security::redaction::redact_secrets(&rejection.hint)
+        )
+    } else {
+        super::sanitize_api_error(&err.to_string())
+    };
+    detail.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A failover chain that ran out of candidates.
+///
+/// Its rendering is the all-failed summary every caller already printed. It
+/// also carries, typed, the tool-schema refusal, when every attempt the chain
+/// made was refused: that is a configuration problem an operator has to fix,
+/// not a transient failure, and the surfaces above the provider (channels,
+/// the gateway) report it differently without matching text. A chain in
+/// which any tried candidate failed for another reason (a 503 before or
+/// after the refusal) carries no refusal, so that failure is what is
+/// reported (SP-INT2 a52, D-069 L-1); the summary still lists every attempt.
+#[derive(Debug, thiserror::Error)]
+#[error("{summary}")]
+pub struct ProviderChainFailure {
+    summary: String,
+    tool_schema_refusal: Option<super::ToolSchemaRefusalError>,
+}
+
+impl ProviderChainFailure {
+    /// The tool-schema refusal that ended this chain: every attempt it made
+    /// was refused.
+    #[must_use]
+    pub const fn tool_schema_refusal(&self) -> Option<&super::ToolSchemaRefusalError> {
+        self.tool_schema_refusal.as_ref()
+    }
+}
+
+/// One member of a failover chain: its display name, its unique key and its
+/// provider, kept together so they can never fall out of step.
+struct ChainMember {
+    /// The label as it may be printed: URL userinfo redacted. Every log line,
+    /// record, summary and telemetry entry names the member by this.
+    name: Arc<str>,
+    /// The key its refusals and rate-limit cool-down are kept under
+    /// ([`member_key`]). The display name is not enough: two labels that
+    /// differ only in URL userinfo print the same, but are two providers.
+    /// In-process only: never printed, recorded or persisted.
+    key: Arc<str>,
+    provider: Arc<dyn Provider>,
+}
+
+/// The key a chain member's refusals and rate-limit cool-down are kept under.
+///
+/// A label without URL userinfo is its own display name, and that is its key,
+/// as before. A label with userinfo is displayed redacted, and two labels that
+/// differ only in their userinfo (two accounts on one host) redact to the same
+/// display name while being two providers (SP-INT2 a50). Such a label is keyed
+/// by its display name plus a fingerprint of the full label: a hash salted
+/// per process, so it is stable across the chains of one process (the
+/// rate-limit gate is shared) and says nothing about the credential. The
+/// `reliability.api_keys` rotation instances carry the same label, so they
+/// share their primary's key, which is what D-020 Q2 wants.
+fn member_key(label: &str, display: &Arc<str>) -> Arc<str> {
+    use std::hash::BuildHasher as _;
+    static SALT: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+        std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+    if label == display.as_ref() {
+        return Arc::clone(display);
+    }
+    Arc::from(format!("{display}#{:016x}", SALT.hash_one(label)))
+}
+
+/// The candidates a tool-schema refusal already ruled out, by member key
+/// ([`member_key`]) and model.
+///
+/// The refusal is decided before transport from the provider's declaration for
+/// the model, so every chain entry with the same label and model — the
+/// `reliability.api_keys` rotation instances are such entries — would refuse
+/// the same request again (D-020 Q2). A different provider (including one
+/// that differs only in its URL userinfo), or a different model of the same
+/// provider, may accept it and is still tried.
+#[derive(Debug, Default)]
+struct RefusedCandidates(Vec<(Arc<str>, String)>);
+
+impl RefusedCandidates {
+    fn contains(&self, member_key: &str, model: &str) -> bool {
+        self.0
+            .iter()
+            .any(|(refused, refused_model)| refused.as_ref() == member_key && refused_model == model)
+    }
+
+    fn insert(&mut self, member_key: &Arc<str>, model: &str) {
+        if !self.contains(member_key, model) {
+            self.0.push((Arc::clone(member_key), model.to_string()));
+        }
+    }
 }
 
 fn push_failure(
@@ -344,7 +461,7 @@ pub struct ReliableProvider {
     // return `'static` streams, so the driver cannot borrow `self`). Non-stream
     // call sites continue to use the providers via `Deref` to `dyn Provider`,
     // so behavior is unchanged for them.
-    providers: Vec<(Arc<str>, Arc<dyn Provider>)>,
+    providers: Vec<ChainMember>,
     max_retries: u32,
     base_backoff_ms: u64,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
@@ -361,13 +478,26 @@ pub struct ReliableProvider {
 }
 
 impl ReliableProvider {
+    /// Build a chain over `providers`, tried in order.
+    ///
+    /// Each name is the label the provider was configured under, and is
+    /// stored with any URL userinfo redacted (`custom:http://[redacted]@host`).
+    /// The chain only ever prints, logs, records or keys its cool-down by that
+    /// name; the real URL, credential included, stays inside the provider's
+    /// transport. Redacting here, once, is what keeps every failed-attempt
+    /// line, the all-failed summary, every `tracing` field, the warmup log and
+    /// every `ProviderAttempt` free of it.
     pub fn new(providers: Vec<(String, Box<dyn Provider>)>, max_retries: u32, base_backoff_ms: u64) -> Self {
         let providers = providers
             .into_iter()
-            .map(|(name, provider)| {
-                let name: Arc<str> = Arc::from(name);
-                let provider: Arc<dyn Provider> = Arc::from(provider);
-                (name, provider)
+            .map(|(label, provider)| {
+                let name: Arc<str> = Arc::from(super::redact_endpoint_userinfo(&label));
+                let key = member_key(&label, &name);
+                ChainMember {
+                    name,
+                    key,
+                    provider: Arc::from(provider),
+                }
             })
             .collect();
         Self {
@@ -394,20 +524,57 @@ impl ReliableProvider {
     }
 
     /// Attach provider availability failures captured during startup.
+    ///
+    /// Both the label and the reason are printed in the all-failed summary,
+    /// and a reason may quote the label, so both are redacted like the chain's
+    /// own names.
     pub fn with_unavailable_providers(mut self, unavailable: Vec<(String, String)>) -> Self {
-        self.unavailable_providers = unavailable;
+        self.unavailable_providers = unavailable
+            .into_iter()
+            .map(|(name, reason)| {
+                (
+                    super::redact_endpoint_userinfo(&name).into_owned(),
+                    super::redact_endpoint_userinfo(&reason).into_owned(),
+                )
+            })
+            .collect();
         self
     }
 
-    fn provider_model_compatible(&self, provider_name: &str, model: &str) -> bool {
-        super::provider_matches_model_prefix(provider_name, model)
+    /// Whether chain member `provider_name` may serve `model`.
+    ///
+    /// The route belongs to the chain's primary member. A self-hosted model
+    /// server (llama.cpp) serves whatever repository it is configured for:
+    /// on its own route any model (D-075); as a fallback member only a
+    /// `model_fallbacks` entry that explicitly names a model repository, never
+    /// the route's requested model and never a bare id or a `<provider>/…`
+    /// model routed to another provider (D-076 N-1). Every other member keeps
+    /// the model-prefix check; the primary serving the requested model uses
+    /// the configured-model rule.
+    fn provider_model_compatible(&self, provider_name: &str, model: &str, requested: &str) -> bool {
+        let primary = self
+            .providers
+            .first()
+            .is_some_and(|member| member.name.as_ref() == provider_name);
+        if super::is_self_hosted_model_server(provider_name) {
+            return if primary {
+                super::provider_serves_configured_model(provider_name, model)
+            } else {
+                model != requested && super::names_model_repository(model)
+            };
+        }
+        if primary && model == requested {
+            super::provider_serves_configured_model(provider_name, model)
+        } else {
+            super::provider_matches_model_prefix(provider_name, model)
+        }
     }
 
     fn all_failed_message(&self, failures: &[String], runtime_unavailable: &[(String, String)]) -> String {
         let available = self
             .providers
             .iter()
-            .map(|(name, _)| name.to_string())
+            .map(|member| member.name.to_string())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -464,7 +631,7 @@ impl ReliableProvider {
                 // Still publish the real cool-down: other in-flight requests
                 // must not keep hammering a provider that just asked for a very
                 // long pause, even though this request gives up on it.
-                self.rate_limit_gate.note_rate_limited(ctx.provider_name, requested_ms);
+                self.rate_limit_gate.note_rate_limited(ctx.gate_key, requested_ms);
                 false
             }
             RetryWait::Sleep(wait) => {
@@ -479,7 +646,7 @@ impl ReliableProvider {
                     "Provider call failed, retrying"
                 );
                 if ctx.rate_limited {
-                    self.rate_limit_gate.note_rate_limited(ctx.provider_name, wait);
+                    self.rate_limit_gate.note_rate_limited(ctx.gate_key, wait);
                 }
                 tokio::time::sleep(Duration::from_millis(wait)).await;
                 true
@@ -487,9 +654,10 @@ impl ReliableProvider {
         }
     }
 
-    /// Park until the shared cool-down for `provider_name` has elapsed.
-    async fn await_rate_limit_gate(&self, provider_name: &str, model: &str) {
-        if let Some(deferred_ms) = self.rate_limit_gate.wait_until_clear(provider_name).await {
+    /// Park until the shared cool-down of the member keyed `gate_key` (named
+    /// `provider_name` in logs) has elapsed.
+    async fn await_rate_limit_gate(&self, provider_name: &str, gate_key: &str, model: &str) {
+        if let Some(deferred_ms) = self.rate_limit_gate.wait_until_clear(gate_key, provider_name).await {
             tracing::warn!(
                 provider = provider_name,
                 model,
@@ -514,6 +682,8 @@ enum RetryWait {
 /// non-streaming failover loops call an identical code path.
 struct RetryContext<'a> {
     provider_name: &'a str,
+    /// The member's rate-limit gate key ([`member_key`]).
+    gate_key: &'a str,
     model: &'a str,
     /// 1-based attempt number that just failed.
     attempt: u32,
@@ -546,15 +716,33 @@ fn plan_wait_from_hint(base: u64, hint_ms: Option<u64>) -> RetryWait {
 
 #[async_trait]
 impl Provider for ReliableProvider {
+    fn accounting_targets(&self, model: &str) -> Option<super::AccountingTargets> {
+        let mut targets = super::AccountingTargets::empty();
+        for current_model in self.model_chain(model) {
+            for member in &self.providers {
+                if self.provider_model_compatible(&member.name, current_model, model)
+                    && let Some(descriptor) = member.provider.accounting_targets(current_model)
+                {
+                    targets.append_member(descriptor, &member.name);
+                }
+            }
+        }
+        targets.nonempty()
+    }
+
+    fn supports_attempt_accounting(&self) -> bool {
+        true
+    }
+
     fn capabilities_for(&self, model: &str, mode: ProviderRequestMode) -> ProviderCapabilities {
         let mut matched = self
             .providers
             .iter()
-            .filter(|(name, provider)| {
-                self.provider_model_compatible(name, model)
-                    && (mode == ProviderRequestMode::NonStreaming || provider.supports_streaming())
+            .filter(|member| {
+                self.provider_model_compatible(&member.name, model, model)
+                    && (mode == ProviderRequestMode::NonStreaming || member.provider.supports_streaming())
             })
-            .map(|(_, provider)| provider.capabilities_for(model, mode));
+            .map(|member| member.provider.capabilities_for(model, mode));
         let Some(first) = matched.next() else {
             return ProviderCapabilities::default();
         };
@@ -566,8 +754,52 @@ impl Provider for ReliableProvider {
         })
     }
 
+    /// Forward the dialect of the providers in the chain.
+    ///
+    /// Without this override the chain inherits the trait default `Raw`, and a
+    /// Gemini turn behind a failover chain is validated against the twenty
+    /// keywords `clean_for_gemini` removed on the way out — rejecting calls the
+    /// model was never shown the constraints for.
+    ///
+    /// A chain whose members all declare one dialect resolves to it exactly.
+    /// A mixed chain resolves to `Raw` (see
+    /// [`unanimous_dialect`](super::traits::unanimous_dialect)).
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        super::traits::unanimous_dialect(
+            self.providers
+                .iter()
+                .map(|member| member.provider.tool_schema_dialect()),
+        )
+    }
+
+    /// The dialect of every (member, model) pair that may serve `model`:
+    /// each member for `model` and for each of its model fallbacks. Exact
+    /// when they agree, `Raw` when they do not.
+    fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+        let models = self.model_chain(model);
+        super::traits::unanimous_dialect(self.providers.iter().flat_map(|member| {
+            models
+                .iter()
+                .map(move |candidate| member.provider.tool_schema_dialect_for(candidate))
+        }))
+    }
+
+    /// The member that served: its own dialect for `model`.
+    ///
+    /// `member` is matched against the unique member keys first, so two
+    /// members whose labels differ only in their password answer for
+    /// themselves (D-068 (2)); a display name is matched as before, for a
+    /// trace that carries no member key.
+    fn tool_schema_dialect_of_member(&self, member: &str, model: &str) -> Option<crate::tools::ToolSchemaDialect> {
+        self.providers
+            .iter()
+            .find(|candidate| &*candidate.key == member)
+            .or_else(|| self.providers.iter().find(|candidate| &*candidate.name == member))
+            .map(|candidate| candidate.provider.tool_schema_dialect_for(model))
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
-        for (name, provider) in &self.providers {
+        for ChainMember { name, provider, .. } in &self.providers {
             tracing::info!(provider = %name, "Warming up provider connection pool");
             if provider.warmup().await.is_err() {
                 tracing::warn!(provider = %name, "Warmup failed (non-fatal)");
@@ -592,8 +824,13 @@ impl Provider for ReliableProvider {
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
-                if !self.provider_model_compatible(provider_name, current_model) {
+            for ChainMember {
+                name: provider_name,
+                key: member_key,
+                provider,
+            } in &self.providers
+            {
+                if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
@@ -607,7 +844,8 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
-                    self.await_rate_limit_gate(provider_name, current_model).await;
+                    self.await_rate_limit_gate(provider_name, member_key, current_model)
+                        .await;
                     match provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
@@ -666,6 +904,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let ctx = RetryContext {
                                     provider_name,
+                                    gate_key: member_key,
                                     model: current_model,
                                     attempt: attempt + 1,
                                     failure_reason,
@@ -684,7 +923,7 @@ impl Provider for ReliableProvider {
                                 let hint = parse_retry_after_ms(&e);
                                 rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
                                 self.rate_limit_gate.note_rate_limited(
-                                    provider_name,
+                                    member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                             }
@@ -731,8 +970,13 @@ impl Provider for ReliableProvider {
         let mut runtime_unavailable = Vec::new();
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
-                if !self.provider_model_compatible(provider_name, current_model) {
+            for ChainMember {
+                name: provider_name,
+                key: member_key,
+                provider,
+            } in &self.providers
+            {
+                if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
@@ -746,7 +990,8 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
-                    self.await_rate_limit_gate(provider_name, current_model).await;
+                    self.await_rate_limit_gate(provider_name, member_key, current_model)
+                        .await;
                     match provider.chat_with_history(messages, current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
@@ -802,6 +1047,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let ctx = RetryContext {
                                     provider_name,
+                                    gate_key: member_key,
                                     model: current_model,
                                     attempt: attempt + 1,
                                     failure_reason,
@@ -820,7 +1066,7 @@ impl Provider for ReliableProvider {
                                 let hint = parse_retry_after_ms(&e);
                                 rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
                                 self.rate_limit_gate.note_rate_limited(
-                                    provider_name,
+                                    member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                             }
@@ -873,14 +1119,29 @@ impl Provider for ReliableProvider {
         // even when an uncapped `provider_retries` pushes the bounded failover
         // space past 255; `saturating_add` is then effectively non-saturating.
         let mut seq: u32 = 0;
+        let mut refused = RefusedCandidates::default();
+        // The chain is reported as refused only when every attempt it made
+        // was refused (SP-INT2 a52, D-069 L-1): if any tried candidate failed
+        // for another reason (a 503, say), that failure class is what the
+        // caller reports, since sending again may then succeed.
+        let mut chain_refusal: Option<super::ToolSchemaRefusalError> = None;
+        let mut every_failure_refused = true;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
-                if !self.provider_model_compatible(provider_name, current_model) {
+            for ChainMember {
+                name: provider_name,
+                key: member_key,
+                provider,
+            } in &self.providers
+            {
+                if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
                     ));
+                    continue;
+                }
+                if refused.contains(member_key, current_model) {
                     continue;
                 }
 
@@ -890,7 +1151,9 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
-                    self.await_rate_limit_gate(provider_name, current_model).await;
+                    super::attempt_accounting::ensure_supported(provider.as_ref())?;
+                    self.await_rate_limit_gate(provider_name, member_key, current_model)
+                        .await;
                     let attempt_started_at = chrono::Utc::now();
                     match provider.chat_traced(request, current_model, temperature).await {
                         Ok(trace) => {
@@ -920,16 +1183,29 @@ impl Provider for ReliableProvider {
                                 attempts,
                                 final_provider: provider_name.to_string(),
                                 final_model: (*current_model).to_string(),
+                                served_member: Some(member_key.to_string()),
                                 tokens_used: trace.tokens_used,
                             });
                         }
                         Err(e) => {
+                            if super::attempt_accounting::is_local_refusal(&e) {
+                                return Err(e);
+                            }
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
                             rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
+                            let failure_refusal = e
+                                .chain()
+                                .find_map(|cause| cause.downcast_ref::<super::ToolSchemaRefusalError>());
+                            match failure_refusal {
+                                Some(refusal) => {
+                                    chain_refusal.get_or_insert_with(|| refusal.clone());
+                                }
+                                None => every_failure_refused = false,
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -965,12 +1241,17 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                if failure_refusal.is_some() {
+                                    refused.insert(member_key, current_model);
+                                }
+
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let ctx = RetryContext {
                                     provider_name,
+                                    gate_key: member_key,
                                     model: current_model,
                                     attempt: attempt + 1,
                                     failure_reason,
@@ -989,7 +1270,7 @@ impl Provider for ReliableProvider {
                                 let hint = parse_retry_after_ms(&e);
                                 rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
                                 self.rate_limit_gate.note_rate_limited(
-                                    provider_name,
+                                    member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                             }
@@ -1014,7 +1295,11 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
+        Err(ProviderChainFailure {
+            summary: self.all_failed_message(&failures, &runtime_unavailable),
+            tool_schema_refusal: chain_refusal.filter(|_| every_failure_refused),
+        }
+        .into())
     }
 
     async fn chat_with_decision(
@@ -1049,11 +1334,11 @@ impl Provider for ReliableProvider {
     fn supports_native_tools(&self) -> bool {
         self.providers
             .iter()
-            .any(|(_, provider)| provider.supports_native_tools())
+            .any(|member| member.provider.supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers.iter().any(|(_, provider)| provider.supports_vision())
+        self.providers.iter().any(|member| member.provider.supports_vision())
     }
 
     async fn chat_with_tools(
@@ -1068,8 +1353,13 @@ impl Provider for ReliableProvider {
         let mut runtime_unavailable = Vec::new();
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
-                if !self.provider_model_compatible(provider_name, current_model) {
+            for ChainMember {
+                name: provider_name,
+                key: member_key,
+                provider,
+            } in &self.providers
+            {
+                if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
@@ -1083,7 +1373,8 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
-                    self.await_rate_limit_gate(provider_name, current_model).await;
+                    self.await_rate_limit_gate(provider_name, member_key, current_model)
+                        .await;
                     match provider
                         .chat_with_tools(messages, tools, current_model, temperature)
                         .await
@@ -1142,6 +1433,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let ctx = RetryContext {
                                     provider_name,
+                                    gate_key: member_key,
                                     model: current_model,
                                     attempt: attempt + 1,
                                     failure_reason,
@@ -1160,7 +1452,7 @@ impl Provider for ReliableProvider {
                                 let hint = parse_retry_after_ms(&e);
                                 rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
                                 self.rate_limit_gate.note_rate_limited(
-                                    provider_name,
+                                    member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                             }
@@ -1189,7 +1481,7 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        self.providers.iter().any(|(_, p)| p.supports_streaming())
+        self.providers.iter().any(|member| member.provider.supports_streaming())
     }
 
     /// Stream with full failover parity to the non-streaming path.
@@ -1264,15 +1556,21 @@ impl ReliableProvider {
         }
         let mut attempts = Vec::new();
         for current_model in self.model_chain(model) {
-            for (provider_name, provider) in &self.providers {
+            for ChainMember {
+                name: provider_name,
+                key: member_key,
+                provider,
+            } in &self.providers
+            {
                 if !provider.supports_streaming() {
                     continue;
                 }
-                if !self.provider_model_compatible(provider_name, current_model) {
+                if !self.provider_model_compatible(provider_name, current_model, model) {
                     continue;
                 }
                 attempts.push(StreamAttempt {
                     provider_name: Arc::clone(provider_name),
+                    member_key: Arc::clone(member_key),
                     provider: Arc::clone(provider),
                     model: current_model.to_string(),
                 });
@@ -1285,6 +1583,9 @@ impl ReliableProvider {
 /// One candidate (provider, model) pair for a streaming request.
 struct StreamAttempt {
     provider_name: Arc<str>,
+    /// Refusals and the rate-limit cool-down are keyed by this
+    /// ([`member_key`]), never by the display name.
+    member_key: Arc<str>,
     provider: Arc<dyn Provider>,
     model: String,
 }
@@ -1315,11 +1616,106 @@ impl StreamFailureClass {
     }
 }
 
+/// Start of the error PRX builds when a stream reports a content-filter stop.
+/// Providers build it only from structured fields (`finish_reason:
+/// content_filter`, or an in-stream error whose `code`/`type` names the
+/// filter), never from upstream prose.
+pub(crate) const CONTENT_FILTER_STOP_PREFIX: &str = "content filter stop";
+
+/// Start of the error PRX builds when a streamed tool-call index exceeds the
+/// supported maximum.
+pub(crate) const TOOL_CALL_INDEX_LIMIT_PREFIX: &str = "streamed tool-call index over the limit";
+
+/// The error for a content-filter stop reported by `provider`.
+pub(crate) fn content_filter_stop(provider: &str, detail: &str) -> super::traits::StreamError {
+    super::traits::StreamError::Provider(format!("{CONTENT_FILTER_STOP_PREFIX} ({provider}): {detail}"))
+}
+
+/// The error for a streamed tool-call index above `max`.
+pub(crate) fn tool_call_index_over_limit(provider: &str, index: usize, max: usize) -> super::traits::StreamError {
+    super::traits::StreamError::InvalidSse(format!(
+        "{TOOL_CALL_INDEX_LIMIT_PREFIX} ({provider}): index {index} exceeds the supported maximum {max}"
+    ))
+}
+
+/// The error for an in-stream `{"error": {...}}` object reported by `provider`.
+///
+/// The label comes from `type`, else `code` (a string code without its JSON
+/// quotes), and is limited to 64 identifier characters; the message is capped
+/// at 300 characters. A `code`/`type` of `content_filter` or
+/// `content_policy_violation` is a content-filter stop.
+pub(crate) fn in_stream_error_object(
+    provider: &str,
+    kind: Option<String>,
+    code: Option<serde_json::Value>,
+    message: Option<String>,
+) -> super::traits::StreamError {
+    let code = code.map(|code| match code {
+        serde_json::Value::String(code) => code,
+        other => other.to_string(),
+    });
+    let is_filter = [kind.as_deref(), code.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| matches!(value, "content_filter" | "content_policy_violation"));
+    let label: String = kind
+        .or(code)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .take(64)
+        .collect();
+    let label = if label.is_empty() {
+        "unknown_error".to_string()
+    } else {
+        label
+    };
+    let message: String = message.unwrap_or_default().chars().take(300).collect();
+    if is_filter {
+        content_filter_stop(provider, &format!("error {label}: {message}"))
+    } else {
+        super::traits::StreamError::Provider(format!("{provider} stream error ({label}): {message}"))
+    }
+}
+
+/// Deterministic pre-content failures that PRX itself detected from
+/// structured stream fields. Retrying the same provider in place cannot change
+/// the outcome, so these skip only the in-place retry; another candidate may
+/// still succeed (filters and parsers differ by provider), so fallback stays.
+///
+/// Matched by the PRX-built prefix at the start of the message, never by a
+/// phrase anywhere in upstream text.
+fn skips_in_place_retry(err: &super::traits::StreamError) -> bool {
+    use super::traits::StreamError;
+    match err {
+        StreamError::Provider(message) => message.starts_with(CONTENT_FILTER_STOP_PREFIX),
+        StreamError::InvalidSse(message) => message.starts_with(TOOL_CALL_INDEX_LIMIT_PREFIX),
+        _ => false,
+    }
+}
+
+/// Whether a stream error is PRX's own tool-schema refusal: a provider
+/// message that is a rendered refusal ([`super::is_tool_schema_refusal_text`]).
+fn stream_error_is_tool_schema_refusal(err: &super::traits::StreamError) -> bool {
+    matches!(err, super::traits::StreamError::Provider(message) if super::is_tool_schema_refusal_text(message))
+}
+
 /// Classify a [`StreamError`] for failover decisions. Reuses the same
 /// string/`reqwest` heuristics as the non-streaming path by routing through the
 /// shared `anyhow` classifiers where possible.
 fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass {
     use super::traits::StreamError;
+
+    // A failure PRX detected from structured stream fields (a content-filter
+    // stop, a tool-call index over the limit) is classified by what it is:
+    // deterministic for this candidate, so no in-place retry, and worth a
+    // fallback. Its message quotes upstream text (the filter's own words, the
+    // index), which the prose heuristics below would misread: `(403)` or
+    // "invalid model" in a filter message ended the whole chain, and a
+    // tool-call index of 404 or 429 read as an HTTP status (COMPATf F-1).
+    if skips_in_place_retry(err) {
+        return StreamFailureClass::Retryable;
+    }
 
     // Structured rate-limit (FIX-P0-33): a 429 is rate-limited; a 503 is a
     // transient server failure worth retrying/falling back. Both already carry
@@ -1373,6 +1769,13 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
         // rather than panicking.
         StreamError::Http(_) | StreamError::RateLimited { .. } => return StreamFailureClass::Retryable,
     };
+    // The stream boundary carries errors as text, so a tool-schema refusal is
+    // recognised by the refusal's own rendering at the start of a provider
+    // message, never by the marker anywhere in upstream text (SP-INT2 a51).
+    // It is deterministic: retrying the same provider cannot help.
+    if stream_error_is_tool_schema_refusal(err) {
+        return StreamFailureClass::NonRetryable;
+    }
     let anyhow_err = anyhow::anyhow!("{message}");
 
     if is_context_window_exceeded(&anyhow_err) {
@@ -1442,7 +1845,9 @@ fn no_streaming_provider_stream() -> stream::BoxStream<'static, StreamResult<Str
 /// 3. Otherwise, if the first chunk is an error that
 ///    [allows fallback](StreamFailureClass::allows_fallback) and another viable
 ///    candidate remains, moves on (context-overflow only falls back to a
-///    *different* model). Otherwise the error is surfaced.
+///    *different* model). A tool-schema refusal also moves on, and its
+///    member and model are skipped from then on, as on the buffered path.
+///    Otherwise the error is surfaced.
 /// 4. Once content has started, forwards the remaining chunks verbatim — a
 ///    mid-content error is never swallowed (switching providers would corrupt
 ///    the already-emitted response). FIX-P0-33: mid-stream **resume** (retrying
@@ -1464,12 +1869,20 @@ where
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    tokio::spawn(async move {
+    crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
         let total = attempts.len();
+        // The last failure that was not a tool-schema refusal, and the last
+        // refusal. A refusal is surfaced only when no tried candidate failed
+        // for another reason, as on the buffered path (D-069 L-1).
         let mut last_error: Option<super::traits::StreamError> = None;
+        let mut last_refusal: Option<super::traits::StreamError> = None;
         let mut attempt_seq = 0_u32;
+        let mut refused = RefusedCandidates::default();
 
         for (index, attempt) in attempts.iter().enumerate() {
+            if refused.contains(&attempt.member_key, &attempt.model) {
+                continue;
+            }
             let is_last = index + 1 == total;
             // For context overflow, only a *different* model is worth trying.
             let next_model_differs = attempts.get(index + 1).is_some_and(|next| next.model != attempt.model);
@@ -1484,7 +1897,7 @@ where
             let mut rate_limited_seen = false;
 
             'candidate: loop {
-                if let Some(deferred_ms) = gate.wait_until_clear(&attempt.provider_name).await {
+                if let Some(deferred_ms) = gate.wait_until_clear(&attempt.member_key, &attempt.provider_name).await {
                     tracing::warn!(
                         provider = %attempt.provider_name,
                         model = %attempt.model,
@@ -1498,7 +1911,19 @@ where
                 let mut emitted_content = false;
                 let mut success_reported = false;
 
-                while let Some(chunk) = stream.next().await {
+                loop {
+                    // Stop as soon as nobody consumes the stream (the turn
+                    // ended, for example by the idle guard): dropping the inner
+                    // stream lets the provider task release its connection.
+                    // Waiting for the next chunk would hold both for as long
+                    // as a silent server stays silent.
+                    let next = tokio::select! {
+                        () = tx.closed() => return,
+                        next = stream.next() => next,
+                    };
+                    let Some(chunk) = next else {
+                        break;
+                    };
                     match chunk {
                         Ok(mut content) => {
                             if !emitted_content && rate_limited_seen {
@@ -1516,6 +1941,7 @@ where
                                     error_class: None,
                                     error_message: None,
                                 });
+                                content.served_member = Some(attempt.member_key.to_string());
                                 success_reported = true;
                             }
                             if tx.send(Ok(content)).await.is_err() {
@@ -1550,6 +1976,15 @@ where
 
                             // Pre-content failure: classify and decide.
                             let class = classify_stream_error(&err);
+                            // A tool-schema refusal is decided before transport,
+                            // so nothing was emitted: like the buffered chain, it
+                            // is never retried against this member and model, and
+                            // it fails over to the next candidate, which lowers
+                            // the schema in its own dialect (D-020 Q2, D-068 (3)).
+                            let tool_schema_refusal = stream_error_is_tool_schema_refusal(&err);
+                            if tool_schema_refusal {
+                                refused.insert(&attempt.member_key, &attempt.model);
+                            }
                             let failed_attempt = ProviderAttempt {
                                 seq: attempt_seq,
                                 provider: attempt.provider_name.to_string(),
@@ -1591,6 +2026,7 @@ where
                             }
                             let retry_in_place =
                                 matches!(class, StreamFailureClass::RateLimited | StreamFailureClass::Retryable)
+                                    && !skips_in_place_retry(&err)
                                     && pre_content_retries < max_retries;
 
                             if retry_in_place {
@@ -1606,7 +2042,7 @@ where
                                             "Streaming failure before content; backing off and retrying same provider/model: {err}"
                                         );
                                         if rate_limited {
-                                            gate.note_rate_limited(&attempt.provider_name, wait);
+                                            gate.note_rate_limited(&attempt.member_key, wait);
                                         }
                                         // Interruptible sleep: bail out early if the
                                         // receiver has gone away rather than waiting
@@ -1628,7 +2064,7 @@ where
                                             max_honored_ms = MAX_HONORED_RETRY_AFTER_MS,
                                             "Upstream Retry-After exceeds the honored ceiling; not retrying this candidate in place"
                                         );
-                                        gate.note_rate_limited(&attempt.provider_name, requested_ms);
+                                        gate.note_rate_limited(&attempt.member_key, requested_ms);
                                     }
                                 }
                             }
@@ -1638,7 +2074,7 @@ where
                                 // Publish the cool-down even though this request
                                 // stops here, so concurrent streams defer too.
                                 gate.note_rate_limited(
-                                    &attempt.provider_name,
+                                    &attempt.member_key,
                                     hint_ms.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                                 tracing::error!(
@@ -1650,7 +2086,7 @@ where
                             }
 
                             let can_fallback = !is_last
-                                && class.allows_fallback()
+                                && (class.allows_fallback() || tool_schema_refusal)
                                 && (class != StreamFailureClass::ContextOverflow || next_model_differs);
 
                             if can_fallback {
@@ -1660,7 +2096,11 @@ where
                                     ?class,
                                     "Streaming attempt failed before content; falling back to next candidate: {err}"
                                 );
-                                last_error = Some(err);
+                                if tool_schema_refusal {
+                                    last_refusal = Some(err);
+                                } else {
+                                    last_error = Some(err);
+                                }
                                 break 'candidate; // Try next candidate.
                             }
 
@@ -1670,7 +2110,15 @@ where
                                 ?class,
                                 "Streaming attempt failed with no viable failover; surfacing: {err}"
                             );
-                            let _ = tx.send(Err(err)).await;
+                            // A refusal after another candidate's transient
+                            // failure is not what ended the request for good:
+                            // the earlier failure is surfaced instead.
+                            let surfaced = if tool_schema_refusal {
+                                last_error.take().unwrap_or(err)
+                            } else {
+                                err
+                            };
+                            let _ = tx.send(Err(surfaced)).await;
                             return;
                         }
                     }
@@ -1689,7 +2137,9 @@ where
                             error_class: None,
                             error_message: None,
                         };
-                        let _ = tx.send(Ok(StreamChunk::route_attempt(success))).await;
+                        let mut chunk = StreamChunk::route_attempt(success);
+                        chunk.served_member = Some(attempt.member_key.to_string());
+                        let _ = tx.send(Ok(chunk)).await;
                     }
                     return;
                 }
@@ -1713,9 +2163,10 @@ where
             }
         }
 
-        // All candidates exhausted without content. Surface the last error if we
-        // captured one, otherwise a generic aggregate failure.
-        let final_err = last_error.unwrap_or_else(|| {
+        // All candidates exhausted without content. Surface the last failure
+        // that was not a refusal if there was one, else the last refusal,
+        // otherwise a generic aggregate failure.
+        let final_err = last_error.or(last_refusal).unwrap_or_else(|| {
             super::traits::StreamError::Provider("All streaming providers/models failed".to_string())
         });
         let _ = tx.send(Err(final_err)).await;
@@ -1830,6 +2281,7 @@ mod tests {
                 }],
                 final_provider: "metered-mock".to_string(),
                 final_model: model.to_string(),
+                served_member: None,
                 tokens_used: self.usage.clone(),
             })
         }
@@ -3378,6 +3830,165 @@ mod tests {
         assert_eq!(calls_anthropic.load(Ordering::SeqCst), 0);
     }
 
+    fn counting_mock(calls: &Arc<AtomicUsize>, fail: bool, response: &'static str) -> Box<dyn Provider> {
+        Box::new(MockProvider {
+            calls: Arc::clone(calls),
+            fail_until_attempt: if fail { usize::MAX } else { 0 },
+            response,
+            error: "500 upstream down",
+        })
+    }
+
+    /// D-072 L-9 / D-075, RED before (B5 made llama.cpp accept any model
+    /// everywhere): a llama.cpp *fallback* answered an Anthropic route after
+    /// Anthropic failed, with whatever model the server had loaded. After: a
+    /// llama.cpp member answers only its own route.
+    #[tokio::test]
+    async fn a_llamacpp_fallback_never_answers_for_another_familys_model() {
+        let calls_anthropic = Arc::new(AtomicUsize::new(0));
+        let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                ("anthropic".into(), counting_mock(&calls_anthropic, true, "never")),
+                ("llamacpp".into(), counting_mock(&calls_llamacpp, false, "local answer")),
+            ],
+            0,
+            1,
+        );
+        let err = provider
+            .simple_chat("hello", "anthropic/claude-sonnet-5", 0.0)
+            .await
+            .expect_err("the local fallback must not answer for Anthropic's model");
+        assert!(err.to_string().contains("not compatible with provider"), "{err}");
+        assert_eq!(calls_anthropic.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 0);
+    }
+
+    fn openai_then_llamacpp(
+        calls_openai: &Arc<AtomicUsize>,
+        calls_llamacpp: &Arc<AtomicUsize>,
+        fallbacks: &[&str],
+    ) -> ReliableProvider {
+        ReliableProvider::new(
+            vec![
+                ("openai".into(), counting_mock(calls_openai, true, "never")),
+                ("llamacpp".into(), counting_mock(calls_llamacpp, false, "local answer")),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(HashMap::from([(
+            "gpt-5".to_string(),
+            fallbacks.iter().map(ToString::to_string).collect(),
+        )]))
+    }
+
+    /// D-076 N-1, RED before (D-075 made a llama.cpp fallback serve nothing):
+    /// a `model_fallbacks` entry that names a model repository is served by
+    /// the llama.cpp fallback when the route's provider fails. Reviewer probe
+    /// `[openai(fail), llamacpp]`, `{"gpt-5": ["ggml-org/gpt-oss-20b-GGUF"]}`.
+    #[tokio::test]
+    async fn a_llamacpp_fallback_serves_a_repository_named_in_model_fallbacks() {
+        let calls_openai = Arc::new(AtomicUsize::new(0));
+        let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+        let provider = openai_then_llamacpp(&calls_openai, &calls_llamacpp, &["ggml-org/gpt-oss-20b-GGUF"]);
+        let answer = provider
+            .simple_chat("hello", "gpt-5", 0.0)
+            .await
+            .expect("the named repository is served by the local fallback");
+        assert_eq!(answer, "local answer");
+        assert_eq!(calls_openai.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 1);
+    }
+
+    /// D-076 N-1: never the route's own model, a bare id or a
+    /// `<provider>/…` model routed to another provider. Reviewer probe
+    /// `[openai(fail), llamacpp]` with bare `gpt-5`.
+    #[tokio::test]
+    async fn a_llamacpp_fallback_never_serves_models_routed_to_another_provider() {
+        for fallbacks in [
+            &[][..],
+            &["gpt-4o"][..],
+            &["anthropic/claude-sonnet-5", "openai/gpt-4o"][..],
+            // D-076 N-10, reviewer probe: the organisation in any case.
+            &["OpenAI/gpt-4o", "Anthropic/claude-sonnet-5", "openai /gpt-4o"][..],
+        ] {
+            let calls_openai = Arc::new(AtomicUsize::new(0));
+            let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+            let provider = openai_then_llamacpp(&calls_openai, &calls_llamacpp, fallbacks);
+            let err = provider
+                .simple_chat("hello", "gpt-5", 0.0)
+                .await
+                .expect_err("nothing here is the local server's");
+            assert!(
+                err.to_string().contains("not compatible with provider"),
+                "{fallbacks:?}: {err}"
+            );
+            assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 0, "{fallbacks:?}");
+        }
+    }
+
+    /// D-075: the route's provider identity decides, not the model's
+    /// organisation. An Anthropic route whose model is written with a
+    /// neutral organisation is still never answered by a llama.cpp fallback.
+    #[tokio::test]
+    async fn a_llamacpp_fallback_never_answers_an_anthropic_route_whatever_the_model() {
+        let calls_anthropic = Arc::new(AtomicUsize::new(0));
+        let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                ("anthropic".into(), counting_mock(&calls_anthropic, true, "never")),
+                ("llamacpp".into(), counting_mock(&calls_llamacpp, false, "local answer")),
+            ],
+            0,
+            1,
+        );
+        let err = provider
+            .simple_chat("hello", "claude-sonnet-5", 0.0)
+            .await
+            .expect_err("the local fallback must not answer the Anthropic route");
+        assert!(err.to_string().contains("not compatible with provider"), "{err}");
+        assert_eq!(calls_anthropic.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 0);
+    }
+
+    /// D-075: llama.cpp as the route's provider serves any repository it is
+    /// configured for, including one whose organisation names a provider
+    /// family.
+    #[tokio::test]
+    async fn a_llamacpp_route_serves_a_gemma_repository() {
+        let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![("llamacpp".into(), counting_mock(&calls_llamacpp, false, "gemma answer"))],
+            0,
+            1,
+        );
+        let answer = provider
+            .simple_chat("hello", "google/gemma-3-27b-it-GGUF", 0.0)
+            .await
+            .expect("the configured repository is served");
+        assert_eq!(answer, "gemma answer");
+        assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 1);
+    }
+
+    /// D-072 L-9: llama.cpp as the primary serves the Hugging Face repository
+    /// it is configured for.
+    #[tokio::test]
+    async fn a_llamacpp_primary_serves_the_repository_it_is_configured_for() {
+        let calls_llamacpp = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![("llamacpp".into(), counting_mock(&calls_llamacpp, false, "local answer"))],
+            0,
+            1,
+        );
+        let answer = provider
+            .simple_chat("hello", "ggml-org/gpt-oss-20b-GGUF", 0.0)
+            .await
+            .expect("the configured repository is served");
+        assert_eq!(answer, "local answer");
+        assert_eq!(calls_llamacpp.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn all_failed_error_includes_available_and_unavailable_provider_summary() {
         let provider = ReliableProvider::new(
@@ -4591,5 +5202,1038 @@ mod tests {
             Some(StreamError::Provider(msg)) => assert!(msg.contains("No provider supports streaming")),
             other => panic!("expected no-streaming provider error, got {other:?}"),
         }
+    }
+
+    /// C2b-1 / D-020 Q2: on the streaming path a tool-schema refusal arrives
+    /// as the provider's own stream error, before any connection. It is
+    /// deterministic, so the chain must not retry it against the same
+    /// provider. Before: it classified as retryable and was retried with
+    /// backoff.
+    #[tokio::test]
+    async fn a_streamed_tool_schema_refusal_is_not_retryable() {
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        let provider = OpenAiCompatibleProvider::new(
+            "Fixture",
+            "http://127.0.0.1:1/v1",
+            Some("sk-fixture-not-real"),
+            AuthStyle::Bearer,
+        )
+        .with_tool_schema_dialects(vec![(None, crate::tools::ToolSchemaDialect::NoRootCombinators)]);
+        let tools = vec![crate::tools::ToolSpec {
+            name: "fixture_alternatives".to_string(),
+            description: "Needs a path or a key.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "key": {"type": "string"}},
+                "anyOf": [{"required": ["path"]}, {"required": ["key"]}]
+            }),
+        }];
+        let messages = vec![ChatMessage::user("hi")];
+        let stream = provider.stream_chat_with_history(
+            &messages,
+            "fixture-model",
+            0.0,
+            StreamOptions::new(true).with_tools(tools),
+        );
+        let (_, error) = collect_stream(stream).await;
+        let Some(error) = error else {
+            panic!("test: the refused tool must end the stream with an error");
+        };
+        assert!(error.to_string().contains("fixture_alternatives"), "{error}");
+        assert_eq!(classify_stream_error(&error), StreamFailureClass::NonRetryable);
+    }
+
+    /// COMPAT-STREAM (R-4): in production every provider sits behind
+    /// `ReliableProvider`. When the consumer drops the stream (the idle guard
+    /// ended the turn), the forwarding task must stop reading and drop the
+    /// inner stream, so the provider's own release reaches the connection.
+    async fn assert_reliable_releases(
+        path: &'static str,
+        first: &'static str,
+        make: impl FnOnce(&str) -> Box<dyn Provider>,
+    ) {
+        use super::stream_release_probe::{spawn_silent_after_first_record_stub, wait_released};
+        let (base, released, server) = spawn_silent_after_first_record_stub(path, first).await;
+        let reliable = ReliableProvider::new(vec![("primary".into(), make(&base))], 0, 1);
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = reliable.stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true));
+        let first_chunk = stream.next().await.expect("test: first chunk");
+        assert!(first_chunk.is_ok(), "first chunk: {first_chunk:?}");
+        drop(stream);
+        let was_released = wait_released(&released).await;
+        server.abort();
+        assert!(
+            was_released,
+            "{path}: the connection must be released through ReliableProvider"
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_stream_releases_an_anthropic_connection_when_the_consumer_goes_away() {
+        assert_reliable_releases(
+            "/v1/messages",
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+            ),
+            |base| Box::new(super::super::anthropic::AnthropicProvider::with_base_url(Some("test-key"), Some(base))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reliable_stream_releases_an_openai_connection_when_the_consumer_goes_away() {
+        assert_reliable_releases(
+            "/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            |base| {
+                Box::new(super::super::openai::OpenAiProvider::with_base_url(
+                    Some(base),
+                    Some("test-key"),
+                ))
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reliable_stream_releases_a_compatible_connection_when_the_consumer_goes_away() {
+        assert_reliable_releases(
+            "/chat/completions",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            |base| {
+                Box::new(super::super::compatible::OpenAiCompatibleProvider::new(
+                    "custom",
+                    base,
+                    Some("test-key"),
+                    super::super::compatible::AuthStyle::Bearer,
+                ))
+            },
+        )
+        .await;
+    }
+
+    /// COMPATf (N-3/N-4): a PRX-built content-filter stop skips only the
+    /// in-place retry; its class still allows fallback. Upstream prose that
+    /// merely mentions the phrase is not a filter stop.
+    #[test]
+    fn content_filter_stop_skips_only_the_in_place_retry() {
+        let stop = content_filter_stop("OpenAI", "finish_reason content_filter");
+        assert!(skips_in_place_retry(&stop));
+        assert!(classify_stream_error(&stop).allows_fallback(), "fallback stays open");
+        let structured = in_stream_error_object(
+            "OpenAI-compatible",
+            None,
+            Some(serde_json::json!("content_filter")),
+            Some("blocked".to_string()),
+        );
+        assert!(skips_in_place_retry(&structured));
+        for mention in [
+            StreamError::Provider("OpenAI stream error (server_error): last finish_reason content_filter".to_string()),
+            StreamError::Provider("upstream said: content filter stop".to_string()),
+        ] {
+            assert!(!skips_in_place_retry(&mention), "{mention}");
+        }
+    }
+
+    /// Minor: the in-stream error label is bounded and stripped to identifier
+    /// characters; a string code loses its JSON quotes.
+    #[test]
+    fn in_stream_error_label_is_bounded() {
+        let long = in_stream_error_object("OpenAI", Some("x".repeat(500) + "\n\u{1b}[31m"), None, None);
+        let text = long.to_string();
+        assert!(text.contains(&"x".repeat(64)), "{text}");
+        assert!(!text.contains(&"x".repeat(65)), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        let coded = in_stream_error_object("OpenAI", None, Some(serde_json::json!("rate_limit")), None);
+        assert!(coded.to_string().contains("(rate_limit)"), "{coded}");
+    }
+
+    #[tokio::test]
+    async fn reliable_does_not_retry_a_content_filter_stop_before_content() {
+        use axum::{Router, http::header, routing::post};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let reliable = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(super::super::openai::OpenAiProvider::with_base_url(
+                    Some(&format!("http://{addr}")),
+                    Some("test-key"),
+                )),
+            )],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let results: Vec<StreamResult<StreamChunk>> = reliable
+            .stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+        let error = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("test: the filter stop surfaces");
+        assert!(error.to_string().contains("content_filter"), "got {error}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "no in-place retry of a deterministic filter stop"
+        );
+    }
+
+    /// Loopback stub serving `body` as SSE on both OpenAI paths, counting hits.
+    async fn spawn_counting_sse(body: &'static str) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::header, routing::post};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let handler = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ([(header::CONTENT_TYPE, "text/event-stream")], body)
+            }
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), hits, server)
+    }
+
+    const FALLBACK_OK: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fallback-ok\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    enum FirstWire {
+        OpenAi,
+        Compatible,
+    }
+
+    /// Stream once through `ReliableProvider(max_retries 2)` with `first`
+    /// serving `body`, optionally with a compatible second candidate that
+    /// answers "fallback-ok". Returns (first hits, second hits, text, error).
+    async fn reliable_run(
+        wire: FirstWire,
+        body: &'static str,
+        with_fallback: bool,
+    ) -> (usize, usize, String, Option<String>) {
+        let (b1, h1, s1) = spawn_counting_sse(body).await;
+        let (b2, h2, s2) = spawn_counting_sse(FALLBACK_OK).await;
+        let first: Box<dyn Provider> = match wire {
+            FirstWire::OpenAi => Box::new(super::super::openai::OpenAiProvider::with_base_url(
+                Some(&b1),
+                Some("test-key"),
+            )),
+            FirstWire::Compatible => Box::new(super::super::compatible::OpenAiCompatibleProvider::new(
+                "first",
+                &b1,
+                Some("test-key"),
+                super::super::compatible::AuthStyle::Bearer,
+            )),
+        };
+        let mut chain: Vec<(String, Box<dyn Provider>)> = vec![("first".into(), first)];
+        if with_fallback {
+            chain.push((
+                "second".into(),
+                Box::new(super::super::compatible::OpenAiCompatibleProvider::new(
+                    "second",
+                    &b2,
+                    Some("test-key"),
+                    super::super::compatible::AuthStyle::Bearer,
+                )),
+            ));
+        }
+        let reliable = ReliableProvider::new(chain, 2, 1);
+        let messages = vec![ChatMessage::user("hi")];
+        let items: Vec<StreamResult<StreamChunk>> = reliable
+            .stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true))
+            .collect()
+            .await;
+        s1.abort();
+        s2.abort();
+        let text: String = items
+            .iter()
+            .filter_map(|i| i.as_ref().ok())
+            .map(|c| c.delta.as_str())
+            .collect();
+        let error = items.iter().find_map(|i| i.as_ref().err()).map(ToString::to_string);
+        (h1.load(Ordering::SeqCst), h2.load(Ordering::SeqCst), text, error)
+    }
+
+    /// COMPATf (N-3): a content-filter stop before any output skips only the
+    /// in-place retry. Filters differ by provider, so the next candidate is
+    /// still tried.
+    #[tokio::test]
+    async fn reliable_falls_back_after_a_content_filter_stop_before_content() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (first, second, text, error) = reliable_run(FirstWire::OpenAi, body, true).await;
+        assert_eq!(first, 1, "no in-place retry of the filter stop");
+        assert_eq!(second, 1, "the next candidate is tried");
+        assert_eq!(text, "fallback-ok", "error: {error:?}");
+        let (first, _, _, error) = reliable_run(FirstWire::OpenAi, body, false).await;
+        assert_eq!(first, 1);
+        assert!(error.is_some_and(|e| e.contains("content_filter")));
+    }
+
+    /// N-3/N-4: a structured in-stream error code `content_filter` is a filter
+    /// stop too: one attempt, then fallback.
+    #[tokio::test]
+    async fn reliable_treats_an_in_stream_content_filter_error_code_as_a_filter_stop() {
+        let body = "data: {\"error\":{\"code\":\"content_filter\",\"message\":\"blocked by policy\"}}\n\n";
+        let (first, second, text, _) = reliable_run(FirstWire::Compatible, body, true).await;
+        assert_eq!(first, 1, "no in-place retry");
+        assert_eq!(second, 1);
+        assert_eq!(text, "fallback-ok");
+    }
+
+    /// N-4: an upstream server error that merely mentions the phrase keeps its
+    /// in-place retries.
+    #[tokio::test]
+    async fn reliable_keeps_retries_for_an_error_that_only_mentions_content_filter() {
+        let body = "data: {\"error\":{\"message\":\"upstream timeout (last finish_reason content_filter)\",\"type\":\"server_error\"}}\n\n";
+        let (first, _, _, error) = reliable_run(FirstWire::Compatible, body, false).await;
+        assert_eq!(first, 3, "1 attempt + 2 in-place retries (error: {error:?})");
+    }
+
+    /// Minor: a tool-call index over the limit before any output is
+    /// deterministic; skip the in-place retry, keep the fallback.
+    #[tokio::test]
+    async fn reliable_does_not_retry_a_tool_call_index_over_the_limit_in_place() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1000,\"id\":\"call_far\",",
+            "\"function\":{\"name\":\"fixture_write\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (first, _, _, error) = reliable_run(FirstWire::Compatible, body, false).await;
+        assert_eq!(first, 1, "no in-place retry (error: {error:?})");
+        let (first, second, text, _) = reliable_run(FirstWire::Compatible, body, true).await;
+        assert_eq!((first, second), (1, 1));
+        assert_eq!(text, "fallback-ok");
+    }
+
+    /// COMPATf (N-2): streams abandoned before the server sent any headers
+    /// must not leak. Behind `ReliableProvider`, the consumer drops each
+    /// stream while the request is still waiting for a response; every
+    /// connection must be closed.
+    async fn assert_abandoned_before_headers_are_released(make: impl Fn(&str) -> Box<dyn Provider>) {
+        use super::stream_release_probe::spawn_never_answering_server;
+        const N: usize = 10;
+        let (base, accepted, closed, server) = spawn_never_answering_server().await;
+        let reliable = ReliableProvider::new(vec![("primary".into(), make(&base))], 0, 1);
+        let messages = vec![ChatMessage::user("hi")];
+        for _ in 0..N {
+            let mut stream = reliable.stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(true));
+            let pending = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+            assert!(pending.is_err(), "no headers were ever sent, so nothing can arrive");
+            drop(stream);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while closed.load(Ordering::SeqCst) < N && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert_eq!(accepted.load(Ordering::SeqCst), N, "every request reached the server");
+        assert_eq!(closed.load(Ordering::SeqCst), N, "every abandoned connection is closed");
+    }
+
+    #[tokio::test]
+    async fn reliable_releases_anthropic_streams_abandoned_before_headers() {
+        assert_abandoned_before_headers_are_released(|base| {
+            Box::new(super::super::anthropic::AnthropicProvider::with_base_url(
+                Some("test-key"),
+                Some(base),
+            ))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reliable_releases_openai_streams_abandoned_before_headers() {
+        assert_abandoned_before_headers_are_released(|base| {
+            Box::new(super::super::openai::OpenAiProvider::with_base_url(
+                Some(base),
+                Some("test-key"),
+            ))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reliable_releases_compatible_streams_abandoned_before_headers() {
+        assert_abandoned_before_headers_are_released(|base| {
+            Box::new(super::super::compatible::OpenAiCompatibleProvider::new(
+                "custom",
+                base,
+                Some("test-key"),
+                super::super::compatible::AuthStyle::Bearer,
+            ))
+        })
+        .await;
+    }
+
+    // ── INT-2B a51 / COMPATf F-1: stream classification by PRX's own markers ──
+
+    /// SP-INT2 a51: an upstream body that merely quotes the refusal marker is
+    /// not a refusal. Before, any stream error containing
+    /// `capability=tool_schema_dialect` was non-retryable, so a 503 whose
+    /// body quoted it never failed over.
+    #[test]
+    fn upstream_text_quoting_the_refusal_marker_is_classified_as_upstream_text() {
+        let quoted = StreamError::Provider(
+            "OpenAI-compatible API error (503 Service Unavailable): proxy says \
+             provider_capability_error provider=x capability=tool_schema_dialect message=nope"
+                .to_string(),
+        );
+        assert_eq!(
+            classify_stream_error(&quoted),
+            StreamFailureClass::Retryable,
+            "a transient upstream status must decide, not a quoted marker"
+        );
+        let real = StreamError::Provider(
+            "provider_capability_error provider=Custom capability=tool_schema_dialect message=tool_schema_dialect \
+             refused 1 tool(s)"
+                .to_string(),
+        );
+        assert_eq!(
+            classify_stream_error(&real),
+            StreamFailureClass::NonRetryable,
+            "PRX's own refusal is still deterministic"
+        );
+    }
+
+    /// A stream mock that fails before content with the error `make` builds,
+    /// counting its calls.
+    struct PreContentErrorStreamMock {
+        calls: Arc<AtomicUsize>,
+        make: fn() -> StreamError,
+    }
+
+    #[async_trait]
+    impl Provider for PreContentErrorStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err((self.make)())]).boxed()
+        }
+    }
+
+    /// Run a two-candidate stream whose primary fails with `make`, and return
+    /// (text, primary calls, fallback calls).
+    async fn stream_with_failing_primary(primary: &str, make: fn() -> StreamError) -> (String, usize, usize) {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    primary.to_string(),
+                    Box::new(PreContentErrorStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        make,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("served by fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let (text, _error) =
+            collect_stream(provider.stream_chat_with_history(&messages, "test-model", 0.0, enabled_options())).await;
+        (
+            text,
+            primary_calls.load(Ordering::SeqCst),
+            fallback_calls.load(Ordering::SeqCst),
+        )
+    }
+
+    /// COMPATf F-1 (RC11): a structured content-filter stop whose upstream
+    /// message quotes `(403)` still falls back. Before, the prose heuristics
+    /// read the quoted status and gave up on the whole chain.
+    #[tokio::test]
+    async fn a_content_filter_stop_quoting_a_status_still_falls_back() {
+        fn make() -> StreamError {
+            in_stream_error_object(
+                "OpenAI-compatible",
+                None,
+                Some(serde_json::json!("content_filter")),
+                Some("request blocked by policy (403) invalid model output".to_string()),
+            )
+        }
+        let (text, primary, fallback) = stream_with_failing_primary("rc11-primary", make).await;
+        assert_eq!(text, "served by fallback");
+        assert_eq!(primary, 1, "a filter stop is not retried in place");
+        assert_eq!(fallback, 1);
+    }
+
+    /// COMPATf F-1 (RC16): a tool-call index of 404 is not an HTTP status.
+    #[tokio::test]
+    async fn a_tool_call_index_of_404_still_falls_back() {
+        fn make() -> StreamError {
+            tool_call_index_over_limit("OpenAI-compatible", 404, 64)
+        }
+        let (text, primary, fallback) = stream_with_failing_primary("rc16-primary", make).await;
+        assert_eq!(text, "served by fallback");
+        assert_eq!(primary, 1, "an index over the limit is not retried in place");
+        assert_eq!(fallback, 1);
+    }
+
+    /// COMPATf F-1 (RC17): a tool-call index of 429 is not a rate limit, so
+    /// it records no rate-limit telemetry for the provider.
+    #[tokio::test]
+    async fn a_tool_call_index_of_429_is_not_a_rate_limit() {
+        fn make() -> StreamError {
+            tool_call_index_over_limit("OpenAI-compatible", 429, 64)
+        }
+        let (text, primary, fallback) = stream_with_failing_primary("rc17-primary", make).await;
+        assert_eq!(text, "served by fallback");
+        assert_eq!(primary, 1);
+        assert_eq!(fallback, 1);
+        let stats = rate_limit::snapshot();
+        assert!(
+            stats
+                .providers
+                .get("rc17-primary")
+                .is_none_or(|entry| entry.rate_limited_total == 0),
+            "an index over the limit was counted as a rate limit: {:?}",
+            stats.providers.get("rc17-primary")
+        );
+    }
+
+    // ── INT-2B B3f / D-068 (3): a streamed refusal fails over ──
+
+    /// A tool whose root `anyOf` a `no_root_combinators` endpoint cannot take.
+    fn root_any_of_tool() -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: "fixture_alternatives".to_string(),
+            description: "Needs a path or a key.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "key": {"type": "string"}},
+                "anyOf": [{"required": ["path"]}, {"required": ["key"]}]
+            }),
+        }
+    }
+
+    /// D-068 (3): a streamed tool-schema refusal fails over exactly like the
+    /// buffered one (D-020 Q2). The refusing endpoint declares
+    /// `no_root_combinators` and refuses before transport; the fallback, a
+    /// loopback endpoint that accepts the schema raw, serves the turn. Before,
+    /// the refusal was `NonRetryable`, which never falls back, so the turn
+    /// ended on it.
+    #[tokio::test]
+    async fn a_streamed_tool_schema_refusal_fails_over_before_any_output() {
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        let (refusing_base, refusing_hits, refusing_server) = spawn_counting_sse(FALLBACK_OK).await;
+        let (fallback_base, fallback_hits, fallback_server) = spawn_counting_sse(FALLBACK_OK).await;
+        let refusing = OpenAiCompatibleProvider::new("Refusing", &refusing_base, Some("test-key"), AuthStyle::Bearer)
+            .with_tool_schema_dialects(vec![(None, crate::tools::ToolSchemaDialect::NoRootCombinators)]);
+        let fallback = OpenAiCompatibleProvider::new("Fallback", &fallback_base, Some("test-key"), AuthStyle::Bearer);
+        let chain = ReliableProvider::new(
+            vec![
+                ("refusing".into(), Box::new(refusing)),
+                ("fallback".into(), Box::new(fallback)),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let (text, error) = collect_stream(chain.stream_chat_with_history(
+            &messages,
+            "fixture-model",
+            0.0,
+            StreamOptions::new(true).with_tools(vec![root_any_of_tool()]),
+        ))
+        .await;
+        refusing_server.abort();
+        fallback_server.abort();
+        assert!(error.is_none(), "the fallback must serve the turn: {error:?}");
+        assert_eq!(text, "fallback-ok");
+        assert_eq!(refusing_hits.load(Ordering::SeqCst), 0, "a refusal sends nothing");
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A member that emits output and then fails with a tool-schema refusal.
+    struct RefusalAfterOutputMock;
+
+    #[async_trait]
+    impl Provider for RefusalAfterOutputMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::iter(vec![
+                Ok(StreamChunk::delta("partial")),
+                Err(StreamError::Provider(
+                    "provider_capability_error provider=Fixture capability=tool_schema_dialect \
+                     message=tool_schema_dialect refused 1 tool(s)"
+                        .to_string(),
+                )),
+            ])
+            .boxed()
+        }
+    }
+
+    /// D-068 (3): once output has been emitted, a refusal is surfaced as the
+    /// error: the loopback fallback is never contacted, because switching
+    /// providers mid-output would corrupt the response.
+    #[tokio::test]
+    async fn a_streamed_tool_schema_refusal_after_output_is_surfaced() {
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        let (fallback_base, fallback_hits, fallback_server) = spawn_counting_sse(FALLBACK_OK).await;
+        let fallback = OpenAiCompatibleProvider::new("Fallback", &fallback_base, Some("test-key"), AuthStyle::Bearer);
+        let chain = ReliableProvider::new(
+            vec![
+                ("partial".into(), Box::new(RefusalAfterOutputMock)),
+                ("fallback".into(), Box::new(fallback)),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let (text, error) = collect_stream(chain.stream_chat_with_history(
+            &messages,
+            "fixture-model",
+            0.0,
+            StreamOptions::new(true).with_tools(vec![root_any_of_tool()]),
+        ))
+        .await;
+        fallback_server.abort();
+        assert_eq!(text, "partial");
+        let error = error.expect("test: the refusal is surfaced");
+        assert!(stream_error_is_tool_schema_refusal(&error), "{error}");
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0, "no failover after output");
+    }
+
+    // ── INT-2B B3f / D-069 L-1: a refusal is the chain's answer only when
+    //    every tried candidate refused ──
+
+    /// Stream through a two-member chain of a refusing endpoint and a
+    /// loopback endpoint answering 503, in the given order, and return the
+    /// surfaced error.
+    async fn stream_refusal_and_503(refusal_first: bool) -> StreamError {
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        let unavailable = crate::providers::label_redaction_tests::spawn_fixed_status_stub(
+            "503 Service Unavailable",
+            r#"{"error":{"message":"overloaded","type":"server_error"}}"#,
+        )
+        .await;
+        let refusing =
+            OpenAiCompatibleProvider::new("Refusing", "http://127.0.0.1:1", Some("test-key"), AuthStyle::Bearer)
+                .with_tool_schema_dialects(vec![(None, crate::tools::ToolSchemaDialect::NoRootCombinators)]);
+        let overloaded = OpenAiCompatibleProvider::new(
+            "Overloaded",
+            &format!("http://{}", unavailable.addr),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        let refusing: (String, Box<dyn Provider>) = ("refusing".into(), Box::new(refusing));
+        let overloaded: (String, Box<dyn Provider>) = ("overloaded".into(), Box::new(overloaded));
+        let members = if refusal_first {
+            vec![refusing, overloaded]
+        } else {
+            vec![overloaded, refusing]
+        };
+        let chain = ReliableProvider::new(members, 0, 1);
+        let messages = vec![ChatMessage::user("hi")];
+        let (_text, error) = collect_stream(chain.stream_chat_with_history(
+            &messages,
+            "fixture-model",
+            0.0,
+            StreamOptions::new(true).with_tools(vec![root_any_of_tool()]),
+        ))
+        .await;
+        assert!(unavailable.hits.load(Ordering::SeqCst) >= 1, "the 503 member was tried");
+        error.expect("test: neither member serves the turn")
+    }
+
+    /// D-069 L-1, streaming, refusal then 503: the 503 is surfaced.
+    #[tokio::test]
+    async fn a_streamed_refusal_then_503_surfaces_the_503() {
+        let error = stream_refusal_and_503(true).await;
+        assert!(!stream_error_is_tool_schema_refusal(&error), "{error}");
+        assert_eq!(classify_stream_error(&error), StreamFailureClass::Retryable, "{error}");
+    }
+
+    /// D-069 L-1, streaming, 503 then refusal: the 503 is still surfaced,
+    /// because sending again may succeed once the first member recovers.
+    /// Before, the last failure (the refusal) was surfaced.
+    #[tokio::test]
+    async fn a_streamed_503_then_refusal_surfaces_the_503() {
+        let error = stream_refusal_and_503(false).await;
+        assert!(!stream_error_is_tool_schema_refusal(&error), "{error}");
+        assert_eq!(classify_stream_error(&error), StreamFailureClass::Retryable, "{error}");
+    }
+
+    // ── INT-2B B3f / D-069 L-3: the member key stays in-process ──
+
+    /// D-069 L-3: a gate deferral of a member whose label carries a password
+    /// is counted under the member's display name. It was counted under the
+    /// salted member key, which reached `rate_limit::snapshot()`, the health
+    /// snapshot and `daemon_state.json`, and changed on every restart.
+    #[tokio::test]
+    async fn a_gate_deferral_is_counted_under_the_display_name_not_the_member_key() {
+        let label = "custom:http://alice:fixture-pw-l3@127.0.0.1:47/v1";
+        let display: Arc<str> = Arc::from(super::super::redact_endpoint_userinfo(label));
+        let key = member_key(label, &display);
+        assert_ne!(key, display, "test: a label with a password has its own key");
+        let gate = Arc::new(RateLimitGate::new());
+        gate.note_rate_limited(&key, 60);
+        let chain = ReliableProvider::new(
+            vec![(
+                label.to_string(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_rate_limit_gate(Arc::clone(&gate));
+
+        let reply = chain.chat_with_system(None, "hi", "fixture-model", 0.0).await;
+        assert_eq!(reply.ok().as_deref(), Some("ok"));
+
+        let stats = rate_limit::snapshot();
+        assert!(
+            stats
+                .providers
+                .get(&*display)
+                .is_some_and(|entry| entry.gate_deferrals_total >= 1),
+            "the deferral must be counted under the display name: {:?}",
+            stats.providers.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !stats.providers.contains_key(&*key),
+            "the member key reached the telemetry"
+        );
+        let health = crate::health::snapshot_json().to_string();
+        assert!(!health.contains(&*key), "the member key reached the health snapshot");
+        assert!(!health.contains("fixture-pw-l3"));
+    }
+
+    // ── INT-2B B3f / D-068 (2): the served member, by its unique key ──
+
+    /// A chain member with its own tool-schema dialect that fails (503) or
+    /// serves, on both the buffered and the streaming path.
+    struct DialectMemberMock {
+        dialect: crate::tools::ToolSchemaDialect,
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl Provider for DialectMemberMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.fails {
+                anyhow::bail!("fixture API error (503 Service Unavailable): try later");
+            }
+            Ok("served".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.fails {
+                anyhow::bail!("fixture API error (503 Service Unavailable): try later");
+            }
+            Ok("served".to_string())
+        }
+
+        fn tool_schema_dialect_for(&self, _model: &str) -> crate::tools::ToolSchemaDialect {
+            self.dialect
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            if self.fails {
+                stream::iter(vec![Err(StreamError::Provider(
+                    "fixture API error (503 Service Unavailable): try later".to_string(),
+                ))])
+                .boxed()
+            } else {
+                stream::iter(vec![Ok(StreamChunk::delta("served")), Ok(StreamChunk::final_chunk())]).boxed()
+            }
+        }
+    }
+
+    /// Two members whose labels differ only in their password: the first
+    /// (raw) fails, the second (Gemini) serves.
+    fn members_differing_only_in_password() -> ReliableProvider {
+        ReliableProvider::new(
+            vec![
+                (
+                    "custom:http://a:fixture-pw-a@127.0.0.1:9/v1".to_string(),
+                    Box::new(DialectMemberMock {
+                        dialect: crate::tools::ToolSchemaDialect::Raw,
+                        fails: true,
+                    }),
+                ),
+                (
+                    "custom:http://b:fixture-pw-b@127.0.0.1:9/v1".to_string(),
+                    Box::new(DialectMemberMock {
+                        dialect: crate::tools::ToolSchemaDialect::Gemini,
+                        fails: false,
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    /// D-068 (2): the dialect reported for the served member is the served
+    /// member's, even when its display name equals another member's. Before,
+    /// the member was looked up by its redacted display name, which both
+    /// members share, so the first member's dialect (`Raw`) was reported.
+    #[tokio::test]
+    async fn the_served_member_is_identified_by_its_key_not_its_redacted_label() {
+        let chain = members_differing_only_in_password();
+        let messages = [ChatMessage::user("hi")];
+        let trace = chain
+            .chat_traced(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "fixture-model",
+                0.0,
+            )
+            .await
+            .expect("test: the second member serves");
+        assert_eq!(trace.response.text.as_deref(), Some("served"));
+        assert!(!trace.final_provider.contains("fixture-pw"), "{}", trace.final_provider);
+        let member = trace
+            .served_member
+            .as_deref()
+            .expect("test: the chain names its member");
+        assert!(
+            !member.contains("fixture-pw"),
+            "the member key carries no password: {member}"
+        );
+        assert_eq!(
+            chain.tool_schema_dialect_of_member(member, &trace.final_model),
+            Some(crate::tools::ToolSchemaDialect::Gemini)
+        );
+    }
+
+    /// D-068 (2), streaming: the chunk that reports the successful attempt
+    /// names the served member by its key too.
+    #[tokio::test]
+    async fn a_streamed_turn_names_its_served_member_by_key() {
+        let chain = members_differing_only_in_password();
+        let messages = vec![ChatMessage::user("hi")];
+        let chunks: Vec<StreamResult<StreamChunk>> = chain
+            .stream_chat_with_history(&messages, "fixture-model", 0.0, enabled_options())
+            .collect()
+            .await;
+        let member = chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .find_map(|chunk| chunk.served_member.clone())
+            .expect("test: the success chunk names the served member");
+        assert_eq!(
+            chain.tool_schema_dialect_of_member(&member, "fixture-model"),
+            Some(crate::tools::ToolSchemaDialect::Gemini)
+        );
+    }
+}
+
+/// Test support for the "release the connection when nobody reads the
+/// stream" probes: a loopback SSE stub that sends one record and then nothing,
+/// and reports when the server lets go of that response.
+#[cfg(test)]
+pub(crate) mod stream_release_probe {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Serve `first` at `path` as `text/event-stream`, then stay silent
+    /// forever. The returned flag turns true when the response body is dropped,
+    /// i.e. when the client closed the connection.
+    pub(crate) async fn spawn_silent_after_first_record_stub(
+        path: &'static str,
+        first: &'static str,
+    ) -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        use axum::{Router, body::Body, http::header, routing::post};
+        use futures_util::StreamExt;
+
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&released);
+        let app = Router::new().route(
+            path,
+            post(move || {
+                let flag = Arc::clone(&flag);
+                async move {
+                    let guard = DropFlag(flag);
+                    let body = futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(first) })
+                        .chain(futures_util::stream::pending())
+                        .map(move |item| {
+                            let _keep = &guard;
+                            item
+                        });
+                    ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), released, server)
+    }
+
+    /// A raw TCP server that accepts connections, reads whatever arrives and
+    /// never answers: no status line, no headers. Returns the base URL and
+    /// the counts of accepted and client-closed connections.
+    pub(crate) async fn spawn_never_answering_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt;
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: loopback addr");
+        let (accepted_in, closed_in) = (Arc::clone(&accepted), Arc::clone(&closed));
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                accepted_in.fetch_add(1, Ordering::SeqCst);
+                let closed = Arc::clone(&closed_in);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (format!("http://{addr}"), accepted, closed, server)
+    }
+
+    /// Wait up to five seconds for the server to see its response released.
+    pub(crate) async fn wait_released(released: &AtomicBool) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !released.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        released.load(Ordering::SeqCst)
     }
 }

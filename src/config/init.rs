@@ -41,6 +41,38 @@ impl Spec {
         report.into_result()
     }
 
+    /// [`generate`](Self::generate), then the decision backend chosen with
+    /// `prx init --decision-*` (CDP-14). The choice is checked before
+    /// anything is written (a hosted kind is refused: it needs a credential);
+    /// it is then applied to the generated configuration through the shared
+    /// management service, as its own recorded transaction.
+    ///
+    /// # Errors
+    ///
+    /// A refused choice (nothing written), or the generation's or the
+    /// transaction's failure.
+    // `prx init` has no log subscriber; stdout is its only channel, as for
+    // `InitReport::print`.
+    #[allow(clippy::print_stdout)]
+    pub async fn generate_with_decision(
+        self,
+        target_dir: &Path,
+        force: bool,
+        decision: Option<&crate::causal_cli::DecisionSetup>,
+    ) -> Result<()> {
+        if let Some(decision) = decision {
+            decision.check()?;
+        }
+        self.generate(target_dir, force).await?;
+        if let Some(decision) = decision {
+            let config = super::Config::load_from_path(&target_dir.join("config.toml"), target_dir.join("workspace"))?;
+            let plan = decision.apply(config).await?;
+            print!("{plan}");
+            println!("Decision backend configured ({}).", decision.kind.as_str());
+        }
+        Ok(())
+    }
+
     /// [`generate`](Self::generate) without the printing, so callers (and
     /// tests) can inspect exactly what the operator is told.
     pub async fn generate_reported(self, target_dir: &Path, force: bool) -> Result<InitReport> {
@@ -90,31 +122,29 @@ impl Spec {
             None
         };
         let managed_defaults = render_managed_defaults(&main_toml, &fragments)?;
+        let mut causal_guard = false;
+        let mut preserved_revision = None;
         let (effective_main, effective_fragments) = if regenerating {
-            match preserve_previous_settings(&config_path, &main_toml, &fragments, previous_defaults.as_ref()) {
-                Ok((merged_main, merged_fragments, outcome)) => {
-                    report.record_preservation(&outcome, archive.as_deref());
-                    (merged_main, merged_fragments)
-                }
-                Err(error) => {
-                    report.record_reset(
-                        &format!("the previous configuration could not be read ({error:#})"),
-                        archive.as_deref(),
-                    );
-                    (main_toml.clone(), fragments.clone())
-                }
-            }
+            let (merged_main, merged_fragments, outcome) =
+                preserve_previous_settings(&config_path, &main_toml, &fragments, previous_defaults.as_ref())?;
+            report.record_preservation(&outcome, archive.as_deref());
+            causal_guard = outcome.causal_guard;
+            preserved_revision = outcome.base_revision;
+            (merged_main, merged_fragments)
         } else {
             (main_toml.clone(), fragments.clone())
         };
 
-        // 4. Stage and validate the complete effective configuration, including
-        // any unknown user-owned fragments, before mutating the target.
+        // 4. Stage and validate the complete effective configuration before
+        // mutation. Unknown/legacy fragment names remain excluded by the loader
+        // and are retained unchanged by the existing mutation planner.
         let plan = match super::files::plan_mutation(&config_path, &workspace_dir, effective_main, effective_fragments)
         {
             Ok(plan) => plan,
-            // Falling back to bare templates still repairs a configuration that
-            // this build cannot load at all, which is what `--force` is for; it
+            Err(error) if causal_guard => return Err(CausalRegenerationError(error).into()),
+            Err(error) if error.is::<crate::causal_tree::config::MigrationError>() => return Err(error),
+            // A readable tree without decision-plane settings can retain the
+            // existing repair fallback for other invalid settings; it
             // is not allowed to do so quietly. The operator's values are in the
             // archive, the reason is printed, and `into_result` exits non-zero
             // so neither a human nor a script can mistake this for a clean run.
@@ -127,7 +157,13 @@ impl Spec {
             }
             Err(error) => return Err(error),
         };
-        super::files::commit_mutation_atomically(plan).await?;
+        if let Some(revision) = preserved_revision.as_deref() {
+            // The same snapshot supplied all preserved values. Reject a
+            // concurrent edit instead of overwriting it.
+            super::files::commit_mutation_guarded(plan, Some(revision), |_| Ok(())).await?;
+        } else {
+            super::files::commit_mutation_atomically(plan).await?;
+        }
 
         // 5. The mutation is on disk from here on. A failure in the steps that
         // follow is still a failure, but it must not take the report with it:
@@ -297,6 +333,13 @@ impl InitReport {
             self.notices
                 .push(format!("  Previous configuration archived to {}", path.display()));
         }
+        if !outcome.causal_moved.is_empty() || !outcome.causal_dropped.is_empty() {
+            self.notices.push(format!(
+                "  Normalized legacy decision-plane settings: moved [{}]; retired defaults [{}]",
+                outcome.causal_moved.join(", "),
+                outcome.causal_dropped.join(", ")
+            ));
+        }
         if outcome.kept.is_empty() {
             self.notices
                 .push("  No explicit settings differed from the regenerated templates".to_string());
@@ -404,7 +447,15 @@ struct PreservationOutcome {
     refreshed: BTreeSet<String>,
     dropped: BTreeSet<String>,
     unfoldable: BTreeSet<String>,
+    causal_guard: bool,
+    base_revision: Option<String>,
+    causal_moved: Vec<&'static str>,
+    causal_dropped: Vec<&'static str>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Decision-plane configuration regeneration refused; existing configuration was not replaced: {0}")]
+struct CausalRegenerationError(#[source] anyhow::Error);
 
 /// Read the defaults the previous `prx init` recorded for this tree.
 ///
@@ -569,8 +620,54 @@ fn preserve_previous_settings(
     fragment_templates: &[(String, String)],
     previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
 ) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
-    let main_previous = read_toml_document(config_path)?;
-    let mut effective = main_previous.clone();
+    super::files::with_consistent_config_snapshot(config_path, || {
+        let revision = super::files::current_config_revision(config_path)?;
+        // An unreadable tree cannot prove that an explicit disable is absent.
+        // Never let a migration preflight failure install a fresh template.
+        let mut effective =
+            super::files::read_merged_toml_with_gate_once(config_path).map_err(CausalRegenerationError)?;
+        let causal_guard = effective.get("causal_tree").is_some();
+        let locate = |path: &[&str]| super::deprecations::file_holding(config_path, path);
+        let migration = crate::causal_tree::config::migrate_legacy(&mut effective, &locate)?;
+        let result = preserve_normalized_settings(
+            config_path,
+            main_template,
+            fragment_templates,
+            previous_defaults,
+            &effective,
+            &migration,
+            causal_guard,
+        )
+        .map(|(main, fragments, mut outcome)| {
+            outcome.base_revision = Some(revision);
+            (main, fragments, outcome)
+        });
+        if causal_guard {
+            result.map_err(|error| CausalRegenerationError(error).into())
+        } else {
+            result
+        }
+    })
+    .map_err(|error| {
+        if error.is::<crate::causal_tree::config::MigrationError>() || error.is::<CausalRegenerationError>() {
+            error
+        } else {
+            CausalRegenerationError(error).into()
+        }
+    })
+}
+
+fn preserve_normalized_settings(
+    config_path: &Path,
+    main_template: &str,
+    fragment_templates: &[(String, String)],
+    previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
+    effective: &toml::Value,
+    migration: &crate::causal_tree::config::MigrationReport,
+    causal_guard: bool,
+) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
+    let mut main_previous = read_toml_document(config_path)?;
+    crate::causal_tree::config::normalize_regeneration_document(&mut main_previous, migration, config_path)?;
     let mut fragment_previous: BTreeMap<String, toml::Value> = BTreeMap::new();
     for path in super::files::list_config_fragment_paths(config_path)? {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -579,17 +676,22 @@ fn preserve_previous_settings(
         if super::files::should_skip_fragment(name) {
             continue;
         }
-        let value = read_toml_document(&path)?;
-        super::files::deep_merge_toml(&mut effective, value.clone());
+        let mut value = read_toml_document(&path)?;
+        crate::causal_tree::config::normalize_regeneration_document(&mut value, migration, &path)?;
         fragment_previous.insert(name.to_string(), value);
     }
 
     let empty = toml::Value::Table(toml::map::Map::new());
-    let mut outcome = PreservationOutcome::default();
+    let mut outcome = PreservationOutcome {
+        causal_guard,
+        causal_moved: migration.moved.clone(),
+        causal_dropped: migration.dropped.clone(),
+        ..PreservationOutcome::default()
+    };
     let merged_main = apply_previous_settings(
         main_template,
         &main_previous,
-        &effective,
+        effective,
         previous_defaults,
         &mut outcome,
     )?;
@@ -608,12 +710,20 @@ fn preserve_previous_settings(
             }
             let placeholder = "# This preset does not generate this fragment.\n\
                                # The settings below were carried over from the previous configuration.\n";
-            let merged = apply_previous_settings(placeholder, previous, &effective, previous_defaults, &mut outcome)?;
+            let merged = apply_previous_settings(placeholder, previous, effective, previous_defaults, &mut outcome)?;
             merged_fragments.push((name.clone(), merged));
             continue;
         }
-        let merged = apply_previous_settings(template, previous, &effective, previous_defaults, &mut outcome)?;
+        let merged = apply_previous_settings(template, previous, effective, previous_defaults, &mut outcome)?;
         merged_fragments.push((name.clone(), merged));
+    }
+    if outcome
+        .unfoldable
+        .iter()
+        .chain(&outcome.dropped)
+        .any(|path| path == "causal_tree" || path.starts_with("causal_tree."))
+    {
+        bail!("Cannot faithfully preserve decision-plane configuration in regenerated templates");
     }
     Ok((merged_main, merged_fragments, outcome))
 }
@@ -800,9 +910,14 @@ fn apply_previous_settings(
         // operator's if it also differs from the default the *previous* run of
         // `prx init` wrote; otherwise it is a stale shipped default and the
         // refreshed one takes effect, which is what `--force` promises.
-        if previous_defaults
-            .and_then(|defaults| defaults.get(path))
-            .is_some_and(|previous_default| previous_default == current)
+        // D-073/D-074: a disable that survived merged-tree X3
+        // normalization is operator intent, even if a sidecar also says false.
+        let explicit_disable =
+            path.iter().map(String::as_str).eq(["causal_tree", "enabled"]) && current.as_bool() == Some(false);
+        if !explicit_disable
+            && previous_defaults
+                .and_then(|defaults| defaults.get(path))
+                .is_some_and(|previous_default| previous_default == current)
         {
             outcome.refreshed.insert(render_key_path(path));
             continue;
@@ -1621,7 +1736,6 @@ encrypt = true
 [security.audit]
 log_path = "audit.log"
 max_size_mb = 100
-# sign_events = false
 
 # Direct natural-person adapters emit this notice before the first AI response.
 [compliance.interaction_notice]
@@ -1759,11 +1873,13 @@ max_backfill_days = 7
 min_samples = 5
 min_coverage = 0.60
 
-# Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs
-# speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)
-# before each turn. Default off; runtime evidence appears as observer CteRun events.
+# Decision plane — enabled by default with conservative local builtin fallback.
+# Remote processing remains opt-in and requires proven prospective cost bounds.
+# Keep schema_version when setting enabled = false for an explicit disable.
+# Applied directives emit causal.directive.applied events.
 [causal_tree]
-enabled = false
+schema_version = 1
+enabled = true
 
 # Delegate agents for multi-agent workflows
 # [agents.researcher]
@@ -3300,5 +3416,24 @@ mod tests {
 
         let soul = fs::read_to_string(&soul_path).expect("test: read SOUL.md");
         assert_eq!(soul, "# My custom soul\n", "existing .md files must not be overwritten");
+    }
+
+    /// D-074 with X-3: the full template's `[causal_tree]` block, unchanged
+    /// since BASE `8a5d160d`, is the old serialized default: the migration
+    /// reads its bare `enabled = false` as unset, so the CDP-31 default flip
+    /// reaches installs that were never saved.
+    #[test]
+    fn the_base_full_template_disable_reads_as_unset() {
+        let mut root: toml::Value = toml::from_str(&agent_template(Spec::Full)).expect("test: template parses");
+        assert_eq!(
+            root.get("causal_tree")
+                .and_then(|table| table.as_table())
+                .map(|table| table.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["enabled".to_string()]),
+            "the template writes a bare disable"
+        );
+        let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
+        assert_eq!(report.dropped, ["enabled"]);
+        assert!(root.get("causal_tree").and_then(|table| table.get("enabled")).is_none());
     }
 }

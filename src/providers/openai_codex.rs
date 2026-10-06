@@ -133,18 +133,7 @@ impl OpenAiCodexProvider {
 }
 
 fn default_openprx_dir() -> PathBuf {
-    directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".openprx"),
-        |dirs| {
-            let primary = dirs.home_dir().join(".openprx");
-            if primary.exists() {
-                primary
-            } else {
-                let legacy = dirs.home_dir().join(".openprx");
-                if legacy.exists() { legacy } else { primary }
-            }
-        },
-    )
+    crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx"))
 }
 
 fn resolve_stream_idle_timeout(config_secs: Option<u64>) -> Duration {
@@ -284,20 +273,32 @@ fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     None
 }
 
-fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<serde_json::Value>> {
-    tools.map(|items| {
-        items
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                })
-            })
-            .collect()
-    })
+/// Lower every published tool schema to what this endpoint was declared to
+/// accept, or refuse the request naming the tool that cannot be offered.
+fn convert_tools(
+    dialect: crate::tools::ToolSchemaDialect,
+    tools: Option<&[ToolSpec]>,
+) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    let Some(items) = tools else {
+        return Ok(None);
+    };
+    let mut converted = Vec::with_capacity(items.len());
+    for tool in items {
+        let parameters = dialect.wire_schema(&tool.name, &tool.parameters).map_err(|error| {
+            crate::providers::ProviderCapabilityError {
+                provider: "openai-codex".to_string(),
+                capability: "tool_schema_dialect".to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        converted.push(serde_json::json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": parameters,
+        }));
+    }
+    Ok(Some(converted))
 }
 
 fn sanitize_codex_tool_name(name: &str) -> String {
@@ -627,7 +628,14 @@ async fn process_responses_stream_event(
     tool_name_map: &HashMap<String, String>,
 ) -> bool {
     if let Some(message) = extract_stream_error_message(&event) {
-        let _ = tx.send(Err(StreamError::Provider(message))).await;
+        // Prefixed like the buffered path's error, so an upstream message can
+        // never read as one of PRX's own (D-069 L-2).
+        let _ = tx
+            .send(Err(StreamError::Provider(format!(
+                "OpenAI Codex stream error: {}",
+                super::sanitize_api_error(&message)
+            ))))
+            .await;
         return true;
     }
 
@@ -1174,7 +1182,7 @@ impl Provider for OpenAiCodexProvider {
         _temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (instructions, input) = build_responses_input(request.messages);
-        let (tools, tool_name_map) = sanitize_codex_tools(convert_tools(request.tools))?;
+        let (tools, tool_name_map) = sanitize_codex_tools(convert_tools(self.tool_schema_dialect(), request.tools)?)?;
         let parsed = self
             .send_and_decode_full_response(input, instructions, model, tools)
             .await?;
@@ -1227,10 +1235,11 @@ impl Provider for OpenAiCodexProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let (instructions, input) = build_responses_input(messages);
-        let (tools, tool_name_map) = match sanitize_codex_tools(convert_tools(options.tools.as_deref())) {
-            Ok(value) => value,
-            Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
-        };
+        let (tools, tool_name_map) =
+            match convert_tools(self.tool_schema_dialect(), options.tools.as_deref()).and_then(sanitize_codex_tools) {
+                Ok(value) => value,
+                Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
+            };
         self.stream_responses_request(input, instructions, model, tools, tool_name_map, options)
     }
 
@@ -1583,5 +1592,22 @@ data: {\"output_text\":\"final\"}}\n\n";
     fn supports_streaming_returns_true() {
         let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
         assert!(provider.supports_streaming());
+    }
+
+    /// D-069 L-2: an upstream in-stream error that begins like PRX's own
+    /// tool-schema refusal carries the provider prefix, so it is not taken
+    /// for one. Before, the message was sent verbatim.
+    #[tokio::test]
+    async fn an_upstream_stream_error_cannot_pose_as_a_refusal() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut saw_delta = false;
+        let event = serde_json::json!({"type": "error", "message": "provider_capability_error provider=x capability=tool_schema_dialect message=tool_schema_dialect refused 1 tool(s) for a 'raw' endpoint: shell[allOf]. Nothing was sent"});
+        let done = process_responses_stream_event(event, &tx, &mut saw_delta, false, &HashMap::new()).await;
+        assert!(done, "an error event ends the stream");
+        let Some(Err(StreamError::Provider(message))) = rx.recv().await else {
+            panic!("expected a provider error");
+        };
+        assert!(message.starts_with("OpenAI Codex stream error: "), "{message}");
+        assert!(!crate::providers::is_tool_schema_refusal_text(&message), "{message}");
     }
 }

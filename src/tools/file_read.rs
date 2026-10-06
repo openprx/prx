@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -112,7 +112,32 @@ impl Tool for FileReadTool {
         })
     }
 
+    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+        static SPEC: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        Some(std::slice::from_ref(SPEC.get_or_init(|| self.spec())))
+    }
+
+    fn catalog_availability_is_configured(&self) -> bool {
+        // FileRead uses the Tool default Ready availability in both ACL modes.
+        true
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(scope) = super::owner_filesystem_dispatch::current() {
+            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+        }
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -280,6 +305,36 @@ mod tests {
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["max_bytes"].is_object());
         assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
+    }
+
+    #[test]
+    fn file_read_borrowed_catalog_spec_matches_owned_for_acl_modes() {
+        for acl_enabled in [false, true] {
+            let tool = FileReadTool::new(test_security(std::env::temp_dir()), acl_enabled);
+            let availability = tool.availability();
+            assert_eq!(
+                tool.catalog_availability_is_configured(),
+                availability.level >= crate::capability::CapabilityAvailabilityLevel::Configured
+                    || availability.reason.trim().is_empty()
+            );
+            let (_, allocations) =
+                crate::decision::builtin::allocation_counter::count(|| tool.catalog_availability_is_configured());
+            assert_eq!(allocations, 0);
+            let owned = tool.catalog_specs();
+            let borrowed = tool.immutable_catalog_specs().expect("immutable file read spec");
+            assert_eq!(borrowed.len(), 1);
+            assert_eq!(borrowed[0].name, owned[0].name);
+            assert_eq!(borrowed[0].description, owned[0].description);
+            assert_eq!(borrowed[0].parameters, owned[0].parameters);
+            let fingerprint = |spec: &ToolSpec| {
+                crate::tools::capability::fingerprint::tool_spec_fingerprint(
+                    &spec.name,
+                    &spec.description,
+                    &spec.parameters,
+                )
+            };
+            assert_eq!(fingerprint(&borrowed[0]), fingerprint(&owned[0]));
+        }
     }
 
     #[tokio::test]

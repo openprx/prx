@@ -30,13 +30,20 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
+    let owner_id = str_field("owner_id");
     Some(MemoryWriteContext {
         workspace_id: str_field("workspace_id"),
         channel: str_field("channel"),
         chat_type: str_field("chat_type"),
         chat_id: str_field("chat_id"),
-        sender_id: str_field("owner_id").or_else(|| str_field("sender_id")),
+        // Historical mapping kept verbatim; `owner_id` below is the new,
+        // explicit owner-isolation anchor carrying the same trusted value.
+        sender_id: owner_id.clone().or_else(|| str_field("sender_id")),
         raw_sender: str_field("sender").or_else(|| str_field("raw_sender")),
+        owner_id,
+        // Set by `execute` from `scope_requires_owner_match`, never read from
+        // the scope block itself, so it survives a missing or malformed scope.
+        require_owner_match: false,
     })
 }
 
@@ -116,15 +123,26 @@ impl Tool for MemoryRecallTool {
         // returns no cross-principal memories rather than leaking the whole
         // store. With ACL disabled the legacy unscoped recall path is preserved
         // unchanged.
-        let recall_result = if self.acl_enabled {
-            let scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
+        //
+        // V02-R5: an owner-isolated origin (today an externally authenticated
+        // MCP caller) takes the owner-scoped path regardless of the flag —
+        // `memory.acl_enabled` is an in-process rollout switch and must not be
+        // able to disable an authenticated caller's owner boundary. That also
+        // makes the FIX-#50 branch reachable in production, which it was not
+        // while `src/tools/mod.rs` built this tool with a hardcoded `false`.
+        let isolated = crate::tools::execution::scope_requires_owner_match(&args);
+        let recall_result = if self.acl_enabled || isolated {
+            let mut scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
                 workspace_id: None,
                 channel: None,
                 chat_type: None,
                 chat_id: None,
                 sender_id: None,
                 raw_sender: None,
+                owner_id: None,
+                require_owner_match: false,
             });
+            scope_ctx.require_owner_match = isolated;
             self.memory
                 .recall_with_context(query, limit, session_id, Some(&scope_ctx))
                 .await
@@ -244,6 +262,45 @@ mod tests {
             "ACL recall must not return the legacy disabled error"
         );
         assert!(result.output.contains("No memories found"));
+    }
+
+    /// V02-R5: the tool is built with a hardcoded `acl_enabled = false` in
+    /// production, so before this change every recall — MCP included — took the
+    /// unscoped path. An owner-isolated origin now takes the scoped one, which
+    /// is what makes the FIX-#50 branch reachable outside tests.
+    ///
+    /// MUTATION GUARD: drop `|| isolated` and this goes red while
+    /// `recall_finds_match` (no isolation marker) stays green.
+    #[tokio::test]
+    async fn an_owner_isolated_recall_is_scoped_with_the_acl_flag_off() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(mem, false);
+        let result = tool
+            .execute(json!({
+                "query": "Rust",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "mcp",
+                    "chat_type": "gateway",
+                    "chat_id": "mcp:shared-subject",
+                    "sender": "shared-subject",
+                    "owner_id": "owner:ws:agent:issuer-a.example:shared-subject",
+                    "owner_isolated": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("No memories found"),
+            "an unattributed row must not reach an owner-isolated caller: {}",
+            result.output
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ Record (realtime) → Analyze (daily) → Evolve (every 3 days)
 - **Memory system**: Retrieval, safety filtering, compression, anti-pattern detection
 - **Analysis**: Automated evaluation with judge model and test suites
 - **Evolution engines**: Memory evolution, prompt evolution, strategy evolution
-- **Safety**: Rollback capability, gate checks, shadow mode for first rounds
+- **Safety**: pre-write snapshots (restored by hand), gate checks, shadow mode for first rounds
 - **Pipeline**: Scheduler, pipeline orchestration, annotation system
 - **Integrated runtime**: evolution state, history, configuration, and manual
   trigger commands are exposed through the main CLI
@@ -26,3 +26,60 @@ prx evolution status   # Show evolution state
 prx evolution history  # Show evolution history
 prx evolution trigger  # Manually trigger one evolution cycle
 ```
+
+## Judge verdicts
+
+A layer engine only **proposes** its change. The evolution judge (the resolved
+default model) scores the proposal, and in `auto` mode the change is written
+only after the judge accepts it:
+
+| Layer | Change | Written when |
+| --- | --- | --- |
+| prompt | the first `prompt.mutable_files` entry | a model judge scores the proposal at or above the pass threshold |
+| strategy | `strategy.decision_policy_path` | the strategy gate passes, then a model judge accepts |
+| memory | `evolution_config.toml` (and redundant conversation memories moved to trash) | the memory gate passes, then a model judge accepts; while the memory engine scores with its built-in mock (as it does today) it defers first, so memory evolution does not apply in `auto` mode |
+
+Before a change is written, the previous version of its target is kept as a
+JSON snapshot under `.evolution/rollback/<layer>/`. There is no rollback
+command; restore a snapshot's `content` by hand if needed.
+
+- A score below the pass threshold writes nothing; the cycle is logged with
+  result `rejected`.
+- A **deferred** verdict writes nothing; the cycle is logged with result
+  `deferred`. A verdict is deferred when there is no model judge (only the
+  built-in mock scorer, error `judge_degraded`), or when the model judge's call
+  fails, its reply is not a score, it does not answer within `[self_system]
+  evolution_judge_timeout_secs` (1 to 3600, default 180), or the run is
+  cancelled while it waits (error `judge_failed`).
+- A run cancelled after the judge accepted but before the change was written
+  writes nothing (error `commit_cancelled`, result `deferred`). A change that
+  cannot be written is logged with result `deferred` and error `apply_failed`.
+- An accepted and written change is logged with no result yet; the fitness
+  backfill scores it later.
+- Each cycle's row is flushed to the evolution log as soon as it is appended,
+  also for a cancelled run. If the row cannot be written, the run reports
+  `record_failed` and the commit decision (for example an applied change)
+  stands.
+- On daemon shutdown, after stopping its components, the daemon cancels the
+  evolution verdict tasks and waits for them (up to 10 seconds) before it
+  exits. A judge still working is abandoned, and a run that reaches its
+  verdict after the drain began is not judged: nothing is written and the
+  cycle is recorded as `deferred`. A write that an accepted verdict already
+  started completes and is recorded if it finishes within that bound;
+  otherwise the runtime shutdown can drop it and its row may be missing.
+- `prx evolution status` opens the circuit on consecutive `regressed` or
+  `rejected` entries; `deferred` entries are skipped. The running scheduler's
+  own breaker still counts a deferred cycle as a failed run, so the two can
+  disagree.
+- The strategy layer could not read any decision policy file before this
+  release, so it never proposed a change. In `auto` mode it now proposes
+  changes to `strategy.decision_policy_path` (`decision_policy.toml`), written
+  only after the judge accepts them.
+- `prx evolution trigger` prints `commit : …` (what became of the proposed
+  change) instead of `rolled : …`; its JSON report has `commit` and
+  `judge_outcome` instead of `rolled_back`.
+- In every mode, including `draft_only`, a `judge_failed` verdict marks the
+  `evolution_judge` health component as an error with the reason, and the
+  scheduler counts the layer run as a failure for its circuit breaker, as it
+  does for a rejected or deferred change. The next scored verdict, or a
+  restart or reload that builds a model judge, marks the component ok again.

@@ -364,28 +364,108 @@ pub(crate) fn is_private_or_local_host(host: &str) -> bool {
     // IP is private/local. This catches hostnames that pass string checks
     // but resolve to internal addresses (e.g. attacker-controlled DNS that
     // alternates between public and private IPs).
-    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
-        for addr in addrs {
-            let ip = addr.ip();
-            if ip.is_loopback() || ip.is_unspecified() {
-                return true;
-            }
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    if is_non_global_v4(v4) {
-                        return true;
-                    }
-                }
-                std::net::IpAddr::V6(v6) => {
-                    if is_non_global_v6(v6) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
+    resolves_to_non_global(host)
+}
 
-    false
+/// Whether any address `host` resolves to is loopback, unspecified or
+/// otherwise not globally routable. A name that does not resolve is not
+/// reported here (the request then fails to connect).
+pub(crate) fn resolves_to_non_global(host: &str) -> bool {
+    resolved_addresses(host).into_iter().any(is_non_global_ip)
+}
+
+/// Whether `ip` is loopback, unspecified or otherwise not globally routable.
+pub(crate) fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        }
+}
+
+/// Resolve `host:port` for a connection, through the system resolver. Every
+/// production lookup of a user-supplied host (media downloads, node
+/// callbacks, the doctor's gateway probe) goes through this, so under test it
+/// reads the fixed table instead and never touches the network (INT-2B
+/// FLAKE-DNS).
+pub(crate) async fn lookup_host(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let host = unbracketed(host);
+    #[cfg(not(test))]
+    {
+        tokio::net::lookup_host((host, port)).await.map(|addrs| addrs.collect())
+    }
+    #[cfg(test)]
+    {
+        std::future::ready(test_lookup_host(host, port)).await
+    }
+}
+
+/// [`lookup_host`] for synchronous callers.
+pub(crate) fn lookup_host_blocking(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let host = unbracketed(host);
+    #[cfg(not(test))]
+    {
+        std::net::ToSocketAddrs::to_socket_addrs(&(host, port)).map(|addrs| addrs.collect())
+    }
+    #[cfg(test)]
+    {
+        test_lookup_host(host, port)
+    }
+}
+
+/// `host` without the brackets a URL or `host:port` spelling puts around an
+/// IPv6 literal (`[::1]`). The system resolvers take the bare literal only,
+/// so a configured `gateway.host = "[::1]"` resolves (D-063).
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Under test: an IP literal is itself, a name comes from the fixed table,
+/// and any other name does not resolve. Like the system resolvers it does
+/// not accept a bracketed literal, so callers must pass the bare form.
+#[cfg(test)]
+fn test_lookup_host(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let addresses = host
+        .parse::<std::net::IpAddr>()
+        .map_or_else(|_| resolved_addresses(&host.to_ascii_lowercase()), |ip| vec![ip]);
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("test resolver: `{host}` is not in the table"),
+        ));
+    }
+    Ok(addresses
+        .into_iter()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .collect())
+}
+
+/// The addresses `host` resolves to, through the system resolver.
+#[cfg(not(test))]
+fn resolved_addresses(host: &str) -> Vec<std::net::IpAddr> {
+    std::net::ToSocketAddrs::to_socket_addrs(&(host, 80))
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// The addresses `host` resolves to under test: a fixed table, never the
+/// network (INT-2B FLAKE-DNS), so no test depends on live DNS. The
+/// `example.com` names resolve to a public address, `rebind.test` to a
+/// private one (a rebinding host), `localhost` to loopback, and every other
+/// name to nothing.
+#[cfg(test)]
+fn resolved_addresses(host: &str) -> Vec<std::net::IpAddr> {
+    match host {
+        "localhost" => vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+        "example.com" | "api.example.com" | "mcp.example.com" | "www.example.com" => {
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 215, 14))]
+        }
+        "rebind.test" => vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))],
+        _ => Vec::new(),
+    }
 }
 
 /// Parse the historical IPv4 forms accepted by libc and many HTTP stacks
@@ -800,5 +880,42 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         let err = tool.validate_url("").unwrap_err().to_string();
         assert!(err.contains("empty"));
+    }
+
+    /// INT-2B FLAKE-DNS, RED before: the DNS-rebinding check resolved the
+    /// host through the system resolver, so these tests depended on live DNS
+    /// (`example.com` once resolved to a blocked address mid-run and four
+    /// tests failed). After: under test the check reads a fixed table and
+    /// never the network. `rebind.test` (a reserved name no real resolver
+    /// answers) resolves to a private address there, so the rebinding branch
+    /// is covered; a name outside the table resolves to nothing.
+    #[test]
+    fn hostname_checks_use_the_test_resolver_and_never_the_network() {
+        assert!(is_private_or_local_host("rebind.test"));
+        assert!(!is_private_or_local_host("example.com"));
+        assert!(!is_private_or_local_host("api.example.com"));
+        assert!(!is_private_or_local_host("unlisted.test"));
+    }
+
+    /// INT-2B B2f F-6: the connection lookups (media downloads, node
+    /// callbacks, the doctor probe) read the same test table: an IP literal
+    /// is itself, a listed name resolves, anything else fails without asking
+    /// a real resolver (`unlisted.test` would otherwise go to DNS).
+    #[tokio::test]
+    async fn connection_lookups_use_the_test_resolver_and_never_the_network() {
+        let public = lookup_host("example.com", 443).await.expect("test: table name");
+        assert_eq!(public.len(), 1);
+        assert_eq!(public.first().map(std::net::SocketAddr::port), Some(443));
+        let literal = lookup_host("[::1]", 8080).await.expect("test: literal");
+        assert_eq!(literal.first().map(|addr| addr.ip().is_loopback()), Some(true));
+        let error = lookup_host("unlisted.test", 80)
+            .await
+            .expect_err("test: not in the table");
+        assert!(error.to_string().contains("test resolver"), "{error}");
+        let blocking = lookup_host_blocking("rebind.test", 80).expect("test: table name");
+        assert_eq!(
+            blocking.first().map(|addr| addr.ip().to_string()),
+            Some("10.0.0.1".to_string())
+        );
     }
 }

@@ -1,11 +1,11 @@
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::SharedEvolutionConfig;
-use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
+use crate::self_system::evolution::engine::{
+    CycleResult, EngineCycleInput, EvolutionEngine, FileChange, PendingChange,
+};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::rollback::RollbackManager;
-use crate::self_system::evolution::safety_utils::{
-    atomic_write, is_raw_debug_enabled, sha256_hex, validate_path_in_workspace,
-};
+use crate::self_system::evolution::safety_utils::{is_raw_debug_enabled, sha256_hex, validate_path_in_workspace};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
@@ -192,22 +192,10 @@ impl PromptEvolutionEngine {
 
     /// Per-layer rollback directory shared with the pipeline rollback path.
     ///
-    /// Must stay byte-identical with `pipeline::infer_rollback_dir(_, Prompt)` so that
-    /// a backup written here is discoverable when the pipeline triggers a rollback.
+    /// Where an applied prompt change snapshots the previous version
+    /// (`VersionSnapshot` JSON); restoring it is manual.
     fn rollback_dir(&self) -> PathBuf {
         self.workspace_root.join(".evolution").join("rollback").join("prompt")
-    }
-
-    /// Back up the current prompt file via the shared `RollbackManager`.
-    ///
-    /// This writes a `VersionSnapshot` JSON under `.evolution/rollback/prompt/<uuid>.json`,
-    /// the exact layout the pipeline's `RollbackManager::rollback_latest` reads. Replaces
-    /// the previous bespoke `.evolution/prompt_versions/<rel>/<uuid>.bak` format that the
-    /// rollback path could never locate.
-    async fn backup_version(&self, target: &Path, max_versions: usize) -> Result<()> {
-        let manager = RollbackManager::new(&self.workspace_root, target, self.rollback_dir(), max_versions)?;
-        manager.backup_current_version().await?;
-        Ok(())
     }
 }
 
@@ -282,17 +270,27 @@ impl EvolutionEngine for PromptEvolutionEngine {
 
         let mut outcome = CycleOutcome::NoAction;
         let mut notes = "shadow mode: prompt mutation recorded only".to_string();
+        let mut pending: Option<Arc<dyn PendingChange>> = None;
 
         if mode.allows_target_mutation() {
             if needs_human_approval {
                 outcome = CycleOutcome::ApprovalRequired;
                 notes = "severity exceeded threshold".to_string();
             } else {
-                self.backup_version(&target_path, prompt_cfg.max_rollback_versions)
-                    .await?;
-                atomic_write(&self.workspace_root, &target_path, after.as_bytes()).await?;
-                outcome = CycleOutcome::Applied;
-                notes = "prompt mutation applied".to_string();
+                // D-046: proposed only; the pipeline writes it after an
+                // accepted verdict.
+                pending = Some(Arc::new(FileChange::new(
+                    self.workspace_root.clone(),
+                    target_path.clone(),
+                    after.clone(),
+                    RollbackManager::new(
+                        &self.workspace_root,
+                        &target_path,
+                        self.rollback_dir(),
+                        prompt_cfg.max_rollback_versions,
+                    )?,
+                )));
+                notes = "prompt mutation proposed; written only after an accepted verdict".to_string();
             }
         }
         let (log_before, log_after, log_diff) = Self::redact_evolution_content(&before, &after, &diff, self.debug_raw);
@@ -316,8 +314,6 @@ impl EvolutionEngine for PromptEvolutionEngine {
             },
             result: if needs_human_approval {
                 Some(EvolutionResult::Rejected)
-            } else if matches!(outcome, CycleOutcome::Applied) {
-                None
             } else {
                 Some(EvolutionResult::Neutral)
             },
@@ -365,6 +361,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
             evolution_log: Some(evolution_log),
             needs_human_approval,
             shadow_mode: mode.is_draft_like(),
+            pending,
         })
     }
 }
@@ -445,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_apply_then_rollback_restores_original_prompt() {
+    async fn auto_mode_proposes_then_apply_snapshots_the_original_prompt() {
         use crate::self_system::evolution::rollback::RollbackManager;
 
         let dir = tempdir().unwrap();
@@ -468,7 +465,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(result.cycle.outcome, CycleOutcome::Applied));
+        // D-046: the engine proposes; nothing is written until the pending
+        // change is applied (by the pipeline, after an accepted verdict).
+        assert!(matches!(result.cycle.outcome, CycleOutcome::NoAction));
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), original);
+        result
+            .pending
+            .expect("test: Auto mode proposes a change")
+            .apply()
+            .await
+            .unwrap();
 
         // File was mutated by apply.
         let after_apply = fs::read_to_string(&path).await.unwrap();
@@ -479,12 +485,10 @@ mod tests {
         let manager = RollbackManager::new(dir.path(), &path, &rollback_dir, 10).unwrap();
         let versions = manager.list_versions().await.unwrap();
         assert_eq!(versions.len(), 1, "exactly one VersionSnapshot json should exist");
-
-        manager.rollback_latest().await.unwrap();
-        let restored = fs::read_to_string(&path).await.unwrap();
         assert_eq!(
-            restored, original,
-            "rollback must restore original prompt byte-for-byte"
+            versions.first().map(|version| version.content.as_str()),
+            Some(original),
+            "the snapshot keeps the original prompt byte-for-byte"
         );
     }
 

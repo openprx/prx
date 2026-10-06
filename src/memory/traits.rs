@@ -32,6 +32,64 @@ pub struct MemoryEntry {
     pub compressed_from: Option<Vec<String>>,
 }
 
+/// Bounded content returned by a selected causal Memory retrieval.
+/// The runtime owns the query and principal; these fields are never a tool
+/// argument or a substitute for the backend ACL check.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DecisionMemoryHit {
+    pub id: String,
+    pub key: String,
+    pub category: MemoryCategory,
+    pub session_id: Option<String>,
+    pub content: String,
+    pub created_at: String,
+    /// Stored row metadata, not a verified runtime event receipt.
+    pub source_event_id: Option<String>,
+}
+
+impl std::fmt::Debug for DecisionMemoryHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionMemoryHit")
+            .field("content_len", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bounded document evidence from a selected, read-only decision query.
+/// Row identities are metadata, not execution authority or event receipts.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DecisionDocumentHit {
+    pub chunk_id: String,
+    pub document_id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+impl std::fmt::Debug for DecisionDocumentHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionDocumentHit")
+            .field("content_len", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bounded historical session text, never a runtime authority receipt.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DecisionSessionHit {
+    pub event_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+impl std::fmt::Debug for DecisionSessionHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionSessionHit")
+            .field("content_len", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// ACL behavior requested by a backend-neutral memory reader.
 ///
 /// `Enforce` returns only entries visible to the runtime principal. `Observe`
@@ -531,6 +589,26 @@ pub struct MessageEvent {
     pub updated_at: String,
 }
 
+impl MessageEvent {
+    pub(crate) fn validate_console_projection(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.id > 0
+                && !self.event_id.is_empty()
+                && !self.workspace_id.is_empty()
+                && self.owner_id.as_deref().is_some_and(|value| !value.is_empty())
+                && self.session_key.as_deref().is_some_and(|value| !value.is_empty())
+                && self.channel.as_deref().is_some_and(|value| !value.is_empty())
+                && self.sender.as_deref().is_some_and(|value| !value.is_empty())
+                && self.source == MessageEventSource::Console
+                && self.visibility == MemoryVisibility::Session
+                && self.event_type == "message.created"
+                && matches!(self.role.as_str(), "user" | "assistant"),
+            "console projection requires a durable scoped message event"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod message_event_contract_tests {
     use super::*;
@@ -821,6 +899,15 @@ pub struct DocumentIngestInput {
     pub mime_type: Option<String>,
     pub visibility: MemoryVisibility,
     pub metadata_json: Option<String>,
+    /// V02-R6: scoping keys copied onto the `document.ingested` memory event so
+    /// it is readable through the same predicate arms as every other memory
+    /// event. Without them the event row carries `NULL` in the columns the
+    /// `session`/`agent`/`private` arms compare against, which no principal can
+    /// ever match. They scope the event row only; the document's own visibility
+    /// and owner columns are unchanged.
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1145,49 @@ pub struct CompactionRun {
     pub created_at: String,
 }
 
+/// Whether a backend's *default*, unscoped read must answer nothing
+/// (C03 / V02-R5, follow-up F2).
+///
+/// The context-carrying read defaults on [`Memory`] fall back to the unscoped
+/// `recall` / `get`, which cannot express an owner boundary: those backends
+/// store no `owner_id` and have no visibility predicate to attach one to. An
+/// owner-isolated caller would therefore read every row in the store — the
+/// same defect the SQL adapters were fixed for, reachable on every backend
+/// that does not override those methods (`markdown`, `none`, `lucid`, the wasm
+/// plugin wrappers, and an unknown backend name, which falls back to
+/// `markdown`).
+///
+/// Fail closed instead: no attribution, no rows. `SqliteMemory` and
+/// `PostgresMemory` override every one of those methods with a real
+/// owner-scoped predicate, so they never reach this and keep serving an
+/// isolated caller its own rows. A caller that is not owner-isolated —
+/// including one with no context at all — is untouched.
+///
+/// The log line carries the backend name and the operation only: no key, no
+/// query, no owner id, no content.
+fn unscoped_read_is_withheld(backend: &str, context: Option<&MemoryWriteContext>, operation: &str) -> bool {
+    if !context.is_some_and(|context| context.require_owner_match) {
+        return false;
+    }
+    tracing::warn!(
+        backend = backend,
+        operation = operation,
+        "memory backend cannot scope a read to an owner; the owner-isolated caller is served nothing"
+    );
+    true
+}
+
+/// An owner-isolated context is enforced whatever mode was requested, so an
+/// `Observe` request cannot route around the fail-closed defaults above. This
+/// mirrors the override both SQL adapters already apply in their own
+/// `*_with_context_mode`.
+const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: MemoryReadMode) -> MemoryReadMode {
+    match context {
+        Some(context) if context.require_owner_match => MemoryReadMode::Enforce,
+        _ => requested,
+    }
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -1085,7 +1215,16 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<()> {
-        let _ = context;
+        // V02-R9: this default stores no owner, so it cannot keep an
+        // owner-isolated caller inside its own keys. Refuse the write rather
+        // than let it overwrite whatever the key holds. `SqliteMemory` and
+        // `PostgresMemory` override this with an owner-guarded upsert.
+        if context.is_some_and(|context| context.require_owner_match) {
+            return Err(super::owner_predicate::OwnerScopedStoreRefusal::UnscopedBackend {
+                backend: self.name().to_string(),
+            }
+            .into());
+        }
         self.store(key, content, category, session_id).await
     }
 
@@ -1124,9 +1263,120 @@ pub trait Memory: Send + Sync {
     /// Recall memories matching a query (keyword search), optionally scoped to a session
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// Runtime statistics read; verifies a durable terminal receipt and source.
+    /// One actual selected Router-history purpose, consumed without lexical recall fallback.
+    async fn read_router_history(
+        &self,
+        evidence: super::RouterHistoryReadEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::RouterHistoryRead> {
+        let _ = (evidence, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "read_router_history"))
+    }
+
+    /// Persist one actual terminal outcome and its retained local embedding.
+    async fn commit_router_history(
+        &self,
+        evidence: &super::RouterHistoryWriteEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::RouterHistoryCommitReceipt> {
+        let _ = (evidence, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "commit_router_history"))
+    }
+
+    async fn read_router_learning(
+        &self,
+        evidence: &RouterLearningEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<RouterLearningRead> {
+        let _ = (evidence, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "read_router_learning"))
+    }
+
+    /// Atomically commit a bounded statistics snapshot and permanent terminal deduplication.
+    async fn commit_router_learning(
+        &self,
+        evidence: &RouterLearningEvidence,
+        expected_version: i64,
+        next: &RouterLearningSnapshot,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<RouterLearningCommit> {
+        let _ = (evidence, expected_version, next, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "commit_router_learning"))
+    }
+
+    /// Count at most `limit` keyword hits visible to a trusted source scope.
+    /// Rehearsal must not compute embeddings, cache, log access, or return
+    /// content. Backends without a strictly scoped read-only path fail closed.
+    async fn count_rehearsal_hits(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &MemoryWriteContext,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u32> {
+        let _ = (query, limit, context, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "count_rehearsal_hits"))
+    }
+
+    /// Read selected Memory evidence with source-owned ACL scope. An optional
+    /// session filter is applied in the backend before ranking/limit; callers
+    /// must authorize its value from the source rather than model arguments.
+    /// Returns stored key/category/session metadata, but no semantic score or
+    /// ancillary metadata. Unsupported backends fail closed instead of using
+    /// semantic recall with side effects.
+    async fn retrieve_decision_memory(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &MemoryWriteContext,
+        session_id: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<DecisionMemoryHit>> {
+        let _ = (query, limit, context, session_id, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "retrieve_decision_memory",
+        ))
+    }
+
+    /// Read selected document evidence locally without embedding generation,
+    /// cache writes or unscoped fallback. The caller owns the principal and deadline.
+    async fn retrieve_decision_documents(
+        &self,
+        query: &str,
+        limit: u8,
+        principal: &MemoryPrincipal,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<DecisionDocumentHit>> {
+        let _ = (query, limit, principal, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "retrieve_decision_documents",
+        ))
+    }
+
+    /// Read bounded session history strictly before the runtime-owned source
+    /// event. No embeddings, unscoped fallback, or current-input echo is allowed.
+    async fn retrieve_decision_session(
+        &self,
+        principal: &MemoryPrincipal,
+        before_event_id: &str,
+        limit: u8,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<DecisionSessionHit>> {
+        let _ = (principal, before_event_id, limit, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "retrieve_decision_session",
+        ))
+    }
+
     /// Recall memories matching a query with optional runtime ACL/write context.
     ///
-    /// Backends without ACL-aware recall support fall back to legacy recall.
+    /// Backends without ACL-aware recall support fall back to legacy recall —
+    /// except for an owner-isolated caller, which this default cannot serve at
+    /// all; see [`unscoped_read_is_withheld`].
     async fn recall_with_context(
         &self,
         query: &str,
@@ -1134,7 +1384,9 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let _ = context;
+        if unscoped_read_is_withheld(self.name(), context, "recall") {
+            return Ok(Vec::new());
+        }
         self.recall(query, limit, session_id).await
     }
 
@@ -1148,7 +1400,7 @@ pub trait Memory: Send + Sync {
         context: Option<&MemoryWriteContext>,
         mode: MemoryReadMode,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        match mode {
+        match enforced_read_mode(context, mode) {
             MemoryReadMode::Enforce => self.recall_with_context(query, limit, session_id, context).await,
             MemoryReadMode::Observe => self.recall(query, limit, session_id).await,
         }
@@ -1163,7 +1415,9 @@ pub trait Memory: Send + Sync {
         key: &str,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<Option<MemoryEntry>> {
-        let _ = context;
+        if unscoped_read_is_withheld(self.name(), context, "keyed read") {
+            return Ok(None);
+        }
         self.get(key).await
     }
 
@@ -1174,7 +1428,7 @@ pub trait Memory: Send + Sync {
         context: Option<&MemoryWriteContext>,
         mode: MemoryReadMode,
     ) -> anyhow::Result<Option<MemoryEntry>> {
-        match mode {
+        match enforced_read_mode(context, mode) {
             MemoryReadMode::Enforce => self.get_with_context(key, context).await,
             MemoryReadMode::Observe => self.get(key).await,
         }
@@ -1187,15 +1441,66 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// The owner of every row in `category`, by row id, for maintenance that
+    /// must never act across owners (deduplication, for one).
+    ///
+    /// `None` means this backend keeps no per-row owner, so every row belongs
+    /// to the one workspace. A backend that stores owners (`SqliteMemory`,
+    /// `PostgresMemory`) must override this: `None` from it would let such
+    /// maintenance treat two owners' rows as one owner's.
+    async fn list_owner_ids(
+        &self,
+        category: &MemoryCategory,
+    ) -> anyhow::Result<Option<std::collections::HashMap<String, Option<String>>>> {
+        let _ = category;
+        Ok(None)
+    }
+
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
+
+    /// Mirror a write the **local operator** made into the backend's workspace
+    /// Markdown files (`MEMORY.md` for `core`, `memory/<date>.md` otherwise),
+    /// when the backend keeps such a mirror (D-026).
+    ///
+    /// `MEMORY.md` is inlined into the system prompt of every surface, so text
+    /// placed there steers every user's turns. The caller — `memory_store` —
+    /// invokes this only for a write that came from the terminal UI or the
+    /// `prx agent` CLI; every other origin (webhook, channel, gateway,
+    /// Console, MCP, sub-agent) stays in the owner-scoped store. Backends with
+    /// no separate mirror do nothing.
+    async fn mirror_operator_write(&self, key: &str, content: &str, category: &MemoryCategory) -> anyhow::Result<()> {
+        let _ = (key, content, category);
+        Ok(())
+    }
+
+    /// Whether this backend's store *is* the shared prompt material: the
+    /// `markdown` backend keeps memory in `MEMORY.md` and the daily logs
+    /// themselves, so a store on it cannot be kept out of every surface's
+    /// system prompt (D-026). `memory_store` refuses such a backend to every
+    /// origin but the local operator.
+    fn stores_into_shared_prompt_files(&self) -> bool {
+        false
+    }
 
     /// Remove a memory by key after applying a runtime write/read scope.
     ///
     /// Backends that do not support ACL metadata fall back to legacy key
-    /// deletion for compatibility; SQLite overrides this with scoped deletion.
+    /// deletion for compatibility; SQLite and PostgreSQL override this with
+    /// scoped deletion.
+    ///
+    /// The owner boundary applies to the delete as it does to the reads above.
+    /// A backend that cannot prove who owns a row cannot prove the row belongs
+    /// to an owner-isolated caller either, so it deletes nothing and reports
+    /// that nothing was deleted. `memory_forget` is not on the default MCP
+    /// surface, but an operator may expose it; without this, the caller that
+    /// cannot *read* another owner's row could still delete it by key.
+    /// A caller that is not owner-isolated — including one with no context at
+    /// all — keeps the legacy unscoped delete unchanged.
     async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<bool> {
-        let _ = context;
+        if unscoped_read_is_withheld(self.name(), context, "forget") {
+            return Ok(false);
+        }
         self.forget(key).await
     }
 
@@ -1291,6 +1596,30 @@ pub trait Memory: Send + Sync {
         Ok(())
     }
 
+    /// Project an exact durable Console message once, including the session
+    /// counter update. Repeating the same event is a no-op; conflicts fail.
+    /// Implementations must verify the stored event inside the transaction.
+    async fn project_console_message(&self, event: &MessageEvent) -> anyhow::Result<()> {
+        let _ = event;
+        Err(crate::memory::fabric::fail_fast(self.name(), "project_console_message"))
+    }
+
+    /// Enumerate committed Console terminal markers for explicit recovery.
+    /// Returned rows are candidates only; the caller must authenticate replay.
+    async fn list_console_terminal_events(
+        &self,
+        workspace_id: &str,
+        session_key: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (workspace_id, session_key, after_id, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_console_terminal_events",
+        ))
+    }
+
     /// List persisted conversation sessions ordered by most recently updated.
     async fn list_conversation_sessions(
         &self,
@@ -1320,6 +1649,23 @@ pub trait Memory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Read the newest Console history window in event-time order, reversing
+    /// the selected page for chronological presentation. Recovery insertion
+    /// order must not move an old event into the newest page.
+    async fn list_console_conversation_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
+        let _ = (principal, session_key, limit, offset);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_console_conversation_turns",
+        ))
+    }
+
     /// Load recent turns per session for runtime history hydration.
     async fn load_recent_conversation_histories(
         &self,
@@ -1340,6 +1686,102 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "append_message_event"))
     }
 
+    /// Create a backend lifetime owner. Unsupported backends fail explicitly.
+    async fn acquire_ingress_lifetime(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<std::sync::Arc<dyn super::ingress_recovery::IngressLifetime>> {
+        let _ = (workspace_id, token, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "acquire_ingress_lifetime",
+        ))
+    }
+
+    /// Input, capsule and indexed projection must commit in one transaction.
+    async fn append_ingress_input(
+        &self,
+        input: MessageEventInput,
+        capsule: super::ingress_recovery::IngressCapsule,
+        lifetime: std::sync::Arc<dyn super::ingress_recovery::IngressLifetime>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::ingress_recovery::IngressAppendOutcome> {
+        let _ = (input, capsule, lifetime, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "append_ingress_input"))
+    }
+
+    async fn list_ingress_recovery_candidates(
+        &self,
+        scope: &super::ingress_recovery::IngressRecoveryScope,
+        current: std::sync::Arc<dyn super::ingress_recovery::IngressLifetime>,
+        phase: super::ingress_recovery::IngressRecoveryScan,
+        after_id: i64,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<super::ingress_recovery::IngressRecoveryCandidate>> {
+        let _ = (scope, current, phase, after_id, limit, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_ingress_recovery_candidates",
+        ))
+    }
+
+    async fn read_ingress_event(
+        &self,
+        scope: &super::ingress_recovery::IngressRecoveryScope,
+        lookup: &super::ingress_recovery::IngressEventLookup,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        let _ = (scope, lookup, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "read_ingress_event"))
+    }
+
+    /// None means another lifetime still owns the lock; no death inference.
+    async fn claim_ingress_recovery(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<super::ingress_recovery::IngressRecoveryClaim>> {
+        let _ = (workspace_id, token, deadline);
+        Err(crate::memory::fabric::fail_fast(self.name(), "claim_ingress_recovery"))
+    }
+
+    /// Evidence event, outbox and projection transition must commit atomically.
+    async fn commit_ingress_recovery(
+        &self,
+        commit: super::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        let _ = commit;
+        Err(crate::memory::fabric::fail_fast(self.name(), "commit_ingress_recovery"))
+    }
+
+    /// Bounded evidence repair; this does not grant provider or tool authority.
+    async fn append_message_event_until(
+        &self,
+        input: MessageEventInput,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<MessageEvent> {
+        let _ = (input, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "append_message_event_until",
+        ))
+    }
+    async fn project_console_message_until(
+        &self,
+        event: &MessageEvent,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        let _ = (event, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "project_console_message_until",
+        ))
+    }
+
     /// Find one MessageEvent by its workspace-scoped idempotency key.
     ///
     /// The default returns no match for backends without event-ledger lookup
@@ -1352,6 +1794,52 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<Option<MessageEvent>> {
         let _ = (workspace_id, idempotency_key);
         Ok(None)
+    }
+
+    /// Bounded runtime recovery discovery, ordered by durable event ID. This
+    /// returns launch candidates only; callers must authenticate their signed
+    /// provenance before using any owner, run, process or result fields.
+    async fn list_worker_launch_events(
+        &self,
+        workspace_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (workspace_id, after_id, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_worker_launch_events",
+        ))
+    }
+
+    /// Indexed recovery lookup with owner isolation. Unsupported backends must
+    /// not turn an unavailable ledger into evidence that no segment existed.
+    async fn find_owned_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        let _ = (workspace_id, owner_id, idempotency_key);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "find_owned_message_event_by_idempotency_key",
+        ))
+    }
+
+    /// Read one durable event for an exact workspace and owner. Runtime replay
+    /// uses this for its original source receipt; it grants no caller authority.
+    async fn find_owned_message_event(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_id: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        let _ = (workspace_id, owner_id, event_id);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "find_owned_message_event",
+        ))
     }
 
     /// List message events visible to `principal` after a cursor.
@@ -1691,6 +2179,8 @@ pub(crate) mod conformance {
             chat_id: Some(format!("{key_prefix}:dm-alice")),
             sender_id: None,
             raw_sender: Some("alice".into()),
+            owner_id: None,
+            require_owner_match: false,
         };
         let bob_ctx = MemoryWriteContext {
             workspace_id: Some("workspace-a".into()),
@@ -1699,6 +2189,8 @@ pub(crate) mod conformance {
             chat_id: Some(format!("{key_prefix}:dm-bob")),
             sender_id: None,
             raw_sender: Some("bob".into()),
+            owner_id: None,
+            require_owner_match: false,
         };
         let alice_key = format!("{key_prefix}:alice-private");
         let bob_key = format!("{key_prefix}:bob-private");
@@ -1789,6 +2281,368 @@ pub(crate) mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // V02-R5 follow-up F2: the trait-level defaults must fail closed.
+    //
+    // `SqliteMemory` and `PostgresMemory` override every `*_with_context*`
+    // read with a real owner-scoped predicate. Every other backend — markdown,
+    // none, lucid and the wasm plugin wrappers — inherits the defaults in this
+    // file, which used to discard the context and answer from the unscoped
+    // read. An owner-isolated MCP caller therefore read the whole store on any
+    // of them, and an unknown backend name falls back to markdown.
+    //
+    // `MarkdownMemory` is the fixture because it inherits every default here
+    // unchanged and really returns rows, so "the caller reads what it must not"
+    // is observable rather than argued.
+    // ---------------------------------------------------------------------
+
+    const UNSCOPED_KEY: &str = "first-owner-note";
+    const UNSCOPED_CONTENT: &str = "alpha rollout note authored by the first owner";
+    const UNSCOPED_QUERY: &str = "rollout";
+
+    /// A read context from a trusted, owner-isolated origin whose owner is not
+    /// the one that authored the row.
+    fn isolated_reader_context(owner_id: Option<&str>) -> MemoryWriteContext {
+        MemoryWriteContext {
+            workspace_id: Some("ws-isolation".to_string()),
+            channel: Some("mcp".to_string()),
+            chat_type: Some("gateway".to_string()),
+            chat_id: Some("mcp:shared-subject".to_string()),
+            sender_id: owner_id.map(str::to_string),
+            raw_sender: Some("shared-subject".to_string()),
+            owner_id: owner_id.map(str::to_string),
+            require_owner_match: true,
+        }
+    }
+
+    async fn unscoped_backend_with_one_row() -> (tempfile::TempDir, crate::memory::markdown::MarkdownMemory) {
+        let workspace = tempfile::TempDir::new().expect("test: temp workspace");
+        let memory = crate::memory::markdown::MarkdownMemory::new(workspace.path());
+        memory
+            .store(UNSCOPED_KEY, UNSCOPED_CONTENT, MemoryCategory::Core, None)
+            .await
+            .expect("test: store a row on the unscoped backend");
+        assert!(
+            !memory
+                .recall(UNSCOPED_QUERY, 10, None)
+                .await
+                .expect("test: unscoped recall")
+                .is_empty(),
+            "sanity: the fixture backend really returns the row to an unscoped read"
+        );
+        (workspace, memory)
+    }
+
+    /// MUTATION GUARD: drop the `require_owner_match` short-circuit from
+    /// `recall_with_context` / `get_with_context` in this file and this goes
+    /// red — the isolated reader gets the other owner's row back.
+    #[tokio::test]
+    async fn an_owner_isolated_reader_gets_nothing_from_a_backend_without_owner_scoping() {
+        let (_workspace, memory) = unscoped_backend_with_one_row().await;
+        let reader = isolated_reader_context(Some("owner:ws-isolation:agent:issuer-b.example:shared-subject"));
+
+        let recalled = memory
+            .recall_with_context(UNSCOPED_QUERY, 10, None, Some(&reader))
+            .await
+            .expect("test: isolated recall");
+        assert!(
+            recalled.is_empty(),
+            "an unscoped backend cannot prove ownership, so it must answer nothing: {:?}",
+            recalled.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>()
+        );
+
+        assert!(
+            memory
+                .get_with_context(UNSCOPED_KEY, Some(&reader))
+                .await
+                .expect("test: isolated keyed read")
+                .is_none(),
+            "an exact key must not cross the boundary on an unscoped backend either"
+        );
+    }
+
+    /// The isolation bit outranks the requested mode here exactly as it does in
+    /// both SQL adapters, so an `Observe` request cannot reopen the boundary.
+    #[tokio::test]
+    async fn an_observe_request_does_not_reopen_the_boundary_on_an_unscoped_backend() {
+        let (_workspace, memory) = unscoped_backend_with_one_row().await;
+        let reader = isolated_reader_context(Some("owner:ws-isolation:agent:issuer-b.example:shared-subject"));
+
+        assert!(
+            memory
+                .recall_with_context_mode(UNSCOPED_QUERY, 10, None, Some(&reader), MemoryReadMode::Observe)
+                .await
+                .expect("test: observe-mode recall under isolation")
+                .is_empty(),
+            "Observe must not reopen the owner boundary on an unscoped backend"
+        );
+        assert!(
+            memory
+                .get_with_context_mode(UNSCOPED_KEY, Some(&reader), MemoryReadMode::Observe)
+                .await
+                .expect("test: observe-mode keyed read under isolation")
+                .is_none(),
+            "Observe must not reopen the owner boundary for the keyed read either"
+        );
+    }
+
+    /// Fail closed, not fail open: an isolated caller with no owner id at all
+    /// reaches nothing rather than falling back to the unscoped read.
+    #[tokio::test]
+    async fn an_isolated_reader_without_an_owner_id_reads_nothing_on_an_unscoped_backend() {
+        let (_workspace, memory) = unscoped_backend_with_one_row().await;
+
+        for owner in [None, Some("   ")] {
+            let reader = isolated_reader_context(owner);
+            assert!(
+                memory
+                    .recall_with_context(UNSCOPED_QUERY, 10, None, Some(&reader))
+                    .await
+                    .expect("test: isolated recall without an owner id")
+                    .is_empty(),
+                "an isolated caller with owner {owner:?} must reach nothing"
+            );
+        }
+    }
+
+    /// The byte-for-byte lock: without the isolation bit the defaults still
+    /// delegate to the unscoped read, so every in-process caller is unchanged.
+    #[tokio::test]
+    async fn a_non_isolated_reader_still_gets_the_legacy_unscoped_answer() {
+        let (_workspace, memory) = unscoped_backend_with_one_row().await;
+        let mut reader = isolated_reader_context(Some("owner:ws-isolation:agent:issuer-b.example:shared-subject"));
+        reader.require_owner_match = false;
+
+        assert!(
+            memory
+                .recall_with_context(UNSCOPED_QUERY, 10, None, Some(&reader))
+                .await
+                .expect("test: non-isolated recall")
+                .iter()
+                .any(|entry| entry.content.contains(UNSCOPED_CONTENT)),
+            "a non-isolated caller keeps the historical unscoped answer"
+        );
+        assert!(
+            memory
+                .get_with_context(UNSCOPED_KEY, Some(&reader))
+                .await
+                .expect("test: non-isolated keyed read")
+                .is_some(),
+            "a non-isolated keyed read keeps the historical unscoped answer"
+        );
+        assert!(
+            memory
+                .recall_with_context(UNSCOPED_QUERY, 10, None, None)
+                .await
+                .expect("test: recall with no context at all")
+                .iter()
+                .any(|entry| entry.content.contains(UNSCOPED_CONTENT)),
+            "a caller with no context at all keeps the historical unscoped answer"
+        );
+    }
+
+    /// A minimal backend that inherits every default on this trait and whose
+    /// `forget` really deletes.
+    ///
+    /// `MarkdownMemory` is append-only — its `forget` always answers `false` —
+    /// so it cannot tell a refusal apart from "nothing was deleted". This
+    /// double can, which is the only way to make the delete assertions below
+    /// non-vacuous. It stores no owner and has no visibility predicate, exactly
+    /// like every backend the defaults serve.
+    #[derive(Default)]
+    struct DeletableUnscopedBackend {
+        rows: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl DeletableUnscopedBackend {
+        fn entry(key: &str, content: &str) -> MemoryEntry {
+            MemoryEntry {
+                id: key.to_string(),
+                key: key.to_string(),
+                content: content.to_string(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-09-21T00:00:00Z".to_string(),
+                session_id: None,
+                score: None,
+                tags: None,
+                access_count: None,
+                useful_count: None,
+                source: None,
+                source_confidence: None,
+                verification_status: None,
+                lifecycle_state: None,
+                compressed_from: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Memory for DeletableUnscopedBackend {
+        fn name(&self) -> &str {
+            "deletable-unscoped"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.rows.lock().push((key.to_string(), content.to_string()));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self
+                .rows
+                .lock()
+                .iter()
+                .filter(|(_, content)| content.contains(query))
+                .take(limit)
+                .map(|(key, content)| Self::entry(key, content))
+                .collect())
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(self
+                .rows
+                .lock()
+                .iter()
+                .find(|(stored, _)| stored == key)
+                .map(|(stored, content)| Self::entry(stored, content)))
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self
+                .rows
+                .lock()
+                .iter()
+                .map(|(key, content)| Self::entry(key, content))
+                .collect())
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            let mut rows = self.rows.lock();
+            let before = rows.len();
+            rows.retain(|(stored, _)| stored != key);
+            Ok(rows.len() != before)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.rows.lock().len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// The delete half of the same boundary: `forget_with_context` is the one
+    /// context-carrying method on this trait that used to discard its context,
+    /// so delete-by-key was unscoped on every backend that inherits the
+    /// default. `memory_forget` is not on the default MCP surface, but an
+    /// operator may expose it, and an unscoped delete from an owner-isolated
+    /// caller is a cross-owner delete.
+    ///
+    /// MUTATION GUARD: restore `let _ = context;` in the default
+    /// `forget_with_context` and the first two assertions go red.
+    #[tokio::test]
+    async fn an_owner_isolated_caller_forgets_nothing_on_a_backend_without_owner_scoping() {
+        let memory = DeletableUnscopedBackend::default();
+        memory
+            .store(UNSCOPED_KEY, UNSCOPED_CONTENT, MemoryCategory::Core, None)
+            .await
+            .expect("test: store a row on the unscoped backend");
+        let isolated = isolated_reader_context(Some("owner:ws-isolation:agent:issuer-b.example:shared-subject"));
+
+        assert!(
+            !memory
+                .forget_with_context(UNSCOPED_KEY, Some(&isolated))
+                .await
+                .expect("test: isolated delete by key"),
+            "an unscoped backend cannot prove ownership, so an isolated caller deletes nothing"
+        );
+        assert!(
+            memory.get(UNSCOPED_KEY).await.expect("test: keyed read").is_some(),
+            "the row must still be there: the refusal has to be a refusal, not a silent delete"
+        );
+
+        let mut in_process = isolated;
+        in_process.require_owner_match = false;
+        assert!(
+            memory
+                .forget_with_context(UNSCOPED_KEY, Some(&in_process))
+                .await
+                .expect("test: non-isolated delete by key"),
+            "a non-isolated caller keeps the historical unscoped delete"
+        );
+        assert!(
+            memory.get(UNSCOPED_KEY).await.expect("test: keyed read").is_none(),
+            "and the row really is gone, so the assertions above are not vacuous"
+        );
+    }
+
+    /// V02-R9: the write half. A backend that stores no owner (`lucid`,
+    /// `markdown`, `none`, wasm wrappers) cannot keep an owner-isolated caller
+    /// inside its own keys, so the default `store_with_context` refuses the
+    /// write instead of overwriting whatever the key holds.
+    ///
+    /// MUTATION GUARD: restore `let _ = context;` in the default
+    /// `store_with_context` and the first two assertions go red.
+    #[tokio::test]
+    async fn an_owner_isolated_caller_stores_nothing_on_a_backend_without_owner_scoping() {
+        let memory = DeletableUnscopedBackend::default();
+        memory
+            .store(UNSCOPED_KEY, UNSCOPED_CONTENT, MemoryCategory::Core, None)
+            .await
+            .expect("test: store a row on the unscoped backend");
+        let isolated = isolated_reader_context(Some("owner:ws-isolation:agent:issuer-b.example:shared-subject"));
+
+        let refused = memory
+            .store_with_context(UNSCOPED_KEY, "overwrite", MemoryCategory::Core, None, Some(&isolated))
+            .await
+            .expect_err("test: an isolated write on an unscoped backend must fail");
+        assert!(
+            refused.to_string().contains("cannot confine a write to an owner"),
+            "{refused}"
+        );
+        assert_eq!(
+            memory
+                .get(UNSCOPED_KEY)
+                .await
+                .expect("test: keyed read")
+                .map(|entry| entry.content),
+            Some(UNSCOPED_CONTENT.to_string()),
+            "the refusal has to be a refusal, not a silent overwrite"
+        );
+
+        let mut in_process = isolated;
+        in_process.require_owner_match = false;
+        memory
+            .store_with_context(UNSCOPED_KEY, "overwrite", MemoryCategory::Core, None, Some(&in_process))
+            .await
+            .expect("test: a non-isolated caller keeps the historical write");
+        assert!(
+            memory
+                .list(None, None)
+                .await
+                .expect("test: list rows")
+                .iter()
+                .any(|entry| entry.content == "overwrite"),
+            "and the write really happened, so the refusal above is not vacuous"
+        );
+    }
 
     #[test]
     fn memory_category_display_outputs_expected_values() {
@@ -1887,5 +2741,430 @@ mod tests {
         assert!(parsed.verification_status.is_none());
         assert!(parsed.lifecycle_state.is_none());
         assert!(parsed.compressed_from.is_none());
+    }
+}
+
+/// Source-owned runtime statistics authority. Fields are not caller-constructible.
+/// This is not a Memory Retrieve grant and carries no user-memory read permission.
+#[derive(Clone)]
+pub struct RouterLearningEvidence {
+    pub(super) terminal: RouterLearningTerminal,
+    pub(super) source_event_id: String,
+    pub(super) source_input: String,
+    pub(super) source_raw_payload: Option<String>,
+    pub(super) generation: i64,
+    pub(super) revision: String,
+    pub(super) policy: String,
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) success: bool,
+    pub(super) latency_ms: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct RouterLearningTerminal {
+    pub id: i64,
+    pub content_hash: Option<String>,
+    pub event_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub session_key: Option<String>,
+    pub run_id: Option<String>,
+    pub channel: Option<String>,
+    pub sender: Option<String>,
+    pub source: MessageEventSource,
+    pub content: String,
+    pub raw_payload_json: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub role: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterLearningMetrics {
+    pub provider: String,
+    pub model: String,
+    pub elo: f32,
+    pub success_rate: f32,
+    pub latency_ms: u32,
+    pub successes: std::collections::VecDeque<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterLearningSnapshot {
+    pub version: i64,
+    pub models: Vec<RouterLearningMetrics>,
+}
+
+pub struct RouterLearningRead {
+    pub snapshot: Option<RouterLearningSnapshot>,
+    pub replayed: bool,
+}
+
+pub enum RouterLearningCommit {
+    Committed(RouterLearningSnapshot),
+    Conflict,
+}
+
+impl RouterLearningSnapshot {
+    pub(crate) const MAX_BYTES: usize = 262_144;
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.version >= 0 && !self.models.is_empty() && self.models.len() <= 128,
+            "invalid Router statistics bounds"
+        );
+        let mut ids = std::collections::HashSet::new();
+        for model in &self.models {
+            anyhow::ensure!(
+                !model.provider.is_empty()
+                    && model.provider.len() <= 512
+                    && !model.model.is_empty()
+                    && model.model.len() <= 512
+                    && model.elo.is_finite()
+                    && model.success_rate.is_finite()
+                    && (0.0..=1.0).contains(&model.success_rate)
+                    && model.successes.len() <= 100
+                    && ids.insert((&model.provider, &model.model)),
+                "invalid Router statistics model"
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn encode(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        let value = serde_json::to_string(self)?;
+        anyhow::ensure!(value.len() <= Self::MAX_BYTES, "Router statistics exceed byte bound");
+        Ok(value)
+    }
+    pub(crate) fn decode(value: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(value.len() <= Self::MAX_BYTES, "Router statistics exceed byte bound");
+        let snapshot: Self = serde_json::from_str(value)?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+}
+
+impl RouterLearningEvidence {
+    /// Only the source-bound terminal consumer constructs this. A public receipt
+    /// is not a seal: each backend still verifies its durable event and source.
+    #[cfg(feature = "llm-router")]
+    pub(crate) fn from_terminal(
+        receipt: &MessageEvent,
+        source_event_id: String,
+        source_input: &str,
+        source_raw_payload: Option<&str>,
+        generation: u64,
+        revision: &str,
+        policy: String,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            source_raw_payload.is_none_or(|raw| raw.len() <= 32 * 1024),
+            "Router source metadata exceeds bound"
+        );
+        anyhow::ensure!(
+            source_input.len() <= 65_536
+                && revision.len() <= 512
+                && receipt.content_hash.as_ref().is_none_or(|value| value.len() <= 128),
+            "Router source/receipt exceeds byte bound"
+        );
+        // This producer is the native embedded source, not a generic imported terminal.
+        // Refuse any additional authority instead of erasing it while projecting the DTO.
+        anyhow::ensure!(
+            receipt.id > 0
+                && receipt.visibility == MemoryVisibility::Session
+                && receipt.parent_session_key.is_none()
+                && receipt.parent_run_id.is_none()
+                && receipt.agent_id.is_none()
+                && receipt.persona_id.is_none()
+                && receipt.subject.is_none()
+                && receipt.goal_id.is_none()
+                && receipt.correlation_id.is_none()
+                && receipt.attempt_id.is_none()
+                && receipt.lease_epoch.is_none()
+                && receipt.recipient == receipt.session_key
+                && receipt.causation_event_id.as_deref() == Some(source_event_id.as_str())
+                && receipt.config_generation_id == Some(generation)
+                && receipt.config_source_revision.as_deref() == Some(revision),
+            "Router native terminal authority differs"
+        );
+        let payload = receipt
+            .raw_payload_json
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("terminal payload missing"))?;
+        anyhow::ensure!(
+            payload.len() <= 65_536 && receipt.content.len() <= 8192,
+            "Router terminal exceeds byte bound"
+        );
+        for value in [
+            Some(receipt.event_id.as_str()),
+            Some(receipt.workspace_id.as_str()),
+            receipt.owner_id.as_deref(),
+            receipt.session_key.as_deref(),
+            receipt.run_id.as_deref(),
+            receipt.channel.as_deref(),
+            receipt.sender.as_deref(),
+            receipt.idempotency_key.as_deref(),
+            Some(receipt.source.as_str()),
+            Some(receipt.role.as_str()),
+            Some(receipt.event_type.as_str()),
+        ] {
+            anyhow::ensure!(
+                value.is_none_or(|value| value.len() <= 512),
+                "Router receipt identity exceeds byte bound"
+            );
+        }
+        let terminal = RouterLearningTerminal {
+            id: receipt.id,
+            content_hash: receipt.content_hash.clone(),
+            event_id: receipt.event_id.clone(),
+            workspace_id: receipt.workspace_id.clone(),
+            owner_id: receipt.owner_id.clone(),
+            session_key: receipt.session_key.clone(),
+            run_id: receipt.run_id.clone(),
+            channel: receipt.channel.clone(),
+            sender: receipt.sender.clone(),
+            source: receipt.source.clone(),
+            content: receipt.content.clone(),
+            raw_payload_json: receipt.raw_payload_json.clone(),
+            idempotency_key: receipt.idempotency_key.clone(),
+            role: receipt.role.clone(),
+            event_type: receipt.event_type.clone(),
+        };
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        let (provider, model, success) = Self::actual_terminal_outcome(&value)?;
+        let started = chrono::DateTime::parse_from_rfc3339(
+            value
+                .get("telemetry")
+                .and_then(|telemetry| telemetry.get("started_at"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("terminal start missing"))?,
+        )?;
+        let finished = chrono::DateTime::parse_from_rfc3339(
+            value
+                .get("telemetry")
+                .and_then(|telemetry| telemetry.get("finished_at"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("terminal finish missing"))?,
+        )?;
+        let latency_ms = u64::try_from(finished.signed_duration_since(started).num_milliseconds()).unwrap_or(0);
+        let evidence = Self {
+            terminal,
+            source_event_id,
+            source_input: source_input.to_owned(),
+            source_raw_payload: source_raw_payload.map(str::to_owned),
+            generation: i64::try_from(generation)?,
+            revision: revision.to_owned(),
+            policy,
+            provider,
+            model,
+            success,
+            latency_ms,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+    #[cfg(feature = "llm-router")]
+    pub(crate) fn served(&self) -> (&str, &str) {
+        (&self.provider, &self.model)
+    }
+    #[cfg(feature = "llm-router")]
+    pub(crate) const fn outcome(&self) -> (bool, u64) {
+        (self.success, self.latency_ms)
+    }
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let event = &self.terminal;
+        anyhow::ensure!(
+            self.source_input.len() <= 65_536
+                && self
+                    .source_raw_payload
+                    .as_ref()
+                    .is_none_or(|raw| raw.len() <= 32 * 1024)
+                && self.generation >= 0
+                && self.revision.len() <= 512,
+            "Router learning source exceeds bounds"
+        );
+        for id in [
+            event.workspace_id.as_str(),
+            event.owner_id.as_deref().unwrap_or_default(),
+            event.session_key.as_deref().unwrap_or_default(),
+            event.run_id.as_deref().unwrap_or_default(),
+            event.event_id.as_str(),
+            self.source_event_id.as_str(),
+            self.provider.as_str(),
+            self.model.as_str(),
+        ] {
+            anyhow::ensure!(!id.is_empty() && id.len() <= 512, "invalid Router learning identity");
+        }
+        anyhow::ensure!(
+            self.policy.len() == 64 && self.policy.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid Router learning policy"
+        );
+        anyhow::ensure!(
+            event.role == "event"
+                && event.event_type == "turn.finalized"
+                && event.source == MessageEventSource::Agent
+                && event.channel.as_deref() == Some("agent_api")
+                && event.sender.as_deref() == Some("embedded-caller")
+                && event.idempotency_key.as_deref() == Some(format!("turn:{}:final", self.terminal_id()).as_str()),
+            "Router learning requires a committed terminal"
+        );
+        let payload = event
+            .raw_payload_json
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("terminal payload missing"))?;
+        anyhow::ensure!(
+            payload.len() <= 65_536 && event.content.len() <= 8192,
+            "Router terminal receipt exceeds byte bound"
+        );
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        let (provider, model, success) = Self::actual_terminal_outcome(&value)?;
+        anyhow::ensure!(
+            value.get("terminal_id").and_then(serde_json::Value::as_str) == Some(self.terminal_id())
+                && provider == self.provider
+                && model == self.model
+                && success == self.success,
+            "Router learning actual outcome differs from terminal"
+        );
+        Ok(())
+    }
+    fn actual_terminal_outcome(value: &serde_json::Value) -> anyhow::Result<(String, String, bool)> {
+        use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, ProviderExecutionOutcome};
+        // The terminal finalizer authenticates an actual auxiliary event and
+        // projects its serving outcome separately from main usage settlement.
+        let outcome_value = if let Some(served) = value.get("served_auxiliary") {
+            served
+                .get("provider_outcome")
+                .ok_or_else(|| anyhow::anyhow!("served auxiliary outcome missing"))?
+        } else {
+            &value["provider_outcome"]
+        };
+        let outcome: ProviderExecutionOutcome = serde_json::from_value(outcome_value.clone())?;
+        let terminal_status: crate::agent::terminal::TurnTerminalStatus =
+            serde_json::from_value(value["status"].clone())?;
+        anyhow::ensure!(
+            matches!(
+                outcome.status,
+                ExecutionStatus::Success | ExecutionStatus::FallbackSuccess
+            ),
+            "Router learning requires an actual serving outcome, not all-failed labels"
+        );
+        let served = outcome
+            .attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.status != AttemptStatus::Skipped)
+            .ok_or_else(|| anyhow::anyhow!("Router learning has no physical attempt"))?;
+        anyhow::ensure!(
+            served.status == AttemptStatus::Success
+                && served.provider == outcome.final_provider
+                && served.model == outcome.final_model
+                && served.finished_at >= served.started_at
+                && outcome.finished_at >= outcome.started_at,
+            "Router actual serving attempt differs from terminal outcome"
+        );
+        let success = matches!(
+            terminal_status,
+            crate::agent::terminal::TurnTerminalStatus::Completed | crate::agent::terminal::TurnTerminalStatus::Silent
+        );
+        Ok((outcome.final_provider, outcome.final_model, success))
+    }
+
+    pub(crate) fn terminal_id(&self) -> &str {
+        self.terminal.run_id.as_deref().unwrap_or_default()
+    }
+    pub(crate) fn domain(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for value in [
+            &self.terminal.workspace_id,
+            self.terminal.owner_id.as_ref().unwrap_or(&self.policy),
+            self.terminal.session_key.as_ref().unwrap_or(&self.policy),
+            &self.policy,
+        ] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        hex::encode(hash.finalize())
+    }
+    pub(crate) fn fingerprint(&self) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        self.validate()?;
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+            &self.source_event_id,
+            self.domain(),
+            &self.terminal.event_id,
+            &self.terminal.raw_payload_json,
+            &self.source_input,
+            &self.source_raw_payload,
+            self.generation,
+            &self.revision,
+            &self.provider,
+            &self.model,
+            self.success,
+            self.latency_ms,
+        ))?)))
+    }
+}
+
+#[cfg(test)]
+mod router_served_auxiliary_tests {
+    use super::RouterLearningEvidence;
+    use crate::llm::route_decision::{
+        AttemptStatus, ExecutionStatus, ProviderAttempt, ProviderExecutionOutcome, TokenUsage,
+    };
+
+    fn outcome(model: &str) -> ProviderExecutionOutcome {
+        let now = chrono::Utc::now();
+        ProviderExecutionOutcome {
+            decision_id: "prx-routing-observation".to_owned(),
+            started_at: now,
+            finished_at: now,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "prx-provider".to_owned(),
+                model: model.to_owned(),
+                started_at: now,
+                finished_at: now,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "prx-provider".to_owned(),
+            final_model: model.to_owned(),
+            status: ExecutionStatus::Success,
+            fallback_reason: None,
+            tokens_used: TokenUsage::default(),
+        }
+    }
+
+    #[test]
+    fn served_auxiliary_selects_real_serving_tuple_without_replacing_main_usage() {
+        let main = outcome("cheap");
+        let mut marker = serde_json::json!({ "status": "completed", "provider_outcome": main });
+        assert_eq!(
+            RouterLearningEvidence::actual_terminal_outcome(&marker).unwrap().1,
+            "cheap"
+        );
+        let original = marker.get("provider_outcome").expect("main outcome").clone();
+        marker.as_object_mut().expect("terminal object").insert(
+            "served_auxiliary".to_owned(),
+            serde_json::json!({ "provider_outcome": outcome("premium") }),
+        );
+        assert_eq!(
+            RouterLearningEvidence::actual_terminal_outcome(&marker).unwrap().1,
+            "premium"
+        );
+        assert_eq!(marker.get("provider_outcome").expect("main outcome"), &original);
+        *marker
+            .pointer_mut("/served_auxiliary/provider_outcome/final_model")
+            .expect("premium final model") = serde_json::json!("foreign");
+        assert!(RouterLearningEvidence::actual_terminal_outcome(&marker).is_err());
+        *marker
+            .get_mut("served_auxiliary")
+            .expect("present auxiliary projection") = serde_json::json!({});
+        assert!(
+            RouterLearningEvidence::actual_terminal_outcome(&marker).is_err(),
+            "malformed present projection must not fall back to cheap"
+        );
     }
 }

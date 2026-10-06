@@ -4,8 +4,8 @@
 //! `providers::traits::StreamError` is deliberately left alone (its five
 //! variants stay as they are, so none of the providers break).
 //! `TransportError` bridges from it through `From<StreamError>`, and
-//! `TransportError::is_retryable` is the method form of what used to be
-//! `dispatcher.rs::stream_error_is_retryable` (kept there as a thin wrapper).
+//! `TransportError::is_retryable` is the method form of the rule the deleted
+//! `dispatcher.rs::stream_error_is_retryable` applied.
 
 use thiserror::Error;
 
@@ -28,7 +28,7 @@ pub enum ProviderError {
 /// Transport errors: network / IO / SSE / JSON-parsing failures.
 ///
 /// Bridged from `providers::traits::StreamError` through `From<StreamError>`;
-/// `is_retryable` is the same rule as `dispatcher.rs::stream_error_is_retryable`.
+/// `is_retryable` is the rule the deleted `dispatcher.rs::stream_error_is_retryable` applied.
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("transport HTTP error: {0}")]
@@ -61,8 +61,8 @@ pub enum TransportError {
 impl TransportError {
     /// Whether this error is worth retrying.
     ///
-    /// Same rule as `dispatcher.rs::stream_error_is_retryable`: Http / Io count
-    /// as transient and are retryable.
+    /// Http / Io count as transient and are retryable (the rule the deleted
+    /// `dispatcher.rs::stream_error_is_retryable` applied).
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Http(_) | Self::Io(_) | Self::RateLimited { .. })
@@ -196,9 +196,8 @@ mod tests {
 
     #[test]
     fn s2_5_t2_5_1_transport_is_retryable_matches_legacy() {
-        // is_retryable follows the same rule as
-        // dispatcher.rs::stream_error_is_retryable: Http / Io are retryable,
-        // the other three are not.
+        // is_retryable: Http / Io are retryable, the other three are not
+        // (the rule the deleted dispatcher.rs::stream_error_is_retryable applied).
         let http = TransportError::Http("conn reset".to_string());
         assert!(http.is_retryable());
 

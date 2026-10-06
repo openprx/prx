@@ -2,7 +2,9 @@ use crate::cron::{Schedule, next_run_for_schedule};
 use crate::self_system::evolution::analyzer::{DailyDigest, EvolutionAnalyzer};
 use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::EvolutionEngine;
-use crate::self_system::evolution::pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
+use crate::self_system::evolution::pipeline::{
+    CommitDecision, EvolutionPipeline, EvolutionTrigger, JudgeOutcome, PipelineRunReport,
+};
 use crate::self_system::evolution::record::EvolutionLayer;
 use crate::self_system::evolution::rollback::CircuitBreaker;
 use crate::self_system::evolution::safety_utils::atomic_write;
@@ -126,7 +128,15 @@ impl EvolutionScheduler {
                                         experiment_id = %report.experiment_id,
                                         "evolution layer skipped by side-effect gate (autonomy denied self-modification)"
                                     );
-                                } else if report.rolled_back {
+                                } else if matches!(
+                                    report.commit,
+                                    CommitDecision::Rejected | CommitDecision::Deferred | CommitDecision::ApplyFailed
+                                ) || report.judge_outcome == JudgeOutcome::Failed
+                                {
+                                    // A proposed change that was not written, or
+                                    // (R-PMMCh S-1) a judge that gave no verdict
+                                    // even where nothing was proposed (DraftOnly,
+                                    // Shadow), is a failed run.
                                     self.circuit_breaker.record_failure(now);
                                 } else {
                                     self.circuit_breaker.record_success();
@@ -159,8 +169,9 @@ impl EvolutionScheduler {
                                     judge_result: None,
                                     evolution_log: None,
                                     shadow_mode: mode.is_draft_like(),
-                                    rolled_back: false,
+                                    commit: CommitDecision::NothingProposed,
                                     gate_denied: false,
+                                    judge_outcome: JudgeOutcome::NotRun,
                                     errors: vec![err.to_string()],
                                 });
                             }
@@ -367,7 +378,7 @@ mod tests {
                         delta: Some(0.1),
                         notes: "ok".to_string(),
                     },
-                    outcome: CycleOutcome::Applied,
+                    outcome: CycleOutcome::NoAction,
                     alert: None,
                     errors: Vec::new(),
                 },
@@ -389,8 +400,151 @@ mod tests {
                 }),
                 needs_human_approval: false,
                 shadow_mode: false,
+                pending: None,
             })
         }
+    }
+
+    /// An engine that proposes but applies nothing (DraftOnly behaviour).
+    struct DraftEngine(EvolutionLayer);
+
+    #[async_trait]
+    impl EvolutionEngine for DraftEngine {
+        fn name(&self) -> &'static str {
+            "draft"
+        }
+
+        fn layer(&self) -> EvolutionLayer {
+            self.0.clone()
+        }
+
+        async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+            let mut result = NoopEngine(self.0.clone()).run_cycle(input).await?;
+            result.cycle.outcome = CycleOutcome::NoAction;
+            Ok(result)
+        }
+    }
+
+    /// A model judge whose provider call always fails.
+    struct FailingJudge;
+
+    #[async_trait]
+    impl crate::self_system::evolution::judge::JudgeScoringModel for FailingJudge {
+        async fn score(
+            &self,
+            _task: &str,
+            _result: &str,
+            _config: &crate::self_system::evolution::judge::JudgeConfig,
+        ) -> Result<String> {
+            bail!("model judge provider call failed: 503")
+        }
+    }
+
+    /// R-PMMCh S-1: a judge that gives no verdict is not a successful layer
+    /// run, even in DraftOnly where nothing is applied or rolled back: it
+    /// counts as a failure for the circuit breaker.
+    #[tokio::test]
+    async fn a_failed_judge_counts_as_a_breaker_failure_in_draft_only() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(JsonlStoragePaths::new(logs.clone()), JsonlRetentionPolicy::default(), 1)
+                .await
+                .unwrap(),
+        );
+        let now = Utc::now();
+        writer
+            .append_memory_access(&crate::self_system::evolution::record::MemoryAccessLog {
+                timestamp: now.to_rfc3339(),
+                experiment_id: "e1".to_string(),
+                trace_id: "t1".to_string(),
+                action: MemoryAction::Read,
+                memory_id: "m1".to_string(),
+                task_context: "ctx".to_string(),
+                task_type: TaskType::ToolCall,
+                actor: Actor::Agent,
+                was_useful: Some(true),
+                useful_annotation_source: Some(AnnotationSource::AutoEvaluator),
+                annotation_confidence: Some(0.8),
+                tokens_consumed: 1,
+            })
+            .await
+            .unwrap();
+        writer
+            .append_decision(&crate::self_system::evolution::record::DecisionLog {
+                timestamp: now.to_rfc3339(),
+                experiment_id: "e1".to_string(),
+                trace_id: "t1".to_string(),
+                decision_type: crate::self_system::evolution::record::DecisionType::ToolSelection,
+                task_type: TaskType::ToolCall,
+                risk_level: 1,
+                actor: Actor::Agent,
+                input_context: "ctx".to_string(),
+                action_taken: "act".to_string(),
+                outcome: Outcome::Success,
+                tokens_used: 1,
+                latency_ms: 1,
+                user_correction: None,
+                config_snapshot_hash: "cfg".to_string(),
+            })
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
+        for days in [2, 1, 0] {
+            let _ = analyzer.generate_daily_digest(now - Duration::days(days)).await;
+        }
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.mode = EvolutionMode::DraftOnly;
+        cfg.runtime.storage_dir = logs.to_string_lossy().to_string();
+        cfg.rollback.circuit_breaker_threshold = 1;
+        let shared = new_shared_evolution_config(cfg);
+        let pipeline = EvolutionPipeline::with_judge_model(
+            shared.clone(),
+            analyzer.clone(),
+            writer,
+            dir.path(),
+            Arc::new(FailingJudge),
+        );
+        let mut scheduler = EvolutionScheduler::new(
+            shared,
+            analyzer,
+            pipeline,
+            dir.path().join("scheduler_state.json"),
+            Box::new(DraftEngine(EvolutionLayer::Memory)),
+            Box::new(DraftEngine(EvolutionLayer::Prompt)),
+            Box::new(DraftEngine(EvolutionLayer::Policy)),
+        );
+        let state = SchedulerState {
+            next_cycle_at: Some((now - Duration::minutes(1)).to_rfc3339()),
+            ..SchedulerState::default()
+        };
+        fs::write(
+            dir.path().join("scheduler_state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let summary = scheduler.run_scheduled(now).await.unwrap();
+        assert!(
+            summary
+                .layer_reports
+                .iter()
+                .any(|report| report.errors.iter().any(|error| error.contains("judge_failed"))),
+            "test: the judge ran and failed: {:?}",
+            summary
+                .layer_reports
+                .iter()
+                .map(|report| &report.errors)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scheduler.circuit_breaker.state(),
+            crate::self_system::evolution::rollback::CircuitBreakerState::Open,
+            "a failed judge was counted as a successful run"
+        );
     }
 
     #[tokio::test]

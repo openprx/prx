@@ -4,6 +4,7 @@
   import { t } from '../lib/i18n';
   import { navigate } from '../lib/router';
   import { Paperclip } from '@lucide/svelte';
+  import DecisionApprovalPanel from '../components/DecisionApprovalPanel.svelte';
 
   const MAX_FILES = 10;
   const MESSAGES_PAGE_SIZE = 40;
@@ -414,6 +415,9 @@
 </script>
 
 <section class="flex h-[calc(100vh-10rem)] flex-col gap-4">
+  {#key sessionId}
+    <DecisionApprovalPanel {sessionId} onsettled={loadInitialMessages} />
+  {/key}
   <div class="flex items-center justify-between">
     <div class="min-w-0">
       <h2 class="text-2xl font-semibold">{t('chat.title')}</h2>

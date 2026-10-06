@@ -26,12 +26,13 @@ fn publish_temperature(shared: &SharedConfig, temperature: f64) -> anyhow::Resul
 }
 
 #[test]
-fn shared_config_initial_load() {
-    let config = Config::default();
-    let temp = config.default_temperature;
-    let shared = new_shared(config);
+fn shared_config_initial_load() -> anyhow::Result<()> {
+    // The fixture keeps the config in a tempdir: the default paths name the
+    // real `~/.openprx`, whose config files the generation owner reads (D-070).
+    let (_temp, shared) = shared_fixture()?;
     let loaded = shared.load_full();
-    assert!((loaded.default_temperature - temp).abs() < f64::EPSILON);
+    assert!((loaded.default_temperature - Config::default().default_temperature).abs() < f64::EPSILON);
+    Ok(())
 }
 
 #[test]

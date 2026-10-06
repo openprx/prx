@@ -184,6 +184,10 @@ fn normalized_entry_timestamp(filename: &str, content: &str) -> String {
 
 #[async_trait]
 impl Memory for MarkdownMemory {
+    fn stores_into_shared_prompt_files(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "markdown"
     }

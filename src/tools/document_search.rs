@@ -306,6 +306,9 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 visibility: MemoryVisibility::Workspace,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();

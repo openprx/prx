@@ -406,6 +406,11 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams, source_ip:
         &state.config.allowed_commands,
         &state.config.blocked_commands,
     )?;
+    // An operator allowlist entry is operator-configured (D-107): git runs,
+    // with the environment hardening `execute_shell_command` applies.
+    if crate::security::git_launch::shell_command_runs_git(command_text) {
+        crate::security::git_launch::warn_operator_git_once("node", &parsed_command.program);
+    }
 
     let cwd = if let Some(cwd) = params.cwd.as_deref() {
         Some(resolve_existing_sandbox_path(&state.sandbox_root.path, cwd)?)
@@ -512,6 +517,23 @@ async fn execute_shell_command(
     if let Some(env) = env {
         cmd.envs(env);
     }
+    // After the caller's variables, so they cannot undo it (D-107).
+    cmd.env_remove("GIT_CONFIG_PARAMETERS");
+    let git_environment = match crate::security::git_launch::operator_git_environment().await {
+        Ok(environment) => environment,
+        Err(error) => {
+            return ExecShellResult {
+                task_id: task_id.to_string(),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("cannot harden git for this operator command: {error}"),
+                duration_ms: elapsed_ms_u64(started.elapsed()),
+                timed_out: false,
+                cancelled: false,
+            };
+        }
+    };
+    cmd.envs(git_environment);
 
     let mut child = match crate::runtime::shell_process::spawn_managed_shell_child(cmd) {
         Ok(child) => child,
@@ -826,10 +848,9 @@ async fn prepare_callback_target(raw: &str) -> Result<CallbackTarget> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("callback_url missing port"))?;
-    let addrs = tokio::net::lookup_host((host, port))
+    let addrs = crate::tools::http_request::lookup_host(host, port)
         .await
-        .context("callback_url DNS resolution failed")?
-        .collect::<Vec<_>>();
+        .context("callback_url DNS resolution failed")?;
     validate_callback_addrs(&addrs)?;
     Ok(CallbackTarget { url, addrs })
 }
@@ -1761,6 +1782,23 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("exceeds node max_output_bytes"));
         assert!(!temp.path().join("too-large.txt").exists());
+    }
+
+    /// B2f F-6, RED before: the callback host was resolved through the
+    /// system resolver, so this test asked live DNS. After: the test
+    /// resolver answers, and a name outside its table fails without a
+    /// network lookup.
+    #[tokio::test]
+    async fn callback_resolution_never_uses_live_dns_in_tests() {
+        let error = prepare_callback_target("https://unlisted.test/node-callback")
+            .await
+            .err()
+            .expect("test: an unlisted host does not resolve");
+        assert!(format!("{error:#}").contains("test resolver"), "{error:#}");
+        let target = prepare_callback_target("https://example.com/node-callback")
+            .await
+            .expect("test: a table host resolves");
+        assert_eq!(target.addrs.len(), 1);
     }
 
     #[test]

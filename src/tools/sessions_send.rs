@@ -20,6 +20,7 @@ pub struct SessionsSendTool {
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     security: Arc<SecurityPolicy>,
     memory: Option<Arc<dyn Memory>>,
+    source_fabric: Option<MemoryFabric>,
     event_recording: MemoryEventRecording,
 }
 
@@ -33,8 +34,15 @@ impl SessionsSendTool {
             active_runs,
             security,
             memory: None,
+            source_fabric: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+
+    /// Logical lifecycle storage is independent of execution-memory isolation.
+    pub(crate) fn with_source_fabric(mut self, fabric: MemoryFabric) -> Self {
+        self.source_fabric = Some(fabric);
+        self
     }
 
     pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
@@ -48,9 +56,11 @@ impl SessionsSendTool {
     }
 
     fn memory_fabric(&self) -> Option<MemoryFabric> {
-        self.memory.as_ref().map(|memory| {
-            MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
-                .with_event_recording(self.event_recording)
+        self.source_fabric.clone().or_else(|| {
+            self.memory.as_ref().map(|memory| {
+                MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
+                    .with_event_recording(self.event_recording)
+            })
         })
     }
 
@@ -254,6 +264,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
             parent_run_id: None,
@@ -485,6 +496,7 @@ mod tests {
             channel_name: None,
             abort_handle: None,
             process_control: None,
+            task_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,

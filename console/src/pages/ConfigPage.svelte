@@ -1,6 +1,8 @@
 <script>
   import { t } from '../lib/i18n/index.svelte.js';
   import { api } from '../lib/api.js';
+  import { confirmationText } from '../lib/change-flow.svelte.js';
+  import ErrorNotice from '../lib/ErrorNotice.svelte';
 
   let files = $state([]);
   let activeFile = $state('');
@@ -8,26 +10,39 @@
   let originalContent = $state('');
   let loading = $state(true);
   let saving = $state(false);
-  let error = $state('');
+  let error = $state(null);
+  let saveError = $state(null);
   let saveMsg = $state('');
   let mergedJson = $state('');
+  let mergedError = $state(null);
   let viewMode = $state('files'); // 'files' | 'merged'
+  // The revision the files were loaded at. Saves send it as If-Match, so a
+  // change made after loading answers 409 instead of being overwritten by
+  // the stale editor buffer.
+  let loadedRevision = $state(null);
 
   const hasChanges = $derived(editContent !== originalContent);
+  // A file that holds a secret is served redacted and read-only
+  // (`editable: false`): its credentials are set on the Providers page or
+  // through the write-only credential endpoints, never by saving the
+  // masked text back.
+  const activeEditable = $derived(files.find((f) => f.filename === activeFile)?.editable === true);
+  const activeRedacted = $derived(files.find((f) => f.filename === activeFile)?.redacted === true);
 
   async function loadFiles() {
     loading = true;
-    error = '';
+    error = null;
     try {
-      const result = await api.getConfigFiles();
+      const { files: result, revision } = await api.getConfigFilesWithRevision();
       files = Array.isArray(result) ? result : (result?.files ?? []);
+      loadedRevision = revision;
       if (files.length > 0 && !activeFile) {
         activeFile = files[0].filename;
         editContent = files[0].content;
         originalContent = files[0].content;
       }
     } catch (e) {
-      error = e.message || 'Failed to load config files';
+      error = e;
     }
     loading = false;
   }
@@ -36,8 +51,10 @@
     try {
       const config = await api.getConfig();
       mergedJson = JSON.stringify(config, null, 2);
+      mergedError = null;
     } catch (e) {
-      mergedJson = `Error: ${e.message}`;
+      mergedJson = '';
+      mergedError = e;
     }
   }
 
@@ -48,23 +65,47 @@
     editContent = file.content;
     originalContent = file.content;
     saveMsg = '';
+    saveError = null;
   }
 
   async function saveFile() {
-    if (!activeFile || !hasChanges) return;
+    if (!activeFile || !hasChanges || !activeEditable) return;
     saving = true;
     saveMsg = '';
+    saveError = null;
     try {
-      await api.saveConfigFile(activeFile, editContent);
+      const saved = await saveConfirmingHighRisk(activeFile, editContent);
       originalContent = editContent;
       const idx = files.findIndex(f => f.filename === activeFile);
       if (idx >= 0) files[idx] = { ...files[idx], content: editContent };
-      saveMsg = 'Saved';
+      saveMsg = saved?.restart_required?.length > 0 ? t('config.saveRestartRequired') : t('config.saveSuccess');
       setTimeout(() => saveMsg = '', 2000);
     } catch (e) {
-      saveMsg = `Error: ${e.message}`;
+      saveError = e;
     }
     saving = false;
+  }
+
+  // A high-risk change (credential, encryption off, provider endpoint) is
+  // refused with 428 until confirmed: show the server's reasons (paths only)
+  // and retry once with the confirmation if the operator agrees. The retry
+  // is bound to the revision the refused plan was computed against
+  // (`If-Match`): if the files change while the dialog is open, it answers
+  // 409 instead of applying risks the operator did not see.
+  async function saveConfirmingHighRisk(filename, content) {
+    let saved;
+    try {
+      saved = await api.saveConfigFile(filename, content, { revision: loadedRevision });
+    } catch (e) {
+      const revision = e.body?.revision;
+      if (e?.status !== 428 || !revision || !window.confirm(confirmationText(e))) {
+        throw e;
+      }
+      saved = await api.saveConfigFile(filename, content, { confirmHighRisk: true, revision });
+    }
+    // The files now hold this save: the next save is based on it.
+    loadedRevision = saved?.desired_source_revision ?? null;
+    return saved;
   }
 
   function revert() {
@@ -78,23 +119,25 @@
 
 <div class="config-page">
   <div class="config-header">
-    <h2>{t('config.title') || 'Configuration'}</h2>
+    <h2>{t('config.advancedTitle')}</h2>
     <div class="view-tabs">
       <button
         class="tab-btn" class:active={viewMode === 'files'}
         onclick={() => { viewMode = 'files'; }}
-      >{t('config.files') || 'Files'}</button>
+      >{t('config.files')}</button>
       <button
         class="tab-btn" class:active={viewMode === 'merged'}
         onclick={() => { viewMode = 'merged'; loadMerged(); }}
-      >{t('config.merged') || 'Merged View'}</button>
+      >{t('config.merged')}</button>
     </div>
   </div>
 
+  <p class="advanced-hint">{t('config.advancedHint')}</p>
+
   {#if loading}
-    <div class="state-msg">{t('common.loading') || 'Loading...'}</div>
+    <div class="state-msg">{t('common.loading')}</div>
   {:else if error}
-    <div class="state-msg error">{error}</div>
+    <ErrorNotice {error} />
   {:else if viewMode === 'files'}
     <div class="editor-layout">
       <div class="file-list">
@@ -104,7 +147,7 @@
             onclick={() => selectFile(file.filename)}
           >
             <span class="file-name">{file.filename}</span>
-            <span class="file-source">{file.source}</span>
+            <span class="file-source">{file.source}{file.editable === false ? ` · ${t('config.readOnlyBadge')}` : ''}</span>
           </button>
         {/each}
       </div>
@@ -113,24 +156,31 @@
           <span class="active-filename">{activeFile}</span>
           <div class="toolbar-actions">
             {#if saveMsg}
-              <span class="save-msg" class:error={saveMsg.startsWith('Error')}>{saveMsg}</span>
+              <span class="save-msg">{saveMsg}</span>
             {/if}
-            <button class="btn secondary" onclick={revert} disabled={!hasChanges}>
-              {t('config.revert') || 'Revert'}
+            <button class="btn secondary" onclick={revert} disabled={!hasChanges || !activeEditable}>
+              {t('config.revert')}
             </button>
-            <button class="btn primary" onclick={saveFile} disabled={!hasChanges || saving}>
-              {saving ? (t('common.saving') || 'Saving...') : (t('config.save') || 'Save')}
+            <button class="btn primary" onclick={saveFile} disabled={!hasChanges || saving || !activeEditable}>
+              {saving ? t('common.saving') : t('config.save')}
             </button>
           </div>
         </div>
+        {#if !activeEditable}
+          <p class="read-only-note">{activeRedacted ? t('config.readOnlyRedacted') : t('config.readOnly')}</p>
+        {/if}
+        <ErrorNotice error={saveError} />
         <textarea
           class="toml-editor"
+          class:readonly={!activeEditable}
           bind:value={editContent}
+          readonly={!activeEditable}
           spellcheck="false"
         ></textarea>
       </div>
     </div>
   {:else}
+    <ErrorNotice error={mergedError} />
     <div class="merged-view">
       <textarea class="toml-editor readonly" value={mergedJson} readonly></textarea>
     </div>
@@ -181,9 +231,6 @@
     padding: 40px;
     text-align: center;
     color: var(--text-secondary, #a1a1aa);
-  }
-  .state-msg.error {
-    color: var(--error, #ef4444);
   }
   .editor-layout {
     display: flex;
@@ -253,8 +300,16 @@
     font-size: 12px;
     color: var(--success, #22c55e);
   }
-  .save-msg.error {
-    color: var(--error, #ef4444);
+  .advanced-hint,
+  .read-only-note {
+    margin: 0;
+    padding: 8px 24px;
+    font-size: 12px;
+    color: var(--text-secondary, #a1a1aa);
+  }
+  .read-only-note {
+    padding: 8px 16px;
+    color: var(--warning, #eab308);
   }
   .btn {
     padding: 6px 14px;

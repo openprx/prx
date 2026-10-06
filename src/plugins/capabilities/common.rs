@@ -261,7 +261,8 @@ pub fn register_event_host_functions(linker: &mut wasmtime::component::Linker<Ho
                         None => Ok((Ok(()),)),
                         Some(bus) => {
                             let bus = bus.clone();
-                            match bus.unsubscribe(sub_id).await {
+                            let plugin_name = store.data().plugin_name.clone();
+                            match bus.unsubscribe(&plugin_name, sub_id).await {
                                 Ok(()) => Ok((Ok(()),)),
                                 Err(e) => Ok((Err(e),)),
                             }
@@ -274,6 +275,40 @@ pub fn register_event_host_functions(linker: &mut wasmtime::component::Linker<Ho
     }
 
     Ok(())
+}
+
+/// One `memory.store` host call: a fresh `plugin:<name>:<uuid>` key in the
+/// workspace memory, written with the plugin as its origin (channel
+/// `plugin:<name>`, no owner). Returns the key.
+///
+/// Written with no origin at all, the row matched the snapshot's
+/// "no caller context" arm and was exported to the Git-visible
+/// `MEMORY_SNAPSHOT.md` as if the operator had written it; a plugin's row may
+/// carry text from any channel its plugin handles.
+///
+/// The origin travels as metadata, not as a caller context: a plugin is not
+/// a caller with a workspace or an owner, and `PostgresMemory` refuses a
+/// context write that has neither, while its metadata write stays the
+/// system-scoped write plugins always made (R-INT2A F1).
+pub(crate) async fn store_plugin_memory(
+    memory: &dyn crate::memory::traits::Memory,
+    plugin_name: &str,
+    text: &str,
+    category: &str,
+) -> anyhow::Result<String> {
+    let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
+    let category = match category {
+        "core" => crate::memory::traits::MemoryCategory::Core,
+        "daily" => crate::memory::traits::MemoryCategory::Daily,
+        "conversation" => crate::memory::traits::MemoryCategory::Conversation,
+        other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
+    };
+    let metadata = crate::memory::traits::MemoryStoreMetadata {
+        channel: Some(format!("plugin:{plugin_name}")),
+        ..crate::memory::traits::MemoryStoreMetadata::default()
+    };
+    memory.store_with_metadata(&key, text, category, None, metadata).await?;
+    Ok(key)
 }
 
 /// Register `prx:host/http-outbound@0.1.0` host functions into the linker.
@@ -368,15 +403,8 @@ pub fn register_memory_host_functions(linker: &mut wasmtime::component::Linker<H
                             return Ok((Err::<String, String>("memory backend not configured".to_string()),));
                         };
                         let plugin_name = store.data().plugin_name.clone();
-                        let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
-                        let category = match category.as_str() {
-                            "core" => crate::memory::traits::MemoryCategory::Core,
-                            "daily" => crate::memory::traits::MemoryCategory::Daily,
-                            "conversation" => crate::memory::traits::MemoryCategory::Conversation,
-                            other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
-                        };
-                        match memory.store(&key, &text, category, None).await {
-                            Ok(()) => Ok((Ok::<String, String>(key),)),
+                        match store_plugin_memory(memory.as_ref(), &plugin_name, &text, &category).await {
+                            Ok(key) => Ok((Ok::<String, String>(key),)),
                             Err(error) => Ok((Err(format!("memory store failed: {error}")),)),
                         }
                     })
@@ -533,4 +561,115 @@ pub fn register_common_host_functions(linker: &mut wasmtime::component::Linker<H
     register_memory_host_functions(linker)?;
     register_websocket_host_functions(linker)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry, MemoryStoreMetadata};
+
+    /// A backend that refuses every context-bearing write, the way
+    /// `PostgresMemory` refuses one that carries no workspace or owner, and
+    /// records the metadata of the writes it accepts.
+    #[derive(Default)]
+    struct RefusesContextWrites {
+        channels: parking_lot::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for RefusesContextWrites {
+        fn name(&self) -> &str {
+            "refuses-context-writes"
+        }
+        async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> {
+            self.channels.lock().push(None);
+            Ok(())
+        }
+        async fn store_with_context(
+            &self,
+            _: &str,
+            _: &str,
+            _: MemoryCategory,
+            _: Option<&str>,
+            _: Option<&crate::memory::MemoryWriteContext>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("PostgreSQL vector isolation requires a trusted workspace context")
+        }
+        async fn store_with_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: MemoryCategory,
+            _: Option<&str>,
+            metadata: MemoryStoreMetadata,
+        ) -> anyhow::Result<()> {
+            self.channels.lock().push(metadata.channel);
+            Ok(())
+        }
+        async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(&self, _: Option<&MemoryCategory>, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// R-INT2A F1: a plugin write carries its origin as metadata, never as a
+    /// caller context. `PostgresMemory` refuses a context with no workspace
+    /// or owner, so the context path made every plugin `memory.store` fail
+    /// on PostgreSQL; the metadata path keeps its system-scoped write.
+    ///
+    /// MUTATION GUARD: route the helper through `store_with_context` and the
+    /// write fails here.
+    #[tokio::test]
+    async fn a_plugin_memory_write_goes_through_the_metadata_path() {
+        let memory = RefusesContextWrites::default();
+        store_plugin_memory(&memory, "sample-plugin", "plugin-authored text", "core")
+            .await
+            .expect("test: a plugin write never takes the context path");
+        assert_eq!(
+            *memory.channels.lock(),
+            vec![Some("plugin:sample-plugin".to_string())],
+            "exactly one write, tagged with the plugin as its channel"
+        );
+    }
+
+    /// R-MCPBh L-1: a plugin's `memory.store` write is the plugin's, not the
+    /// operator's. Written without a context it matched the snapshot's
+    /// "no caller context at all" arm and was exported to the Git-visible
+    /// `MEMORY_SNAPSHOT.md` as an operator row.
+    #[tokio::test]
+    async fn a_plugin_memory_write_is_not_exported_as_an_operator_row() {
+        let workspace = tempfile::tempdir().expect("test: workspace");
+        let memory = crate::memory::sqlite::SqliteMemory::new(workspace.path()).expect("test: sqlite memory");
+        let key = store_plugin_memory(&memory, "sample-plugin", "plugin-authored text", "core")
+            .await
+            .expect("test: plugin write");
+        assert!(key.starts_with("plugin:sample-plugin:"), "{key}");
+        let stored = crate::memory::traits::Memory::get(&memory, &key)
+            .await
+            .expect("test: read back");
+        assert!(stored.is_some(), "the plugin write is stored");
+        drop(memory);
+
+        crate::memory::snapshot::export_snapshot(workspace.path()).expect("test: export");
+        let snapshot = std::fs::read_to_string(workspace.path().join(crate::memory::snapshot::SNAPSHOT_FILENAME))
+            .unwrap_or_default();
+        assert!(
+            !snapshot.contains("plugin-authored text"),
+            "a plugin row must stay out of the operator snapshot: {snapshot}"
+        );
+    }
 }

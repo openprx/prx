@@ -14,10 +14,10 @@
 //! module never opens the workspace's local `brain.db`.
 
 use crate::config::Config;
-use crate::cron::store::{decode_delivery, decode_schedule, format_claim_time, truncate_cron_output};
+use crate::cron::store::{decode_delivery, decode_schedule, format_claim_time, stored_cron_output};
 use crate::cron::types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    DeliveryPrincipal, JobType, Schedule, SessionTarget,
+    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget,
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 use crate::memory::postgres::PostgresConnectionPool;
@@ -47,6 +47,15 @@ const TERMINAL_STATE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF 
 const DELIVERY_PRINCIPAL_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_sender TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_channel TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_chat_type TEXT;";
+/// Creating origin (CRON-ORIGIN), mirroring the SQLite `ALTER TABLE`.
+///
+/// Nullable with no backfill: a row stored before this column existed has no
+/// provable creator and reads as [`JobOrigin::Unattributed`], which never runs
+/// with the local operator's authority.
+const ORIGIN_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS origin TEXT;";
+/// Which surface created a job (D-107 amendment), mirroring the SQLite
+/// `ALTER TABLE`. Nullable with no backfill: NULL reads as `agent_tool`.
+const CREATED_VIA_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS created_via TEXT;";
 const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claim_owner TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claimed_at TEXT;
@@ -193,6 +202,8 @@ impl PostgresCronStore {
         let expression = schedule_cron_expression(&schedule).unwrap_or_default();
         let schedule_json = serde_json::to_string(&schedule)?;
         let delivery_json = serde_json::to_string(&DeliveryConfig::default())?;
+        let origin = lineage.origin.to_stored()?;
+        let created_via = lineage.created_via.as_str();
 
         self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron insert transaction")?;
@@ -201,9 +212,9 @@ impl PostgresCronStore {
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                    creator_sender, creator_channel, creator_chat_type
+                    creator_sender, creator_channel, creator_chat_type, origin, created_via
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'shell', NULL, $9, 'isolated', NULL,
-                           TRUE, $10, $11, $12, $13, $14, $15, $16, $17)",
+                           TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -222,6 +233,8 @@ impl PostgresCronStore {
                     &lineage.delivery_principal.sender,
                     &lineage.delivery_principal.channel,
                     &lineage.delivery_principal.chat_type,
+                    &origin,
+                    &created_via,
                 ],
             )
             .context("Failed to insert cron shell job")?;
@@ -272,6 +285,7 @@ impl PostgresCronStore {
         let delivery = delivery.unwrap_or_default();
         let delivery_json = serde_json::to_string(&delivery)?;
         let session_target_str = session_target.as_str();
+        let origin = lineage.origin.to_stored()?;
 
         self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron insert transaction")?;
@@ -280,9 +294,9 @@ impl PostgresCronStore {
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                    creator_sender, creator_channel, creator_chat_type
+                    creator_sender, creator_channel, creator_chat_type, origin
                  ) VALUES ($1, $2, $3, $4, $5, $6, '', $7, 'agent', $8, $9, $10, $11,
-                           TRUE, $12, $13, $14, $15, NULL, $16, $17, $18)",
+                           TRUE, $12, $13, $14, $15, NULL, $16, $17, $18, $19)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -302,6 +316,7 @@ impl PostgresCronStore {
                     &lineage.delivery_principal.sender,
                     &lineage.delivery_principal.channel,
                     &lineage.delivery_principal.chat_type,
+                    &origin,
                 ],
             )
             .context("Failed to insert cron agent job")?;
@@ -349,6 +364,47 @@ impl PostgresCronStore {
                 Some(row) => map_cron_job_row(&row),
                 None => anyhow::bail!("Cron job '{job_id}' not found"),
             }
+        })
+    }
+
+    pub fn job_created_via(&self, job_id: &str) -> Result<JobCreator> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt("SELECT created_via FROM cron_jobs WHERE id = $1", &[&job_id])
+                .context("Failed to query cron job creator")?;
+            match row {
+                Some(row) => Ok(JobCreator::from_stored(row.try_get::<_, Option<String>>(0)?.as_deref())),
+                None => anyhow::bail!("Cron job '{job_id}' not found"),
+            }
+        })
+    }
+
+    pub fn mark_job_operator(&self, job_id: &str) -> Result<()> {
+        let changed = self.with_client(|client| {
+            client
+                .execute(
+                    "UPDATE cron_jobs SET created_via = 'operator_cli' WHERE id = $1",
+                    &[&job_id],
+                )
+                .context("Failed to mark cron job as the operator's")
+        })?;
+        if changed == 0 {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
+        Ok(())
+    }
+
+    pub fn unmarked_shell_jobs(&self) -> Result<Vec<(String, String)>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' AND created_via IS NULL ORDER BY id",
+                    &[],
+                )
+                .context("Failed to list unmarked cron shell jobs")?;
+            rows.iter()
+                .map(|row| Ok((row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?)))
+                .collect()
         })
     }
 
@@ -782,6 +838,10 @@ impl PostgresCronStore {
         } else {
             None
         };
+        let command_created_via = patch
+            .command
+            .as_ref()
+            .map(|_| patch.created_via.unwrap_or_default().as_str());
         if let Some(command) = patch.command {
             job.command = command;
             job.approval_grant_json = approval_grant_json;
@@ -884,6 +944,13 @@ impl PostgresCronStore {
             if changed == 0 {
                 anyhow::bail!("cron job '{}' was deleted or modified concurrently", job.id);
             }
+            if let Some(created_via) = command_created_via {
+                tx.execute(
+                    "UPDATE cron_jobs SET created_via = $1 WHERE id = $2",
+                    &[&created_via, &job.id],
+                )
+                .context("Failed to record the cron job creator")?;
+            }
             let event_type = match (was_enabled, job.enabled) {
                 (true, false) => "cron.job.disabled",
                 (false, true) => "cron.job.enabled",
@@ -923,7 +990,7 @@ impl PostgresCronStore {
         let now = Utc::now();
         let next_run = next_run_for_schedule(&job.schedule, now)?;
         let status = if success { "ok" } else { "error" };
-        let bounded_output = truncate_cron_output(output);
+        let bounded_output = stored_cron_output(output);
         self.with_client(|client| {
             let mut tx = client
                 .transaction()
@@ -993,7 +1060,7 @@ impl PostgresCronStore {
             );
         }
         let status = if success { "ok" } else { "error" };
-        let bounded_output = truncate_cron_output(output);
+        let bounded_output = stored_cron_output(output);
         let next_run = if advance_schedule {
             next_run_for_schedule(&job.schedule, finished_at)?
         } else {
@@ -1087,7 +1154,7 @@ impl PostgresCronStore {
         } else {
             "cron.job.failed"
         };
-        let bounded_output = truncate_cron_output(output);
+        let bounded_output = stored_cron_output(output);
         let keep = i64::from(max_run_history.max(1));
         let schedule_json = serde_json::to_string(&job.schedule)?;
         self.with_client(|client| {
@@ -1211,7 +1278,7 @@ impl PostgresCronStore {
             anyhow::bail!("manual terminal rerun requires an already terminal Schedule::At job");
         }
         let status = if success { "ok" } else { "error" };
-        let bounded_output = truncate_cron_output(output);
+        let bounded_output = stored_cron_output(output);
         let schedule_json = serde_json::to_string(&job.schedule)?;
         let keep = i64::from(max_run_history.max(1));
         self.with_client(|client| {
@@ -1303,7 +1370,7 @@ impl PostgresCronStore {
         duration_ms: i64,
         max_run_history: u32,
     ) -> Result<()> {
-        let bounded_output = output.map(truncate_cron_output);
+        let bounded_output = output.map(stored_cron_output);
         let keep = i64::from(max_run_history.max(1));
         self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron run transaction")?;
@@ -1403,7 +1470,7 @@ const SELECT_JOB_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id,
             expression, command, schedule, job_type, prompt, name, session_target, model,
             enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
             terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-            creator_sender, creator_channel, creator_chat_type
+            creator_sender, creator_channel, creator_chat_type, origin
      FROM cron_jobs";
 
 /// Lineage + last-known status of a job, used to enrich emitted events.
@@ -1475,6 +1542,7 @@ fn map_cron_job_row(row: &Row) -> Result<CronJob> {
         approval_grant_json: row.try_get(22)?,
         claim: decode_postgres_claim(row, 23)?,
         delivery_principal: DeliveryPrincipal::new(row.try_get(27)?, row.try_get(28)?, row.try_get(29)?),
+        origin: JobOrigin::from_stored(row.try_get::<_, Option<String>>(30)?.as_deref()),
     })
 }
 
@@ -1662,7 +1730,8 @@ fn init_schema(client: &mut Client) -> Result<()> {
                 claim_expires_at TEXT,
                 creator_sender   TEXT,
                 creator_channel  TEXT,
-                creator_chat_type TEXT
+                creator_chat_type TEXT,
+                origin           TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner ON cron_jobs(owner_id, enabled, next_run);
@@ -1712,6 +1781,12 @@ fn init_schema(client: &mut Client) -> Result<()> {
     client
         .batch_execute(DELIVERY_PRINCIPAL_MIGRATION_SQL)
         .context("Failed to migrate cron postgres delivery principal")?;
+    client
+        .batch_execute(ORIGIN_MIGRATION_SQL)
+        .context("Failed to migrate cron postgres job origin")?;
+    client
+        .batch_execute(CREATED_VIA_MIGRATION_SQL)
+        .context("Failed to migrate cron postgres job creator")?;
     Ok(())
 }
 
@@ -1775,6 +1850,11 @@ mod tests {
         assert!(CLAIM_LEASE_MIGRATION_SQL.contains("ADD COLUMN IF NOT EXISTS worker_id"));
         assert!(CLAIM_LEASE_MIGRATION_SQL.contains("WHERE attempt_id IS NOT NULL"));
         assert!(TERMINAL_STATE_MIGRATION_SQL.contains("ADD COLUMN IF NOT EXISTS terminal_state"));
+        // CRON-ORIGIN: the projection reads the origin at the index the mapper
+        // decodes, and the migration adds it without a backfill.
+        assert!(SELECT_JOB_COLUMNS.contains("creator_chat_type, origin\n"));
+        assert!(ORIGIN_MIGRATION_SQL.contains("ADD COLUMN IF NOT EXISTS origin TEXT"));
+        assert!(!ORIGIN_MIGRATION_SQL.contains("UPDATE"));
         assert!(TERMINAL_STATE_MIGRATION_SQL.contains("last_run IS NOT NULL"));
         assert!(TERMINAL_STATE_MIGRATION_SQL.contains("last_status IN ('ok', 'error')"));
         assert!(TERMINAL_STATE_MIGRATION_SQL.contains("enabled = FALSE"));
@@ -1815,12 +1895,12 @@ mod tests {
     /// This is the regression the pool could plausibly have broken: the claim
     /// path relies on `FOR UPDATE` plus a compare-and-set `WHERE` clause inside
     /// one transaction, which stays correct only while a transaction never
-    /// spans two checkouts. Gated on `OPENPRX_TEST_POSTGRES_URL`.
+    /// spans two checkouts. Needs a live PostgreSQL: `#[ignore]`d, run with
+    /// `OPENPRX_TEST_POSTGRES_URL` and `--ignored`.
     #[test]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     fn postgres_cron_pooled_claim_fencing_is_exclusive_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
         let workspace = "ws-pool-fencing";
         let job = store
@@ -1937,13 +2017,13 @@ mod tests {
     /// The synchronous `postgres` client drives a private Tokio runtime and
     /// panics if it is entered while another runtime is entered on the same
     /// thread, so this is the test that proves the `block_in_place` hand-off in
-    /// `with_client` really leaves the worker's runtime context behind. Gated on
-    /// `OPENPRX_TEST_POSTGRES_URL`.
+    /// `with_client` really leaves the worker's runtime context behind. Needs a
+    /// live PostgreSQL: `#[ignore]`d, run with `OPENPRX_TEST_POSTGRES_URL` and
+    /// `--ignored`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_cron_pooled_claim_from_async_workers_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let store = std::sync::Arc::new(
             tokio::task::spawn_blocking(move || PostgresCronStore::connect(&db_url, Some(5)))
                 .await
@@ -2000,13 +2080,13 @@ mod tests {
     }
 
     /// The current-thread fallback: `block_in_place` is unavailable there, so
-    /// `with_client` must offload to a scoped thread rather than panic. Gated on
-    /// `OPENPRX_TEST_POSTGRES_URL`.
+    /// `with_client` must offload to a scoped thread rather than panic. Needs a
+    /// live PostgreSQL: `#[ignore]`d, run with `OPENPRX_TEST_POSTGRES_URL` and
+    /// `--ignored`.
     #[tokio::test]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_cron_client_works_on_current_thread_runtime_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
         let before = crate::runtime::blocking::sync_snapshot().offloaded;
         store.list_jobs().expect("test: list jobs on a current-thread runtime");
@@ -2016,14 +2096,14 @@ mod tests {
         );
     }
 
-    /// End-to-end cron lifecycle against a real PostgreSQL instance. Gated on
-    /// `OPENPRX_TEST_POSTGRES_URL`; a no-op (returns early) when unset so the
-    /// suite stays green without a database, mirroring the memory backend tests.
+    /// End-to-end cron lifecycle against a real PostgreSQL instance. Like the
+    /// memory backend tests it is `#[ignore]`d, so a run without a database
+    /// counts it as ignored rather than passed; run it with
+    /// `OPENPRX_TEST_POSTGRES_URL` and `--ignored`.
     #[test]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     fn postgres_cron_lifecycle_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
 
         store

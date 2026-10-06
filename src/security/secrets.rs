@@ -39,6 +39,9 @@ pub struct SecretStore {
     key_path: PathBuf,
     /// Whether encryption is enabled
     enabled: bool,
+    /// Whether a missing key file is created on first use. A reader of a
+    /// configuration it does not own (`prx-node --config`) never creates one.
+    create_missing_key: bool,
 }
 
 impl SecretStore {
@@ -47,6 +50,18 @@ impl SecretStore {
         Self {
             key_path: openprx_dir.join(".secret_key"),
             enabled,
+            create_missing_key: true,
+        }
+    }
+
+    /// A store that only reads the key already in `openprx_dir`: decrypting
+    /// without one fails (naming the key file) instead of writing a fresh,
+    /// wrong key beside a configuration this process does not own.
+    pub fn with_existing_key(openprx_dir: &Path) -> Self {
+        Self {
+            key_path: openprx_dir.join(".secret_key"),
+            enabled: true,
+            create_missing_key: false,
         }
     }
 
@@ -132,47 +147,6 @@ impl SecretStore {
         value.starts_with("enc:")
     }
 
-    /// Migrate all legacy `enc:` values in a mutable slice to the secure `enc2:` format.
-    ///
-    /// Each `Some(value)` that starts with `enc:` is decrypted with the legacy XOR cipher
-    /// and re-encrypted using ChaCha20-Poly1305. Values already using `enc2:` or that are
-    /// plaintext are left untouched.
-    ///
-    /// Failures on individual values are logged as warnings and skipped — the migration
-    /// continues and processes the remaining values. Returns the number of values that were
-    /// successfully migrated.
-    ///
-    /// Callers are responsible for persisting the updated values back to storage.
-    pub fn migrate_legacy_secrets(&self, values: &mut [Option<String>]) -> Result<usize> {
-        let mut migrated = 0usize;
-        for slot in values.iter_mut() {
-            let Some(ref raw) = *slot else {
-                continue;
-            };
-            if !Self::needs_migration(raw) {
-                continue;
-            }
-            match self.decrypt_and_migrate(raw) {
-                Ok((_, Some(new_enc2))) => {
-                    tracing::info!("Migrated legacy XOR-encrypted secret (enc:) to ChaCha20-Poly1305 (enc2:)");
-                    *slot = Some(new_enc2);
-                    migrated += 1;
-                }
-                Ok((_, None)) => {
-                    // decrypt_and_migrate on an enc: value always returns Some(new_enc2)
-                    // unless encrypt() returns plaintext (disabled store / empty value).
-                    // Count it as migrated only when a non-empty plaintext was produced.
-                    tracing::warn!("Legacy secret migrated to plaintext (encryption disabled or empty value)");
-                    migrated += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to migrate legacy secret — skipping");
-                }
-            }
-        }
-        Ok(migrated)
-    }
-
     /// Decrypt using ChaCha20-Poly1305 (current secure format).
     fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
         let blob = hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
@@ -180,7 +154,7 @@ impl SecretStore {
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let key_bytes = self.load_or_create_key()?;
+        let key_bytes = self.load_existing_key()?;
         if key_bytes.len() != KEY_LEN {
             anyhow::bail!(
                 "Secret key has invalid length ({} bytes, expected {}). Key file may be corrupt.",
@@ -201,10 +175,17 @@ impl SecretStore {
     /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
         let ciphertext = hex_decode(hex_str).context("Failed to decode legacy encrypted secret (corrupt hex)")?;
-        let key = self.load_or_create_key()?;
+        let key = self.load_existing_key()?;
         let plaintext_bytes = xor_cipher(&ciphertext, &key);
         String::from_utf8(plaintext_bytes)
             .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+    }
+
+    /// `plaintext` in the legacy `enc:` format, for tests of the migration.
+    #[cfg(test)]
+    pub(crate) fn legacy_xor_value(&self, plaintext: &str) -> Result<String> {
+        let key = self.load_or_create_key()?;
+        Ok(format!("enc:{}", hex_encode(&xor_cipher(plaintext.as_bytes(), &key))))
     }
 
     /// Check if a value is already encrypted (current or legacy format).
@@ -218,10 +199,22 @@ impl SecretStore {
     }
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
+    /// The key already on disk. Decryption only reads it: a key created on a
+    /// read could never decrypt a value written before it (D-084 E-3).
+    fn load_existing_key(&self) -> Result<Vec<u8>> {
+        if !self.key_path.exists() {
+            anyhow::bail!(
+                "No secret key file at {}: encrypted values cannot be read without the key that wrote them",
+                self.key_path.display()
+            );
+        }
+        let hex_key = fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
+        hex_decode(hex_key.trim()).context("Secret key file is corrupt")
+    }
+
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
-        if self.key_path.exists() {
-            let hex_key = fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
-            hex_decode(hex_key.trim()).context("Secret key file is corrupt")
+        if self.key_path.exists() || !self.create_missing_key {
+            self.load_existing_key()
         } else {
             let key = generate_random_key();
             if let Some(parent) = self.key_path.parent() {
@@ -874,5 +867,19 @@ mod tests {
 
         let perms = fs::metadata(&store.key_path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600, "Key file must be owner-only (0600)");
+    }
+
+    /// RED before PMMDtail-j (D-084 E-3): decrypting with the key file
+    /// missing created a fresh key, which cannot decrypt anything written
+    /// before it. A read never creates a key.
+    #[test]
+    fn decrypting_without_a_key_never_creates_one() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let store = SecretStore::new(tmp.path(), true);
+        let encrypted = format!("enc2:{}", "00".repeat(40));
+
+        assert!(store.decrypt(&encrypted).is_err());
+        assert!(store.decrypt_and_migrate("enc:0011").is_err());
+        assert!(!tmp.path().join(".secret_key").exists(), "a read created a key");
     }
 }

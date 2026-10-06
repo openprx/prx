@@ -10,7 +10,7 @@
 use crossterm::event::KeyEvent;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::loop_::ChatMode;
+use crate::agent::turn_contracts::ChatMode;
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord};
 use crate::llm::route_decision::TokenUsage;
 
@@ -213,7 +213,6 @@ pub fn format_provider_worker_tokens_compact(tokens: u64) -> String {
 }
 
 /// History navigation direction.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum HistoryDir {
     /// Upwards (older)
@@ -227,7 +226,6 @@ pub enum HistoryDir {
 /// S2-B Step 1: introduced together with the `HistoryCompacted` Action so the reducer can tell in the
 /// trace whether this was an automatic context-overflow compaction or a manual user/test trigger, and
 /// so unit tests can assert that the reason field reaches the `Effect::LogTrace` output.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactReason {
     /// Automatic compaction after exceeding the context window (the chat::run main-loop overflow
@@ -253,8 +251,11 @@ pub enum ProviderUsageRecordKind {
 ///
 /// `Send + Sync` (passed across tasks over channels), and every case is expressible without
 /// `Box<dyn>`. Step 1: the type skeleton; Steps 2-5 wire it into the call paths one by one.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve inline public variants without a per-turn heap allocation"
+)]
 pub enum Action {
     // ── Input path ──────────────────────────────────────────────
     /// Raw keyboard event
@@ -311,7 +312,7 @@ pub enum Action {
     /// Relationship to [`Self::TurnStarted`]:
     /// - `TurnStarted` is the historical Action, used only for reducer state initialization (set the
     ///   draft, register active_cancel, raise generating); the chat::run main loop dispatches it
-    ///   synchronously before calling the old `run_tool_call_loop`, and it emits no `Effect::StartTurn`
+    ///   synchronously before its legacy tool-loop path calls `run_turn`, and it emits no `Effect::StartTurn`
     /// - `StartLLMTurn` carries a full `history` snapshot, and besides initializing the draft the
     ///   reducer **also** emits `Effect::StartTurn { draft_id, history, cancel }`, which the
     ///   EffectExecutor really wires to `provider.stream_chat_with_history`
@@ -357,11 +358,12 @@ pub enum Action {
         /// The turn's raw user text, before memory recall, `@path` expansion,
         /// or the `[Recent shared workspace events]` block are prepended to it.
         /// Capability routing runs on this and nothing else: every other entry
-        /// point already passes `ToolLoopMemory::with_routing_input`, and chat
+        /// point already passes `RoutingInput::Pinned` in its `TurnRequest`, and chat
         /// was the one surface routing on injected context, which let recalled
         /// text and shared-workspace events widen the published tool surface.
         /// `None` keeps non-chat/test callers on the driver's history fallback.
         routing_input: Option<String>,
+        turn_binding: Option<std::sync::Arc<super::decision_source::ChatTurnBinding>>,
     },
     /// Received one streaming delta chunk
     StreamChunkReceived {
@@ -501,7 +503,7 @@ pub enum Action {
     /// applies the exact patch, or falls back to deterministic trim on mismatch.
     HistoryCompactionPatchApplied {
         reason: CompactReason,
-        patch: crate::agent::loop_::CompactionPatch,
+        patch: crate::agent::turn_contracts::CompactionPatch,
         compaction_config: crate::config::AgentCompactionConfig,
     },
     /// A rollover could not produce a lossless handoff and the turn continued on

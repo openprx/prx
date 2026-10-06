@@ -1,12 +1,14 @@
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::SharedEvolutionConfig;
-use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
+use crate::self_system::evolution::engine::{
+    CycleResult, EngineCycleInput, EvolutionEngine, FileChange, PendingChange,
+};
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateResult};
 use crate::self_system::evolution::record::{
     ChangeType, DataBasis, DecisionLog, EvolutionLayer, EvolutionLog, EvolutionResult, Outcome,
 };
 use crate::self_system::evolution::rollback::RollbackManager;
-use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in_workspace};
+use crate::self_system::evolution::safety_utils::validate_path_in_workspace;
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
@@ -133,7 +135,12 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         let raw = fs::read_to_string(&policy_path)
             .await
             .with_context(|| format!("failed reading {}", policy_path.display()))?;
-        let mut parsed = raw.parse::<toml::Value>()?;
+        // A policy is a TOML document; `str::parse::<toml::Value>()` would
+        // read a single TOML value and refuse every `[section]`.
+        let mut parsed = toml::Value::Table(
+            toml::from_str::<toml::Table>(&raw)
+                .with_context(|| format!("failed parsing decision policy {}", policy_path.display()))?,
+        );
 
         let summaries = self.collect_daily_summary().await?;
         let worst = self.select_worst_summary(&summaries);
@@ -182,12 +189,18 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         let mut outcome = CycleOutcome::NoAction;
         let mut notes = "shadow mode: strategy mutation recorded only".to_string();
 
+        let mut pending: Option<Arc<dyn PendingChange>> = None;
         if mode.allows_target_mutation() {
             if matches!(gate_result, GateResult::Passed) {
-                self.rollback.backup_current_version().await?;
-                atomic_write(&self.workspace_root, &policy_path, serialized.as_bytes()).await?;
-                outcome = CycleOutcome::Applied;
-                notes = "gate passed and strategy persisted".to_string();
+                // D-046: proposed only; the pipeline writes it after an
+                // accepted verdict.
+                pending = Some(Arc::new(FileChange::new(
+                    self.workspace_root.clone(),
+                    policy_path.clone(),
+                    serialized,
+                    self.rollback.clone(),
+                )));
+                notes = "gate passed; strategy written only after an accepted verdict".to_string();
             } else {
                 outcome = CycleOutcome::Failed;
                 notes = "gate rejected strategy mutation".to_string();
@@ -214,15 +227,14 @@ impl EvolutionEngine for StrategyEvolutionEngine {
                     worst.as_ref().map(|item| item.task_type.as_str()).unwrap_or("unknown")
                 )],
             },
-            result: if matches!(outcome, CycleOutcome::Applied) {
-                None
-            } else if matches!(gate_result, GateResult::Passed) {
+            result: if matches!(gate_result, GateResult::Passed) {
                 Some(EvolutionResult::Neutral)
             } else {
                 Some(EvolutionResult::Rejected)
             },
         };
-        self.writer.append_evolution(&evolution_log).await?;
+        // The pipeline records the cycle, once, under its experiment id; an
+        // engine row here was an orphan that backfill later scored.
 
         let cycle = EvolutionCycle {
             id: cycle_id,
@@ -261,6 +273,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
             evolution_log: Some(evolution_log),
             needs_human_approval: false,
             shadow_mode: mode.is_draft_like(),
+            pending,
         })
     }
 }
@@ -418,6 +431,44 @@ mod tests {
         assert_eq!(rows[0].total, 2);
         assert_eq!(rows[0].success, 1);
         assert_eq!(rows[0].avg_tokens, 200.0);
+    }
+
+    /// The decision policy is a TOML document (`[section]` tables). Parsing
+    /// it with `str::parse::<toml::Value>()` reads a single TOML value, so
+    /// every real policy failed with "unexpected content".
+    #[tokio::test]
+    async fn strategy_engine_reads_a_policy_document() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("decision_policy.toml"),
+            "[retry]\nmax_attempts = 3\nbackoff = 0.5\n",
+        )
+        .await
+        .unwrap();
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(dir.path().join("logs")),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut engine = StrategyEvolutionEngine::new(
+            new_shared_evolution_config(EvolutionConfig::default()),
+            dir.path(),
+            writer,
+        )
+        .unwrap();
+        let result = engine
+            .run_cycle(EngineCycleInput {
+                cycle_id: "policy".to_string(),
+                analyzer_candidates: Vec::new(),
+                fitness_trend: None,
+            })
+            .await
+            .expect("a policy document is read");
+        assert!(result.proposal.is_some());
     }
 
     #[tokio::test]

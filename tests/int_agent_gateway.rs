@@ -31,12 +31,14 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use openprx::HookManager;
-use openprx::agent::agent::Agent;
+#[path = "support/embedded_agent.rs"]
+mod embedded_agent;
+use embedded_agent::EmbeddedAgentFixture;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::{Config, MemoryConfig, new_shared};
+use openprx::config::{Config, new_shared};
 use openprx::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, MAX_BODY_SIZE};
-use openprx::memory::{self, Memory, MemoryCategory, MemoryEntry};
-use openprx::observability::{NoopObserver, Observer};
+use openprx::memory::{Memory, MemoryCategory, MemoryEntry};
+use openprx::observability::NoopObserver;
 use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use openprx::security::pairing::PairingGuard;
 use openprx::tools::{Tool, ToolResult};
@@ -93,15 +95,15 @@ impl Provider for MockProvider {
 struct HangingProvider {
     responses: std::sync::Mutex<Vec<ChatResponse>>,
     hang_on_call: usize,
-    call_count: std::sync::atomic::AtomicUsize,
+    call_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HangingProvider {
-    const fn new(responses: Vec<ChatResponse>, hang_on_call: usize) -> Self {
+    fn new(responses: Vec<ChatResponse>, hang_on_call: usize) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
             hang_on_call,
-            call_count: std::sync::atomic::AtomicUsize::new(0),
+            call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -270,18 +272,6 @@ impl Memory for MockMemory {
 // Test helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn make_memory() -> Arc<dyn Memory> {
-    let cfg = MemoryConfig {
-        backend: "none".into(),
-        ..MemoryConfig::default()
-    };
-    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir(), None).expect("test: create none-backend memory"))
-}
-
-fn make_observer() -> Arc<dyn Observer> {
-    Arc::from(NoopObserver {})
-}
-
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
@@ -299,29 +289,32 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     }
 }
 
-fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .build()
-        .expect("test: build agent")
+fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
+    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(NativeToolDispatcher));
+    EmbeddedAgentFixture::finish(builder, workspace)
+}
+
+/// A default config whose files live under the system temp directory. The
+/// default paths name the real `~/.openprx`, whose config files the
+/// generation owner reads, so no test may use them (D-070).
+fn scratch_config() -> Config {
+    let scratch = std::env::temp_dir().join(format!("openprx-int-agent-gateway-{}", std::process::id()));
+    Config {
+        config_path: scratch.join("config.toml"),
+        workspace_dir: scratch.join("workspace"),
+        ..Config::default()
+    }
 }
 
 /// Build a minimal `AppState` for gateway integration tests.
 fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
     AppState {
-        config: new_shared(Config::default()),
+        config: new_shared(scratch_config()),
         provider: overrides.provider.unwrap_or_else(|| Arc::new(GatewayMockProvider)),
         model: "test-model".into(),
         temperature: 0.0,
         mem: Arc::new(MockMemory),
         auto_save: false,
-        tools_registry: Arc::new(vec![]),
-        mcp_tool: None,
         turn_runtime: None,
         hooks: Arc::new(HookManager::new(std::env::temp_dir())),
         webhook_token_hash: overrides.webhook_token_hash,
@@ -604,11 +597,16 @@ async fn int_agent_gateway_ap03_provider_timeout_during_tool_loop() {
         1, // hang on the second call (index 1)
     ));
 
+    let attempts = Arc::clone(&provider.call_count);
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
 
     // Use a timeout to prevent the test from hanging forever.
     let result = tokio::time::timeout(Duration::from_secs(5), agent.turn("timeout test")).await;
 
+    assert!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "timeout evidence requires reaching the actual hanging provider call"
+    );
     match result {
         Ok(Ok(response)) => {
             // If the agent returns a partial result, that is acceptable.

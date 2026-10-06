@@ -3,6 +3,8 @@
 use crate::config::Config;
 use anyhow::{Result, bail};
 
+#[cfg(test)]
+pub(crate) mod origin_test_support;
 mod postgres;
 mod schedule;
 mod store;
@@ -21,12 +23,13 @@ pub use store::{
     abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
     claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
-    finish_claimed_run, get_job, job_claim_is_current, list_job_events, list_jobs, list_runs, record_claim_lost,
-    record_delivery_withheld, record_terminal_manual_run, remove_job, renew_job_claim, update_job,
+    finish_claimed_run, get_job, job_claim_is_current, job_created_via, list_job_events, list_jobs, list_runs,
+    mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run, remove_job,
+    renew_job_claim, unmarked_shell_jobs, update_job,
 };
 pub use types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    DeliveryPrincipal, JobType, Schedule, SessionTarget,
+    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -82,7 +85,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             command,
         } => {
             let schedule = Schedule::Cron { expr: expression, tz };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job =
+                add_shell_job_with_lineage_and_approval_grant(config, None, schedule, &command, None, cli_lineage())?;
             println!("✅ Added cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
@@ -94,7 +98,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job =
+                add_shell_job_with_lineage_and_approval_grant(config, None, schedule, &command, None, cli_lineage())?;
             println!("✅ Added one-shot cron job {}", job.id);
             println!("  At  : {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
@@ -102,7 +107,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         }
         crate::CronCommands::AddEvery { every_ms, command } => {
             let schedule = Schedule::Every { every_ms };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job =
+                add_shell_job_with_lineage_and_approval_grant(config, None, schedule, &command, None, cli_lineage())?;
             println!("✅ Added interval cron job {}", job.id);
             println!("  Every(ms): {every_ms}");
             println!("  Next     : {}", job.next_run.to_rfc3339());
@@ -110,7 +116,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             Ok(())
         }
         crate::CronCommands::Once { delay, command } => {
-            let job = add_once(config, &delay, &command)?;
+            let job = add_once_with_lineage_and_approval_grant(config, &delay, &command, None, cli_lineage())?;
             println!("✅ Added one-shot cron job {}", job.id);
             println!("  At  : {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
@@ -148,6 +154,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 schedule,
                 command,
                 name,
+                // The operator's own command (D-107 amendment).
+                created_via: Some(JobCreator::OperatorCli),
                 ..CronJobPatch::default()
             };
 
@@ -159,6 +167,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             Ok(())
         }
         crate::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::MarkOperator { id } => {
+            // Only the local operator reaches `handle_command` (CRON-ORIGIN),
+            // the same gate as `prx cron add`.
+            let job = get_job(config, &id)?;
+            mark_job_operator(config, &id)?;
+            println!("\u{2705} Marked cron job {id} as the operator's own: its shell command may run git (hardened)");
+            println!("  Cmd : {}", job.command);
+            Ok(())
+        }
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
             println!("⏸️  Paused cron job {id}");
@@ -169,6 +186,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("▶️  Resumed cron job {id}");
             Ok(())
         }
+    }
+}
+
+/// Lineage of a job written by the `prx cron` CLI: the local operator, the
+/// only caller that reaches `handle_command` (CRON-ORIGIN).
+fn cli_lineage() -> CronJobLineage {
+    CronJobLineage {
+        origin: JobOrigin::LocalOperator,
+        // D-107 amendment: the operator's own command, so its git may run
+        // (hardened).
+        created_via: JobCreator::OperatorCli,
+        ..CronJobLineage::default()
     }
 }
 
@@ -323,8 +352,11 @@ pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> 
         _ => None,
     });
 
+    let origin = JobOrigin::from_trusted_args(args, owner_id.as_deref());
     CronJobLineage {
         owner_id,
+        origin,
+        created_via: JobCreator::AgentTool,
         delivery_principal: DeliveryPrincipal::new(
             sender.map(str::to_string),
             channel.map(str::to_string),
@@ -720,6 +752,37 @@ mod tests {
         assert!(
             result.is_ok(),
             "medium-risk git commit should be allowed under Full autonomy: {result:?}"
+        );
+    }
+
+    /// CRON-ORIGIN: the `prx cron` CLI is reached only by the local operator,
+    /// so the jobs it writes record that origin.
+    #[test]
+    fn cli_created_jobs_record_the_local_operator_origin() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                tz: None,
+                command: "echo cli".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        handle_command(
+            crate::CronCommands::Once {
+                delay: "10m".into(),
+                command: "echo once".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter().all(|job| job.origin == JobOrigin::LocalOperator),
+            "{jobs:?}"
         );
     }
 }

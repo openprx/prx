@@ -120,8 +120,8 @@ impl RuntimeEnvelope {
     ///
     /// Prefer a purpose-specific constructor:
     /// [`channel`](Self::channel) / [`channel_with_session`](Self::channel_with_session) /
-    /// [`agent`](Self::agent) / [`agent_process_message`](Self::agent_process_message) /
-    /// [`gateway`](Self::gateway) / [`gateway_webhook`](Self::gateway_webhook) /
+    /// [`agent`](Self::agent) /
+    /// [`gateway`](Self::gateway) /
     /// [`chat`](Self::chat) / [`chat_terminal`](Self::chat_terminal) /
     /// [`console`](Self::console) / [`session_worker`](Self::session_worker) /
     /// [`sessions_spawn`](Self::sessions_spawn) / [`delegate`](Self::delegate).
@@ -134,7 +134,7 @@ impl RuntimeEnvelope {
     /// tripping the crate's `-D warnings` build. `#[doc(hidden)]` keeps it out
     /// of the public API surface.
     #[doc(hidden)]
-    #[deprecated(note = "use channel()/agent()/gateway_webhook()/chat() — new() bypasses visibility/sender defaults")]
+    #[deprecated(note = "use channel()/agent()/gateway()/chat() — new() bypasses visibility/sender defaults")]
     #[must_use]
     pub fn new(
         source: RuntimeSource,
@@ -261,50 +261,15 @@ impl RuntimeEnvelope {
         .with_recipient(format!("xin:task:{task_id}"))
     }
 
-    /// `Agent` envelope for the `process_message` entry path.
-    ///
-    /// Unlike [`agent`](Self::agent) (interactive CLI, `agent:{run_id}` key,
-    /// `cli` channel), this path keeps its own caller-supplied `session_key`
-    /// and routes through the `process_message` channel. It applies the same
-    /// `local-user` sender / `Session` visibility defaults so the
-    /// channel/sender/recipient triad stays consistent with the CLI agent.
-    #[must_use]
-    pub fn agent_process_message(workspace_id: impl Into<String>, session_key: impl Into<String>) -> Self {
-        Self::new_internal(
-            RuntimeSource::Agent,
-            workspace_id,
-            session_key,
-            MemoryVisibility::Session,
-        )
-        .with_channel("process_message")
-        .with_sender("local-user")
-        .with_recipient("process_message:local-user".to_string())
-    }
-
-    #[must_use]
-    pub fn gateway_webhook(workspace_id: impl Into<String>, reply_target: Option<&str>) -> Self {
-        let target = reply_target
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("webhook-client");
-        Self::new_internal(
-            RuntimeSource::Gateway,
-            workspace_id,
-            format!("gateway:webhook:{target}"),
-            MemoryVisibility::Session,
-        )
-        .with_channel("webhook")
-        .with_sender("webhook")
-        .with_recipient(target.to_string())
-    }
-
     /// `Gateway` envelope for the multimodal chat path, where the channel,
     /// sender, recipient, session key and visibility are all supplied by the
     /// caller's `GatewayFabricContext`.
     ///
-    /// [`gateway_webhook`](Self::gateway_webhook) covers the fixed
-    /// webhook ingress (constant `webhook` channel/sender, derived session
-    /// key); this constructor is for gateway traffic whose routing identity is
-    /// resolved upstream and must be carried through verbatim.
+    /// The routing identity — for `/webhook` the credential-qualified session
+    /// key `GatewayFabricContext::generic_webhook` derives (D-025) — is resolved
+    /// upstream and carried through verbatim; there is deliberately no
+    /// constructor here that derives a webhook session key from the
+    /// client-chosen `reply_target` alone.
     #[must_use]
     pub fn gateway(
         workspace_id: impl Into<String>,
@@ -720,6 +685,14 @@ impl RuntimeEnvelope {
             chat_id: Some(recipient.unwrap_or(self.session_key.as_str()).to_string()),
             sender_id: Some(owner_principal.principal_id),
             raw_sender: self.sender.clone(),
+            // V02-R5: this projection feeds the post-turn semantic *write*
+            // paths (agent loop, session worker, chat, channels, gateway
+            // turns). Owner isolation is a read boundary, and every one of
+            // those writes already persists its owner through
+            // `MemoryStoreMetadata`, so this context declares none and the
+            // statements it produces are unchanged.
+            owner_id: None,
+            require_owner_match: false,
         }
     }
 
@@ -840,14 +813,6 @@ mod tests {
         assert_eq!(envelope.session_key, format!("agent:{run_id}"));
         assert_eq!(envelope.channel.as_deref(), Some("cli"));
         assert_eq!(envelope.sender.as_deref(), Some("local-user"));
-    }
-
-    #[test]
-    fn runtime_envelope_gateway_webhook_preserves_reply_target_session() {
-        let envelope = RuntimeEnvelope::gateway_webhook("workspace", Some("client-a"));
-        assert_eq!(envelope.session_key, "gateway:webhook:client-a");
-        assert_eq!(envelope.channel.as_deref(), Some("webhook"));
-        assert_eq!(envelope.recipient.as_deref(), Some("client-a"));
     }
 
     #[test]

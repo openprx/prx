@@ -3,7 +3,7 @@
 //! Each `ChatSession` captures a full conversation (turns, metadata, timestamps)
 //! and can be serialized/deserialized for persistence via the Memory backend.
 
-use crate::agent::loop_::ChatMode;
+use crate::agent::turn_contracts::ChatMode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

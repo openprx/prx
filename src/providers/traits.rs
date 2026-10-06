@@ -95,6 +95,14 @@ pub struct ChatTrace {
     pub final_provider: String,
     /// Model that actually produced `response`.
     pub final_model: String,
+    /// The unique key of the failover-chain member that produced `response`
+    /// (INT-2B B3f, D-068 (2)); `None` when the serving provider is not a
+    /// chain member. `final_provider` is the member's display name, which
+    /// is redacted, so two members whose URLs differ only in their password
+    /// print the same; this key tells them apart. It is for identifying the
+    /// member inside the process (for example its tool-schema dialect) and is
+    /// never printed or recorded.
+    pub served_member: Option<String>,
     /// Provider-reported or explicitly estimated usage for the successful call.
     pub tokens_used: TokenUsage,
 }
@@ -273,6 +281,10 @@ pub struct StreamChunk {
     /// Content adapters leave it `None`; callers then synthesize one direct
     /// attempt for backward compatibility.
     pub route_attempt: Option<ProviderAttempt>,
+    /// Set by a failover chain on the chunk that reports the successful
+    /// attempt: the unique key of the member that served
+    /// (see [`ChatTrace::served_member`]). Never printed or recorded.
+    pub served_member: Option<String>,
 }
 
 impl StreamChunk {
@@ -286,6 +298,7 @@ impl StreamChunk {
             usage: None,
             tool_calls: Vec::new(),
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -301,6 +314,7 @@ impl StreamChunk {
             usage: None,
             tool_calls: Vec::new(),
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -318,6 +332,7 @@ impl StreamChunk {
             usage: None,
             tool_calls: calls,
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -331,6 +346,7 @@ impl StreamChunk {
             usage: Some(usage),
             tool_calls: Vec::new(),
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -344,6 +360,7 @@ impl StreamChunk {
             usage: None,
             tool_calls: Vec::new(),
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -357,6 +374,7 @@ impl StreamChunk {
             usage: None,
             tool_calls: Vec::new(),
             route_attempt: None,
+            served_member: None,
         }
     }
 
@@ -487,6 +505,31 @@ pub fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Opti
     u64::try_from(std::time::Duration::from_secs_f64(secs).as_millis()).ok()
 }
 
+/// The one dialect every candidate agrees on, or `Raw` when they disagree.
+///
+/// For a caller that cannot say which member or model serves a request.
+/// When every candidate would put the same document on the wire, that
+/// document is exact whichever one serves. When they disagree there is no
+/// exact answer, and picking one member's rewrite would enforce less than was
+/// published on the requests the others serve, so the answer is the
+/// published document (`Raw`) — the strict side. Nothing here ranks rewrites:
+/// the loosening "widest" fold is gone, and callers that know the model ask
+/// [`Provider::tool_schema_dialect_for`] instead.
+pub(crate) fn unanimous_dialect<I>(dialects: I) -> crate::tools::ToolSchemaDialect
+where
+    I: IntoIterator<Item = crate::tools::ToolSchemaDialect>,
+{
+    let mut dialects = dialects.into_iter();
+    let Some(first) = dialects.next() else {
+        return crate::tools::ToolSchemaDialect::Raw;
+    };
+    if dialects.all(|next| next == first) {
+        first
+    } else {
+        crate::tools::ToolSchemaDialect::Raw
+    }
+}
+
 /// Structured error returned when a requested capability is not supported.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("provider_capability_error provider={provider} capability={capability} message={message}")]
@@ -540,6 +583,16 @@ pub enum ToolsPayload {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Snapshot actual instrumented targets only when an auxiliary owner asks.
+    fn accounting_targets(&self, _model: &str) -> Option<super::AccountingTargets> {
+        None
+    }
+
+    /// True only when auxiliary chat_traced instruments every physical request.
+    fn supports_attempt_accounting(&self) -> bool {
+        false
+    }
+
     /// Query provider capabilities.
     ///
     /// Default implementation returns minimal capabilities (no native tool calling).
@@ -575,16 +628,44 @@ pub trait Provider: Send + Sync {
         crate::tools::ToolSchemaDialect::Raw
     }
 
+    /// Which rewrite of the published tool schemas this provider puts on the
+    /// wire for a request to `model`.
+    ///
+    /// This is the hook a caller that knows the model uses: a provider that
+    /// serves several models (an endpoint with per-model declarations, a
+    /// router, a failover chain) answers for the member and model that serve
+    /// this request instead of folding every member into one answer.
+    /// Providers with one fixed rewrite keep the default.
+    fn tool_schema_dialect_for(&self, _model: &str) -> crate::tools::ToolSchemaDialect {
+        self.tool_schema_dialect()
+    }
+
+    /// The dialect of the chain member identified by `member` for `model`, or
+    /// `None` when this provider has no such member. `member` is the
+    /// [`ChatTrace::served_member`] key when the trace carries one, otherwise
+    /// its `final_provider` name. Chains answer
+    /// for the one member that actually served, so a fallback across
+    /// provider families is validated against the fallback's own rewrite.
+    fn tool_schema_dialect_of_member(&self, _member: &str, _model: &str) -> Option<crate::tools::ToolSchemaDialect> {
+        None
+    }
+
     /// Convert tool specifications to provider-native format.
     ///
     /// Default implementation returns `PromptGuided` payload, which injects
     /// tool documentation into the system prompt as text. Providers with
     /// native tool calling support should override this to return their
     /// specific format (Gemini, Anthropic, OpenAI).
-    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
-        ToolsPayload::PromptGuided {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tool's published schema cannot be lowered to
+    /// what this provider accepts. The tool is then not offered and the caller
+    /// is told which one and why, rather than the payload quietly shrinking.
+    fn convert_tools(&self, tools: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
+        Ok(ToolsPayload::PromptGuided {
             instructions: build_tool_instructions_text(tools),
-        }
+        })
     }
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
@@ -628,7 +709,7 @@ pub trait Provider: Send + Sync {
         // inject tool instructions into system prompt as fallback.
         if let Some(tools) = request.tools {
             if !tools.is_empty() && !self.supports_native_tools() {
-                let tool_instructions = match self.convert_tools(tools) {
+                let tool_instructions = match self.convert_tools(tools)? {
                     ToolsPayload::PromptGuided { instructions } => instructions,
                     payload => {
                         anyhow::bail!(
@@ -692,6 +773,7 @@ pub trait Provider: Send + Sync {
             }],
             final_provider: "default".to_string(),
             final_model: model.to_string(),
+            served_member: None,
             tokens_used: TokenUsage::default(),
         })
     }
@@ -1037,7 +1119,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let payload = provider.convert_tools(&tools);
+        let payload = provider.convert_tools(&tools).expect("test: tools convert");
 
         // Default implementation should return PromptGuided.
         assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
@@ -1115,10 +1197,10 @@ mod tests {
             false
         }
 
-        fn convert_tools(&self, _tools: &[ToolSpec]) -> ToolsPayload {
-            ToolsPayload::PromptGuided {
+        fn convert_tools(&self, _tools: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
+            Ok(ToolsPayload::PromptGuided {
                 instructions: "CUSTOM_TOOL_INSTRUCTIONS".to_string(),
-            }
+            })
         }
 
         async fn chat_with_system(
@@ -1141,10 +1223,10 @@ mod tests {
             false
         }
 
-        fn convert_tools(&self, _tools: &[ToolSpec]) -> ToolsPayload {
-            ToolsPayload::OpenAI {
+        fn convert_tools(&self, _tools: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
+            Ok(ToolsPayload::OpenAI {
                 tools: vec![serde_json::json!({"type": "function"})],
-            }
+            })
         }
 
         async fn chat_with_system(

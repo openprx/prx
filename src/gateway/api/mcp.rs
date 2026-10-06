@@ -48,9 +48,12 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
 
     let mut servers = Vec::new();
     for (name, server_config) in &mcp.servers {
+        // `mcp.servers.<name>.url` is a URL-userinfo path of the secret
+        // registry: shown without `user:password@`, like every other
+        // configuration read surface.
         let url = server_config.url.as_ref().map_or_else(
             || server_config.command.clone().unwrap_or_else(|| "stdio".to_string()),
-            |u| u.clone(),
+            |url| crate::security::redaction::redact_url_value(url).into_owned(),
         );
 
         let info = runtime_info.get(name);
@@ -74,13 +77,22 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
             url,
             status: status.to_string(),
             tools,
-            last_error: info.and_then(|info| info.last_error.clone()),
+            // A discovery error can quote the server URL.
+            last_error: info.and_then(|info| {
+                info.last_error
+                    .as_deref()
+                    .map(|error| crate::security::redaction::redact_url_components(error).into_owned())
+            }),
             last_refresh_at: info.and_then(|info| info.last_refresh_at.clone()),
         });
     }
 
     servers.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let config_error = runtime.mcp_tool.as_ref().and_then(|tool| tool.config_error());
+    let config_error = runtime
+        .mcp_tool
+        .as_ref()
+        .and_then(|tool| tool.config_error())
+        .map(|error| crate::security::redaction::redact_url_components(&error).into_owned());
     Json(McpServersResponse { servers, config_error })
 }

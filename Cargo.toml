@@ -27,6 +27,9 @@ bench = false
 [[bench]]
 name = "router_decision"
 harness = false
+# The bench imports `openprx::router::automix`, which only exists with the
+# router (D-047: every feature set builds with --all-targets).
+required-features = ["llm-router"]
 
 [[bench]]
 name = "prompt_render"
@@ -49,7 +52,7 @@ tokio-util = { version = "0.7", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks", "http2"] }
 
 # Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.19", optional = true, default-features = false, features = ["e2e-encryption", "rustls-aws-lc-rs", "markdown"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -61,7 +64,6 @@ pulldown-cmark = { version = "0.13", default-features = false }
 directories = "6.0"
 fs2 = "0.4"
 toml = "1.0"
-shellexpand = "3.1"
 
 # JSON Schema generation for config export
 schemars = "1.2"
@@ -93,6 +95,8 @@ uuid = { version = "1.11", default-features = false, features = ["v4", "v7", "st
 
 # Authenticated encryption (AEAD) for secret store
 chacha20poly1305 = "0.10"
+# Credential values in transit are zeroed when dropped
+zeroize = "1.9"
 
 # HMAC for webhook signature verification
 hmac = "0.12"
@@ -124,6 +128,12 @@ notify-debouncer-mini = "0.7.0"
 async-trait = "0.1"
 # MCP client (stdio + streamable HTTP)
 rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+# The reqwest 0.13 client of the MCP streamable-HTTP transport (rmcp's own
+# reqwest). Its TLS backend is pinned here: without it, `https://` MCP servers
+# were reachable only when another dependency (the Matrix SDK) enabled rustls
+# on the same crate. PRX builds that client itself (`tools::mcp::mcp_http_client`)
+# with redirects disabled.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
@@ -132,8 +142,9 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -230,7 +241,7 @@ rppal = { version = "0.22", optional = true }
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [features]
 default = ["channel-matrix", "llm-router", "wasm-plugins", "terminal-tui"]

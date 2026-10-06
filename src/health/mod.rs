@@ -8,6 +8,12 @@ use tokio::sync::Notify;
 
 const DEFAULT_FRESHNESS_TTL: Duration = Duration::from_mins(5);
 const MAX_PUBLIC_ERROR_CHARS: usize = 200;
+/// Characters kept from the start of an over-long public error summary; the
+/// rest of the budget keeps its end, where a chain's root cause is.
+const PUBLIC_ERROR_HEAD_CHARS: usize = 80;
+const PUBLIC_ERROR_ELISION: &str = " ... ";
+/// Characters of each end of an input that are scanned at all.
+const PUBLIC_ERROR_SCAN_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -244,14 +250,33 @@ pub fn bump_component_restart(component: &str) {
 
 fn sanitize_error_summary(error: &str) -> String {
     let flattened: String = error.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
-    let scrubbed = crate::providers::sanitize_api_error(flattened.trim());
+    let flattened = flattened.trim();
+    // Bound the work on a pathological input by its two ends; both lie far
+    // outside what the summary keeps, so the cut never shows.
+    let bounded = if flattened.chars().count() > PUBLIC_ERROR_SCAN_CHARS * 2 {
+        let head: String = flattened.chars().take(PUBLIC_ERROR_SCAN_CHARS).collect();
+        let tail: String = flattened
+            .chars()
+            .skip(flattened.chars().count() - PUBLIC_ERROR_SCAN_CHARS)
+            .collect();
+        format!("{head}{PUBLIC_ERROR_ELISION}{tail}")
+    } else {
+        flattened.to_string()
+    };
+    // Redact the whole text first, so no secret is cut in half by the
+    // elision below and survives unrecognised.
+    let scrubbed = crate::security::redaction::redact_secrets(&bounded);
     if scrubbed.chars().count() <= MAX_PUBLIC_ERROR_CHARS {
         return scrubbed;
     }
 
-    let mut bounded: String = scrubbed.chars().take(MAX_PUBLIC_ERROR_CHARS - 3).collect();
-    bounded.push_str("...");
-    bounded
+    // An error chain (`{:#}`) ends with its root cause, the part an operator
+    // needs most, so the middle is elided rather than the end (D-072 L-1).
+    let head: String = scrubbed.chars().take(PUBLIC_ERROR_HEAD_CHARS).collect();
+    let tail_chars = MAX_PUBLIC_ERROR_CHARS - PUBLIC_ERROR_HEAD_CHARS - PUBLIC_ERROR_ELISION.chars().count();
+    let skip = scrubbed.chars().count() - tail_chars;
+    let tail: String = scrubbed.chars().skip(skip).collect();
+    format!("{head}{PUBLIC_ERROR_ELISION}{tail}")
 }
 
 fn timestamp_is_fresh(updated_at: &str, ttl_seconds: u64, now: DateTime<Utc>) -> bool {
@@ -722,5 +747,34 @@ mod tests {
             .expect("failed component should expose a bounded summary");
         assert!(!public_error.contains(secret));
         assert!(public_error.chars().count() <= MAX_PUBLIC_ERROR_CHARS);
+    }
+
+    /// D-072 L-1, RED before: an over-long chain was cut at the end, which
+    /// is where `{:#}` puts the root cause. After: the middle is elided and
+    /// the root cause survives the cap.
+    #[test]
+    fn an_over_long_error_chain_keeps_its_root_cause() {
+        let component = unique_component("health-long-chain");
+        let chain = format!(
+            "the previous generation could not restart: `gateway` failed during generation preparation: {}: \
+             bind 0.0.0.0:3000: address already in use (os error 48)",
+            "while loading the listener configuration and its fragments ".repeat(4)
+        );
+
+        mark_component_error(&component, chain);
+
+        let json = snapshot_json();
+        let public_error = json["components"][&component]["last_error"]
+            .as_str()
+            .expect("failed component should expose a bounded summary");
+        assert!(public_error.chars().count() <= MAX_PUBLIC_ERROR_CHARS, "{public_error}");
+        assert!(
+            public_error.starts_with("the previous generation could not restart"),
+            "{public_error}"
+        );
+        assert!(
+            public_error.ends_with("address already in use (os error 48)"),
+            "{public_error}"
+        );
     }
 }

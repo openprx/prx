@@ -119,13 +119,16 @@ pub fn canonicalize_tool_order(tools: &mut Vec<ToolSpec>) {
 /// request. It is derived from the post-filter, post-middleware ToolSpec
 /// snapshot, so it cannot drift from the execution allowlist like TOOLS.md did.
 pub fn render_runtime_capability_snapshot(tools: &[ToolSpec]) -> String {
-    if tools.is_empty() {
+    render_ordered_capability_snapshot(canonical_tool_order(tools).into_iter())
+}
+
+/// Render the already canonical core-plus-discovery order without sorting it.
+pub(crate) fn render_ordered_capability_snapshot<'a>(tools: impl ExactSizeIterator<Item = &'a ToolSpec>) -> String {
+    let count = tools.len();
+    if count == 0 {
         return String::new();
     }
-
-    let ordered = canonical_tool_order(tools);
-    let names = ordered
-        .iter()
+    let names = tools
         .map(|tool| format!("`{}`", tool.name))
         .collect::<Vec<_>>()
         .join(", ");
@@ -133,7 +136,7 @@ pub fn render_runtime_capability_snapshot(tools: &[ToolSpec]) -> String {
         "## Runtime Capabilities\n\n\
          The following {} tools are exposed and executable for this request: {names}.\n\
          This request-local list is authoritative; use the supplied tool schemas for arguments.",
-        ordered.len()
+        count
     )
 }
 
@@ -143,6 +146,11 @@ pub fn render_runtime_capability_snapshot(tools: &[ToolSpec]) -> String {
 /// provider request. Provider-native and prompt-guided paths must never build
 /// independent capability inventories.
 pub fn render_prompt_guided_tool_protocol(tools: &[ToolSpec]) -> String {
+    render_ordered_tool_protocol(canonical_tool_order(tools).into_iter())
+}
+
+/// Preserve the compiler's stable core prefix when rendering tool schemas.
+pub(crate) fn render_ordered_tool_protocol<'a>(tools: impl Iterator<Item = &'a ToolSpec>) -> String {
     let mut instructions = String::new();
     instructions.push_str("## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -156,7 +164,7 @@ pub fn render_prompt_guided_tool_protocol(tools: &[ToolSpec]) -> String {
     instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in canonical_tool_order(tools) {
+    for tool in tools {
         let parameters = serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
         let _ = writeln!(
             instructions,
@@ -367,6 +375,40 @@ mod tests {
             first,
             render_prompt_guided_tool_protocol(registry_order.get(..2).unwrap_or(&[])),
             "dropping an exposed tool must change the rendered protocol"
+        );
+    }
+
+    /// The prompt-guided protocol is the only text in this module that teaches
+    /// a call grammar, and it teaches exactly one.
+    ///
+    /// `render_runtime_capability_snapshot` is rendered unconditionally beside
+    /// it, including when native tools are sent, so it must stay free of
+    /// syntax. And no PRX prompt anywhere writes the `<function=` chat-template
+    /// spelling: a grep for it across the tree finds only the parser.
+    #[test]
+    fn only_the_prompt_guided_protocol_teaches_a_call_grammar() {
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+
+        let snapshot = render_runtime_capability_snapshot(&tools);
+        for grammar in ["<tool_call>", "<function="] {
+            assert!(
+                !snapshot.contains(grammar),
+                "the unconditional capability snapshot teaches '{grammar}': {snapshot}"
+            );
+        }
+
+        let protocol = render_prompt_guided_tool_protocol(&tools);
+        assert!(
+            protocol.contains("<tool_call>"),
+            "the prompt-guided protocol stopped teaching its own grammar"
+        );
+        assert!(
+            !protocol.contains("<function="),
+            "the prompt-guided protocol teaches a second, chat-template grammar: {protocol}"
         );
     }
 }

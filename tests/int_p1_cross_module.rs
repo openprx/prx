@@ -287,9 +287,10 @@ async fn int_sme_04_circuit_breaker_opens_after_threshold_failures() {
 // INT-SME-05: Rollback manager restores previous state on failure
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// `RollbackManager` can backup, modify, then restore the previous version.
+/// `RollbackManager` snapshots the previous version before a change; the
+/// snapshot keeps its content (restoring it is manual: D-046).
 #[tokio::test]
-async fn int_sme_05_rollback_manager_backup_and_restore() {
+async fn int_sme_05_rollback_manager_backup_keeps_the_previous_version() {
     let dir = tempfile::tempdir().expect("test: create temp dir");
     let target = dir.path().join("system_prompt.md");
     let versions = dir.path().join(".evolution/rollback/versions");
@@ -317,18 +318,13 @@ async fn int_sme_05_rollback_manager_backup_and_restore() {
     let mutated = tokio::fs::read_to_string(&target).await.expect("test: read mutated");
     assert_eq!(mutated, "You are an evil assistant.");
 
-    // Rollback to the backup
-    manager
-        .rollback_to_version(&snapshot.version_id)
-        .await
-        .expect("test: rollback should succeed");
-
-    // Verify restoration
-    let restored = tokio::fs::read_to_string(&target).await.expect("test: read restored");
-    assert_eq!(
-        restored, "You are a helpful assistant.",
-        "test: content should be restored to original after rollback"
-    );
+    // The snapshot keeps the pre-mutation content.
+    let versions = manager.list_versions().await.expect("test: list versions");
+    let kept = versions
+        .iter()
+        .find(|version| version.version_id == snapshot.version_id)
+        .expect("test: the snapshot is listed");
+    assert_eq!(kept.content, "You are a helpful assistant.");
 }
 
 /// Rollback manager prunes old versions beyond `max_versions`.
@@ -645,6 +641,7 @@ async fn int_tr_05_direct_shell_process_has_no_sandbox_selection() {
             workspace_dir: workspace.path(),
             timeout: Some(Duration::from_secs(5)),
             cancellation: None,
+            git: openprx::runtime::shell_process::ShellGitPolicy::RefuseGit,
         })
         .await
         .unwrap();

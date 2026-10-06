@@ -775,7 +775,7 @@ Subscriptions are supported only by hook-capable plugins, because those plugins 
 
 #### `unsubscribe`
 
-Cancel a subscription.
+Cancel one of your own subscriptions. A plugin can cancel only subscriptions it made; another plugin's ID is refused exactly like an unknown one.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|

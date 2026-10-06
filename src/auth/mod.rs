@@ -58,8 +58,9 @@ impl AuthService {
         }
     }
 
+    /// Every profile, read-only: nothing is rewritten (D-084 E-3).
     pub fn load_profiles(&self) -> Result<AuthProfilesData> {
-        self.store.load()
+        self.store.load_read_only()
     }
 
     pub fn store_openai_tokens(
@@ -119,7 +120,7 @@ impl AuthService {
 
     pub fn get_profile(&self, provider: &str, profile_override: Option<&str>) -> Result<Option<AuthProfile>> {
         let provider = normalize_provider(provider)?;
-        let data = self.store.load()?;
+        let data = self.store.load_read_only()?;
         let Some(profile_id) = select_profile_id(&data, &provider, profile_override) else {
             return Ok(None);
         };
@@ -268,13 +269,40 @@ impl AuthService {
     }
 }
 
+/// The auth-profile provider key for a provider spelling.
+///
+/// A catalog alias folds to the name the provider factory reads the store
+/// under (`providers::canonical_auth_profile_provider`), so a token stored
+/// with `--provider google` is the one `gemini` reads. The fold never changes
+/// the provider identity: a spelling that selects a different regional
+/// endpoint than its vendor row (`qwen-us`, `minimax-cn`, `kimi-intl`, …) is
+/// kept as typed, so the stored profile's owner is the region it was issued
+/// for (D-018 Q8). An identity that is case-sensitive — a `custom:` or
+/// `anthropic-custom:` URL's path or userinfo, a `wasm:` plugin name — is
+/// stored under its `ProviderId` key, never lowercased. `claude` is an extra
+/// spelling of this CLI only.
 pub fn normalize_provider(provider: &str) -> Result<String> {
-    let normalized = provider.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "openai-codex" | "openai_codex" | "codex" => Ok(OPENAI_CODEX_PROVIDER.to_string()),
-        "anthropic" | "claude" | "claude-code" => Ok(ANTHROPIC_PROVIDER.to_string()),
-        other if !other.is_empty() => Ok(other.to_string()),
-        _ => anyhow::bail!("Provider name cannot be empty"),
+    let typed = provider.trim();
+    let lowered = typed.to_ascii_lowercase();
+    if lowered.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+    if lowered == "claude" {
+        return Ok(ANTHROPIC_PROVIDER.to_string());
+    }
+    let identity = crate::providers::ProviderId::of(typed);
+    match identity.namespace() {
+        crate::providers::ProviderNamespace::Custom
+        | crate::providers::ProviderNamespace::AnthropicCustom
+        | crate::providers::ProviderNamespace::Wasm
+        | crate::providers::ProviderNamespace::DecisionService => return Ok(identity.as_str().to_string()),
+        crate::providers::ProviderNamespace::Catalog | crate::providers::ProviderNamespace::Unknown => {}
+    }
+    let folded = crate::providers::canonical_auth_profile_provider(&lowered);
+    if crate::providers::ProviderId::of(&folded) == identity {
+        Ok(folded)
+    } else {
+        Ok(lowered)
     }
 }
 
@@ -317,9 +345,12 @@ pub fn select_profile_id(data: &AuthProfilesData, provider: &str, profile_overri
         return Some(default);
     }
 
-    data.profiles
-        .iter()
-        .find_map(|(id, profile)| (profile.provider == provider).then(|| id.clone()))
+    // A credential reference (`cred-<name>`) is used only by reference: it
+    // never becomes a provider's own credential by default (PMM-D-6).
+    data.profiles.iter().find_map(|(id, profile)| {
+        (profile.provider == provider && !id.starts_with(crate::config::manage::credentials::REFERENCE_PREFIX))
+            .then(|| id.clone())
+    })
 }
 
 fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -535,6 +566,49 @@ mod tests {
                 .as_ref()
                 .and_then(|tokens| tokens.refresh_token.as_deref()),
             Some("imported-refresh")
+        );
+    }
+
+    /// RED before PMM-D-6: a credential reference (`cred-<name>`, used only
+    /// by reference) was picked as the provider's own store credential when
+    /// the provider had no default profile.
+    #[test]
+    fn a_credential_reference_is_never_the_providers_own_profile() {
+        let mut data = AuthProfilesData::default();
+        let mut reference = AuthProfile::new_token("openai", "route-key", "pmmd6-ref-sentinel".into());
+        reference.id = "cred-route-key".into();
+        data.profiles.insert(reference.id.clone(), reference);
+
+        assert_eq!(select_profile_id(&data, "openai", None), None);
+    }
+
+    /// RED before PMMDtail-j (D-084 E-3): `prx auth list/status` and
+    /// `get_profile` loaded through the migrating load, rewriting
+    /// auth-profiles.json when it held a legacy `enc:` value.
+    #[test]
+    fn auth_list_status_and_get_profile_never_rewrite_the_profiles_file() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let path = crate::auth::profiles::write_legacy_token_profile(tmp.path(), "moonshot", "sentinel-moonshot");
+        let before = std::fs::read_to_string(&path).expect("test: read");
+        let service =
+            AuthService::new_with_codex_import(tmp.path(), true, Some(tmp.path().join("codex-auth.json")), false);
+
+        let listed = service.load_profiles().expect("test: list");
+        let profile = service.get_profile("moonshot", None).expect("test: get");
+        let token = service
+            .get_provider_bearer_token("moonshot", None)
+            .expect("test: bearer");
+
+        assert_eq!(listed.profiles.len(), 1);
+        assert_eq!(
+            profile.and_then(|profile| profile.token).as_deref(),
+            Some("sentinel-moonshot")
+        );
+        assert_eq!(token.as_deref(), Some("sentinel-moonshot"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("test: read"),
+            before,
+            "the file was rewritten"
         );
     }
 }

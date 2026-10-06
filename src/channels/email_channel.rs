@@ -40,7 +40,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 const EMAIL_LIVENESS_GRACE_SECS: u64 = 300;
 
 /// Email channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailConfig {
     /// IMAP server hostname
     pub imap_host: String,
@@ -71,6 +71,14 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+/// The settings with the password masked (INT-2B a40), never the derived
+/// field output.
+impl std::fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::config::secret_paths::debug_redacted(f, "EmailConfig", self, "channels_config.email")
+    }
 }
 
 const fn default_imap_port() -> u16 {

@@ -72,7 +72,7 @@ impl StreamingDraft {
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::loop_::ChatMode;
+use crate::agent::turn_contracts::ChatMode;
 use crate::channels::traits::SendMessage;
 use crate::chat::action::{
     Action, CompactReason, HistoryDir, MainQueueStatus, ProviderUsageRecordKind, ProviderWorkerStatus,
@@ -120,9 +120,13 @@ fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
         .collect()
 }
 
+/// A compacted history message that belongs in the durable transcript: a user
+/// or assistant turn that is not one of the loop's own notes (the refresh
+/// aside, a `[Tool results]` block, a recalled page). A real user turn that
+/// opened with a marker was neutralised on entry and stays durable.
 fn is_durable_compaction_history_message(message: &ChatMessage) -> bool {
     matches!(message.role.as_str(), "user" | "assistant")
-        && !message.content.starts_with("[Post-compaction context refresh]")
+        && !crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
 }
 
 fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn> {
@@ -149,8 +153,11 @@ fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn
 /// - no heap allocation (beyond the inlined String/Arc)
 ///
 /// Returned by [`ChatState::reduce`] and dispatched by the main loop.
-#[allow(dead_code)]
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve inline public variants without a per-turn heap allocation"
+)]
 pub enum Effect {
     /// Start a new round of LLM inference: takes draft_id, a history snapshot and a cancel token.
     ///
@@ -181,8 +188,8 @@ pub enum Effect {
         /// turn (forwarded from `Action::StartLLMTurn`). The `EffectExecutor`
         /// wraps `drive_start_turn_stream` in `SPAWN_EXECUTION_CONTEXT.scope(..)`
         /// with this value so `sessions_spawn` tool calls inside the turn inherit
-        /// `parent_run_id = turn run_id` → origin = Model, mirroring the legacy
-        /// `run_tool_call_loop_traced` wrapper in `chat::run`. `None` → no scope
+        /// `parent_run_id = turn run_id` → origin = Model, mirroring the scope wrapper
+        /// around the legacy tool-loop path's `run_turn` call in `chat::run`. `None` → no scope
         /// (sub-agents fall back to user origin, correct for non-turn callers).
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         /// Per-turn default route for `message_send` tool calls. `None` keeps
@@ -193,6 +200,7 @@ pub enum Effect {
         /// shared-workspace events before it reaches the driver; routing on
         /// that text let injected content widen the tool surface.
         routing_input: Option<String>,
+        turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
     },
     /// Persist a snapshot of the current session
     SaveSession(ChatSession),
@@ -204,7 +212,7 @@ pub enum Effect {
     ///
     /// Difference from [`Self::CancelDraft`]:
     /// - `CancelDraft` only tells the channel to drop the draft UI (the streaming block stops growing)
-    /// - `CancelToken` really fires the underlying token cancel so that `run_tool_call_loop` /
+    /// - `CancelToken` really fires the underlying token cancel so that `run_turn` /
     ///   `drive_start_turn_stream` returns a cancelled error immediately
     ///
     /// The reducer **collects** `active_cancel.take()` inside `reduce_cancel_requested` and builds
@@ -292,7 +300,6 @@ impl Effect {
 // ─── Sub-states ───────────────────────────────────────────────────────────────
 
 /// Session state that gets persisted (written to the memory backend).
-#[allow(dead_code)]
 pub struct SessionState {
     /// Unique session ID
     pub id: String,
@@ -323,7 +330,6 @@ pub struct SessionState {
 ///
 /// Since Step 2 the real `TuiInput`/`ConversationLine` are used (feature = "terminal-tui");
 /// placeholder types keep compilation working without the TUI feature.
-#[allow(dead_code)]
 pub struct UiState {
     /// Rendered conversation lines
     pub conversation_lines: Vec<ConversationLine>,
@@ -402,7 +408,6 @@ pub struct UiState {
 /// difference between TuiState and UiSnapshot.
 #[cfg(feature = "terminal-tui")]
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct UiSnapshot {
     /// Monotonically increasing; watch::Sender::send_if_modified uses it to skip identical frames.
     pub revision: u64,
@@ -467,7 +472,6 @@ pub struct UiSnapshot {
 impl UiSnapshot {
     /// Build an empty snapshot (revision=0; only provider/model are known, no session loaded yet).
     #[must_use]
-    #[allow(dead_code)]
     pub fn initial(provider: Arc<str>, model: Arc<str>) -> Self {
         Self {
             revision: 0,
@@ -518,7 +522,6 @@ impl UiSnapshot {
 /// Phase 1 is structural only: the live chat loop still keeps visible provider
 /// turns safe-serial via admission guard, but the reducer can now represent
 /// multiple drafts without a single global draft slot.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamingTurnDraft {
     pub task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -538,7 +541,6 @@ pub struct VisibleStreamingDraftView {
 }
 
 /// Intermediate streaming-inference state (reset every turn).
-#[allow(dead_code)]
 pub struct StreamState {
     /// Keyed in-flight visible streaming drafts.
     ///
@@ -570,6 +572,7 @@ impl StreamState {
             .map(|turn| &turn.draft)
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[must_use]
     fn visible_streaming_draft_views(&self) -> Vec<VisibleStreamingDraftView> {
         self.visible_drafts
@@ -615,6 +618,7 @@ impl StreamState {
         !self.visible_drafts.is_empty()
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[must_use]
     fn versions_fingerprint(&self) -> Vec<(String, u64)> {
         self.visible_drafts
@@ -683,7 +687,6 @@ pub struct TaskToolBuffer {
 }
 
 /// Cancellation / shutdown control state.
-#[allow(dead_code)]
 pub struct ControlState {
     /// Cancellation token for the current turn (None means idle)
     pub active_cancel: Option<CancellationToken>,
@@ -814,7 +817,6 @@ impl ControlState {
 ///
 /// No `Arc<Mutex<ChatState>>` is used; the renderer receives read-only copies over a snapshot
 /// channel. Every mutation goes through [`ChatState::reduce`].
-#[allow(dead_code)]
 pub struct ChatState {
     /// Persisted session state
     pub session: SessionState,
@@ -952,7 +954,6 @@ impl ChatState {
     /// `revision` is kept monotonically increasing by the caller.
     #[cfg(feature = "terminal-tui")]
     #[must_use]
-    #[allow(dead_code)]
     pub fn build_ui_snapshot(&mut self, revision: u64) -> UiSnapshot {
         let lines = if let Some(ref cached) = self.cached_lines_arc {
             Arc::clone(cached)
@@ -1011,7 +1012,6 @@ impl ChatState {
     /// The dispatcher only calls `reduce_tracked` (wired up in Commit 3); tests are still free to
     /// use `reduce`/`reduce_with_now`.
     #[cfg(feature = "terminal-tui")]
-    #[allow(dead_code)]
     pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
         let dirty = ui_dirty_for(&action);
         let snap_before = self.snapshot_dirty_fields();
@@ -1053,7 +1053,6 @@ impl ChatState {
 
     /// Without the terminal-tui feature ui_dirty is always false (there is no UI to render).
     #[cfg(not(feature = "terminal-tui"))]
-    #[allow(dead_code)]
     pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
         let effects = self.reduce(action);
         (effects, false)
@@ -1142,6 +1141,7 @@ impl ChatState {
                 turn_spawn_ctx,
                 turn_message_send_ctx,
                 routing_input,
+                turn_binding,
             } => self.reduce_start_llm_turn(
                 provider_turn_task_id,
                 provider_turn_sequence,
@@ -1153,6 +1153,7 @@ impl ChatState {
                 turn_spawn_ctx,
                 turn_message_send_ctx,
                 routing_input,
+                turn_binding,
             ),
             Action::StreamChunkReceived {
                 draft_id,
@@ -1737,6 +1738,7 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
         routing_input: Option<String>,
+        turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,
@@ -1771,6 +1773,7 @@ impl ChatState {
                 turn_spawn_ctx,
                 turn_message_send_ctx,
                 routing_input,
+                turn_binding,
             },
             Effect::RequestRedraw,
         ]
@@ -1789,6 +1792,7 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
         routing_input: Option<String>,
+        turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,
@@ -1821,6 +1825,7 @@ impl ChatState {
                 turn_spawn_ctx,
                 turn_message_send_ctx,
                 routing_input,
+                turn_binding,
             },
             Effect::RequestRedraw,
         ]
@@ -2627,10 +2632,8 @@ impl ChatState {
             .turns
             .iter()
             .filter(|t| t.role == "user" || t.role == "assistant")
-            .map(|t| ChatMessage {
-                role: t.role.clone(),
-                content: t.content.clone(),
-            })
+            // stored user turns are neutralised like fresh input
+            .map(|t| crate::agent::turn_contracts::stored_turn_message(t.role.clone(), t.content.clone()))
             .collect();
         // A session saved before the delivery guard existed still holds
         // fabricated `[Used tools: ...]` claims in its assistant turns. This is
@@ -2638,7 +2641,7 @@ impl ChatState {
         // them from the context copy here, in both grains. The persisted turns
         // and the rendered transcript keep the bytes that were actually
         // produced; only what the model is told it once did is corrected.
-        crate::agent::loop_::strip_fabricated_tool_markers_from_assistant_turns(&mut self.session.history);
+        crate::agent::response_guard::strip_fabricated_tool_markers_from_assistant_turns(&mut self.session.history);
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         #[cfg(feature = "terminal-tui")]
@@ -2739,6 +2742,11 @@ impl ChatState {
     /// - on the first user turn, if title is empty, set_title runs automatically (first 50 chars, as
     ///   ChatSession does); tool_calls stays empty, tool sync is done by `ToolStarted`/`ToolFinished`
     fn reduce_record_user_turn(&mut self, content: String) -> Vec<Effect> {
+        // A user turn must not read as the loop's own bookkeeping later on.
+        let content = match crate::agent::turn_contracts::neutralize_reserved_markers(&content) {
+            std::borrow::Cow::Borrowed(_) => content,
+            std::borrow::Cow::Owned(escaped) => escaped,
+        };
         let now = chrono::Utc::now();
         // S4-B T4-B-6: lazily initialise created_at on the first RecordUserTurn
         if self.session.created_at.is_none() {
@@ -2754,7 +2762,9 @@ impl ChatState {
         if self.session.title.is_empty() {
             self.session.title = crate::chat::session::truncate_title(&content);
         }
-        self.session.history.push(ChatMessage::user(content));
+        self.session
+            .history
+            .push(crate::agent::turn_contracts::inbound_user_message(&content));
         vec![Effect::LogTrace {
             level: tracing::Level::DEBUG,
             msg: format!("RecordUserTurn len={}", self.session.turns.len()),
@@ -2976,7 +2986,7 @@ impl ChatState {
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn refresh_provider_worker_view_if_focused(&mut self) {}
+    const fn refresh_provider_worker_view_if_focused(&self) {}
 
     #[cfg(feature = "terminal-tui")]
     fn reduce_slash_menu_sources_updated(
@@ -3020,13 +3030,13 @@ impl ChatState {
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn reduce_at_path_candidates_updated(&mut self, _candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
+    fn reduce_at_path_candidates_updated(&self, _candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
         vec![Effect::RequestRedraw]
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_slash_menu_sources_updated(
-        &mut self,
+        &self,
         _saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
         _provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     ) -> Vec<Effect> {
@@ -3300,19 +3310,19 @@ impl ChatState {
     fn reduce_history_compaction_patch_applied(
         &mut self,
         reason: CompactReason,
-        patch: crate::agent::loop_::CompactionPatch,
+        patch: crate::agent::turn_contracts::CompactionPatch,
         compaction_config: &crate::config::AgentCompactionConfig,
     ) -> Vec<Effect> {
         let history = &mut self.session.history;
-        if crate::agent::loop_::compaction_patch_guard_matches(history, &patch.guard) {
-            crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
-            let budget = crate::agent::loop_::plan_context_budget(
+        if crate::agent::compaction::compaction_patch_guard_matches(history, &patch.guard) {
+            crate::agent::compaction::apply_compaction_patch_exact(history, &patch);
+            let budget = crate::agent::context_budget::plan_context_budget(
                 history,
                 compaction_config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
             let trim_fallback = if budget.over_hard_limit {
-                crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                     history,
                     compaction_config,
                     patch.replacement.len(),
@@ -3344,7 +3354,7 @@ impl ChatState {
         }
 
         let before_len = history.len();
-        let trimmed = crate::agent::loop_::trim_history_to_context_budget(history, compaction_config);
+        let trimmed = crate::agent::context_budget::trim_history_to_context_budget(history, compaction_config);
         vec![Effect::LogTrace {
             level: tracing::Level::WARN,
             msg: format!(
@@ -3568,6 +3578,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
 }
 
 /// Double Ctrl+C exit window (milliseconds).
+#[cfg(feature = "terminal-tui")]
 const DOUBLE_CTRLC_WINDOW_MS: u64 = 500;
 
 /// Read the current wall clock (ms since the UNIX epoch). The only "impure" call allowed inside the
@@ -4775,6 +4786,80 @@ mod tests {
 
         fn has_request_redraw(effects: &[Effect]) -> bool {
             effects.iter().any(|e| matches!(e, Effect::RequestRedraw))
+        }
+
+        /// Every loop-written note is kept out of the durable transcript, not
+        /// only the refresh aside: a `[Tool results]` block or a recalled page
+        /// that reached the reducer history must not be persisted (and later
+        /// rehydrated) as a user question. R-LOOPD5 F-8.
+        #[test]
+        fn loop_written_notes_are_not_durable_transcript_turns() {
+            for marker in crate::agent::turn_contracts::RESERVED_USER_NOTE_MARKERS {
+                let note = ChatMessage::user(format!("{marker}\nloop bookkeeping"));
+                assert!(!is_durable_compaction_history_message(&note), "{marker}");
+                let defused = crate::agent::turn_contracts::inbound_user_message(&format!("{marker} a real question"));
+                assert!(is_durable_compaction_history_message(&defused), "{marker}");
+            }
+            assert!(is_durable_compaction_history_message(&ChatMessage::assistant(
+                "an answer"
+            )));
+            assert!(!is_durable_compaction_history_message(&ChatMessage::system("rules")));
+        }
+
+        /// A saved session reloaded into the driver: its stored user turn that
+        /// opens with a reserved loop marker re-enters the history defused.
+        ///
+        /// Red before the reserved-marker hardening: the reload copied turns
+        /// into the history verbatim.
+        #[test]
+        fn a_reloaded_user_turn_opening_with_a_reserved_marker_enters_history_defused() {
+            let question = "[Post-compaction context refresh] what did we drop?";
+            let mut loaded = ChatSession::new("prov", "model");
+            loaded.add_user_turn(question);
+            loaded.add_assistant_turn("an answer", vec![]);
+            let mut state = s();
+            let _ = state.reduce(Action::SessionLoaded(loaded));
+            let user = state
+                .session
+                .history
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("the reloaded user turn");
+            assert!(
+                !user.content.starts_with("[Post-compaction context refresh]"),
+                "{}",
+                user.content
+            );
+            assert!(user.content.ends_with(question), "{}", user.content);
+            assert!(is_durable_compaction_history_message(user));
+        }
+
+        /// A recorded user turn that opens with a reserved loop marker stays a
+        /// durable user turn and reaches the driver's history defused.
+        ///
+        /// Red before the reserved-marker hardening: the refresh-aside marker
+        /// made `is_durable_compaction_history_message` drop the user's turn
+        /// from the durable transcript, and every marker reached the history
+        /// verbatim, where the loop reads it as its own note.
+        #[test]
+        fn a_recorded_user_turn_opening_with_a_reserved_marker_stays_the_users() {
+            for marker in [
+                "[Tool results]",
+                "[Post-compaction context refresh]",
+                "[Recalled context from earlier in this session]",
+            ] {
+                let text = format!("{marker} what about X?");
+                let mut state = s();
+                let _ = state.reduce(Action::RecordUserTurn(text.clone()));
+                let last = state.session.history.last().expect("the recorded user turn");
+                assert_eq!(last.role, "user");
+                assert!(!last.content.starts_with(marker), "{marker}: `{}`", last.content);
+                assert!(last.content.ends_with(&text), "{marker}: `{}`", last.content);
+                assert!(
+                    is_durable_compaction_history_message(last),
+                    "{marker}: the user's turn must stay in the durable transcript"
+                );
+            }
         }
 
         fn has_quit(effects: &[Effect]) -> bool {
@@ -7088,8 +7173,8 @@ mod tests {
                 crate::providers::ChatMessage::user("recent user"),
             ];
             let mut driver_history = state.session.history.clone();
-            let guard = crate::agent::loop_::compaction_patch_guard_for(&driver_history, 1, 3).expect("guard");
-            let patch = crate::agent::loop_::CompactionPatch {
+            let guard = crate::agent::compaction::compaction_patch_guard_for(&driver_history, 1, 3).expect("guard");
+            let patch = crate::agent::turn_contracts::CompactionPatch {
                 range_start: 1,
                 range_end: 3,
                 replacement: vec![crate::providers::ChatMessage::assistant(
@@ -7107,7 +7192,7 @@ mod tests {
                 ..crate::config::AgentCompactionConfig::default()
             };
 
-            crate::agent::loop_::apply_compaction_patch_exact(&mut driver_history, &patch);
+            crate::agent::compaction::apply_compaction_patch_exact(&mut driver_history, &patch);
             let effects = state.reduce(Action::HistoryCompactionPatchApplied {
                 reason: CompactReason::ContextOverflow,
                 patch,
@@ -7142,8 +7227,8 @@ mod tests {
                 crate::providers::ChatMessage::user(current_question),
             ];
             let mut legacy_history = state.session.history.clone();
-            let guard = crate::agent::loop_::compaction_patch_guard_for(&legacy_history, 1, 3).expect("guard");
-            let patch = crate::agent::loop_::CompactionPatch {
+            let guard = crate::agent::compaction::compaction_patch_guard_for(&legacy_history, 1, 3).expect("guard");
+            let patch = crate::agent::turn_contracts::CompactionPatch {
                 range_start: 1,
                 range_end: 3,
                 replacement: vec![crate::providers::ChatMessage::assistant(
@@ -7161,7 +7246,7 @@ mod tests {
                 ..crate::config::AgentCompactionConfig::default()
             };
 
-            crate::agent::loop_::apply_compaction_patch_exact(&mut legacy_history, &patch);
+            crate::agent::compaction::apply_compaction_patch_exact(&mut legacy_history, &patch);
             let _ = state.reduce(Action::HistoryCompactionPatchApplied {
                 reason: CompactReason::ContextOverflow,
                 patch,
@@ -7214,8 +7299,9 @@ mod tests {
                 crate::providers::ChatMessage::assistant("old assistant"),
             ];
             let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
-            let guard = crate::agent::loop_::compaction_patch_guard_for(&state.session.history, 1, 3).expect("guard");
-            let patch = crate::agent::loop_::CompactionPatch {
+            let guard =
+                crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3).expect("guard");
+            let patch = crate::agent::turn_contracts::CompactionPatch {
                 range_start: 1,
                 range_end: 3,
                 replacement: vec![crate::providers::ChatMessage::assistant(
@@ -7293,13 +7379,13 @@ mod tests {
                 crate::providers::ChatMessage::assistant(format!("old assistant {}", "y ".repeat(180))),
                 crate::providers::ChatMessage::user(format!("recent {}", "z ".repeat(180))),
             ];
-            let guard = crate::agent::loop_::compaction_patch_guard_for(&original, 1, 3).expect("guard");
+            let guard = crate::agent::compaction::compaction_patch_guard_for(&original, 1, 3).expect("guard");
             state.session.history = original;
             state
                 .session
                 .history
                 .push(crate::providers::ChatMessage::user("mutation before reducer"));
-            let patch = crate::agent::loop_::CompactionPatch {
+            let patch = crate::agent::turn_contracts::CompactionPatch {
                 range_start: 1,
                 range_end: 3,
                 replacement: vec![crate::providers::ChatMessage::assistant(
@@ -7330,10 +7416,10 @@ mod tests {
                 "guard mismatch must not apply stale provider patch"
             );
             assert!(
-                crate::agent::loop_::plan_context_budget(
+                crate::agent::context_budget::plan_context_budget(
                     &state.session.history,
                     &config,
-                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD
+                    crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD
                 )
                 .used_tokens
                     <= 80,
@@ -7416,6 +7502,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
 
             // state changes: draft + active_cancel + generating
@@ -7463,6 +7550,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
             // cancel the original token and check the token inside the Effect is cancelled too (shared)
             cancel.cancel();
@@ -7499,6 +7587,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
@@ -7535,6 +7624,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
@@ -7646,6 +7736,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
             assert!(state.control.generating);
 
@@ -7674,6 +7765,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
             assert!(has_start_turn(&effects), "phase1 draft start must still emit StartTurn");
         }
@@ -7696,6 +7788,7 @@ mod tests {
                 .map(|turn| turn.draft.accumulated.clone())
         }
 
+        #[cfg(feature = "terminal-tui")]
         fn provider_worker_status(sequences: &[u64]) -> ProviderWorkerStatus {
             ProviderWorkerStatus {
                 running: sequences.len(),
@@ -7720,6 +7813,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "terminal-tui")]
         fn active_worker_view_text(state: &ChatState) -> String {
             state
                 .ui
@@ -9874,6 +9968,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
         }
 
@@ -9899,6 +9994,10 @@ mod tests {
             });
         }
 
+        // Reads the TUI conversation lines, which exist only with the
+        // `terminal-tui` feature (BENCH-FEAT b: `--no-default-features
+        // --all-targets` must build).
+        #[cfg(feature = "terminal-tui")]
         #[test]
         fn p3a_cancelled_task_finalizes_only_its_tool_buffer() {
             let mut state = s();
@@ -10084,6 +10183,7 @@ mod tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             });
         }
 
@@ -10678,17 +10778,6 @@ mod tests {
             assert_eq!(
                 snap_session.created_at, created_first,
                 "build_session_snapshot must inherit SessionState.created_at, not overwrite it"
-            );
-        }
-
-        /// S4-B T4-B-4: route_turn always returns ReduxDriver in Pure mode
-        #[test]
-        fn s4_b_route_turn_pure_always_redux_driver() {
-            use crate::chat::{ReduxMode, TurnRoute, route_turn};
-            assert_eq!(
-                route_turn(ReduxMode::Pure),
-                TurnRoute::ReduxDriver,
-                "Pure mode must route to ReduxDriver even without driver_opt_in"
             );
         }
 

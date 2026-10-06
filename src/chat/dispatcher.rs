@@ -1,33 +1,19 @@
-//! Redux dispatcher infrastructure (Step 5a-1 — real business execution + dual-write guard).
+//! Chat reducer dispatch and admitted turn execution.
 //!
-//! Provides three pieces that feed production events into the reducer and run business logic on demand:
-//! - [`ChatDispatcher`]: `Action` sender wrapper (bounded mpsc + try_send policy)
-//! - [`EffectExecutor`]: in shadow mode (5b) every business Effect is a no-op;
-//!   in real mode (5a-1) it holds [`EffectDeps`] and really executes, gated by PRX_CHAT_REDUX
-//! - [`StreamChunkCoalescer`]: merges `StreamChunkReceived` deltas into a single `Action`
-//!   when the channel is full, so backpressure does not drop intermediate chunks
+//! - [`ChatDispatcher`] sends Actions through a bounded channel.
+//! - [`EffectExecutor`] executes effects with [`EffectDeps`]; its shadow
+//!   constructor remains available for isolated reducer tests.
+//! - [`StreamChunkCoalescer`] retains the latest stream revision under
+//!   backpressure instead of dropping intermediate state.
 //!
-//! Design notes (Codex audit P0-1 / P0-2 / P0-3 / P2-coalescer-version):
-//! - **bounded channel**: `Action` channel capacity is 2048, to prevent OOM
-//! - **dual-write guard**: [`RuntimeDualWriteGuard`] (Arc<AtomicBool>) marks whether this turn
-//!   is handled by the Redux path; in Both/Redux mode the legacy path uses the guard to decide
-//!   whether to skip persistence, preventing history / session from being written twice
-//! - **long-running effects spawn subtasks**: `StartTurn` / `SaveSession` / `EmitChannelMessage`
-//!   / `PersistToMemory` all use `tokio::spawn` in deps mode, so await never blocks the main loop
-//! - **coalescer version takes the newest**: consistent with the reducer's strict-monotonic check
-//!   at `state.rs:540`, merging uses `version = max(pending, new)`; otherwise a higher version that
-//!   arrived first would be dropped after merging
-//! - **RouteDecision / ProviderExecutionOutcome timeline**: the streaming path keeps the unified
-//!   recording in the ingress layer; the dispatcher only owns stream-state event ordering
-//! - **OS signals all enter as Actions**: the Ctrl+C / SIGTERM handler `try_send`s a shutdown action
-//!
-//! Rollout modes (aligned with `chat::ReduxMode`):
-//! - `Off`: EffectExecutor::new_shadow() (business no-op, only LogTrace runs)
-//! - `Both`: EffectExecutor::new_with_deps() (business really executes) + legacy path still runs +
-//!   the guard suppresses legacy persistence, so both paths run in parallel but only the reducer
-//!   truly persists (the reducer is the new source of truth)
-//! - `Redux`: similar to Both (stage 5a-1 does not delete the legacy path, it only lets the reducer
-//!   lead at runtime; 5a-3 actually deletes the legacy path)
+//! Production terminal chat uses the Pure reducer mode. The admitted turn
+//! binding supplies execution authority; an Action or a configured provider
+//! alone cannot authorize another model turn. The ingress layer owns source,
+//! route and terminal records, while the dispatcher owns stream-state ordering.
+//! [`RuntimeDualWriteGuard`] coordinates persistence ownership within that flow;
+//! it does not select a second legacy executor. Long-running effects retain
+//! their cancellation and completion ownership while returning Actions to the
+//! reducer. Shutdown signals enter through the same Action channel.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +33,7 @@ use crate::observability::Observer;
 use crate::providers::Provider;
 use crate::tools::{
     ApprovalStrategy, SecurityEffectPolicy, ToolApprovalDecision, ToolApprovalRequest, ToolExecutionCommand,
-    ToolExecutionContext, ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService, ToolExecutionStatus,
+    ToolExecutionContext, ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService,
     TracingToolExecutionAudit,
 };
 
@@ -207,7 +193,7 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
         let envelope = &request.context.envelope;
         let sender = envelope.sender.as_deref().unwrap_or("unknown");
         let channel = envelope.channel.as_deref().unwrap_or("unknown");
-        let scope = crate::agent::loop_::ScopeContext {
+        let scope = crate::agent::turn_contracts::ScopeContext {
             policy: self.policy.as_ref(),
             sender,
             channel,
@@ -220,7 +206,7 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
             config_generation_id: envelope.config_generation_id,
             config_source_revision: envelope.config_source_revision.as_deref(),
         };
-        let runtime_grant = crate::agent::loop_::runtime_approval_grant_for_call(
+        let runtime_grant = crate::agent::execution_policy::runtime_approval_grant_for_call(
             &request.descriptor.public_name,
             &request.command.arguments,
             Some(&scope),
@@ -299,14 +285,12 @@ mod approval_router_regression_tests {
 /// - `try_send`: non-blocking — for streaming chunks / control Actions (when full the caller should use the coalescer)
 /// - `send_blocking`: blocking synchronous path — for critical exit Actions (Ctrl+C / SIGTERM handler)
 /// - `send`: async blocking — for critical Actions when the caller is in an async context (e.g. the main loop)
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ChatDispatcher {
     action_tx: mpsc::Sender<Action>,
 }
 
 /// Result of the `try_send` policy (lets the caller decide whether coalescing / a fallback is needed).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchResult {
     /// Action was enqueued
@@ -318,15 +302,14 @@ pub enum DispatchResult {
 }
 
 impl ChatDispatcher {
-    /// Construct the dispatcher plus its receiver. The receiver is consumed by [`spawn_dispatcher_task`].
-    #[allow(dead_code)]
+    /// Construct the dispatcher plus its receiver. The receiver is consumed by the dispatcher task
+    /// ([`spawn_dispatcher_task_with_signal`]).
     pub fn new() -> (Self, mpsc::Receiver<Action>) {
         let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
         (Self { action_tx }, action_rx)
     }
 
     /// Non-blocking send. Returns `Backpressured` when full; the caller decides to coalesce or drop.
-    #[allow(dead_code)]
     pub fn try_dispatch(&self, action: Action) -> DispatchResult {
         match self.action_tx.try_send(action) {
             Ok(()) => DispatchResult::Sent,
@@ -341,7 +324,6 @@ impl ChatDispatcher {
     /// silently lost when the channel is full / closed. `site_tag` tags the failure log with the call
     /// site (e.g. "chat.banner" / "chat.shutdown_sigint" / "chat.user_input"), so gaps can be located
     /// later by grep. Returns the original `DispatchResult` for further handling by the caller.
-    #[allow(dead_code)]
     pub fn dispatch_or_log(&self, action: Action, site: &'static str) -> DispatchResult {
         let action_kind = action.kind();
         let result = self.try_dispatch(action);
@@ -372,7 +354,6 @@ impl ChatDispatcher {
     /// **Note**: blocking_send is not allowed inside the tokio runtime, it would panic.
     /// The Ctrl+C / SIGTERM handler runs inside a spawned task (async context), so it should prefer
     /// [`Self::try_dispatch`] or [`Self::dispatch`].
-    #[allow(dead_code)]
     pub fn blocking_dispatch(&self, action: Action) -> DispatchResult {
         match self.action_tx.blocking_send(action) {
             Ok(()) => DispatchResult::Sent,
@@ -381,7 +362,6 @@ impl ChatDispatcher {
     }
 
     /// Async blocking send (recommended: safe backpressure on async paths).
-    #[allow(dead_code)]
     pub async fn dispatch(&self, action: Action) -> DispatchResult {
         match self.action_tx.send(action).await {
             Ok(()) => DispatchResult::Sent,
@@ -393,7 +373,6 @@ impl ChatDispatcher {
     ///
     /// Warning: holding the sender directly bypasses the policy checks in [`Self::try_dispatch`].
     /// Only use it where fine-grained `TrySendError` handling is required, such as the coalescer.
-    #[allow(dead_code)]
     pub fn sender(&self) -> mpsc::Sender<Action> {
         self.action_tx.clone()
     }
@@ -404,14 +383,13 @@ impl ChatDispatcher {
 /// Semantic result of a turn's termination, written by the dispatcher in
 /// [`TurnCompletionSignal::record_and_notify`] and read by chat::run after await to decide UI/hook behaviour.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum TurnOutcomeKind {
     /// The LLM stream completed successfully; `final_text` is the final accumulated visible text, `reasoning`
     /// carries the final reasoning card payload that must be replayed when an
     /// ordered commit gate releases the reducer terminal action.
     Completed { final_text: String, reasoning: String },
     /// The LLM stream failed; `err` is the error description carried by [`Action::StreamFailed`],
-    /// `retryable` reflects the [`stream_error_is_retryable`] verdict.
+    /// `retryable` tells whether the failure was reported as transient.
     Failed { err: String, retryable: bool },
     /// The user cancelled, or shutdown preempted the turn.
     Cancelled,
@@ -436,6 +414,8 @@ pub enum TurnOutcomeKind {
 ///   and calls `consume_outcome()` to clear the old slot, then dispatches, and finally awaits the future.
 #[derive(Clone)]
 pub struct TurnCompletionSignal {
+    turn_cancellation: CancellationToken,
+    commit_failure: Arc<ParkingMutex<Option<String>>>,
     inner: Arc<tokio::sync::Notify>,
     outcome: Arc<ParkingMutex<Option<TurnOutcomeKind>>>,
     usage: Arc<ParkingMutex<ProviderUsageAccumulator>>,
@@ -459,12 +439,44 @@ impl TurnCompletionSignal {
     /// Construct a new signal instance.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_turn_cancellation(CancellationToken::new())
+    }
+
+    pub(super) fn with_turn_cancellation(turn_cancellation: CancellationToken) -> Self {
         Self {
+            turn_cancellation,
+            commit_failure: Arc::new(ParkingMutex::new(None)),
             inner: Arc::new(tokio::sync::Notify::new()),
             outcome: Arc::new(parking_lot::Mutex::new(None)),
             usage: Arc::new(ParkingMutex::new(ProviderUsageAccumulator::new())),
             keyed: Arc::new(ParkingMutex::new(KeyedTurnCompletionState::default())),
         }
+    }
+
+    pub(super) fn new_turn_cancellation(&self) -> CancellationToken {
+        self.turn_cancellation.child_token()
+    }
+
+    pub(super) fn cancel_turns_on_exit(&self) -> tokio_util::sync::DropGuard {
+        self.turn_cancellation.clone().drop_guard()
+    }
+
+    /// A failed history commit invalidates subsequent session projections.
+    /// This latch is process-local and cannot be cleared by a new UI action.
+    pub(super) fn fail_history_commit(&self, reason: impl Into<String>) {
+        let mut failure = self.commit_failure.lock();
+        if failure.is_none() {
+            *failure = Some(reason.into());
+        }
+        drop(failure);
+        self.turn_cancellation.cancel();
+    }
+
+    pub(super) fn ensure_history_commits_healthy(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.commit_failure.lock().as_ref() {
+            anyhow::bail!("Chat stopped after an unconfirmed history commit: {reason}");
+        }
+        Ok(())
     }
 
     pub fn record_usage(&self, usage: TokenUsage) {
@@ -617,7 +629,6 @@ impl std::fmt::Debug for TurnCompletionSignal {
 
 /// Map an action type to a turn outcome (used by the dispatcher task to extract it before reduce).
 #[must_use]
-#[allow(dead_code)]
 pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
     match action {
         Action::StreamCompleted {
@@ -676,19 +687,6 @@ fn record_turn_signal_action(
             let _ = sig.record_and_notify_for_draft(draft_id, outcome);
         }
     }
-}
-
-/// Report whether an action is a turn-terminal event. The dispatcher task uses this to decide when to
-/// trigger [`TurnCompletionSignal::notify`].
-#[must_use]
-pub const fn is_turn_terminal_action(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::StreamCompleted { .. }
-            | Action::ProviderTurnReadyForCommit { .. }
-            | Action::StreamFailed { .. }
-            | Action::StreamCancelled { .. }
-    )
 }
 
 // ─── RuntimeDualWriteGuard ─────────────────────────────────────────────────────
@@ -950,30 +948,21 @@ pub struct EffectDeps {
     /// republished the whole registry to the provider on every single turn.
     /// Carrying it here puts terminal chat back on the same boundary.
     pub tool_tiering: crate::config::ToolTieringConfig,
-    /// Session-scoped union of every tool set capability routing has published
-    /// on this chat session.
-    ///
-    /// The `tools` array travels inside the provider's cacheable request
-    /// prefix, next to the system prompt: re-deciding the exposed set on every
-    /// turn invalidates the prefix — and the whole conversation's prefill —
-    /// each time the user rephrases. Exposing the running union instead means
-    /// the prefix moves only when a genuinely new intent appears.
-    pub exposed_tools: crate::tools::intent::SessionToolExposure,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
 
 /// `Effect` executor. Two construction shapes:
-/// - shadow mode (`new_shadow`): every business Effect except `LogTrace` is a no-op; kept for Off mode /
-///   unit tests / the 5b behaviour baseline
+/// - shadow construction (`new_shadow`): every business Effect except `LogTrace` is a no-op;
+///   used by isolated reducer tests
 /// - real mode (`new_with_deps`): holds [`EffectDeps`] and really executes business Effects; long-running
 ///   operations spawn a subtask that feeds Actions back (Codex P0-1)
 ///
 /// P0-2 fix: `redraw_tx` is injected later through a shared `Arc<parking_lot::Mutex<Option<mpsc::Sender<()>>>>`.
 /// `chat::run` constructs the EffectExecutor first (redraw_tx does not exist yet), and after spawning the
 /// dispatcher task injects `redraw_tx` through the Arc returned by `redraw_handle()`, solving the ordering problem.
-#[allow(dead_code)]
 pub struct EffectExecutor {
+    cleanup_owner: Option<Arc<crate::runtime::turn_cleanup::CleanupTracker>>,
     /// shadow mode flag. When `true` every business Effect skips execution.
     shadow_mode: bool,
     /// Real business dependencies. Some means deps mode, None means shadow mode.
@@ -995,10 +984,10 @@ pub struct EffectExecutor {
 
 impl EffectExecutor {
     /// Construct a shadow-mode executor (Step 5b compatibility, unit tests, Off mode).
-    #[allow(dead_code)]
     #[must_use]
     pub fn new_shadow() -> Self {
         Self {
+            cleanup_owner: None,
             shadow_mode: true,
             deps: None,
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
@@ -1007,12 +996,12 @@ impl EffectExecutor {
         }
     }
 
-    /// Construct a real business executor (Step 5a-1, PRX_CHAT_REDUX=both/1 mode).
-    #[allow(dead_code)]
+    /// Construct the business executor with its actual runtime dependencies.
     #[must_use]
     pub fn new_with_deps(deps: EffectDeps) -> Self {
         let provider_slot = Some(ProviderSlot::new(Arc::clone(&deps.provider)));
         Self {
+            cleanup_owner: None,
             shadow_mode: false,
             deps: Some(deps),
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
@@ -1021,8 +1010,25 @@ impl EffectExecutor {
         }
     }
 
-    fn outcome_after_effects(&self, outcome: Option<TurnOutcomeKind>) -> Option<TurnOutcomeKind> {
+    #[cfg(feature = "terminal-tui")]
+    pub(crate) fn with_cleanup_owner(mut self, owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>) -> Self {
+        self.cleanup_owner = Some(owner);
+        self
+    }
+
+    fn outcome_after_effects(
+        &self,
+        outcome: Option<TurnOutcomeKind>,
+        requires_persistence: bool,
+        save_requested: bool,
+    ) -> Option<TurnOutcomeKind> {
         let persistence_error = self.persistence_error.lock().take();
+        if requires_persistence && (!save_requested || self.shadow_mode || self.deps.is_none()) {
+            return Some(TurnOutcomeKind::Failed {
+                err: "session completion did not execute persistence".to_owned(),
+                retryable: false,
+            });
+        }
         match (outcome, persistence_error) {
             (Some(TurnOutcomeKind::Completed { .. }), Some(err)) => Some(TurnOutcomeKind::Failed {
                 err: format!("session persistence failed: {err}"),
@@ -1038,7 +1044,6 @@ impl EffectExecutor {
     /// Injection still works after the dispatcher task is spawned, because the Arc crosses the spawn boundary.
     ///
     /// Injection has no effect in shadow mode (execute_shadow does not read this slot).
-    #[allow(dead_code)]
     #[must_use]
     pub fn redraw_handle(&self) -> Arc<ParkingMutex<Option<mpsc::Sender<()>>>> {
         Arc::clone(&self.redraw_slot)
@@ -1048,7 +1053,6 @@ impl EffectExecutor {
     ///
     /// `chat::run` uses this handle to atomically replace the model name on `/model <name>`, so later turns'
     /// `drive_start_turn_stream` reads the new value. Shadow mode has no deps and returns None.
-    #[allow(dead_code)]
     #[must_use]
     pub fn model_handle(&self) -> Option<ModelSlot> {
         self.deps.as_ref().map(|d| d.model.clone())
@@ -1058,7 +1062,6 @@ impl EffectExecutor {
     ///
     /// `chat::run` uses this handle to atomically replace the provider handle on `/provider <name>`, so later
     /// turns' `drive_start_turn_stream` issues requests with the new provider. Shadow mode returns None.
-    #[allow(dead_code)]
     #[must_use]
     pub fn provider_handle(&self) -> Option<ProviderSlot> {
         self.provider_slot.clone()
@@ -1068,7 +1071,6 @@ impl EffectExecutor {
     ///
     /// `spawn_dispatcher_task_with_signal` uses this handle to send the decision back to the driver's pending
     /// oneshot after `Action::ToolApprovalReceived` has entered the reducer. Shadow mode has no deps and returns None.
-    #[allow(dead_code)]
     #[must_use]
     pub fn approval_router(&self) -> Option<Arc<ApprovalRouter>> {
         self.deps.as_ref().map(|d| Arc::clone(&d.approval_router))
@@ -1091,7 +1093,6 @@ impl EffectExecutor {
     /// Dual-write suppression: when entering a business Effect with deps, the dual_write_guard is set first
     /// (so the legacy path skips its matching write). Persistence effects such as SaveSession /
     /// PersistToMemory / EmitChannelMessage are reset by the caller once done (typically at turn end).
-    #[allow(dead_code)]
     pub async fn execute(&self, effect: Effect) {
         // S2.5 T2.5-2: instrument every Effect entry with prx_chat_effects_total{effect_kind=...}.
         crate::observability::chat_metrics::inc_effect(effect.kind());
@@ -1159,7 +1160,8 @@ impl EffectExecutor {
                 chat_mode,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
-                routing_input,
+                routing_input: _,
+                turn_binding,
             } => {
                 // Step 5a-2 — long-running: spawn a subtask that really calls provider.stream_chat_with_history
                 // and feeds chunk / completed / failed / cancelled events back to the reducer via deps.action_tx,
@@ -1174,41 +1176,58 @@ impl EffectExecutor {
                 //
                 // Note: StartTurn is currently **not** triggered automatically by the reducer — this path only
                 // applies when the caller explicitly spawns `Effect::StartTurn { ... }` (e.g. unit tests, or the
-                // ratatui path after 5a-3 wiring). The chat::run main loop is still driven by `run_tool_call_loop`
+                // ratatui path after 5a-3 wiring). The chat::run main loop's legacy tool-loop path still calls `run_turn`
                 // (legacy path); `dual_write_guard` already guards the reducer persistence effects.
                 // Bug #3: prefer the hot-swappable provider slot (updated by
                 // `/provider <name>`); fall back to the construction-time provider
                 // when no slot is present (e.g. shadow construction edge cases).
-                let provider = self
-                    .provider_slot
-                    .as_ref()
-                    .map(ProviderSlot::current)
-                    .unwrap_or_else(|| Arc::clone(&deps.provider));
+                let provider = turn_binding.as_ref().map_or_else(
+                    || {
+                        self.provider_slot
+                            .as_ref()
+                            .map(ProviderSlot::current)
+                            .unwrap_or_else(|| Arc::clone(&deps.provider))
+                    },
+                    |binding| binding.provider(),
+                );
                 let action_tx = deps.action_tx.clone();
                 let guard_scope = deps.dual_write_guard.enter_scope();
                 // Codex P1 fix: take the real model + temperature from deps and pass them to the stream API.
                 // BUG-07: read the current ModelSlot value at the start of every turn, so after /model <name>
                 // later turns automatically use the new model (same provider, different model).
-                let model = deps.model.current().to_string();
+                let model = turn_binding.as_ref().map_or_else(
+                    || deps.model.current().to_string(),
+                    |binding| binding.model().to_owned(),
+                );
                 let temperature = deps.temperature;
                 // 5a-6: pass the tool registry through (None → the driver degrades to a plain text stream).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let tool_security_policy = Arc::clone(&deps.tool_security_policy);
                 // Validation enforces the document this provider actually put
                 // on the wire; see `ToolExecutionContext::schema_dialect`.
-                let tool_execution_context = chat_tool_execution_context(
-                    tool_security_policy.as_ref(),
-                    turn_spawn_ctx.as_ref(),
-                    provider_turn_task_id,
-                    &draft_id,
-                )
-                .with_schema_dialect(provider.tool_schema_dialect());
+                let tool_execution_context = turn_binding
+                    .as_ref()
+                    .map_or_else(
+                        || {
+                            chat_tool_execution_context(
+                                tool_security_policy.as_ref(),
+                                turn_spawn_ctx.as_ref(),
+                                provider_turn_task_id,
+                                &draft_id,
+                            )
+                        },
+                        |binding| {
+                            ToolExecutionContext::new(binding.envelope().clone(), "private")
+                                .with_chat_id("terminal:user")
+                        },
+                    )
+                    .with_schema_dialect(provider.tool_schema_dialect_for(&model));
                 let request_event_fabric = MemoryFabric::new(
                     Arc::clone(&deps.memory),
                     tool_execution_context.envelope.workspace_id.clone(),
                 )
                 .with_event_recording(deps.memory_event_recording);
-                let compaction_audit = Some(crate::agent::loop_::DocumentIngestRuntime::from_envelope(
+                let compaction_audit = Some(crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(
                     Arc::clone(&deps.memory),
                     &tool_execution_context.envelope,
                 ));
@@ -1228,46 +1247,109 @@ impl EffectExecutor {
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
                 let hooks = Arc::clone(&deps.hooks);
-                // Route on the turn's raw user text (never on the enriched
-                // history) and publish the session's cumulative set, so an
-                // injected `[Recent shared workspace events]` block can neither
-                // widen the tool surface nor move the cacheable prefix.
-                let tool_surface = match (routing_input.as_deref(), tools_registry.as_deref()) {
-                    (Some(input), Some(registry)) => {
-                        deps.exposed_tools.sticky_surface(&deps.tool_tiering, registry, input)
-                    }
-                    _ => crate::tools::intent::SessionToolSurface {
-                        tiering: deps.tool_tiering.clone(),
-                        unrouted: crate::tools::intent::UnroutedToolPolicy::PublishEverything,
-                    },
-                };
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
+                // Task locals do not cross spawn; carry the chat owner's tracker.
+                let cleanup_owner = self.cleanup_owner.clone();
                 let provider_task_handle = tokio::spawn(async move {
-                    if let (Some(task_id), Some(lease_id), Some(tx)) = (
-                        provider_turn_task_id,
-                        provider_turn_execution_lease_id,
-                        provider_turn_lifecycle_tx.as_ref(),
-                    ) {
-                        // Backpressure point: awaiting here slows turn startup
-                        // when chat::run is behind on lifecycle bookkeeping,
-                        // which is exactly the desired coupling — the registry
-                        // must not fall arbitrarily far behind reality.
-                        let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id }).await;
-                    }
-                    tracing::debug!(
-                        provider_turn_task_id = provider_turn_task_id_for_trace,
-                        provider_turn_execution_lease_id,
-                        draft_id = %draft_id,
-                        "provider turn worker task started"
-                    );
-                    // RAII scope: automatically resets dual_write_guard when the subtask exits (including on panic).
-                    let _scope = guard_scope;
-                    if cancel.is_cancelled() {
-                        // already cancelled before start: send StreamCancelled directly, do not issue an LLM request.
-                        if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
-                            tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
+                    let work = async move {
+                        if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                            provider_turn_task_id,
+                            provider_turn_execution_lease_id,
+                            provider_turn_lifecycle_tx.as_ref(),
+                        ) {
+                            // Backpressure point: awaiting here slows turn startup
+                            // when chat::run is behind on lifecycle bookkeeping,
+                            // which is exactly the desired coupling — the registry
+                            // must not fall arbitrarily far behind reality.
+                            let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id }).await;
                         }
+                        tracing::debug!(
+                            provider_turn_task_id = provider_turn_task_id_for_trace,
+                            provider_turn_execution_lease_id,
+                            draft_id = %draft_id,
+                            "provider turn worker task started"
+                        );
+                        // RAII scope: automatically resets dual_write_guard when the subtask exits (including on panic).
+                        let _scope = guard_scope;
+                        if cancel.is_cancelled() {
+                            // already cancelled before start: send StreamCancelled directly, do not issue an LLM request.
+                            if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
+                                tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
+                            }
+                            if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                                provider_turn_task_id,
+                                provider_turn_execution_lease_id,
+                                provider_turn_lifecycle_tx.as_ref(),
+                            ) {
+                                let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
+                            }
+                            return;
+                        }
+                        let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
+                        let driver = drive_start_turn_stream(
+                            turn_binding.clone(),
+                            provider_turn_task_id,
+                            provider,
+                            history,
+                            compaction_guard_history,
+                            model,
+                            temperature,
+                            compaction_config,
+                            cancel.clone(),
+                            draft_id.clone(),
+                            action_tx.clone(),
+                            tools_registry,
+                            tool_execution_service,
+                            tool_execution_context,
+                            request_event_fabric,
+                            compaction_audit,
+                            chat_mode,
+                            observer,
+                            hooks,
+                        );
+                        // D8-4 (redux path real fix): mirror the scope wrapper around
+                        // the legacy tool-loop path's `run_turn` call in `chat::run` — seed the
+                        // turn-root spawn execution context so any `sessions_spawn`
+                        // tool call executed inside this turn's tool loop reads
+                        // `SPAWN_EXECUTION_CONTEXT.try_with(..)` = Ok → `parent_run_id =
+                        // turn run_id` → origin = Model. The legacy path scoped this at
+                        // `chat::run`, but the redux driver `continue`s before reaching
+                        // it, so the scope must be applied here (the redux turn's actual
+                        // tool-execution site). When `turn_spawn_ctx` is `None` (e.g.
+                        // non-turn callers / tests / the `/bg` slash command which never
+                        // dispatches `StartLLMTurn`), the driver runs unscoped and
+                        // spawned sub-agents fall back to user origin — the correct
+                        // behavior for those paths.
+                        let scoped_spawn_driver = async move {
+                            match turn_spawn_ctx {
+                                Some(ctx) => {
+                                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                                        .scope(ctx, driver)
+                                        .await;
+                                }
+                                None => driver.await,
+                            }
+                        };
+                        let scoped_driver = async move {
+                            match turn_message_send_ctx {
+                                Some(ctx) => {
+                                    crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                                        .scope(ctx, scoped_spawn_driver)
+                                        .await;
+                                }
+                                None => scoped_spawn_driver.await,
+                            }
+                        };
+                        // No wall clock: a provider turn ends when it finishes, when
+                        // `cancel` fires, or when the stall detector in
+                        // `crate::agent::idle` finds it has stopped making progress.
+                        scoped_driver.await;
+                        tracing::debug!(
+                            provider_turn_task_id = provider_turn_task_id_for_trace,
+                            provider_turn_execution_lease_id,
+                            "provider turn worker task exited"
+                        );
                         if let (Some(task_id), Some(lease_id), Some(tx)) = (
                             provider_turn_task_id,
                             provider_turn_execution_lease_id,
@@ -1275,79 +1357,11 @@ impl EffectExecutor {
                         ) {
                             let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
                         }
-                        return;
-                    }
-                    let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
-                    let driver = drive_start_turn_stream(
-                        provider_turn_task_id,
-                        provider,
-                        history,
-                        compaction_guard_history,
-                        model,
-                        temperature,
-                        compaction_config,
-                        cancel.clone(),
-                        draft_id.clone(),
-                        action_tx.clone(),
-                        tools_registry,
-                        tool_execution_service,
-                        tool_execution_context,
-                        request_event_fabric,
-                        compaction_audit,
-                        chat_mode,
-                        observer,
-                        hooks,
-                        tool_surface,
-                        routing_input,
-                    );
-                    // D8-4 (redux path real fix): mirror the legacy
-                    // `run_tool_call_loop_traced` wrapper in `chat::run` — seed the
-                    // turn-root spawn execution context so any `sessions_spawn`
-                    // tool call executed inside this turn's tool loop reads
-                    // `SPAWN_EXECUTION_CONTEXT.try_with(..)` = Ok → `parent_run_id =
-                    // turn run_id` → origin = Model. The legacy path scoped this at
-                    // `chat::run`, but the redux driver `continue`s before reaching
-                    // it, so the scope must be applied here (the redux turn's actual
-                    // tool-execution site). When `turn_spawn_ctx` is `None` (e.g.
-                    // non-turn callers / tests / the `/bg` slash command which never
-                    // dispatches `StartLLMTurn`), the driver runs unscoped and
-                    // spawned sub-agents fall back to user origin — the correct
-                    // behavior for those paths.
-                    let scoped_spawn_driver = async move {
-                        match turn_spawn_ctx {
-                            Some(ctx) => {
-                                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
-                                    .scope(ctx, driver)
-                                    .await;
-                            }
-                            None => driver.await,
-                        }
                     };
-                    let scoped_driver = async move {
-                        match turn_message_send_ctx {
-                            Some(ctx) => {
-                                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
-                                    .scope(ctx, scoped_spawn_driver)
-                                    .await;
-                            }
-                            None => scoped_spawn_driver.await,
-                        }
-                    };
-                    // No wall clock: a provider turn ends when it finishes, when
-                    // `cancel` fires, or when the stall detector in
-                    // `crate::agent::idle` finds it has stopped making progress.
-                    scoped_driver.await;
-                    tracing::debug!(
-                        provider_turn_task_id = provider_turn_task_id_for_trace,
-                        provider_turn_execution_lease_id,
-                        "provider turn worker task exited"
-                    );
-                    if let (Some(task_id), Some(lease_id), Some(tx)) = (
-                        provider_turn_task_id,
-                        provider_turn_execution_lease_id,
-                        provider_turn_lifecycle_tx.as_ref(),
-                    ) {
-                        let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
+                    if let Some(owner) = cleanup_owner {
+                        owner.scope(work).await;
+                    } else {
+                        work.await;
                     }
                 });
                 if let (Some(task_id), Some(lease_id), Some(tx)) = (
@@ -1638,256 +1652,6 @@ pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
 
 // ─── StartTurn streaming driver (Step 5a-2) ────────────────────────────────────
 
-/// Decide whether a [`StreamError`] is worth retrying.
-///
-/// Aligned with the reducer's `Action::StreamFailed { retryable, .. }` field. **This bool drives no
-/// automatic resend**, and is not meant to: the real retries happen in the provider layer
-/// (the backoff / `Retry-After` / failover chain of
-/// [`ReliableProvider`](crate::providers::reliable::ReliableProvider)); once an error reaches the chat
-/// turn layer this turn's tool side effects may already have run, so silently resending is unsafe.
-/// Its purpose is diagnostic: written into trace logs and exposed as a `HookEvent::Error` payload
-/// field, so external audits / webhooks can tell a transient upstream failure from a hopeless request. Criteria:
-/// - `Http` / `Io`: transient network failure, retryable
-/// - `RateLimited`: upstream throttling (429/503), retryable (FIX-P0-33: carries a structured Retry-After hint)
-/// - `Json` / `InvalidSse`: corrupted data, a retry most likely reproduces it, non-retryable
-/// - `Provider`: server-side semantic error, leans non-retryable (show it upstream and let the user decide)
-#[must_use]
-const fn stream_error_is_retryable(err: &crate::providers::traits::StreamError) -> bool {
-    use crate::providers::traits::StreamError;
-    matches!(
-        err,
-        StreamError::Http(_) | StreamError::Io(_) | StreamError::RateLimited { .. }
-    )
-}
-
-/// **S3 T3-1**: network timeout / connection error detection — decides whether the driver uses backoff retry.
-///
-/// Matching conditions:
-/// - `StreamError::Io` is always a retryable transient failure (same source as [`stream_error_is_retryable`])
-/// - `StreamError::Http(reqwest_err)` where `is_timeout()` or `is_connect()` returns true
-///
-/// Everything else returns false, and the caller takes the plain `StreamFailed` path instead of the retry loop.
-#[must_use]
-fn stream_error_is_network_timeout(err: &crate::providers::traits::StreamError) -> bool {
-    use crate::providers::traits::StreamError;
-    match err {
-        StreamError::Io(_) => true,
-        StreamError::Http(http_err) => http_err.is_timeout() || http_err.is_connect(),
-        // A rate-limit is not a network timeout; it is honored via Retry-After in
-        // the reliability layer, not the network-backoff retry loop here.
-        StreamError::Json(_)
-        | StreamError::InvalidSse(_)
-        | StreamError::Provider(_)
-        | StreamError::RateLimited { .. } => false,
-    }
-}
-
-/// **S3 T3-1**: detect context overflow / context_length_exceeded style errors.
-///
-/// On a match → the driver compacts history and keeps retrying as long as each compaction makes progress.
-/// The decision is a substring match on the message of `StreamError::Provider` (OpenAI returns
-/// "maximum context length", Anthropic returns "prompt is too long", Gemini returns "input token count", ...).
-///
-/// No exact regex: provider error message formats are unstable, so substring matching is safer; a false
-/// positive (one extra compact) only costs a little compute rather than breaking correctness.
-#[must_use]
-fn stream_error_is_context_overflow(err: &crate::providers::traits::StreamError) -> bool {
-    use crate::providers::traits::StreamError;
-    let msg = match err {
-        StreamError::Provider(s) => s.as_str(),
-        StreamError::Http(http_err) => return matches!(http_err.status(), Some(s) if s.as_u16() == 413),
-        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) | StreamError::RateLimited { .. } => {
-            return false;
-        }
-    };
-    let needles = [
-        "context_length_exceeded",
-        "context length exceeded",
-        "maximum context",
-        "exceeds maximum",
-        "prompt is too long",
-        "input token count",
-        "exceed the maximum",
-        "too many tokens",
-        "token limit",
-    ];
-    let lower = msg.to_ascii_lowercase();
-    needles.iter().any(|n| lower.contains(n))
-}
-
-/// **S3 T3-1**: aggregation buffer for tool-call arguments.
-///
-/// Internally the driver keeps the state of each in-flight tool call keyed by [`ToolCallChunk::index`]:
-/// on a Streaming chunk → push `arguments_delta`; on Completed → compare the aggregated value with
-/// `args` to check consistency (on a discrepancy, trust Completed.args).
-///
-/// Design notes (Codex audit 1):
-/// - only emit `Action::ToolStarted` after the Completed chunk arrives (so half-built args never trigger execution)
-/// - a repeated Completed for the same index is an idempotent no-op, guarding against a provider emitting twice
-/// - `id` / `name` are strictly immutable; on a conflict a warn is logged but the last Completed still wins
-struct ToolCallAggregator {
-    /// already aggregated chunk index → buffer
-    by_index: std::collections::HashMap<usize, ToolCallSlot>,
-    /// set of indices whose Completed was already emitted (guards against provider duplicates)
-    completed: std::collections::HashSet<usize>,
-}
-
-/// Aggregation slot for a single tool call.
-struct ToolCallSlot {
-    id: String,
-    name: String,
-    args_buffer: String,
-    final_args: Option<String>,
-}
-
-impl ToolCallAggregator {
-    fn new() -> Self {
-        Self {
-            by_index: std::collections::HashMap::new(),
-            completed: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Ingest one `ToolCallChunk` — dispatch by `status` to streaming-append / completed-finalize.
-    ///
-    /// Returns `Some((id, name, args))` when a tool call is fully ready and should trigger ToolStarted;
-    /// returns `None` when it is not ready yet / already completed (already emitted) / a protocol conflict was logged.
-    fn ingest(&mut self, chunk: crate::providers::traits::ToolCallChunk) -> Option<(String, String, String)> {
-        use crate::providers::traits::ToolCallChunkStatus;
-        match chunk.status {
-            ToolCallChunkStatus::Streaming => {
-                let slot = self.by_index.entry(chunk.index).or_insert_with(|| ToolCallSlot {
-                    id: chunk.id.clone(),
-                    name: chunk.name.clone(),
-                    args_buffer: String::new(),
-                    final_args: None,
-                });
-                // ID / name immutability check: the provider protocol forbids renaming or swapping the ID.
-                // Some compatible providers may emit an opening chunk before the
-                // id is known, then fill it in later; preserve that first real id.
-                if !chunk.id.is_empty() {
-                    if slot.id.is_empty() {
-                        slot.id = chunk.id.clone();
-                    } else if slot.id != chunk.id {
-                        tracing::warn!(
-                            index = chunk.index,
-                            prev_id = %slot.id,
-                            new_id = %chunk.id,
-                            "ToolCallAggregator: streaming chunk changed id; keeping first id"
-                        );
-                    }
-                }
-                if !chunk.name.is_empty() && slot.name != chunk.name {
-                    tracing::warn!(
-                        index = chunk.index,
-                        prev_name = %slot.name,
-                        new_name = %chunk.name,
-                        "ToolCallAggregator: streaming chunk changed name; keeping first name"
-                    );
-                }
-                if let Some(delta) = chunk.arguments_delta {
-                    slot.args_buffer.push_str(&delta);
-                }
-                None
-            }
-            ToolCallChunkStatus::Completed => {
-                if self.completed.contains(&chunk.index) {
-                    tracing::debug!(
-                        index = chunk.index,
-                        id = %chunk.id,
-                        "ToolCallAggregator: duplicate Completed; ignoring"
-                    );
-                    return None;
-                }
-                self.completed.insert(chunk.index);
-                let slot = self.by_index.entry(chunk.index).or_insert_with(|| ToolCallSlot {
-                    id: chunk.id.clone(),
-                    name: chunk.name.clone(),
-                    args_buffer: String::new(),
-                    final_args: None,
-                });
-                slot.final_args = Some(chunk.args.clone());
-                // trust Completed.args as authoritative (matching the protocol comment in traits.rs).
-                let resolved_id = if chunk.id.is_empty() { slot.id.clone() } else { chunk.id };
-                let resolved_name = if chunk.name.is_empty() {
-                    slot.name.clone()
-                } else {
-                    chunk.name
-                };
-                Some((resolved_id, resolved_name, chunk.args))
-            }
-        }
-    }
-}
-
-/// A completed tool call, ready to execute.
-struct ResolvedToolCall {
-    id: String,
-    name: String,
-    args: String,
-}
-
-/// **S3 T3-1**: retry limit for transient network failure backoff (attempts).
-const MAX_NETWORK_RETRIES: u8 = 3;
-/// **S3 T3-1**: initial backoff sleep (ms; sleep 500ms before retry 1, 1s before retry 2, 2s before retry 3).
-const BACKOFF_BASE_MS: u64 = 500;
-
-/// Result classification of one stream pass (the driver loop unwinds on this).
-enum StreamPassOutcome {
-    /// No tool_call this pass, plain text generation finished. Carries the final accumulated text.
-    Completed { iter_text: String, usage: TokenUsage },
-    /// The LLM requested tool calls this pass — carries aggregated tool_calls plus this pass's assistant text.
-    ToolCallRequested {
-        calls: Vec<ResolvedToolCall>,
-        iter_text: String,
-        reasoning_content: String,
-        usage: TokenUsage,
-    },
-    /// Transient network error (may take backoff retry, does not consume the iteration quota).
-    TransientNetworkError { err: String },
-    /// context overflow (may take compact + progress-based retry).
-    ContextOverflow { err: String },
-    /// Non-retryable hard error — the driver stops and emits StreamFailed.
-    HardError { err: String, retryable: bool },
-    /// User cancel — the driver already sent StreamCancelled and returns directly.
-    Cancelled,
-    /// action_tx closed, the driver exits silently (no more actions are sent).
-    SenderClosed,
-}
-
-/// Really call `provider.stream_chat_with_history` and feed the streaming events back to the reducer.
-///
-/// Designed to run standalone inside a spawned subtask; cancelled midway via `cancel`, feeding back via `action_tx`.
-/// It is a standalone fn rather than inlined in `execute_real`, which makes it easier to:
-///   - drive a fake provider directly from unit tests to verify the feedback sequence
-///   - keep borrow / move relationships clear (the spawn move closure no longer holds a deps reference)
-///
-/// Behaviour guarantees:
-/// - every exit path sends **exactly one** terminal action: `StreamCompleted` / `StreamFailed` /
-///   `StreamCancelled`, so the reducer can match it and clean up `state.stream.draft`
-/// - `version` increases strictly monotonically (1, 2, 3, ...), monotonic across all tool iterations,
-///   matching the reducer's strict-monotonic rule
-/// - `reasoning` is not mixed into the main delta (it is only carried in the final `StreamCompleted.reasoning` field)
-///
-/// **5a-6**: multi-pass tool turn support.
-/// **S3 T3-1**: the four extensions (tool-pass state machine / context overflow compact / approval bridge /
-/// timeout backoff retry). See `task/prx/T3-1.md` for details.
-/// Build the tool specs advertised to the provider for a TUI / Redux chat turn.
-///
-/// TUI / Redux chat is always a plain (non-group, non-smart) conversation, so the
-/// smart group-reply `stay_silent` tool must NEVER be advertised here. Routed
-/// through the shared exposure gate (`expose_stay_silent = false`) so this path
-/// applies the identical rule as every other tool-spec construction site.
-fn build_dispatcher_tool_specs(
-    tools_registry: Option<&Vec<Box<dyn crate::tools::Tool>>>,
-) -> Vec<crate::tools::ToolSpec> {
-    let mut specs: Vec<crate::tools::ToolSpec> = tools_registry.map_or_else(Vec::new, |registry| {
-        crate::tools::ToolCatalog::from_boxed_registry(registry).tool_specs()
-    });
-    crate::tools::filter_tool_specs_for_exposure(&mut specs, false);
-    specs
-}
-
 /// The detached Redux driver receives a provider/guard snapshot that already
 /// contains the pending user message. Reducer state intentionally does not add
 /// that message until ordered commit, so the patch sent back to the reducer
@@ -1895,10 +1659,10 @@ fn build_dispatcher_tool_specs(
 /// durable target minus that pending turn. Ordered commit then appends the user
 /// message without shifting patch indices or weakening stale-state detection.
 fn compaction_patch_for_reducer_without_pending_user(
-    patch: &crate::agent::loop_::CompactionPatch,
+    patch: &crate::agent::turn_contracts::CompactionPatch,
     source_history: &[crate::providers::traits::ChatMessage],
     compacted_history: &[crate::providers::traits::ChatMessage],
-) -> crate::agent::loop_::CompactionPatch {
+) -> crate::agent::turn_contracts::CompactionPatch {
     let Some(pending_index) = source_history.len().checked_sub(1) else {
         return patch.clone();
     };
@@ -1912,7 +1676,8 @@ fn compaction_patch_for_reducer_without_pending_user(
     let Some(reducer_source) = source_history.get(..pending_index) else {
         return patch.clone();
     };
-    let Some(guard) = crate::agent::loop_::compaction_patch_guard_for(reducer_source, 0, reducer_source.len()) else {
+    let Some(guard) = crate::agent::compaction::compaction_patch_guard_for(reducer_source, 0, reducer_source.len())
+    else {
         return patch.clone();
     };
     let mut reducer_target_with_pending = compacted_history.to_vec();
@@ -1923,7 +1688,7 @@ fn compaction_patch_for_reducer_without_pending_user(
         return patch.clone();
     }
     reducer_target_with_pending.pop();
-    crate::agent::loop_::CompactionPatch {
+    crate::agent::turn_contracts::CompactionPatch {
         range_start: 0,
         range_end: reducer_source.len(),
         replacement: reducer_target_with_pending,
@@ -1970,7 +1735,7 @@ async fn apply_redux_context_rollover(
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
-    audit: Option<&crate::agent::loop_::DocumentIngestRuntime>,
+    audit: Option<&crate::agent::document_ingest::DocumentIngestRuntime>,
     action_tx: &mpsc::Sender<Action>,
     reason: crate::chat::action::CompactReason,
     trigger: &str,
@@ -1979,7 +1744,7 @@ async fn apply_redux_context_rollover(
         return Ok(ContextRolloverOutcome::default());
     }
 
-    let patch = match crate::agent::loop_::build_configurable_compaction_patch_with_source_history(
+    let patch = match crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
         history,
         compaction_guard_history,
         provider,
@@ -2007,12 +1772,12 @@ async fn apply_redux_context_rollover(
                     trigger,
                     "context switch could not create an exact transcript handoff; continuing on a lossy trim"
                 );
-                let budget = crate::agent::loop_::plan_context_budget(
+                let budget = crate::agent::context_budget::plan_context_budget(
                     history,
                     config,
-                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                    crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
                 );
-                crate::agent::loop_::persist_context_switch_degradation(
+                crate::agent::compaction::persist_context_switch_degradation(
                     audit,
                     trigger,
                     "handoff_unavailable",
@@ -2029,12 +1794,12 @@ async fn apply_redux_context_rollover(
         }
         Err(error) => {
             tracing::warn!(error = %error, trigger, "redux driver context rollover failed; falling back to trim");
-            let budget = crate::agent::loop_::plan_context_budget(
+            let budget = crate::agent::context_budget::plan_context_budget(
                 history,
                 config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
-            crate::agent::loop_::persist_context_switch_degradation(
+            crate::agent::compaction::persist_context_switch_degradation(
                 audit,
                 trigger,
                 "handoff_failed",
@@ -2052,10 +1817,13 @@ async fn apply_redux_context_rollover(
 
     let replacement_len = patch.replacement.len();
     let reducer_source_history = compaction_guard_history.clone();
-    crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
-    crate::agent::loop_::apply_compaction_patch_exact(compaction_guard_history, &patch);
-    let budget =
-        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    crate::agent::compaction::apply_compaction_patch_exact(history, &patch);
+    crate::agent::compaction::apply_compaction_patch_exact(compaction_guard_history, &patch);
+    let budget = crate::agent::context_budget::plan_context_budget(
+        history,
+        config,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+    );
     let mut degraded_dropped = 0usize;
     if budget.over_hard_limit {
         if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
@@ -2067,11 +1835,12 @@ async fn apply_redux_context_rollover(
             );
         }
         let before_trim = history.len();
-        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-            history,
-            config,
-            replacement_len,
-        );
+        let trimmed =
+            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                history,
+                config,
+                replacement_len,
+            );
         degraded_dropped = before_trim.saturating_sub(history.len());
         tracing::warn!(
             used_tokens = budget.used_tokens,
@@ -2080,12 +1849,12 @@ async fn apply_redux_context_rollover(
             "redux driver context rollover applied preserving trim"
         );
         if degraded_dropped > 0 {
-            let after = crate::agent::loop_::plan_context_budget(
+            let after = crate::agent::context_budget::plan_context_budget(
                 history,
                 config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
-            crate::agent::loop_::persist_context_switch_degradation(
+            crate::agent::compaction::persist_context_switch_degradation(
                 audit,
                 trigger,
                 "over_hard_limit_after_handoff",
@@ -2167,18 +1936,18 @@ fn redux_injection_overbudget_diagnostic_text(
     original_history: &[crate::providers::traits::ChatMessage],
     config: &crate::config::AgentCompactionConfig,
 ) -> Option<String> {
-    let enriched_budget = crate::agent::loop_::plan_context_budget(
+    let enriched_budget = crate::agent::context_budget::plan_context_budget(
         enriched_history,
         config,
-        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
     );
     if !enriched_budget.over_hard_limit {
         return None;
     }
-    let original_budget = crate::agent::loop_::plan_context_budget(
+    let original_budget = crate::agent::context_budget::plan_context_budget(
         original_history,
         config,
-        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
     );
     if original_budget.over_hard_limit {
         return None;
@@ -2216,8 +1985,11 @@ async fn send_redux_context_window_update(
     config: &crate::config::AgentCompactionConfig,
     context: &'static str,
 ) -> Result<(), ()> {
-    let budget =
-        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    let budget = crate::agent::context_budget::plan_context_budget(
+        history,
+        config,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+    );
     if let Err(error) = action_tx
         .send(Action::ContextWindowUpdated {
             used_context_tokens: Some(budget.used_tokens),
@@ -2243,13 +2015,13 @@ fn trim_redux_driver_context_budget_after_rollover(
             .zip(compaction_guard_history.iter())
             .all(|(left, right)| left.role == right.role && left.content == right.content);
     let trimmed = if let Some(replacement_len) = replacement_len {
-        crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+        crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
             replacement_len,
         )
     } else {
-        crate::agent::loop_::trim_history_to_context_budget(history, config)
+        crate::agent::context_budget::trim_history_to_context_budget(history, config)
     };
     if histories_matched_before_trim {
         *compaction_guard_history = history.clone();
@@ -2398,15 +2170,15 @@ struct ReduxToolLoopEventSink {
 }
 
 #[async_trait]
-impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
-    async fn emit(&self, event: crate::agent::loop_::ToolLoopEvent) -> anyhow::Result<()> {
+impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink {
+    async fn emit(&self, event: crate::agent::turn_contracts::ToolLoopEvent) -> anyhow::Result<()> {
         let action = match event {
-            crate::agent::loop_::ToolLoopEvent::TextDelta(delta) => Action::StreamChunkReceived {
+            crate::agent::turn_contracts::ToolLoopEvent::TextDelta(delta) => Action::StreamChunkReceived {
                 draft_id: self.draft_id.clone(),
                 delta,
                 version: self.version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
             },
-            crate::agent::loop_::ToolLoopEvent::ReasoningDelta(delta) => {
+            crate::agent::turn_contracts::ToolLoopEvent::ReasoningDelta(delta) => {
                 self.reasoning.lock().push_str(&delta);
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let Some(batch) = self.reasoning_progress.lock().push(&delta, now_ms) else {
@@ -2418,13 +2190,13 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
                     version: self.version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
                 }
             }
-            crate::agent::loop_::ToolLoopEvent::RetryAttempt { attempt, reason } => {
+            crate::agent::turn_contracts::ToolLoopEvent::RetryAttempt { attempt, reason } => {
                 Action::StreamRetryAttempt { attempt, reason }
             }
-            crate::agent::loop_::ToolLoopEvent::ContextCompacted => Action::HistoryCompacted {
+            crate::agent::turn_contracts::ToolLoopEvent::ContextCompacted => Action::HistoryCompacted {
                 reason: crate::chat::action::CompactReason::ContextOverflow,
             },
-            crate::agent::loop_::ToolLoopEvent::ContextCompactionPatch {
+            crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
                 patch,
                 config,
                 turns_before,
@@ -2462,7 +2234,7 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
                     .map_err(|_| anyhow::anyhow!("chat action channel closed"))?;
                 return Ok(());
             }
-            crate::agent::loop_::ToolLoopEvent::ToolStarted {
+            crate::agent::turn_contracts::ToolLoopEvent::ToolStarted {
                 tool_call_id,
                 name,
                 args,
@@ -2473,7 +2245,7 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
                 name,
                 args,
             },
-            crate::agent::loop_::ToolLoopEvent::ToolFinished {
+            crate::agent::turn_contracts::ToolLoopEvent::ToolFinished {
                 tool_call_id,
                 name,
                 success,
@@ -2500,7 +2272,7 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
 ///
 /// Redux remains the UI/state/persistence owner. Provider iterations, provider
 /// streaming, overflow recovery, tool execution, usage aggregation, history
-/// mutation and cancellation are all delegated to `run_tool_call_loop_outcome`.
+/// mutation and cancellation are all delegated to `run_turn`.
 #[allow(clippy::too_many_arguments)]
 /// Publish the tail of the last throttle window before a terminal action
 /// retires the draft, since the reducer drops reasoning deltas once it has.
@@ -2529,6 +2301,7 @@ async fn flush_trailing_reasoning(
 }
 
 async fn drive_start_turn_stream(
+    turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
@@ -2543,20 +2316,100 @@ async fn drive_start_turn_stream(
     tool_execution_service: Option<Arc<ToolExecutionService>>,
     tool_execution_context: ToolExecutionContext,
     request_event_fabric: MemoryFabric,
-    compaction_audit: Option<crate::agent::loop_::DocumentIngestRuntime>,
-    chat_mode: crate::agent::loop_::ChatMode,
+    compaction_audit: Option<crate::agent::document_ingest::DocumentIngestRuntime>,
+    chat_mode: crate::agent::turn_contracts::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
-    tool_surface: crate::tools::intent::SessionToolSurface,
-    routing_input: Option<String>,
 ) {
+    let Some(binding) = turn_binding.as_ref() else {
+        let _ = action_tx
+            .send(Action::StreamFailed {
+                draft_id,
+                err: "chat runtime turn requires an admitted decision".to_owned(),
+                retryable: false,
+            })
+            .await;
+        return;
+    };
+    if let Err(error) = binding.verify_execution_mode(chat_mode) {
+        let _ = action_tx
+            .send(Action::StreamFailed {
+                draft_id,
+                err: error.to_string(),
+                retryable: false,
+            })
+            .await;
+        return;
+    }
+    let Some(routing) = binding.decision_routing() else {
+        let _ = action_tx
+            .send(Action::StreamFailed {
+                draft_id,
+                err: "chat runtime turn requires an admitted decision".to_owned(),
+                retryable: false,
+            })
+            .await;
+        return;
+    };
+    // Fixed directives bypass compaction, provider execution and tool setup.
+    // Completion still travels through the task-scoped ordered history owner.
+    match binding.fixed_reply() {
+        Ok(Some(reply)) => {
+            let action = if cancel.is_cancelled() {
+                Action::StreamCancelled { draft_id }
+            } else if provider_turn_task_id.is_some() {
+                Action::ProviderTurnReadyForCommit {
+                    draft_id,
+                    final_text: reply.to_owned(),
+                    reasoning: String::new(),
+                }
+            } else {
+                if action_tx
+                    .send(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: reply.to_owned(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text: reply.to_owned(),
+                    reasoning: String::new(),
+                }
+            };
+            let _ = action_tx.send(action).await;
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = action_tx
+                .send(Action::StreamFailed {
+                    draft_id,
+                    err: error.to_string(),
+                    retryable: false,
+                })
+                .await;
+            return;
+        }
+    }
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
-    // provider/tool iteration itself remains exclusively in agent::loop_.
-    if let Some(config) = compaction_config.as_ref() {
-        let budget =
-            crate::agent::loop_::plan_context_budget(&history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    // provider/tool iteration itself remains exclusively in agent::turn_engine.
+    if let Some(config) = compaction_config.as_ref()
+        && !matches!(
+            routing.context.directive(),
+            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_)
+        )
+    {
+        let budget = crate::agent::context_budget::plan_context_budget(
+            &history,
+            config,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+        );
         if budget.over_hard_limit {
             let turns_before = chat_history_turn_count(&history);
             let tokens_before = super::estimate_chat_history_tokens(&history);
@@ -2585,10 +2438,10 @@ async fn drive_start_turn_stream(
                 }
             };
             let replacement_len = outcome.replacement_len;
-            let after_compact = crate::agent::loop_::plan_context_budget(
+            let after_compact = crate::agent::context_budget::plan_context_budget(
                 &history,
                 config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
             if compaction_off || after_compact.over_hard_limit {
                 trim_redux_driver_context_budget_after_rollover(
@@ -2650,7 +2503,7 @@ async fn drive_start_turn_stream(
     let reasoning = Arc::new(ParkingMutex::new(String::new()));
     let reasoning_progress = Arc::new(ParkingMutex::new(ReasoningProgressBatcher::default()));
     let stream_version = Arc::new(AtomicU64::new(0));
-    let events: Arc<dyn crate::agent::loop_::ToolLoopEventSink> = Arc::new(ReduxToolLoopEventSink {
+    let events: Arc<dyn crate::agent::turn_contracts::ToolLoopEventSink> = Arc::new(ReduxToolLoopEventSink {
         provider_turn_task_id,
         draft_id: draft_id.clone(),
         action_tx: action_tx.clone(),
@@ -2658,7 +2511,8 @@ async fn drive_start_turn_stream(
         reasoning: Arc::clone(&reasoning),
         reasoning_progress: Arc::clone(&reasoning_progress),
     });
-    let runtime_adapter = crate::agent::loop_::ToolLoopRuntimeAdapter {
+    let runtime_adapter = crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+        provider_trace: binding.retained_provider_trace(),
         events: Some(events),
         stream_provider: true,
         tool_execution_service,
@@ -2667,64 +2521,81 @@ async fn drive_start_turn_stream(
     };
     let tools = tools_registry.unwrap_or_else(|| Arc::new(Vec::new()));
 
-    let result = crate::agent::loop_::run_tool_call_loop_outcome(
-        provider.as_ref(),
+    let multimodal = crate::config::MultimodalConfig::default();
+    let work = crate::agent::turn_engine::run_turn(
         &mut history,
-        tools,
-        observer.as_ref(),
-        hooks.as_ref(),
-        "chat",
-        &model,
-        temperature,
-        true,
-        None,
-        "terminal",
-        &crate::config::MultimodalConfig::default(),
-        1,
-        false,
-        Vec::new(),
-        compaction_config.as_ref(),
-        Some(cancel.clone()),
-        None,
-        None,
-        None,
-        Some(&tool_surface.tiering),
-        // The adapter's ToolExecutionService already carries the resolved ledger.
-        // `with_routing_input` pins capability routing to the raw user text:
-        // without it the loop falls back to the last history user message,
-        // which chat has already enriched with memory recall and the
-        // `[Recent shared workspace events]` block — an injected URL there used
-        // to publish the whole web tool surface.
-        //
-        // `with_unrouted_tool_policy` carries the other half of the session
-        // decision: the loop re-routes this same text, and without it an
-        // unrouted turn would answer "the whole registry" there and undo the
-        // session exposure the dispatcher just held still.
-        {
-            let memory = crate::agent::loop_::ToolLoopMemory::none()
-                .with_event_fabric(request_event_fabric)
-                .with_unrouted_tool_policy(tool_surface.unrouted);
-            match routing_input {
-                Some(input) => memory.with_routing_input(input),
-                None => memory,
-            }
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "terminal",
+            scope: None,
+            mode: chat_mode,
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &multimodal,
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: compaction_config.as_ref(),
+            decision: routing,
         },
-        chat_mode,
-        None,
-        false,
-        Some(runtime_adapter),
-    )
-    .await;
+        crate::agent::turn_request::TurnServices {
+            provider: provider.as_ref(),
+            provider_name: binding.provider_name(),
+            model: &model,
+            temperature,
+            tools_registry: tools,
+            observer: observer.as_ref(),
+            hooks: hooks.as_ref(),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(runtime_adapter),
+            // The adapter's ToolExecutionService already carries the resolved ledger.
+            memory: crate::agent::turn_request::ToolLoopMemory::none().with_event_fabric(request_event_fabric),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: Some(cancel.clone()),
+            on_delta: None,
+            on_tool_call: None,
+        },
+    );
+    // Child cleanup must settle before reducer terminal actions can publish
+    // completion or permit the ordered history commit.
+    let result = if let Some(owner) = crate::runtime::turn_cleanup::current_tracker() {
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&owner), CancellationToken::new()) {
+            Ok(cleanup) => cleanup.run(work).await,
+            Err(error) => Err(error.context(crate::runtime::turn_cleanup::CleanupIncomplete)),
+        }
+    } else {
+        work.await
+    };
 
     let (outcome, trace) = match result {
         Ok(result) => result,
-        Err(error) if crate::agent::loop_::is_tool_loop_event_sink_closed(&error) => return,
-        Err(error) if crate::agent::loop_::is_tool_loop_cancelled(&error) || cancel.is_cancelled() => {
+        Err(error) if crate::agent::turn_contracts::is_tool_loop_event_sink_closed(&error) => {
+            return;
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::runtime::turn_cleanup::CleanupIncomplete>()
+                .is_some() =>
+        {
+            flush_trailing_reasoning(&action_tx, &draft_id, &reasoning_progress, &stream_version).await;
+            let _ = action_tx
+                .send(Action::StreamFailed {
+                    draft_id,
+                    err: "Child terminal cleanup is unconfirmed".to_owned(),
+                    retryable: false,
+                })
+                .await;
+            return;
+        }
+        Err(error) if crate::agent::turn_contracts::is_tool_loop_cancelled(&error) || cancel.is_cancelled() => {
             let _ = action_tx.send(Action::StreamCancelled { draft_id }).await;
             return;
         }
         Err(error) => {
-            let retryable = crate::agent::loop_::tool_loop_error_is_retryable(&error);
+            let retryable = crate::agent::provider_round::tool_loop_error_is_retryable(&error);
             // A failed turn keeps whatever reasoning it produced before it
             // broke, and that tail is often the only account of why it broke.
             // `StreamFailed` retires the draft, so the flush has to come first
@@ -2741,6 +2612,17 @@ async fn drive_start_turn_stream(
         }
     };
 
+    if let Err(error) = binding.capture_trace(&trace) {
+        flush_trailing_reasoning(&action_tx, &draft_id, &reasoning_progress, &stream_version).await;
+        let _ = action_tx
+            .send(Action::StreamFailed {
+                draft_id,
+                err: error.to_string(),
+                retryable: false,
+            })
+            .await;
+        return;
+    }
     let final_text = outcome.into_text();
     // Publish the tail of the last throttle window before the terminal action
     // retires the draft: after it the reducer drops reasoning deltas as stale.
@@ -2756,11 +2638,11 @@ async fn drive_start_turn_stream(
     {
         return;
     }
-    let empty_response = crate::agent::loop_::is_empty_assistant_response(&final_text, false);
+    let empty_response = crate::agent::response_guard::is_empty_assistant_response(&final_text, false);
     if empty_response {
         if action_tx
             .send(Action::SystemMessageAdded {
-                text: crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
+                text: crate::agent::response_guard::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
             })
             .await
             .is_err()
@@ -2799,580 +2681,7 @@ async fn drive_start_turn_stream(
     let _ = action_tx.send(terminal).await;
 }
 
-/// **S3 T3-1**: result classification of one tool execution.
-#[derive(Debug)]
-enum ToolExecOutcome {
-    /// The tool finished normally (success / fail / reject — all already sent ToolFinished + wrote back history).
-    ///
-    /// BUG-03: when the failure is *unrecoverable* (permission denied / command
-    /// not allowed / path not allowed — the model retrying the identical call
-    /// can never succeed), `unrecoverable` carries a stable signature so the
-    /// driver loop can detect a repeated blocked action and stop the turn early
-    /// instead of retrying a futile operation indefinitely.
-    Done { unrecoverable: Option<String> },
-    /// User cancel — the caller should return from the driver immediately.
-    Cancelled,
-    /// action_tx closed, the driver should exit silently.
-    SenderClosed,
-}
-
-/// BUG-03: classify whether a tool error is **unrecoverable** — i.e. retrying
-/// the identical call can never succeed because a security policy or
-/// OS permission permanently blocks it. The Redux driver uses this to short-
-/// circuit the "LLM keeps re-issuing the same blocked tool call" spin observed
-/// in chat-demo (BUG-03).
-///
-/// Matching is case-insensitive substring against the human-readable error /
-/// output. Transient failures (timeouts, network, "file not found", parse
-/// errors the model can fix) are intentionally NOT matched — those remain
-/// retryable so the model can self-correct.
-fn is_unrecoverable_tool_error(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    const SIGNATURES: &[&str] = &[
-        "permission denied",
-        "command not allowed",
-        "command is not allowed",
-        "not allowed",
-        "path not allowed",
-        "path is not allowed",
-        "not permitted",
-        "operation not permitted",
-        "access denied",
-        "blocked by security policy",
-        "security policy",
-        "denied by policy",
-        "forbidden by policy",
-        "read-only file system",
-        "user rejected tool approval",
-        "approval system not available",
-    ];
-    SIGNATURES.iter().any(|sig| lower.contains(sig))
-}
-
-/// BUG-03: build the stable signature used to detect a *repeated* unrecoverable
-/// tool failure. Keyed by tool name + a normalized slice of the error so that
-/// the same blocked action recurring across iterations collapses to one key,
-/// while a *different* blocked call (e.g. a different denied path) does not
-/// falsely trip the early-stop on its first occurrence.
-fn unrecoverable_signature(tool_name: &str, error_text: &str) -> String {
-    let normalized: String = error_text
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| !c.is_ascii_digit())
-        .take(160)
-        .collect();
-    format!("{tool_name}::{normalized}")
-}
-
-/// BUG-09: classify whether a tool mutates state and must be intercepted in
-/// plan mode. Mirrors `agent::loop_::is_write_tool`'s read-tool allowlist so the
-/// Redux driver path enforces the exact same read-only contract as the legacy
-/// `run_tool_call_loop`. Unknown tools are conservatively treated as writes.
-fn is_plan_intercepted_write_tool(name: &str) -> bool {
-    !matches!(
-        name,
-        "file_read"
-            | "grep"
-            | "web_search"
-            | "web_search_tool"
-            | "web_fetch"
-            | "memory_recall"
-            | "memory_search"
-            | "memory_get"
-            | "document_search"
-            | "document_get_chunk"
-            | "sessions_list"
-            | "sessions_history"
-            | "session_status"
-            | "agents_list"
-            | "image_info"
-            | "hardware_board_info"
-            | "hardware_memory_map"
-            | "hardware_memory_read"
-    )
-}
-
-/// BUG-09: short, bounded preview of the raw tool arguments for the synthesized
-/// "[plan mode] would call X with …" message. Keeps the line readable even when
-/// arguments are large (file contents, shell scripts).
-fn plan_preview_args(raw_args: &str) -> String {
-    const MAX: usize = 160;
-    if raw_args.len() <= MAX {
-        return raw_args.to_string();
-    }
-    let mut cut = MAX;
-    while cut > 0 && !raw_args.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &raw_args[..cut])
-}
-
-/// **S3 T3-1**: execute a single tool call (including the approval check) + write back history + emit Tool* Actions.
-///
-/// Split out because the driver main loop nests too deeply and the approval path has a oneshot await;
-/// this makes logic and borrows clearer. The return value tells the caller what to do next (continue / cancel / exit).
-#[allow(clippy::too_many_arguments)]
-async fn execute_single_tool_call(
-    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
-    service: Option<&ToolExecutionService>,
-    context: &ToolExecutionContext,
-    call: &ResolvedToolCall,
-    cancel: &CancellationToken,
-    action_tx: &mpsc::Sender<Action>,
-    draft_id: &str,
-    history: &mut Vec<crate::providers::traits::ChatMessage>,
-    compaction_config: Option<&crate::config::AgentCompactionConfig>,
-    chat_mode: crate::agent::loop_::ChatMode,
-) -> ToolExecOutcome {
-    // 0) BUG-09: plan mode is read-only. Intercept write/shell/git tools BEFORE
-    // approval or execution and feed back a simulated "[plan mode] would call X"
-    // result so the model can keep reasoning without any real side effect
-    // touching the filesystem. This mirrors the legacy `run_tool_call_loop`
-    // interception (agent::loop_::execute_one_tool) for the Redux driver path,
-    // which previously executed write tools for real even in plan mode.
-    if chat_mode.intercepts_writes() && is_plan_intercepted_write_tool(&call.name) {
-        let preview = plan_preview_args(&call.args);
-        let simulated = format!("[plan mode] would call {} with {preview}", call.name);
-        let tool_payload = serde_json::json!({
-            "tool_call_id": call.id,
-            "content": simulated,
-            "success": true,
-        });
-        history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-        if let Err(e) = action_tx
-            .send(Action::ToolFinished {
-                task_id: provider_turn_task_id,
-                sequence: None,
-                tool_call_id: Some(call.id.clone()),
-                name: call.name.clone(),
-                success: true,
-                duration_ms: 0,
-                result: Some(simulated),
-            })
-            .await
-        {
-            tracing::debug!(error = %e, "StartTurn: action_tx closed on plan-mode-intercept");
-            return ToolExecOutcome::SenderClosed;
-        }
-        // Plan-mode interception reports simulated success — fully recoverable.
-        return ToolExecOutcome::Done { unrecoverable: None };
-    }
-
-    // Transport-level JSON decoding happens before the typed service command.
-    // Descriptor schema validation remains service-owned.
-    let args_value: serde_json::Value = match serde_json::from_str(&call.args) {
-        Ok(v) => v,
-        Err(parse_err) => {
-            let err_msg = format!("tool args JSON parse error: {parse_err}");
-            let tool_payload = serde_json::json!({
-                "tool_call_id": call.id,
-                "content": err_msg,
-                "success": false,
-            });
-            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-            let _ = action_tx
-                .send(Action::ToolFinished {
-                    task_id: provider_turn_task_id,
-                    sequence: None,
-                    tool_call_id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    success: false,
-                    duration_ms: 0,
-                    result: Some(err_msg),
-                })
-                .await;
-            // Recoverable: the model can re-emit corrected JSON.
-            return ToolExecOutcome::Done { unrecoverable: None };
-        }
-    };
-
-    let Some(service) = service else {
-        let err_msg = "ToolExecutionService is unavailable; tool rejected for safety".to_string();
-        let tool_payload = serde_json::json!({
-            "tool_call_id": call.id,
-            "content": err_msg,
-            "success": false,
-        });
-        history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-        let _ = action_tx
-            .send(Action::ToolFinished {
-                task_id: provider_turn_task_id,
-                sequence: None,
-                tool_call_id: Some(call.id.clone()),
-                name: call.name.clone(),
-                success: false,
-                duration_ms: 0,
-                result: Some(err_msg.clone()),
-            })
-            .await;
-        return ToolExecOutcome::Done {
-            unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
-        };
-    };
-    let command = ToolExecutionCommand::new(&call.name, args_value)
-        .with_operation_id(&call.id)
-        .with_idempotency_key(&call.id);
-    let outcome = service.execute(command, context.clone(), Some(cancel.clone())).await;
-    let duration_ms = outcome.duration_ms;
-
-    if outcome.status == ToolExecutionStatus::Cancelled {
-        if let Err(e) = action_tx
-            .send(Action::StreamCancelled {
-                draft_id: draft_id.to_string(),
-            })
-            .await
-        {
-            tracing::debug!(error = %e, "StartTurn: action_tx closed on cancellable tool result");
-        }
-        return ToolExecOutcome::Cancelled;
-    }
-
-    if action_tx.is_closed() {
-        return ToolExecOutcome::SenderClosed;
-    }
-
-    let status = outcome.status;
-    let (tool_payload, ok_flag, summary) = match outcome.result {
-        Some(tool_result) => {
-            // BUG-05: when a tool fails (e.g. file_write rejected by the path
-            // security policy) the human-readable reason lives in `error`, and
-            // `output` is usually empty. The LLM keys off `content`, so an empty
-            // `content` made the model believe the call "returned nothing /
-            // looked fine". Surface the error reason in `content` (not just the
-            // side `error` field) so the rejection is unambiguous to the model.
-            let content = if tool_result.success || !tool_result.output.is_empty() {
-                tool_result.output.clone()
-            } else {
-                tool_result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "tool failed with no output".to_string())
-            };
-            let max_inline_chars =
-                crate::agent::loop_::tool_result_inline_budget_for_history(&call.name, history, compaction_config);
-            let content = crate::agent::loop_::compact_tool_result_for_budget(&call.name, &content, max_inline_chars);
-            let payload = serde_json::json!({
-                "tool_call_id": call.id,
-                "content": content,
-                "success": tool_result.success,
-                "error": tool_result.error,
-            });
-            let summary = if tool_result.success {
-                tool_result.output.clone()
-            } else {
-                tool_result.error.clone().unwrap_or_else(|| "tool failed".to_string())
-            };
-            (payload, tool_result.success, summary)
-        }
-        None => {
-            let err_str = outcome.error.unwrap_or_else(|| outcome.model_content.clone());
-            let payload = serde_json::json!({
-                "tool_call_id": call.id,
-                "content": err_str,
-                "success": false,
-            });
-            (payload, false, err_str)
-        }
-    };
-    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-    // BUG-03: a real tool failure whose message names a permanent block
-    // (permission denied / command not allowed / path not allowed …) is
-    // unrecoverable — surface a signature so the driver can stop a retry spin.
-    let terminal_block = matches!(
-        status,
-        ToolExecutionStatus::Denied
-            | ToolExecutionStatus::ApprovalDenied
-            | ToolExecutionStatus::PreparationDenied
-            | ToolExecutionStatus::UnknownTool
-            | ToolExecutionStatus::IdempotencyConflict
-            | ToolExecutionStatus::Indeterminate
-    );
-    let unrecoverable = if !ok_flag && (terminal_block || is_unrecoverable_tool_error(&summary)) {
-        Some(unrecoverable_signature(&call.name, &summary))
-    } else {
-        None
-    };
-    let _ = action_tx
-        .send(Action::ToolFinished {
-            task_id: provider_turn_task_id,
-            sequence: None,
-            tool_call_id: Some(call.id.clone()),
-            name: call.name.clone(),
-            success: ok_flag,
-            duration_ms,
-            result: Some(summary),
-        })
-        .await;
-    ToolExecOutcome::Done { unrecoverable }
-}
-
-/// **S3 T3-1**: one stream pass + exponential backoff retry on transient network failures.
-///
-/// Behaviour:
-/// - calls `provider.stream_chat_with_history`, receives chunks and emits `Action::StreamChunkReceived`
-/// - on an `is_timeout()` / `is_connect()` error: sleep and retry, at most [`MAX_NETWORK_RETRIES`] times
-/// - on context overflow (HTTP 413 / provider message match): return ContextOverflow so the caller compacts + retries
-/// - on an ordinary retryable (`StreamError::Http`) error that is not a timeout: return a hard error (no retry loop)
-/// - on cancel: send StreamCancelled and return Cancelled
-#[allow(clippy::too_many_arguments)]
-async fn run_one_stream_pass_with_retry(
-    provider: &dyn Provider,
-    history: &[crate::providers::traits::ChatMessage],
-    model: &str,
-    temperature: f64,
-    cancel: &CancellationToken,
-    draft_id: &str,
-    action_tx: &mpsc::Sender<Action>,
-    version: &mut u64,
-    reasoning_buf: &mut String,
-    tool_specs: &[crate::tools::ToolSpec],
-) -> StreamPassOutcome {
-    let mut attempt: u8 = 0;
-    loop {
-        if cancel.is_cancelled() {
-            if let Err(e) = action_tx
-                .send(Action::StreamCancelled {
-                    draft_id: draft_id.to_string(),
-                })
-                .await
-            {
-                tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-pass cancel");
-                return StreamPassOutcome::SenderClosed;
-            }
-            return StreamPassOutcome::Cancelled;
-        }
-        match run_one_stream_pass(
-            provider,
-            history,
-            model,
-            temperature,
-            cancel,
-            draft_id,
-            action_tx,
-            version,
-            reasoning_buf,
-            tool_specs,
-        )
-        .await
-        {
-            inner @ (StreamPassOutcome::Completed { .. }
-            | StreamPassOutcome::ToolCallRequested { .. }
-            | StreamPassOutcome::ContextOverflow { .. }
-            | StreamPassOutcome::HardError { .. }
-            | StreamPassOutcome::Cancelled
-            | StreamPassOutcome::SenderClosed) => return inner,
-            StreamPassOutcome::TransientNetworkError { err } => {
-                let last_err = err;
-                attempt = attempt.saturating_add(1);
-                if attempt > MAX_NETWORK_RETRIES {
-                    return StreamPassOutcome::TransientNetworkError {
-                        err: format!("network retries exhausted ({MAX_NETWORK_RETRIES}): {last_err}"),
-                    };
-                }
-                // tell the reducer / UI about the retry attempt (observability).
-                if let Err(e) = action_tx
-                    .send(Action::StreamRetryAttempt {
-                        attempt,
-                        reason: last_err.clone(),
-                    })
-                    .await
-                {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on retry-notify");
-                    return StreamPassOutcome::SenderClosed;
-                }
-                // 500ms, 1000ms, 2000ms — equivalent to multiplying via `<< (attempt-1)` (u64 has no saturating_shl).
-                let backoff_ms = BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(31));
-                tracing::info!(
-                    attempt,
-                    backoff_ms,
-                    err = %last_err,
-                    "drive_start_turn_stream: backoff retry"
-                );
-                let sleep = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms));
-                tokio::pin!(sleep);
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        if let Err(e) = action_tx
-                            .send(Action::StreamCancelled { draft_id: draft_id.to_string() })
-                            .await
-                        {
-                            tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel-mid-backoff");
-                            return StreamPassOutcome::SenderClosed;
-                        }
-                        return StreamPassOutcome::Cancelled;
-                    }
-                    () = &mut sleep => {}
-                }
-            }
-        }
-    }
-}
-
-/// **S3 T3-1**: the actual single stream pass (without retry / overflow retry logic).
-///
-/// Extracted so the retry/overflow loop can compose it from outside; this function's behaviour:
-/// - consume chunk by chunk, aggregating `ToolCallChunk` by index
-/// - reasoning inside a chunk accumulates into `reasoning_buf`, text chunks feed back via `Action::StreamChunkReceived`
-/// - stream ends naturally / `is_final` → return Completed or ToolCallRequested
-/// - stream error → return ContextOverflow / TransientNetworkError / HardError by type
-#[allow(clippy::too_many_arguments)]
-async fn run_one_stream_pass(
-    provider: &dyn Provider,
-    history: &[crate::providers::traits::ChatMessage],
-    model: &str,
-    temperature: f64,
-    cancel: &CancellationToken,
-    draft_id: &str,
-    action_tx: &mpsc::Sender<Action>,
-    version: &mut u64,
-    reasoning_buf: &mut String,
-    tool_specs: &[crate::tools::ToolSpec],
-) -> StreamPassOutcome {
-    use crate::providers::traits::{StreamChunk, StreamOptions};
-    use futures::StreamExt;
-
-    let opts = StreamOptions::new(true).with_tools(tool_specs.to_vec());
-    let stream = provider.stream_chat_with_history(history, model, temperature, opts);
-    tokio::pin!(stream);
-
-    let mut aggregator = ToolCallAggregator::new();
-    let mut completed_calls: Vec<ResolvedToolCall> = Vec::new();
-    let mut usage_accumulator = ProviderUsageAccumulator::new();
-    let mut iter_text = String::new();
-    let mut iter_reasoning = String::new();
-    let mut emitted_model_output = false;
-
-    loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel");
-                    return StreamPassOutcome::SenderClosed;
-                }
-                return StreamPassOutcome::Cancelled;
-            }
-            next = stream.next() => {
-                match next {
-                    Some(Ok(StreamChunk { delta, reasoning, is_final, usage, tool_calls, .. })) => {
-                        emitted_model_output |= !delta.is_empty()
-                            || reasoning.as_ref().is_some_and(|value| !value.is_empty())
-                            || !tool_calls.is_empty();
-                        if let Some(usage) = usage {
-                            usage_accumulator.record(usage);
-                        }
-                        if !tool_calls.is_empty() {
-                            for tc in tool_calls {
-                                if let Some((id, name, args)) = aggregator.ingest(tc) {
-                                    completed_calls.push(ResolvedToolCall { id, name, args });
-                                }
-                            }
-                        }
-                        if let Some(reason_text) = reasoning {
-                            if !reason_text.is_empty() {
-                                iter_reasoning.push_str(&reason_text);
-                                reasoning_buf.push_str(&reason_text);
-                            }
-                        }
-                        if !delta.is_empty() {
-                            *version = version.saturating_add(1);
-                            iter_text.push_str(&delta);
-                            let action = Action::StreamChunkReceived {
-                                draft_id: draft_id.to_string(),
-                                delta,
-                                version: *version,
-                            };
-                            if let Err(e) = action_tx.send(action).await {
-                                tracing::debug!(error = %e, "StartTurn: action_tx closed mid-stream");
-                                return StreamPassOutcome::SenderClosed;
-                            }
-                        }
-                        if is_final {
-                            break;
-                        }
-                    }
-                    Some(Err(err)) => {
-                        // Once the provider has emitted any model output, replaying
-                        // the request is unsafe: visible text/reasoning would be
-                        // duplicated and a partial tool call could be rebuilt with
-                        // different arguments. Fail this turn explicitly instead.
-                        if emitted_model_output {
-                            return StreamPassOutcome::HardError {
-                                err: format!(
-                                    "stream interrupted after model output; refusing unsafe request replay: {err}"
-                                ),
-                                retryable: false,
-                            };
-                        }
-                        // S3 T3-1: error classification — overflow / network timeout / hard error.
-                        if stream_error_is_context_overflow(&err) {
-                            return StreamPassOutcome::ContextOverflow { err: err.to_string() };
-                        }
-                        if stream_error_is_network_timeout(&err) {
-                            return StreamPassOutcome::TransientNetworkError { err: err.to_string() };
-                        }
-                        let retryable = stream_error_is_retryable(&err);
-                        return StreamPassOutcome::HardError { err: err.to_string(), retryable };
-                    }
-                    None => {
-                        // Stream ended without explicit final chunk — treat as completion.
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    let usage = usage_accumulator
-        .finish_or_estimate_completion_chars(iter_text.chars().count().saturating_add(iter_reasoning.chars().count()));
-    if completed_calls.is_empty() {
-        StreamPassOutcome::Completed { iter_text, usage }
-    } else {
-        StreamPassOutcome::ToolCallRequested {
-            calls: completed_calls,
-            iter_text,
-            reasoning_content: iter_reasoning,
-            usage,
-        }
-    }
-}
-
 // ─── Dispatcher task ───────────────────────────────────────────────────────────
-
-/// Spawn the central dispatcher task: drives `state.reduce(action)` for every
-/// Action received on `action_rx`, then runs each returned Effect through the
-/// shadow [`EffectExecutor`].
-///
-/// Shutdown conditions:
-/// - `action_rx.recv()` returns `None` (every sender has been dropped)
-/// - `shutdown.cancelled()` fires (preempted by select!)
-///
-/// Step 5b shadow mode: the dispatcher task only runs the reducer + log effects and produces no external
-/// side effects, so it coexists safely with the main loop's legacy path. Returns a `JoinHandle` so
-/// `chat::run` can await it once before exiting to make sure the final trace output is complete.
-#[allow(dead_code)]
-pub fn spawn_dispatcher_task(
-    initial_state: ChatState,
-    action_rx: mpsc::Receiver<Action>,
-    shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<DispatcherStats> {
-    spawn_dispatcher_task_with_executor(initial_state, action_rx, shutdown, EffectExecutor::new_shadow())
-}
-
-/// Spawn dispatcher task with explicit [`EffectExecutor`].
-///
-/// Equivalent to [`spawn_dispatcher_task`] but lets the caller inject a real-mode executor (Step 5a-1).
-/// Tests and shadow-compatible scenarios still use `spawn_dispatcher_task`.
-#[allow(dead_code)]
-pub fn spawn_dispatcher_task_with_executor(
-    initial_state: ChatState,
-    action_rx: mpsc::Receiver<Action>,
-    shutdown: CancellationToken,
-    executor: EffectExecutor,
-) -> tokio::task::JoinHandle<DispatcherStats> {
-    spawn_dispatcher_task_with_signal(initial_state, action_rx, shutdown, executor, None)
-}
 
 /// Step 5a-4: Spawn dispatcher task with optional [`TurnCompletionSignal`].
 ///
@@ -3380,9 +2689,8 @@ pub fn spawn_dispatcher_task_with_executor(
 /// action (`StreamCompleted` / `StreamFailed` / `StreamCancelled`), waking the await point in the
 /// `chat::run` main loop that waits for turn completion.
 ///
-/// This protocol works together with [`is_turn_terminal_action`]: the dispatcher is completely unaware of
-/// the concrete driver implementation and only fires turn-boundary events by action type.
-#[allow(dead_code)]
+/// The dispatcher is completely unaware of the concrete driver implementation and only fires
+/// turn-boundary events by action type.
 pub fn spawn_dispatcher_task_with_signal(
     initial_state: ChatState,
     action_rx: mpsc::Receiver<Action>,
@@ -3404,7 +2712,6 @@ pub fn spawn_dispatcher_task_with_signal(
 /// S4-A wrap-up P1: factor out the snapshot construction + push block duplicated in two places in the dispatcher.
 /// send_replace simply overwrites; the monotonic increase of snapshot_rev is guaranteed by reduce ordering.
 #[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
 fn push_snapshot_if_dirty(
     state: &mut ChatState,
     snapshot_tx: &Option<tokio::sync::watch::Sender<Arc<crate::chat::state::UiSnapshot>>>,
@@ -3428,12 +2735,11 @@ fn push_snapshot_if_dirty(
 ///
 /// Pure mode passes `snapshot_tx: Some(watch::Sender<Arc<UiSnapshot>>)`, and the dispatcher builds a new
 /// snapshot and calls send_if_modified once reduce finishes with `ui_dirty=true`;
-/// Off/Both/Redux modes pass None and keep the single-source chat_mirror path.
+/// Callers without a snapshot consumer pass None; this does not choose an execution mode.
 ///
 /// snapshot_rev: AtomicU64, monotonically increasing. watch send_if_modified compares the revision to
 /// skip identical frames; the revision never goes backwards, so a receiver can never see a stale frame.
 #[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
 pub fn spawn_dispatcher_task_full(
     initial_state: ChatState,
     mut action_rx: mpsc::Receiver<Action>,
@@ -3466,12 +2772,14 @@ pub fn spawn_dispatcher_task_full(
                         let usage = extract_stream_usage(&action);
                         let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                         let approval_response = extract_approval_response(&action);
+                        let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
                         let (effects, ui_dirty) = state.reduce_tracked(action);
+                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                         for effect in effects {
                             executor.execute(effect).await;
                         }
-                        let outcome = executor.outcome_after_effects(outcome);
+                        let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
                         push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
@@ -3507,12 +2815,14 @@ pub fn spawn_dispatcher_task_full(
                             let usage = extract_stream_usage(&action);
                             let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                             let approval_response = extract_approval_response(&action);
-                            let (effects, ui_dirty) = state.reduce_tracked(action);
+                            let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
+                        let (effects, ui_dirty) = state.reduce_tracked(action);
+                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                             for effect in effects {
                                 executor.execute(effect).await;
                             }
-                            let outcome = executor.outcome_after_effects(outcome);
+                            let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
                             push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                             // S3 T3-1: once the reducer has handled ToolApprovalReceived, hand the decision
                             // to the driver's pending oneshot through approval_router.
@@ -3549,7 +2859,6 @@ pub fn spawn_dispatcher_task_full(
 
 /// Placeholder for spawn_dispatcher_task_full without the terminal-tui feature (no snapshot push).
 #[cfg(not(feature = "terminal-tui"))]
-#[allow(dead_code)]
 pub fn spawn_dispatcher_task_full(
     initial_state: ChatState,
     mut action_rx: mpsc::Receiver<Action>,
@@ -3572,12 +2881,14 @@ pub fn spawn_dispatcher_task_full(
                         let usage = extract_stream_usage(&action);
                         let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                         let approval_response = extract_approval_response(&action);
+                        let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
                         let effects = state.reduce(action);
+                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                         for effect in effects {
                             executor.execute(effect).await;
                         }
-                        let outcome = executor.outcome_after_effects(outcome);
+                        let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
                         {
@@ -3600,12 +2911,14 @@ pub fn spawn_dispatcher_task_full(
                             let usage = extract_stream_usage(&action);
                             let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                             let approval_response = extract_approval_response(&action);
-                            let effects = state.reduce(action);
+                            let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
+                        let effects = state.reduce(action);
+                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                             for effect in effects {
                                 executor.execute(effect).await;
                             }
-                            let outcome = executor.outcome_after_effects(outcome);
+                            let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
                             if let (Some((tool_id, approved)), Some(router)) =
                                 (approval_response, approval_router.as_ref())
                             {
@@ -3641,9 +2954,8 @@ fn extract_approval_response(action: &Action) -> Option<(String, bool)> {
     }
 }
 
-/// Lightweight stats returned by [`spawn_dispatcher_task`] on shutdown
+/// Lightweight stats returned by [`spawn_dispatcher_task_with_signal`] on shutdown
 /// (for integration tests and metrics).
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DispatcherStats {
     pub actions_seen: u64,
@@ -3667,7 +2979,6 @@ pub struct DispatcherStats {
 ///   higher version that arrived first be dropped by the reducer because `merged.version <=
 ///   draft.version`, losing the delta permanently. Merging takes `max(pending.version, new.version)`
 ///   so the merged Action can at least move the reducer forward.
-#[allow(dead_code)]
 pub struct StreamChunkCoalescer {
     /// pending: (draft_id, accumulated_delta, latest_version)
     pending: Option<(String, String, u64)>,
@@ -3675,7 +2986,6 @@ pub struct StreamChunkCoalescer {
 }
 
 impl StreamChunkCoalescer {
-    #[allow(dead_code)]
     pub const fn new(sender: mpsc::Sender<Action>) -> Self {
         Self { pending: None, sender }
     }
@@ -3683,7 +2993,6 @@ impl StreamChunkCoalescer {
     /// Try to send one chunk Action. When the channel is full, accumulate into pending.
     ///
     /// Returns a `DispatchResult` for the caller to observe (on Closed the caller should stop pumping chunks).
-    #[allow(dead_code)]
     pub fn try_send_chunk(&mut self, draft_id: String, delta: String, version: u64) -> DispatchResult {
         // 1. If pending exists, first try to send the accumulated result + the current delta as one merged Action
         if let Some((p_draft, p_delta, p_version)) = self.pending.take() {
@@ -3731,7 +3040,6 @@ impl StreamChunkCoalescer {
     }
 
     /// Force-flush pending at stream end or shutdown (best-effort).
-    #[allow(dead_code)]
     pub fn flush(&mut self) -> DispatchResult {
         let Some((draft_id, delta, version)) = self.pending.take() else {
             return DispatchResult::Sent;
@@ -3786,36 +3094,6 @@ fn tool_security_policy(level: crate::security::AutonomyLevel) -> Arc<crate::sec
 #[cfg(test)]
 fn full_tool_security_policy() -> Arc<crate::security::SecurityPolicy> {
     tool_security_policy(crate::security::AutonomyLevel::Full)
-}
-
-#[cfg(test)]
-fn tool_service_for_test(
-    registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
-    action_tx: &mpsc::Sender<Action>,
-    draft_id: &str,
-    level: crate::security::AutonomyLevel,
-) -> (
-    ToolExecutionService,
-    ToolExecutionContext,
-    CancellationToken,
-    tempfile::TempDir,
-) {
-    let policy = tool_security_policy(level);
-    let cancellation = CancellationToken::new();
-    let context = chat_tool_execution_context(policy.as_ref(), None, None, draft_id);
-    let ledger = tempfile::TempDir::new().expect("tool ledger tempdir");
-    let memory: Arc<dyn Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(ledger.path()).expect("tool ledger sqlite"));
-    let service = chat_tool_execution_service(
-        registry,
-        Some(memory),
-        policy,
-        Arc::new(ApprovalRouter::new()),
-        action_tx.clone(),
-        cancellation.clone(),
-        None,
-    );
-    (service, context, cancellation, ledger)
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
@@ -3891,39 +3169,6 @@ mod tests {
 
         // And a flush of an untouched batcher stays quiet.
         assert!(ReasoningProgressBatcher::default().flush().is_none());
-    }
-
-    #[test]
-    fn dispatcher_tool_specs_never_include_stay_silent() {
-        use crate::security::SecurityPolicy;
-        use crate::tools::{STAY_SILENT_TOOL_NAME, ShellTool, StaySilentTool};
-
-        let security = Arc::new(SecurityPolicy::from_config(
-            &crate::config::AutonomyConfig::default(),
-            std::path::Path::new("/tmp"),
-        ));
-        let registry: Vec<Box<dyn crate::tools::Tool>> = vec![
-            Box::new(ShellTool::new(
-                Arc::new(crate::runtime::NativeRuntime::new()),
-                security.workspace_dir.clone(),
-            )),
-            Box::new(StaySilentTool::new()),
-        ];
-
-        let specs = build_dispatcher_tool_specs(Some(&registry));
-        assert!(
-            specs.iter().any(|s| s.name == "shell"),
-            "non-gated tools must still be advertised in the TUI dispatcher"
-        );
-        assert!(
-            !specs.iter().any(|s| s.name == STAY_SILENT_TOOL_NAME),
-            "TUI / Redux dispatcher must never advertise stay_silent (plain chat is never smart)"
-        );
-    }
-
-    #[test]
-    fn dispatcher_tool_specs_empty_when_no_registry() {
-        assert!(build_dispatcher_tool_specs(None).is_empty());
     }
 
     #[test]
@@ -4414,12 +3659,26 @@ mod tests {
 
         let history = vec![PMsg::system("sys"), PMsg::user("think then break")];
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(32);
-        let policy = full_tool_security_policy();
-        let tool_context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-failing-reasoning");
+        let workspace = tempfile::TempDir::new().expect("chat admission workspace");
+        let provider: Arc<dyn Provider> = Arc::new(FailingAfterReasoningProvider);
+        let admitted = super::turn_characterization_tests::admit_chat_fixture(
+            Arc::clone(&provider),
+            None,
+            workspace.path(),
+            ("ollama", "model", None),
+            (
+                "draft-failing-reasoning",
+                &history.last().expect("source input").content,
+            ),
+            action_tx.clone(),
+            CancellationToken::new(),
+        )
+        .await;
 
         drive_start_turn_stream(
+            Some(admitted.binding),
             None,
-            Arc::new(FailingAfterReasoningProvider),
+            provider,
             history.clone(),
             history,
             "model".to_string(),
@@ -4428,19 +3687,14 @@ mod tests {
             CancellationToken::new(),
             "draft-failing-reasoning".to_string(),
             action_tx,
+            Some(admitted.registry),
+            Some(admitted.service),
+            admitted.context,
+            admitted.fabric,
             None,
-            None,
-            tool_context,
-            MemoryFabric::new(Arc::new(crate::memory::NoneMemory::new()), "test"),
-            None,
-            crate::agent::loop_::ChatMode::Edit,
+            crate::agent::turn_contracts::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-            crate::tools::intent::SessionToolSurface {
-                tiering: crate::config::ToolTieringConfig::default(),
-                unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
-            },
-            None,
         )
         .await;
 
@@ -4539,12 +3793,26 @@ mod tests {
             ..crate::config::AgentCompactionConfig::default()
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(16);
-        let policy = full_tool_security_policy();
-        let tool_context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-injection-diagnostic");
+        let workspace = tempfile::TempDir::new().expect("chat admission workspace");
+        let provider: Arc<dyn Provider> = Arc::new(DiagnosticProvider);
+        let admitted = super::turn_characterization_tests::admit_chat_fixture(
+            Arc::clone(&provider),
+            None,
+            workspace.path(),
+            ("ollama", "model", None),
+            (
+                "draft-injection-diagnostic",
+                &original_history.last().expect("source input").content,
+            ),
+            action_tx.clone(),
+            CancellationToken::new(),
+        )
+        .await;
 
         drive_start_turn_stream(
+            Some(admitted.binding),
             None,
-            Arc::new(DiagnosticProvider),
+            provider,
             enriched_history,
             original_history.clone(),
             "model".to_string(),
@@ -4553,19 +3821,14 @@ mod tests {
             CancellationToken::new(),
             "draft-injection-diagnostic".to_string(),
             action_tx,
+            Some(admitted.registry),
+            Some(admitted.service),
+            admitted.context,
+            admitted.fabric,
             None,
-            None,
-            tool_context,
-            MemoryFabric::new(Arc::new(crate::memory::NoneMemory::new()), "test"),
-            None,
-            crate::agent::loop_::ChatMode::Edit,
+            crate::agent::turn_contracts::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-            crate::tools::intent::SessionToolSurface {
-                tiering: crate::config::ToolTieringConfig::default(),
-                unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
-            },
-            None,
         )
         .await;
 
@@ -4660,47 +3923,6 @@ mod tests {
 
     // ── S5 P0-1: stream error classification regression (driver protocol layer) ──────────
 
-    #[test]
-    fn s5_release_p0_1_retryable_http_io_triggers_retry() {
-        // StreamError::Io is always retryable (same verdict source as the driver retry loop).
-        let io_err =
-            crate::providers::traits::StreamError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "boom"));
-        assert!(
-            stream_error_is_retryable(&io_err),
-            "Io errors must be retryable (the driver retry loop depends on it)"
-        );
-        // Provider errors (semantic errors) are not retryable.
-        let provider_err = crate::providers::traits::StreamError::Provider("invalid api key".to_string());
-        assert!(
-            !stream_error_is_retryable(&provider_err),
-            "Provider semantic errors must not be retryable"
-        );
-    }
-
-    #[test]
-    fn s5_release_p0_1_context_overflow_triggers_compact() {
-        // the differing error wordings of three providers must all be recognised as context overflow.
-        let cases = [
-            "This model's maximum context length is 8192 tokens",
-            "prompt is too long",
-            "request exceed the maximum input token count",
-            "context_length_exceeded",
-        ];
-        for msg in cases {
-            let err = crate::providers::traits::StreamError::Provider(msg.to_string());
-            assert!(
-                stream_error_is_context_overflow(&err),
-                "must be recognised as context overflow: {msg:?}"
-            );
-        }
-        // non-overflow errors must not trigger compact.
-        let other = crate::providers::traits::StreamError::Provider("rate limited".to_string());
-        assert!(
-            !stream_error_is_context_overflow(&other),
-            "rate limit must not trigger compact"
-        );
-    }
-
     #[tokio::test]
     async fn s5_release_p0_1_parallel_tool_calls_serialize() {
         // SCRIPT emits two tool_call chunks + final inside the same stream.
@@ -4755,7 +3977,6 @@ mod integration_tests {
     //! - whether the shutdown protocol (drop sender + cancel token) makes the dispatcher exit
     //!
     //! Important constraints:
-    //! - REDUX_DIFF_COUNT == 0: in shadow mode business effects are no-ops, so history is never double-written
     //! - every timeout in the tests is at most 2s, matching main.rs:866 RUNTIME_SHUTDOWN_TIMEOUT
     use super::*;
     use crate::chat::action::{Action, HistoryDir};
@@ -4775,7 +3996,8 @@ mod integration_tests {
         let shutdown = CancellationToken::new();
         let state = make_state(shutdown.clone());
         let (dispatcher, action_rx) = ChatDispatcher::new();
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+        let handle =
+            spawn_dispatcher_task_with_signal(state, action_rx, shutdown.clone(), EffectExecutor::new_shadow(), None);
 
         // 1. user input
         assert_eq!(
@@ -4840,16 +4062,6 @@ mod integration_tests {
         assert_eq!(stats.actions_seen, 11, "actions_seen={}", stats.actions_seen);
         // the reducer should produce at least some effects (RequestRedraw / LogTrace / NotifyHook etc.)
         assert!(stats.effects_seen > 0, "no effects produced");
-
-        // verify REDUX_DIFF_COUNT == 0: in shadow mode business effects are no-ops, so there is no
-        // divergence from double-writing history (DIFF is only produced with PRX_CHAT_REDUX=both on the
-        // run_tui_unified_loop key event path; this integration test does not take that path)
-        #[cfg(feature = "terminal-tui")]
-        assert_eq!(
-            crate::chat::redux_diff_count(),
-            0,
-            "shadow mode should produce zero REDUX_DIFF_COUNT"
-        );
     }
 
     #[tokio::test]
@@ -4858,7 +4070,8 @@ mod integration_tests {
         let shutdown = CancellationToken::new();
         let state = make_state(shutdown.clone());
         let (dispatcher, action_rx) = ChatDispatcher::new();
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+        let handle =
+            spawn_dispatcher_task_with_signal(state, action_rx, shutdown.clone(), EffectExecutor::new_shadow(), None);
 
         let _ = dispatcher.try_dispatch(Action::ForceQuit);
         shutdown.cancel();
@@ -4876,7 +4089,7 @@ mod integration_tests {
         let shutdown = CancellationToken::new();
         let state = make_state(shutdown.clone());
         let (dispatcher, action_rx) = ChatDispatcher::new();
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown);
+        let handle = spawn_dispatcher_task_with_signal(state, action_rx, shutdown, EffectExecutor::new_shadow(), None);
 
         let _ = dispatcher.try_dispatch(Action::ForceQuit);
         drop(dispatcher);
@@ -4893,7 +4106,8 @@ mod integration_tests {
         let shutdown = CancellationToken::new();
         let state = make_state(shutdown.clone());
         let (tx, action_rx) = mpsc::channel::<Action>(4);
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+        let handle =
+            spawn_dispatcher_task_with_signal(state, action_rx, shutdown.clone(), EffectExecutor::new_shadow(), None);
 
         let draft = "draft-load".to_string();
         let mut coalescer = StreamChunkCoalescer::new(tx.clone());
@@ -4942,7 +4156,8 @@ mod integration_tests {
         let shutdown = CancellationToken::new();
         let state = make_state(shutdown.clone());
         let (dispatcher, action_rx) = ChatDispatcher::new();
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+        let handle =
+            spawn_dispatcher_task_with_signal(state, action_rx, shutdown.clone(), EffectExecutor::new_shadow(), None);
 
         let actions: Vec<Action> = vec![
             Action::InputSubmitted("x".to_string()),
@@ -5032,10 +4247,11 @@ mod integration_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: token.clone(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             },
             Effect::CancelToken(token),
             Effect::ResolveApproval {
@@ -5054,7 +4270,13 @@ mod integration_tests {
         // blocking_dispatch is only usable in a synchronous context; isolate the call via spawn_blocking.
         let shutdown = CancellationToken::new();
         let (dispatcher, action_rx) = ChatDispatcher::new();
-        let _handle = spawn_dispatcher_task(make_state(shutdown.clone()), action_rx, shutdown.clone());
+        let _handle = spawn_dispatcher_task_with_signal(
+            make_state(shutdown.clone()),
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+        );
 
         let dispatcher_clone = dispatcher.clone();
         let r = crate::runtime::blocking::spawn_blocking(move || dispatcher_clone.blocking_dispatch(Action::ForceQuit))
@@ -5064,43 +4286,6 @@ mod integration_tests {
 
         shutdown.cancel();
         drop(dispatcher);
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[tokio::test]
-    async fn redux_diff_count_remains_zero_in_shadow_mode() {
-        // P0-2 check: in shadow mode the reducer does not double-write history, so REDUX_DIFF_COUNT == 0.
-        // That counter is only incremented on the run_tui_unified_loop key event path under
-        // PRX_CHAT_REDUX=both; this test never reaches that path, so it stays 0.
-        crate::chat::reset_redux_diff_count();
-
-        let shutdown = CancellationToken::new();
-        let state = make_state(shutdown.clone());
-        let (dispatcher, action_rx) = ChatDispatcher::new();
-        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
-
-        // run 50 mixed Actions, simulating streaming + tools + input
-        for i in 0..50u64 {
-            let _ = dispatcher.try_dispatch(Action::InputSubmitted(format!("msg{i}")));
-            let _ = dispatcher.try_dispatch(Action::RecordUserTurn(format!("user{i}")));
-            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn {
-                task_id: None,
-                content: format!("assist{i}"),
-            });
-        }
-
-        shutdown.cancel();
-        drop(dispatcher);
-        let _stats = tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("exit")
-            .expect("join");
-
-        assert_eq!(
-            crate::chat::redux_diff_count(),
-            0,
-            "shadow mode must not produce any REDUX_DIFF_COUNT increments"
-        );
     }
 }
 
@@ -5133,35 +4318,6 @@ mod real_mode_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
-
-    struct FlagTool {
-        name: &'static str,
-        executed: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::tools::Tool for FlagTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "records execution"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-            self.executed.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "executed".to_string(),
-                error: None,
-            })
-        }
-    }
 
     /// Wrapper that counts memory.store calls (NoneMemory does not really store, it only traces calls).
     struct CountingMemory {
@@ -5259,7 +4415,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         (deps, action_rx, hooks, temp)
     }
@@ -5280,7 +4435,7 @@ mod real_mode_tests {
             "raw effect {secret} Authorization: Bearer abcdefghijklmnop\n{}",
             "\u{20ac}".repeat(5_000)
         );
-        let pre_truncate_len = crate::chat::sanitize::redact_secrets(&long_content).len();
+        let pre_truncate_len = crate::security::redaction::redact_secrets(&long_content).len();
         let mut state =
             crate::chat::state::ChatState::new(Arc::from("prov"), Arc::from("model"), CancellationToken::new());
         state.session.id = "dispatcher-sanitize-session".to_string();
@@ -5554,10 +4709,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -5722,7 +4878,6 @@ mod real_mode_tests {
                 approval_router: Arc::new(ApprovalRouter::new()),
                 tool_security_policy: full_tool_security_policy(),
                 tool_tiering: crate::config::ToolTieringConfig::default(),
-                exposed_tools: crate::tools::intent::SessionToolExposure::new(),
             };
             let executor = EffectExecutor::new_with_deps(deps);
 
@@ -5793,7 +4948,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
         executor.execute(Effect::RequestRedraw).await;
@@ -5948,10 +5102,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
         // execute() returns immediately; the spawned subtask really calls the provider and feeds Actions back.
@@ -6016,10 +5171,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6108,10 +5264,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6269,10 +5426,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6311,7 +5469,9 @@ mod real_mode_tests {
                 assert_eq!(final_text, "ordered commit");
                 assert_eq!(reasoning, "gate");
             }
-            other => panic!("task-scoped completion must wait for ordered commit gate, got {other:?}"),
+            other => {
+                panic!("task-scoped completion must wait for ordered commit gate, got {other:?}")
+            }
         }
     }
 
@@ -6394,10 +5554,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6501,10 +5662,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6599,10 +5761,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: cancel.clone(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -6835,7 +5998,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         (deps, action_rx, temp)
     }
@@ -6958,7 +6120,10 @@ mod real_mode_tests {
         });
         std::fs::write(temp.path().join("hooks.json"), hooks_json.to_string()).expect("write hooks.json");
 
-        let hooks = Arc::new(HookManager::new(temp.path().to_path_buf()));
+        // The operator opted in to workspace hooks (HOOKS-ENV).
+        let hooks = Arc::new(
+            HookManager::new(temp.path().to_path_buf()).allowing_workspace_hooks(temp.path().join("hook-launch")),
+        );
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
         let provider: Arc<dyn crate::providers::Provider> =
             Arc::new(crate::providers::router::MockEnvProvider::from_env());
@@ -6987,7 +6152,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -7143,7 +6307,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -7339,10 +6502,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -7518,10 +6682,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -7678,10 +6843,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -7883,10 +7049,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: Some(seed),
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8030,10 +7197,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8139,10 +7307,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: cancel.clone(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8187,6 +7356,7 @@ mod real_mode_tests {
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
             routing_input: None,
+            turn_binding: None,
         });
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
@@ -8259,154 +7429,6 @@ mod real_mode_tests {
     }
 
     // ─── S3 T3-1 four-part tests ───────────────────────────────────────────────
-
-    /// **S3 T3-1 Step 2**: ToolCallAggregator aggregates the Streaming + Completed protocol.
-    ///
-    /// Verifies that several Streaming increments + one Completed return Completed.args as the final arguments;
-    /// a repeated Completed must be recognised as an idempotent no-op.
-    #[test]
-    fn t31_aggregator_aggregates_streaming_and_completed() {
-        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
-        let mut agg = ToolCallAggregator::new();
-
-        // 1st Streaming delta
-        let r1 = agg.ingest(ToolCallChunk {
-            id: "tc-x".to_string(),
-            name: "shell".to_string(),
-            args: String::new(),
-            index: 0,
-            arguments_delta: Some(r#"{"cmd":"#.to_string()),
-            status: ToolCallChunkStatus::Streaming,
-        });
-        assert!(r1.is_none(), "streaming chunk should not yield ready tool call");
-
-        // 2nd Streaming delta
-        let r2 = agg.ingest(ToolCallChunk {
-            id: "tc-x".to_string(),
-            name: "shell".to_string(),
-            args: String::new(),
-            index: 0,
-            arguments_delta: Some(r#""ls"}"#.to_string()),
-            status: ToolCallChunkStatus::Streaming,
-        });
-        assert!(r2.is_none(), "second streaming chunk also no-op");
-
-        // Completed chunk
-        let r3 = agg.ingest(ToolCallChunk {
-            id: "tc-x".to_string(),
-            name: "shell".to_string(),
-            args: r#"{"cmd":"ls"}"#.to_string(),
-            index: 0,
-            arguments_delta: None,
-            status: ToolCallChunkStatus::Completed,
-        });
-        let (id, name, args) = r3.expect("Completed chunk should yield ready tool call");
-        assert_eq!(id, "tc-x");
-        assert_eq!(name, "shell");
-        assert_eq!(args, r#"{"cmd":"ls"}"#);
-
-        // repeated Completed → idempotent no-op.
-        let r4 = agg.ingest(ToolCallChunk {
-            id: "tc-x".to_string(),
-            name: "shell".to_string(),
-            args: r#"{"cmd":"ls"}"#.to_string(),
-            index: 0,
-            arguments_delta: None,
-            status: ToolCallChunkStatus::Completed,
-        });
-        assert!(r4.is_none(), "duplicate Completed should be idempotent no-op");
-    }
-
-    #[test]
-    fn aggregator_backfills_slot_id_when_empty() {
-        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
-        let mut agg = ToolCallAggregator::new();
-
-        assert!(
-            agg.ingest(ToolCallChunk {
-                id: String::new(),
-                name: "shell".into(),
-                args: String::new(),
-                index: 0,
-                arguments_delta: Some("{".into()),
-                status: ToolCallChunkStatus::Streaming,
-            })
-            .is_none()
-        );
-        assert!(
-            agg.ingest(ToolCallChunk {
-                id: "call_abc".into(),
-                name: "shell".into(),
-                args: String::new(),
-                index: 0,
-                arguments_delta: Some("}".into()),
-                status: ToolCallChunkStatus::Streaming,
-            })
-            .is_none()
-        );
-
-        let (id, name, args) = agg
-            .ingest(ToolCallChunk {
-                id: String::new(),
-                name: "shell".into(),
-                args: "{}".into(),
-                index: 0,
-                arguments_delta: None,
-                status: ToolCallChunkStatus::Completed,
-            })
-            .expect("completed chunk should resolve");
-        assert_eq!(id, "call_abc");
-        assert_eq!(name, "shell");
-        assert_eq!(args, "{}");
-    }
-
-    /// **S3 T3-1 Step 2**: ToolCallAggregator concurrent indices — several tool calls in flight at once.
-    #[test]
-    fn t31_aggregator_concurrent_indices_yield_each_separately() {
-        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
-        let mut agg = ToolCallAggregator::new();
-        // interleaved emit: tc-a streaming → tc-b streaming → tc-a complete → tc-b complete.
-        agg.ingest(ToolCallChunk {
-            id: "tc-a".into(),
-            name: "tool_a".into(),
-            args: String::new(),
-            index: 0,
-            arguments_delta: Some("{".into()),
-            status: ToolCallChunkStatus::Streaming,
-        });
-        agg.ingest(ToolCallChunk {
-            id: "tc-b".into(),
-            name: "tool_b".into(),
-            args: String::new(),
-            index: 1,
-            arguments_delta: Some("[".into()),
-            status: ToolCallChunkStatus::Streaming,
-        });
-        let ra = agg
-            .ingest(ToolCallChunk {
-                id: "tc-a".into(),
-                name: "tool_a".into(),
-                args: "{}".into(),
-                index: 0,
-                arguments_delta: None,
-                status: ToolCallChunkStatus::Completed,
-            })
-            .expect("tc-a should complete");
-        let rb = agg
-            .ingest(ToolCallChunk {
-                id: "tc-b".into(),
-                name: "tool_b".into(),
-                args: "[]".into(),
-                index: 1,
-                arguments_delta: None,
-                status: ToolCallChunkStatus::Completed,
-            })
-            .expect("tc-b should complete");
-        assert_eq!(ra.0, "tc-a");
-        assert_eq!(rb.0, "tc-b");
-        assert_eq!(ra.2, "{}");
-        assert_eq!(rb.2, "[]");
-    }
 
     /// **S3 T3-1 Step 2**: driver path: ToolCallChunks from the streaming protocol can also drive tool execution.
     ///
@@ -8531,10 +7553,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8561,7 +7584,9 @@ mod real_mode_tests {
                     saw_completion = true;
                     break;
                 }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail in happy path: {err}"),
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should not fail in happy path: {err}")
+                }
                 _ => {}
             }
         }
@@ -8673,10 +7698,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8796,10 +7822,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8910,10 +7937,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -8929,7 +7957,9 @@ mod real_mode_tests {
                     assert!(final_text.contains("answered anyway"), "got {final_text:?}");
                     break;
                 }
-                Action::StreamFailed { err, .. } => panic!("degrading must not end the turn: {err}"),
+                Action::StreamFailed { err, .. } => {
+                    panic!("degrading must not end the turn: {err}")
+                }
                 _ => {}
             }
         }
@@ -9000,7 +8030,7 @@ mod real_mode_tests {
                 self.first_tokens
                     .compare_exchange(
                         0,
-                        crate::agent::loop_::measure_history_tokens(messages),
+                        crate::agent::context_budget::measure_history_tokens(messages),
                         AtomicOrdering::SeqCst,
                         AtomicOrdering::SeqCst,
                     )
@@ -9054,10 +8084,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -9222,9 +8253,9 @@ mod real_mode_tests {
         ];
         state.session.turns = durable_test_turns(&state.session.history);
         let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
-        let guard = crate::agent::loop_::compaction_patch_guard_for(&state.session.history, 1, 3)
+        let guard = crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3)
             .expect("test: compaction guard");
-        let patch = crate::agent::loop_::CompactionPatch {
+        let patch = crate::agent::turn_contracts::CompactionPatch {
             range_start: 1,
             range_end: 3,
             replacement: vec![PMsg::assistant(
@@ -9298,10 +8329,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -9441,10 +8473,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -9662,11 +8695,11 @@ mod real_mode_tests {
             .expect("reducer history fixture")
             .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            crate::agent::compaction::compaction_patch_guard_matches(&reducer_history, &patch.guard),
             "patch guard must validate against reducer history before ordered user-turn commit"
         );
         assert!(
-            !crate::agent::loop_::compaction_patch_guard_matches(&enriched_before_compaction, &patch.guard),
+            !crate::agent::compaction::compaction_patch_guard_matches(&enriched_before_compaction, &patch.guard),
             "old enriched guard source would have mismatched the reducer"
         );
 
@@ -9810,7 +8843,7 @@ mod real_mode_tests {
             .expect("reducer history fixture")
             .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            crate::agent::compaction::compaction_patch_guard_matches(&reducer_history, &patch.guard),
             "empty-enrichment path should guard reducer history before ordered user-turn commit"
         );
 
@@ -9937,7 +8970,7 @@ mod real_mode_tests {
             .expect("reducer history fixture")
             .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            crate::agent::compaction::compaction_patch_guard_matches(&reducer_history, &patch.guard),
             "fallback-preserving patch must still be guarded by reducer persisted source"
         );
         assert!(
@@ -10041,10 +9074,10 @@ mod real_mode_tests {
         .replacement_len
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 2, "memory flush plus summary must both be protected");
-        let after_compact = crate::agent::loop_::plan_context_budget(
+        let after_compact = crate::agent::context_budget::plan_context_budget(
             &driver_history,
             &config,
-            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         assert!(
             !after_compact.over_hard_limit,
@@ -10178,10 +9211,10 @@ mod real_mode_tests {
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 1);
 
-        let driver_budget = crate::agent::loop_::plan_context_budget(
+        let driver_budget = crate::agent::context_budget::plan_context_budget(
             &driver_history,
             &config,
-            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         assert!(
             !driver_budget.over_hard_limit,
@@ -10276,7 +9309,7 @@ mod real_mode_tests {
                 self.first_tokens
                     .compare_exchange(
                         0,
-                        crate::agent::loop_::measure_history_tokens(messages),
+                        crate::agent::context_budget::measure_history_tokens(messages),
                         AtomicOrdering::SeqCst,
                         AtomicOrdering::SeqCst,
                     )
@@ -10324,10 +9357,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -10420,7 +9454,7 @@ mod real_mode_tests {
                 self.first_tokens
                     .compare_exchange(
                         0,
-                        crate::agent::loop_::measure_history_tokens(messages),
+                        crate::agent::context_budget::measure_history_tokens(messages),
                         AtomicOrdering::SeqCst,
                         AtomicOrdering::SeqCst,
                     )
@@ -10468,10 +9502,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -10495,7 +9530,9 @@ mod real_mode_tests {
                     saw_completion = true;
                     break;
                 }
-                Action::StreamFailed { err, .. } => panic!("driver should fail soft to trim: {err}"),
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should fail soft to trim: {err}")
+                }
                 _ => {}
             }
         }
@@ -10618,10 +9655,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -10669,7 +9707,9 @@ mod real_mode_tests {
                     assert!(final_text.contains("summary-retry-ok"));
                     break;
                 }
-                Action::StreamFailed { err, .. } => panic!("driver should recover after summary retry: {err}"),
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should recover after summary retry: {err}")
+                }
                 _ => {}
             }
         }
@@ -10760,10 +9800,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -10931,10 +9972,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -11109,7 +10151,7 @@ mod real_mode_tests {
                                 } = &action
                                 {
                                     #[cfg(not(feature = "terminal-tui"))]
-                                    let _ = (name, args);
+                                    let _ = (task_id, name, args);
                                     #[cfg(feature = "terminal-tui")]
                                     {
                                         let mut tui = crate::chat::tui::TuiState::new("p", "m");
@@ -11165,10 +10207,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -11209,372 +10252,10 @@ mod real_mode_tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_tool_with_missing_approval_router_rejects() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-        struct DangerousTool {
-            executed: Arc<AtomicBool>,
-        }
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for DangerousTool {
-            fn name(&self) -> &str {
-                "danger"
-            }
-            fn description(&self) -> &str {
-                "danger"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                self.executed.store(true, AtomicOrdering::SeqCst);
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: "ran".into(),
-                    error: None,
-                })
-            }
-        }
-
-        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
-        let executed = Arc::new(AtomicBool::new(false));
-        let registry = Arc::new(vec![Box::new(DangerousTool {
-            executed: Arc::clone(&executed),
-        }) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-danger".into(),
-            name: "danger".into(),
-            args: "{}".into(),
-        };
-        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let mut history = Vec::new();
-        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-missing-router");
-        let service = ToolExecutionService::from_shared_boxed_registry(
-            Arc::clone(&registry),
-            Arc::new(SecurityEffectPolicy::new(policy)),
-            Arc::new(crate::tools::DenyApprovalStrategy),
-            Arc::new(ChatToolExecutionPreparation {
-                task_id: None,
-                action_tx: action_tx.clone(),
-            }),
-            Arc::new(TracingToolExecutionAudit),
-        );
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &CancellationToken::new(),
-            &action_tx,
-            "draft-missing-router",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
-        assert!(
-            !executed.load(AtomicOrdering::SeqCst),
-            "tool requiring approval must not execute without router"
-        );
-        let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-            .await
-            .expect("ToolFinished action")
-            .expect("action present");
-        match action {
-            Action::ToolFinished {
-                name, success, result, ..
-            } => {
-                assert_eq!(name, "danger");
-                assert!(!success);
-                assert!(
-                    result
-                        .as_deref()
-                        .is_some_and(|value| value.contains("no approval resolver")),
-                    "unexpected result: {result:?}"
-                );
-            }
-            other => panic!("expected ToolFinished fail-CLOSED action, got {other:?}"),
-        }
-        assert!(
-            action_rx.try_recv().is_err(),
-            "fail-CLOSED path must not start the tool"
-        );
-        let tool_message = history.last().expect("tool rejection history expected");
-        assert_eq!(tool_message.role, "tool");
-        let payload: serde_json::Value = serde_json::from_str(&tool_message.content).expect("tool payload JSON");
-        assert_eq!(
-            payload.get("tool_call_id").and_then(serde_json::Value::as_str),
-            Some("call-danger")
-        );
-        assert_eq!(payload.get("success").and_then(serde_json::Value::as_bool), Some(false));
-        assert!(
-            payload
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.contains("no approval resolver"))
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_tool_with_approval_router_works_normally() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-        struct DangerousTool {
-            executed: Arc<AtomicBool>,
-        }
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for DangerousTool {
-            fn name(&self) -> &str {
-                "danger"
-            }
-            fn description(&self) -> &str {
-                "danger"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                self.executed.store(true, AtomicOrdering::SeqCst);
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: "ran".into(),
-                    error: None,
-                })
-            }
-        }
-
-        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
-        let approval_router = Arc::new(ApprovalRouter::new());
-        let executed = Arc::new(AtomicBool::new(false));
-        let registry = Arc::new(vec![Box::new(DangerousTool {
-            executed: Arc::clone(&executed),
-        }) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-danger".into(),
-            name: "danger".into(),
-            args: "{}".into(),
-        };
-        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let mut history = Vec::new();
-        let cancellation = CancellationToken::new();
-        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-router");
-        let ledger = tempfile::TempDir::new().expect("approval router ledger");
-        let ledger_memory: Arc<dyn Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(ledger.path()).expect("approval router sqlite"));
-        let service = chat_tool_execution_service(
-            Arc::clone(&registry),
-            Some(ledger_memory),
-            policy,
-            Arc::clone(&approval_router),
-            action_tx.clone(),
-            cancellation.clone(),
-            None,
-        );
-
-        let router_handle = Arc::clone(&approval_router);
-        let executed_before_approval = Arc::clone(&executed);
-        let resolver = tokio::spawn(async move {
-            let action = action_rx.recv().await.expect("approval request action");
-            match action {
-                Action::ToolApprovalRequested { tool_id, name, .. } => {
-                    assert_eq!(tool_id, "call-danger");
-                    assert_eq!(name, "danger");
-                    assert!(
-                        !executed_before_approval.load(AtomicOrdering::SeqCst),
-                        "tool must not execute before approval is resolved"
-                    );
-                    assert!(router_handle.resolve(&tool_id, true));
-                }
-                other => panic!("expected approval request, got {other:?}"),
-            }
-
-            let started = action_rx.recv().await.expect("tool started action");
-            assert!(matches!(started, Action::ToolStarted { ref name, .. } if name == "danger"));
-            let finished = action_rx.recv().await.expect("tool finished action");
-            match finished {
-                Action::ToolFinished { name, success, .. } => {
-                    assert_eq!(name, "danger");
-                    assert!(success);
-                }
-                other => panic!("expected ToolFinished success, got {other:?}"),
-            }
-        });
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-router",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
-        assert!(executed.load(AtomicOrdering::SeqCst));
-        resolver.await.expect("resolver task should complete");
-        let tool_message = history.last().expect("tool result history expected");
-        assert_eq!(tool_message.role, "tool");
-        let payload: serde_json::Value = serde_json::from_str(&tool_message.content).expect("tool payload JSON");
-        assert_eq!(
-            payload.get("tool_call_id").and_then(serde_json::Value::as_str),
-            Some("call-danger")
-        );
-        assert_eq!(payload.get("success").and_then(serde_json::Value::as_bool), Some(true));
-    }
-
-    #[tokio::test]
-    async fn read_only_policy_denies_act_tool_without_prompt_or_execution() {
-        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let registry = Arc::new(vec![Box::new(FlagTool {
-            name: "danger",
-            executed: Arc::clone(&executed),
-        }) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-read-only".to_string(),
-            name: "danger".to_string(),
-            args: "{}".to_string(),
-        };
-        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let (service, context, cancellation, _ledger) = tool_service_for_test(
-            registry,
-            &action_tx,
-            "draft-read-only",
-            crate::security::AutonomyLevel::ReadOnly,
-        );
-        let mut history = Vec::new();
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-read-only",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecOutcome::Done { unrecoverable: Some(_) }));
-        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(matches!(
-            action_rx.recv().await,
-            Some(Action::ToolFinished { success: false, .. })
-        ));
-        assert!(action_rx.try_recv().is_err(), "deny must not prompt or start the tool");
-    }
-
-    #[tokio::test]
-    async fn cancelling_pending_tui_approval_cancels_service_and_clears_router() {
-        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let registry = Arc::new(vec![Box::new(FlagTool {
-            name: "danger",
-            executed: Arc::clone(&executed),
-        }) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-cancel-approval".to_string(),
-            name: "danger".to_string(),
-            args: "{}".to_string(),
-        };
-        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
-        let cancellation = CancellationToken::new();
-        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-cancel-approval");
-        let approval_router = Arc::new(ApprovalRouter::new());
-        let service = chat_tool_execution_service(
-            registry,
-            None,
-            policy,
-            Arc::clone(&approval_router),
-            action_tx.clone(),
-            cancellation.clone(),
-            None,
-        );
-        let cancellation_for_task = cancellation.clone();
-        let task = tokio::spawn(async move {
-            let mut history = Vec::new();
-            execute_single_tool_call(
-                None,
-                Some(&service),
-                &context,
-                &call,
-                &cancellation_for_task,
-                &action_tx,
-                "draft-cancel-approval",
-                &mut history,
-                None,
-                crate::agent::loop_::ChatMode::Edit,
-            )
-            .await
-        });
-
-        assert!(matches!(
-            action_rx.recv().await,
-            Some(Action::ToolApprovalRequested { .. })
-        ));
-        assert!(approval_router.has_pending());
-        cancellation.cancel();
-        assert!(matches!(task.await.expect("tool task"), ToolExecOutcome::Cancelled));
-        assert!(!approval_router.has_pending());
-        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(matches!(action_rx.recv().await, Some(Action::StreamCancelled { .. })));
-        assert!(
-            action_rx.try_recv().is_err(),
-            "cancelled approval must not start the tool"
-        );
-    }
-
-    /// **S3 T3-1 Step 5**: stream_error_is_network_timeout correctly recognises reqwest errors.
-    ///
-    /// Uses reqwest::Client to GET an unreachable address on purpose, triggering a real connect error.
-    #[test]
-    fn t31_stream_error_is_network_timeout_recognises_io_error() {
-        use crate::providers::traits::StreamError;
-        let io_err = StreamError::Io(std::io::Error::other("simulated"));
-        assert!(stream_error_is_network_timeout(&io_err));
-        let json_err = StreamError::Json(serde_json::from_str::<serde_json::Value>("notjson").unwrap_err());
-        assert!(!stream_error_is_network_timeout(&json_err));
-        let provider_err = StreamError::Provider("rate limit".into());
-        assert!(!stream_error_is_network_timeout(&provider_err));
-    }
-
-    /// **S3 T3-1 Step 5**: stream_error_is_context_overflow substring-matches several providers.
-    #[test]
-    fn t31_stream_error_is_context_overflow_matches_provider_strings() {
-        use crate::providers::traits::StreamError;
-        for msg in [
-            "Error: maximum context length exceeded",
-            "context_length_exceeded",
-            "the prompt is too long",
-            "input token count is 200000",
-            "exceeds maximum allowed",
-            "Token limit reached",
-        ] {
-            let err = StreamError::Provider(msg.into());
-            assert!(
-                stream_error_is_context_overflow(&err),
-                "expected overflow match for: {msg}"
-            );
-        }
-        let normal = StreamError::Provider("rate limited".into());
-        assert!(!stream_error_is_context_overflow(&normal));
-    }
-
     /// **S3 T3-1 Step 5**: io error retry — the driver succeeds on attempt 3 after io errors on attempts 1 and 2.
     ///
-    /// A short backoff keeps the unit test fast (note: the current BACKOFF_BASE_MS=500ms is already small,
-    /// and with 1s+2s the total is 3.5s, comfortably inside the unit test timeout).
+    /// A short backoff keeps the unit test fast (1s+2s, 3.5s in total, comfortably inside the unit
+    /// test timeout).
     #[tokio::test]
     async fn t31_driver_network_timeout_retries_with_backoff_then_succeeds() {
         use crate::providers::traits::{
@@ -11647,10 +10328,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -11763,10 +10445,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -11853,10 +10536,11 @@ mod real_mode_tests {
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
+                turn_binding: None,
             })
             .await;
 
@@ -11935,7 +10619,10 @@ mod real_mode_tests {
         });
         std::fs::write(temp.path().join("hooks.json"), hooks_json.to_string()).expect("write hooks.json");
 
-        let hooks = Arc::new(HookManager::new(temp.path().to_path_buf()));
+        // The operator opted in to workspace hooks (HOOKS-ENV).
+        let hooks = Arc::new(
+            HookManager::new(temp.path().to_path_buf()).allowing_workspace_hooks(temp.path().join("hook-launch")),
+        );
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let provider: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
         let channel: Arc<dyn crate::channels::Channel> = Arc::new(TerminalChannel::new(true));
@@ -11963,7 +10650,6 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
-            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -12065,6 +10751,9 @@ mod turn_characterization_tests;
 
 #[cfg(test)]
 mod tool_tiering_tests;
+
+#[cfg(test)]
+mod stream_native_tools_tests;
 
 // ─── S4-A Commit 3: dispatcher snapshot push ────────────────────────────────
 
@@ -12282,391 +10971,4 @@ mod s4_a_3 {
     }
 
     // ── BUG-09 / BUG-05 driver-path coverage ──────────────────────────────
-
-    #[test]
-    fn plan_intercept_classifies_read_vs_write_tools() {
-        // Read-only tools must NOT be intercepted in plan mode.
-        for read in ["file_read", "grep", "web_fetch", "memory_recall", "sessions_list"] {
-            assert!(
-                !is_plan_intercepted_write_tool(read),
-                "{read} is read-only and must run in plan mode"
-            );
-        }
-        // Mutating + unknown tools MUST be intercepted.
-        for write in ["file_write", "shell", "git_operations", "some_unknown_mcp_tool"] {
-            assert!(
-                is_plan_intercepted_write_tool(write),
-                "{write} mutates state (or is unknown) and must be simulated in plan mode"
-            );
-        }
-    }
-
-    #[test]
-    fn plan_preview_args_is_bounded_and_utf8_safe() {
-        assert_eq!(plan_preview_args("short"), "short");
-        let long = "a".repeat(500);
-        let preview = plan_preview_args(&long);
-        assert!(preview.chars().count() <= 161, "preview must be bounded");
-        assert!(preview.ends_with('…'));
-        // Must not panic on a multibyte boundary.
-        let multibyte = "\u{20ac}".repeat(200);
-        let _ = plan_preview_args(&multibyte);
-    }
-
-    #[tokio::test]
-    async fn plan_mode_simulates_write_tool_without_executing() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-        struct RecordingWrite {
-            executed: Arc<AtomicBool>,
-        }
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for RecordingWrite {
-            fn name(&self) -> &str {
-                "file_write"
-            }
-            fn description(&self) -> &str {
-                "write"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                self.executed.store(true, AtomicOrdering::SeqCst);
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: "REALLY WROTE".into(),
-                    error: None,
-                })
-            }
-        }
-
-        let executed = Arc::new(AtomicBool::new(false));
-        let registry = Arc::new(vec![Box::new(RecordingWrite {
-            executed: Arc::clone(&executed),
-        }) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-w".into(),
-            name: "file_write".into(),
-            args: r#"{"path":"a.txt","content":"x"}"#.into(),
-        };
-        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let mut history = Vec::new();
-        let (service, context, cancellation, _ledger) = tool_service_for_test(
-            Arc::clone(&registry),
-            &action_tx,
-            "draft-plan",
-            crate::security::AutonomyLevel::Full,
-        );
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-plan",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Plan,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
-        assert!(
-            !executed.load(AtomicOrdering::SeqCst),
-            "plan mode MUST NOT execute the write tool"
-        );
-        // history tool message must carry the simulated marker, not the real output.
-        let tool_msg = history.last().expect("tool result pushed to history");
-        assert!(
-            tool_msg.content.contains("[plan mode] would call file_write"),
-            "history must carry simulated result, got: {}",
-            tool_msg.content
-        );
-        assert!(
-            !tool_msg.content.contains("REALLY WROTE"),
-            "real tool output must never appear in plan mode"
-        );
-        // A ToolFinished(success=true) with the simulated text must be emitted.
-        let mut saw_finished = false;
-        while let Ok(action) = action_rx.try_recv() {
-            if let Action::ToolFinished { name, result, .. } = action {
-                assert_eq!(name, "file_write");
-                assert!(result.unwrap_or_default().contains("[plan mode]"));
-                saw_finished = true;
-            }
-        }
-        assert!(saw_finished, "must emit ToolFinished for the simulated call");
-    }
-
-    #[tokio::test]
-    async fn redux_tool_result_is_budgeted_and_trimmed_after_insertion() {
-        struct LargeOutputTool;
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for LargeOutputTool {
-            fn name(&self) -> &str {
-                "shell"
-            }
-            fn description(&self) -> &str {
-                "large output"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: format!("START-LARGE-OUTPUT\n{}", "payload ".repeat(20_000)),
-                    error: None,
-                })
-            }
-        }
-
-        let registry = Arc::new(vec![Box::new(LargeOutputTool) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-large".into(),
-            name: "shell".into(),
-            args: "{}".into(),
-        };
-        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Aggressive,
-            reserve_tokens: 100,
-            keep_recent_messages: 1,
-            memory_flush: false,
-            max_context_tokens: 1_000,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![
-            crate::providers::traits::ChatMessage::system("sys"),
-            crate::providers::traits::ChatMessage::user("run the large command"),
-        ];
-        let (service, context, cancellation, _ledger) = tool_service_for_test(
-            Arc::clone(&registry),
-            &action_tx,
-            "draft-large",
-            crate::security::AutonomyLevel::Full,
-        );
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-large",
-            &mut history,
-            Some(&config),
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
-        let tool_msg = history.last().expect("tool result pushed to history");
-        let payload: serde_json::Value = serde_json::from_str(&tool_msg.content).expect("tool payload JSON");
-        let content = payload
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            content.contains("[document_ingest_ref]"),
-            "large redux tool result must be document-referenced, got {} chars",
-            content.len()
-        );
-        assert!(
-            !content.contains(&"payload ".repeat(1_000)),
-            "large redux tool result must not insert the full output"
-        );
-        let tokens_after_tool = crate::agent::loop_::measure_history_tokens(&history);
-        assert!(
-            tokens_after_tool <= 900,
-            "redux tool result insertion alone must stay below literal hard limit 900 tokens, got {tokens_after_tool}"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_tool_with_empty_output_surfaces_error_in_content() {
-        // BUG-05: a tool that fails with empty output must put its error reason
-        // into `content` so the LLM sees the rejection (not an empty result).
-        struct RejectingTool;
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for RejectingTool {
-            fn name(&self) -> &str {
-                "file_write"
-            }
-            fn description(&self) -> &str {
-                "write"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Path not allowed by security policy: /etc/passwd".into()),
-                })
-            }
-        }
-
-        let registry = Arc::new(vec![Box::new(RejectingTool) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-rej".into(),
-            name: "file_write".into(),
-            args: "{}".into(),
-        };
-        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
-        let mut history = Vec::new();
-        let (service, context, cancellation, _ledger) = tool_service_for_test(
-            Arc::clone(&registry),
-            &action_tx,
-            "draft-rej",
-            crate::security::AutonomyLevel::Full,
-        );
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-rej",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        // BUG-03: a "Path not allowed" failure is unrecoverable — the outcome
-        // must carry a signature so the driver can stop a retry spin.
-        match outcome {
-            ToolExecOutcome::Done { unrecoverable } => {
-                let sig = unrecoverable.expect("path-not-allowed failure must be flagged unrecoverable");
-                assert!(sig.starts_with("file_write::"), "signature keyed by tool name: {sig}");
-            }
-            other => panic!("expected Done, got {other:?}"),
-        }
-        let tool_msg = history.last().expect("tool result pushed to history");
-        let payload: serde_json::Value = serde_json::from_str(&tool_msg.content).expect("tool payload is JSON");
-        assert_eq!(payload.get("success"), Some(&serde_json::json!(false)));
-        let content = payload.get("content").and_then(|c| c.as_str()).unwrap_or_default();
-        assert!(
-            content.contains("Path not allowed") && content.contains("/etc/passwd"),
-            "failed tool must surface its error reason in `content`, got: {content}"
-        );
-    }
-
-    /// BUG-03: a recoverable tool failure (one the model can fix, e.g. a missing
-    /// file) must NOT be flagged unrecoverable, so the agent retains the chance
-    /// to self-correct rather than stopping prematurely.
-    #[tokio::test]
-    async fn recoverable_tool_failure_is_not_flagged_unrecoverable() {
-        struct FlakyTool;
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for FlakyTool {
-            fn name(&self) -> &str {
-                "file_read"
-            }
-            fn description(&self) -> &str {
-                "read"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("file not found: /tmp/typo.txt".into()),
-                })
-            }
-        }
-
-        let registry = Arc::new(vec![Box::new(FlakyTool) as Box<dyn crate::tools::Tool>]);
-        let call = ResolvedToolCall {
-            id: "call-flaky".into(),
-            name: "file_read".into(),
-            args: "{}".into(),
-        };
-        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
-        let mut history = Vec::new();
-        let (service, context, cancellation, _ledger) = tool_service_for_test(
-            Arc::clone(&registry),
-            &action_tx,
-            "draft-flaky",
-            crate::security::AutonomyLevel::Full,
-        );
-
-        let outcome = execute_single_tool_call(
-            None,
-            Some(&service),
-            &context,
-            &call,
-            &cancellation,
-            &action_tx,
-            "draft-flaky",
-            &mut history,
-            None,
-            crate::agent::loop_::ChatMode::Edit,
-        )
-        .await;
-
-        match outcome {
-            ToolExecOutcome::Done { unrecoverable } => {
-                assert!(
-                    unrecoverable.is_none(),
-                    "'file not found' must stay retryable, got {unrecoverable:?}"
-                );
-            }
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    /// BUG-03: detector classifies permanent blocks vs. retryable failures.
-    #[test]
-    fn unrecoverable_error_detector_classifies_correctly() {
-        // Permanent / policy / permission failures → unrecoverable.
-        for s in [
-            "permission denied",
-            "Permission Denied while writing",
-            "command not allowed: rm",
-            "this command is not allowed",
-            "Path not allowed by security policy: /etc/passwd",
-            "operation not permitted",
-            "Access Denied",
-            "Read-only file system",
-            "User rejected tool approval",
-        ] {
-            assert!(is_unrecoverable_tool_error(s), "should be unrecoverable: {s}");
-        }
-        // Retryable / fixable failures → NOT unrecoverable.
-        for s in [
-            "file not found: /tmp/x",
-            "connection timed out",
-            "tool args JSON parse error: expected value",
-            "rate limited, try again",
-            "no such file or directory",
-        ] {
-            assert!(!is_unrecoverable_tool_error(s), "should be recoverable: {s}");
-        }
-    }
-
-    /// BUG-03: the same blocked call collapses to one signature across retries
-    /// (digits stripped so e.g. a PID/line-number difference does not split it),
-    /// while a *different* tool yields a distinct signature.
-    #[test]
-    fn unrecoverable_signature_collapses_repeats_but_separates_tools() {
-        let a = unrecoverable_signature("shell", "permission denied (errno 13)");
-        let b = unrecoverable_signature("shell", "permission denied (errno 13)");
-        let c = unrecoverable_signature("shell", "permission denied (errno 99)");
-        let d = unrecoverable_signature("file_write", "permission denied (errno 13)");
-        assert_eq!(a, b, "identical failures must share a signature");
-        assert_eq!(a, c, "digit-only differences must collapse to one signature");
-        assert_ne!(a, d, "different tools must have distinct signatures");
-    }
 }

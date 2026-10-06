@@ -2080,7 +2080,11 @@ impl Channel for SignalChannel {
         let text_content = &clean_text;
 
         // ── Native mode: JSON-RPC send ────────────────────────────────────────
-        tracing::info!("Signal send: is_native={} http_url={}", self.is_native, self.http_url);
+        tracing::info!(
+            "Signal send: is_native={} http_url={}",
+            self.is_native,
+            crate::providers::redact_endpoint_userinfo(&self.http_url)
+        );
         if self.is_native {
             // In native mode, attachments are referenced as absolute paths.
             // signal-cli JSON-RPC expects plain absolute paths, not file:// URIs.
@@ -2270,10 +2274,16 @@ impl Channel for SignalChannel {
         };
 
         if use_polling {
-            tracing::info!("Signal channel using REST polling on {}...", self.http_url);
+            tracing::info!(
+                "Signal channel using REST polling on {}...",
+                crate::providers::redact_endpoint_userinfo(&self.http_url)
+            );
             self.listen_polling(&poll_url, tx).await
         } else {
-            tracing::info!("Signal channel using SSE on {}...", self.http_url);
+            tracing::info!(
+                "Signal channel using SSE on {}...",
+                crate::providers::redact_endpoint_userinfo(&self.http_url)
+            );
             self.listen_sse(&sse_url_str, tx).await
         }
     }

@@ -342,6 +342,11 @@ pub fn build_provider_outcome_trace(
     attempts_count: u8,
     status: &str,
 ) -> ControlLadderTrace {
+    // The trace is persisted: a provider label may carry URL userinfo
+    // (`custom:http://user:password@host`), so labels pass the one redactor
+    // (D-054).
+    let final_provider = crate::security::redaction::redact_secrets(final_provider);
+    let final_model = crate::security::redaction::redact_secrets(final_model);
     ControlLadderTrace {
         trace_id: Uuid::new_v4().to_string(),
         source: "provider".to_string(),
@@ -405,20 +410,78 @@ fn router_layer(config: &Config) -> ControlLayerTrace {
     }
 }
 
+/// Report only after publication checks and cleanup ownership succeed.
+/// Reads the exact service without probes, store opens or config reconstruction.
+pub(crate) fn report_decision_service_status(service: &super::turn_decision::TurnDecisionService) {
+    if tracing::enabled!(tracing::Level::INFO) {
+        let layer = published_decision_layer(service.status());
+        tracing::info!(
+            layer = %layer.name,
+            status = %layer.status,
+            enabled = layer.enabled,
+            detail = %layer.detail,
+            "runtime.control_ladder.decision_published"
+        );
+    }
+}
+
+fn published_decision_layer(status: super::turn_decision::DecisionPlaneStatus) -> ControlLayerTrace {
+    let order: Vec<_> = status
+        .backend
+        .order
+        .iter()
+        .map(|slot| {
+            json!({
+                "kind": slot.identity.kind.as_str(),
+                "locality": slot.locality.as_str(),
+                "circuit": slot.breaker.as_str(),
+                "healthy": slot.healthy,
+                "last_failure": slot.last_failure,
+            })
+        })
+        .collect();
+    let excluded: Vec<_> = status
+        .backend
+        .excluded
+        .iter()
+        .map(|(kind, locality, reason)| {
+            json!({
+                "kind": kind.as_str(),
+                "locality": locality.as_str(),
+                "reason": reason.as_str(),
+            })
+        })
+        .collect();
+    ControlLayerTrace {
+        level: 2,
+        name: "causal_tree".to_string(),
+        enabled: status.backend.enabled,
+        status: "published".to_string(),
+        reason: Some("decision_service_published".to_string()),
+        detail: json!({
+            "attachment": "service_snapshot",
+            "config_generation": status.backend.config_generation,
+            "catalog_generation": status.catalog_generation.to_hex(),
+            "store_mode": match status.store_mode {
+                crate::causal_tree::store::StoreMode::ReadOnly => "read_only",
+                crate::causal_tree::store::StoreMode::ReadWrite => "read_write",
+            },
+            "durable_key": status.durable_key,
+            "recordable": status.recordable,
+            "backend_order": order,
+            "excluded_backends": excluded,
+            "cached_decisions": status.backend.cached,
+            "runtime_evidence": "observer:causal.directive.applied",
+        }),
+    }
+}
+
 fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
-    let feature_enabled = cfg!(feature = "llm-router");
     let requested = config.causal_tree.enabled;
-    let enabled = feature_enabled && requested;
-    // Honest semantics: this trace is built from `&Config` only — it has no access
-    // to the runtime `AppContext`, and `loop_::run` never calls `build_trace`. So
-    // it can only declare the *config intent*, not prove that CTE is actually
-    // attached and running. The previous `status = "configured"` over-claimed a
-    // runtime attachment that this layer cannot observe. We therefore report
-    // `config_declared` and point at the real runtime evidence: the observer's
-    // `CteRun` events emitted by `CausalTreeEngine::run` (only fired when the
-    // AgentLoop profile attached CTE and a turn actually ran the pipeline). The two
-    // are complementary — config declaration here, runtime proof in the event
-    // stream — neither pretends to be the other.
+    let enabled = requested;
+    // This configuration-only snapshot cannot prove a service is attached.
+    // Applied directives have separate causal events; service status must be
+    // read from the exact attached generation, not inferred from configuration.
     ControlLayerTrace {
         level: 2,
         name: "causal_tree".to_string(),
@@ -426,22 +489,26 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
         status: if enabled { "config_declared" } else { "fallback" }.to_string(),
         reason: if enabled {
             Some("causal_tree_enabled".to_string())
-        } else if !feature_enabled {
-            Some("feature_disabled".to_string())
         } else {
             Some("config_disabled".to_string())
         },
         detail: json!({
             "config_enabled": requested,
-            "feature_enabled": feature_enabled,
             // Make the evidence boundary explicit: this layer is a config snapshot,
             // not a runtime-attached proof. Runtime attachment/run is evidenced by
-            // observer `CteRun` events, not by this trace.
+            // causal directive events, not by this trace.
             "attachment": "config_snapshot",
-            "runtime_evidence": "observer:CteRun",
+            "runtime_evidence": "observer:causal.directive.applied",
             "experimental": true,
-            "max_branches": config.causal_tree.policy.max_branches,
-            "default_side_effect_mode": config.causal_tree.policy.default_side_effect_mode,
+            "max_candidates": config.causal_tree.policy.max_candidates,
+            // Keep the existing JSON key: this is the configured autonomy
+            // projection only, not attached execution authority or a per-turn
+            // Chat mode restriction. Rehearsal remains independently read-only.
+            "default_side_effect_mode": match config.autonomy.level {
+                crate::security::AutonomyLevel::ReadOnly => crate::causal_tree::state::SideEffectMode::ReadOnly,
+                crate::security::AutonomyLevel::Supervised => crate::causal_tree::state::SideEffectMode::ApprovalRequired,
+                crate::security::AutonomyLevel::Full => crate::causal_tree::state::SideEffectMode::GuardedWrite,
+            },
         }),
     }
 }
@@ -529,6 +596,38 @@ mod tests {
     }
 
     #[test]
+    fn published_disabled_service_keeps_exact_generation_and_store_state() {
+        let status = super::super::turn_decision::DecisionPlaneStatus {
+            backend: crate::decision::factory::BackendPlaneStatus {
+                enabled: false,
+                config_generation: 23,
+                order: Vec::new(),
+                excluded: Vec::new(),
+                cached: 0,
+            },
+            catalog_generation: crate::causal_tree::branch::CatalogGeneration([7; 32]),
+            store_mode: crate::causal_tree::store::StoreMode::ReadOnly,
+            durable_key: false,
+            recordable: false,
+        };
+        let layer = published_decision_layer(status);
+        assert_eq!(layer.status, "published");
+        assert!(!layer.enabled);
+        assert_eq!(
+            *layer.detail.get("attachment").expect("snapshot field"),
+            "service_snapshot"
+        );
+        assert_eq!(*layer.detail.get("config_generation").expect("snapshot field"), 23);
+        assert_eq!(
+            *layer.detail.get("catalog_generation").expect("snapshot field"),
+            "07".repeat(32)
+        );
+        assert_eq!(*layer.detail.get("store_mode").expect("snapshot field"), "read_only");
+        assert_eq!(*layer.detail.get("recordable").expect("snapshot field"), false);
+        assert!(layer.detail.get("admitted").is_none());
+    }
+
+    #[test]
     fn snapshot_records_independent_disabled_layers_with_fallback_reasons() {
         let mut config = Config::default();
         config.causal_tree.enabled = false;
@@ -546,11 +645,8 @@ mod tests {
         assert_eq!(layer(&trace, "task_pool").status, "configured");
     }
 
-    /// When CTE is enabled (and the feature is compiled in), the layer reports the
-    /// honest `config_declared` status plus an explicit evidence boundary
-    /// (`attachment = config_snapshot`, `runtime_evidence = observer:CteRun`) — it
-    /// must not over-claim a runtime attachment it cannot observe.
-    #[cfg(feature = "llm-router")]
+    /// Configuration intent is available independently of the router feature;
+    /// it does not establish service publication or directive execution.
     #[test]
     fn causal_tree_layer_declares_config_snapshot_when_enabled() {
         let mut config = Config::default();
@@ -571,10 +667,73 @@ mod tests {
         );
         assert_eq!(
             cte.detail.get("runtime_evidence").and_then(Value::as_str),
-            Some("observer:CteRun"),
-            "runtime proof is the observer CteRun event stream"
+            Some("observer:causal.directive.applied"),
+            "applied-directive evidence is a separate causal event stream"
         );
         assert_eq!(cte.detail.get("experimental").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn config_snapshot_reports_autonomy_without_claiming_turn_authority() {
+        for enabled in [false, true] {
+            for (autonomy, expected) in [
+                (crate::security::AutonomyLevel::ReadOnly, "ReadOnly"),
+                (crate::security::AutonomyLevel::Supervised, "ApprovalRequired"),
+                (crate::security::AutonomyLevel::Full, "GuardedWrite"),
+            ] {
+                let mut config = Config::default();
+                config.causal_tree.enabled = enabled;
+                config.autonomy.level = autonomy;
+                let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
+                // Check the actual serialized trace contract, including the
+                // existing field spelling and enum wire values.
+                let wire = serde_json::to_string(&trace).unwrap();
+                let restored: ControlLadderTrace = serde_json::from_str(&wire).unwrap();
+                let causal = layer(&restored, "causal_tree");
+                assert_eq!(
+                    causal.detail.get("default_side_effect_mode").and_then(Value::as_str),
+                    Some(expected)
+                );
+                assert_eq!(
+                    causal.detail.get("attachment").and_then(Value::as_str),
+                    Some("config_snapshot")
+                );
+                assert_eq!(
+                    causal.detail.get("runtime_evidence").and_then(Value::as_str),
+                    Some("observer:causal.directive.applied")
+                );
+                assert_eq!(causal.enabled, enabled);
+                assert_eq!(causal.status, if enabled { "config_declared" } else { "fallback" });
+                assert_eq!(causal.level, 2);
+                assert!(causal.detail.get("admitted").is_none());
+                assert!(causal.detail.get("chat_mode").is_none());
+                assert!(causal.detail.get("catalog_generation").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn captured_config_projection_does_not_follow_later_configuration_changes() {
+        let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let snapshot = ControlLadderSnapshot::from_config(&config);
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let captured = snapshot.build_trace("test", None);
+        let later = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
+        assert_eq!(
+            layer(&captured, "causal_tree")
+                .detail
+                .get("default_side_effect_mode")
+                .and_then(Value::as_str),
+            Some("GuardedWrite")
+        );
+        assert_eq!(
+            layer(&later, "causal_tree")
+                .detail
+                .get("default_side_effect_mode")
+                .and_then(Value::as_str),
+            Some("ReadOnly")
+        );
     }
 
     #[test]
@@ -611,6 +770,29 @@ mod tests {
         let parsed: ControlLadderTrace = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(parsed.source, "test");
         assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+    }
+
+    /// D-054: a provider label with URL userinfo never reaches the persisted
+    /// control-ladder trace.
+    #[test]
+    fn provider_outcome_traces_persist_no_url_password() {
+        let tmp = tempfile::TempDir::new().expect("test: tempdir");
+        append_provider_outcome_trace(
+            tmp.path(),
+            "dec-password-url",
+            "custom:http://alice:TRACE-SECRET-pw@127.0.0.1:1/v1",
+            "model-a",
+            1,
+            "success",
+        );
+        let dir = tmp.path().join("runtime");
+        let mut traces = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("test: the trace directory exists") {
+            let text = std::fs::read_to_string(entry.expect("test: entry").path()).expect("test: read a trace");
+            traces += text.lines().count();
+            assert!(!text.contains("TRACE-SECRET-pw"), "{text}");
+        }
+        assert!(traces > 0, "the trace was written");
     }
 
     #[test]

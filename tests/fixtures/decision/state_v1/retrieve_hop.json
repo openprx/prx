@@ -1,0 +1,70 @@
+{
+  "schema": "prx.causal.state.v1",
+  "hop": 1,
+  "prior_decision_id": "01936c4e-7d2a-7c3b-9f10-4b5e6a7d8c9e",
+  "latest_user_turn": "What did we decide about the release date last week?",
+  "goal": "Recall the release-date decision from earlier sessions.",
+  "completed_steps": [
+    {
+      "kind": "retrieve",
+      "status": "ok"
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "memory",
+      "age_ms": 1250,
+      "summary": "Two memory entries about the release plan; one names a date."
+    }
+  ],
+  "failed_tool_fingerprints": [],
+  "retry_count": 0,
+  "approval_pending": false,
+  "constraints": [],
+  "budgets": {
+    "tokens": "b2",
+    "latency": "b1",
+    "cost": "b1"
+  },
+  "candidates": [
+    {
+      "id": "answer-none",
+      "action": "answer",
+      "target": "none",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b1",
+      "latency_bucket": "b1",
+      "summary": "Answer from the conversation and the retrieved artifacts.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    },
+    {
+      "id": "retrieve-memory",
+      "action": "retrieve",
+      "target": "memory",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b1",
+      "latency_bucket": "b1",
+      "summary": "Search long-term memory for relevant entries.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    },
+    {
+      "id": "discover-skill",
+      "action": "discover",
+      "target": "skill",
+      "side_effect": "read_only",
+      "approval": "none",
+      "cost_bucket": "b1",
+      "latency_bucket": "b1",
+      "summary": "Search installed skills by description.",
+      "exact_mention": false,
+      "failed_before": false,
+      "available": true
+    }
+  ]
+}

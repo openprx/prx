@@ -1,7 +1,12 @@
+pub(crate) mod auxiliary_call;
 pub mod blocking;
 pub mod bootstrap;
+pub(crate) mod causal_events;
 pub mod chat_sessions;
+pub(crate) mod child_source;
+pub(crate) mod child_turn;
 pub mod control_ladder;
+pub(crate) mod decision_accounting;
 pub mod docker;
 pub mod envelope;
 pub mod native;
@@ -11,6 +16,12 @@ pub mod shutdown;
 pub mod sqlite_pool;
 pub mod tasks_cli;
 pub mod traits;
+pub(crate) mod turn_cleanup;
+pub(crate) mod turn_cost;
+pub(crate) mod turn_decision;
+pub(crate) mod turn_publication;
+pub(crate) mod turn_source;
+pub(crate) mod turn_terminal;
 
 pub use docker::DockerRuntime;
 pub use native::NativeRuntime;
@@ -95,3 +106,7 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod operator_spawn;
+
+pub(crate) mod ingress_recovery;

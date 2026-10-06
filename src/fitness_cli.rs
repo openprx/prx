@@ -425,10 +425,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_migration_exports_and_removes_legacy_rows_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
         let tmp = tempfile::tempdir().unwrap();
         let schema = format!("prx_fitness_cli_{}", Uuid::new_v4().simple());
         let mut config = Config {

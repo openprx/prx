@@ -15,8 +15,8 @@ use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::store;
 use crate::xin::types::{
-    ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
-    XinGoal, XinRun, XinStep, XinTask, XinTaskEvent, XinTaskPatch,
+    ExecutionMode, GoalStatus, JobOrigin, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority,
+    TaskStatus, XinGoal, XinRun, XinStep, XinTask, XinTaskEvent, XinTaskPatch,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -593,10 +593,18 @@ impl Tool for XinTool {
                 });
             }
         };
-        if let Some(denied) = self.enforce_owner_scope(&cfg, &args, action) {
+        // The local-process operator (terminal UI, `prx agent`) sees and manages
+        // every task and goal, as it does every cron job (R-CRON F-7). Its
+        // own creations still record its lineage and origin below; managing
+        // another principal's task never changes that task's origin.
+        let local_operator = crate::tools::execution::scope_is_local_process_operator(&args);
+        if !local_operator && let Some(denied) = self.enforce_owner_scope(&cfg, &args, action) {
             return Ok(denied);
         }
-        let caller_scope = parse_xin_lineage_scope(&cfg, &args);
+        let mut caller_scope = parse_xin_lineage_scope(&cfg, &args);
+        if local_operator {
+            caller_scope.owner_id = None;
+        }
 
         match action {
             // ── Read-only ──────────────────────────────────────────────
@@ -990,6 +998,7 @@ impl Tool for XinTool {
                     });
                 }
 
+                let origin = JobOrigin::from_trusted_args(&args, lineage_scope.owner_id.as_deref());
                 let new = NewXinTask {
                     owner_id: lineage_scope.owner_id,
                     topic_id: lineage_scope.topic_id,
@@ -1007,7 +1016,7 @@ impl Tool for XinTool {
                     approval_grant_json,
                 };
 
-                match store::add_task(&cfg, &new) {
+                match store::add_task_with_origin(&cfg, &new, &origin) {
                     Ok(task) => Ok(ToolResult {
                         success: true,
                         output: format!("Created xin task: {} ({})", task.id, task.name),
@@ -1254,6 +1263,7 @@ impl Tool for XinTool {
                     })
                     .transpose()?;
                 let lineage = parse_xin_lineage_scope(&cfg, &args);
+                let origin = JobOrigin::from_trusted_args(&args, lineage.owner_id.as_deref());
                 let new = NewXinGoal {
                     owner_id: lineage.owner_id,
                     topic_id: lineage.topic_id,
@@ -1273,7 +1283,7 @@ impl Tool for XinTool {
                     target_completion_at,
                     initial_steps,
                 };
-                match store::add_goal(&cfg, &new) {
+                match store::add_goal_with_origin(&cfg, &new, &origin) {
                     Ok(goal) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&goal)?,
@@ -1635,5 +1645,52 @@ mod tests {
             .unwrap();
         assert!(!denied.success);
         assert!(denied.error.unwrap().contains("owner scope"));
+    }
+
+    /// R-CRON F-7: xin's owner rule compared owners only, so the terminal UI
+    /// and `prx agent` (two different owners) could not manage each other's
+    /// tasks, nor any network-created task. The local-process operator now
+    /// sees and manages every task and goal, as with cron; every other caller
+    /// stays confined to its own owner, and the operator changing a task does
+    /// not change its origin.
+    ///
+    /// MUTATION GUARD: drop the operator exemption and the operator rows go red.
+    #[tokio::test]
+    async fn the_local_operator_manages_every_xin_task() {
+        use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let tool = || Box::new(XinTool::new(new_shared(config.clone()), Arc::clone(&security)));
+        let created = execute_as(
+            tool(),
+            surface_context(&config, Surface::Webhook),
+            json!({"action": "add", "name": "webhook-task", "payload": "inspect"}),
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let task = store::list_tasks(&config).unwrap().remove(0);
+
+        for surface in [Surface::Terminal, Surface::AgentCli] {
+            let listed = execute_as(tool(), surface_context(&config, surface), json!({"action": "list"})).await;
+            assert!(listed.output.contains(&task.id), "{surface:?}: {listed:?}");
+            let paused = execute_as(
+                tool(),
+                surface_context(&config, surface),
+                json!({"action": "update", "task_id": task.id, "priority": "high"}),
+            )
+            .await;
+            assert!(
+                paused.success,
+                "{surface:?}: the operator manages every task: {paused:?}"
+            );
+        }
+        assert_eq!(
+            store::get_task(&config, &task.id).unwrap().origin,
+            task.origin,
+            "managing a task never changes its origin"
+        );
     }
 }

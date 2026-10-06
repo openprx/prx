@@ -4,10 +4,7 @@
 //! configuration. Readers pin an immutable [`ConfigGeneration`] (or its
 //! `Arc<Config>` payload) for the lifetime of one operation.
 
-use super::{
-    files::{compute_config_fingerprint_gated, compute_config_revision_gated},
-    schema::Config,
-};
+use super::{files::compute_config_revision_gated, schema::Config};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -61,6 +58,9 @@ pub enum ConfigReloadTrigger {
     Tool,
     ConfigFileApi,
     PairingPersistence,
+    /// A configuration management transaction: an operator rollback, or the
+    /// restore of a change the runtime refused.
+    Management,
     Test,
 }
 
@@ -80,6 +80,122 @@ pub struct ConfigGeneration {
     pub applied_at: DateTime<Utc>,
     pub trigger: ConfigReloadTrigger,
     pub deferred_changes: Arc<[DeferredConfigChange]>,
+}
+
+/// Metadata and keyed effective-snapshot digest carried to a child process.
+/// Configuration and credential values are never included in this transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessGenerationBinding {
+    pub id: ConfigGenerationId,
+    pub source_revision: ConfigSourceRevision,
+    pub applied_at: DateTime<Utc>,
+    pub trigger: ConfigReloadTrigger,
+    pub deferred_changes: Vec<DeferredConfigChange>,
+    pub seal: [u8; 32],
+}
+
+impl ProcessGenerationBinding {
+    fn signing_payload(&self, config: &Config) -> anyhow::Result<Vec<u8>> {
+        // Config excludes both paths from serde; bind them explicitly. Sort
+        // nested maps so process-specific HashMap iteration cannot change a tag.
+        let mut value = serde_json::to_value((
+            self.id,
+            &self.source_revision,
+            self.applied_at,
+            self.trigger,
+            &self.deferred_changes,
+            &config.workspace_dir,
+            &config.config_path,
+            config,
+        ))?;
+        value.sort_all_objects();
+        Ok(serde_json::to_vec(&value)?)
+    }
+}
+
+impl ConfigGeneration {
+    /// Pin an ordinary disabled child without startup globals or disk reloads.
+    pub(crate) fn for_disabled_child(config: &Config) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(
+            !config.causal_tree.enabled,
+            "ordinary child snapshot requires disabled decision plane"
+        );
+        let mut value = serde_json::to_value((&config.workspace_dir, &config.config_path, config))?;
+        value.sort_all_objects();
+        let encoded = serde_json::to_vec(&value)?;
+        Ok(Arc::new(Self {
+            id: ConfigGenerationId(0),
+            source_revision: ConfigSourceRevision {
+                fingerprint_sha256: format!("{:x}", Sha256::digest(encoded)),
+                disk_generation: None,
+            },
+            effective: Arc::new(config.clone()),
+            applied_at: Utc::now(),
+            trigger: ConfigReloadTrigger::Startup,
+            deferred_changes: Arc::from([]),
+        }))
+    }
+
+    pub(crate) fn bind_process(
+        &self,
+        key: &crate::decision::key::DecisionKey,
+    ) -> anyhow::Result<ProcessGenerationBinding> {
+        anyhow::ensure!(
+            self.source_revision.fingerprint_sha256.len() == 64
+                && self
+                    .source_revision
+                    .fingerprint_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "process configuration source revision is unavailable"
+        );
+        let mut binding = ProcessGenerationBinding {
+            id: self.id,
+            source_revision: self.source_revision.clone(),
+            applied_at: self.applied_at,
+            trigger: self.trigger,
+            deferred_changes: self.deferred_changes.to_vec(),
+            seal: [0; 32],
+        };
+        binding.seal = key.hmac(
+            crate::decision::key::KeyDomain::StateFingerprint,
+            &[
+                b"process-effective-config-v1",
+                &binding.signing_payload(&self.effective)?,
+            ],
+        );
+        Ok(binding)
+    }
+
+    /// Restore only an exact snapshot. A newer disk revision or a configuration
+    /// with different effective values cannot borrow the parent's generation id.
+    pub(crate) fn restore_process(
+        config: Config,
+        binding: &ProcessGenerationBinding,
+        key: &crate::decision::key::DecisionKey,
+    ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(
+            ConfigSourceRevision::from_config(&config)? == binding.source_revision,
+            "process configuration source differs from parent generation"
+        );
+        anyhow::ensure!(
+            key.verify_hmac(
+                crate::decision::key::KeyDomain::StateFingerprint,
+                &[b"process-effective-config-v1", &binding.signing_payload(&config)?],
+                &binding.seal
+            ),
+            "process effective configuration differs from parent generation"
+        );
+        Ok(Arc::new(Self {
+            id: binding.id,
+            source_revision: binding.source_revision.clone(),
+            effective: Arc::new(config),
+            applied_at: binding.applied_at,
+            trigger: binding.trigger,
+            deferred_changes: binding.deferred_changes.clone().into(),
+        }))
+    }
 }
 
 /// Latest valid configuration found on disk, including fields awaiting restart.
@@ -171,6 +287,8 @@ pub struct ConfigGenerationManager {
     last_report: RwLock<Option<ConfigApplyReport>>,
     last_failure: RwLock<Option<ConfigReloadFailure>>,
     audit_sinks: RwLock<Vec<Arc<dyn ConfigGenerationAuditSink>>>,
+    /// The configured-model allowlist refreshed with every generation.
+    model_allowlist: Arc<crate::observability::labels::ModelAllowlist>,
 }
 
 /// Runtime subsystem that must prepare a complete candidate before publication.
@@ -223,7 +341,82 @@ impl ConfigGenerationManager {
     /// Build the process owner around the startup-effective configuration.
     #[must_use]
     pub fn new(initial: Config) -> Self {
+        Self::with_model_allowlist(initial, crate::observability::labels::ModelAllowlist::global())
+    }
+
+    /// Establish an owner for a standalone caller that already holds an
+    /// effective generation. Unlike startup loading, this never relabels the
+    /// snapshot using a later on-disk revision. A generation with deferred
+    /// fields needs its existing manager, which owns the distinct desired
+    /// configuration; an effective snapshot cannot reconstruct that state.
+    pub(crate) fn from_pinned_generation(generation: Arc<ConfigGeneration>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            generation.deferred_changes.is_empty(),
+            "a generation with deferred configuration requires its existing manager"
+        );
+        anyhow::ensure!(
+            !generation.source_revision.fingerprint_sha256.is_empty()
+                && generation.source_revision.fingerprint_sha256 != "startup-unavailable",
+            "pinned configuration source revision is unavailable"
+        );
+        let next_generation = generation
+            .id
+            .0
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("configuration generation counter is exhausted"))?;
+        let model_allowlist = crate::observability::labels::ModelAllowlist::global();
+        // Preserve standalone startup setup, but take every value from the
+        // supplied effective snapshot rather than loading a new revision.
+        crate::config::set_runtime_proxy_config(generation.effective.proxy.clone());
+        if let Some(warning) = crate::config::manage::validate::decision_startup_check(&generation.effective) {
+            tracing::warn!("{warning}");
+        }
+        if generation.effective.causal_tree.enabled
+            && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(&generation.effective)
+        {
+            tracing::warn!("{warning}");
+        }
+        model_allowlist.refresh(&generation.effective);
+        let desired = Arc::new(DesiredConfigState {
+            source_revision: generation.source_revision.clone(),
+            config: Arc::clone(&generation.effective),
+            observed_at: generation.applied_at,
+        });
+        Ok(Self {
+            active: ArcSwap::from(generation),
+            desired: ArcSwap::from(desired),
+            reload_lock: Mutex::new(()),
+            next_generation: AtomicU64::new(next_generation),
+            participants: RwLock::new(Vec::new()),
+            reload_in_progress: AtomicBool::new(false),
+            last_report: RwLock::new(None),
+            last_failure: RwLock::new(None),
+            audit_sinks: RwLock::new(Vec::new()),
+            model_allowlist,
+        })
+    }
+
+    /// [`Self::new`] refreshing `model_allowlist` instead of the process
+    /// allowlist the metrics read.
+    fn with_model_allowlist(
+        initial: Config,
+        model_allowlist: Arc<crate::observability::labels::ModelAllowlist>,
+    ) -> Self {
         crate::config::set_runtime_proxy_config(initial.proxy.clone());
+        // Startup never fails for the decision plane: a refused backend
+        // runs builtin-only, and says so (D-094 C-1).
+        if let Some(warning) = crate::config::manage::validate::decision_startup_check(&initial) {
+            tracing::warn!("{warning}");
+        }
+        // Decision credentials left unreferenced are reported (D-094 C-5);
+        // a disabled plane does not read the credential store.
+        if initial.causal_tree.enabled
+            && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(&initial)
+        {
+            tracing::warn!("{warning}");
+        }
+        // Metric model labels follow the configured models (D-059).
+        model_allowlist.refresh(&initial);
         let source_revision = ConfigSourceRevision::from_config(&initial).unwrap_or_else(|_| ConfigSourceRevision {
             fingerprint_sha256: "startup-unavailable".to_string(),
             disk_generation: None,
@@ -252,6 +445,7 @@ impl ConfigGenerationManager {
             last_report: RwLock::new(None),
             last_failure: RwLock::new(None),
             audit_sinks: RwLock::new(Vec::new()),
+            model_allowlist,
         }
     }
 
@@ -332,21 +526,37 @@ impl ConfigGenerationManager {
             self.record_failure(trigger, None, &error);
             return Err(error);
         }
-        let fresh = match load_stable_config_snapshot(&config_path, current.workspace_dir.clone()) {
-            Ok(fresh) => fresh,
+        // The revision is the one the loaded files had, not one read again
+        // afterwards: a write landing in between must not be published as the
+        // revision of content that does not contain it.
+        let (fresh, revision) = match load_stable_config_snapshot(&config_path, current.workspace_dir.clone()) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.record_failure(trigger, None, &error);
                 return Err(error);
             }
         };
-        let revision = match ConfigSourceRevision::from_config(&fresh) {
-            Ok(revision) => revision,
-            Err(error) => {
-                self.record_failure(trigger, None, &error);
-                return Err(error);
-            }
+        #[cfg(test)]
+        run_after_snapshot_hook(&config_path);
+        // An operator's file edit is trusted and applied without
+        // confirmation; one that sends decisions off the machine is said so,
+        // once the reload is applied (D-079 L-4, D-082 N-4). It is compared
+        // with the desired configuration, so an edit already published and
+        // waiting for a restart is not reported again.
+        let remote_paths = if matches!(trigger, ConfigReloadTrigger::FileWatcher | ConfigReloadTrigger::Tool) {
+            hand_edited_remote_decisions(&self.desired().config, &fresh)
+        } else {
+            Vec::new()
         };
-        self.apply_config(fresh, revision, trigger)
+        let report = self.apply_config(fresh, revision, trigger)?;
+        for path in remote_paths {
+            tracing::warn!(
+                path = %path,
+                "a configuration file edit sends decision state off this machine; it was applied without \
+                 confirmation because the operator edited the file"
+            );
+        }
+        Ok(report)
     }
 
     /// Publish a validated desired configuration through the sole owner.
@@ -403,7 +613,20 @@ impl ConfigGenerationManager {
         desired.validate()?;
 
         let old_generation = self.active.load_full();
-        let old = old_generation.effective.as_ref();
+        // The decision backend check every configuration plan runs: a hand
+        // edit to an invalid backend leaves this generation active
+        // (CDP-12, R-CXR P0-B t2).
+        // A reload that does not own a refusal is not held back by it
+        // (D-094 C-1).
+        if let Some(warning) =
+            crate::config::manage::validate::check_decision_plane(Some(old_generation.effective.as_ref()), &desired)
+                .map_err(|refusal| anyhow::anyhow!(refusal))?
+        {
+            tracing::warn!("{warning}");
+        }
+        let active = old_generation.effective.as_ref();
+        let adopted = adopt_live_pairing_tokens(active, &desired, trigger);
+        let old = adopted.as_ref().unwrap_or(active);
         let changed = changed_top_level_fields(old, &desired)?;
         let participants = {
             let mut registrations = self.participants.write();
@@ -436,13 +659,21 @@ impl ConfigGenerationManager {
             .filter(|field| is_controlled_restart(field) && !restart_required.contains(field))
             .cloned()
             .collect::<Vec<_>>();
-        let applied = changed
+        let mut applied = changed
             .iter()
             .filter(|field| {
                 !is_process_restart_only(field) && !is_rebuild_and_swap(field) && !is_controlled_restart(field)
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Adopted pairing tokens are applied in-process (the pairing guard
+        // holds them); report them so, unless another `gateway` change is
+        // what is being deferred.
+        let mut changed = changed;
+        if adopted.is_some() && !changed.iter().any(|field| field == "gateway") {
+            changed.push("gateway".to_string());
+            applied.push("gateway".to_string());
+        }
 
         self.desired.store(Arc::new(DesiredConfigState {
             source_revision: source_revision.clone(),
@@ -451,7 +682,9 @@ impl ConfigGenerationManager {
         }));
 
         let effective = preserve_deferred_fields(old, desired, &restart_required)?;
-        let effective_changed = changed_top_level_fields(old, &effective)?;
+        // Against the generation that is really active: adopted pairing
+        // tokens are a change to publish even when nothing else changed.
+        let effective_changed = changed_top_level_fields(active, &effective)?;
         let deferred_changes: Arc<[DeferredConfigChange]> = restart_required
             .iter()
             .map(|field| DeferredConfigChange {
@@ -472,7 +705,11 @@ impl ConfigGenerationManager {
                             .iter()
                             .any(|field| participant.prepares_for_field(field))
                 });
-            let id = ConfigGenerationId(self.next_generation.fetch_add(1, Ordering::SeqCst));
+            let id = ConfigGenerationId(
+                self.next_generation
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| next.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("configuration generation counter is exhausted"))?,
+            );
             let generation = Arc::new(ConfigGeneration {
                 id,
                 source_revision: source_revision.clone(),
@@ -568,6 +805,7 @@ impl ConfigGenerationManager {
                 );
             }
             self.active.store(Arc::clone(&generation));
+            self.model_allowlist.refresh(&generation.effective);
             for update in &mut prepared {
                 update.finalize();
             }
@@ -634,15 +872,45 @@ impl ConfigGenerationManager {
     }
 }
 
-fn load_stable_config_snapshot(config_path: &Path, workspace_dir: std::path::PathBuf) -> anyhow::Result<Config> {
+/// Test seam: run once, for one config path, right after the stable
+/// snapshot is loaded (a write landing in the reload's window).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static AFTER_SNAPSHOT_HOOK: parking_lot::Mutex<Option<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_snapshot_hook(config_path: &Path) {
+    let hook = {
+        let mut slot = AFTER_SNAPSHOT_HOOK.lock();
+        if slot.as_ref().is_some_and(|(path, _)| path == config_path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
+fn load_stable_config_snapshot(
+    config_path: &Path,
+    workspace_dir: std::path::PathBuf,
+) -> anyhow::Result<(Config, ConfigSourceRevision)> {
     const MAX_ATTEMPTS: usize = 3;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let before = compute_config_fingerprint_gated(config_path)?;
+        let before = compute_config_revision_gated(config_path)?;
         let fresh = Config::load_from_path(config_path, workspace_dir.clone())?;
-        let after = compute_config_fingerprint_gated(config_path)?;
+        let after = compute_config_revision_gated(config_path)?;
         if before == after {
-            return Ok(fresh);
+            let (fingerprint, disk_generation) = before;
+            let revision = ConfigSourceRevision {
+                fingerprint_sha256: fingerprint.iter().map(|byte| format!("{byte:02x}")).collect(),
+                disk_generation: Some(disk_generation),
+            };
+            return Ok((fresh, revision));
         }
 
         tracing::debug!(
@@ -670,6 +938,30 @@ fn changed_top_level_fields(old: &Config, desired: &Config) -> anyhow::Result<Ve
         .into_iter()
         .filter(|key| old.get(key) != desired.get(key))
         .collect())
+}
+
+/// The active configuration with the persisted `gateway.paired_tokens`
+/// adopted, when `trigger` is the pairing persistence and the list differs.
+///
+/// `gateway` is a process-restart-only field, and its token list is too for
+/// every other writer: a token added by hand is not accepted until restart.
+/// The one exception is `/pair`: the running pairing guard already holds the
+/// token it issued, and the reload that persists it is triggered with
+/// [`ConfigReloadTrigger::PairingPersistence`]. Keeping the old list active
+/// after that reload made every later reload find `gateway` changed again, so
+/// even a save of `agent.compact_context` reported
+/// `restart_required: ["gateway"]` (CONSOLE-OBS-3), and a supervised gateway
+/// restart would have been built from the list without the token. Only the
+/// token list is adopted; any other `gateway` change stays deferred.
+fn adopt_live_pairing_tokens(active: &Config, desired: &Config, trigger: ConfigReloadTrigger) -> Option<Config> {
+    if trigger != ConfigReloadTrigger::PairingPersistence
+        || active.gateway.paired_tokens == desired.gateway.paired_tokens
+    {
+        return None;
+    }
+    let mut adopted = active.clone();
+    adopted.gateway.paired_tokens.clone_from(&desired.gateway.paired_tokens);
+    Some(adopted)
 }
 
 pub(crate) fn is_process_restart_only(field: &str) -> bool {
@@ -722,6 +1014,26 @@ pub(crate) fn is_rebuild_and_swap(field: &str) -> bool {
             | "causal_tree"
             | "proxy"
     )
+}
+
+/// The paths of `remote_decision_enabled` reasons between `old` and `new`:
+/// what a hand edit applied by a reload turned towards remote decisions.
+fn hand_edited_remote_decisions(old: &Config, new: &Config) -> Vec<String> {
+    crate::config::manage::ConfigChangeSummary::between(Some(old), new)
+        .map(|summary| {
+            summary
+                .risk_reasons
+                .into_iter()
+                .filter_map(|reason| match reason {
+                    crate::config::manage::RiskReason::RemoteDecisionEnabled { path } => Some(path),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!("could not compare the reloaded configuration: {error:#}");
+            Vec::new()
+        })
 }
 
 fn preserve_deferred_fields(old: &Config, desired: Config, fields: &[String]) -> anyhow::Result<Config> {
@@ -826,6 +1138,41 @@ mod tests {
         }
     }
 
+    /// The proxy the publication tests publish: a real `all_proxy`, so the
+    /// publication stays observable, but with loopback exempt, so a test
+    /// running at the same time against its own `127.0.0.1` server is never
+    /// sent to a proxy that is not there (R-INT2A F3). A services scope with a
+    /// dummy key would be refused by validation, which only knows real keys.
+    fn test_publication_proxy(url: &str) -> crate::config::ProxyConfig {
+        crate::config::ProxyConfig {
+            all_proxy: Some(url.to_string()),
+            no_proxy: vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()],
+            ..Config::default().proxy
+        }
+    }
+
+    /// Restores the process-wide runtime proxy when dropped, so a failing
+    /// assertion cannot leave a test proxy published.
+    struct RuntimeProxyRestore(crate::config::ProxyConfig);
+
+    impl RuntimeProxyRestore {
+        fn capture() -> Self {
+            Self(crate::config::runtime_proxy_config())
+        }
+
+        fn publish(proxy: crate::config::ProxyConfig) -> Self {
+            let restore = Self::capture();
+            crate::config::set_runtime_proxy_config(proxy);
+            restore
+        }
+    }
+
+    impl Drop for RuntimeProxyRestore {
+        fn drop(&mut self) {
+            crate::config::set_runtime_proxy_config(self.0.clone());
+        }
+    }
+
     fn participant(
         name: &'static str,
         events: Arc<Mutex<Vec<String>>>,
@@ -901,6 +1248,87 @@ mod tests {
         assert!(report.restart_required.is_empty());
     }
 
+    /// CONSOLE-OBS-3 (CONSOLE-VERIFY): once the gateway paired, every later
+    /// save reported `restart_required: ["gateway"]`, even one that changed
+    /// only `agent.compact_context`. `/pair` persists the new token hash and
+    /// reloads; `gateway` is restart-only, so the active generation kept the
+    /// old (empty) token list while disk held the new one, and every reload
+    /// after it found `gateway` different again. The pairing guard already
+    /// holds that token, so the pairing reload adopts the persisted list into
+    /// the active generation; nothing else about `gateway` is adopted.
+    #[test]
+    #[serial]
+    fn a_save_after_pairing_does_not_report_a_gateway_restart() {
+        let manager = ConfigGenerationManager::new(Config::default());
+        let mut paired = (*manager.load_full()).clone();
+        paired.gateway.paired_tokens = vec![crate::security::pairing::hash_token("zc_paired_in_test")];
+
+        let pairing = manager
+            .apply_runtime_config(paired.clone(), ConfigReloadTrigger::PairingPersistence)
+            .expect("test: pairing reload");
+        assert!(
+            pairing.restart_required.is_empty(),
+            "the token pairing just issued is live already: {:?}",
+            pairing.restart_required
+        );
+        assert_eq!(
+            manager.load_full().gateway.paired_tokens,
+            paired.gateway.paired_tokens,
+            "the active generation carries the persisted token list"
+        );
+        assert_eq!(pairing.applied, vec!["gateway"], "the adoption is reported as applied");
+
+        let mut save = paired;
+        save.agent.compact_context = !save.agent.compact_context;
+        let report = manager
+            .apply_runtime_config(save, ConfigReloadTrigger::Api)
+            .expect("test: low-risk save");
+        assert!(
+            report.restart_required.is_empty(),
+            "a save of agent.compact_context must not report a restart: {:?}",
+            report.restart_required
+        );
+        assert_eq!(report.applied, vec!["agent"]);
+    }
+
+    /// The pairing adoption is exactly the token list: another `gateway`
+    /// change in the same reload stays deferred, and a token list changed by
+    /// any other writer (a hand edit picked up by the watcher) still needs a
+    /// restart, because the running pairing guard never loaded it.
+    #[test]
+    #[serial]
+    fn only_pairing_adopts_only_the_token_list() {
+        let manager = ConfigGenerationManager::new(Config::default());
+        let original_port = manager.load_full().gateway.port;
+        let mut desired = (*manager.load_full()).clone();
+        desired.gateway.paired_tokens = vec![crate::security::pairing::hash_token("zc_first")];
+        desired.gateway.port = original_port.wrapping_add(1);
+
+        let report = manager
+            .apply_runtime_config(desired.clone(), ConfigReloadTrigger::PairingPersistence)
+            .expect("test: pairing reload with a port change");
+        assert_eq!(report.restart_required, vec!["gateway"]);
+        let active = manager.load_full();
+        assert_eq!(
+            active.gateway.port, original_port,
+            "the port change waits for a restart"
+        );
+        assert_eq!(active.gateway.paired_tokens, desired.gateway.paired_tokens);
+
+        let mut hand_edit = desired;
+        hand_edit.gateway.port = original_port;
+        hand_edit.gateway.paired_tokens.push("operator-added-token".to_string());
+        let report = manager
+            .apply_runtime_config(hand_edit, ConfigReloadTrigger::FileWatcher)
+            .expect("test: watcher reload");
+        assert_eq!(
+            report.restart_required,
+            vec!["gateway"],
+            "a token the pairing guard never loaded is not live until restart"
+        );
+        assert_eq!(manager.load_full().gateway.paired_tokens.len(), 1);
+    }
+
     #[test]
     fn auth_and_proxy_are_rebuild_and_swap_fields() {
         assert!(is_rebuild_and_swap("auth"));
@@ -909,16 +1337,50 @@ mod tests {
         assert!(!is_process_restart_only("proxy"));
     }
 
+    /// Serve one HTTP response on a loopback port and return its URL.
+    fn one_shot_loopback_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer);
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// R-INT2A F3: while a publication test's proxy is live, a concurrently
+    /// running test's runtime-proxy-built client can still reach its own
+    /// loopback server. Before, the published `all_proxy` applied to every
+    /// service with no loopback exemption, so such a client was sent to the
+    /// absent proxy and refused (this is how the A12 test hung).
+    #[tokio::test]
+    #[serial]
+    async fn a_published_test_proxy_leaves_loopback_clients_alone() {
+        let url = one_shot_loopback_server();
+        let _restore = RuntimeProxyRestore::publish(test_publication_proxy("http://127.0.0.1:8080"));
+        let client = crate::config::build_runtime_proxy_client("provider.compatible").expect("test: client");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), client.get(&url).send())
+            .await
+            .expect("test: bounded")
+            .expect("test: the loopback request bypasses the test proxy");
+        assert!(response.status().is_success());
+    }
+
     #[test]
     #[serial]
     fn proxy_runtime_state_tracks_successful_generation_publication() {
+        let _restore = RuntimeProxyRestore::capture();
         let initial = Config::default();
         let manager = ConfigGenerationManager::new(initial.clone());
         let events = Arc::new(Mutex::new(Vec::new()));
         let runtime = participant("runtime", events, false, false);
         manager.register_participant(&runtime);
-        let mut desired = initial.clone();
-        desired.proxy.all_proxy = Some("http://127.0.0.1:8080".to_string());
+        let mut desired = initial;
+        desired.proxy = test_publication_proxy("http://127.0.0.1:8080");
 
         let report = manager
             .apply_runtime_config(desired.clone(), ConfigReloadTrigger::Test)
@@ -928,19 +1390,19 @@ mod tests {
         assert_eq!(report.rebuilt, vec!["proxy"]);
         assert!(runtime_proxy.has_any_proxy_url());
         assert_eq!(runtime_proxy.all_proxy, desired.proxy.all_proxy);
-        crate::config::set_runtime_proxy_config(initial.proxy);
     }
 
     #[test]
     #[serial]
     fn proxy_runtime_state_rolls_back_when_participant_rejects_candidate() {
+        let _restore = RuntimeProxyRestore::capture();
         let initial = Config::default();
         let manager = ConfigGenerationManager::new(initial.clone());
         let events = Arc::new(Mutex::new(Vec::new()));
         let rejecting = participant("rejecting", events, true, false);
         manager.register_participant(&rejecting);
         let mut desired = initial.clone();
-        desired.proxy.all_proxy = Some("http://127.0.0.1:8081".to_string());
+        desired.proxy = test_publication_proxy("http://127.0.0.1:8081");
 
         manager
             .apply_runtime_config(desired, ConfigReloadTrigger::Test)
@@ -950,7 +1412,6 @@ mod tests {
         assert_eq!(manager.active_generation_id(), ConfigGenerationId(0));
         assert_eq!(runtime_proxy.has_any_proxy_url(), initial.proxy.has_any_proxy_url());
         assert_eq!(runtime_proxy.all_proxy, initial.proxy.all_proxy);
-        crate::config::set_runtime_proxy_config(initial.proxy);
     }
 
     #[test]
@@ -1087,6 +1548,325 @@ mod tests {
                 "config.supervisor.restart_completed",
                 "config.reload.applied",
             ]
+        );
+    }
+
+    /// PMMD-g (N-8): the revision `reload_from_disk` publishes with the
+    /// desired configuration is the one of the files it loaded, not of a
+    /// write that landed after the load.
+    /// D-074 P1-1: the reload rebuilds the active generation through a JSON
+    /// round trip (`preserve_deferred_fields`); configured values and the
+    /// schema version survive the reload.
+    #[test]
+    fn a_reload_keeps_the_causal_settings() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, CAUSAL_FIXTURE).expect("test: causal config");
+        let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+        let manager = ConfigGenerationManager::new(initial);
+        // `causal_tree` is deferred to restart, so the new active generation
+        // carries the running section through `preserve_deferred_fields`'s
+        // JSON round trip.
+        std::fs::write(
+            &config_path,
+            CAUSAL_FIXTURE.replace("default_temperature = 0.7", "default_temperature = 0.4"),
+        )
+        .expect("test: edited config");
+
+        manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect("test: reload");
+        assert!((manager.load_full().default_temperature - 0.4).abs() < f64::EPSILON);
+
+        for config in [manager.load_full(), Arc::clone(&manager.desired().config)] {
+            let causal = &config.causal_tree;
+            assert_eq!(causal.schema_version, 1);
+            assert_eq!(causal.policy.max_candidates, 5);
+            assert_eq!(causal.rehearsal.timeout_ms, 80);
+            assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
+        }
+    }
+
+    /// D-079 L-4: a hand edit that turns remote decisions on is found, so
+    /// the reload can warn; a local edit is not.
+    #[test]
+    fn a_hand_edited_remote_enablement_is_reported() {
+        use crate::causal_tree::config::BackendSelection;
+        let old = Config::default();
+        let mut new = old.clone();
+        new.causal_tree.enabled = true;
+        new.causal_tree.backend.kind = BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        new.causal_tree.backend.endpoint = "https://decisions.example.com/v1".to_string();
+        new.causal_tree.backend.remote_enabled = true;
+        assert_eq!(
+            hand_edited_remote_decisions(&old, &new),
+            vec!["causal_tree.backend.remote_enabled".to_string()]
+        );
+        let mut local = old.clone();
+        local.causal_tree.enabled = true;
+        assert!(hand_edited_remote_decisions(&old, &local).is_empty());
+    }
+
+    /// D-082 N-4: the hand-edit warning is logged only when the reload is
+    /// applied; a refused reload logs nothing of it.
+    /// D-059: the configured-model allowlist follows the applied
+    /// generation: a model named only by the new configuration becomes a
+    /// label after the reload, and one no longer named becomes `unlisted`.
+    /// The manager refreshes its own allowlist here, so no other test can
+    /// race it.
+    #[test]
+    fn the_model_allowlist_follows_the_applied_generation() {
+        use crate::observability::labels::{ModelAllowlist, UNLISTED_MODEL};
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.7\n\n[causal_tree.backend]\nmodel = \"vendor/before-reload\"\n",
+        )
+        .expect("test: config");
+        let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+        let allowlist = Arc::new(ModelAllowlist::default());
+        let manager = ConfigGenerationManager::with_model_allowlist(initial, Arc::clone(&allowlist));
+        // A participant that rebuilds `[causal_tree]`, so the edit is applied
+        // rather than deferred to a restart.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let rebuilding = participant("decision", events, false, false);
+        manager.register_participant(&rebuilding);
+        assert_eq!(allowlist.label("vendor/before-reload"), "vendor/before-reload");
+        assert_eq!(allowlist.label("vendor/after-reload"), UNLISTED_MODEL);
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.7\n\n[causal_tree.backend]\nmodel = \"vendor/after-reload\"\n",
+        )
+        .expect("test: edit");
+        manager
+            .reload_from_disk(ConfigReloadTrigger::FileWatcher)
+            .expect("test: reload");
+        assert_eq!(allowlist.label("vendor/after-reload"), "vendor/after-reload");
+        assert_eq!(allowlist.label("vendor/before-reload"), UNLISTED_MODEL);
+    }
+
+    #[test]
+    #[serial]
+    fn a_hand_edited_remote_enablement_is_logged_only_when_applied() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        const REMOTE: &str = "default_temperature = 0.4\n\n[causal_tree]\nenabled = true\n\n[causal_tree.backend]\n\
+                              kind = \"compatible_http\"\nendpoint = \"https://decisions.example.com/v1\"\n\
+                              model = \"decider-1\"\nremote_enabled = true\n\n[[providers.models]]\n\
+                              provider = \"custom:https://decisions.example.com/v1\"\nmodel = \"decider-1\"\n\
+                              operations = [\"decision_endpoint\"]\n";
+        let run = |fail_prepare: bool| {
+            let dir = tempfile::TempDir::new().expect("test: temp dir");
+            let config_path = dir.path().join("config.toml");
+            std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: config");
+            let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+            let manager = ConfigGenerationManager::new(initial);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let refusing = participant("refusing", Arc::clone(&events), fail_prepare, false);
+            manager.register_participant(&refusing);
+            std::fs::write(&config_path, REMOTE).expect("test: edit");
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                // Another test may have cached this callsite as disabled.
+                tracing::callsite::rebuild_interest_cache();
+                let result = manager.reload_from_disk(ConfigReloadTrigger::FileWatcher);
+                // A control line: the capture worked for this run, so a
+                // missing warning is a real absence (D-086 C-3).
+                tracing::warn!("capture control line");
+                result
+            });
+            let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
+            (result.is_ok(), logs)
+        };
+        let (applied, logs) = run(false);
+        assert!(applied);
+        assert!(
+            logs.contains("sends decision state off this machine")
+                && logs.contains("causal_tree.backend.remote_enabled"),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("decisions.example.com"),
+            "the warning names the path, never the endpoint: {logs}"
+        );
+        let (applied, logs) = run(true);
+        assert!(!applied, "the participant refused the reload");
+        assert!(logs.contains("capture control line"), "the capture must work: {logs}");
+        assert!(!logs.contains("sends decision state off this machine"), "{logs}");
+    }
+
+    /// CDP-04 (V6.07 hot-reload half): a hand edit that points the decision
+    /// backend at a remote host without `remote_enabled` does not activate;
+    /// the running generation is kept.
+    #[test]
+    fn a_remote_decision_endpoint_without_the_remote_switch_keeps_the_generation() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: config");
+        let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+        let manager = ConfigGenerationManager::new(initial);
+        let active = manager.active_generation_id();
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+             endpoint = \"https://decisions.example.com/v1\"\n",
+        )
+        .expect("test: edit");
+        let error = manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect_err("test: refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("remote_enabled"), "{message}");
+        assert!(!message.contains("decisions.example.com"), "{message}");
+        assert_eq!(manager.active_generation_id(), active);
+        assert!((manager.load_full().default_temperature - 0.7).abs() < f64::EPSILON);
+        assert!(!manager.load_full().causal_tree.backend.remote_enabled);
+    }
+
+    /// CDP-12 (R-CXR P0-B t2): a hand edit to a decision backend the strict
+    /// selection refuses (here a model nobody declared for
+    /// `decision_endpoint`) leaves the running generation active.
+    #[test]
+    fn an_invalid_causal_backend_leaves_the_prior_generation_active() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: config");
+        let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+        let manager = ConfigGenerationManager::new(initial);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let rebuilding = participant("decision", events, false, false);
+        manager.register_participant(&rebuilding);
+        let active = manager.active_generation_id();
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+             endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n",
+        )
+        .expect("test: edit");
+        let error = manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect_err("test: refused");
+        assert!(format!("{error:#}").contains("causal_tree.backend"), "{error:#}");
+        assert_eq!(manager.active_generation_id(), active);
+        assert!((manager.load_full().default_temperature - 0.7).abs() < f64::EPSILON);
+
+        // Declared for decision_endpoint, the same backend activates.
+        std::fs::write(
+            &config_path,
+            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+             endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n\n\
+             [[providers.models]]\nprovider = \"custom:http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n\
+             operations = [\"decision_endpoint\"]\n",
+        )
+        .expect("test: edit");
+        manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect("test: applied");
+        assert_ne!(manager.active_generation_id(), active);
+    }
+
+    /// D-094 C-1: a daemon started with a decision section the check
+    /// refuses starts, and a later reload that does not touch
+    /// `[causal_tree]` is applied; one that does is still refused.
+    #[test]
+    fn an_invalid_decision_section_never_blocks_startup_or_unrelated_reloads() {
+        const INVALID: &str = "\n[causal_tree]\nenabled = true\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+                               endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n";
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, format!("default_temperature = 0.7\n{INVALID}")).expect("test: config");
+        let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
+        let manager = ConfigGenerationManager::new(initial);
+        let active = manager.active_generation_id();
+        // A declaration for another provider: the check runs, finds the
+        // section already refused, and does not hold the change back.
+        const UNRELATED: &str = "\n[[providers.models]]\nprovider = \"openrouter\"\nmodel = \"vendor/chat-model\"\n\
+                                 operations = [\"chat\"]\n";
+        std::fs::write(&config_path, format!("default_temperature = 0.4\n{INVALID}{UNRELATED}")).expect("test: edit");
+        manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect("test: an unrelated change is applied");
+        assert_ne!(manager.active_generation_id(), active);
+        assert!((manager.load_full().default_temperature - 0.4).abs() < f64::EPSILON);
+        let active = manager.active_generation_id();
+        std::fs::write(
+            &config_path,
+            format!(
+                "default_temperature = 0.4\n{}{UNRELATED}",
+                INVALID.replace("undeclared-model", "other-model")
+            ),
+        )
+        .expect("test: edit");
+        let error = manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect_err("test: a change to the section is refused");
+        assert!(format!("{error:#}").contains("causal_tree.backend"), "{error:#}");
+        assert_eq!(manager.active_generation_id(), active);
+    }
+
+    const CAUSAL_FIXTURE: &str = r#"default_temperature = 0.7
+
+[causal_tree]
+schema_version = 1
+enabled = false
+
+[causal_tree.policy]
+max_candidates = 5
+
+[causal_tree.rehearsal]
+timeout_ms = 80
+
+[causal_tree.scoring.weights]
+w_cost = 0.4
+"#;
+
+    #[test]
+    fn a_reload_publishes_the_revision_of_the_files_it_loaded() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: config");
+        let mut initial = Config::default();
+        initial.config_path = config_path.clone();
+        initial.workspace_dir = dir.path().join("workspace");
+        let manager = ConfigGenerationManager::new(initial);
+        let loaded_revision = crate::config::files::current_config_revision(&config_path).expect("test: revision");
+        let writer_path = config_path.clone();
+        *AFTER_SNAPSHOT_HOOK.lock() = Some((
+            config_path,
+            Box::new(move || {
+                std::fs::write(&writer_path, "default_temperature = 0.4\n").expect("test: late write");
+            }),
+        ));
+
+        manager
+            .reload_from_disk(ConfigReloadTrigger::Test)
+            .expect("test: reload");
+
+        let desired = manager.desired();
+        assert!((desired.config.default_temperature - 0.7).abs() < f64::EPSILON);
+        assert_eq!(
+            desired.source_revision.fingerprint_sha256, loaded_revision,
+            "the desired configuration must carry the revision it was loaded from"
         );
     }
 }

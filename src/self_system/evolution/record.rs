@@ -94,6 +94,10 @@ pub enum EvolutionResult {
     Neutral,
     Regressed,
     Rejected,
+    /// The change was never written: no verdict accepted it in time (the
+    /// judge failed, was only the mock, or the run was cancelled or shut
+    /// down first), or it could not be applied (D-046).
+    Deferred,
 }
 
 /// Statistical basis for an evolution change proposal.

@@ -10,18 +10,24 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 
+mod causal;
 mod channels;
 mod chat_sessions;
 mod config;
 mod hooks;
 mod jobs;
 mod logs;
+mod manage;
 mod mcp;
+mod models;
 mod plugins;
+mod providers;
 mod runtime;
 mod sessions;
 mod skills;
 mod status;
+#[cfg(test)]
+mod test_support;
 
 pub(super) fn authorize_resource_mutation(
     state: &AppState,
@@ -52,6 +58,61 @@ pub(super) fn authorize_resource_mutation_for_config(
 }
 
 pub fn router(state: AppState) -> Router<AppState> {
+    // The provider/model management plane (SP-PMM §2.8). Every endpoint
+    // calls the one management service; a URL that carries a secret is
+    // refused before a handler runs (a credential goes only in the body of
+    // the credential `PUT`). Model ids carry `/`, so they travel in the query
+    // or the body, never in the path.
+    let management_routes = Router::new()
+        .route(
+            "/providers",
+            get(providers::get_providers).post(providers::post_provider),
+        )
+        .route(
+            "/providers/{id}",
+            get(providers::get_provider)
+                .patch(providers::patch_provider)
+                .delete(providers::delete_provider),
+        )
+        .route(
+            "/providers/{id}/credential",
+            put(providers::put_credential).delete(providers::delete_credential),
+        )
+        .route("/providers/{id}/test", post(providers::post_test))
+        .route(
+            "/models",
+            get(models::get_models)
+                .post(models::post_model)
+                .patch(models::patch_model)
+                .delete(models::delete_model),
+        )
+        .route("/defaults", get(models::get_defaults).put(models::put_defaults))
+        .route("/routes", get(models::get_routes).post(models::post_route))
+        .route(
+            "/routes/{hint}",
+            patch(models::patch_route).delete(models::delete_route),
+        )
+        .route("/agents", get(models::get_agents))
+        .route("/agents/{name}", put(models::put_agent))
+        .route("/config/plans", post(manage::post_plan))
+        .route("/config/apply", post(manage::post_apply))
+        .route("/config/history", get(manage::get_history))
+        .route("/config/rollback", post(manage::post_rollback))
+        .route_layer(middleware::from_fn(manage::refuse_secrets_in_url));
+
+    let causal_routes = Router::new()
+        .route("/causal/status", get(causal::get_status))
+        .route("/causal/backends", get(causal::get_backends))
+        .route("/causal/test", post(causal::post_test))
+        .route("/causal/decisions", get(causal::get_decisions))
+        .route("/causal/decisions/{id}", get(causal::get_decision))
+        .route("/causal/reports", get(causal::get_report))
+        .route("/causal/reports/saved", get(causal::get_saved_reports))
+        .route("/causal/config/plans", post(causal::post_plan))
+        .route("/causal/config/apply", post(causal::post_apply))
+        .route("/causal/credential", put(causal::put_credential))
+        .route_layer(middleware::from_fn(causal::refuse_secrets_in_url));
+
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
         .route("/sessions", get(sessions::get_sessions))
@@ -62,6 +123,16 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/sessions/{id}/message",
             post(sessions::post_session_message),
+        )
+        .route(
+            "/sessions/{id}/approvals/{decision_id}",
+            get(sessions::get_decision_approval)
+                .post(sessions::post_decision_approval)
+                .delete(sessions::delete_decision_approval),
+        )
+        .route(
+            "/sessions/{id}/approvals/{decision_id}/resume",
+            post(sessions::post_decision_resume),
         )
         .route("/channels", get(channels::get_channels_status))
         // Phase 1: alias for frontend compatibility
@@ -82,6 +153,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/config", get(config::get_config))
         .route("/config/files", get(config::get_config_files))
         .route("/config/files/{filename}", put(config::put_config_file))
+        // Write-only: a credential goes in, and no response carries it back.
+        .route("/config/secrets", put(config::put_config_secret))
         .route("/config/schema", get(config::get_config_schema))
         .route("/config", post(config::post_config))
         .route("/config", put(config::post_config))
@@ -113,6 +186,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))
         .route("/plugins/{name}/reload", post(plugins::reload_plugin))
+        // The decision plane (CDP-15, SP-CDP-A 5.14).
+        .merge(causal_routes)
+        .merge(management_routes)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -247,7 +323,42 @@ pub(super) fn extract_resource_auth_token(headers: &HeaderMap) -> String {
         .unwrap_or_default()
 }
 
-async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
+/// Who an authenticated API request acts for (SP-CDP-A 5.14, D-040 OQ-A10):
+/// the owner of the rows it may read. It is derived from the bearer that
+/// passed [`auth_middleware`] and inserted into the request's extensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ApiPrincipal {
+    /// `api:<digest>`: SHA-256 over `prx-api-owner-v1 \0 token`, truncated
+    /// to 128 bits, so it is stable per token, distinct across tokens, and
+    /// never the at-rest verifier of `gateway.paired_tokens` (the plain
+    /// digest). `api:local` when pairing is off and no token was sent.
+    pub(super) owner_id: String,
+}
+
+/// Domain separator of the API owner digest (D-040 OQ-A10).
+const API_OWNER_DIGEST_DOMAIN: &str = "prx-api-owner-v1";
+
+impl ApiPrincipal {
+    /// The principal of a request that presented `token`.
+    fn of_token(token: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        if token.is_empty() {
+            return Self {
+                owner_id: "api:local".to_string(),
+            };
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(API_OWNER_DIGEST_DOMAIN.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(token.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        Self {
+            owner_id: format!("api:{}", digest.get(..32).unwrap_or(digest.as_str())),
+        }
+    }
+}
+
+async fn auth_middleware(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let provided_token = extract_resource_auth_token(request.headers());
 
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
@@ -258,6 +369,7 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
             .into_response();
     }
 
+    request.extensions_mut().insert(ApiPrincipal::of_token(&provided_token));
     next.run(request).await
 }
 

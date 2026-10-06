@@ -1,5 +1,8 @@
 # Web Console
 
+See [provider management](provider-management.md) for inspection, configuration
+transactions, credential references and recovery.
+
 Browser-based management interface for OpenPRX. Located at `console/` in the repository.
 
 ## Features
@@ -27,6 +30,219 @@ bun run build
 ```
 
 ## Long-running requests
+
+### Decision configuration
+
+Open **Decision plane** to read the current enabled state, backend health,
+circuit state, exclusions, backend timeout, current numeric policy thresholds
+and store counts. Configuration forms propose
+changes; they do not prefill the current configuration. Enable/disable,
+remote access, backend (including timeout), credential reference and policy changes first open
+the shared plan review. Apply sends that saved mutation set with the plan's
+revision; a stale revision requires a new preview. Remote access changes
+retain the server's high-risk confirmation and authorization checks.
+Blank policy inputs leave those settings unchanged. Blank backend endpoint,
+model, snapshot and timeout inputs are omitted; the server retains existing
+values, except that switching to a non-hosted kind clears the hosted snapshot.
+The credential reference field accepts a reference, never a secret value;
+`none` or an empty reference explicitly proposes clearing it. These changes
+still require plan review and apply.
+
+Leaving a decision, provider, model or routing page disposes its pending change
+flow. A late response cannot trigger another confirmation send after teardown.
+An already-sent transaction may still finish; leaving the page is not rollback.
+Provider selection and model/routing refreshes discard superseded responses;
+old provider details and route rows are cleared when their selection changes.
+
+The credential replacement panel first reads the configuration revision,
+then accepts a new secret in a password field. Submission sends it only in
+the write request body with `If-Match`; it never loads the existing secret.
+The input is cleared on submission, cancellation and page teardown. Failures
+use a generic message and are not retried automatically. A changed revision
+requires preparing the change again. A successful write with `previous_left`
+warns that the previous credential remains stored, so rotation is not fully
+complete. A status-refresh failure after a confirmed write is reported separately
+and does not instruct the operator to repeat the secret write.
+
+The backend test panel separates builtin, local configured and live tests.
+Live tests first obtain the server confirmation response, then require a
+separate confirmation before sending the neutral fixture. The confirmation
+carries the server's revision in `If-Match`, binding the active configuration
+generation and requested backend. A changed generation returns a conflict
+without sending; review the target again. They may be billed.
+The panel preserves the returned outcome, sent flag and backend attempts.
+It also shows the serving backend's answered primitives, restricted to `choice`,
+`score` and `noul`; unknown labels are not presented as coverage. A fallback's
+covered primitives do not prove conformance of the requested backend;
+fallback and not-tested results are not presented as a successful test of the
+requested backend. Failed or uncertain requests are never retried automatically.
+
+The evaluation panel reads owner-scoped reports over a UTC date window, with
+both entered dates included. A displayed report retains its successful request's
+window even when the form is edited afterward; failed requests do not relabel
+old results as a new report.
+It displays coverage, agreement, calibration, outcome/backend rates, latency,
+byte totals and counterfactual estimates with their confidence intervals.
+Unavailable metrics remain unavailable, and agreement is not causal proof.
+This read does not save a report. To preview calibration, enter the identifier
+of a report already saved by `prx causal evaluate`; the shared plan review
+then shows the server-validated changes before a revision-bound apply.
+New reports persisted with `prx causal evaluate --owner …` also receive a
+separate ownership receipt under the durable decision key. It binds the
+workspace, owner and exact report bytes without storing the owner text in the
+receipt. Historical reports are not rewritten or assigned an inferred owner;
+reports without a verifiable receipt are not eligible for owner-scoped listing.
+A missing durable key refuses an owner-scoped report write.
+
+### Decision inspection
+
+Open **Decision inspection** to list up to 100 decisions visible to the current
+authenticated account. Time filters use UTC and the result list displays its
+successful request's half-open interval (start included, end excluded). Editing
+the form does not change the displayed list's recorded query window. Details
+also show the record timestamp and decision-cache flag. Narrow the window to examine
+older records, or enter a decision identifier to load it directly. Details
+show the chosen directive, backend, policy, candidates, recorded action/target
+probability distributions, per-pass gate counts and recorded outcome
+classifications. An outcome join means records have been linked; it does not
+by itself establish successful execution. Missing outcomes remain unknown.
+Router history/readmission evidence is historical: it cannot authorize a new
+provider attempt, and a recorded refusal does not prove a premium or vision call
+was sent. Provider/model/routing configuration success likewise does not establish
+that KNN ran or that a billed auxiliary request was admitted. The
+[routing and cost lifecycle](provider-routing-cost-lifecycle.md#embedded-local-routing)
+describes the local candidate's supported path and pending acceptance.
+A `delegated` parent outcome records completed dispatch with partial completeness;
+child completion remains separate. Details show up to 64 owner-scoped child
+outcome links, with a truncation notice when more exist. Each link opens the child
+decision and shows its recorded classification and completeness. Missing child
+links leave completion unknown; child costs are not added to the parent record.
+The page uses an explicit field projection rather than a raw decision record
+dump. Its optional projection section reads only the historical redacted state
+actually saved by the recording policy. It never reconstructs missing state
+from current input. Reads share the decision owner scope, reject oversized
+payloads, and reapply display redaction. Additional display masking is labeled;
+projection contents are excluded from debug output. Distribution labels are restricted to canonical
+actions and targets; absent, legacy or invalid maps remain unavailable without
+fabricated probabilities or renormalization. Gate details are read under the
+same owner scope and reduced to pass/approval counts and blocked gate numbers.
+Operation digests and arbitrary diagnostic strings are not exposed. Missing,
+legacy or malformed gate summaries remain unavailable.
+
+### Decision approval and resume
+
+In a conversation, expand **Review a pending operation**, enter the decision
+identifier from the waiting reply, and load its details. Inspect the tool,
+effect and redacted arguments before approving. Approval, rejection,
+revocation and execution are separate buttons. The panel sends no display
+arguments back to the server; execution uses the saved original call. Review
+and revocation acknowledgements are checked against the inspected decision;
+the panel shows single-use status and the returned approval expiration. A
+conversation-refresh failure after an execution response is distinguished from
+an unknown execution result. A failed execution request is shown as an unknown result and is never retried
+automatically. Check conversation history before another attempt.
+
+When the decision plane is enabled, an authenticated owner can inspect a
+pending call with `GET /api/sessions/{id}/approvals/{decision_id}`. The response
+contains the tool, redacted arguments, call digest and pending expiration;
+`arguments_redacted` identifies a changed display and `original_call_available`
+indicates whether an authenticated encrypted snapshot exists. This projection
+contains no reusable grant and does not assert that execution is currently
+approved. Missing, expired or inaccessible records return a conflict response.
+
+An authenticated operator can review a
+pending call with `POST /api/sessions/{id}/approvals/{decision_id}` and JSON
+`{"approved":true}` (or `false` to reject). Review records a decision-scoped
+approval; it does not execute the operation. An initial `RequestApproval`
+directive closes with the decision identifier and effect category, without
+entering the ordinary model/tool loop. Its outcome is `awaiting_approval`,
+not operation success. The pending record must be durable before this close
+is issued.
+
+Console review, rejection, revocation and resume are authenticated owner control
+operations. Read-only policy still refuses them with HTTP 403 and the existing API rate limits
+still apply. They do not require a prior autonomous runtime grant merely to
+review an operation: the signed owner review is the grant issuance step.
+Each request verifies the durable pending owner, workspace, session, source and
+current publication. Resume independently verifies and consumes the original
+single-use exact-call grant, including the current schema, path and arguments;
+control authorization never grants general filesystem permission. Control
+requests are audited separately from signed review and execution evidence.
+
+To revoke an issued, unexpired approval, use
+`DELETE /api/sessions/{id}/approvals/{decision_id}`. This records revocation
+without deleting the audit history. Repeating a matching revocation is safe
+while the approval remains current. Revocation and execution consumption
+compete for the same durable resolution; an already consumed approval cannot
+be reported as revoked. Missing, expired, conflicting or consumed approvals
+return a conflict response, and revocation never stops an operation that has
+already claimed its grant.
+
+Resume through `POST /api/sessions/{id}/approvals/{decision_id}/resume` with
+`{}` to recover the original call from its authenticated encrypted snapshot.
+Older records without a snapshot require
+`{"tool":"tool_name","arguments":{}}`, supplying the original approved tool
+and arguments; this explicit form also remains supported for newer records.
+Do not copy redacted display arguments into an explicit resume request.
+The route requires the same authenticated owner, session and
+actor, a current unexpired approval, and current policy permission. Unknown
+request fields are rejected. Ordinary session messages never trigger resume
+by resembling this JSON.
+
+Resume creates a new recorded input and reruns the decision gates and selection.
+Approval permits the exact call; it does not force an execution decision. A
+clarification or refusal closes the turn without dispatch. An unconsumed,
+unexpired approval can still be revoked through the owner control above.
+
+When the decision selects execution, the route dispatches the approved call
+directly. A changed call, schema, catalog, resolved operation or authority is
+refused. Approval is consumed once after execution preparation and reservation;
+a failed or uncertain attempt does not restore it. No main-model response or
+usage is invented for direct execution. The execution result includes
+`execution_status` and a reply; a finished job alone does not establish operation
+success. A closed clarification or refusal returns its reply without an
+execution result.
+The route supports the same synchronous and asynchronous job modes below.
+
+### Private files
+
+In the candidate runtime, Console `file_read`, `file_write` and `file_edit`
+address the authenticated owner's private file space. For example,
+`notes/result.txt` belongs to that owner within the current workspace identity.
+Another owner using the same path addresses a different file. Console does not
+import or write files from the shared workspace. Ordinary Chat file paths keep
+their existing workspace meaning.
+
+Use relative paths. Absolute paths, parent traversal, symbolic links, hard links
+and special files are rejected. Reads and edits are limited to 10 MiB files.
+Writes still require the current execution policy and, when requested, exact
+owner approval. Approval review and resume resolve the same private target;
+changed owner, root identity or call data requires a new approval. Private
+write/edit results report the affected logical path and byte or replacement
+count, without a shared-workspace diff preview.
+
+Storage uses `owner-files/v1` beneath the existing configuration directory,
+outside the shared workspace, with private directories and files. Configuration
+layouts that overlap these spaces or lack safe ownership/permissions leave
+private file capabilities unavailable; there is no fallback to shared files.
+Directories are created only during an authorized write. Unsupported platforms
+also leave these capabilities unavailable. This is isolation between Console
+owners, not protection against an administrator controlling the host account.
+No new configuration option or MCP file permission is introduced.
+
+Private file namespaces also depend on the configuration directory's filesystem
+identity. Moving, recreating or restoring that directory onto another filesystem
+can select a new namespace. Existing private files are not automatically imported
+or remapped. Preserve the old data and arrange an explicit migration that verifies
+its owner; this candidate provides no automatic migration command. Previously
+issued approvals cannot be reused across a root identity change. Obtain fresh
+approvals when required by the current execution policy.
+
+Signed child-worker source snapshots now retain the isolation flag explicitly.
+Older snapshots without that provenance are refused and need a newly issued
+child task; they are not restored with weaker permissions.
+
+### Job lifecycle
 
 The gateway has no request timeout. Routes that can start an agent turn —
 `POST /webhook`, `POST /api/sessions/{id}/message`, `POST /mcp/v1/tools/call` —
@@ -199,3 +415,9 @@ second auth surface, a port per terminal — or routing visibility through share
 memory, which first requires unifying the operator identity and the chat user's
 memory principal that the section above says are separate today. Both are
 independent pieces of engineering, and neither is pretended to be done here.
+
+The read-only `GET /api/causal/reports/saved` catalog returns only authenticated owner report IDs and timestamps. It scans at most 4096 directory entries and verifies at most 128 canonical report files; `complete: false` denotes a bounded or unavailable catalog. Unbound historical and operator reports remain invisible. Results are sorted by creation time within the inspected subset; an incomplete result is not a newest-report guarantee. Owner report writes and reads share a 2 MiB limit. The Console can load this catalog and select a report ID for the existing explicit calibration preview; selecting alone applies no change.
+
+Decision inspection also projects recorded Noul probabilities for canonical global and candidate questions. Missing, legacy or malformed feature maps remain unavailable; the view neither fills missing probabilities nor renormalizes them. Candidate feature names are restricted to canonical action/target keys and optional eight-digit hexadecimal namespace discriminators.
+
+Ordinary Console session messages use the pinned source-bound built-in decision service even when the causal plane is disabled. Disabled mode may use authenticated in-memory input when no durable event exists, omits causal settlement/rejoin, and keeps normal transcript persistence and cancellation cleanup. Approval/revoke/resume endpoints remain unavailable while disabled. Gateway default-provider construction binds the exact PMM-resolved model and credentials in both modes.

@@ -1,7 +1,7 @@
 //! Event bridge for live read-only attach (v1.1a).
 //!
 //! Background sub-agents spawned by the chat `/bg` command run a full agent loop
-//! ([`crate::agent::loop_::run_tool_call_loop`]). That loop can stream its
+//! ([`crate::agent::turn_engine::run_turn`]). That loop can stream its
 //! incremental output and tool-call notifications over `on_delta` /
 //! `on_tool_call` channels. To surface those to the chat UI **without ever
 //! back-pressuring the background agent**, this module implements the decoupling
@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   background agent          drainer task              chat main loop
-//!   (run_tool_call_loop)   (one per session)        (single SessionEvent rx)
+//!   (run_turn)   (one per session)        (single SessionEvent rx)
 //!
 //!   on_delta  ──send().await──▶  raw_delta_rx  ─┐
 //!                                                ├─ try_send ─▶ event_tx ──▶ ring
@@ -33,7 +33,8 @@
 //! "real-time tokens".
 
 use super::id::SessionId;
-use crate::agent::loop_::{SpawnEventSink, ToolCallNotification};
+use crate::agent::turn_contracts::ToolCallNotification;
+use crate::agent::turn_request::SpawnEventSink;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
@@ -92,7 +93,7 @@ impl SessionEvent {
 
 /// The chat-side sink that owns the producer end of the chat main loop's single
 /// [`SessionEvent`] channel and turns it into the library-level
-/// [`SpawnEventSink`] that `tools::sessions_spawn` understands.
+/// `SpawnEventSink` that `tools::sessions_spawn` understands.
 ///
 /// `tools` is a *library* module and must not depend on `chat`, so the wiring is
 /// inverted: this chat-side type builds a closure (capturing `event_tx`) that,
@@ -106,7 +107,7 @@ pub struct SessionEventSink {
 impl SessionEventSink {
     /// Build a sink/receiver pair. The chat main loop keeps the `Receiver`
     /// (it must be the single consumer — never clone or share it); the
-    /// [`SessionEventSink`] is turned into a [`SpawnEventSink`] for the tool.
+    /// [`SessionEventSink`] is turned into a `SpawnEventSink` for the tool.
     #[must_use]
     pub fn channel() -> (Self, mpsc::Receiver<SessionEvent>) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -124,12 +125,12 @@ impl SessionEventSink {
         self.event_tx.clone()
     }
 
-    /// Build the library-level [`SpawnEventSink`] to hand to the spawn tool.
+    /// Build the library-level `SpawnEventSink` to hand to the spawn tool.
     ///
     /// The returned sink, when invoked by `sessions_spawn` for a given run id,
     /// creates that run's middle channels, spawns its drainer (tagged with the
     /// run's [`SessionId`]), and returns the `on_delta` / `on_tool_call`
-    /// senders for `run_tool_call_loop`.
+    /// senders for `run_turn`.
     #[must_use]
     pub fn into_spawn_sink(self) -> SpawnEventSink {
         let event_tx = self.event_tx;

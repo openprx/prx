@@ -1,9 +1,66 @@
 use crate::self_system::evolution::analyzer::EvolutionCandidate;
 use crate::self_system::evolution::cycle_types::{EvolutionCycle, EvolutionProposal, FitnessTrend};
 use crate::self_system::evolution::record::{EvolutionLayer, EvolutionLog};
+use crate::self_system::evolution::rollback::RollbackManager;
+use crate::self_system::evolution::safety_utils::atomic_write;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// A change an engine proposes but has not written (D-046). Engines never
+/// write their target in `run_cycle`: the pipeline judges the proposal and
+/// applies this only after an accepted verdict, in a task the daemon waits
+/// for on shutdown.
+#[async_trait]
+pub trait PendingChange: Send + Sync + std::fmt::Debug {
+    /// Write the change. The pipeline calls it at most once.
+    async fn apply(&self) -> Result<()>;
+}
+
+/// The common pending change: snapshot the target for a later manual
+/// rollback, then replace it atomically.
+pub struct FileChange {
+    workspace_root: PathBuf,
+    target: PathBuf,
+    content: String,
+    backup: RollbackManager,
+}
+
+impl FileChange {
+    pub const fn new(workspace_root: PathBuf, target: PathBuf, content: String, backup: RollbackManager) -> Self {
+        Self {
+            workspace_root,
+            target,
+            content,
+            backup,
+        }
+    }
+}
+
+impl std::fmt::Debug for FileChange {
+    // The content can be a whole prompt; it is never logged (FIX-P0-05).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileChange")
+            .field("target", &self.target)
+            .field("content_bytes", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PendingChange for FileChange {
+    async fn apply(&self) -> Result<()> {
+        self.backup.backup_current_version().await?;
+        if let Some(parent) = self.target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        atomic_write(&self.workspace_root, &self.target, self.content.as_bytes()).await
+    }
+}
 
 /// Engine input payload shared by layer-specific evolution executors.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,6 +81,10 @@ pub struct CycleResult {
     pub evolution_log: Option<EvolutionLog>,
     pub needs_human_approval: bool,
     pub shadow_mode: bool,
+    /// The change to write if the verdict accepts it; `None` when the cycle
+    /// proposes nothing to write (DraftOnly, Shadow, a refused gate).
+    #[serde(skip)]
+    pub pending: Option<Arc<dyn PendingChange>>,
 }
 
 /// Unified trait for evolution layer executors.
@@ -31,6 +92,8 @@ pub struct CycleResult {
 pub trait EvolutionEngine: Send + Sync {
     fn name(&self) -> &'static str;
     fn layer(&self) -> EvolutionLayer;
+    /// Propose one cycle's change. Never writes the layer's target: the
+    /// change to write goes in [`CycleResult::pending`] (D-046).
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult>;
 }
 

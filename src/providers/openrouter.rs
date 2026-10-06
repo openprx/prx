@@ -117,24 +117,34 @@ impl OpenRouterProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        let items = tools?;
-        if items.is_empty() {
-            return None;
+    /// Lower every published tool schema to what this endpoint was declared to
+    /// accept, or refuse the request naming the tool that cannot be offered.
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<Vec<NativeToolSpec>>> {
+        let items = tools.filter(|items| !items.is_empty());
+        let Some(items) = items else {
+            return Ok(None);
+        };
+        let dialect = self.tool_schema_dialect();
+        let mut converted = Vec::with_capacity(items.len());
+        for tool in items {
+            let parameters =
+                dialect
+                    .wire_schema(&tool.name, &tool.parameters)
+                    .map_err(|error| super::ProviderCapabilityError {
+                        provider: "openrouter".to_string(),
+                        capability: "tool_schema_dialect".to_string(),
+                        message: error.to_string(),
+                    })?;
+            converted.push(NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: parameters.into_owned(),
+                },
+            });
         }
-        Some(
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect(),
-        )
+        Ok(Some(converted))
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -262,7 +272,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
+            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
         })?;
 
         let mut messages = Vec::new();
@@ -316,7 +326,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
+            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
         })?;
 
         let api_messages: Vec<Message> = messages
@@ -364,10 +374,10 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
+            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
         })?;
 
-        let tools = Self::convert_tools(request.tools);
+        let tools = self.convert_tools(request.tools)?;
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -413,7 +423,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
+            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
         })?;
 
         // Convert tool JSON values to NativeToolSpec
@@ -494,26 +504,35 @@ impl Provider for OpenRouterProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::Provider(
-                        "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                        "OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.".to_string(),
                     ))
                 })
                 .boxed();
             }
         };
 
+        // Lowered before the connection is opened, so a tool this endpoint
+        // cannot be offered ends the turn with the reason, not an upstream 400.
+        let tools = match self.convert_tools(options.tools.as_deref()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature,
             stream: true,
             tool_choice: options.tools.as_ref().map(|_| "auto".to_string()),
-            tools: Self::convert_tools(options.tools.as_deref()),
+            tools,
         };
         let client = self.http_client();
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-        tokio::spawn(async move {
+        crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let response = match client
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
@@ -538,12 +557,11 @@ impl Provider for OpenRouterProvider {
                 return;
             }
 
-            let mut chunks = crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens);
-            while let Some(chunk) = chunks.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
-            }
+            crate::providers::compatible::forward_stream_until_closed(
+                crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens),
+                &tx,
+            )
+            .await;
         });
 
         stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()

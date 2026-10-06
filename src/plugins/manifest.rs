@@ -131,6 +131,78 @@ pub struct Resources {
     /// 0 means no pooling (default). Reserved for future use.
     #[serde(default)]
     pub pool_size: usize,
+    /// Host-side cap on the payload handed to the guest in one call.
+    /// Absent means "derive it from `max_memory_mb`".
+    #[serde(default)]
+    pub max_payload_bytes: Option<u64>,
+}
+
+/// Floor for the derived payload cap, so a small `max_memory_mb` cannot make a
+/// plugin skip ordinary envelopes.
+const MIN_PAYLOAD_CAP_BYTES: u64 = 64 * 1024;
+
+impl Resources {
+    /// Largest payload the host will hand to a guest in one call.
+    ///
+    /// A guest that parses its input into a DOM holds three live copies of the
+    /// text at once — the canonical ABI copy of the argument, the parsed value
+    /// and the serialized result — so the text has to stay well under the
+    /// linear-memory cap. Above it the guest's `memory.grow` fails, which
+    /// `trap_on_grow_failure` turns into a trap that poisons the whole store.
+    /// An eighth of the cap leaves room for all three copies; an author whose
+    /// guest streams instead of DOM-parsing can raise it with
+    /// `max_payload_bytes`.
+    pub fn payload_cap_bytes(&self) -> usize {
+        let cap = self.max_payload_bytes.map_or_else(
+            || (self.guest_memory_bytes() / 8).max(MIN_PAYLOAD_CAP_BYTES),
+            |explicit| explicit.max(1),
+        );
+        usize::try_from(cap).unwrap_or(usize::MAX)
+    }
+
+    /// Linear memory the guest may grow to, in bytes.
+    const fn guest_memory_bytes(&self) -> u64 {
+        self.max_memory_mb.saturating_mul(1024).saturating_mul(1024)
+    }
+
+    /// Normalise an explicit `max_payload_bytes` so a manifest cannot configure
+    /// a cap that is useless in one direction or dangerous in the other.
+    ///
+    /// `0` is rejected: it caps the payload at one byte, which skips every call
+    /// for the adapter's whole life, and no author writes it meaning that. An
+    /// author who wants every call skipped removes the capability instead.
+    ///
+    /// A cap above the guest's own linear memory is clamped rather than
+    /// rejected. Such a cap re-arms the trap-rebuild-quarantine loop the
+    /// host-side guard exists to close, but it was accepted before, so
+    /// rejecting it would turn a tuning mistake into a plugin that no longer
+    /// loads at all. Clamping keeps the plugin running with the footgun
+    /// removed, and the warning names the manifest that has to be corrected.
+    fn normalize_payload_cap(&mut self, plugin: &str) -> PluginResult<()> {
+        let Some(explicit) = self.max_payload_bytes else {
+            return Ok(());
+        };
+        if explicit == 0 {
+            return Err(PluginError::Manifest(format!(
+                "plugin '{plugin}' sets resources.max_payload_bytes = 0, which refuses every call \
+                 into the plugin; remove the key to derive the cap from max_memory_mb"
+            )));
+        }
+        let guest_bytes = self.guest_memory_bytes();
+        // `max_memory_mb = 0` leaves nothing to clamp against and cannot
+        // instantiate a guest at all, so it is left to fail where it is armed.
+        if guest_bytes > 0 && explicit > guest_bytes {
+            tracing::warn!(
+                plugin,
+                max_payload_bytes = explicit,
+                max_memory_mb = self.max_memory_mb,
+                clamped_to = guest_bytes,
+                "resources.max_payload_bytes exceeds the guest linear-memory cap and was clamped to it"
+            );
+            self.max_payload_bytes = Some(guest_bytes);
+        }
+        Ok(())
+    }
 }
 
 impl Default for Resources {
@@ -142,6 +214,7 @@ impl Default for Resources {
             max_http_requests_per_call: default_max_http_requests(),
             max_kv_storage_mb: default_max_kv_storage_mb(),
             pool_size: 0,
+            max_payload_bytes: None,
         }
     }
 }
@@ -199,7 +272,7 @@ impl PluginManifest {
         }
         let content = std::str::from_utf8(&bytes)
             .map_err(|error| PluginError::Manifest(format!("plugin manifest is not UTF-8: {error}")))?;
-        let manifest: Self = toml::from_str(&content).map_err(|e| PluginError::ManifestParse {
+        let mut manifest: Self = toml::from_str(&content).map_err(|e| PluginError::ManifestParse {
             path: path.display().to_string(),
             source: e,
         })?;
@@ -207,8 +280,10 @@ impl PluginManifest {
         Ok(manifest)
     }
 
-    /// Basic validation of required fields.
-    fn validate(&self) -> PluginResult<()> {
+    /// Basic validation of required fields, plus the `[resources]`
+    /// normalisation that keeps an explicit payload cap inside what the guest
+    /// can actually hold.
+    fn validate(&mut self) -> PluginResult<()> {
         if self.plugin.name.is_empty() {
             return Err(PluginError::Manifest("plugin name cannot be empty".to_string()));
         }
@@ -259,6 +334,7 @@ impl PluginManifest {
                 )));
             }
         }
+        self.resources.normalize_payload_cap(&self.plugin.name)?;
         Ok(())
     }
 
@@ -280,6 +356,91 @@ impl PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_cap_is_derived_from_guest_memory_and_manifest_overridable() {
+        let derived = Resources {
+            max_memory_mb: 8,
+            ..Resources::default()
+        };
+        assert_eq!(derived.payload_cap_bytes(), 1024 * 1024);
+
+        let tiny_guest = Resources {
+            max_memory_mb: 1,
+            ..Resources::default()
+        };
+        assert_eq!(tiny_guest.payload_cap_bytes(), 128 * 1024);
+
+        let unset_guest_memory = Resources {
+            max_memory_mb: 0,
+            ..Resources::default()
+        };
+        assert_eq!(
+            unset_guest_memory.payload_cap_bytes(),
+            usize::try_from(MIN_PAYLOAD_CAP_BYTES).unwrap()
+        );
+
+        // An override the guest can hold is taken verbatim; `validate()` is what
+        // clamps one it cannot, so the raw accessor never has to second-guess it.
+        let overridden = Resources {
+            max_memory_mb: 64,
+            max_payload_bytes: Some(16 * 1024 * 1024),
+            ..Resources::default()
+        };
+        assert_eq!(overridden.payload_cap_bytes(), 16 * 1024 * 1024);
+
+        let parsed: PluginManifest = toml::from_str(
+            r#"
+[plugin]
+name = "streaming"
+version = "0.1.0"
+
+[resources]
+max_memory_mb = 8
+max_payload_bytes = 32
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.resources.payload_cap_bytes(), 32);
+    }
+
+    fn manifest_with_payload_cap(max_memory_mb: u64, max_payload_bytes: u64) -> PluginManifest {
+        toml::from_str(&format!(
+            r#"
+[plugin]
+name = "capped"
+version = "0.1.0"
+
+[resources]
+max_memory_mb = {max_memory_mb}
+max_payload_bytes = {max_payload_bytes}
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_payload_cap_above_guest_memory_is_clamped_to_it() {
+        let mut clamped = manifest_with_payload_cap(8, 16 * 1024 * 1024);
+        clamped
+            .validate()
+            .expect("test: an over-large cap is clamped, not rejected");
+        assert_eq!(clamped.resources.payload_cap_bytes(), 8 * 1024 * 1024);
+
+        let mut kept = manifest_with_payload_cap(64, 16 * 1024 * 1024);
+        kept.validate().expect("test: a cap the guest can hold is kept");
+        assert_eq!(kept.resources.payload_cap_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_zero_payload_cap_is_rejected() {
+        let mut zero = manifest_with_payload_cap(8, 0);
+        let error = zero
+            .validate()
+            .expect_err("test: a zero cap skips every call and must be rejected")
+            .to_string();
+        assert!(error.contains("max_payload_bytes"), "{error}");
+    }
 
     #[test]
     fn parse_minimal_manifest() {
@@ -467,7 +628,7 @@ name = ""
 version = "0.1.0"
 "#;
         // Parse succeeds, but validate() should reject empty name.
-        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let mut manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         let result = manifest.validate();
         assert!(result.is_err(), "empty plugin name should fail validation");
         let err = format!("{}", result.unwrap_err());
@@ -481,7 +642,7 @@ version = "0.1.0"
 name = "my-plugin"
 version = ""
 "#;
-        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let mut manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         let result = manifest.validate();
         assert!(result.is_err(), "empty plugin version should fail validation");
         let err = format!("{}", result.unwrap_err());

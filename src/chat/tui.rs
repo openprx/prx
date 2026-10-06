@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::loop_::ChatMode;
+use crate::agent::turn_contracts::ChatMode;
 use crate::chat::action::{MainQueueStatus, ProviderWorkerRowState, ProviderWorkerStatus, ProviderWorkerStatusRow};
 use crate::chat::commands::{CommandArgCandidate, CommandArgSource, CommandSpec, command_specs};
 use crate::chat::session::MainSessionTokenUsageSummary;
@@ -1069,15 +1069,6 @@ pub fn transcript_switcher_entry() -> crate::chat::sessions::SwitcherEntry {
     }
 }
 
-fn switcher_entries_with_transcript(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-) -> Vec<crate::chat::sessions::SwitcherEntry> {
-    let mut out = Vec::with_capacity(entries.len().saturating_add(1));
-    out.push(transcript_switcher_entry());
-    out.extend(entries.iter().filter(|entry| !entry.is_transcript()).cloned());
-    out
-}
-
 fn switcher_entries_with_transcript_and_workers(
     entries: &[crate::chat::sessions::SwitcherEntry],
     workers: ProviderWorkerStatus,
@@ -1170,13 +1161,6 @@ fn focus_active_entry_seq(focus: crate::chat::sessions::FocusTarget) -> Option<u
             .worker_sequence()
             .map(|sequence| PROVIDER_WORKER_SWITCHER_SEQ_BASE.saturating_add(sequence))
     })
-}
-
-pub(crate) fn focus_entry_index(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    focus: crate::chat::sessions::FocusTarget,
-) -> Option<usize> {
-    focus_active_entry_seq(focus).and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
 }
 
 const MAIN_SESSION_SELECTION_SEQ: u64 = 0;
@@ -3515,16 +3499,6 @@ impl TuiState {
         }
         None
     }
-
-    /// Total content lines (estimated). Used by tests to compare folded vs
-    /// expanded card row counts.
-    #[cfg(test)]
-    fn total_content_lines(&self) -> usize {
-        self.conversation_lines
-            .iter()
-            .map(|l| estimate_line_height(l) as usize)
-            .sum()
-    }
 }
 
 pub(crate) const fn tool_result_defaults_expanded(tool_name: &str) -> bool {
@@ -3690,60 +3664,6 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
             "Pure mode ignores the UiActor side path (driver already dispatched StreamCancelled)"
         );
     }
-}
-
-/// Logical row count for a [`ConversationLine`], **before** soft-wrap.
-/// Used by tests to compare folded vs expanded card row counts.
-/// Always returns >= 1.
-fn estimate_line_height(line: &ConversationLine) -> u16 {
-    let rows = match line {
-        ConversationLine::User { content } => {
-            // First content line shares the row with the `> ` prompt; further
-            // rows render as continuations. Trailing blank separator.
-            content.lines().count().max(1) + 1
-        }
-        ConversationLine::Assistant { content } | ConversationLine::StreamingAssistant { content } => {
-            // No prefix row, just content + trailing blank.
-            content.lines().count().max(1) + 1
-        }
-        ConversationLine::System { content } => content.lines().count().max(1) + 1,
-        ConversationLine::Tool { .. } => 1,
-        ConversationLine::ToolResult {
-            folded, result, status, ..
-        } => {
-            // Compact action header (1 row) + an optional follow-on block.
-            // While running there is no follow-on yet.
-            if matches!(status, ToolStatus::Running) {
-                1
-            } else if *folded {
-                // Header + branch/metrics summary row + bounded preview.
-                let result_text = result.as_deref().unwrap_or("");
-                let preview_rows = if result_text.trim().is_empty() {
-                    0
-                } else {
-                    let total = result_text.lines().count();
-                    total.min(TOOL_FOLDED_RESULT_PREVIEW_LINES) + usize::from(total > TOOL_FOLDED_RESULT_PREVIEW_LINES)
-                };
-                2 + preview_rows
-            } else {
-                // header + input row + output/error label + bounded body rows
-                let body = result.as_deref().filter(|s| !s.is_empty()).unwrap_or("");
-                let body_line_count = body.lines().count();
-                let body_rows = body_line_count.clamp(1, TOOL_EXPANDED_OUTPUT_MAX_LINES);
-                let trunc_row = usize::from(body_line_count > TOOL_EXPANDED_OUTPUT_MAX_LINES);
-                3 + body_rows + trunc_row
-            }
-        }
-        ConversationLine::Reasoning { folded, content, .. } => {
-            if *folded {
-                1
-            } else {
-                // header + content body (one row per logical line, min 1)
-                1 + content.lines().count().max(1)
-            }
-        }
-    };
-    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Count the visible rows a `Vec<Line>` will consume at the given
@@ -4744,64 +4664,6 @@ fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: boo
     session_status_glyph_for_tick(entry, ascii, current_animation_tick())
 }
 
-const SESSION_STRIP_CHIP_MAX_WIDTH: u16 = 24;
-const SESSION_STRIP_USAGE_CHIP_MAX_WIDTH: u16 = 48;
-const SESSION_STRIP_IDLE_CHIP_MAX_WIDTH: u16 = 30;
-const SESSION_STRIP_TITLE_MAX_WIDTH: u16 = 10;
-
-fn render_sessions_strip_entry(
-    entry: &crate::chat::sessions::SwitcherEntry,
-    active_seq: Option<u64>,
-    ascii: bool,
-    max_width: u16,
-) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let marker = session_active_marker(active_seq == Some(entry.seq), ascii);
-    let glyph = session_status_glyph(entry, ascii);
-    let elapsed = entry.elapsed_label();
-    let idle = if entry.idle_warning {
-        if ascii { " [idle]" } else { " ⚠ idle" }
-    } else {
-        ""
-    };
-    let usage = entry
-        .token_usage_summary()
-        .and_then(crate::chat::session::format_session_token_usage_inline);
-    let chip_cap = if usage.is_some() {
-        SESSION_STRIP_USAGE_CHIP_MAX_WIDTH
-    } else if entry.idle_warning {
-        SESSION_STRIP_IDLE_CHIP_MAX_WIDTH
-    } else {
-        SESSION_STRIP_CHIP_MAX_WIDTH
-    };
-    let chip_width = max_width.min(chip_cap);
-    let display_id = switcher_entry_display_id(entry);
-    let prefix = usage.map_or_else(
-        || format!("{marker}{glyph} {display_id} {} {elapsed}{idle}", entry.kind),
-        |usage| format!("{marker}{glyph} {display_id} {} {elapsed}{idle} {usage}", entry.kind),
-    );
-    let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
-    let max = usize::from(chip_width);
-    if prefix_cols >= max {
-        return truncate_chars_with_ellipsis(&prefix, chip_width, ascii);
-    }
-    let remaining = max.saturating_sub(prefix_cols);
-    if remaining <= 1 {
-        return prefix;
-    }
-    let title_budget = u16::try_from(remaining.saturating_sub(1))
-        .unwrap_or(u16::MAX)
-        .min(SESSION_STRIP_TITLE_MAX_WIDTH);
-    let title = truncate_chars_with_ellipsis(&entry.title, title_budget, ascii);
-    if title.is_empty() {
-        prefix
-    } else {
-        format!("{prefix} {title}")
-    }
-}
-
 fn render_sessions_list_entry_line(
     entry: &crate::chat::sessions::SwitcherEntry,
     active_seq: Option<u64>,
@@ -4862,7 +4724,7 @@ fn render_main_session_list_line<V: BottomChromeView + ?Sized>(state: &V, width:
         sep,
         usage,
         sep,
-        state.provider(),
+        crate::providers::redact_endpoint_userinfo(state.provider()),
         state.model()
     );
     let text = truncate_chars_with_ellipsis(&text, width, ascii);
@@ -4932,227 +4794,6 @@ fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
         lines.push(render_sessions_navigation_hint_line(ascii, focus, width));
     }
     lines
-}
-
-fn render_sessions_strip_line(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    summary: &str,
-    focus: crate::chat::sessions::FocusTarget,
-    ascii: bool,
-    width: u16,
-) -> String {
-    render_sessions_strip_styled_line(entries, summary, focus, ascii, width)
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
-}
-
-fn render_sessions_strip_styled_line(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    summary: &str,
-    focus: crate::chat::sessions::FocusTarget,
-    ascii: bool,
-    width: u16,
-) -> Line<'static> {
-    if width == 0 {
-        return Line::default();
-    }
-    let content_width = width.saturating_sub(1);
-    if content_width == 0 {
-        return Line::default();
-    }
-    if entries.is_empty() {
-        if summary.is_empty() {
-            return Line::default();
-        }
-        let text = truncate_chars_with_ellipsis(summary, content_width, ascii);
-        return Line::from(vec![Span::raw(" "), Span::raw(text)]);
-    }
-
-    let active_seq = focus_active_entry_seq(focus);
-    let target_idx = focus_entry_index(entries, focus);
-    let start = target_idx
-        .map(|target| sessions_strip_window_start(entries, active_seq, ascii, content_width, target))
-        .unwrap_or(0);
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(render_sessions_strip_window(
-        entries,
-        start,
-        active_seq,
-        ascii,
-        content_width,
-    ));
-    Line::from(spans)
-}
-
-fn sessions_strip_window_start(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    active_seq: Option<u64>,
-    ascii: bool,
-    width: u16,
-    target_idx: usize,
-) -> usize {
-    for start in 0..=target_idx {
-        let visible = sessions_strip_visible_indices(entries, start, active_seq, ascii, width);
-        if visible.contains(&target_idx) {
-            return start;
-        }
-    }
-    target_idx.min(entries.len().saturating_sub(1))
-}
-
-fn sessions_strip_visible_indices(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    start: usize,
-    active_seq: Option<u64>,
-    ascii: bool,
-    width: u16,
-) -> Vec<usize> {
-    let mut visible = Vec::new();
-    let mut used_cols = 0usize;
-    let width_cols = usize::from(width);
-    if width_cols == 0 || start >= entries.len() {
-        return visible;
-    }
-    let left = sessions_strip_left_overflow(start, ascii);
-    if !left.is_empty() {
-        let left_cols = UnicodeWidthStr::width(left);
-        if left_cols >= width_cols {
-            return visible;
-        }
-        used_cols = used_cols.saturating_add(left_cols);
-    }
-    for idx in start..entries.len() {
-        let Some(entry) = entries.get(idx) else {
-            break;
-        };
-        let sep_cols = usize::from(idx > start);
-        let hidden_after = entries.len().saturating_sub(idx.saturating_add(1));
-        let right_cols = sessions_strip_right_overflow_width(hidden_after, ascii);
-        let available = width_cols
-            .saturating_sub(used_cols)
-            .saturating_sub(sep_cols)
-            .saturating_sub(right_cols);
-        if available == 0 {
-            break;
-        }
-        let segment =
-            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(available).unwrap_or(u16::MAX));
-        let segment_cols = UnicodeWidthStr::width(segment.as_str());
-        let seq_marker = switcher_entry_display_id(entry);
-        if segment.is_empty()
-            || segment_cols == 0
-            || !segment.contains(seq_marker.as_str())
-            || used_cols
-                .saturating_add(sep_cols)
-                .saturating_add(segment_cols)
-                .saturating_add(right_cols)
-                > width_cols
-        {
-            break;
-        }
-        visible.push(idx);
-        used_cols = used_cols.saturating_add(sep_cols).saturating_add(segment_cols);
-    }
-    visible
-}
-
-fn render_sessions_strip_window(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    start: usize,
-    active_seq: Option<u64>,
-    ascii: bool,
-    width: u16,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let width_cols = usize::from(width);
-    if width_cols == 0 || start >= entries.len() {
-        return spans;
-    }
-
-    let mut used_cols = 0usize;
-    let left = sessions_strip_left_overflow(start, ascii);
-    if !left.is_empty() {
-        let left_cols = UnicodeWidthStr::width(left);
-        if left_cols >= width_cols {
-            spans.push(Span::raw(truncate_chars_with_ellipsis(left, width, ascii)));
-            return spans;
-        }
-        spans.push(Span::styled(left.to_string(), Style::default().fg(Color::DarkGray)));
-        used_cols = used_cols.saturating_add(left_cols);
-    }
-
-    let visible = sessions_strip_visible_indices(entries, start, active_seq, ascii, width);
-    for (position, idx) in visible.iter().copied().enumerate() {
-        let Some(entry) = entries.get(idx) else {
-            break;
-        };
-        if position > 0 {
-            spans.push(Span::raw(" "));
-            used_cols = used_cols.saturating_add(1);
-        }
-        let hidden_after = entries.len().saturating_sub(idx.saturating_add(1));
-        let right_cols = sessions_strip_right_overflow_width(hidden_after, ascii);
-        let available = width_cols.saturating_sub(used_cols).saturating_sub(right_cols);
-        if available == 0 {
-            break;
-        }
-        let segment =
-            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(available).unwrap_or(u16::MAX));
-        let segment_cols = UnicodeWidthStr::width(segment.as_str());
-        if segment.is_empty()
-            || segment_cols == 0
-            || used_cols.saturating_add(segment_cols).saturating_add(right_cols) > width_cols
-        {
-            break;
-        }
-        spans.push(Span::raw(segment));
-        used_cols = used_cols.saturating_add(segment_cols);
-    }
-
-    let rendered_last = visible.last().copied();
-    let hidden_after = rendered_last.map_or_else(
-        || entries.len().saturating_sub(start),
-        |idx| entries.len().saturating_sub(idx.saturating_add(1)),
-    );
-    if hidden_after > 0 {
-        let right = sessions_strip_right_overflow(hidden_after, ascii);
-        let right_cols = UnicodeWidthStr::width(right.as_str());
-        if used_cols.saturating_add(right_cols) <= width_cols {
-            spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
-        }
-    }
-
-    spans
-}
-
-const fn sessions_strip_left_overflow(start: usize, ascii: bool) -> &'static str {
-    if start == 0 {
-        ""
-    } else if ascii {
-        "< "
-    } else {
-        "\u{2039} "
-    }
-}
-
-fn sessions_strip_right_overflow(hidden_after: usize, ascii: bool) -> String {
-    if hidden_after == 0 {
-        String::new()
-    } else if ascii {
-        format!(" +{hidden_after}>")
-    } else {
-        format!(" +{hidden_after}\u{203A}")
-    }
-}
-
-fn sessions_strip_right_overflow_width(hidden_after: usize, ascii: bool) -> usize {
-    if hidden_after == 0 {
-        0
-    } else {
-        UnicodeWidthStr::width(sessions_strip_right_overflow(hidden_after, ascii).as_str())
-    }
 }
 
 fn active_session_visible_lines(view: &crate::chat::sessions::ActiveSessionView, visible_rows: usize) -> Vec<String> {
@@ -5241,7 +4882,7 @@ fn render_saved_session_picker_row(
         format!(
             "{} turns | {}/{} | {}",
             entry.turn_count,
-            entry.provider,
+            crate::providers::redact_endpoint_userinfo(&entry.provider),
             entry.model,
             entry.updated_at.format("%Y-%m-%d %H:%M")
         )
@@ -5682,7 +5323,7 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
     let full = format!(
         " PRX Chat | {}/{} | {} | {permissions} | {usage} ",
-        state.provider(),
+        crate::providers::redact_endpoint_userinfo(state.provider()),
         state.model(),
         title,
     );
@@ -5692,7 +5333,7 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
 
     let compact = format!(
         " PRX Chat | {}/{} | {permissions} | {usage} ",
-        state.provider(),
+        crate::providers::redact_endpoint_userinfo(state.provider()),
         state.model()
     );
     if compact.chars().count() <= usize::from(width) {
@@ -7021,15 +6662,6 @@ const fn tool_status_marker(status: ToolStatus, ascii: bool) -> (&'static str, C
 // with Claude-like tool rendering, we surface the agent/model/task in the normal
 // `tool(preview)` header instead of a separate robot card.
 
-/// Names of the tools that spawn / drive a sub-agent. A card for any of these
-/// gets an enriched readable args preview.
-const SUBAGENT_TOOL_NAMES: [&str; 5] = ["delegate", "sessions_spawn", "subagents", "session_worker", "nodes"];
-
-/// True when `tool_name` belongs to the sub-agent tool family.
-fn is_subagent_tool(tool_name: &str) -> bool {
-    SUBAGENT_TOOL_NAMES.contains(&tool_name)
-}
-
 /// Sub-agent metadata extracted from a tool card for the BUG-11 visibility
 /// header. Every field is optional because args may be malformed JSON and the
 /// result is absent while the tool is still running.
@@ -7062,83 +6694,6 @@ fn one_line_summary(raw: &str, max: usize) -> String {
         format!("{head}…")
     } else {
         collapsed
-    }
-}
-
-/// Parse the `[Agent 'name' (provider/model)]` banner that delegate prepends to
-/// its successful output. Returns `(agent, model)` with either side optional.
-fn parse_agent_banner(result: &str) -> (Option<String>, Option<String>) {
-    let first = result.lines().next().unwrap_or("");
-    let Some(rest) = first.strip_prefix("[Agent ") else {
-        return (None, None);
-    };
-    let rest = rest.strip_suffix(']').unwrap_or(rest);
-    // rest now looks like: 'name' (provider/model)
-    let agent = rest
-        .split_once('\'')
-        .and_then(|(_, after)| after.split_once('\''))
-        .map(|(name, _)| name.trim().to_string())
-        .filter(|s| !s.is_empty());
-    // Pull the `provider/model` inside the parentheses; keep only the model side.
-    let model = rest
-        .split_once('(')
-        .and_then(|(_, after)| after.split_once(')'))
-        .map(|(inner, _)| inner.trim())
-        .map(|pm| pm.rsplit('/').next().unwrap_or(pm).trim().to_string())
-        .filter(|s| !s.is_empty());
-    (agent, model)
-}
-
-/// Extract sub-agent metadata from a tool card. Prefers explicit args fields,
-/// then falls back to parsing the delegate result banner. Never panics on bad
-/// JSON — a parse failure simply yields fewer fields.
-fn extract_subagent_meta(args_full: &str, result: Option<&str>) -> SubagentMeta {
-    let mut meta = SubagentMeta::default();
-
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(args_full) {
-        let str_field = |key: &str| {
-            map.get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        meta.agent = str_field("agent");
-        meta.model = str_field("model");
-        // delegate uses `prompt`; sessions_spawn uses `task`.
-        meta.task = str_field("prompt").or_else(|| str_field("task"));
-        if meta.task.is_none() {
-            // subagents drives an existing run via an action verb (kill/steer/list).
-            meta.task = str_field("action").or_else(|| str_field("operation"));
-        }
-    }
-
-    // Fill gaps from the result banner (carries provider/model the LLM may not
-    // have echoed back in args, and the resolved agent name).
-    if let Some(res) = result {
-        let (banner_agent, banner_model) = parse_agent_banner(res);
-        if meta.agent.is_none() {
-            meta.agent = banner_agent;
-        }
-        if meta.model.is_none() {
-            meta.model = banner_model;
-        }
-    }
-
-    if let Some(task) = meta.task.take() {
-        meta.task = Some(one_line_summary(&task, 60));
-    }
-    meta
-}
-
-/// Compose the `agent/model` identity tag shown in brackets after the tool
-/// name. Falls back to a single side, or `?` when neither is known.
-fn subagent_identity_tag(meta: &SubagentMeta) -> String {
-    match (meta.agent.as_deref(), meta.model.as_deref()) {
-        (Some(a), Some(m)) => format!("{a}/{m}"),
-        (Some(a), None) => a.to_string(),
-        (None, Some(m)) => m.to_string(),
-        (None, None) => "?".to_string(),
     }
 }
 
@@ -7671,71 +7226,6 @@ mod tests {
     }
 
     // ── BUG-11: sub-agent tool-card visibility ─────────────────────────
-
-    #[test]
-    fn subagent_tool_names_recognized() {
-        for name in ["delegate", "sessions_spawn", "subagents", "session_worker", "nodes"] {
-            assert!(is_subagent_tool(name), "{name} should be a sub-agent tool");
-        }
-        for name in ["shell", "file_write", "web_search", ""] {
-            assert!(!is_subagent_tool(name), "{name} should NOT be a sub-agent tool");
-        }
-    }
-
-    #[test]
-    fn extract_meta_from_delegate_args() {
-        // delegate args carry agent + model + prompt directly.
-        let args = r#"{"agent":"researcher","model":"kimi-2.6","prompt":"summarize the codebase architecture"}"#;
-        let meta = extract_subagent_meta(args, None);
-        assert_eq!(meta.agent.as_deref(), Some("researcher"));
-        assert_eq!(meta.model.as_deref(), Some("kimi-2.6"));
-        assert_eq!(meta.task.as_deref(), Some("summarize the codebase architecture"));
-        assert!(!meta.is_empty());
-    }
-
-    #[test]
-    fn extract_meta_fills_model_from_result_banner() {
-        // When args omit model, the delegate result banner supplies provider/model.
-        let args = r#"{"agent":"coder","prompt":"write a fib fn"}"#;
-        let result = "[Agent 'coder' (openrouter/anthropic/claude-sonnet-4)]\nfn fib(n: u64) -> u64 { ... }";
-        let meta = extract_subagent_meta(args, Some(result));
-        assert_eq!(meta.agent.as_deref(), Some("coder"));
-        // model side of `provider/model` keeps the trailing segment.
-        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4"));
-    }
-
-    #[test]
-    fn extract_meta_from_sessions_spawn_task_field() {
-        // sessions_spawn uses `task` rather than `prompt`.
-        let args = r#"{"agent":"worker","task":"run the test suite and report failures"}"#;
-        let meta = extract_subagent_meta(args, None);
-        assert_eq!(meta.agent.as_deref(), Some("worker"));
-        assert_eq!(meta.task.as_deref(), Some("run the test suite and report failures"));
-    }
-
-    #[test]
-    fn extract_meta_bad_json_is_empty() {
-        // Malformed args must never panic and yield no fields (caller falls back).
-        let meta = extract_subagent_meta("not json at all", None);
-        assert!(meta.is_empty(), "bad JSON → empty meta");
-    }
-
-    #[test]
-    fn identity_tag_prefers_agent_slash_model() {
-        let meta = SubagentMeta {
-            agent: Some("researcher".into()),
-            model: Some("kimi-2.6".into()),
-            task: None,
-        };
-        assert_eq!(subagent_identity_tag(&meta), "researcher/kimi-2.6");
-        let only_model = SubagentMeta {
-            agent: None,
-            model: Some("gpt-4o".into()),
-            task: None,
-        };
-        assert_eq!(subagent_identity_tag(&only_model), "gpt-4o");
-        assert_eq!(subagent_identity_tag(&SubagentMeta::default()), "?");
-    }
 
     #[test]
     fn one_line_summary_collapses_and_clips() {
@@ -8765,9 +8255,17 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.push_tool_result_started("shell", "x");
         state.mark_last_tool_result_finished("shell", true, 12, Some("line1\nline2\nline3".to_string()));
-        let folded_total = state.total_content_lines();
+        // rows as the production renderer draws them
+        let rendered_rows = |state: &TuiState| {
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            for line in &state.conversation_lines {
+                render_conversation_line(&mut lines, line, false);
+            }
+            lines.len()
+        };
+        let folded_total = rendered_rows(&state);
         state.toggle_last_tool_result_folded();
-        let expanded_total = state.total_content_lines();
+        let expanded_total = rendered_rows(&state);
         assert!(
             expanded_total > folded_total,
             "expanded card takes more rows: {expanded_total} vs {folded_total}"
@@ -9069,24 +8567,6 @@ mod tests {
         let header = line_text(lines2.first().expect("test: expanded header"));
         assert!(header.starts_with("v Thinking ("), "ASCII expanded header: {header}");
         assert!(!header.contains("\u{25BE}"), "no ▾ in ASCII mode: {header}");
-    }
-
-    #[test]
-    fn estimate_line_height_reasoning_folded_vs_expanded() {
-        let folded = ConversationLine::Reasoning {
-            content: "a\nb\nc\nd".to_string(),
-            char_count: 7,
-            folded: true,
-        };
-        assert_eq!(estimate_line_height(&folded), 1);
-
-        let expanded = ConversationLine::Reasoning {
-            content: "a\nb\nc\nd".to_string(),
-            char_count: 7,
-            folded: false,
-        };
-        // 1 header + 4 body lines = 5
-        assert_eq!(estimate_line_height(&expanded), 5);
     }
 
     #[test]
@@ -11399,25 +10879,6 @@ mod tests {
     }
 
     #[test]
-    fn sessions_strip_marks_estimated_subsession_usage() {
-        let mut e = elapsed_entry(4, "running", 63);
-        e.token_usage_records = vec![usage_record(crate::llm::route_decision::TokenUsageSource::Estimated)];
-
-        let line = render_sessions_strip_line(
-            &[e],
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 4 },
-            true,
-            96,
-        );
-
-        assert!(
-            line.contains("1m03s ~12.3k tok | $0.0042"),
-            "strip carries estimated usage marker: {line}"
-        );
-    }
-
-    #[test]
     fn switcher_row_narrow_drops_origin_and_keeps_kind() {
         // narrow=true → origin + long status text dropped to save columns.
         let e = pty_entry(3, "vim notes.md");
@@ -11447,135 +10908,6 @@ mod tests {
     fn switcher_row_zero_budget_is_empty() {
         let e = pty_entry(1, "x");
         assert!(render_switcher_row(&e, "⏳", false, 0).is_empty());
-    }
-
-    #[test]
-    fn sessions_strip_empty_state_is_hidden() {
-        let state = TuiState::new("p", "m");
-        assert!(!session_footer_has_sessions(&state));
-        assert!(render_sessions_strip_line(&[], "", crate::chat::sessions::FocusTarget::Main, false, 40).is_empty());
-    }
-
-    #[test]
-    fn sessions_strip_one_active_entry_shows_marker_glyph_kind_and_title() {
-        let entries = vec![entry(1)];
-        let line = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            false,
-            80,
-        );
-        assert!(line.contains('\u{25B8}'), "active marker visible: {line}");
-        assert!(
-            UNICODE_SPINNER_FRAMES.iter().any(|frame| line.contains(frame)),
-            "running status spinner visible: {line}"
-        );
-        assert!(line.contains("#1"), "seq visible: {line}");
-        assert!(line.contains("agent"), "kind visible: {line}");
-        assert!(line.contains("task 1"), "title visible: {line}");
-        assert!(
-            !line.contains("tok"),
-            "P1 must not fake per-session token usage: {line}"
-        );
-    }
-
-    #[test]
-    fn sessions_strip_entry_shows_elapsed() {
-        let entries = vec![elapsed_entry(2, "running", 3)];
-        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
-        assert!(line.contains("3s"), "strip carries compact elapsed: {line}");
-    }
-
-    #[test]
-    fn sessions_strip_entry_shows_idle_warning() {
-        let mut entry = elapsed_entry(2, "running", 601);
-        entry.kind = "shell";
-        entry.idle_warning = true;
-        let line = render_sessions_strip_line(&[entry], "", crate::chat::sessions::FocusTarget::Main, false, 80);
-        assert!(line.contains("⚠ idle"), "strip carries idle warning: {line}");
-    }
-
-    #[test]
-    fn sessions_strip_multiple_entries_share_one_row() {
-        let entries = vec![entry(1), entry(2)];
-        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
-        assert!(line.contains("#1"), "first session visible: {line}");
-        assert!(line.contains("#2"), "second session visible: {line}");
-        assert!(line.contains(" #2"), "entries separated in one row: {line}");
-    }
-
-    #[test]
-    fn sessions_strip_long_titles_render_multiple_compact_chips() {
-        let entries = long_strip_entries(6);
-        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 94);
-
-        assert!(line.contains("#1"), "first compact chip visible: {line}");
-        assert!(line.contains("#2"), "second compact chip visible: {line}");
-        assert!(line.contains("#3"), "third compact chip visible: {line}");
-        assert!(
-            !line.contains("Return only concise bullets"),
-            "strip keeps long descriptions out of compact chips: {line}"
-        );
-        assert!(
-            UnicodeWidthStr::width(line.as_str()) <= 94,
-            "compact strip must fit 94 cols, got {}: {line}",
-            UnicodeWidthStr::width(line.as_str())
-        );
-    }
-
-    #[test]
-    fn sessions_strip_active_entry_beyond_initial_window_is_visible_and_marked() {
-        let entries = long_strip_entries(8);
-        let line = render_sessions_strip_styled_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 8 },
-            false,
-            58,
-        );
-        let plain = line_to_plain(&line);
-
-        assert!(plain.contains("#8"), "active seq is windowed into view: {plain}");
-        assert!(
-            plain.contains('\u{2039}'),
-            "leading overflow indicator appears: {plain}"
-        );
-        assert!(plain.contains('\u{25B8}'), "active marker remains visible: {plain}");
-    }
-
-    #[test]
-    fn sessions_strip_active_entry_drives_window_when_no_selection() {
-        let entries = long_strip_entries(8);
-        let line = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 7 },
-            false,
-            58,
-        );
-
-        assert!(line.contains("#7"), "active seq is windowed into view: {line}");
-        assert!(line.contains('\u{25B8}'), "active marker remains distinct: {line}");
-        assert!(line.contains('\u{2039}'), "leading overflow indicator appears: {line}");
-    }
-
-    #[test]
-    fn sessions_strip_overflow_indicator_has_ascii_fallback() {
-        let entries = long_strip_entries(8);
-        let line = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 3 },
-            true,
-            58,
-        );
-
-        assert!(line.contains("#3"), "active seq is visible in ASCII mode: {line}");
-        assert!(
-            line.contains('>') && line.contains('+'),
-            "ASCII right overflow/count affordance appears when entries remain hidden: {line}"
-        );
     }
 
     #[test]
@@ -11747,109 +11079,6 @@ mod tests {
             "terminal worker titles stay unchanged: {}",
             entry.title
         );
-    }
-
-    #[test]
-    fn sessions_strip_zero_width_and_one_entry_edge_cases_do_not_panic() {
-        let entries = long_strip_entries(1);
-        let empty = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            false,
-            0,
-        );
-        assert!(empty.is_empty());
-
-        let one = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            false,
-            18,
-        );
-        assert!(one.contains("#1"), "single active chip still renders: {one}");
-        assert!(
-            UnicodeWidthStr::width(one.as_str()) <= 18,
-            "single-chip strip must fit narrow width: {one}"
-        );
-    }
-
-    #[test]
-    fn sessions_strip_focus_drives_active_marker_without_selection_highlight() {
-        let entries = vec![entry(1), entry(2)];
-        let line = render_sessions_strip_styled_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            false,
-            96,
-        );
-        let plain = line_to_plain(&line);
-        assert!(plain.contains("#1"), "focused entry remains visible: {plain}");
-        assert!(plain.contains("#2"), "neighbor entry remains visible: {plain}");
-
-        let focused = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains("#1"))
-            .expect("test: focused span");
-        assert_eq!(
-            focused.style.bg, None,
-            "input-routing focus uses the active marker, not selected highlight"
-        );
-        assert!(plain.contains('\u{25B8}'), "focused entry has active marker: {plain}");
-    }
-
-    #[test]
-    fn sessions_strip_narrow_width_truncates() {
-        let entries = vec![pty_entry(
-            7,
-            "a-very-long-interactive-command-that-will-not-fit-in-the-strip",
-        )];
-        let width = 24;
-        let line = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 7 },
-            false,
-            width,
-        );
-        assert!(
-            line.chars().count() <= width as usize,
-            "strip row must fit width {width}, got {} chars: {line}",
-            line.chars().count()
-        );
-        assert!(line.contains('\u{2026}'), "long title should be elided: {line}");
-    }
-
-    #[test]
-    fn sessions_strip_cjk_title_truncates_without_panicking() {
-        let entries = vec![crate::chat::sessions::SwitcherEntry {
-            seq: 5,
-            kind: "shell",
-            origin: "user",
-            status: "running",
-            title: "\u{ac00}".repeat(13),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            token_usage_records: Vec::new(),
-            idle_warning: false,
-        }];
-        let width = 22;
-        let line = render_sessions_strip_line(
-            &entries,
-            "",
-            crate::chat::sessions::FocusTarget::Session { seq: 5 },
-            false,
-            width,
-        );
-        assert!(
-            UnicodeWidthStr::width(line.as_str()) <= width as usize,
-            "CJK strip row must fit column budget {width}, got {} cols: {line}",
-            UnicodeWidthStr::width(line.as_str())
-        );
-        assert!(line.contains("#5"), "seq remains visible under CJK truncation: {line}");
     }
 
     #[test]
@@ -14484,5 +13713,18 @@ mod tests {
                 "the Pure-mode banner must reach the reducer via SystemMessageAdded, snapshot contains a System line"
             );
         }
+    }
+
+    /// USERINFO-2: the status bar and the session list show the provider on
+    /// every frame; a `custom:` URL may carry `user:password@`.
+    #[test]
+    fn the_status_bar_names_the_provider_without_url_userinfo() {
+        let state = TuiState::new("custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1", "fixture-model");
+        for width in [72, 120, 220] {
+            let line = render_status_bar_text(&state, width);
+            assert!(!line.contains("SECRET-fixture-pw"), "{line}");
+        }
+        let line = render_status_bar_text(&state, 220);
+        assert!(line.contains("custom:http://[redacted]@127.0.0.1:1/v1"), "{line}");
     }
 }

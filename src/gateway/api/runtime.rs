@@ -579,10 +579,12 @@ mod tests {
         // registry: `run_sub_agent_task` short-circuits a registry-less spawn
         // into a single provider call that never reads its steer channel. An
         // empty registry is enough to take the real path.
-        tool.tools_handle()
-            .set(Arc::new(Vec::new()))
-            .ok()
-            .expect("test: tools registry must be injectable once");
+        // The tool holds its registry weakly; the test keeps it alive.
+        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(Vec::new());
+        assert!(
+            tool.tools_handle().set(&registry),
+            "test: tools registry must be injectable once"
+        );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
         let result = tool
             .execute(serde_json::json!({

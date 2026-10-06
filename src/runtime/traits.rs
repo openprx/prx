@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Runtime adapter that abstracts platform differences for the agent.
@@ -64,6 +65,20 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Returns an error if the runtime does not support shell access or if
     /// the command cannot be constructed (e.g., missing shell binary).
     fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command>;
+
+    /// Build a shell command with environment values that must reach the
+    /// executed shell, including a shell inside a container. Native runtimes
+    /// inherit these values directly; container runtimes forward them.
+    fn build_shell_command_with_env(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut process = self.build_shell_command(command, workspace_dir)?;
+        process.envs(environment.iter().cloned());
+        Ok(process)
+    }
 }
 
 #[cfg(test)]

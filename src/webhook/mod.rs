@@ -1037,28 +1037,6 @@ impl WebhookRepository for PostgresWebhookRepository {
 /// Run the standalone webhook receiver from the authoritative application
 /// configuration with the durable repository injected by the daemon assembly
 /// boundary. This keeps backend selection out of the standalone HTTP service.
-#[allow(dead_code)]
-pub(crate) async fn run_configured_with_repository(
-    config: &Config,
-    repository: WebhookRepositoryHandle,
-    security: Arc<SecurityPolicy>,
-) -> Result<()> {
-    let token = config
-        .webhook
-        .token
-        .as_deref()
-        .context("webhook.token must be configured")?;
-    run_with_repository(
-        &config.webhook.bind,
-        token,
-        config.webhook.signing_secret.as_deref(),
-        repository.repository,
-        security,
-        None,
-    )
-    .await
-}
-
 pub(crate) async fn run_configured_with_repository_generation(
     config: &Config,
     repository: WebhookRepositoryHandle,
@@ -2424,7 +2402,7 @@ mod tests {
     fn standalone_repository_is_injected_at_daemon_boundary() {
         let webhook_source = include_str!("mod.rs");
         let runner = webhook_source
-            .split_once("pub(crate) async fn run_configured_with_repository(")
+            .split_once("pub(crate) async fn run_configured_with_repository_generation(")
             .unwrap()
             .1
             .split_once("pub(crate) fn repository_from_config(")
@@ -2504,13 +2482,9 @@ mod tests {
     /// it holds under any role -- including the superuser setups where RLS
     /// short-circuits and an effect-based assertion would prove nothing.
     #[tokio::test]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_webhook_session_context_does_not_leak_from_env() {
-        let Some(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
 
         let schema = format!("openprx_whctx_{}", Uuid::new_v4().simple());
         let repository = PostgresWebhookRepository::new(
@@ -2589,13 +2563,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_webhook_repository_conformance_from_env() {
-        let Some(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            return;
-        };
+        let db_url = crate::memory::postgres::live_postgres_url();
 
         let schema = format!("openprx_wh_{}", Uuid::new_v4().simple());
         let repository = PostgresWebhookRepository::new(

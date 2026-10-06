@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+#[cfg(test)]
 use crate::security::op_id;
-use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::policy::ApprovalGrant;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::tools::tool_diff::{build_new_file_preview, build_unified_diff};
 use async_trait::async_trait;
@@ -48,7 +49,22 @@ impl Tool for FileWriteTool {
         })
     }
 
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(scope) = super::owner_filesystem_dispatch::current() {
+            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+        }
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -76,32 +92,23 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
-
-        let Some(parent) = full_path.parent() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing parent directory".into()),
-            });
-        };
-
-        // Ensure parent directory exists
-        tokio::fs::create_dir_all(parent).await?;
-
-        // Resolve parent AFTER creation to block symlink escapes.
-        let resolved_parent = match tokio::fs::canonicalize(parent).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
-                });
-            }
-        };
-
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        let resolved_target =
+            match crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, true)
+                .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to resolve file path: {error}")),
+                    });
+                }
+            };
+        let resolved_parent = resolved_target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("file parent missing"))?;
+        if !self.security.is_resolved_path_allowed(resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -111,28 +118,53 @@ impl Tool for FileWriteTool {
                 )),
             });
         }
-
-        let Some(file_name) = full_path.file_name() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing file name".into()),
-            });
-        };
-
-        let resolved_target = resolved_parent.join(file_name);
-        let operation_name = op_id::op_id(self.name(), "write", &[&op_id::ref_for_file(&resolved_target)]);
+        let (operation_name, risk, launch_file, git_control) = crate::security::approval_operation::file_operation(
+            self.name(),
+            &self.security.workspace_dir,
+            &resolved_target,
+        );
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
             self.name(),
             &operation_name,
-            ResourceRiskLevel::Medium,
+            risk,
             approval_grant.as_ref(),
         ) {
+            let error = if launch_file {
+                format!(
+                    "{error} (a workspace launch definition: hooks.json and mcp.json decide which programs run as \
+                     PRX's user, so writing one is a high-risk operation of its own)"
+                )
+            } else if git_control {
+                format!(
+                    "{error} (a git control file: .git/config, .git/hooks and .git/info decide which programs git \
+                     runs as PRX's user, so writing one is a high-risk operation of its own)"
+                )
+            } else {
+                error
+            };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error),
+            });
+        }
+
+        // Only an authorized operation may create its missing directories.
+        // Re-resolve afterward: a symlink change must not redirect the write
+        // away from the exact operation just authorized.
+        tokio::fs::create_dir_all(resolved_parent).await?;
+        let current =
+            crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, false).await?;
+        if current != resolved_target
+            || !self
+                .security
+                .is_resolved_path_allowed(current.parent().ok_or_else(|| anyhow::anyhow!("file parent missing"))?)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("File path changed after authorization".to_owned()),
             });
         }
 
@@ -277,6 +309,81 @@ mod tests {
                 None,
             )
         })
+    }
+
+    /// RED before HOOKS-ENV: writing the workspace `hooks.json` (or
+    /// `mcp.json`, in any letter case) was an ordinary file write, so an
+    /// approval for an ordinary write covered it. It is now a high-risk
+    /// operation of its own, and the refusal says why.
+    #[tokio::test]
+    async fn writing_a_workspace_launch_definition_needs_its_own_approval() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let workspace = dir.path().to_path_buf();
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        for file in ["hooks.json", "mcp.json", "Hooks.JSON"] {
+            let result = tool
+                .execute(approved_args(&workspace, file, "{}"))
+                .await
+                .expect("test: executes");
+            assert!(
+                !result.success,
+                "{file}: an ordinary write approval covered a launch definition"
+            );
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("workspace launch definition"), "{file}: {error}");
+            assert!(!workspace.join(file).exists(), "{file} was written");
+        }
+        // An ordinary file keeps its ordinary approval.
+        let result = tool
+            .execute(approved_args(&workspace, "notes.json", "{}"))
+            .await
+            .expect("test: executes");
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    /// RED before GIT-ENV: `.git/config`, `.git/hooks/*` and `.git/info/*`
+    /// decide which programs git runs as PRX's user (`core.fsmonitor`, a
+    /// hook, a filter driver named by `info/attributes`), yet an approval for
+    /// an ordinary write covered them. Each is now a high-risk operation of
+    /// its own, and the refusal says why.
+    #[tokio::test]
+    async fn writing_a_git_control_file_needs_its_own_approval() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let workspace = dir.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".git/hooks")).expect("test: .git/hooks");
+        std::fs::create_dir_all(workspace.join(".git/info")).expect("test: .git/info");
+        std::fs::create_dir_all(workspace.join("vendor/.git")).expect("test: nested .git");
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        for file in [
+            ".git/config",
+            ".git/hooks/pre-commit",
+            ".git/info/attributes",
+            ".GIT/Config",
+            "vendor/.git/config",
+        ] {
+            let result = tool
+                .execute(approved_args(&workspace, file, "[core]\n\tfsmonitor = ./evil\n"))
+                .await
+                .expect("test: executes");
+            assert!(
+                !result.success,
+                "{file}: an ordinary write approval covered a git control file"
+            );
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("git control file"), "{file}: {error}");
+            assert!(
+                std::fs::read_to_string(workspace.join(file))
+                    .ok()
+                    .is_none_or(|text| !text.contains("fsmonitor")),
+                "{file} was written"
+            );
+        }
+        // A file beside the repository keeps its ordinary approval.
+        let result = tool
+            .execute(approved_args(&workspace, ".gitignore", "target/\n"))
+            .await
+            .expect("test: executes");
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[test]

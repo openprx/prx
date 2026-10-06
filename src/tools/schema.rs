@@ -1274,21 +1274,453 @@ pub enum ToolSchemaDialect {
     Gemini,
     /// The provider was shown `SchemaCleanr::clean_for_anthropic(..)`.
     Anthropic,
+    /// The provider rejects `allOf`, `anyOf` and `oneOf` at the top level of a
+    /// tool schema and was shown the document with the root `allOf` merged
+    /// away, or was not offered the tool at all.
+    ///
+    /// Nested combinators are untouched: this class of endpoint objects to the
+    /// *top-level* keyword only. A root combinator that carries a conditional
+    /// or an alternative requirement has no lossless merge, so the tool is
+    /// refused before transport with a diagnostic rather than reshaped into a
+    /// contract nobody published — see [`wire_schema`](Self::wire_schema).
+    NoRootCombinators,
+}
+
+impl std::fmt::Display for ToolSchemaDialect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A published tool contract that cannot be put on the wire for the declared
+/// dialect without changing what it means.
+///
+/// This is a refusal, not a repair and not a drop. It names the tool, the
+/// keyword that could not be lowered, the dialect that refused it, where that
+/// dialect was declared and what an operator can do about it, so the failure is
+/// actionable without reading a provider's HTTP 400 text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tool '{tool}' cannot be offered to a '{dialect}' endpoint: the root '{keyword}' of its published contract \
+     {detail}. Declared by: {descriptor_source}. {remediation}"
+)]
+pub struct ToolSchemaLoweringError {
+    /// The published name of the tool that was refused.
+    pub tool: String,
+    /// The root keyword that has no lossless lowering: one of `allOf`,
+    /// `anyOf`, `oneOf`.
+    pub keyword: &'static str,
+    /// The dialect the refusal was made for.
+    pub dialect: ToolSchemaDialect,
+    /// Why this particular occurrence cannot be merged.
+    pub detail: String,
+    /// Where the dialect declaration came from.
+    pub descriptor_source: String,
+    /// The change that would make this tool available again.
+    pub remediation: String,
+}
+
+impl ToolSchemaLoweringError {
+    /// Replace the description of where the dialect was declared.
+    ///
+    /// The default names the resolution path a provider uses today; a caller
+    /// that resolved the dialect from an operator declaration should say so
+    /// instead, because that is the line the operator would edit.
+    #[must_use]
+    pub fn with_descriptor_source(mut self, source: impl Into<String>) -> Self {
+        self.descriptor_source = source.into();
+        self
+    }
+}
+
+/// Every tool one request offered that its dialect refused, in one error.
+///
+/// A request fails closed as a whole (D-016, OQ-26), so the operator needs the
+/// complete list at once, not one tool per run. The rendering puts the compact
+/// list first (`cron[allOf], memory_get[anyOf]`), then the configuration that
+/// makes the endpoint usable, then why each tool was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSchemaRefusals {
+    /// The dialect that refused them.
+    pub dialect: ToolSchemaDialect,
+    /// One refusal per refused tool, in the order the request offered them.
+    pub refusals: Vec<ToolSchemaLoweringError>,
+    /// The provider label the declaration is keyed by, as it is safe to print.
+    pub provider: String,
+    /// The model the request was for.
+    pub model: String,
+    /// Where the dialect was declared, in the words of the line to edit.
+    pub descriptor_source: String,
+}
+
+/// The first words of every [`ToolSchemaRefusals`] rendering: a stable marker
+/// that survives a boundary which carries errors as text (a stream error).
+pub const TOOL_SCHEMA_REFUSALS_MARKER: &str = "tool_schema_dialect refused ";
+
+impl ToolSchemaRefusals {
+    /// The refused tools' published names, in request order.
+    pub fn tool_names(&self) -> impl Iterator<Item = &str> {
+        self.refusals.iter().map(|refusal| refusal.tool.as_str())
+    }
+
+    /// The refused tool names from a rendering of this type, for a caller
+    /// that only received the text (the stream boundary carries errors as
+    /// strings). `None` when `text` holds no refusal list.
+    #[must_use]
+    pub fn tool_names_in(text: &str) -> Option<Vec<String>> {
+        let start = text.find(TOOL_SCHEMA_REFUSALS_MARKER)?;
+        let rest = &text[start..];
+        let list_start = rest.find("endpoint: ")? + "endpoint: ".len();
+        let list = &rest[list_start..];
+        let list = &list[..list.find(". ").unwrap_or(list.len())];
+        let names = list
+            .split(", ")
+            .filter_map(|entry| entry.split_once('[').map(|(name, _)| name.to_string()))
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then_some(names)
+    }
+}
+
+impl std::fmt::Display for ToolSchemaRefusals {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listed = self
+            .refusals
+            .iter()
+            .map(|refusal| format!("{}[{}]", refusal.tool, refusal.keyword))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let quoted = self
+            .tool_names()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pasteable = crate::providers::pasteable_provider_label(&self.provider);
+        write!(
+            formatter,
+            "{TOOL_SCHEMA_REFUSALS_MARKER}{count} tool(s) for a '{dialect}' endpoint: {listed}. Nothing was sent; \
+             the whole request fails closed. Declared by: {source}. To use this endpoint, stop offering these \
+             tools to model '{model}': for every model, `always_exclude = [{quoted}]` under `[tool_tiering]`; \
+             for this model only, list the tools it may use in `[tool_tiering.model_allowlists]` \
+             (\"{model}\" = [...]) without these; an MCP alias `<prefix>__<server>__<tool>` is removed with \
+             `deny_tools = [\"<tool>\"]` under `[mcp.servers.<server>]`. Sub-agents and session workers do not \
+             apply `[tool_tiering]`. If the endpoint does accept root combinators after all, declare \
+             `[[providers.tool_dialects]]` provider = \"{provider}\" model = \"{model}\" tool_schema = \"raw\"{fill_in}. \
+             Why each tool was refused:",
+            count = self.refusals.len(),
+            dialect = self.dialect,
+            source = self.descriptor_source,
+            model = self.model,
+            provider = pasteable.0,
+            fill_in = if pasteable.1 {
+                " (write the provider exactly as in your configuration, replacing <user>:<password> with the \
+                 credentials it carries)"
+            } else {
+                ""
+            },
+        )?;
+        for refusal in &self.refusals {
+            write!(
+                formatter,
+                " {} — the root '{}' of its published contract {};",
+                refusal.tool, refusal.keyword, refusal.detail
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ToolSchemaRefusals {}
+
+/// How the dialect is resolved today, before a per-(provider, model) descriptor
+/// exists. Callers that know better replace it with
+/// [`ToolSchemaLoweringError::with_descriptor_source`].
+const DEFAULT_DIALECT_SOURCE: &str = "the tool-schema dialect declared by the constructed provider";
+
+/// One root keyword that could not be lowered, before it is attributed to a
+/// tool and a dialect.
+struct LoweringRefusal {
+    keyword: &'static str,
+    detail: String,
+}
+
+/// Root keys a plain object fragment of an `allOf` may carry and still be
+/// mergeable into the root.
+///
+/// This is an allowlist, so an unforeseen keyword fails closed. Anything else —
+/// `if`, `then`, `else`, `not`, a nested combinator, `$ref`, `$defs`, `enum`,
+/// `const`, `default`, a bound — either encodes a rule a single object cannot
+/// express or is a constraint the merge would have to drop.
+///
+/// `additionalProperties` is deliberately absent and handled separately: it is
+/// scoped to the object that declares it, so it can never be hoisted onto a
+/// union of several objects' `properties`.
+const MERGEABLE_FRAGMENT_KEYS: &[&str] = &["type", "properties", "required", "description", "title"];
+
+/// Annotation keywords a member may carry and the merge drops (C2af-02).
+///
+/// In JSON Schema 2020-12 each of these only describes: none changes the set
+/// of instances a schema accepts, and [`CompiledToolSchema`] already treats
+/// every one of them as non-constraining, so dropping one leaves enforcement
+/// exactly where it was. Only the member's own prompt hint is lost, never a
+/// rule. They are dropped, not hoisted: a member's `default` or `examples`
+/// describe that member, not the merged object.
+///
+/// `$id`, `$schema`, `$anchor`, `$dynamicAnchor` and `$vocabulary` are not
+/// here and stay refused: `$id` rebases `$ref` resolution inside the member
+/// and `$schema`/`$vocabulary` switch what its keywords mean, so dropping one
+/// can change what the member accepts.
+const DROPPED_FRAGMENT_ANNOTATIONS: &[&str] =
+    &["$comment", "examples", "default", "deprecated", "readOnly", "writeOnly"];
+
+/// Merge a root `allOf` of plain object fragments into the root, or say why it
+/// cannot be merged.
+///
+/// The merge runs only when it is provably lossless, and "lossless" is defined
+/// narrowly on purpose, because [`ToolSchemaDialect::enforceable_schema`] reruns
+/// it: a merged document that is looser than the published one is a document
+/// PRX would then validate the model's answer against, silently enforcing less
+/// than the tool author published.
+///
+/// It is lossless exactly when every member is a *plain object fragment*:
+///
+/// - its keys are a subset of `type`, `properties`, `required`, `description`,
+///   `title` (plus an `additionalProperties` that is literally `true`, which
+///   constrains nothing, and the pure annotations in
+///   [`DROPPED_FRAGMENT_ANNOTATIONS`], which the merge drops);
+/// - its `properties`, if present, is an object and its `required`, if
+///   present, is an array — anything else is not a schema this pass can read;
+/// - its `type` is absent or exactly `"object"`, and so is the root's;
+/// - no property name is declared differently in two members, or in a member
+///   and the root.
+///
+/// The merged document is then the union of `properties` and the union of
+/// `required` — `required` only ever grows, so no requirement can be dropped —
+/// and its `additionalProperties` is the root's, untouched. If the merge widens
+/// a root that declares `additionalProperties`, the merge is refused too: that
+/// setting is scoped to the properties the root itself declared, so a widened
+/// map would admit names the published root forbade.
+///
+/// Every other shape is refused, naming the keyword that could not be lowered.
+fn lower_root_combinators(schema: &Value) -> Result<Cow<'_, Value>, LoweringRefusal> {
+    let Some(root) = schema.as_object() else {
+        // Not an object, so it has no root keyword to lower.
+        return Ok(Cow::Borrowed(schema));
+    };
+    for keyword in ["anyOf", "oneOf"] {
+        if root.contains_key(keyword) {
+            return Err(LoweringRefusal {
+                keyword: if keyword == "anyOf" { "anyOf" } else { "oneOf" },
+                detail: format!(
+                    "offers alternative required sets, and no single object requires exactly one of them: \
+                     merging the branches would require every branch's fields at once and dropping the \
+                     '{keyword}' would require none of them"
+                ),
+            });
+        }
+    }
+    let Some(members) = root.get("allOf") else {
+        return Ok(Cow::Borrowed(schema));
+    };
+    let Some(members) = members.as_array() else {
+        return Err(LoweringRefusal {
+            keyword: "allOf",
+            detail: "is not an array, so it is not a schema composition this pass can read".to_string(),
+        });
+    };
+
+    if let Some(root_type) = root.get("type")
+        && root_type != "object"
+    {
+        return Err(LoweringRefusal {
+            keyword: "allOf",
+            detail: "composes members into a root whose 'type' is not 'object', so the members' 'properties' \
+                     do not describe the same instance the root does"
+                .to_string(),
+        });
+    }
+
+    // The merge only ever inserts property names, so a growth in the count is
+    // exactly "the merged object declares names the root did not".
+    let root_property_count = root.get("properties").and_then(Value::as_object).map_or(0, Map::len);
+
+    let mut merged = root.clone();
+    merged.remove("allOf");
+    for member in members {
+        let Some(fragment) = member.as_object() else {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "contains a member that is not an object schema".to_string(),
+            });
+        };
+        // `additionalProperties` is scoped to the object that declares it. A
+        // member saying `false` forbids every name that member does not itself
+        // declare; hoisting that onto the union of every member's properties
+        // admits precisely the names it forbade, and a schema-valued setting
+        // cannot be hoisted at all. Only a literal `true`, which constrains
+        // nothing, survives the merge — by being dropped.
+        if let Some(additional) = fragment.get("additionalProperties")
+            && additional != &Value::Bool(true)
+        {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "contains a member declaring 'additionalProperties', which is scoped to that member's \
+                         own 'properties'; a single object carrying it over the union of every member's \
+                         properties would admit the names the member forbade, which is a more permissive \
+                         contract than the one published"
+                    .to_string(),
+            });
+        }
+        if let Some(unmergeable) = fragment.keys().find(|key| {
+            key.as_str() != "additionalProperties"
+                && !MERGEABLE_FRAGMENT_KEYS.contains(&key.as_str())
+                && !DROPPED_FRAGMENT_ANNOTATIONS.contains(&key.as_str())
+        }) {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: format!(
+                    "contains a member using '{unmergeable}', which is not a plain object fragment: a single \
+                     object can state that rule only by changing what the published contract requires or \
+                     permits"
+                ),
+            });
+        }
+        if let Some(fragment_type) = fragment.get("type")
+            && fragment_type != "object"
+        {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "contains a member whose 'type' is not 'object', so the member constrains the instance \
+                         in a way a merge of object members cannot carry"
+                    .to_string(),
+            });
+        }
+        merge_fragment_into_root(&mut merged, fragment)?;
+    }
+
+    let merged_property_count = merged.get("properties").and_then(Value::as_object).map_or(0, Map::len);
+    if merged_property_count > root_property_count
+        && root
+            .get("additionalProperties")
+            .is_some_and(|additional| additional != &Value::Bool(true))
+    {
+        return Err(LoweringRefusal {
+            keyword: "allOf",
+            detail: "adds properties to a root declaring 'additionalProperties', whose setting is scoped to the \
+                     properties the root itself declared; the merged object would admit names the published \
+                     root forbade"
+                .to_string(),
+        });
+    }
+
+    Ok(Cow::Owned(Value::Object(merged)))
+}
+
+/// Fold one plain object fragment into the merged root.
+///
+/// Every key the allowlist admitted is either read here or is an annotation
+/// in [`DROPPED_FRAGMENT_ANNOTATIONS`], which is dropped on purpose; a key of
+/// the wrong shape is refused rather than skipped, so the merge never answers
+/// for a document it did not fully read (C2af-03).
+fn merge_fragment_into_root(
+    merged: &mut Map<String, Value>,
+    fragment: &Map<String, Value>,
+) -> Result<(), LoweringRefusal> {
+    let properties = match fragment.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "contains a member whose 'properties' is not an object, which is not a schema this \
+                         merge can read"
+                    .to_string(),
+            });
+        }
+    };
+    let required = match fragment.get("required") {
+        None => None,
+        Some(Value::Array(required)) => Some(required),
+        Some(_) => {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "contains a member whose 'required' is not an array, which is not a schema this merge \
+                         can read"
+                    .to_string(),
+            });
+        }
+    };
+    if let Some(properties) = properties {
+        let target = merged
+            .entry("properties".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(target) = target.as_object_mut() else {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "cannot be merged because the root's 'properties' is not an object".to_string(),
+            });
+        };
+        for (name, declaration) in properties {
+            match target.get(name) {
+                Some(existing) if existing != declaration => {
+                    return Err(LoweringRefusal {
+                        keyword: "allOf",
+                        detail: format!(
+                            "declares property '{name}' differently from the root, and the two declarations \
+                             have no single spelling that means both"
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    target.insert(name.clone(), declaration.clone());
+                }
+            }
+        }
+    }
+    if let Some(required) = required {
+        let target = merged
+            .entry("required".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(target) = target.as_array_mut() else {
+            return Err(LoweringRefusal {
+                keyword: "allOf",
+                detail: "cannot be merged because the root's 'required' is not an array".to_string(),
+            });
+        };
+        for name in required {
+            if !target.contains(name) {
+                target.push(name.clone());
+            }
+        }
+    }
+    // A fragment's `type` has already been checked to be exactly `"object"`, so
+    // a root that declared none adopts it rather than losing it.
+    if fragment.contains_key("type") && !merged.contains_key("type") {
+        merged.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    // `additionalProperties` is never taken from a fragment: the only value a
+    // fragment may carry here is a literal `true`, which constrains nothing.
+    // The merged document keeps the root's setting, whatever it was.
+    for key in ["description", "title"] {
+        if let Some(value) = fragment.get(key)
+            && !merged.contains_key(key)
+        {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 impl ToolSchemaDialect {
-    /// The dialect a provider label selects.
-    ///
-    /// The labels are the ones `crate::providers::create_provider` accepts;
-    /// `provider_aliases_agree_with_the_declared_schema_dialect` in
-    /// `src/providers/mod.rs` pins this map against what each provider
-    /// implementation actually does, so the two cannot drift.
+    /// The wire spelling of this dialect, matching its serialized form.
     #[must_use]
-    pub fn for_provider(provider: &str) -> Self {
-        match provider.trim().to_ascii_lowercase().as_str() {
-            "gemini" | "google" | "google-gemini" => Self::Gemini,
-            "anthropic" | "claude-code" | "claude-cli" => Self::Anthropic,
-            _ => Self::Raw,
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Gemini => "gemini",
+            Self::Anthropic => "anthropic",
+            Self::NoRootCombinators => "no_root_combinators",
         }
     }
 
@@ -1297,10 +1729,84 @@ impl ToolSchemaDialect {
     #[must_use]
     pub const fn cleaning_strategy(self) -> Option<CleaningStrategy> {
         match self {
-            Self::Raw => None,
+            // `NoRootCombinators` removes no keyword class: its rewrite is
+            // structural, and it is applied by `wire_schema` rather than by a
+            // `CleaningStrategy` keyword list.
+            Self::Raw | Self::NoRootCombinators => None,
             Self::Gemini => Some(CleaningStrategy::Gemini),
             Self::Anthropic => Some(CleaningStrategy::Anthropic),
         }
+    }
+
+    /// The document this dialect puts on the wire for `tool`, or a refusal.
+    ///
+    /// This is the single entry point every provider converter uses in place of
+    /// cloning the published parameters, so the rewrite and the enforcement
+    /// contract cannot come apart: [`enforceable_schema`](Self::enforceable_schema)
+    /// returns the same document this produced.
+    ///
+    /// [`Raw`](Self::Raw) borrows — the published bytes go out untouched and
+    /// nothing is allocated. `Gemini` and `Anthropic` return the cleaned
+    /// document they already sent. `NoRootCombinators` merges a root `allOf` of
+    /// plain object fragments, borrows when there is no root combinator at all,
+    /// and fails closed on a conditional or alternative requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolSchemaLoweringError`] when the published contract's root
+    /// combinator has no lossless lowering for this dialect. The tool is then
+    /// not offered — and the caller reports which one and why, rather than
+    /// dropping it from the payload.
+    pub fn wire_schema<'a>(self, tool: &str, schema: &'a Value) -> Result<Cow<'a, Value>, ToolSchemaLoweringError> {
+        if self == Self::NoRootCombinators {
+            return lower_root_combinators(schema).map_err(|refusal| ToolSchemaLoweringError {
+                tool: tool.to_string(),
+                keyword: refusal.keyword,
+                dialect: self,
+                detail: refusal.detail,
+                descriptor_source: DEFAULT_DIALECT_SOURCE.to_string(),
+                remediation: format!(
+                    "Stop offering '{tool}' to this (provider, model) with `[tool_tiering]`, or republish it \
+                     without a root '{}'.",
+                    refusal.keyword
+                ),
+            });
+        }
+        Ok(self.cleaning_strategy().map_or(Cow::Borrowed(schema), |strategy| {
+            Cow::Owned(SchemaCleanr::clean(schema.clone(), strategy))
+        }))
+    }
+
+    /// Lower every tool of one request, or return every refusal.
+    ///
+    /// Unlike a loop over [`wire_schema`](Self::wire_schema) that stops at the
+    /// first refusal, this visits every tool, so one error names them all.
+    /// [`Raw`](Self::Raw) still borrows every document.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`ToolSchemaLoweringError`], in request order, when at
+    /// least one tool has no lossless lowering for this dialect. Nothing is
+    /// returned for the tools that did lower: the request fails as a whole.
+    pub fn lower_all<'a, I>(self, tools: I) -> Result<Vec<Cow<'a, Value>>, Vec<ToolSchemaLoweringError>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a Value)>,
+    {
+        let mut lowered = Vec::new();
+        let mut refused = Vec::new();
+        for (tool, schema) in tools {
+            match self.wire_schema(tool, schema) {
+                // Once a tool is refused the request is not sent, so the
+                // documents lowered after it are not kept.
+                Ok(document) => {
+                    if refused.is_empty() {
+                        lowered.push(document);
+                    }
+                }
+                Err(refusal) => refused.push(refusal),
+            }
+        }
+        if refused.is_empty() { Ok(lowered) } else { Err(refused) }
     }
 
     /// The document a call made under this dialect must be validated against.
@@ -1309,6 +1815,12 @@ impl ToolSchemaDialect {
     /// validator allocates nothing when no rewrite happened.
     #[must_use]
     pub fn enforceable_schema<'a>(self, schema: &'a Value) -> Cow<'a, Value> {
+        if self == Self::NoRootCombinators {
+            // A refused tool never reached the wire, so no constraint was
+            // stripped from anything the model saw and the published document
+            // stands. A lowered tool is enforced against exactly what went out.
+            return lower_root_combinators(schema).unwrap_or(Cow::Borrowed(schema));
+        }
         self.cleaning_strategy().map_or(Cow::Borrowed(schema), |strategy| {
             Cow::Owned(SchemaCleanr::clean(schema.clone(), strategy))
         })
@@ -1845,13 +2357,17 @@ fn validate_schema_node(schema: &Value, path: &str, require_type: bool) -> anyho
     }
     if let Some(schema_type_value) = object.get("type") {
         const TYPES: &[&str] = &["object", "array", "string", "integer", "number", "boolean", "null"];
-        let schema_types = if let Some(single) = schema_type_value.as_str() {
-            vec![single]
+        let single_type;
+        let multiple_types;
+        let schema_types: &[&str] = if let Some(single) = schema_type_value.as_str() {
+            single_type = [single];
+            &single_type
         } else if let Some(multiple) = schema_type_value.as_array() {
             if multiple.is_empty() || multiple.iter().any(|entry| !entry.is_string()) {
                 anyhow::bail!("Schema node {path}.type must be a string or a non-empty string array");
             }
-            multiple.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+            multiple_types = multiple.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            &multiple_types
         } else {
             anyhow::bail!("Schema node {path}.type must be a string or a non-empty string array");
         };
@@ -2096,6 +2612,31 @@ pub(crate) mod action_contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_schema_type_validates_without_allocating_and_keeps_array_errors() {
+        let valid = json!({"type": "object", "properties": {}});
+        assert!(SchemaCleanr::validate(&valid).is_ok());
+        let (result, allocations) =
+            crate::decision::builtin::allocation_counter::count(|| SchemaCleanr::validate(&valid));
+        assert!(result.is_ok());
+        assert_eq!(allocations, 0);
+
+        for invalid in [
+            json!({"type": "prx_unknown"}),
+            json!({"type": ["object", "prx_unknown"], "properties": {}}),
+        ] {
+            assert_eq!(
+                SchemaCleanr::validate(&invalid).unwrap_err().to_string(),
+                "Schema node $ has unsupported type 'prx_unknown'"
+            );
+        }
+        let malformed = json!({"type": ["object", 3], "properties": {}});
+        assert_eq!(
+            SchemaCleanr::validate(&malformed).unwrap_err().to_string(),
+            "Schema node $.type must be a string or a non-empty string array"
+        );
+    }
 
     #[test]
     fn unknown_schema_keywords_are_ignored_rather_than_rejected() {
@@ -3411,5 +3952,163 @@ mod tests {
             cyclic_issues.iter().any(|issue| issue.path == "$.limit"),
             "the part of a cycle that was walked must still bind: {cyclic_issues:?}"
         );
+    }
+
+    // ── C2af-02 / C2af-03: what a root `allOf` member may carry ─────────
+
+    /// C2af-03: a member whose `properties` is not an object, or whose
+    /// `required` is not an array, used to pass the key check and then be
+    /// skipped, so the merge answered `Ok` on a document it had not fully
+    /// read. It is malformed JSON Schema and is now refused by name.
+    #[test]
+    fn a_member_with_malformed_properties_or_required_is_refused() {
+        for (label, member) in [
+            ("properties as an array", json!({"properties": ["path"]})),
+            ("properties as a string", json!({"properties": "path"})),
+            ("required as a string", json!({"required": "path"})),
+            ("required as an object", json!({"required": {"path": true}})),
+        ] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "allOf": [member]
+            });
+            let error = ToolSchemaDialect::NoRootCombinators
+                .wire_schema("fixture_malformed", &schema)
+                .expect_err(label);
+            assert_eq!(error.keyword, "allOf", "{label}");
+            assert!(error.to_string().contains("fixture_malformed"), "{label}: {error}");
+        }
+    }
+
+    /// C2af-02: pure annotations constrain nothing, so a member carrying one
+    /// is merged and the annotation is dropped (never hoisted onto the
+    /// root). What the merged document accepts, rejects and normalizes is
+    /// exactly what the published one does, on every probe.
+    #[test]
+    fn a_member_carrying_only_annotations_merges_and_enforces_the_published_contract() {
+        let probes = [
+            json!({"query": "q", "limit": 3}),
+            json!({"query": "q", "limit": 3.0}),
+            json!({"query": "q"}),
+            json!({"limit": 3}),
+            json!({"query": "q", "limit": 0}),
+            json!({"query": 7, "limit": 3}),
+            json!({"query": "q", "limit": "3"}),
+            json!({}),
+        ];
+        for (keyword, value) in [
+            ("$comment", json!("generated by a tool")),
+            ("examples", json!([{"limit": 5}])),
+            ("default", json!({"limit": 10})),
+            ("deprecated", json!(false)),
+            ("readOnly", json!(false)),
+            ("writeOnly", json!(false)),
+        ] {
+            let mut member = json!({
+                "properties": {"limit": {"type": "integer", "minimum": 1}},
+                "required": ["limit"]
+            });
+            member[keyword] = value;
+            let published = json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "allOf": [member]
+            });
+            let merged = ToolSchemaDialect::NoRootCombinators
+                .wire_schema("fixture_annotated", &published)
+                .unwrap_or_else(|error| panic!("{keyword}: an annotation must not refuse the merge: {error}"))
+                .into_owned();
+            assert!(merged.get("allOf").is_none(), "{keyword}: {merged}");
+            assert!(
+                merged.get(keyword).is_none(),
+                "{keyword} was hoisted onto the root: {merged}"
+            );
+            assert_eq!(merged["required"], json!(["query", "limit"]), "{keyword}");
+
+            let published_rules = CompiledToolSchema::compile(&published);
+            let merged_rules = CompiledToolSchema::compile(&merged);
+            for probe in &probes {
+                assert_eq!(
+                    published_rules.validate_tool_arguments(probe).is_empty(),
+                    merged_rules.validate_tool_arguments(probe).is_empty(),
+                    "{keyword}: the merged document disagrees with the published one on {probe}"
+                );
+                let (mut left, mut right) = (probe.clone(), probe.clone());
+                published_rules.normalize_integral_numbers(&mut left);
+                merged_rules.normalize_integral_numbers(&mut right);
+                assert_eq!(left, right, "{keyword}: normalization differs on {probe}");
+            }
+        }
+    }
+
+    /// C2af-02 boundary: identity and vocabulary keywords are not
+    /// annotations. `$id` rebases `$ref` resolution inside the member and
+    /// `$schema`/`$vocabulary` switch what the keywords mean, so dropping one
+    /// can change what the member accepts. They stay refused.
+    #[test]
+    fn a_member_carrying_an_identity_or_vocabulary_keyword_stays_refused() {
+        for keyword in ["$id", "$schema", "$anchor", "$dynamicAnchor", "$vocabulary"] {
+            let mut member = json!({"properties": {"limit": {"type": "integer"}}});
+            member[keyword] = json!("urn:fixture");
+            let published = json!({"type": "object", "allOf": [member]});
+            let error = ToolSchemaDialect::NoRootCombinators
+                .wire_schema("fixture_identity", &published)
+                .expect_err(keyword);
+            assert!(error.detail.contains(keyword), "{keyword}: {error}");
+        }
+    }
+
+    /// R-C2BU F-8: the declaration a refusal suggests must be pasteable. A
+    /// redacted label (`[redacted]@`) matches no entry and reads as a mask,
+    /// so the suggestion shows where the credentials go instead.
+    #[test]
+    fn a_refusal_for_a_redacted_endpoint_suggests_a_pasteable_declaration() {
+        let schema = json!({"type": "object", "anyOf": [{"required": ["a"]}, {"required": ["b"]}]});
+        let refused = ToolSchemaDialect::NoRootCombinators
+            .lower_all([("fixture_alternatives", &schema)])
+            .expect_err("test: refused");
+        let rendered = ToolSchemaRefusals {
+            dialect: ToolSchemaDialect::NoRootCombinators,
+            refusals: refused,
+            provider: "custom:http://[redacted]@127.0.0.1:8080/v1".to_string(),
+            model: "fixture-model".to_string(),
+            descriptor_source: "fixture".to_string(),
+        }
+        .to_string();
+        assert!(
+            rendered.contains("provider = \"custom:http://<user>:<password>@127.0.0.1:8080/v1\""),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("provider = \"custom:http://[redacted]@"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("exactly as in your configuration"), "{rendered}");
+    }
+
+    /// R-C2BUf F-8: the placeholder also replaces a redacted userinfo that
+    /// follows a `http:\\` or `http:/` spelling.
+    #[test]
+    fn every_redacted_spelling_gets_the_pasteable_placeholder() {
+        for (label, expected) in [
+            (
+                "custom:http:\\\\[redacted]@h.invalid/v1",
+                "custom:http:\\\\<user>:<password>@h.invalid/v1",
+            ),
+            (
+                "custom:http:/[redacted]@h.invalid/v1",
+                "custom:http:/<user>:<password>@h.invalid/v1",
+            ),
+            (
+                "custom:http:[redacted]@h.invalid/v1",
+                "custom:http:<user>:<password>@h.invalid/v1",
+            ),
+        ] {
+            let (pasteable, credentialed) = crate::providers::pasteable_provider_label(label);
+            assert!(credentialed, "{label}");
+            assert_eq!(pasteable, expected);
+        }
     }
 }

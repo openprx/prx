@@ -31,11 +31,72 @@ pub struct IrcChannel {
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
     verify_tls: bool,
-    /// Shared write half of the TLS stream for sending messages.
-    writer: Arc<Mutex<Option<WriteHalf>>>,
+    /// Shared write half of the TLS stream for sending messages, tagged with
+    /// the listener generation that opened it.
+    writer: Arc<Mutex<Option<OwnedWriter>>>,
+    /// The generation the next `listen` takes.
+    next_generation: AtomicU64,
 }
 
 type WriteHalf = tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// A connection's write half and the listener generation that owns it, so a
+/// listener's release can never take a newer listener's connection (D-072
+/// L-6).
+struct OwnedWriter {
+    generation: u64,
+    half: WriteHalf,
+}
+
+impl std::ops::Deref for OwnedWriter {
+    type Target = WriteHalf;
+
+    fn deref(&self) -> &WriteHalf {
+        &self.half
+    }
+}
+
+impl std::ops::DerefMut for OwnedWriter {
+    fn deref_mut(&mut self) -> &mut WriteHalf {
+        &mut self.half
+    }
+}
+
+/// Takes the stored write half if `generation` owns it.
+fn release_generation(slot: &mut Option<OwnedWriter>, generation: u64) {
+    if slot.as_ref().is_some_and(|owned| owned.generation == generation) {
+        slot.take();
+    }
+}
+
+/// Releases the connection's write half when the `listen` that stored it
+/// ends, however it ends (D-067). The channel `Arc` outlives a listener
+/// (senders hold it), so the stored write half kept the TLS stream, and with
+/// it the server session, open after a channel-runtime restart: a ghost
+/// session that forced a nick change on the next connect. Dropping both
+/// halves closes the connection.
+struct ConnectionRelease {
+    writer: Arc<Mutex<Option<OwnedWriter>>>,
+    generation: u64,
+}
+
+impl Drop for ConnectionRelease {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.writer.try_lock() {
+            release_generation(&mut guard, self.generation);
+            return;
+        }
+        // A send holds the lock right now: release it once that send is done,
+        // and only if it is still this listener's connection.
+        let writer = Arc::clone(&self.writer);
+        let generation = self.generation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                release_generation(&mut *writer.lock().await, generation);
+            });
+        }
+    }
+}
 
 /// Style instruction prepended to every IRC message before it reaches the LLM.
 /// IRC clients render plain text only — no markdown, no HTML, no XML.
@@ -253,6 +314,7 @@ impl IrcChannel {
             sasl_password: cfg.sasl_password,
             verify_tls: cfg.verify_tls,
             writer: Arc::new(Mutex::new(None)),
+            next_generation: AtomicU64::new(0),
         }
     }
 
@@ -397,10 +459,20 @@ impl Channel for IrcChannel {
         Self::send_raw(&mut writer, &format!("USER {} 0 * :OpenPRX", self.username)).await?;
 
         // Store writer for send()
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         {
             let mut guard = self.writer.lock().await;
-            *guard = Some(writer);
+            *guard = Some(OwnedWriter {
+                generation,
+                half: writer,
+            });
         }
+        // Released when this listener ends, also when the channel runtime
+        // drops the listener on a restart or shutdown.
+        let _release = ConnectionRelease {
+            writer: Arc::clone(&self.writer),
+            generation,
+        };
 
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
@@ -1019,5 +1091,147 @@ nickname = "bot"
             sasl_password: None,
             verify_tls: true,
         })
+    }
+
+    /// A loopback TLS IRC server that counts connections (accepted, and open
+    /// until the client closes), and a channel pointed at it.
+    async fn loopback_irc() -> (
+        Arc<IrcChannel>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("test: cert");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+            )
+            .expect("test: server TLS config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let port = listener.local_addr().expect("test: addr").port();
+        let open = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        {
+            let open = Arc::clone(&open);
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let open = Arc::clone(&open);
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        open.fetch_add(1, Ordering::SeqCst);
+                        // Read until the client closes the connection.
+                        let mut buf = [0_u8; 1024];
+                        while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+                        open.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        let channel = Arc::new(IrcChannel::new(IrcChannelConfig {
+            server: "127.0.0.1".into(),
+            port,
+            nickname: "prxbot".into(),
+            username: None,
+            channels: vec![],
+            allowed_users: vec!["*".into()],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: false,
+        }));
+        (channel, open, accepted)
+    }
+
+    /// `counter` reaches `target`, polled; a minute at most, which only turns
+    /// a hang into a failure.
+    async fn reaches(target: usize, counter: &std::sync::atomic::AtomicUsize) -> bool {
+        for _ in 0..6000 {
+            if counter.load(Ordering::SeqCst) == target {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        counter.load(Ordering::SeqCst) == target
+    }
+
+    /// D-067, RED before: after a channel-runtime restart the old IRC
+    /// connection stayed open (the channel kept its write half), a ghost
+    /// session on the server. After: when a listener is dropped, as the
+    /// runtime does on restart or shutdown, its connection closes, so a
+    /// loopback server never holds more than one open connection across
+    /// restarts and none once the listener is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_listener_closes_its_previous_connection() {
+        let (channel, open, accepted) = loopback_irc().await;
+
+        for generation in 1..=3 {
+            let (tx, _rx) = mpsc::channel(8);
+            let listening = Arc::clone(&channel);
+            let task = tokio::spawn(async move { listening.listen(tx).await });
+            assert!(
+                reaches(generation, &accepted).await,
+                "generation {generation} connected"
+            );
+            assert!(reaches(1, &open).await, "one open connection while listening");
+            // What the channel runtime does on a restart: drop the listener.
+            task.abort();
+            let _ = task.await;
+            assert!(
+                reaches(0, &open).await,
+                "generation {generation}'s connection is closed once its listener is gone"
+            );
+        }
+        // The channel itself is still alive (senders hold it) and holds no
+        // connection.
+        assert!(channel.writer.lock().await.is_none());
+    }
+
+    /// D-072 L-6: a listener's release takes only the connection its own
+    /// generation opened. A release that runs late (a send held the lock at
+    /// drop time) must not close the connection a newer listener stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_release_never_takes_a_newer_listeners_connection() {
+        let (channel, open, _accepted) = loopback_irc().await;
+        let older = channel.connect().await.expect("test: first connection");
+        let newer = channel.connect().await.expect("test: second connection");
+        assert!(reaches(2, &open).await, "both connections are open");
+        drop(older);
+        assert!(reaches(1, &open).await, "the older connection is closed");
+        let (reader, half) = tokio::io::split(newer);
+        *channel.writer.lock().await = Some(OwnedWriter { generation: 2, half });
+
+        // The older listener's release runs now.
+        drop(ConnectionRelease {
+            writer: Arc::clone(&channel.writer),
+            generation: 1,
+        });
+        assert_eq!(
+            channel.writer.lock().await.as_ref().map(|owned| owned.generation),
+            Some(2),
+            "the newer listener keeps its connection"
+        );
+        assert_eq!(open.load(Ordering::SeqCst), 1);
+
+        // Its own release takes it.
+        drop(ConnectionRelease {
+            writer: Arc::clone(&channel.writer),
+            generation: 2,
+        });
+        assert!(channel.writer.lock().await.is_none());
+        drop(reader);
+        assert!(
+            reaches(0, &open).await,
+            "the newer connection closes with its own release"
+        );
     }
 }

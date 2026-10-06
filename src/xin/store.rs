@@ -4,6 +4,8 @@
 //! Pattern follows `cron/store.rs`: `with_connection()` + `rusqlite::params!`.
 
 use crate::config::Config;
+use crate::cron::JobCreator;
+use crate::tools::execution::JobOrigin;
 use crate::xin::types::{
     ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
     XinGoal, XinRun, XinStep, XinTask, XinTaskEvent, XinTaskPatch, default_lease_ttl_secs,
@@ -27,7 +29,30 @@ pub struct XinTaskLease {
 // ── CRUD ────────────────────────────────────────────────────────────────
 
 /// Insert a new task and return the persisted record.
+///
+/// The task records no creator and so runs as [`JobOrigin::Unattributed`];
+/// entry points that know who created it use [`add_task_with_origin`].
+#[cfg(test)]
 pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
+    add_task_with_origin(config, new, &JobOrigin::Unattributed)
+}
+
+/// Insert a new task created by `origin` (CRON-ORIGIN) and return it. The
+/// origin is fixed here: no later update changes whose authority its agent
+/// runs execute under.
+pub fn add_task_with_origin(config: &Config, new: &NewXinTask, origin: &JobOrigin) -> Result<XinTask> {
+    add_task_with_origin_and_creator(config, new, origin, JobCreator::AgentTool)
+}
+
+/// [`add_task_with_origin`] recording which surface created the task (D-107
+/// amendment): only `prx xin` passes [`JobCreator::OperatorCli`].
+pub fn add_task_with_origin_and_creator(
+    config: &Config,
+    new: &NewXinTask,
+    origin: &JobOrigin,
+    created_via: JobCreator,
+) -> Result<XinTask> {
+    let origin = origin.to_stored()?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let next_run = if new.recurring && new.interval_secs > 0 {
@@ -43,13 +68,13 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
                 name, description, kind, status, priority, execution_mode,
                 payload, recurring, interval_secs, created_at, updated_at,
                 last_run_at, next_run_at, last_status, last_output,
-                run_count, fail_count, max_failures, enabled, approval_grant_json
+                run_count, fail_count, max_failures, enabled, approval_grant_json, origin, created_via
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, 'pending', ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15,
                 NULL, ?16, NULL, NULL,
-                0, 0, ?17, 1, ?18
+                0, 0, ?17, 1, ?18, ?19, ?20
              )",
             params![
                 id,
@@ -70,6 +95,8 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
                 next_run.to_rfc3339(),
                 i64::from(new.max_failures),
                 new.approval_grant_json,
+                origin,
+                created_via.as_str(),
             ],
         )
         .context("Failed to insert xin task")?;
@@ -124,7 +151,7 @@ pub fn list_tasks(config: &Config) -> Result<Vec<XinTask>> {
                     name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled, approval_grant_json
+                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin
              FROM xin_tasks
              ORDER BY priority DESC, next_run_at ASC",
         )?;
@@ -147,7 +174,7 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
                     name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled, approval_grant_json
+                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin
              FROM xin_tasks
              WHERE enabled = 1
                AND status IN ('pending', 'stale')
@@ -164,6 +191,36 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
 }
 
 /// Apply a partial update to an existing task.
+/// Which surface created the task (D-107 amendment); NULL is `agent_tool`.
+pub fn task_created_via(config: &Config, task_id: &str) -> Result<JobCreator> {
+    with_connection(config, |conn| {
+        let value = conn
+            .query_row(
+                "SELECT created_via FROM xin_tasks WHERE id = ?1",
+                params![task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .with_context(|| format!("xin task '{task_id}' not found"))?;
+        Ok(JobCreator::from_stored(value.as_deref()))
+    })
+}
+
+/// Record that the operator vouches for a task as their own (`prx xin
+/// mark-operator`): its shell command may then run git, hardened.
+pub fn mark_task_operator(config: &Config, task_id: &str) -> Result<()> {
+    let changed = with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE xin_tasks SET created_via = 'operator_cli' WHERE id = ?1",
+            params![task_id],
+        )
+        .context("Failed to mark xin task as the operator's")
+    })?;
+    if changed == 0 {
+        anyhow::bail!("xin task '{task_id}' not found");
+    }
+    Ok(())
+}
+
 pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Result<XinTask> {
     let mut task = get_task(config, task_id)?;
     let now = Utc::now();
@@ -199,7 +256,8 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                 "UPDATE xin_tasks
              SET name = ?1, description = ?2, priority = ?3, payload = ?4,
                  interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8,
-                 approval_grant_json = ?9
+                 approval_grant_json = ?9,
+                 created_via = COALESCE(?12, created_via)
              WHERE id = ?10 AND updated_at = ?11",
                 params![
                     task.name,
@@ -213,6 +271,10 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                     task.approval_grant_json,
                     task_id,
                     previous_updated_at.to_rfc3339(),
+                    patch
+                        .payload
+                        .as_ref()
+                        .map(|_| patch.created_via.unwrap_or_default().as_str()),
                 ],
             )
             .context("Failed to update xin task")?;
@@ -440,7 +502,7 @@ pub fn step_lease_is_current(config: &Config, step_id: &str, lease: &XinStepLeas
 #[cfg(test)]
 pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_connection(config, |conn| {
         let changed = conn
             .execute(
@@ -472,7 +534,7 @@ pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()
 #[cfg(test)]
 pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_connection(config, |conn| {
         // Increment fail_count first
         let changed = conn
@@ -702,61 +764,6 @@ pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> 
     })
 }
 
-/// Mark only running system tasks inside a reserved namespace as stale.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn mark_stale_system_tasks_in_namespace(
-    config: &Config,
-    stale_timeout_minutes: u32,
-    namespace_prefix: &str,
-) -> Result<usize> {
-    let pattern = format!("{namespace_prefix}%");
-    with_immediate_connection(config, |conn| {
-        let now = authoritative_now(conn)?;
-        let cutoff = now - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
-        let mut stmt = conn.prepare(
-            "SELECT id FROM xin_tasks
-             WHERE kind = 'system' AND name LIKE ?1
-               AND status = 'running'
-               AND (
-                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?2)
-                    OR (lease_expires_at IS NULL AND updated_at < ?3)
-               )",
-        )?;
-        let ids = stmt
-            .query_map(params![pattern, now.to_rfc3339(), cutoff.to_rfc3339()], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        let changed = conn.execute(
-            "UPDATE xin_tasks
-             SET status = 'stale', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
-             WHERE kind = 'system' AND name LIKE ?2
-               AND status = 'running'
-               AND (
-                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?1)
-                    OR (lease_expires_at IS NULL AND updated_at < ?3)
-               )",
-            params![now.to_rfc3339(), pattern, cutoff.to_rfc3339()],
-        )?;
-        for task_id in ids {
-            if let Some(lineage) = load_task_lineage(conn, &task_id)? {
-                insert_task_event(
-                    conn,
-                    &workspace_id(config),
-                    &task_id,
-                    lineage,
-                    "xin.task.stale",
-                    Some("stale"),
-                    Some(serde_json::json!({ "stale_timeout_minutes": stale_timeout_minutes }).to_string()).as_deref(),
-                )?;
-            }
-        }
-        Ok(changed)
-    })
-}
-
 /// Upsert a system task by name + kind=system. If it exists, update payload/interval; if not, insert.
 pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     // Check if a system task with this name already exists
@@ -772,7 +779,9 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
     })?;
 
     existing.map_or_else(
-        || add_task(config, new),
+        // System tasks come only from the built-in definitions and the
+        // operator's `HEARTBEAT.md` (CRON-ORIGIN).
+        || add_task_with_origin(config, new, &JobOrigin::LocalOperator),
         |id| {
             let current = get_task(config, &id)?;
             if current.payload == new.payload
@@ -871,7 +880,7 @@ pub fn commit_task_execution(
     finished_at: DateTime<Utc>,
     duration_ms: i64,
 ) -> Result<bool> {
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_immediate_connection(config, |conn| {
         let task: Option<(bool, i64)> = conn
             .query_row(
@@ -1002,7 +1011,7 @@ pub fn commit_task_cancellation(
     finished_at: DateTime<Utc>,
     output: &str,
 ) -> Result<bool> {
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     let duration_ms = (finished_at - started_at).num_milliseconds();
     with_immediate_connection(config, |conn| {
         let changed = conn.execute(
@@ -1040,7 +1049,7 @@ fn insert_run_record(
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
-    let bounded = output.map(truncate_output);
+    let bounded = output.map(stored_task_output);
 
     conn.execute(
         "INSERT INTO xin_runs (task_id, started_at, finished_at, status, output, duration_ms)
@@ -1172,7 +1181,7 @@ pub fn list_task_events(config: &Config, task_id: &str) -> Result<Vec<XinTaskEve
 const SELECT_GOAL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
             name, description, kind, status, priority, target_completion_at,
             steps_completed, steps_total, created_at, updated_at, completed_at,
-            final_output, enabled
+            final_output, enabled, origin
      FROM xin_goals";
 
 const SELECT_STEP_COLUMNS: &str = "SELECT id, goal_id, sequence, name, description, status, execution_mode,
@@ -1182,12 +1191,23 @@ const SELECT_STEP_COLUMNS: &str = "SELECT id, goal_id, sequence, name, descripti
      FROM xin_steps";
 
 /// Insert a goal and (optionally) its initial steps in a single transaction.
-#[allow(dead_code)] // Canonical crate API; adoption currently owns the production caller.
+///
+/// The goal records no creator and so runs as [`JobOrigin::Unattributed`];
+/// entry points that know who created it use [`add_goal_with_origin`].
+#[cfg(test)]
 pub fn add_goal(config: &Config, new: &NewXinGoal) -> Result<XinGoal> {
+    add_goal_with_origin(config, new, &JobOrigin::Unattributed)
+}
+
+/// Insert a goal created by `origin` (CRON-ORIGIN); every step of it runs
+/// under that origin.
+pub fn add_goal_with_origin(config: &Config, new: &NewXinGoal, origin: &JobOrigin) -> Result<XinGoal> {
     let goal_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    with_immediate_connection(config, |conn| insert_goal_rows(conn, config, &goal_id, new, now))?;
+    with_immediate_connection(config, |conn| {
+        insert_goal_rows(conn, config, &goal_id, new, origin, now)
+    })?;
 
     get_goal(config, &goal_id)
 }
@@ -1199,20 +1219,22 @@ fn insert_goal_rows(
     config: &Config,
     goal_id: &str,
     new: &NewXinGoal,
+    origin: &JobOrigin,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let steps_total = u32::try_from(new.initial_steps.len()).unwrap_or(u32::MAX);
+    let origin = origin.to_stored()?;
     conn.execute(
         "INSERT INTO xin_goals (
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 name, description, kind, status, priority, target_completion_at,
                 steps_completed, steps_total, created_at, updated_at, completed_at,
-                final_output, enabled
+                final_output, enabled, origin
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, 'pending', ?9, ?10,
                 0, ?11, ?12, ?13, NULL,
-                NULL, 1
+                NULL, 1, ?14
              )",
         params![
             goal_id,
@@ -1228,6 +1250,7 @@ fn insert_goal_rows(
             i64::from(steps_total),
             now.to_rfc3339(),
             now.to_rfc3339(),
+            origin,
         ],
     )
     .context("Failed to insert xin goal")?;
@@ -1293,7 +1316,6 @@ fn insert_step_row(conn: &Connection, goal_id: &str, step: &NewXinStep, now: Dat
 }
 
 /// Append a step to an existing goal and bump its `steps_total`.
-#[allow(dead_code)] // Canonical crate API for future interactive goal authoring.
 pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<XinStep> {
     let now = Utc::now();
     let step_id = with_immediate_connection(config, |conn| {
@@ -1792,7 +1814,7 @@ pub(crate) fn complete_step_with_lease(
     lease: &XinStepLease,
     output: &str,
 ) -> Result<bool> {
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_immediate_connection(config, |conn| {
         let now = authoritative_now(conn)?;
         let goal_id: Option<String> = conn
@@ -1839,7 +1861,7 @@ pub(crate) fn complete_step_with_lease(
 /// fail the goal. Operators can explicitly cancel a goal when retrying is no
 /// longer desired.
 pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinStepLease, output: &str) -> Result<bool> {
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_immediate_connection(config, |conn| {
         let now = authoritative_now(conn)?;
         let exists = conn
@@ -1883,7 +1905,7 @@ pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinSt
 #[cfg(test)]
 pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_connection(config, |conn| {
         let goal_id: Option<String> = conn
             .query_row("SELECT goal_id FROM xin_steps WHERE id = ?1", params![step_id], |row| {
@@ -1915,7 +1937,7 @@ pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()>
 #[cfg(test)]
 pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
-    let bounded = truncate_output(output);
+    let bounded = stored_task_output(output);
     with_connection(config, |conn| {
         let exists = conn
             .query_row("SELECT 1 FROM xin_steps WHERE id = ?1", params![step_id], |_| Ok(()))
@@ -2052,7 +2074,8 @@ pub(crate) fn adopt_legacy_task(config: &Config, task_id: &str) -> Result<Option
             target_completion_at: None,
             initial_steps: vec![migrated_step, verification_step],
         };
-        insert_goal_rows(conn, config, &goal_id, &goal, now)?;
+        // The adopted goal runs under the legacy task's own origin.
+        insert_goal_rows(conn, config, &goal_id, &goal, &task.origin, now)?;
         conn.execute(
             "INSERT INTO xin_task_adoptions (legacy_task_id, goal_id, adopted_at)
              VALUES (?1, ?2, ?3)",
@@ -2129,7 +2152,7 @@ pub fn migrate_task_to_goal(config: &Config, task_id: &str) -> Result<XinGoal> {
         target_completion_at: None,
         initial_steps: vec![step],
     };
-    add_goal(config, &new_goal)
+    add_goal_with_origin(config, &new_goal, &task.origin)
 }
 
 /// Recompute `steps_completed` and roll the goal status up. Called inside an
@@ -2251,6 +2274,7 @@ fn load_goal_lineage(conn: &Connection, goal_id: &str) -> Result<Option<TaskLine
 }
 
 fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinGoal> {
+    let kind = TaskKind::from_str_lossy(&row.get::<_, String>(7)?);
     let created_at_raw: String = row.get(13)?;
     let updated_at_raw: String = row.get(14)?;
     let target_raw: Option<String> = row.get(10)?;
@@ -2263,7 +2287,7 @@ fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinGoal> {
         source_message_event_id: row.get(4)?,
         name: row.get(5)?,
         description: row.get(6)?,
-        kind: TaskKind::from_str_lossy(&row.get::<_, String>(7)?),
+        kind: kind.clone(),
         status: GoalStatus::from_str_lossy(&row.get::<_, String>(8)?),
         priority: TaskPriority::from_i32(row.get(9)?),
         target_completion_at: match target_raw {
@@ -2280,6 +2304,7 @@ fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinGoal> {
         },
         final_output: row.get(16)?,
         enabled: row.get::<_, i64>(17)? != 0,
+        origin: stored_origin(row.get::<_, Option<String>>(18)?.as_deref(), &kind),
     })
 }
 
@@ -2334,10 +2359,16 @@ const SELECT_ALL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id,
             name, description, kind, status, priority, execution_mode,
             payload, recurring, interval_secs, created_at, updated_at,
             last_run_at, next_run_at, last_status, last_output,
-            run_count, fail_count, max_failures, enabled, approval_grant_json
+            run_count, fail_count, max_failures, enabled, approval_grant_json, origin
      FROM xin_tasks WHERE id = ?1";
 
-fn truncate_output(output: &str) -> String {
+/// Redact and bound a task's output before the store persists it.
+///
+/// An agent task's output is the agent turn's reply (or its error), so it is
+/// redacted like the terminal commit (D-053) before it is capped.
+fn stored_task_output(output: &str) -> String {
+    let redacted = crate::agent::terminal::redact_persisted_text(output);
+    let output = redacted.as_str();
     if output.len() <= MAX_OUTPUT_BYTES {
         return output.to_string();
     }
@@ -2548,7 +2579,7 @@ fn deliver_pending_xin_event_outbox(conn: &Connection) -> Result<usize> {
                 delivered += 1;
             }
             Err(error) => {
-                let error = truncate_output(&error.to_string());
+                let error = stored_task_output(&error.to_string());
                 conn.execute(
                     "UPDATE xin_event_outbox
                      SET attempt_count = attempt_count + 1, last_error = ?1
@@ -2581,6 +2612,7 @@ fn map_task_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTaskEvent>
 }
 
 fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask> {
+    let kind = TaskKind::from_str_lossy(&row.get::<_, String>(7)?);
     let created_at_raw: String = row.get(14)?;
     let updated_at_raw: String = row.get(15)?;
     let last_run_raw: Option<String> = row.get(16)?;
@@ -2594,7 +2626,7 @@ fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask> {
         source_message_event_id: row.get(4)?,
         name: row.get(5)?,
         description: row.get(6)?,
-        kind: TaskKind::from_str_lossy(&row.get::<_, String>(7)?),
+        kind: kind.clone(),
         status: TaskStatus::from_str_lossy(&row.get::<_, String>(8)?),
         priority: TaskPriority::from_i32(row.get(9)?),
         execution_mode: ExecutionMode::from_str_lossy(&row.get::<_, String>(10)?),
@@ -2615,7 +2647,23 @@ fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask> {
         max_failures: u32::try_from(row.get::<_, i64>(22)?).unwrap_or(0),
         enabled: row.get::<_, i64>(23)? != 0,
         approval_grant_json: row.get(24)?,
+        origin: stored_origin(row.get::<_, Option<String>>(25)?.as_deref(), &kind),
     })
+}
+
+/// Decode a stored task or goal origin (CRON-ORIGIN migration rule).
+///
+/// A row written before the `origin` column existed is attributed to the local
+/// operator only when it is a `system` task or goal: those are written solely
+/// by `ensure_system_task` from the built-in definitions and `HEARTBEAT.md`
+/// (and by adopting such a task), never by the `xin` tool or the `prx xin` CLI,
+/// which both hard-code `user`. Every other legacy row reads as
+/// [`JobOrigin::Unattributed`] and never runs with operator authority.
+fn stored_origin(raw: Option<&str>, kind: &TaskKind) -> JobOrigin {
+    if raw.is_none() && *kind == TaskKind::System {
+        return JobOrigin::LocalOperator;
+    }
+    JobOrigin::from_stored(raw)
 }
 
 fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
@@ -2687,7 +2735,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             lease_owner      TEXT,
             lease_epoch      INTEGER NOT NULL DEFAULT 0,
             lease_expires_at TEXT,
-            last_heartbeat_at TEXT
+            last_heartbeat_at TEXT,
+            origin           TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_next_run ON xin_tasks(next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_status ON xin_tasks(status);
@@ -2761,7 +2810,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             updated_at              TEXT NOT NULL,
             completed_at            TEXT,
             final_output            TEXT,
-            enabled                 INTEGER NOT NULL DEFAULT 1
+            enabled                 INTEGER NOT NULL DEFAULT 1,
+            origin                  TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_xin_goals_owner  ON xin_goals(owner_id, status);
          CREATE INDEX IF NOT EXISTS idx_xin_goals_topic  ON xin_goals(topic_id, status);
@@ -2816,6 +2866,14 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_tasks", "lease_expires_at", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "last_heartbeat_at", "TEXT")?;
     add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
+    // CRON-ORIGIN: nullable, no backfill; see `stored_origin` for how a row
+    // written before this column existed is attributed.
+    add_column_if_missing(&conn, "xin_tasks", "origin", "TEXT")?;
+    // D-107 amendment: which surface created the task. Nullable with no
+    // backfill: a row stored before the column existed reads as
+    // `agent_tool` (its git is refused) until the operator marks it.
+    add_column_if_missing(&conn, "xin_tasks", "created_via", "TEXT")?;
+    add_column_if_missing(&conn, "xin_goals", "origin", "TEXT")?;
     // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
     add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "xin_steps", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
@@ -3617,33 +3675,6 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_namespace_stale_recovery_leaves_regular_xin_tasks_running() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
-        let regular = add_task(&config, &sample_task()).unwrap();
-        let mut heartbeat_task = recurring_task();
-        heartbeat_task.name = "heartbeat:scoped-stale".to_string();
-        let heartbeat = add_task(&config, &heartbeat_task).unwrap();
-        assert!(claim_task(&config, &regular.id).unwrap());
-        assert!(claim_task(&config, &heartbeat.id).unwrap());
-
-        with_connection(&config, |conn| {
-            let old = (Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
-            conn.execute(
-                "UPDATE xin_tasks SET lease_expires_at = ?1 WHERE id IN (?2, ?3)",
-                params![old, regular.id, heartbeat.id],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-        let stale_count = mark_stale_system_tasks_in_namespace(&config, 60, "heartbeat:").unwrap();
-        assert_eq!(stale_count, 1);
-        assert_eq!(get_task(&config, &heartbeat.id).unwrap().status, TaskStatus::Stale);
-        assert_eq!(get_task(&config, &regular.id).unwrap().status, TaskStatus::Running);
-    }
-
-    #[test]
     fn ensure_system_task_upserts() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3682,10 +3713,26 @@ mod tests {
         .unwrap();
     }
 
+    /// D-053 / REDACT-TURN: an agent task's output is the agent turn's reply or
+    /// error; the store redacts it before it caps it, on every write path that
+    /// bounds output. Fails before REDACT-TURN.
+    #[test]
+    fn stored_task_output_redacts_secrets_before_capping() {
+        use crate::agent::terminal::persistence_probe::PROBE_SECRET;
+        let stored = stored_task_output(&format!("agent task failed: upstream rejected key {PROBE_SECRET}"));
+        assert!(!stored.contains(PROBE_SECRET), "{stored}");
+        assert!(stored.contains("[REDACTED]"), "{stored}");
+
+        let large = format!("{PROBE_SECRET} {}", "x".repeat(MAX_OUTPUT_BYTES + 512));
+        let capped = stored_task_output(&large);
+        assert!(!capped.contains(PROBE_SECRET));
+        assert!(capped.len() <= MAX_OUTPUT_BYTES);
+    }
+
     #[test]
     fn truncate_output_handles_large_text() {
         let large = "x".repeat(MAX_OUTPUT_BYTES + 512);
-        let truncated = truncate_output(&large);
+        let truncated = stored_task_output(&large);
         assert!(truncated.len() <= MAX_OUTPUT_BYTES);
         assert!(truncated.ends_with(TRUNCATED_MARKER));
     }
@@ -4415,5 +4462,129 @@ mod tests {
         assert!(resumed.enabled);
         let retried = retry_step(&config, &step.id).unwrap();
         assert_eq!(retried.status, StepStatus::Pending);
+    }
+
+    // ── CRON-ORIGIN ──
+
+    fn telegram_origin() -> JobOrigin {
+        JobOrigin::Principal {
+            channel: "telegram".to_string(),
+            sender: "alice".to_string(),
+            chat_type: "direct".to_string(),
+            owner_id: Some("owner-alice".to_string()),
+            owner_isolated: false,
+        }
+    }
+
+    /// Migration rule: a task or goal stored before the `origin` column
+    /// existed runs as the operator only when it is a `system` row (written
+    /// solely by `ensure_system_task`); every other legacy row is unattributed.
+    ///
+    /// MUTATION GUARD: attribute every `NULL` origin to the operator in
+    /// `stored_origin` and the user rows go red.
+    #[test]
+    fn legacy_rows_without_an_origin_are_the_operator_s_only_when_they_are_system_rows() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let user_task = add_task_with_origin(&config, &sample_task(), &JobOrigin::LocalOperator).unwrap();
+        let mut system_new = sample_task();
+        system_new.name = "system_task".into();
+        system_new.kind = TaskKind::System;
+        let system_task = add_task_with_origin(&config, &system_new, &telegram_origin()).unwrap();
+        let user_goal = add_goal_with_origin(&config, &sample_goal(Vec::new()), &JobOrigin::LocalOperator).unwrap();
+        let mut system_goal_new = sample_goal(Vec::new());
+        system_goal_new.kind = TaskKind::System;
+        let system_goal = add_goal_with_origin(&config, &system_goal_new, &telegram_origin()).unwrap();
+
+        // What a database written before the column existed looks like.
+        open_xin_test_connection(&config)
+            .execute_batch("UPDATE xin_tasks SET origin = NULL; UPDATE xin_goals SET origin = NULL;")
+            .unwrap();
+
+        assert_eq!(
+            get_task(&config, &user_task.id).unwrap().origin,
+            JobOrigin::Unattributed
+        );
+        assert_eq!(
+            get_task(&config, &system_task.id).unwrap().origin,
+            JobOrigin::LocalOperator
+        );
+        assert_eq!(
+            get_goal(&config, &user_goal.id).unwrap().origin,
+            JobOrigin::Unattributed
+        );
+        assert_eq!(
+            get_goal(&config, &system_goal.id).unwrap().origin,
+            JobOrigin::LocalOperator
+        );
+        assert!(
+            list_tasks(&config)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == user_task.id && task.origin == JobOrigin::Unattributed),
+            "every read path decodes the same rule"
+        );
+    }
+
+    /// The origin is recorded at creation, survives updates unchanged, and an
+    /// adopted goal keeps its task's origin. `add_task` / `add_goal` without an
+    /// origin never grant the operator's.
+    #[test]
+    fn origins_are_fixed_at_creation_and_carried_into_adopted_goals() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let system = ensure_system_task(&config, &recurring_task()).unwrap();
+        assert_eq!(system.origin, JobOrigin::LocalOperator);
+        assert_eq!(
+            add_task(&config, &sample_task()).unwrap().origin,
+            JobOrigin::Unattributed
+        );
+        assert_eq!(
+            add_goal(&config, &sample_goal(Vec::new())).unwrap().origin,
+            JobOrigin::Unattributed
+        );
+
+        let mut new = sample_task();
+        new.name = "alice_task".into();
+        let task = add_task_with_origin(&config, &new, &telegram_origin()).unwrap();
+        assert_eq!(task.origin, telegram_origin());
+        let updated = update_task(
+            &config,
+            &task.id,
+            &XinTaskPatch {
+                payload: Some("rewritten".into()),
+                ..XinTaskPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.origin, telegram_origin(), "an update never changes the origin");
+
+        let goal = migrate_task_to_goal(&config, &task.id).unwrap();
+        assert_eq!(goal.origin, telegram_origin(), "the goal runs as the task's creator");
+    }
+
+    #[test]
+    fn rewriting_an_operator_shell_payload_downgrades_its_creator() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = sample_task();
+        new.execution_mode = ExecutionMode::Shell;
+        new.payload = "echo initial".into();
+        let task = add_task(&config, &new).unwrap();
+        mark_task_operator(&config, &task.id).unwrap();
+        assert_eq!(task_created_via(&config, &task.id).unwrap(), JobCreator::OperatorCli);
+
+        let updated = update_task(
+            &config,
+            &task.id,
+            &XinTaskPatch {
+                payload: Some("git status".into()),
+                ..XinTaskPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.payload, "git status");
+        assert_eq!(task_created_via(&config, &task.id).unwrap(), JobCreator::AgentTool);
     }
 }

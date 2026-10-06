@@ -65,31 +65,6 @@ impl RollbackManager {
         Ok(Some(version))
     }
 
-    /// Restore a specific version content into target file.
-    pub async fn rollback_to_version(&self, version_id: &str) -> Result<()> {
-        let snapshot = self.read_version(version_id).await?;
-        if let Some(parent) = self.target_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).await?;
-            }
-        }
-        let workspace_root = self.target_path.parent().unwrap_or_else(|| Path::new("."));
-        atomic_write(workspace_root, &self.target_path, snapshot.content.as_bytes())
-            .await
-            .context("failed writing rollback target")?;
-        Ok(())
-    }
-
-    /// Restore most recent version.
-    pub async fn rollback_latest(&self) -> Result<()> {
-        let mut versions = self.list_versions().await?;
-        versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let Some(latest) = versions.first() else {
-            bail!("no rollback versions available");
-        };
-        self.rollback_to_version(&latest.version_id).await
-    }
-
     pub async fn list_versions(&self) -> Result<Vec<VersionSnapshot>> {
         if fs::metadata(&self.versions_dir).await.is_err() {
             return Ok(Vec::new());
@@ -119,16 +94,6 @@ impl RollbackManager {
     fn version_path(&self, version_id: &str) -> Result<PathBuf> {
         let id = sanitize_version_id(version_id)?;
         Ok(self.versions_dir.join(format!("{id}.json")))
-    }
-
-    async fn read_version(&self, version_id: &str) -> Result<VersionSnapshot> {
-        let path = self.version_path(version_id)?;
-        let raw = fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("rollback version not found: {}", path.display()))?;
-        let snapshot = serde_json::from_str::<VersionSnapshot>(&raw)
-            .with_context(|| format!("invalid rollback snapshot: {}", path.display()))?;
-        Ok(snapshot)
     }
 
     async fn prune_versions(&self) -> Result<()> {
@@ -275,8 +240,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The pre-write snapshot keeps the previous content under the versions
+    /// directory as JSON; restoring it is manual (D-046, R-PMMCj G-2).
     #[tokio::test]
-    async fn rollback_manager_can_restore_latest_snapshot() {
+    async fn backup_keeps_the_previous_content_as_a_json_snapshot() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("cfg.toml");
         let versions = dir.path().join(".evolution/rollback/versions");
@@ -286,21 +253,11 @@ mod tests {
         let snap = manager.backup_current_version().await.unwrap().unwrap();
         fs::write(&target, "value=2").await.unwrap();
 
-        manager.rollback_to_version(&snap.version_id).await.unwrap();
-        let restored = fs::read_to_string(&target).await.unwrap();
-        assert_eq!(restored, "value=1");
-    }
-
-    #[tokio::test]
-    async fn rollback_manager_rejects_version_traversal_id() {
-        let dir = tempdir().unwrap();
-        let target = dir.path().join("cfg.toml");
-        let versions = dir.path().join(".evolution/rollback/versions");
-        fs::write(&target, "value=1").await.unwrap();
-
-        let manager = RollbackManager::new(dir.path(), &target, &versions, 3).unwrap();
-        let err = manager.rollback_to_version("../escape").await.unwrap_err();
-        assert!(err.to_string().contains("invalid version_id"));
+        let raw = fs::read_to_string(versions.join(format!("{}.json", snap.version_id)))
+            .await
+            .unwrap();
+        let stored: VersionSnapshot = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored.content, "value=1");
     }
 
     #[test]

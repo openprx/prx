@@ -60,6 +60,30 @@ impl Observer for LogObserver {
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }
+            ObserverEvent::Causal(event) => {
+                let (lineage, fields) = (&event.lineage, &event.fields);
+                info!(
+                    workspace = %lineage.workspace_id,
+                    owner = ?lineage.owner_id.as_deref(),
+                    session = ?lineage.session_key.as_deref(),
+                    run = ?lineage.run_id.as_deref(),
+                    task = ?lineage.task_id.as_deref(),
+                    source_event = ?lineage.source_event_id.as_deref(),
+                    causation_event = ?lineage.causation_event_id.as_deref(),
+                    decision = ?lineage.decision_id.as_deref(),
+                    backend = ?fields.backend.map(crate::decision::BackendKind::as_str),
+                    locality = ?fields.locality.map(crate::decision::BackendLocality::as_str),
+                    to_backend = ?fields.to_backend.map(crate::decision::BackendKind::as_str),
+                    class = ?fields.error_class,
+                    rule = ?fields.error_rule,
+                    circuit = ?fields.circuit.map(crate::decision::telemetry::CircuitState::as_str),
+                    served = ?fields.served.map(crate::decision::telemetry::ServedLabel::as_str),
+                    incomplete = ?fields.incomplete.map(crate::decision::telemetry::IncompleteReason::as_str),
+                    latency_ms = ?fields.latency_ms,
+                    "{}",
+                    event.kind.as_str()
+                );
+            }
             ObserverEvent::LlmRequest {
                 provider,
                 model,
@@ -89,24 +113,6 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
-            ObserverEvent::CteRun {
-                branch_count,
-                chosen_branch,
-                chosen_label,
-                extra_latency_ms,
-                commit_succeeded,
-                circuit_breaker_tripped,
-            } => {
-                info!(
-                    branch_count = branch_count,
-                    chosen_branch = %chosen_branch,
-                    chosen_label = %chosen_label,
-                    extra_latency_ms = extra_latency_ms,
-                    commit_succeeded = commit_succeeded,
-                    circuit_breaker_tripped = circuit_breaker_tripped,
-                    "cte.run"
-                );
-            }
         }
     }
 
@@ -124,10 +130,6 @@ impl Observer for LogObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 info!(depth = d, "metric.queue_depth");
-            }
-            ObserverMetric::CteExtraLatency(d) => {
-                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                info!(latency_ms = ms, "metric.cte_extra_latency");
             }
         }
     }
@@ -186,14 +188,6 @@ mod tests {
             component: "provider".into(),
             message: "timeout".into(),
         });
-        obs.record_event(&ObserverEvent::CteRun {
-            branch_count: 2,
-            chosen_branch: "branch-abc".into(),
-            chosen_label: "RetrieveThenAnswer".into(),
-            extra_latency_ms: 55,
-            commit_succeeded: true,
-            circuit_breaker_tripped: false,
-        });
     }
 
     #[test]
@@ -204,6 +198,5 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(u64::MAX));
         obs.record_metric(&ObserverMetric::ActiveSessions(1));
         obs.record_metric(&ObserverMetric::QueueDepth(999));
-        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(20)));
     }
 }

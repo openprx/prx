@@ -1,3 +1,6 @@
+use super::labels::{
+    BoundedLabel, COMPONENT_LABEL_CAP, channel_label, direction_label, model_label, provider_label, tool_label,
+};
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
@@ -29,9 +32,9 @@ pub struct OtelObserver {
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
 
-    // CTE metrics
-    cte_runs: Counter<u64>,
-    cte_extra_latency: Histogram<f64>,
+    // Decision-plane metrics
+    causal_events: Counter<u64>,
+    component_labels: BoundedLabel,
 }
 
 impl OtelObserver {
@@ -157,15 +160,9 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
-        let cte_runs = meter
-            .u64_counter("prx.cte.runs")
-            .with_description("Total CTE pipeline runs")
-            .build();
-
-        let cte_extra_latency = meter
-            .f64_histogram("prx.cte.extra_latency")
-            .with_description("Extra latency from CTE pipeline")
-            .with_unit("s")
+        let causal_events = meter
+            .u64_counter("prx.causal.events")
+            .with_description("Decision-plane events by kind, backend and class")
             .build();
 
         Ok(Self {
@@ -185,8 +182,8 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
-            cte_runs,
-            cte_extra_latency,
+            causal_events,
+            component_labels: BoundedLabel::new(COMPONENT_LABEL_CAP),
         })
     }
 }
@@ -200,8 +197,8 @@ impl Observer for OtelObserver {
                 self.agent_starts.add(
                     1,
                     &[
-                        KeyValue::new("provider", provider.clone()),
-                        KeyValue::new("model", model.clone()),
+                        KeyValue::new("provider", provider_label(provider)),
+                        KeyValue::new("model", model_label(model).into_owned()),
                     ],
                 );
             }
@@ -215,8 +212,8 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
-                    KeyValue::new("provider", provider.clone()),
-                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("provider", provider_label(provider)),
+                    KeyValue::new("model", model_label(model).into_owned()),
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.llm_calls.add(1, &attrs);
@@ -229,8 +226,8 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("provider", provider_label(provider)),
+                            KeyValue::new("model", model_label(model).into_owned()),
                             KeyValue::new("success", *success),
                             KeyValue::new("duration_s", secs),
                         ]),
@@ -258,8 +255,8 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("provider", provider_label(provider)),
+                            KeyValue::new("model", model_label(model).into_owned()),
                             KeyValue::new("duration_s", secs),
                         ]),
                 );
@@ -274,8 +271,8 @@ impl Observer for OtelObserver {
                 self.agent_duration.record(
                     secs,
                     &[
-                        KeyValue::new("provider", provider.clone()),
-                        KeyValue::new("model", model.clone()),
+                        KeyValue::new("provider", provider_label(provider)),
+                        KeyValue::new("model", model_label(model).into_owned()),
                     ],
                 );
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
@@ -296,7 +293,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
+                            KeyValue::new("tool.name", tool_label(tool).to_string()),
                             KeyValue::new("tool.success", *success),
                             KeyValue::new("duration_s", secs),
                         ]),
@@ -305,11 +302,12 @@ impl Observer for OtelObserver {
                 span.end();
 
                 let attrs = [
-                    KeyValue::new("tool", tool.clone()),
+                    KeyValue::new("tool", tool_label(tool).to_string()),
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.tool_calls.add(1, &attrs);
-                self.tool_duration.record(secs, &[KeyValue::new("tool", tool.clone())]);
+                self.tool_duration
+                    .record(secs, &[KeyValue::new("tool", tool_label(tool).to_string())]);
             }
             ObserverEvent::ToolBatch {
                 batch_size,
@@ -330,8 +328,8 @@ impl Observer for OtelObserver {
                 self.channel_messages.add(
                     1,
                     &[
-                        KeyValue::new("channel", channel.clone()),
-                        KeyValue::new("direction", direction.clone()),
+                        KeyValue::new("channel", channel_label(channel).to_string()),
+                        KeyValue::new("direction", direction_label(direction).to_string()),
                     ],
                 );
             }
@@ -339,52 +337,31 @@ impl Observer for OtelObserver {
                 self.heartbeat_ticks.add(1, &[]);
             }
             ObserverEvent::Error { component, message } => {
+                let (attributes, redacted) = self.error_attributes(component, message);
                 // Create an error span for visibility in trace backends
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("error")
                         .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("component", component.clone()),
-                            KeyValue::new("error.message", message.clone()),
-                        ]),
+                        .with_attributes(attributes),
                 );
-                span.set_status(Status::error(message.clone()));
+                span.set_status(Status::error(redacted));
                 span.end();
 
-                self.errors.add(1, &[KeyValue::new("component", component.clone())]);
-            }
-            ObserverEvent::CteRun {
-                branch_count,
-                chosen_branch,
-                chosen_label,
-                extra_latency_ms,
-                commit_succeeded,
-                circuit_breaker_tripped,
-            } => {
-                let attrs = [
-                    KeyValue::new("commit_succeeded", commit_succeeded.to_string()),
-                    KeyValue::new("circuit_breaker_tripped", circuit_breaker_tripped.to_string()),
-                ];
-                self.cte_runs.add(1, &attrs);
-                // Latency is recorded via record_metric(CteExtraLatency) to avoid double-counting.
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("cte.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("cte.branch_count", *branch_count as i64),
-                            KeyValue::new("cte.chosen_branch", chosen_branch.clone()),
-                            KeyValue::new("cte.chosen_label", chosen_label.clone()),
-                            KeyValue::new("cte.extra_latency_ms", *extra_latency_ms as i64),
-                            KeyValue::new("cte.commit_succeeded", *commit_succeeded),
-                            KeyValue::new("cte.circuit_breaker_tripped", *circuit_breaker_tripped),
-                        ]),
+                self.errors.add(
+                    1,
+                    &[KeyValue::new(
+                        "component",
+                        self.component_labels.label(component).to_string(),
+                    )],
                 );
-                if *commit_succeeded {
-                    span.set_status(Status::Ok);
-                } else {
-                    span.set_status(Status::error("CTE pipeline failed or no branch qualified"));
-                }
+            }
+            ObserverEvent::Causal(event) => {
+                self.causal_events.add(1, &causal_metric_attributes(event));
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name(event.kind.as_str())
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(causal_span_attributes(event)),
+                );
                 span.end();
             }
         }
@@ -403,9 +380,6 @@ impl Observer for OtelObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d as u64, &[]);
-            }
-            ObserverMetric::CteExtraLatency(d) => {
-                self.cte_extra_latency.record(d.as_secs_f64(), &[]);
             }
         }
     }
@@ -428,10 +402,123 @@ impl Observer for OtelObserver {
     }
 }
 
+/// The metric attributes of a causal event: bounded values only (AG-11).
+fn causal_metric_attributes(event: &crate::decision::telemetry::CausalEvent) -> [KeyValue; 3] {
+    let fields = &event.fields;
+    [
+        KeyValue::new("kind", event.kind.as_str()),
+        KeyValue::new(
+            "backend",
+            fields.backend.map_or("none", crate::decision::BackendKind::as_str),
+        ),
+        KeyValue::new("class", fields.error_class.unwrap_or("none")),
+    ]
+}
+
+/// The span attributes of a causal event: the lineage identifiers and the
+/// bounded fields, the model through the configured-model allowlist; never
+/// state, text or a claimed model (D-060 L-1).
+fn causal_span_attributes(event: &crate::decision::telemetry::CausalEvent) -> Vec<KeyValue> {
+    let (fields, lineage) = (&event.fields, &event.lineage);
+    let mut attributes = vec![
+        KeyValue::new("causal.kind", event.kind.as_str()),
+        KeyValue::new("causal.workspace", lineage.workspace_id.to_string()),
+        KeyValue::new(
+            "causal.backend",
+            fields.backend.map_or("none", crate::decision::BackendKind::as_str),
+        ),
+        KeyValue::new("causal.class", fields.error_class.unwrap_or("none")),
+    ];
+    for (key, value) in [
+        ("causal.owner", &lineage.owner_id),
+        ("causal.session", &lineage.session_key),
+        ("causal.run", &lineage.run_id),
+        ("causal.task", &lineage.task_id),
+        ("causal.source_event", &lineage.source_event_id),
+        ("causal.causation_event", &lineage.causation_event_id),
+        ("causal.decision", &lineage.decision_id),
+    ] {
+        if let Some(value) = value {
+            attributes.push(KeyValue::new(key, value.to_string()));
+        }
+    }
+    if let Some(model) = &fields.configured_model {
+        attributes.push(KeyValue::new("causal.model", model_label(model).into_owned()));
+    }
+    if let Some(latency) = fields.latency_ms {
+        attributes.push(KeyValue::new(
+            "causal.latency_ms",
+            i64::try_from(latency).unwrap_or(i64::MAX),
+        ));
+    }
+    attributes
+}
+
+impl OtelObserver {
+    /// The error span's attributes and status text: the component through
+    /// the bounded label, the message with secrets redacted (D-060 L-1).
+    fn error_attributes(&self, component: &str, message: &str) -> (Vec<KeyValue>, String) {
+        let redacted = crate::security::redaction::redact_secrets(message);
+        (
+            vec![
+                KeyValue::new("component", self.component_labels.label(component).to_string()),
+                KeyValue::new("error.message", redacted.clone()),
+            ],
+            redacted,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// D-060 L-1: OpenTelemetry attributes are bounded. A causal event's
+    /// metric attributes carry no lineage, its span shows an unlisted model
+    /// as `unlisted`, and an error's message is redacted and its component
+    /// capped.
+    #[test]
+    fn otel_attributes_are_bounded() {
+        use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalLineage};
+        let event = CausalEvent {
+            kind: CausalEventKind::PredictionFailed,
+            lineage: CausalLineage {
+                workspace_id: "workspace-1".into(),
+                session_key: Some("SESSION-SENTINEL-41".into()),
+                ..CausalLineage::default()
+            },
+            fields: CausalEventFields {
+                backend: Some(crate::decision::BackendKind::CompatibleHttp),
+                configured_model: Some("HOSTILE-UNLISTED-MODEL-77".into()),
+                error_class: Some("transport"),
+                ..CausalEventFields::default()
+            },
+        };
+        let metric = causal_metric_attributes(&event);
+        let rendered = format!("{metric:?}");
+        assert!(!rendered.contains("SESSION-SENTINEL-41"), "{rendered}");
+        assert!(!rendered.contains("workspace-1"), "{rendered}");
+        assert!(!rendered.contains("HOSTILE"), "{rendered}");
+        let span = format!("{:?}", causal_span_attributes(&event));
+        assert!(
+            span.contains("SESSION-SENTINEL-41"),
+            "the lineage goes to the span: {span}"
+        );
+        assert!(!span.contains("HOSTILE-UNLISTED-MODEL-77"), "{span}");
+        assert!(span.contains(crate::observability::labels::UNLISTED_MODEL), "{span}");
+
+        let obs = test_observer();
+        let secret = "sk-ant-api03-OTELSENTINELabcdefghijklmnopqrstuvwxyz0123456789";
+        let (attributes, status) = obs.error_attributes("provider", &format!("failed with {secret}"));
+        let rendered = format!("{attributes:?} {status}");
+        assert!(!rendered.contains("OTELSENTINEL"), "{rendered}");
+        for index in 0..(COMPONENT_LABEL_CAP + 8) {
+            let _ = obs.error_attributes(&format!("component-{index}"), "x");
+        }
+        let (attributes, _) = obs.error_attributes("component-past-the-cap", "x");
+        assert!(format!("{attributes:?}").contains("\"other\""), "{attributes:?}");
+    }
 
     // Note: OtelObserver::new() requires an OTLP endpoint.
     // In tests we verify the struct creation fails gracefully
@@ -520,28 +607,6 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(3));
         obs.record_metric(&ObserverMetric::QueueDepth(42));
-        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(45)));
-    }
-
-    #[test]
-    fn records_cte_events_without_panic() {
-        let obs = test_observer();
-        obs.record_event(&ObserverEvent::CteRun {
-            branch_count: 3,
-            chosen_branch: "branch-abc".into(),
-            chosen_label: "DirectAnswer".into(),
-            extra_latency_ms: 42,
-            commit_succeeded: true,
-            circuit_breaker_tripped: false,
-        });
-        obs.record_event(&ObserverEvent::CteRun {
-            branch_count: 0,
-            chosen_branch: String::new(),
-            chosen_label: String::new(),
-            extra_latency_ms: 0,
-            commit_succeeded: false,
-            circuit_breaker_tripped: true,
-        });
     }
 
     #[test]

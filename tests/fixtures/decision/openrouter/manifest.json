@@ -1,0 +1,114 @@
+{
+  "generated": "2026-09-24",
+  "committed_by": "CDP-13 (D-043)",
+  "files": [
+    {
+      "file": "decisions.request.json",
+      "sha256": "8e8d67590b0db220709819a3ce1346db9b9fd125fd30c3d290ce9794645c9ec5",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "status": "VERIFIED",
+      "sources": [
+        "O02 requestBody example"
+      ],
+      "license": "MIT (OpenRouter OpenAPI, info.license MIT)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "key order normalised; YAML example re-serialised as JSON"
+    },
+    {
+      "file": "decisions.response.json",
+      "sha256": "4b9a0235e8e9a19123da86b3a6a7a5e4e47f386efd59fc232417616df304e799",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "status": "VERIFIED",
+      "sources": [
+        "O02 200 example"
+      ],
+      "license": "MIT (OpenRouter OpenAPI, info.license MIT)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "integer 0 appears as a probability (JSON integer, not 0.0): decoders must accept integer-typed numbers"
+    },
+    {
+      "file": "decisions_v109.request.json",
+      "sha256": "24dccf8c526d07e2a8aedacca61c59ed02a3f73be0c616b711340f36bb606078",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "status": "VERIFIED shape; content from the direct capture",
+      "sources": [
+        "O02 DecisionsRequest schema",
+        "S14 fixtures/triage.json"
+      ],
+      "license": "shape MIT (OpenRouter OpenAPI, info.license MIT); content MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": false,
+      "inferred": [],
+      "pairs_with": "systemone/multi.request.json"
+    },
+    {
+      "file": "decisions_v109.response.json",
+      "sha256": "c9896e38f34292fc62130661b4978d75cc5ba2f5acc3e64391e0a74c981c3961",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "status": "VERIFIED shape; synthetic envelope values",
+      "sources": [
+        "O02 DecisionsResponse schema and example (model/provider format)",
+        "S14 fixtures/triage.json (answers)"
+      ],
+      "license": "shape MIT (OpenRouter OpenAPI, info.license MIT); answers MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": false,
+      "inferred": [
+        "answers copied from the direct capture so V1.09 can assert equal typed answers; OpenRouter did not produce them",
+        "id value synthetic (documented format gen-dec-<digits>-<20 chars>)",
+        "usage.cost value synthetic (USD per O04/O05; 403 tokens * $0.042/Mtok)",
+        "model value taken from the documented example; the snapshot that would serve this request is not knowable"
+      ],
+      "pairs_with": "systemone/multi.response.json",
+      "v109_note": "typed answers equal the direct shape; backend AND resolved_model differ (jev-1.13.0 vs typesafe/jev-1.13-20260917)"
+    },
+    {
+      "file": "decisions_minimal.response.json",
+      "sha256": "271f10662d99a973efbabce3bce81ec6cced5978135b673d07e19dec5961a3d2",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "request": "openrouter/decisions_v109.request.json",
+      "status": "VERIFIED shape",
+      "sources": [
+        "O02 DecisionsResponse.required = [model, answers, usage]; usage.required = [input_tokens, output_tokens]"
+      ],
+      "license": "shape MIT (OpenRouter OpenAPI, info.license MIT); answers MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": false,
+      "inferred": [
+        "answers from the direct capture"
+      ],
+      "expect": "decodes; provider_request_id=None; cost_micro_usd=None"
+    },
+    {
+      "file": "decisions_sparse_choice.response.json",
+      "sha256": "d88452cf7cb64ce0a22636515fc7851d5c34151fdc8e18f98498f7d3dc816522",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "request": "openrouter/decisions_v109.request.json",
+      "status": "schema-valid per O02 (DecisionsChoiceAnswer.required = [type, choice])",
+      "sources": [
+        "O02 DecisionsChoiceAnswer"
+      ],
+      "license": "shape MIT (OpenRouter OpenAPI, info.license MIT); base MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": false,
+      "inferred": [
+        "synthetic omission"
+      ],
+      "expect": "REJECTED: DecisionError::InvalidResponse(Malformed) if the wire struct requires the field, else (ProbabilityMissing). CDP keeps the TypeSafe contract (every option has a probability) for every backend kind (DIFFS D-17)"
+    },
+    {
+      "file": "decisions_options.request.json",
+      "sha256": "45e8e8a2020da483fd10373f8e9056973aba0d7091f03f0598c689150392fd52",
+      "endpoint": "POST https://openrouter.ai/api/alpha/decisions",
+      "status": "VERIFIED shape",
+      "sources": [
+        "O02 DecisionsRequest.session_id (example session-1234, max 256), trace (TraceConfig example), user (max 256), provider (ProviderPreferences)"
+      ],
+      "license": "MIT (OpenRouter OpenAPI, info.license MIT)",
+      "verbatim": false,
+      "inferred": [
+        "user value synthetic (the schema gives no example)",
+        "provider omitted (large routing-preferences object)"
+      ],
+      "expect": "PRX's encoder must never emit session_id, trace, user or provider (CDP invariant 16); fixture exists for a negative encoder test"
+    }
+  ]
+}

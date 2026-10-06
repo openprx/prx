@@ -37,6 +37,47 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+tokio::task_local! {
+    static JOB_CANCELLATION: CancellationToken;
+    static JOB_TERMINAL_CLEANUPS: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>>>;
+}
+
+/// Only the detached job runner installs this token. A turn derives a child
+/// so its normal cleanup cannot cancel the parent job or a sibling operation.
+pub(super) fn current_cancellation() -> Option<CancellationToken> {
+    JOB_CANCELLATION.try_with(Clone::clone).ok()
+}
+
+/// Register before terminal work begins; the receiver survives abortion of
+/// the work task because the independent job monitor owns the collection.
+pub(super) fn register_terminal_cleanup() -> Option<tokio::sync::oneshot::Sender<Result<(), String>>> {
+    JOB_TERMINAL_CLEANUPS
+        .try_with(|pending| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().push(rx);
+            tx
+        })
+        .ok()
+}
+
+async fn wait_terminal_cleanups(
+    pending: &Mutex<Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>>,
+) -> Result<(), String> {
+    let receivers = std::mem::take(&mut *pending.lock());
+    let wait = async {
+        for receiver in receivers {
+            receiver
+                .await
+                .map_err(|_| "terminal cleanup acknowledgement was lost".to_owned())??;
+        }
+        Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(15), wait)
+        .await
+        .map_err(|_| "terminal cleanup remains unconfirmed after the drain deadline".to_owned())?
+}
+
 use uuid::Uuid;
 
 /// How long a finished job's result stays queryable. A client that submits in
@@ -309,6 +350,21 @@ pub(super) fn submit<F>(kind: &'static str, label: impl Into<Arc<str>>, work: F)
 where
     F: Future<Output = Result<JobOutput, String>> + Send + 'static,
 {
+    submit_with_cleanup(kind, label, work, None)
+}
+
+/// Seed a cleanup owner before spawning a future which may never be polled.
+/// The sender must already belong to the durable input/terminal guard captured
+/// by `work`; registration inside `work` is too late for pre-poll cancellation.
+pub(super) fn submit_with_cleanup<F>(
+    kind: &'static str,
+    label: impl Into<Arc<str>>,
+    work: F,
+    initial_cleanup: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+) -> JobHandle
+where
+    F: Future<Output = Result<JobOutput, String>> + Send + 'static,
+{
     let id = Uuid::new_v4();
     let label: Arc<str> = label.into();
     let job_ref = id.to_string();
@@ -344,12 +400,21 @@ where
         phase_tx,
     });
 
+    let terminal_cleanups = Arc::new(Mutex::new(initial_cleanup.into_iter().collect()));
+    let work_cleanups = Arc::clone(&terminal_cleanups);
     let inner = tokio::spawn(registry::scoped(guard, async move {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => None,
-            result = work => Some(result),
-        }
+        JOB_TERMINAL_CLEANUPS
+            .scope(
+                work_cleanups,
+                JOB_CANCELLATION.scope(cancel.clone(), async move {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => None,
+                        result = work => Some(result),
+                    }
+                }),
+            )
+            .await
     }));
     registry::attach_abort_handle(work_id, inner.abort_handle());
 
@@ -360,6 +425,10 @@ where
             Ok(None) => Terminal::Cancelled,
             Err(error) if error.is_cancelled() => Terminal::Cancelled,
             Err(error) => Terminal::Failed(format!("The job task ended abnormally: {error}")),
+        };
+        let terminal = match wait_terminal_cleanups(&terminal_cleanups).await {
+            Ok(()) => terminal,
+            Err(error) => Terminal::Failed(format!("Gateway terminal persistence is unconfirmed: {error}")),
         };
         JOBS.finish(id, terminal);
     });

@@ -203,6 +203,15 @@ impl HostState {
         self
     }
 
+    /// Share an existing KV namespace instead of the empty one `new`
+    /// allocates. A rebuilt adapter passes the namespace of the store it
+    /// replaces, so data a guest wrote through the `kv` host functions
+    /// survives a trap rebuild.
+    pub fn with_kv_store(mut self, kv_store: Arc<RwLock<HashMap<String, Vec<u8>>>>) -> Self {
+        self.kv_store = kv_store;
+        self
+    }
+
     /// Override the websocket connector implementation.
     pub fn with_websocket_connector(mut self, connector: Arc<dyn WebSocketConnector>) -> Self {
         self.websocket_connector = connector;

@@ -34,6 +34,18 @@ pub const SHELL_OUTPUT_TRUNCATED_MARKER: &str = "\n... [output truncated at 1MiB
 const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// A single shell execution request. Policy decisions are intentionally absent.
+/// How a shell job's git is treated (GIT-ENV, D-107).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellGitPolicy {
+    /// A model-driven surface (the `shell` tool, workspace skill scripts,
+    /// and cron and Xin jobs, whose stores cannot tell a tool-created job
+    /// from an operator's): a command string that runs git is refused.
+    RefuseGit,
+    /// An operator-configured job: git runs, with the environment hardening
+    /// of [`crate::security::git_launch::operator_git_environment`].
+    HardenGit,
+}
+
 pub struct ShellProcessRequest<'a> {
     pub command: &'a str,
     pub workspace_dir: &'a Path,
@@ -41,6 +53,8 @@ pub struct ShellProcessRequest<'a> {
     /// explicitly bounded internal probes may opt into a deadline.
     pub timeout: Option<Duration>,
     pub cancellation: Option<CancellationToken>,
+    /// Whether a command string that runs git is refused or hardened.
+    pub git: ShellGitPolicy,
 }
 
 /// Completed shell execution with independently bounded output streams.
@@ -67,6 +81,13 @@ pub enum ShellProcessError {
     Timeout(Duration),
     #[error("command execution cancelled")]
     Cancelled,
+    /// The command string runs git (GIT-ENV, D-106): git runs only through
+    /// the hardened launch, which the shell cannot apply.
+    #[error(
+        "refusing to run git through the shell: use the git_operations tool, which disables the programs a \
+         repository's configuration names"
+    )]
+    GitRefused,
 }
 
 /// Reusable process adapter shared by interactive shell, cron, and Xin.
@@ -92,6 +113,20 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
+        if request.git == ShellGitPolicy::RefuseGit
+            && crate::security::git_launch::shell_command_runs_git(request.command)
+        {
+            return Err(ShellProcessError::GitRefused);
+        }
+        // An operator job's git (also inside a script it runs) gets the
+        // fixed settings through the environment.
+        let git_environment = if request.git == ShellGitPolicy::HardenGit {
+            crate::security::git_launch::operator_git_environment()
+                .await
+                .map_err(ShellProcessError::Runtime)?
+        } else {
+            Vec::new()
+        };
         if request
             .cancellation
             .as_ref()
@@ -101,7 +136,7 @@ impl ShellProcessAdapter {
         }
         let mut command = self
             .runtime
-            .build_shell_command(request.command, request.workspace_dir)
+            .build_shell_command_with_env(request.command, request.workspace_dir, &git_environment)
             .map_err(ShellProcessError::Runtime)?;
         command
             .stdin(Stdio::null())
@@ -607,6 +642,86 @@ mod tests {
         ShellProcessAdapter::new(Arc::new(NativeRuntime::new()))
     }
 
+    /// D-107: a model-driven surface's command string that runs git is
+    /// refused before anything starts.
+    #[tokio::test]
+    async fn a_model_driven_shell_command_that_runs_git_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("started");
+        for command in [
+            format!("touch '{}'; git status", marker.display()),
+            "cd . && GIT_DIR=x git log".to_string(),
+            "sh -c 'git status'".to_string(),
+        ] {
+            let result = adapter()
+                .execute(ShellProcessRequest {
+                    command: &command,
+                    workspace_dir: temp.path(),
+                    timeout: None,
+                    cancellation: None,
+                    git: ShellGitPolicy::RefuseGit,
+                })
+                .await;
+            assert!(matches!(result, Err(ShellProcessError::GitRefused)), "{command}");
+        }
+        assert!(!marker.exists(), "part of a refused command ran");
+    }
+
+    /// D-107: an operator-configured job's git runs, with the fixed settings
+    /// and `GIT_NO_LAZY_FETCH` in its environment (a repository fsmonitor
+    /// does not run).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_operator_shell_job_runs_git_with_the_hardened_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::security::git_launch::hermetic_git_for_tests();
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let marker = temp.path().join("fsmonitor-ran");
+        let fsmonitor = temp.path().join("fsmonitor.sh");
+        std::fs::write(&fsmonitor, format!("#!/bin/sh\necho ran > '{}'\n", marker.display())).expect("script");
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let setup = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        setup(&["init", "-q"]);
+        setup(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
+        setup(&["config", "core.fsmonitor", &fsmonitor.display().to_string()]);
+        let outcome = adapter()
+            .execute(ShellProcessRequest {
+                command: "git status --porcelain && git config --get core.hooksPath && printf \"$GIT_NO_LAZY_FETCH\"",
+                workspace_dir: &repo,
+                timeout: None,
+                cancellation: None,
+                git: ShellGitPolicy::HardenGit,
+            })
+            .await
+            .expect("operator git runs");
+        assert!(outcome.status.success(), "{}", outcome.stderr);
+        assert!(outcome.stdout.contains("/dev/null"), "{}", outcome.stdout);
+        assert!(outcome.stdout.trim_end().ends_with('1'), "{}", outcome.stdout);
+        assert!(!marker.exists(), "the repository's fsmonitor ran in an operator job");
+    }
+
     #[tokio::test]
     async fn request_without_deadline_runs_to_natural_completion() {
         let temp = TempDir::new().expect("temp dir");
@@ -616,6 +731,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: None,
                 cancellation: None,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await
             .expect("unbounded shell execution");
@@ -634,6 +750,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_secs(5)),
                 cancellation: None,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await
             .expect("shell execution");
@@ -651,6 +768,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_secs(10)),
                 cancellation: None,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await
             .expect("large-output command");
@@ -673,6 +791,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_secs(5)),
                 cancellation: Some(cancellation),
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
 
@@ -690,51 +809,79 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_millis(100)),
                 cancellation: None,
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
 
         assert!(matches!(result, Err(ShellProcessError::Timeout(_))));
     }
 
+    /// A detached (`setsid`) descendant that keeps stderr open must not keep
+    /// the call waiting for EOF: once the call is ended, the output drains
+    /// get the bounded kill grace and are then aborted.
+    ///
+    /// D-063: this used a 100 ms timeout started at spawn, so under load the
+    /// deadline could fire before the child had called `setsid` and written
+    /// its pid file (`setsid.pid: NotFound`). The call is now ended by
+    /// cancellation, and only after the pid file exists, so the descendant
+    /// is always detached first. The timeout and cancellation arms share the
+    /// same kill-and-drain code. That the call did not wait for the
+    /// descendant's EOF is shown by the descendant still being alive (and
+    /// holding stderr) when the call returns, not by a wall-clock budget.
     #[cfg(unix)]
     #[tokio::test]
     async fn setsid_descendant_holding_stderr_cannot_exceed_drain_grace() {
         let temp = TempDir::new().expect("temp dir");
         let process = adapter();
-        let started = tokio::time::Instant::now();
         // macOS does not ship the util-linux `setsid` executable.  Its system
         // Python exposes the same POSIX syscall, so keep the test's detached
         // descendant contract without making the suite Linux-command dependent.
+        // The pid file is written after `setsid`, atomically (rename), so a
+        // reader never sees a partial pid.
         let detached = if cfg!(target_os = "macos") {
-            "python3 -c 'import os; os.setsid(); open(\"setsid.pid\", \"w\").write(str(os.getpid())); os.execvp(\"sleep\", [\"sleep\", \"30\"])'"
+            "python3 -c 'import os; os.setsid(); open(\"setsid.tmp\", \"w\").write(str(os.getpid())); os.rename(\"setsid.tmp\", \"setsid.pid\"); os.execvp(\"sleep\", [\"sleep\", \"30\"])'"
         } else {
-            "setsid sh -c 'echo $$ > setsid.pid; exec sleep 30'"
+            "setsid sh -c 'echo $$ > setsid.tmp; mv setsid.tmp setsid.pid; exec sleep 30'"
         };
         let command = format!("{detached} >&2 & while [ ! -s setsid.pid ]; do :; done; exit 0");
+        let cancellation = CancellationToken::new();
+        let cancellation_watcher = cancellation.clone();
+        let pid_file = temp.path().join("setsid.pid");
+        let canceller = tokio::spawn(async move {
+            let pid = wait_for_pid_file(&pid_file).await;
+            cancellation_watcher.cancel();
+            pid
+        });
         let result = process
             .execute(ShellProcessRequest {
                 command: &command,
                 workspace_dir: temp.path(),
-                timeout: Some(Duration::from_millis(100)),
-                cancellation: None,
+                timeout: None,
+                cancellation: Some(cancellation),
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
+        let pid = canceller.await.expect("canceller task");
+        let pid = i32::try_from(pid).expect("pid fits pid_t");
 
-        assert!(matches!(result, Err(ShellProcessError::Timeout(_))));
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "drain grace must remain bounded"
+            matches!(result, Err(ShellProcessError::Cancelled)),
+            "{:?}",
+            result.as_ref().err()
+        );
+        #[allow(unsafe_code)]
+        // SAFETY: signal 0 only checks that the process exists; `pid` is the
+        // positive pid the test's own detached child wrote.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            alive,
+            "the call returned while the detached descendant still held stderr"
         );
         assert_eq!(
             process.active_output_reader_count(),
             0,
             "bounded return must leave no detached output-reader tasks"
         );
-        let pid: i32 = std::fs::read_to_string(temp.path().join("setsid.pid"))
-            .expect("setsid pid")
-            .trim()
-            .parse()
-            .expect("numeric pid");
         #[allow(unsafe_code)]
         // SAFETY: the positive pgid was written by the test's freshly-created
         // setsid leader; killpg does not dereference pointers.
@@ -792,6 +939,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_secs(10)),
                 cancellation: Some(cancellation),
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
         let pid = canceller.await.expect("canceller task");
@@ -821,6 +969,7 @@ mod tests {
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_secs(10)),
                 cancellation: Some(cancellation),
+                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
             })
             .await;
         let pid = canceller.await.expect("canceller task");
@@ -898,6 +1047,7 @@ mod tests {
                     workspace_dir: &workspace,
                     timeout: Some(Duration::from_mins(1)),
                     cancellation: None,
+                    git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
                 })
                 .await
         });

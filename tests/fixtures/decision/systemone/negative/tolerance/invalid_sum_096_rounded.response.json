@@ -1,0 +1,177 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "a0_information": {
+      "type": "score",
+      "score": 2.58,
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.01,
+        "2": 0.37,
+        "3": 0.61
+      },
+      "legend": {
+        "0": "No new evidence or repeats current known information",
+        "1": "Minor detail unlikely to affect the next decision",
+        "2": "Useful evidence about an unresolved hypothesis",
+        "3": "Directly discriminates plausible causes or verifies an unverified repair"
+      },
+      "confidence": 0.58
+    },
+    "a0_progress": {
+      "type": "score",
+      "score": 1.82,
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.2,
+        "2": 0.67,
+        "3": 0.08
+      },
+      "legend": {
+        "0": "No relevant progress, redundant, or contradicted by evidence",
+        "1": "A plausible step but weak evidence it addresses the current blocker",
+        "2": "Evidence supports this repair or a needed prerequisite",
+        "3": "The clearly supported repair, or verification immediately after a repair"
+      },
+      "confidence": 0.66
+    },
+    "a0_risk": {
+      "type": "score",
+      "score": 0.0,
+      "probabilities": {
+        "0": 1.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "legend": {
+        "0": "Read-only observation with no service mutation",
+        "1": "Narrow reversible change supported by current evidence",
+        "2": "Speculative mutation with little supporting evidence",
+        "3": "Mutation contradicted by evidence or likely to worsen the incident"
+      },
+      "confidence": 1.0
+    },
+    "a1_information": {
+      "type": "score",
+      "score": 2.53,
+      "probabilities": {
+        "0": 0.08,
+        "1": 0.03,
+        "2": 0.17,
+        "3": 0.72
+      },
+      "legend": {
+        "0": "No new evidence or repeats current known information",
+        "1": "Minor detail unlikely to affect the next decision",
+        "2": "Useful evidence about an unresolved hypothesis",
+        "3": "Directly discriminates plausible causes or verifies an unverified repair"
+      },
+      "confidence": 0.53
+    },
+    "a1_progress": {
+      "type": "score",
+      "score": 2.38,
+      "probabilities": {
+        "0": 0.02,
+        "1": 0.19,
+        "2": 0.18,
+        "3": 0.61
+      },
+      "legend": {
+        "0": "No relevant progress, redundant, or contradicted by evidence",
+        "1": "A plausible step but weak evidence it addresses the current blocker",
+        "2": "Evidence supports this repair or a needed prerequisite",
+        "3": "The clearly supported repair, or verification immediately after a repair"
+      },
+      "confidence": 0.38
+    },
+    "a1_risk": {
+      "type": "score",
+      "score": 0.0,
+      "probabilities": {
+        "0": 1.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "legend": {
+        "0": "Read-only observation with no service mutation",
+        "1": "Narrow reversible change supported by current evidence",
+        "2": "Speculative mutation with little supporting evidence",
+        "3": "Mutation contradicted by evidence or likely to worsen the incident"
+      },
+      "confidence": 1.0
+    },
+    "a2_information": {
+      "type": "score",
+      "score": 2.66,
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.0,
+        "2": 0.31,
+        "3": 0.68
+      },
+      "legend": {
+        "0": "No new evidence or repeats current known information",
+        "1": "Minor detail unlikely to affect the next decision",
+        "2": "Useful evidence about an unresolved hypothesis",
+        "3": "Directly discriminates plausible causes or verifies an unverified repair"
+      },
+      "confidence": 0.66
+    },
+    "a2_progress": {
+      "type": "score",
+      "score": 1.95,
+      "probabilities": {
+        "0": 0.0,
+        "1": 0.14,
+        "2": 0.76,
+        "3": 0.1
+      },
+      "legend": {
+        "0": "No relevant progress, redundant, or contradicted by evidence",
+        "1": "A plausible step but weak evidence it addresses the current blocker",
+        "2": "Evidence supports this repair or a needed prerequisite",
+        "3": "The clearly supported repair, or verification immediately after a repair"
+      },
+      "confidence": 0.75
+    },
+    "a2_risk": {
+      "type": "score",
+      "score": 0.01,
+      "probabilities": {
+        "0": 0.99,
+        "1": 0.01,
+        "2": 0.0,
+        "3": 0.0
+      },
+      "legend": {
+        "0": "Read-only observation with no service mutation",
+        "1": "Narrow reversible change supported by current evidence",
+        "2": "Speculative mutation with little supporting evidence",
+        "3": "Mutation contradicted by evidence or likely to worsen the incident"
+      },
+      "confidence": 0.99
+    },
+    "diagnosis": {
+      "type": "choice",
+      "choice": "unknown",
+      "probabilities": {
+        "bad_deploy": 0.03,
+        "pool_exhaustion": 0.0,
+        "stale_cache": 0.0,
+        "unknown": 0.97
+      },
+      "confidence": 0.95
+    },
+    "resolved": {
+      "type": "noul",
+      "noul": 0.17
+    }
+  },
+  "usage": {
+    "input_tokens": 2549,
+    "output_tokens": 210
+  }
+}

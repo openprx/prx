@@ -1,0 +1,150 @@
+{
+  "generated": "2026-09-24",
+  "task": "CDP-00B",
+  "copied_by": "CDP-01 (D-042 C-6, D-043)",
+  "files": [
+    {
+      "file": "multi.request.json",
+      "sha256": "39c8a3bd78a59d5f97c69dd8dde29b4f5f41af6bd568c0708cb9f657dddec2ed",
+      "sources": [
+        "S14:fixtures/triage.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "plain strings, all three primitives",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi.response.json",
+      "sha256": "2d4fac8db52011234782c68067607a3c835c87e6544382f74a0f7aea0b7a3040",
+      "sources": [
+        "S14:fixtures/triage.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "plain strings, all three primitives",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_structured.request.json",
+      "sha256": "7c53a8f6f43e0a7a1767e01206cc208fb58e9628aada68cd62f05dc9e7c77fbb",
+      "sources": [
+        "S14:fixtures/structured.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "object instructions, object criteria, null Choice description, object Score levels echoed in legend, structured Noul criteria",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_structured.response.json",
+      "sha256": "77725c687838140f50b8d49ce9176085c5ea2d1b30431b8c61511ca70caf7751",
+      "sources": [
+        "S14:fixtures/structured.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "object instructions, object criteria, null Choice description, object Score levels echoed in legend, structured Noul criteria",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_rounded.request.json",
+      "sha256": "9f421cafd09ef29b22c7794a4e48e983430f518c9e51434781d5df4c919400d7",
+      "sources": [
+        "S14:fixtures/rounded.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "11 questions; a0_progress probabilities sum to 0.99 and score differs from sum(i*p) by 0.02: VALID under the recommended rounding-aware rule, REJECTED by current CDP constants",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_rounded.response.json",
+      "sha256": "aa667f2266c3ac1266883e693b57dd5386cb1af3dc12ca9fde9438c51e62f242",
+      "sources": [
+        "S14:fixtures/rounded.json"
+      ],
+      "license": "MIT (rig, Playgrounds Analytics Inc.)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "11 questions; a0_progress probabilities sum to 0.99 and score differs from sum(i*p) by 0.02: VALID under the recommended rounding-aware rule, REJECTED by current CDP constants",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_array_instructions.request.json",
+      "sha256": "2641efc1d6f90291f838203f028529f485290cff8d004f09b8e54260be85ab59",
+      "sources": [
+        "S16:crates/jev/tests/fixtures/systemone-request.json"
+      ],
+      "license": "Apache-2.0 (OpenAgentsInc/openagents)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "array instructions, array Choice description, mixed string/object Score levels, Noul criteria with false:null, camelCase question id",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "multi_array_instructions.response.json",
+      "sha256": "ac60232eaab1b5cbb31177c2014f9c1c4b3bdf7e95e01682a8f1fa9b00d6f6b3",
+      "sources": [
+        "S16:crates/jev/tests/fixtures/systemone-response.json"
+      ],
+      "license": "Apache-2.0 (OpenAgentsInc/openagents)",
+      "verbatim": true,
+      "inferred": [],
+      "note": "severity score 0.97 while sum(i*p)=0.98 (rounding): VALID under the recommended rule, REJECTED by current CDP ExpectedOutOfRange tolerance 1e-3*(n-1)",
+      "repo_eligible": "yes: MIT/Apache recorded response (or its request), verbatim"
+    },
+    {
+      "file": "limits/choice_max_255.request.json",
+      "sha256": "e406d4fea6e3f8770d258a2d5b323fe4b675c67b2d2da8ed15db0a2fbeb25bd4",
+      "sources": [
+        "S01#choice (max 255 options)",
+        "S05",
+        "S14:questions.rs 2..=255"
+      ],
+      "license": "PRX-authored synthetic",
+      "verbatim": false,
+      "inferred": [
+        "all content synthetic; only the count (255) is documented"
+      ],
+      "expect": "accepted by the documented API",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "limits/score_max_10.request.json",
+      "sha256": "36b1d6450b2b326f40feba5b6106669632c3df5a226bc8418dc80cc7bc1d50c4",
+      "sources": [
+        "S01#score (up to 10)",
+        "S06",
+        "S14:questions.rs 2..=10"
+      ],
+      "license": "PRX-authored synthetic",
+      "verbatim": false,
+      "inferred": [
+        "all content synthetic; only the count (10) is documented"
+      ],
+      "expect": "accepted by the documented API",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    },
+    {
+      "file": "limits/score_min_2.request.json",
+      "sha256": "9730498c5035d82058de7687232793c8298cf1509acbc00202bd236ef5996aa2",
+      "sources": [
+        "S06 (at least two levels)",
+        "S13 ScoreCriteria tuple >=2"
+      ],
+      "license": "PRX-authored synthetic",
+      "verbatim": false,
+      "inferred": [
+        "content synthetic"
+      ],
+      "expect": "accepted",
+      "repo_eligible": "derivative: PRX-authored mutation/synthetic built on an MIT capture or on documented limits only; not docs text (coordinator to confirm it counts as PRX test data)"
+    }
+  ]
+}

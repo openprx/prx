@@ -5,6 +5,16 @@ use unicode_normalization::UnicodeNormalization;
 /// Trait for embedding providers — convert text to vectors
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Actual supported transport fields, snapshotted only for paid admission.
+    fn accounting_targets(&self) -> Option<crate::providers::AccountingTargets> {
+        None
+    }
+
+    /// True only for a provider with physical-send accounting instrumentation.
+    fn supports_attempt_accounting(&self) -> bool {
+        false
+    }
+
     /// Provider name
     fn name(&self) -> &str;
 
@@ -77,6 +87,83 @@ impl LocalHashEmbedding {
             model: model.to_string(),
             dims,
         }
+    }
+
+    /// The source-owned Router path never launches a detached blocking job.
+    /// Cooperative checkpoints bound cancellation latency while retaining the
+    /// exact feature hashing and normalization of the ordinary embedding API.
+    #[cfg(feature = "llm-router")]
+    pub(crate) async fn embed_router_until(
+        &self,
+        text: &str,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<Vec<f32>> {
+        use super::router_history::{ROUTER_HISTORY_MAX_DIMENSIONS, ROUTER_HISTORY_MAX_INPUT_BYTES};
+        anyhow::ensure!(
+            text.len() <= ROUTER_HISTORY_MAX_INPUT_BYTES && (1..=ROUTER_HISTORY_MAX_DIMENSIONS).contains(&self.dims),
+            "local Router embedding exceeds capacity"
+        );
+        async fn checkpoint(
+            deadline: std::time::Instant,
+            cancellation: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            anyhow::ensure!(
+                !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+                "local Router embedding cancelled or expired"
+            );
+            Ok(())
+        }
+        checkpoint(deadline, cancellation).await?;
+        let mut normalized = String::new();
+        for (index, ch) in text.nfkc().flat_map(char::to_lowercase).enumerate() {
+            if index % 128 == 0 {
+                checkpoint(deadline, cancellation).await?;
+            }
+            // Normalization expands some code points. Refuse before allocating
+            // beyond the finite expansion envelope, never truncate the query.
+            anyhow::ensure!(
+                normalized.len() + ch.len_utf8() <= ROUTER_HISTORY_MAX_INPUT_BYTES * 64,
+                "local Router normalized input exceeds capacity"
+            );
+            normalized.push(ch);
+        }
+        let mut vector = vec![0.0; self.dims];
+        let mut work = 0usize;
+        for token in normalized
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            checkpoint(deadline, cancellation).await?;
+            Self::add_feature(&mut vector, &format!("token:{token}"), 2.0);
+            let mut chars = Vec::new();
+            for ch in token.chars() {
+                if work % 128 == 0 {
+                    checkpoint(deadline, cancellation).await?;
+                }
+                chars.push(ch);
+                work += 1;
+            }
+            for width in 2..=3 {
+                for gram in chars.windows(width) {
+                    if work % 128 == 0 {
+                        checkpoint(deadline, cancellation).await?;
+                    }
+                    let gram = gram.iter().collect::<String>();
+                    Self::add_feature(&mut vector, &format!("char{width}:{gram}"), 1.0);
+                    work += 1;
+                }
+            }
+        }
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        checkpoint(deadline, cancellation).await?;
+        Ok(vector)
     }
 
     fn add_feature(vector: &mut [f32], feature: &str, weight: f32) {
@@ -225,6 +312,18 @@ impl OpenAiEmbedding {
 
 #[async_trait]
 impl EmbeddingProvider for OpenAiEmbedding {
+    fn accounting_targets(&self) -> Option<crate::providers::AccountingTargets> {
+        Some(crate::providers::AccountingTargets::embedding(
+            &self.model,
+            self.embeddings_url(),
+            &self.api_key,
+        ))
+    }
+
+    fn supports_attempt_accounting(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "openai"
     }
@@ -247,14 +346,19 @@ impl EmbeddingProvider for OpenAiEmbedding {
             "input": texts,
         });
 
-        let resp = self
-            .http_client()
-            .post(self.embeddings_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let endpoint = self.embeddings_url();
+        let resp = crate::providers::attempt_accounting::send_json(
+            self.http_client()
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json"),
+            &self.model,
+            &endpoint,
+            Some(&self.api_key),
+            &body,
+            crate::providers::attempt_accounting::PhysicalKind::Embedding,
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -293,20 +397,42 @@ pub fn create_embedding_provider(
     model: &str,
     dims: usize,
 ) -> Box<dyn EmbeddingProvider> {
-    match provider {
-        "local" => Box::new(LocalHashEmbedding::new(model, dims)),
-        "openai" => {
-            let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new("https://api.openai.com", key, model, dims))
-        }
-        "openrouter" => {
-            let key = api_key.unwrap_or("");
+    create_embedding_provider_with_base_url(provider, api_key, None, model, dims)
+}
+
+/// Like [`create_embedding_provider`], with the base URL `api_key` belongs to.
+///
+/// Only the `openai` embedder honours `base_url` (as the `openai` chat
+/// provider does); `None` means the vendor's default host.
+pub fn create_embedding_provider_with_base_url(
+    provider: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    model: &str,
+    dims: usize,
+) -> Box<dyn EmbeddingProvider> {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("local") {
+        return Box::new(LocalHashEmbedding::new(model, dims));
+    }
+    // Chosen by provider identity, like the chat factory: every spelling of
+    // `openai` or `openrouter` is that provider, and a `custom:` endpoint is
+    // addressed at the URL its identity parsed. Anything else has no
+    // embedding adapter (see `providers::catalog::adapters`).
+    let key = api_key.unwrap_or("");
+    match crate::providers::classify_provider(provider) {
+        crate::providers::ProviderIdentity::ByoEndpoint {
+            dialect: crate::providers::ByoDialect::OpenAiCompatible,
+            base_url: endpoint,
+        } => Box::new(OpenAiEmbedding::new(&endpoint, key, model, dims)),
+        crate::providers::ProviderIdentity::Catalog("openai") => Box::new(OpenAiEmbedding::new(
+            base_url.unwrap_or("https://api.openai.com"),
+            key,
+            model,
+            dims,
+        )),
+        crate::providers::ProviderIdentity::Catalog("openrouter") => {
             Box::new(OpenAiEmbedding::new("https://openrouter.ai/api/v1", key, model, dims))
-        }
-        name if name.starts_with("custom:") => {
-            let base_url = name.strip_prefix("custom:").unwrap_or("");
-            let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
         }
         _ => Box::new(NoopEmbedding),
     }
@@ -478,9 +604,9 @@ mod tests {
 
     #[test]
     fn factory_custom_empty_url() {
-        // "custom:" with no URL — should still construct without panic
+        // "custom:" with no URL names no endpoint, so there is nothing to embed with.
         let p = create_embedding_provider("custom:", None, "model", 768);
-        assert_eq!(p.name(), "openai");
+        assert_eq!(p.name(), "none");
     }
 
     #[test]

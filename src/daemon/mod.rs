@@ -86,6 +86,8 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         ));
     }
 
+    // Retained outside abortable component supervisors and their spawned jobs.
+    let runtime_cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let initial_generation = shared_config.pin();
     let mut generation_controllers = Vec::new();
 
@@ -94,20 +96,31 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         "channels",
         OPTIONAL_HEALTH_TTL_SECONDS,
         Arc::clone(&initial_generation),
-        Arc::new(|field| field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)),
+        Arc::new(channels_prepares_for_field),
         Arc::new(has_supervised_channels),
         {
             let shared = Arc::clone(&shared_config);
+            let cleanup_owner = Arc::clone(&runtime_cleanup);
+            let retirement_gate = Arc::new(tokio::sync::Mutex::new(()));
             Arc::new(move |generation, shutdown| {
                 let shared = Arc::clone(&shared);
+                let cleanup_owner = Arc::clone(&cleanup_owner);
+                let retirement_gate = Arc::clone(&retirement_gate);
                 Box::pin(async move {
-                    crate::channels::start_channels_with_config(
-                        (*generation.effective).clone(),
-                        shared,
-                        generation,
-                        shutdown,
-                    )
-                    .await
+                    let retirement = retirement_gate.lock_owned().await;
+                    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
+                        Some(&cleanup_owner),
+                        CancellationToken::new(),
+                    )?
+                    .with_retirement_guard(retirement);
+                    let work: Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+                        Box::pin(crate::channels::start_channels_with_config(
+                            (*generation.effective).clone(),
+                            shared,
+                            generation,
+                            shutdown,
+                        ));
+                    cleanup.run(work).await
                 })
             })
         },
@@ -132,18 +145,29 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         Arc::new(|_| true),
         {
             let shared = Arc::clone(&shared_config);
+            let cleanup_owner = Arc::clone(&runtime_cleanup);
+            let retirement_gate = Arc::new(tokio::sync::Mutex::new(()));
             Arc::new(move |generation, shutdown| {
                 let shared = Arc::clone(&shared);
+                let cleanup_owner = Arc::clone(&cleanup_owner);
+                let retirement_gate = Arc::clone(&retirement_gate);
                 Box::pin(async move {
-                    let cfg = (*generation.effective).clone();
-                    tokio::select! {
-                        result = crate::cron::scheduler::run_with_config_generation_manager(
-                            cfg,
-                            generation,
-                            shared,
-                        ) => result,
-                        () = shutdown.cancelled() => Ok(()),
-                    }
+                    let retirement = retirement_gate.lock_owned().await;
+                    let cleanup =
+                        crate::runtime::turn_cleanup::CleanupScope::new(Some(&cleanup_owner), shutdown.clone())?
+                            .with_retirement_guard(retirement);
+                    let work: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(async move {
+                        let cfg = (*generation.effective).clone();
+                        tokio::select! {
+                            result = crate::cron::scheduler::run_with_config_generation_manager(
+                                cfg,
+                                generation,
+                                shared,
+                            ) => result,
+                            () = shutdown.cancelled() => Ok(()),
+                        }
+                    });
+                    cleanup.run(work).await
                 })
             })
         },
@@ -167,18 +191,29 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         Arc::new(xin_runtime_enabled),
         {
             let shared = Arc::clone(&shared_config);
+            let cleanup_owner = Arc::clone(&runtime_cleanup);
+            let retirement_gate = Arc::new(tokio::sync::Mutex::new(()));
             Arc::new(move |generation, shutdown| {
                 let shared = Arc::clone(&shared);
+                let cleanup_owner = Arc::clone(&cleanup_owner);
+                let retirement_gate = Arc::clone(&retirement_gate);
                 Box::pin(async move {
-                    let cfg = (*generation.effective).clone();
-                    tokio::select! {
-                        result = crate::xin::runner::run_with_config_generation_manager(
-                            cfg,
-                            generation,
-                            shared,
-                        ) => result,
-                        () = shutdown.cancelled() => Ok(()),
-                    }
+                    let retirement = retirement_gate.lock_owned().await;
+                    let cleanup =
+                        crate::runtime::turn_cleanup::CleanupScope::new(Some(&cleanup_owner), shutdown.clone())?
+                            .with_retirement_guard(retirement);
+                    let work: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(async move {
+                        let cfg = (*generation.effective).clone();
+                        tokio::select! {
+                            result = crate::xin::runner::run_with_config_generation_manager(
+                                cfg,
+                                generation,
+                                shared,
+                            ) => result,
+                            () = shutdown.cancelled() => Ok(()),
+                        }
+                    });
+                    cleanup.run(work).await
                 })
             })
         },
@@ -312,8 +347,8 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
 
         // D5/D9 step 4: wait for either the external root shutdown token (e.g. the
         // dispatch-owned signal task wired in A6) or a direct ctrl_c as a fallback.
-        // The abort-based teardown below is preserved verbatim: the daemon performs
-        // a stateless exit and must not be turned into a graceful child-await.
+        // Supervisors still use abort-based teardown. Decision terminal cleanup
+        // has a separate bounded acknowledgement below, like evolution commits.
         tokio::select! {
             () = shutdown.cancelled() => {}
             res = tokio::signal::ctrl_c() => res?,
@@ -328,6 +363,14 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     for handle in handles {
         let _ = handle.await;
     }
+    // D-046: an evolution verdict task may still be judging or recording
+    // its cycle; the aborts above do not reach it. Cancel it and wait,
+    // bounded, so it records the cycle before `main` shuts the runtime down.
+    let runtime_cleanup_result = runtime_cleanup
+        .drain(tokio::time::Instant::now() + Duration::from_secs(30))
+        .await;
+    drain_evolution_commits(crate::self_system::evolution::commit::daemon_commits()).await;
+    runtime_cleanup_result?;
     crate::health::mark_component_stopped("daemon");
 
     Ok(())
@@ -558,8 +601,10 @@ where
                     backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
-                    tracing::error!("Daemon component '{name}' failed: {e}");
+                    // The whole chain: the outer context alone ("… failed")
+                    // does not say why (D-067).
+                    crate::health::mark_component_error(name, format!("{e:#}"));
+                    tracing::error!("Daemon component '{name}' failed: {}", redacted_chain(&e));
                 }
             }
 
@@ -833,6 +878,10 @@ async fn run_config_generation_supervisor(
     let mut current_generation = initial_generation;
     let mut previous_generation: Option<Arc<crate::config::ConfigGeneration>> = None;
     let mut committed_generation: Option<u64> = None;
+    // Set while the component is down because a start failed (initial start,
+    // restart, or a restore of the previous generation); the tick retries the
+    // current generation with a growing backoff (D-072 L-5).
+    let mut retry: Option<ComponentRetry> = None;
     let (mut task, mut task_shutdown) = match start_generation_component(
         name,
         owner,
@@ -845,8 +894,13 @@ async fn run_config_generation_supervisor(
     {
         Ok(state) => state,
         Err(error) => {
-            crate::health::mark_component_error(name, error.to_string());
-            tracing::error!(component = name, "initial generation failed: {error}");
+            crate::health::mark_component_error(name, format!("{error:#}"));
+            tracing::error!(
+                component = name,
+                "initial generation failed: {}",
+                redacted_chain(&error)
+            );
+            retry = Some(ComponentRetry::first());
             (None, None)
         }
     };
@@ -906,13 +960,31 @@ async fn run_config_generation_supervisor(
                                         current_generation = old;
                                     }
                                     Err(rollback_error) => {
+                                        current_generation = old;
+                                        retry = Some(ComponentRetry::first());
+                                        // The component is down until the next
+                                        // generation: say so in its health (D-067).
+                                        crate::health::mark_component_error(
+                                            name,
+                                            // What happened first, the restore's chain
+                                            // last: a bounded summary keeps both ends,
+                                            // and the restore's root cause is why the
+                                            // component is down (D-072 L-1).
+                                            format!(
+                                                "the previous generation could not restart (after the candidate \
+                                                 generation failed: {error:#}): {rollback_error:#}"
+                                            ),
+                                        );
                                         tracing::error!(
                                             component = name,
-                                            "candidate failed and old generation could not restart: {rollback_error}"
+                                            "candidate failed and old generation could not restart: {}",
+                                            redacted_chain(&rollback_error)
                                         );
                                     }
                                 }
-                                let _ = response.send(Err(error.to_string()));
+                                // The whole chain, so the refusal (and the reload
+                                // warning built from it) says why the candidate failed.
+                                let _ = response.send(Err(format!("{error:#}")));
                             }
                         }
                     }
@@ -971,18 +1043,56 @@ async fn run_config_generation_supervisor(
                                 let _ = response.send(Ok(()));
                             }
                             Err(error) => {
-                                let _ = response.send(Err(error.to_string()));
+                                // The previous generation is the one to run; the
+                                // tick keeps trying to bring it back.
+                                current_generation = previous;
+                                committed_generation = None;
+                                retry = Some(ComponentRetry::first());
+                                // The previous generation could not be restored:
+                                // the component is down, so its health says why,
+                                // and the reply carries the whole chain (D-067).
+                                crate::health::mark_component_error(
+                                    name,
+                                    format!("rollback to the previous generation failed: {error:#}"),
+                                );
+                                tracing::error!(
+                                    component = name,
+                                    "rollback to the previous generation failed: {}",
+                                    redacted_chain(&error)
+                                );
+                                let _ = response.send(Err(format!("{error:#}")));
                             }
                         }
                     }
                 }
             }
             () = tokio::time::sleep(Duration::from_millis(250)) => {
-                if task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                if task.is_none() && retry.as_ref().is_some_and(ComponentRetry::is_due) {
+                    crate::health::bump_component_restart(name);
+                    match start_generation_component(
+                        name,
+                        owner,
+                        freshness_ttl_seconds,
+                        Arc::clone(&current_generation),
+                        &enabled,
+                        &runner,
+                    ).await {
+                        Ok((next_task, next_shutdown)) => {
+                            task = next_task;
+                            task_shutdown = next_shutdown;
+                            retry = None;
+                        }
+                        Err(error) => {
+                            crate::health::mark_component_error(name, format!("{error:#}"));
+                            tracing::error!(component = name, "component retry failed: {}", redacted_chain(&error));
+                            retry = retry.map(ComponentRetry::next);
+                        }
+                    }
+                } else if task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
                     if let Some(finished) = task.take() {
                         match finished.await {
                             Ok(Ok(())) => tracing::warn!(component = name, "component exited unexpectedly"),
-                            Ok(Err(error)) => tracing::error!(component = name, "component failed: {error}"),
+                            Ok(Err(error)) => tracing::error!(component = name, "component failed: {}", redacted_chain(&error)),
                             Err(error) => tracing::error!(component = name, "component task failed: {error}"),
                         }
                     }
@@ -1000,11 +1110,45 @@ async fn run_config_generation_supervisor(
                             task = next_task;
                             task_shutdown = next_shutdown;
                         }
-                        Err(error) => crate::health::mark_component_error(name, error.to_string()),
+                        Err(error) => {
+                            crate::health::mark_component_error(name, format!("{error:#}"));
+                            tracing::error!(component = name, "component restart failed: {}", redacted_chain(&error));
+                            retry = Some(ComponentRetry::first());
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// When a component that failed to start is tried again.
+struct ComponentRetry {
+    at: tokio::time::Instant,
+    backoff: Duration,
+}
+
+impl ComponentRetry {
+    const FIRST: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_mins(1);
+
+    fn first() -> Self {
+        Self {
+            at: tokio::time::Instant::now() + Self::FIRST,
+            backoff: Self::FIRST,
+        }
+    }
+
+    fn next(self) -> Self {
+        let backoff = (self.backoff * 2).min(Self::MAX);
+        Self {
+            at: tokio::time::Instant::now() + backoff,
+            backoff,
+        }
+    }
+
+    fn is_due(&self) -> bool {
+        tokio::time::Instant::now() >= self.at
     }
 }
 
@@ -1038,8 +1182,17 @@ async fn start_generation_component(
                     match component_health_status(name).as_deref() {
                         Some("ok") => return Ok(()),
                         Some("error") => {
-                            return Err(anyhow::anyhow!(
-                                "{name} reported failed health during generation preparation"
+                            // Keep the component's own cause: the supervisor
+                            // overwrites its health with this error (D-072 L-2).
+                            let cause = crate::health::snapshot()
+                                .components
+                                .get(name)
+                                .and_then(|component| component.last_error.clone());
+                            return Err(cause.map_or_else(
+                                || anyhow::anyhow!("{name} reported failed health during generation preparation"),
+                                |cause| anyhow::anyhow!(
+                                    "{name} reported failed health during generation preparation: {cause}"
+                                ),
                             ));
                         }
                         _ => {}
@@ -1052,8 +1205,16 @@ async fn start_generation_component(
         Ok(Ok(())) => Ok((Some(handle), Some(token))),
         Ok(Err(error)) => {
             token.cancel();
-            handle.abort();
-            let _ = handle.await;
+            // D-065 R-1: when the component ended during preparation the
+            // readiness loop already took its result; awaiting the handle
+            // again panics ("JoinHandle polled after completion") and kills
+            // this supervisor, so a refused candidate (for example a channel
+            // runtime whose default cannot chat) left the component stopped
+            // instead of restarting the previous generation.
+            if !handle.is_finished() {
+                handle.abort();
+                let _ = handle.await;
+            }
             Err(error)
         }
         Err(_) => {
@@ -1076,6 +1237,13 @@ const fn generation_readiness_timeout() -> Duration {
 #[cfg(test)]
 const fn generation_readiness_timeout() -> Duration {
     Duration::from_millis(500)
+}
+
+/// An error's whole chain for a log line, with secrets redacted: inner
+/// errors (a request URL, a token in a path) can carry them, and the health
+/// copy of the same text is sanitized too (D-072 L-3).
+fn redacted_chain(error: &anyhow::Error) -> String {
+    crate::security::redaction::redact_secrets(&format!("{error:#}"))
 }
 
 fn component_health_status(name: &str) -> Option<String> {
@@ -1140,8 +1308,8 @@ async fn run_fitness_if_due(config: &Config) {
         match crate::self_system::fitness::latest_closed_window(chrono::Utc::now(), &config.self_system.fitness) {
             Ok(window) => window,
             Err(error) => {
-                crate::health::mark_component_error("self_system_fitness", error.to_string());
-                tracing::warn!(target: "self_system", "fitness schedule failed: {error}");
+                crate::health::mark_component_error("self_system_fitness", format!("{error:#}"));
+                tracing::warn!(target: "self_system", "fitness schedule failed: {}", redacted_chain(&error));
                 return;
             }
         };
@@ -1164,8 +1332,8 @@ async fn run_fitness_backfill<F, Fut>(
         let window = match crate::self_system::fitness::configured_window_for_day(day, &config.self_system.fitness) {
             Ok(window) => window,
             Err(error) => {
-                crate::health::mark_component_error("self_system_fitness", error.to_string());
-                tracing::warn!(target: "self_system", "fitness backfill window failed: {error}");
+                crate::health::mark_component_error("self_system_fitness", format!("{error:#}"));
+                tracing::warn!(target: "self_system", "fitness backfill window failed: {}", redacted_chain(&error));
                 return;
             }
         };
@@ -1184,8 +1352,8 @@ async fn run_fitness_window_if_missing(config: &Config, window: crate::self_syst
         }
         Ok(None) => {}
         Err(error) => {
-            crate::health::mark_component_error("self_system_fitness", error.to_string());
-            tracing::warn!(target: "self_system", "fitness store read failed: {error}");
+            crate::health::mark_component_error("self_system_fitness", format!("{error:#}"));
+            tracing::warn!(target: "self_system", "fitness store read failed: {}", redacted_chain(&error));
             return false;
         }
     }
@@ -1204,8 +1372,8 @@ async fn run_fitness_window_if_missing(config: &Config, window: crate::self_syst
             true
         }
         Err(error) => {
-            crate::health::mark_component_error("self_system_fitness", error.to_string());
-            tracing::warn!(target: "self_system", "fitness report failed: {error}");
+            crate::health::mark_component_error("self_system_fitness", format!("{error:#}"));
+            tracing::warn!(target: "self_system", "fitness report failed: {}", redacted_chain(&error));
             false
         }
     }
@@ -1244,11 +1412,18 @@ async fn run_evolution_scheduler_worker(
                                 "evolution scheduler tick completed"
                             );
                         }
+                        record_evolution_judge_health(
+                            EVOLUTION_JUDGE_COMPONENT,
+                            summary
+                                .layer_reports
+                                .iter()
+                                .map(|report| (report.judge_outcome, report.errors.as_slice())),
+                        );
                         crate::health::mark_component_ok("evolution_scheduler");
                     }
                     Err(error) => {
-                        crate::health::mark_component_error("evolution_scheduler", error.to_string());
-                        tracing::warn!(target: "self_system", "evolution scheduler tick failed: {error}");
+                        crate::health::mark_component_error("evolution_scheduler", format!("{error:#}"));
+                        tracing::warn!(target: "self_system", "evolution scheduler tick failed: {}", redacted_chain(&error));
                     }
                 }
             }
@@ -1317,15 +1492,17 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         &config.workspace_dir,
         judge_model,
     )
-    .with_security_policy(security_policy);
+    .with_security_policy(security_policy)
+    .with_judge_timeout(Duration::from_secs(config.self_system.evolution_judge_timeout_secs))
+    .with_commit_tracker(crate::self_system::evolution::commit::daemon_commits().clone());
 
     let evolution_memory: Arc<dyn crate::memory::Memory> =
         Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
             &config.memory,
-            &config.embedding_routes,
+            &config.embedding_routes_with_references(),
             Some(&config.storage.provider.config),
             &config.workspace_dir,
-            config.api_key.as_deref(),
+            crate::memory::EmbeddingRootCredential::from_config(&config),
             &config.identity_bindings,
             &config.user_policies,
         )?);
@@ -1337,7 +1514,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
             .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend for evolution: {error}"))?;
     }
     let memory_engine = Box::new(
-        MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
+        MemoryEvolutionEngine::new(shared.clone(), &cfg_path)
             .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?
             .with_memory(evolution_memory),
     );
@@ -1364,9 +1541,62 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     Ok((scheduler, u64::from(config.self_system.evolution_interval_hours.max(1))))
 }
 
+/// How long `daemon::run` waits for evolution verdict tasks on shutdown.
+const EVOLUTION_COMMIT_DRAIN: Duration = Duration::from_secs(10);
+
+/// Cancel the evolution verdict tasks on `commits` and wait for them, up to
+/// [`EVOLUTION_COMMIT_DRAIN`]: a cancelled task writes nothing it has not
+/// already been accepted to write, and records its cycle (D-046).
+pub(crate) async fn drain_evolution_commits(commits: &crate::self_system::evolution::commit::CommitTracker) {
+    let pending = commits.active();
+    if !commits.drain(EVOLUTION_COMMIT_DRAIN).await {
+        tracing::warn!(
+            target: "self_system",
+            pending,
+            still_running = commits.active(),
+            "evolution verdict tasks did not finish within the shutdown bound"
+        );
+    }
+}
+
 /// Health component name reporting whether evolution judging runs on a real
 /// LLM judge or has degraded to the deterministic mock judge (FIX-P1-10).
 const EVOLUTION_JUDGE_COMPONENT: &str = "evolution_judge";
+
+/// R-PMMCh S-1: reflect one scheduler tick's verdicts on the judge health
+/// component. A judge that gave no verdict (error, unparseable reply,
+/// timeout) marks it as an error naming why; a scored verdict marks it ok
+/// again. Mock (degraded) verdicts leave the status that start-up recorded.
+fn record_evolution_judge_health<'a>(
+    component: &str,
+    verdicts: impl IntoIterator<Item = (crate::self_system::evolution::pipeline::JudgeOutcome, &'a [String])>,
+) {
+    use crate::self_system::evolution::pipeline::JudgeOutcome;
+
+    let mut scored = false;
+    for (outcome, errors) in verdicts {
+        match outcome {
+            JudgeOutcome::Failed => {
+                let reason = errors
+                    .iter()
+                    .find(|error| error.starts_with("judge_failed"))
+                    .map_or("the evolution judge gave no verdict", String::as_str);
+                // The judge error comes from the provider stack; the endpoint
+                // is named without URL userinfo.
+                crate::health::mark_component_error(
+                    component,
+                    crate::providers::redact_endpoint_userinfo(reason).into_owned(),
+                );
+                return;
+            }
+            JudgeOutcome::Scored => scored = true,
+            JudgeOutcome::NotRun | JudgeOutcome::Degraded => {}
+        }
+    }
+    if scored {
+        crate::health::mark_component_ok(component);
+    }
+}
 
 /// FIX-P1-10: build the scoring model used to judge evolution cycles.
 ///
@@ -1383,25 +1613,43 @@ const EVOLUTION_JUDGE_COMPONENT: &str = "evolution_judge";
 fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::evolution::judge::JudgeScoringModel> {
     use crate::self_system::evolution::judge::{MockJudgeModel, ModelJudge};
 
-    let provider_name = config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "openrouter".to_string());
+    let provider_name = crate::providers::selection::default_provider(config).to_string();
     let provider_runtime_options = crate::providers::provider_runtime_options_from_config(config);
 
-    match crate::providers::create_resilient_provider_with_options(
-        &provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &provider_runtime_options,
-    ) {
-        Ok(provider) => {
+    // D-034: the judge asks the resolved default model (the route's
+    // destination for a `hint:` default), with the credential the resolver
+    // released for it. A default that cannot be resolved means no model
+    // judge: judging degrades to the deterministic mock, which sends nothing.
+    let built =
+        crate::providers::selection::check_default(config, crate::providers::catalog::UnknownPolicy::Invocation)
+            .map_err(anyhow::Error::from)
+            .and_then(|resolved| {
+                let credential = resolved.credential();
+                let reliability = crate::config::ReliabilityConfig {
+                    api_keys: credential.rotation_keys().to_vec(),
+                    ..config.reliability.clone()
+                };
+                crate::providers::create_resilient_provider_with_options(
+                    resolved.provider_label(),
+                    credential.api_key(),
+                    credential.api_url(),
+                    &reliability,
+                    &provider_runtime_options,
+                )
+                .map(|provider| (provider, resolved.model().to_string()))
+            });
+    match built {
+        Ok((provider, model)) => {
             let provider: Arc<dyn crate::providers::traits::Provider> = Arc::from(provider);
             crate::health::mark_component_ok(EVOLUTION_JUDGE_COMPONENT);
-            Arc::new(ModelJudge::new(provider))
+            Arc::new(ModelJudge::new(provider, model))
         }
         Err(error) => {
+            // The default provider may be a `custom:` URL carrying
+            // `user:password@`; the health record and the log name the
+            // endpoint without it.
+            let provider_name = crate::providers::redact_endpoint_userinfo(&provider_name);
+            let error = crate::providers::redact_endpoint_userinfo(&error.to_string()).into_owned();
             crate::health::mark_component_error(
                 EVOLUTION_JUDGE_COMPONENT,
                 format!("provider '{provider_name}' unavailable: {error}"),
@@ -1471,6 +1719,17 @@ const fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRe
         warm_days: retention.warm_days,
         cold_days: retention.cold_days,
     }
+}
+
+/// The fields whose change makes the channels supervisor prepare a new
+/// channel runtime for the candidate generation: its own table and every
+/// rebuild-and-swap field, which includes the default provider and model,
+/// the provider tables and the model routes. The new runtime resolves its
+/// default before anything is built (`check_channel_startup_default`), so a
+/// candidate whose default cannot chat fails the prepare and the generation
+/// is refused (D-065 R-1).
+fn channels_prepares_for_field(field: &str) -> bool {
+    field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)
 }
 
 const fn has_supervised_channels(config: &Config) -> bool {
@@ -1858,6 +2117,72 @@ mod tests {
         assert_eq!(path, config.workspace_dir.join("evolution_config.toml"));
     }
 
+    /// R-PMMCh S-1: a judge that gave no verdict marks the judge health
+    /// component as an error, naming why; a later scored verdict clears it; a
+    /// mock (degraded) verdict leaves the start-up status alone.
+    #[test]
+    fn a_failed_judge_verdict_marks_the_judge_component_error() {
+        use crate::self_system::evolution::pipeline::JudgeOutcome;
+        let component = "daemon-test-evolution-judge";
+        crate::health::mark_component_ok(component);
+        let failed = vec![
+            "judge_failed: the model judge gave no verdict (the judge call timed out after 180s), so the verdict is \
+             deferred"
+                .to_string(),
+        ];
+        record_evolution_judge_health(
+            component,
+            [
+                (JudgeOutcome::NotRun, &[][..]),
+                (JudgeOutcome::Failed, failed.as_slice()),
+            ],
+        );
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(snapshot["components"][component]["status"], "error");
+        assert!(
+            snapshot["components"][component]["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out"),
+            "{snapshot}"
+        );
+
+        record_evolution_judge_health(component, [(JudgeOutcome::Degraded, &[][..])]);
+        assert_eq!(
+            crate::health::snapshot_json()["components"][component]["status"],
+            "error",
+            "a mock verdict must not clear the judge error"
+        );
+
+        record_evolution_judge_health(component, [(JudgeOutcome::Scored, &[][..])]);
+        assert_eq!(crate::health::snapshot_json()["components"][component]["status"], "ok");
+    }
+
+    /// D-046 / R-PMMCi F-1: `daemon::run` drains the evolution commit
+    /// tracker after aborting its supervisors, and the daemon's pipelines
+    /// run their verdict tasks on that tracker.
+    #[test]
+    fn daemon_run_drains_the_evolution_commit_tracker_before_returning() {
+        let source = include_str!("mod.rs");
+        let run = source
+            .split_once("pub async fn run(")
+            .and_then(|(_, rest)| rest.split_once("\nfn register_optional_component"))
+            .expect("test: daemon::run body")
+            .0;
+        let abort = run.find("handle.abort()").expect("test: supervisors are aborted");
+        let drain = run
+            .find("drain_evolution_commits(crate::self_system::evolution::commit::daemon_commits())")
+            .expect("daemon::run drains the evolution commit tracker");
+        assert!(abort < drain, "the drain runs after the supervisors are aborted");
+        let builder = source
+            .split_once("async fn build_evolution_scheduler")
+            .expect("test: scheduler builder")
+            .1;
+        assert!(
+            builder.contains("with_commit_tracker(crate::self_system::evolution::commit::daemon_commits().clone())")
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
         let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async { anyhow::bail!("boom") });
@@ -1934,6 +2259,109 @@ mod tests {
         })
         .await
         .expect("ack task")
+    }
+
+    /// D-065 R-1: a hot reload to a default model that cannot chat is
+    /// refused by the channels supervisor exactly as the gateway refuses it:
+    /// the supervisor prepares a channel runtime for the candidate with the
+    /// production field filter and runner (`start_channels_with_config`),
+    /// whose start-up resolution fails, so the manager rejects the generation
+    /// and the previous default stays active. Loopback and temp dirs only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_reload_to_a_model_that_cannot_chat_is_refused_and_the_previous_stays() {
+        let workspace = tempfile::tempdir().expect("test: temp dir");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut good = Config::default();
+        good.workspace_dir = workspace.path().join("workspace");
+        good.config_path = workspace.path().join("config.toml");
+        std::fs::create_dir_all(&good.workspace_dir).expect("test: workspace");
+        good.default_provider = Some(probe.custom_provider());
+        good.default_model = Some("vendor/chat-model".to_string());
+        good.memory.backend = "none".to_string();
+        good.providers.models.push(
+            toml::from_str(&format!(
+                "provider = \"{}\"\nmodel = \"jev-decision-test\"\noperations = [\"decision_endpoint\"]\n",
+                probe.custom_provider()
+            ))
+            .expect("test: declaration"),
+        );
+        let mut decision_only = good.clone();
+        decision_only.default_model = Some("jev-decision-test".to_string());
+
+        let manager = crate::config::new_shared(good);
+        let root_shutdown = CancellationToken::new();
+        let shared = Arc::clone(&manager);
+        let runner: GenerationComponentRunner = Arc::new(move |generation, shutdown| {
+            let shared = Arc::clone(&shared);
+            Box::pin(async move {
+                crate::channels::start_channels_with_config(
+                    (*generation.effective).clone(),
+                    shared,
+                    generation,
+                    shutdown,
+                )
+                .await
+            })
+        });
+        let (handle, controller) = spawn_config_generation_supervisor(
+            "channels",
+            "channels",
+            OPTIONAL_HEALTH_TTL_SECONDS,
+            manager.pin(),
+            Arc::new(channels_prepares_for_field),
+            Arc::new(|_| true),
+            runner,
+            root_shutdown.clone(),
+        );
+        let alive_probe = controller.clone();
+        let participant: Arc<dyn crate::config::ConfigGenerationParticipant> =
+            Arc::new(DaemonConfigGenerationParticipant {
+                controllers: vec![controller],
+            });
+        manager.register_participant(&participant);
+        assert!(channels_prepares_for_field("default_model"));
+
+        let applying = Arc::clone(&manager);
+        let error = crate::runtime::blocking::spawn_blocking(move || {
+            applying.apply_runtime_config(decision_only, crate::config::ConfigReloadTrigger::Test)
+        })
+        .await
+        .expect("test: apply task")
+        .expect_err("a default that cannot chat must not activate");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("channels"), "{text}");
+        assert!(text.contains("cannot be used for chat"), "{text}");
+        assert_eq!(
+            manager.pin().effective.default_model.as_deref(),
+            Some("vendor/chat-model"),
+            "the previous generation stays active"
+        );
+        assert!(
+            !probe
+                .requests()
+                .iter()
+                .any(|request| request.path.contains("chat/completions")),
+            "no model request was sent"
+        );
+        // The channels supervisor survived the refusal and still answers: a
+        // stale prepare is rejected rather than going unheard.
+        let (stale_tx, stale_rx) = std::sync::mpsc::sync_channel(1);
+        alive_probe
+            .commands
+            .send(GenerationSupervisorCommand::Prepare {
+                generation: manager.pin(),
+                response: stale_tx,
+            })
+            .expect("the channels supervisor is still running");
+        let ack = receive_generation_ack(stale_rx).await;
+        assert!(
+            ack.as_ref().is_err_and(|error| error.contains("stale")),
+            "the channels supervisor stopped answering after the refusal: {ack:?}"
+        );
+
+        root_shutdown.cancel();
+        let _ = handle.await;
     }
 
     #[test]
@@ -2049,6 +2477,328 @@ mod tests {
         assert_eq!(*starts.lock(), vec![0, 1, 0]);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    /// The last error a component's health reports, if any.
+    fn component_last_error(name: &str) -> Option<String> {
+        crate::health::snapshot()
+            .components
+            .get(name)
+            .and_then(|component| component.last_error.clone())
+    }
+
+    /// The component's last error once it mentions `needle`, polled until
+    /// then (a minute at most, which only turns a hang into a failure).
+    async fn wait_for_last_error(name: &str, needle: &str) -> String {
+        for _ in 0..2400 {
+            if let Some(error) = component_last_error(name).filter(|error| error.contains(needle)) {
+                return error;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        component_last_error(name).unwrap_or_default()
+    }
+
+    /// A runner whose `n`-th start (0-based) behaves as `plan[n]`: `Ok` acks
+    /// readiness and runs until shutdown, `Err(cause)` fails with `cause`
+    /// under an outer context (so only `{:#}` shows it), and `ExitSoon` acks
+    /// and then exits on its own after a moment.
+    #[derive(Clone, Copy)]
+    enum StartPlan {
+        Run,
+        Fail(&'static str),
+        ExitSoon,
+        /// Marks its own health failed with this cause and keeps running.
+        MarkError(&'static str),
+    }
+
+    fn planned_runner(name: &'static str, plan: Vec<StartPlan>) -> GenerationComponentRunner {
+        let calls = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |_generation, shutdown| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let step = plan.get(call).copied().unwrap_or(StartPlan::Run);
+            Box::pin(async move {
+                match step {
+                    StartPlan::Run => {
+                        crate::health::mark_component_ok(name);
+                        shutdown.cancelled().await;
+                        Ok(())
+                    }
+                    StartPlan::Fail(cause) => Err(anyhow::anyhow!(cause).context("component setup failed")),
+                    StartPlan::ExitSoon => {
+                        crate::health::mark_component_ok(name);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(())
+                    }
+                    StartPlan::MarkError(cause) => {
+                        crate::health::mark_component_error(name, cause);
+                        shutdown.cancelled().await;
+                        Ok(())
+                    }
+                }
+            })
+        })
+    }
+
+    /// D-067, RED before: the initial-generation failure was recorded with
+    /// `to_string()`, which keeps only the outer context, so the component's
+    /// health did not say why it failed. After: the whole chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initial_generation_failure_reports_the_whole_error_chain() {
+        let name = "daemon-generation-initial-chain-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, _controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            initial,
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(name, vec![StartPlan::Fail("INITIAL-ROOT-CAUSE")]),
+            root_shutdown.clone(),
+        );
+        let error = wait_for_last_error(name, "INITIAL-ROOT-CAUSE").await;
+        assert!(error.contains("INITIAL-ROOT-CAUSE"), "{error}");
+        root_shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// D-072 L-3: a chain logged whole may carry an inner error's secret (a
+    /// token in a request URL); the log copy is redacted and keeps the chain.
+    #[test]
+    fn a_logged_error_chain_is_redacted() {
+        let error = Err::<(), _>(anyhow::anyhow!(
+            "error sending request for url (https://user:hunter2@api.example.test/v1?key=sk-abc123456789012345678901)"
+        ))
+        .context("provider warmup failed")
+        .expect_err("test: an error");
+        let logged = redacted_chain(&error);
+        assert!(
+            logged.starts_with("provider warmup failed: error sending request"),
+            "{logged}"
+        );
+        assert!(!logged.contains("hunter2"), "{logged}");
+        assert!(!logged.contains("sk-abc123456789012345678901"), "{logged}");
+    }
+
+    /// D-072 L-2, RED before: a component that marked its own health failed
+    /// during preparation had that cause overwritten by the supervisor's
+    /// "reported failed health" message. After: the cause is kept in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_component_that_marks_itself_failed_keeps_its_own_cause() {
+        let name = "daemon-generation-self-marked-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, _controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            initial,
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(name, vec![StartPlan::MarkError("SELF-MARKED-CAUSE")]),
+            root_shutdown.clone(),
+        );
+        let error = wait_for_last_error(name, "reported failed health").await;
+        assert!(
+            error.contains("reported failed health") && error.contains("SELF-MARKED-CAUSE"),
+            "{error}"
+        );
+        root_shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// D-067, RED before: a restart after the component exited recorded only
+    /// the outer context of a failed start. After: the whole chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_restart_tick_reports_the_whole_error_chain() {
+        let name = "daemon-generation-restart-chain-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, _controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            initial,
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(name, vec![StartPlan::ExitSoon, StartPlan::Fail("RESTART-ROOT-CAUSE")]),
+            root_shutdown.clone(),
+        );
+        let mut error = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            error = component_last_error(name).unwrap_or_default();
+            if error.contains("RESTART-ROOT-CAUSE") {
+                break;
+            }
+        }
+        assert!(error.contains("RESTART-ROOT-CAUSE"), "{error}");
+        root_shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// D-067, RED before: a `Rollback` whose restore of the previous
+    /// generation failed replied with the outer context only and left the
+    /// component's health silent although it was down. After: the reply has
+    /// the whole chain and the health is failed with the cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_rollback_reports_the_chain_and_marks_the_component_failed() {
+        let name = "daemon-generation-rollback-chain-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            Arc::clone(&initial),
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(
+                name,
+                vec![StartPlan::Run, StartPlan::Run, StartPlan::Fail("ROLLBACK-ROOT-CAUSE")],
+            ),
+            root_shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (prepare_tx, prepare_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Prepare {
+                generation: next_test_generation(&initial, 1),
+                response: prepare_tx,
+            })
+            .unwrap();
+        assert_eq!(receive_generation_ack(prepare_rx).await, Ok(()));
+
+        let (rollback_tx, rollback_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Rollback {
+                generation_id: 1,
+                response: rollback_tx,
+            })
+            .unwrap();
+        let reply = receive_generation_ack(rollback_rx)
+            .await
+            .expect_err("test: the restore fails");
+        assert!(reply.contains("ROLLBACK-ROOT-CAUSE"), "{reply}");
+        let health = crate::health::snapshot();
+        let component = health.components.get(name).expect("test: registered");
+        assert_eq!(component.state, crate::health::ComponentState::Failed);
+        let error = component.last_error.clone().unwrap_or_default();
+        assert!(error.contains("ROLLBACK-ROOT-CAUSE"), "{error}");
+        root_shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// D-067, RED before: when a candidate generation failed and the previous
+    /// generation also failed to restart, only a log line said so; the
+    /// component stayed down with no failed health. After: its health is
+    /// failed and names the restore failure (the reply names the candidate's).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_candidate_whose_restore_also_fails_marks_the_component_failed() {
+        let name = "daemon-generation-restore-failure-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            Arc::clone(&initial),
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(
+                name,
+                vec![
+                    StartPlan::Run,
+                    StartPlan::Fail("CANDIDATE-ROOT-CAUSE"),
+                    StartPlan::Fail("RESTORE-ROOT-CAUSE"),
+                ],
+            ),
+            root_shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (prepare_tx, prepare_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Prepare {
+                generation: next_test_generation(&initial, 1),
+                response: prepare_tx,
+            })
+            .unwrap();
+        let reply = receive_generation_ack(prepare_rx)
+            .await
+            .expect_err("test: the candidate fails");
+        assert!(reply.contains("CANDIDATE-ROOT-CAUSE"), "{reply}");
+        let health = crate::health::snapshot();
+        let component = health.components.get(name).expect("test: registered");
+        assert_eq!(component.state, crate::health::ComponentState::Failed);
+        let error = component.last_error.clone().unwrap_or_default();
+        assert!(error.contains("could not restart"), "{error}");
+        assert!(error.contains("RESTORE-ROOT-CAUSE"), "{error}");
+        root_shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// D-072 L-5, RED before: when the candidate failed and the previous
+    /// generation could not be restored either, the component stayed down
+    /// until the next config generation (the tick restarts only a task that
+    /// finished, and there was none). After: it is retried with a backoff and
+    /// comes back once a start succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_component_whose_restore_failed_is_retried_until_it_runs() {
+        let name = "daemon-generation-restore-retry-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let (handle, controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            Arc::clone(&initial),
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            planned_runner(
+                name,
+                vec![
+                    StartPlan::Run,
+                    StartPlan::Fail("CANDIDATE-ROOT-CAUSE"),
+                    StartPlan::Fail("RESTORE-ROOT-CAUSE"),
+                    StartPlan::Fail("FIRST-RETRY-ROOT-CAUSE"),
+                    StartPlan::Run,
+                ],
+            ),
+            root_shutdown.clone(),
+        );
+        let (prepare_tx, prepare_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Prepare {
+                generation: next_test_generation(&initial, 1),
+                response: prepare_tx,
+            })
+            .unwrap();
+        assert!(receive_generation_ack(prepare_rx).await.is_err());
+
+        let mut state = None;
+        for _ in 0..2400 {
+            state = crate::health::snapshot()
+                .components
+                .get(name)
+                .map(|component| component.state);
+            if state == Some(crate::health::ComponentState::Ready) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            state,
+            Some(crate::health::ComponentState::Ready),
+            "the component comes back after a failed retry"
+        );
+        root_shutdown.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2173,5 +2923,174 @@ mod tests {
             mention_only: false,
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    /// USERINFO-REDACT: a judge provider that fails to build is recorded on
+    /// the health snapshot `GET /health` serializes. The default provider may
+    /// be a `custom:` URL carrying `user:password@`.
+    #[test]
+    fn a_degraded_judge_names_its_provider_without_url_userinfo() {
+        let _serial = JUDGE_HEALTH_SERIAL.lock();
+        let config = Config {
+            // Port 99999 does not parse, so the chain cannot be built.
+            default_provider: Some("custom:http://alice:SECRET-fixture-pw@127.0.0.1:99999/v1".to_string()),
+            api_key: Some("sk-fixture-not-real".to_string()),
+            ..Config::default()
+        };
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || JudgeLogCapture(std::sync::Arc::clone(&sink)))
+            .finish();
+        let _judge = tracing::subscriber::with_default(subscriber, || build_evolution_judge_model(&config));
+        let logged = String::from_utf8_lossy(&captured.lock()).into_owned();
+        assert!(
+            logged.contains("DEGRADED"),
+            "the capture saw no degraded-judge warning: {logged}"
+        );
+        assert!(
+            !logged.contains("SECRET-fixture-pw"),
+            "the warning leaked the password: {logged}"
+        );
+        let snapshot = serde_json::to_string(&crate::health::snapshot()).expect("test: snapshot serializes");
+        assert!(
+            snapshot.contains("custom:http://[redacted]@127.0.0.1:99999/v1"),
+            "the degraded judge must still name its endpoint: {snapshot}"
+        );
+        assert!(!snapshot.contains("SECRET-fixture-pw"), "{snapshot}");
+    }
+
+    /// The judge tests write the process-wide `evolution_judge` health
+    /// component; one runs at a time so each reads its own record.
+    static JUDGE_HEALTH_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// PMM-C: a default that cannot chat degrades the judge to the mock
+    /// before any provider is built, and says why.
+    #[test]
+    fn a_decision_only_default_degrades_the_judge_before_building() {
+        let _serial = JUDGE_HEALTH_SERIAL.lock();
+        let mut config = Config {
+            default_provider: Some("openrouter".to_string()),
+            default_model: Some("jev-decision-test".to_string()),
+            api_key: Some("sk-fixture-not-real".to_string()),
+            ..Config::default()
+        };
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"openrouter\"\nmodel = \"jev-decision-test\"\noperations = [\"decision_endpoint\"]\n",
+            )
+            .expect("test: declaration"),
+        );
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || JudgeLogCapture(std::sync::Arc::clone(&sink)))
+            .finish();
+        let _judge = tracing::subscriber::with_default(subscriber, || build_evolution_judge_model(&config));
+        let logged = String::from_utf8_lossy(&captured.lock()).into_owned();
+        assert!(
+            logged.contains("DEGRADED") && logged.contains("cannot be used for chat"),
+            "a decision-only default built a real judge: {logged}"
+        );
+        assert!(!logged.contains("sk-fixture-not-real"), "{logged}");
+    }
+
+    /// A loopback chat endpoint that records the `model` of every request
+    /// and answers with a judge score.
+    async fn judge_stub() -> (
+        String,
+        std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        let models: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&models);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                while let Ok(read) = socket.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buffer).to_string();
+                    let Some(split) = text.find("\r\n\r\n") else { continue };
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= split + 4 + length {
+                        if let Ok(body) =
+                            serde_json::from_slice::<serde_json::Value>(&buffer[split + 4..split + 4 + length])
+                        {
+                            sink.lock().push(body["model"].as_str().unwrap_or_default().to_string());
+                        }
+                        break;
+                    }
+                }
+                let content = "{\"task_completion\":0.7,\"correctness\":0.7,\"efficiency\":0.7,\"safety_compliance\":0.7,\"reasoning\":\"r\"}";
+                let payload = serde_json::json!({
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("custom:http://{addr}/v1"), models, server)
+    }
+
+    /// D-034 / R-PMMC F-3: the judge sends the resolved default model, never
+    /// the `mock-judge-v1` placeholder, to a real provider.
+    #[tokio::test]
+    async fn the_judge_sends_the_resolved_default_model_never_the_placeholder() {
+        use crate::self_system::evolution::judge::JudgeConfig;
+        let (label, models, server) = judge_stub().await;
+        let config = Config {
+            default_provider: Some(label),
+            default_model: Some("judge-model".to_string()),
+            ..Config::default()
+        };
+        let judge = {
+            let _serial = JUDGE_HEALTH_SERIAL.lock();
+            build_evolution_judge_model(&config)
+        };
+        let _ = judge.score("task", "done", &JudgeConfig::default()).await;
+        let seen = models.lock().clone();
+        server.abort();
+        assert!(
+            !seen.iter().any(|model| model == "mock-judge-v1"),
+            "the placeholder reached the provider: {seen:?}"
+        );
+        assert_eq!(seen.first().map(String::as_str), Some("judge-model"), "{seen:?}");
+    }
+
+    struct JudgeLogCapture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for JudgeLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

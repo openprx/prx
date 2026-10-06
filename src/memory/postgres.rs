@@ -1,3 +1,8 @@
+mod decision_reads;
+mod ingress_recovery;
+mod router_history;
+mod router_learning;
+
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, ScopeParam, Visibility, classify_memory};
 use super::traits::{
     ChatProfile, CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,
@@ -40,6 +45,47 @@ const PG_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
     crate::memory::session_predicate::PlaceholderDialect::Postgres;
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
+/// D-028: the read-only policy that shares `public` memory rows across owners.
+const MEMORIES_PUBLIC_READ_POLICY: &str = "memories_public_read";
+
+/// Migrations the isolation evidence verifies as recorded with the checksum
+/// this build carries: 21 (owner-isolation policies), 23 (their shared read
+/// arm closed to owner-isolated callers), 24 (`memories_public_read`).
+const VERIFIED_ISOLATION_MIGRATIONS: [i64; 3] = [21, 23, 24];
+
+/// One `pg_policies` row, as the isolation evidence reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyRow {
+    name: String,
+    /// `PERMISSIVE` or `RESTRICTIVE`.
+    permissive: String,
+    roles: Vec<String>,
+}
+
+/// A vector table must carry exactly the `expected` policies, each
+/// permissive and granted to `PUBLIC`, as `init_vector_rls` installs them.
+///
+/// Any other policy fails the evidence: a permissive one widens access by
+/// OR, and a restrictive or role-limited variant of an expected one breaks
+/// the reads it exists to grant.
+fn check_policy_inventory(target: &str, rows: &[PolicyRow], expected: &[&str]) -> Result<()> {
+    let mut found = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+    found.sort_unstable();
+    let mut wanted = expected.to_vec();
+    wanted.sort_unstable();
+    anyhow::ensure!(
+        found == wanted,
+        "A04 table {target} carries policies {found:?}; expected exactly {wanted:?}"
+    );
+    for row in rows {
+        anyhow::ensure!(
+            row.permissive == "PERMISSIVE" && row.roles == ["public"],
+            "A04 policy {} on {target} is not a permissive policy for PUBLIC",
+            row.name
+        );
+    }
+    Ok(())
+}
 
 /// Default ceiling on live pooled PostgreSQL connections.
 ///
@@ -53,12 +99,14 @@ pub(crate) const POSTGRES_DEFAULT_POOL_MAX_SIZE: usize = 32;
 
 /// Default timeout for *establishing* a connection when none is configured.
 ///
-/// This is deliberately the only timeout this backend applies. A stalled TCP or
+/// This is deliberately the only timeout ordinary pooled operations apply. A stalled TCP or
 /// startup handshake is a network fault rather than a long-running task, so
 /// bounding it keeps a dead endpoint from wedging checkouts forever. Statement
-/// execution is never bounded (no `statement_timeout` is set anywhere in this
-/// backend) and waiting for a pooled connection is never bounded either,
+/// execution on that pool is never bounded and waiting for a pooled connection
+/// is never bounded either,
 /// because long queries and queueing are both normal for agent workloads.
+/// Decision rehearsal uses its own read-only connection and caller deadline;
+/// it never changes these ordinary pool settings.
 const POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// FIX-P2-03: safety cap on the BYTEA-fallback (no-pgvector) candidate scan.
@@ -81,6 +129,8 @@ const POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP: i64 = 4_096;
 /// This backend focuses on reliable CRUD and keyword recall using SQL, without
 /// requiring extension setup (for example pgvector).
 pub struct PostgresMemory {
+    ingress_owners: crate::memory::ingress_recovery::IngressOwnerCache,
+    ingress_owner_id: std::sync::OnceLock<uuid::Uuid>,
     client: Arc<PostgresConnectionPool>,
     /// Quoted schema identifier (for example `"public"`). Used to build the
     /// qualified names of schema-scoped helper tables (sessions,
@@ -554,6 +604,104 @@ fn drop_client_off_runtime(client: Client) {
 }
 
 impl PostgresMemory {
+    async fn list_conversation_turns_ordered(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+        recorded_order: bool,
+    ) -> Result<Vec<ConversationTurn>> {
+        let client = self.client.clone();
+        let turns_table = self.qualified_conversation_turns_table();
+        let events_table = self.qualified_message_events_table.clone();
+        let ordering = if recorded_order {
+            format!(
+                "timestamp::timestamptz DESC, COALESCE((SELECT event.id FROM {events_table} event WHERE event.event_id = {turns_table}.message_event_id), id) DESC, id DESC"
+            )
+        } else {
+            "id DESC".to_owned()
+        };
+        let owner_id = principal
+            .owner_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
+        let workspace_id = principal.workspace_id.trim().to_string();
+        let session_key = session_key.to_string();
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = limit.clamp(1, 500) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let offset = offset.min(100_000) as i64;
+        let system_allowed = Self::is_system_principal(principal);
+        let owner_isolated = principal.require_owner_match;
+        // D4 read-merge: the explicit `session_key` arg is the canonical key
+        // (bound at `$1`); the principal may carry a distinct legacy key bound
+        // at trailing placeholders starting at `$6`.
+        let legacy_session_keys: Vec<String> = principal
+            .legacy_session_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != session_key.trim())
+            .map(|key| vec![key.to_string()])
+            .unwrap_or_default();
+        let mut session_indices = vec![1usize];
+        for offset_idx in 0..legacy_session_keys.len() {
+            session_indices.push(6 + offset_idx);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<ConversationTurn>> {
+            let stmt = format!(
+                "SELECT id, session_key, role, content, timestamp, message_id
+                 FROM {turns_table}
+                 WHERE {session_fragment}
+                   AND (
+                       $4
+                       OR owner_id = $5
+                       OR owner_id IS NULL
+                       OR owner_id = 'legacy:' || session_key
+                   )
+                 ORDER BY {ordering}
+                 LIMIT $2 OFFSET $3",
+                session_fragment = session_fragment.sql,
+            );
+            let rows = client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    system_allowed,
+                    Some(&workspace_id),
+                    owner_id.as_deref(),
+                    owner_isolated,
+                )?;
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    vec![&session_key, &limit, &offset, &system_allowed, &owner_id];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                let rows = tx.query(&stmt, &bind)?;
+                tx.commit()?;
+                Ok(rows)
+            })?;
+            let mut turns: Vec<ConversationTurn> = rows
+                .iter()
+                .map(|row| ConversationTurn {
+                    id: row.get(0),
+                    session_key: row.get(1),
+                    role: row.get(2),
+                    content: row.get(3),
+                    timestamp: row.get(4),
+                    message_id: row.get(5),
+                })
+                .collect();
+            turns.reverse();
+            Ok(turns)
+        })
+        .await?
+    }
+
     /// Read-only proof that the A04 vector isolation migration and policies are
     /// active on the configured PostgreSQL deployment. The returned reference
     /// contains only migration/policy hashes, never credentials or row data.
@@ -597,22 +745,29 @@ impl PostgresMemory {
             .connect(NoTls)
             .context("PostgreSQL isolation evidence connection failed")?;
         let migration_table = format!("{}.memory_schema_migrations", quote_identifier(schema));
-        let (version, _, descriptor) = Self::memory_schema_migration_registry()
-            .iter()
-            .find(|(version, _, _)| *version == 21)
-            .context("A04 schema migration is not registered")?;
-        let expected_checksum = Self::schema_migration_checksum(descriptor);
-        let row = client
-            .query_opt(
-                &format!("SELECT checksum FROM {migration_table} WHERE version = $1"),
-                &[version],
-            )?
-            .context("A04 schema migration 21 is not recorded")?;
-        let recorded_checksum: String = row.get(0);
-        anyhow::ensure!(
-            recorded_checksum == expected_checksum,
-            "A04 schema migration checksum does not match the runtime evaluator"
-        );
+        // 21 installed the owner-isolation policies, 23 closed their shared
+        // read arm to owner-isolated callers, 24 added the public read grant:
+        // the evidence names all three.
+        let mut migration_proof = String::from("postgres");
+        for wanted in VERIFIED_ISOLATION_MIGRATIONS {
+            let (version, _, descriptor) = Self::memory_schema_migration_registry()
+                .iter()
+                .find(|(version, _, _)| *version == wanted)
+                .with_context(|| format!("A04 schema migration {wanted} is not registered"))?;
+            let expected_checksum = Self::schema_migration_checksum(descriptor);
+            let row = client
+                .query_opt(
+                    &format!("SELECT checksum FROM {migration_table} WHERE version = $1"),
+                    &[version],
+                )?
+                .with_context(|| format!("A04 schema migration {wanted} is not recorded"))?;
+            let recorded_checksum: String = row.get(0);
+            anyhow::ensure!(
+                recorded_checksum == expected_checksum,
+                "A04 schema migration {wanted} checksum does not match the runtime evaluator"
+            );
+            migration_proof = format!("{migration_proof}:migration:{version}:sha256:{expected_checksum}");
+        }
 
         let targets = [
             (table, "memories_owner_isolation"),
@@ -632,6 +787,28 @@ impl PostgresMemory {
                 flags.get::<_, bool>(0) && flags.get::<_, bool>(1),
                 "A04 RLS is not enabled and forced for {target}"
             );
+            // Enumerate, not just look up: a stray permissive policy — added by
+            // hand, or left behind by another build — ORs its own access in
+            // while every named policy still checks out (R-B2 F-5).
+            let inventory = client
+                .query(
+                    "SELECT policyname::text, permissive, roles::text[] \
+                     FROM pg_policies WHERE schemaname = $1 AND tablename = $2",
+                    &[&schema, &target],
+                )?
+                .iter()
+                .map(|row| PolicyRow {
+                    name: row.get(0),
+                    permissive: row.get(1),
+                    roles: row.get(2),
+                })
+                .collect::<Vec<_>>();
+            let expected: &[&str] = if target == table {
+                &[policy, MEMORIES_PUBLIC_READ_POLICY]
+            } else {
+                &[policy]
+            };
+            check_policy_inventory(target, &inventory, expected)?;
             let policy_row = client
                 .query_opt(
                     "SELECT COALESCE(qual, ''), COALESCE(with_check, '') \
@@ -648,17 +825,51 @@ impl PostgresMemory {
                     "A04 policy {policy} lacks required transaction context"
                 );
             }
+            // OQ-8: a shared read arm must be closed to owner-isolated callers.
+            anyhow::ensure!(
+                !using_expr.contains("'workspace'") || using_expr.contains("prx.owner_isolated"),
+                "A04 policy {policy} shares workspace rows with owner-isolated callers"
+            );
             policy_proof.push_str(policy);
             policy_proof.push('\0');
             policy_proof.push_str(&using_expr);
             policy_proof.push('\0');
             policy_proof.push_str(&check_expr);
             policy_proof.push('\0');
+            // D-028: the `public` tier is granted by its own read-only policy,
+            // never by the owner-isolation policy that also governs writes.
+            anyhow::ensure!(
+                !using_expr.contains("'public'") && !check_expr.contains("'public'"),
+                "A04 policy {policy} admits public rows outside the read-only public policy"
+            );
         }
+        let public_row = client
+            .query_opt(
+                "SELECT cmd, COALESCE(qual, ''), COALESCE(with_check, '') \
+                 FROM pg_policies \
+                 WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+                &[&schema, &table, &MEMORIES_PUBLIC_READ_POLICY],
+            )?
+            .with_context(|| format!("A04 policy {MEMORIES_PUBLIC_READ_POLICY} is missing"))?;
+        let public_cmd: String = public_row.get(0);
+        let public_using: String = public_row.get(1);
+        let public_check: String = public_row.get(2);
+        anyhow::ensure!(
+            public_cmd == "SELECT"
+                && public_check.is_empty()
+                && public_using.contains("'public'")
+                && public_using.contains("prx.current_workspace")
+                && public_using.contains("prx.current_owner"),
+            "A04 policy {MEMORIES_PUBLIC_READ_POLICY} is not a read-only, workspace-scoped public grant"
+        );
+        policy_proof.push_str(MEMORIES_PUBLIC_READ_POLICY);
+        policy_proof.push('\0');
+        policy_proof.push_str(&public_cmd);
+        policy_proof.push('\0');
+        policy_proof.push_str(&public_using);
+        policy_proof.push('\0');
         let policy_hash = Self::schema_migration_checksum(&policy_proof);
-        Ok(format!(
-            "postgres:migration:{version}:sha256:{expected_checksum}:policy-sha256:{policy_hash}"
-        ))
+        Ok(format!("{migration_proof}:policy-sha256:{policy_hash}"))
     }
 
     /// Inspect a key namespace without initializing or mutating the configured
@@ -834,6 +1045,8 @@ impl PostgresMemory {
             client: pool,
             schema_ident: schema_ident_field,
             qualified_table,
+            ingress_owners: Default::default(),
+            ingress_owner_id: std::sync::OnceLock::new(),
             qualified_message_events_table,
             qualified_memory_events_table,
             qualified_drafts_table,
@@ -1704,6 +1917,21 @@ impl PostgresMemory {
                 // NULL (unattributed).
                 "memory_events + owner_id + idx_memory_events_owner",
             ),
+            (
+                23,
+                "vector_rls_owner_isolated_reads",
+                // OQ-8 / D-019: the policy DDL itself is reinstalled on every
+                // start by `init_vector_rls`; this entry records the contract
+                // change so a schema initialized by this build is identifiable.
+                "memories + document_chunks POLICY *_owner_isolation USING: shared global/workspace read arm additionally requires COALESCE(current_setting('prx.owner_isolated', true), '') <> 'on'; prx.owner_isolated set transaction-local from require_owner_match; WITH CHECK and embedding_cache unchanged",
+            ),
+            (
+                24,
+                "memories_public_read_policy",
+                // D-028: `public` memory rows are readable across owners, as
+                // the shared SQL predicate and SQLite already allow. Read only.
+                "memories POLICY memories_public_read FOR SELECT USING: transaction-local workspace and owner present AND workspace_id = prx.current_workspace AND visibility = 'public'; permissive, read only (UPDATE/DELETE/INSERT still need memories_owner_isolation); independent of prx.owner_isolated; document_chunks and embedding_cache unchanged",
+            ),
         ]
     }
 
@@ -1930,50 +2158,108 @@ impl PostgresMemory {
                 false,
             ),
         ] {
-            let read_scope = if shared_reads {
-                "(owner_id = current_setting('prx.current_owner', true) OR visibility IN ('global', 'workspace'))"
-            } else {
-                "owner_id = current_setting('prx.current_owner', true)"
-            };
-            tx.batch_execute(&format!(
-                "
-                ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
-                ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
-                DROP POLICY IF EXISTS {policy} ON {table};
-                CREATE POLICY {policy} ON {table}
-                    USING (
-                        current_setting('prx.rls_bypass', true) = 'on'
-                        OR (
-                            NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
-                            AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
-                            AND workspace_id = current_setting('prx.current_workspace', true)
-                            AND {read_scope}
-                        )
-                    )
-                    WITH CHECK (
-                        current_setting('prx.rls_bypass', true) = 'on'
-                        OR (
-                            NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
-                            AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
-                            AND workspace_id = current_setting('prx.current_workspace', true)
-                            AND owner_id = current_setting('prx.current_owner', true)
-                        )
-                    );
-                "
-            ))?;
+            tx.batch_execute(&Self::vector_rls_policy_sql(table, policy, shared_reads))?;
         }
+        tx.batch_execute(&Self::memories_public_read_policy_sql(
+            qualified_memories_table,
+            MEMORIES_PUBLIC_READ_POLICY,
+        ))?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The read-only `public` policy on `memories` (D-028).
+    ///
+    /// `public` is the explicit sharing path (D-016), and the shared SQL
+    /// predicate admits another owner's `public` memory row for every caller,
+    /// owner-isolated or not. This permissive `FOR SELECT` policy lets RLS
+    /// agree, within the caller's workspace and only with a full
+    /// transaction-local context. It grants nothing to `UPDATE`, `DELETE` or
+    /// `INSERT`: those still need the owner-exact `memories_owner_isolation`
+    /// policy, so another owner's `public` row stays unwritable. It does not
+    /// read `prx.owner_isolated`. `document_chunks` has no `public` tier.
+    fn memories_public_read_policy_sql(table: &str, policy: &str) -> String {
+        format!(
+            "
+            DROP POLICY IF EXISTS {policy} ON {table};
+            CREATE POLICY {policy} ON {table}
+                FOR SELECT
+                USING (
+                    NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
+                    AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
+                    AND workspace_id = current_setting('prx.current_workspace', true)
+                    AND visibility = 'public'
+                );
+            "
+        )
+    }
+
+    /// The row-level-security DDL for one vector table.
+    ///
+    /// Reads and writes both require the transaction-local workspace and
+    /// owner. Inserted and updated rows must carry the caller's owner (WITH
+    /// CHECK). Update and delete *targeting* is governed by USING, the read
+    /// scope below: owner-isolated callers can update or delete only their
+    /// own rows, but for other callers the policy also admits other owners'
+    /// `workspace`/`global` rows, and the statement's own SQL predicate
+    /// decides (R-B2 F-3). On the shared tables (`memories`,
+    /// `document_chunks`) a read also admits another owner's `global` or
+    /// `workspace` row, but only for a caller that is not owner-isolated:
+    /// OQ-8 / D-019 make the shared SQL predicate the owner contract, and an
+    /// owner-isolated caller (`prx.owner_isolated = 'on'`, set by
+    /// [`Self::apply_rls_context_raw`]) reaches only its own rows here, so the
+    /// policy floor matches that predicate instead of being wider than it. An
+    /// unset flag keeps the historical tenant-wide read scope. The embedding
+    /// cache has no shared arm at all.
+    fn vector_rls_policy_sql(table: &str, policy: &str, shared_reads: bool) -> String {
+        let read_scope = if shared_reads {
+            "(owner_id = current_setting('prx.current_owner', true) \
+             OR (visibility IN ('global', 'workspace') \
+                 AND COALESCE(current_setting('prx.owner_isolated', true), '') <> 'on'))"
+        } else {
+            "owner_id = current_setting('prx.current_owner', true)"
+        };
+        format!(
+            "
+            ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
+            DROP POLICY IF EXISTS {policy} ON {table};
+            CREATE POLICY {policy} ON {table}
+                USING (
+                    current_setting('prx.rls_bypass', true) = 'on'
+                    OR (
+                        NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
+                        AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
+                        AND workspace_id = current_setting('prx.current_workspace', true)
+                        AND {read_scope}
+                    )
+                )
+                WITH CHECK (
+                    current_setting('prx.rls_bypass', true) = 'on'
+                    OR (
+                        NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
+                        AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
+                        AND workspace_id = current_setting('prx.current_workspace', true)
+                        AND owner_id = current_setting('prx.current_owner', true)
+                    )
+                );
+            "
+        )
     }
 
     /// Bind trusted isolation context to the current transaction only. Values
     /// come from resolved runtime principals, never prompt/tool arguments. A
     /// non-system operation without both identifiers fails before SQL executes.
+    ///
+    /// `owner_isolated` is the caller's `require_owner_match` bit: when set,
+    /// the vector RLS policies drop their shared `global`/`workspace` read arm
+    /// for this transaction (see [`Self::vector_rls_policy_sql`]).
     fn apply_rls_context_raw<C: GenericClient>(
         client: &mut C,
         system: bool,
         workspace_id: Option<&str>,
         owner_id: Option<&str>,
+        owner_isolated: bool,
     ) -> Result<()> {
         if system {
             client.execute("SELECT set_config('prx.rls_bypass', 'on', true)", &[])?;
@@ -1990,7 +2276,13 @@ impl PostgresMemory {
             .context("PostgreSQL vector isolation requires a trusted owner context")?;
         client.execute("SELECT set_config('prx.rls_bypass', 'off', true)", &[])?;
         client.execute("SELECT set_config('prx.current_workspace', $1, true)", &[&workspace])?;
-        client.execute("SELECT set_config('prx.current_owner', $1, true)", &[&owner])?;
+        // The owner and its isolation bit are bound in one statement: the
+        // policy reads them together, and it saves a round trip.
+        let isolation = if owner_isolated { "on" } else { "off" };
+        client.execute(
+            "SELECT set_config('prx.current_owner', $1, true), set_config('prx.owner_isolated', $2, true)",
+            &[&owner, &isolation],
+        )?;
         Ok(())
     }
 
@@ -2013,6 +2305,14 @@ impl PostgresMemory {
         Self::content_hash(content)
     }
 
+    /// Render an embedding in pgvector's text input form (`[a,b,c]`).
+    ///
+    /// PG-VECTOR: the result is bound as a Rust `String`, so every statement
+    /// that receives it casts the parameter to `text` first and only then to
+    /// `vector`. A parameter cast straight to `vector` makes the server type
+    /// the parameter as `vector`, which a `String` cannot bind to, and the
+    /// statement fails before it runs. `tests/pgvector_binding_regression.rs`
+    /// guards every such cast.
     fn pgvector_literal(embedding: &[f32]) -> Option<String> {
         if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
             return None;
@@ -2108,7 +2408,8 @@ impl PostgresMemory {
             );
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, system, Some(&select_workspace), Some(&select_owner))?;
+                // The cache policy is owner exact; it has no shared arm to narrow.
+                Self::apply_rls_context_raw(&mut tx, system, Some(&select_workspace), Some(&select_owner), false)?;
                 let row = tx.query_opt(
                     &select_stmt,
                     &[
@@ -2200,7 +2501,8 @@ impl PostgresMemory {
             );
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, system, Some(&scope_workspace), Some(&scope_owner))?;
+                // The cache policy is owner exact; it has no shared arm to narrow.
+                Self::apply_rls_context_raw(&mut tx, system, Some(&scope_workspace), Some(&scope_owner), false)?;
                 let now = Utc::now();
                 tx.execute(
                     &insert_stmt,
@@ -2288,6 +2590,103 @@ impl PostgresMemory {
         )
     }
 
+    /// The guard appended to the *visibility* disjunct of every document chunk
+    /// search statement (V02-R8). Twin of `SqliteMemory::document_visibility_guard`.
+    ///
+    /// Those statements admit a chunk when the owning document is `global` or
+    /// `workspace` **or** when the chunk's owner matches the caller. The first
+    /// disjunct short-circuits the second, and a document's visibility defaults
+    /// to `workspace`, so an owner-isolated caller was handed a snippet of every
+    /// other owner's documents — including the conversation transcript the
+    /// OS-paging evictor ingests verbatim.
+    ///
+    /// `document_search` renders chunk content to its caller, so it has to agree
+    /// with `document_get_chunk`'s `chunk_visible_to_principal`, which is
+    /// already the intended semantic: an owner-isolated principal reads a chunk
+    /// only when the chunk's `owner_id` equals its authenticated owner id. A
+    /// `global` or `workspace` document owned by someone else and an
+    /// unattributed chunk are both hidden, and a caller with no owner id reaches
+    /// nothing. The owner disjunct beside this guard already expresses exactly
+    /// that test, so the whole correction is to stop the visibility disjunct
+    /// short-circuiting it.
+    ///
+    /// The fragment comes from
+    /// [`crate::memory::owner_predicate::owner_match_suffix`] — the single
+    /// owner-isolation seam — asked for an arm that carries no owner of its own
+    /// (`has_owner = false`), which is precisely what this arm is: a document's
+    /// visibility proves nothing about who owns the chunk. It therefore renders
+    /// the empty string for a non-isolated principal, leaving the statements and
+    /// their bind lists byte-identical, and `" AND FALSE"` for an isolated one.
+    /// It binds no parameter in either case, so the placeholder accounting of
+    /// these statements is unchanged.
+    ///
+    /// This is a statement-level filter. The row-level security policy on the
+    /// chunk table is a second, independent layer and is untouched.
+    fn document_visibility_guard(principal: &MemoryPrincipal) -> String {
+        // Unused: this arm never binds, because it never has an owner to bind.
+        const UNBOUND_INDEX: usize = 1;
+        crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            UNBOUND_INDEX,
+            principal.require_owner_match,
+            false,
+        )
+        .sql
+    }
+
+    /// The owner id an owner-isolated delete is confined to, with blanks
+    /// treated as absent — the same rule
+    /// [`Self::isolated_read_without_owner`] applies to the keyed reads, so the
+    /// short-circuit and this anchor can never disagree about what "no owner"
+    /// means. A non-isolated context never yields one.
+    fn forget_owner_anchor(context: &MemoryWriteContext) -> Option<String> {
+        if !context.require_owner_match {
+            return None;
+        }
+        context
+            .owner_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The guard appended to `forget_with_context`'s visibility scope
+    /// (R-B1d D-1).
+    ///
+    /// Delete-by-key was confined to the shared visibility predicate alone.
+    /// That predicate owner-qualifies every **non-public** arm for an isolated
+    /// caller, but `visibility = 'public'` stays shared by design — correct for
+    /// a read, wrong for a destructive operation, because it let an
+    /// owner-isolated caller remove a public row belonging to someone else.
+    /// This guard is therefore appended at the top level of the `WHERE` rather
+    /// than inside one arm: an owner-isolated caller deletes only rows whose
+    /// `owner_id` equals its authenticated owner id, whatever their visibility.
+    ///
+    /// The fragment comes from
+    /// [`crate::memory::owner_predicate::owner_match_suffix`] — the single
+    /// owner-isolation seam — so it renders the empty string for a
+    /// non-isolated caller (statement and bind list byte-identical) and
+    /// `" AND owner_id = $N"` for an isolated one. The `" AND FALSE"` case
+    /// cannot be reached here: an isolated context with no usable owner id has
+    /// already returned above, before any statement or RLS call. `index` is the
+    /// caller's next free placeholder, so the one-marker-one-parameter
+    /// accounting is preserved.
+    ///
+    /// This is a statement-level filter; the row-level security policy on the
+    /// memory table is a second, independent layer and is untouched.
+    fn forget_owner_guard(
+        context: &MemoryWriteContext,
+        index: usize,
+    ) -> crate::memory::owner_predicate::OwnerMatchPredicate {
+        crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            index,
+            context.require_owner_match,
+            Self::forget_owner_anchor(context).is_some(),
+        )
+    }
+
     fn is_system_principal(principal: &MemoryPrincipal) -> bool {
         principal
             .agent_id
@@ -2343,6 +2742,25 @@ impl PostgresMemory {
         indices
     }
 
+    /// Whether an owner-isolated read must answer empty without touching the
+    /// database (C03 / V02-R5, follow-up F1).
+    ///
+    /// Under isolation the RLS owner follows `context.owner_id` alone, and a
+    /// blank or absent owner id leaves it `None`. `apply_rls_context_raw`
+    /// rejects a non-system read that carries no owner, so without this
+    /// decision the read would return an *error* where the SQLite adapter
+    /// answers with an empty result — the same fail-closed intent, two
+    /// different contracts for the caller. The blank rule is the one
+    /// [`crate::memory::owner_predicate::owner_match_suffix`] applies to the
+    /// SQL arm, so both ends agree on what "no owner" means.
+    ///
+    /// A non-isolated context is never short-circuited: its read path and its
+    /// RLS owner are byte-identical to the historical ones.
+    #[must_use]
+    fn isolated_read_without_owner(context: &MemoryWriteContext) -> bool {
+        context.require_owner_match && context.owner_id.as_deref().map(str::trim).is_none_or(str::is_empty)
+    }
+
     fn principal_from_context(context: &MemoryWriteContext) -> Principal {
         let current_channel = context.channel.clone().unwrap_or_default();
         let current_chat_id = context.chat_id.clone().unwrap_or_default();
@@ -2375,7 +2793,10 @@ impl PostgresMemory {
             // self-authored rows for anonymous principals.
             raw_sender: context.raw_sender.clone().unwrap_or_default(),
             acl_enforced: true,
+            owner_id: None,
+            require_owner_match: false,
         }
+        .with_owner_scope(context)
     }
 
     /// Qualified name of a schema-scoped helper table (lives directly under the
@@ -2503,17 +2924,22 @@ impl PostgresMemory {
 
         // FIX-P1-06: raw sender anchor shared by the fallback and resolved paths.
         let raw_sender_anchor = context.raw_sender.clone().unwrap_or_default();
-        let fallback = |user_id: String| Principal {
-            user_id,
-            role: Role::Anonymous,
-            projects: Vec::new(),
-            visibility_ceiling: Visibility::Private,
-            blocked_patterns: Vec::new(),
-            current_channel: current_channel.clone(),
-            current_chat_id: current_chat_id.clone(),
-            current_chat_type: current_chat_type.clone(),
-            raw_sender: raw_sender_anchor.clone(),
-            acl_enforced: true,
+        let fallback = |user_id: String| {
+            Principal {
+                user_id,
+                role: Role::Anonymous,
+                projects: Vec::new(),
+                visibility_ceiling: Visibility::Private,
+                blocked_patterns: Vec::new(),
+                current_channel: current_channel.clone(),
+                current_chat_id: current_chat_id.clone(),
+                current_chat_type: current_chat_type.clone(),
+                raw_sender: raw_sender_anchor.clone(),
+                acl_enforced: true,
+                owner_id: None,
+                require_owner_match: false,
+            }
+            .with_owner_scope(context)
         };
 
         let (Some(channel), Some(raw_sender)) = (context.channel.clone(), context.raw_sender.clone()) else {
@@ -2582,6 +3008,7 @@ impl PostgresMemory {
             current_chat_type,
             raw_sender_anchor,
         )
+        .with_owner_scope(context)
     }
 
     fn parse_category(value: &str) -> MemoryCategory {
@@ -3128,7 +3555,7 @@ impl Memory for PostgresMemory {
                 )?;
                 if pgvector_available {
                     let update_vector_stmt =
-                        format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE key = $2");
+                        format!("UPDATE {qualified_table} SET embedding_vector = $1::text::vector WHERE key = $2");
                     let clear_vector_stmt =
                         format!("UPDATE {qualified_table} SET embedding_vector = NULL WHERE key = $1");
                     if let Some(embedding_vector) = embedding_vector.as_ref() {
@@ -3160,6 +3587,14 @@ impl Memory for PostgresMemory {
         };
 
         validate_memory_write_target(key, session_id)?;
+        // V02-R9: an owner-isolated write is confined to the caller's own keys,
+        // exactly as on SQLite. A blank owner id refuses before any SQL runs,
+        // and the isolated row is attributed to the authenticated owner alone.
+        let isolated_owner = super::owner_predicate::isolated_store_owner(Some(&context))?;
+        let mut metadata = metadata;
+        if let Some(owner) = isolated_owner.as_ref() {
+            metadata.owner_id = Some(owner.clone());
+        }
         let isolation_workspace = metadata.workspace_id.clone().or_else(|| context.workspace_id.clone());
         let isolation_owner = metadata.owner_id.clone().or_else(|| {
             context.sender_id.clone().or_else(|| {
@@ -3189,6 +3624,9 @@ impl Memory for PostgresMemory {
         let content = content.to_string();
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
+        let rls_owner_isolated = isolated_owner.is_some();
+        let owner_guard =
+            super::owner_predicate::store_conflict_guard(PG_DIALECT, &qualified_table, isolated_owner.is_some());
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let now = Utc::now();
@@ -3252,15 +3690,24 @@ impl Memory for PostgresMemory {
                     visibility = EXCLUDED.visibility,
                     sensitivity = EXCLUDED.sensitivity,
                     risk_signals = EXCLUDED.risk_signals,
-                    policy_version = EXCLUDED.policy_version
+                    policy_version = EXCLUDED.policy_version{owner_guard}
                 "
             );
 
             let id = Uuid::new_v4().to_string();
+            let refused = || -> anyhow::Error {
+                super::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable { key: key.clone() }.into()
+            };
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, rls_system, workspace_id.as_deref(), owner_id.as_deref())?;
-                tx.execute(
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    rls_system,
+                    workspace_id.as_deref(),
+                    owner_id.as_deref(),
+                    rls_owner_isolated,
+                )?;
+                let written = tx.execute(
                     &stmt,
                     &[
                         &id,
@@ -3291,10 +3738,30 @@ impl Memory for PostgresMemory {
                         &risk_json,
                         &classified.policy_version,
                     ],
-                )?;
+                );
+                // An isolated write that meets another owner's key ends in one
+                // of two ways, and both are the same refusal: the conflict
+                // guard suppresses the update (zero rows), or the
+                // `memories_owner_isolation` policy rejects the existing row
+                // outright (`42501`) — which of the two PostgreSQL reports for
+                // a non-shared row is pinned by
+                // `postgres_owner_isolated_store_refuses_a_cross_owner_upsert`.
+                let written = match written {
+                    Ok(rows) => rows,
+                    Err(error)
+                        if isolated_owner.is_some()
+                            && error.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) =>
+                    {
+                        return Err(refused());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if isolated_owner.is_some() && written == 0 {
+                    return Err(refused());
+                }
                 if pgvector_available {
                     let update_vector_stmt = format!(
-                        "UPDATE {qualified_table} SET embedding_vector = $1::vector \
+                        "UPDATE {qualified_table} SET embedding_vector = $1::text::vector \
                          WHERE key = $2 AND workspace_id = $3 AND owner_id = $4"
                     );
                     let clear_vector_stmt = format!(
@@ -3370,7 +3837,7 @@ impl Memory for PostgresMemory {
                         let vector_stmt = format!(
                             "
                             SELECT id, key, content, category, created_at, session_id,
-                                   (1.0 - (embedding_vector <=> $1::vector))::DOUBLE PRECISION AS score,
+                                   (1.0 - (embedding_vector <=> $1::text::vector))::DOUBLE PRECISION AS score,
                                    useful_count
                             FROM {qualified_table}
                             WHERE embedding_vector IS NOT NULL
@@ -3378,7 +3845,7 @@ impl Memory for PostgresMemory {
                               AND embedding_model = $3
                               AND embedding_dimensions = $4
                               AND ($5::TEXT IS NULL OR session_id = $5)
-                            ORDER BY embedding_vector <=> $1::vector
+                            ORDER BY embedding_vector <=> $1::text::vector
                             LIMIT $6
                             "
                         );
@@ -3496,6 +3963,91 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn read_router_history(
+        &self,
+        evidence: super::router_history::RouterHistoryReadEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::router_history::RouterHistoryRead> {
+        self.router_history_read(evidence, deadline).await
+    }
+    async fn commit_router_history(
+        &self,
+        evidence: &super::router_history::RouterHistoryWriteEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::router_history::RouterHistoryCommitReceipt> {
+        self.router_history_commit(evidence, deadline).await
+    }
+    async fn read_router_learning(
+        &self,
+        evidence: &super::traits::RouterLearningEvidence,
+        deadline: Instant,
+    ) -> Result<super::traits::RouterLearningRead> {
+        self.router_learning_transaction(evidence, None, deadline)
+            .await
+            .map(|(read, _)| read)
+    }
+    async fn commit_router_learning(
+        &self,
+        evidence: &super::traits::RouterLearningEvidence,
+        expected_version: i64,
+        next: &super::traits::RouterLearningSnapshot,
+        deadline: Instant,
+    ) -> Result<super::traits::RouterLearningCommit> {
+        let (read, conflict) = self
+            .router_learning_transaction(evidence, Some((expected_version, next.clone())), deadline)
+            .await?;
+        if conflict {
+            Ok(super::traits::RouterLearningCommit::Conflict)
+        } else {
+            Ok(super::traits::RouterLearningCommit::Committed(
+                read.snapshot.context("Router committed snapshot missing")?,
+            ))
+        }
+    }
+
+    async fn count_rehearsal_hits(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &MemoryWriteContext,
+        deadline: Instant,
+    ) -> Result<u32> {
+        self.count_decision_rehearsal(query, limit, context, deadline).await
+    }
+
+    async fn retrieve_decision_memory(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &MemoryWriteContext,
+        session_id: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Vec<super::traits::DecisionMemoryHit>> {
+        self.read_decision_memory(query, limit, context, session_id, deadline)
+            .await
+    }
+
+    async fn retrieve_decision_documents(
+        &self,
+        query: &str,
+        limit: u8,
+        principal: &MemoryPrincipal,
+        deadline: Instant,
+    ) -> Result<Vec<super::traits::DecisionDocumentHit>> {
+        self.read_decision_documents(query, limit, principal, deadline).await
+    }
+
+    async fn retrieve_decision_session(
+        &self,
+        principal: &MemoryPrincipal,
+        before_event_id: &str,
+        limit: u8,
+        deadline: Instant,
+    ) -> Result<Vec<super::traits::DecisionSessionHit>> {
+        self.read_decision_session(principal, before_event_id, limit, deadline)
+            .await
+    }
+
     async fn recall_with_context(
         &self,
         query: &str,
@@ -3506,6 +4058,15 @@ impl Memory for PostgresMemory {
         let Some(context) = context.cloned() else {
             return self.recall(query, limit, session_id).await;
         };
+        // C03 / V02-R5 (F1): an owner-isolated caller with no usable owner id
+        // reaches nothing owned. Decide that here, before the RLS context is
+        // applied, so the answer is the empty set the SQLite adapter returns
+        // rather than the "requires a trusted owner context" error
+        // `apply_rls_context_raw` would raise for a missing owner.
+        if Self::isolated_read_without_owner(&context) {
+            tracing::warn!("owner-isolated memory recall carries no owner id; returning no rows");
+            return Ok(Vec::new());
+        }
         let rls_workspace = context.workspace_id.clone().unwrap_or_default();
 
         // FIX-P0-22 (#3 F3): resolve a full ACL principal (identity_bindings +
@@ -3541,10 +4102,18 @@ impl Memory for PostgresMemory {
         // the effective `sender_id` (see store_with_context_and_metadata). System
         // principals (resolved via the ACL user_id) get the policy bypass.
         let rls_system = super::principal::is_system_principal(&principal.user_id);
-        let rls_owner = sender_id
-            .as_deref()
-            .filter(|owner| !owner.trim().is_empty())
-            .map(str::to_string);
+        // C03 / V02-R5: for an owner-isolated caller the RLS owner is the
+        // authenticated `owner_id` itself, so the row-level policy and the SQL
+        // predicate gate on the same string by construction rather than by the
+        // coincidence that these tools also copy the owner into `sender_id`.
+        let rls_owner_isolated = context.require_owner_match;
+        let rls_owner = if rls_owner_isolated {
+            context.owner_id.as_deref()
+        } else {
+            sender_id.as_deref()
+        }
+        .filter(|owner| !owner.trim().is_empty())
+        .map(str::to_string);
 
         // D11: render the ACL visibility scope from the shared, dialect-agnostic
         // predicate (single source with SQLite). The fixed parameters are
@@ -3578,7 +4147,13 @@ impl Memory for PostgresMemory {
             let limit_i64 = fetch_limit.max(1) as i64;
             let rows = client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    rls_system,
+                    Some(&rls_workspace),
+                    rls_owner.as_deref(),
+                    rls_owner_isolated,
+                )?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&query, &sid, &limit_i64];
                 for value in &scope_values {
                     params.push(value);
@@ -3607,6 +4182,13 @@ impl Memory for PostgresMemory {
         mode: MemoryReadMode,
     ) -> Result<Vec<MemoryEntry>> {
         let context = context.cloned().unwrap_or_default();
+        // C03 / V02-R5 defence in depth: an owner-isolated context is enforced
+        // whatever mode was requested (parity with the SQLite adapter).
+        let mode = if context.require_owner_match {
+            MemoryReadMode::Enforce
+        } else {
+            mode
+        };
         let scoped = self
             .recall_with_context(query, limit, session_id, Some(&context))
             .await?;
@@ -3667,6 +4249,12 @@ impl Memory for PostgresMemory {
 
     async fn get_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> Result<Option<MemoryEntry>> {
         let context = context.cloned().unwrap_or_default();
+        // C03 / V02-R5 (F1): see `recall_with_context` — the keyed read answers
+        // "no entry", not an error, when an isolated caller has no owner id.
+        if Self::isolated_read_without_owner(&context) {
+            tracing::warn!("owner-isolated memory keyed read carries no owner id; returning no entry");
+            return Ok(None);
+        }
         let rls_workspace = context.workspace_id.clone().unwrap_or_default();
         let principal = self.resolve_principal_from_context(&context).await;
         let sender_id = context.sender_id.clone().or_else(|| {
@@ -3681,10 +4269,16 @@ impl Memory for PostgresMemory {
             }
         });
         let rls_system = super::principal::is_system_principal(&principal.user_id);
-        let rls_owner = sender_id
-            .as_deref()
-            .filter(|owner| !owner.trim().is_empty())
-            .map(str::to_string);
+        // C03 / V02-R5: see `recall_with_context` — an isolated caller's RLS
+        // owner is its authenticated `owner_id`.
+        let rls_owner_isolated = context.require_owner_match;
+        let rls_owner = if rls_owner_isolated {
+            context.owner_id.as_deref()
+        } else {
+            sender_id.as_deref()
+        }
+        .filter(|owner| !owner.trim().is_empty())
+        .map(str::to_string);
         let (scope_sql, scope_params) = principal.build_sql_scope_pg(2);
         let scope_values = scope_params_to_strings(scope_params);
         let client = self.client.clone();
@@ -3702,7 +4296,13 @@ impl Memory for PostgresMemory {
             );
             let row = client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    rls_system,
+                    Some(&rls_workspace),
+                    rls_owner.as_deref(),
+                    rls_owner_isolated,
+                )?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
                 for value in &scope_values {
                     params.push(value);
@@ -3728,6 +4328,12 @@ impl Memory for PostgresMemory {
         mode: MemoryReadMode,
     ) -> Result<Option<MemoryEntry>> {
         let context = context.cloned().unwrap_or_default();
+        // C03 / V02-R5: isolation outranks the requested mode.
+        let mode = if context.require_owner_match {
+            MemoryReadMode::Enforce
+        } else {
+            mode
+        };
         let scoped = self.get_with_context(key, Some(&context)).await?;
         let unrestricted = self.get(key).await?;
         let would_deny = unrestricted.is_some() && scoped.is_none();
@@ -3791,6 +4397,28 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_owner_ids(
+        &self,
+        category: &MemoryCategory,
+    ) -> Result<Option<std::collections::HashMap<String, Option<String>>>> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let category = Self::category_to_str(category);
+
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<std::collections::HashMap<String, Option<String>>>> {
+                let stmt = format!("SELECT id, owner_id FROM {qualified_table} WHERE category = $1");
+                let rows = client.with_client(|client| Ok(client.query(&stmt, &[&category])?))?;
+                Ok(Some(
+                    rows.iter()
+                        .map(|row| (row.get::<_, String>(0), row.get::<_, Option<String>>(1)))
+                        .collect(),
+                ))
+            },
+        )
+        .await?
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -3808,19 +4436,38 @@ impl Memory for PostgresMemory {
         let Some(context) = context.cloned() else {
             return self.forget(key).await;
         };
+        // R-B1d D-1: an owner-isolated caller with no usable owner id deletes
+        // nothing. Decide that here, before the RLS context is applied — and
+        // before any statement runs — so the answer is the "nothing forgotten"
+        // the SQLite adapter gives rather than the "requires a trusted owner
+        // context" error `apply_rls_context_raw` would raise for a missing
+        // owner. Log line: operation only, no key and no content.
+        if Self::isolated_read_without_owner(&context) {
+            tracing::warn!("owner-isolated memory forget carries no owner id; removing nothing");
+            return Ok(false);
+        }
         let rls_workspace = context.workspace_id.clone().unwrap_or_default();
 
         // FIX-P0-22 (#3 F3): resolve the ACL principal and record an access-audit
         // entry for both allowed and denied deletes (parity with SQLite).
         let principal = self.resolve_principal_from_context(&context).await;
         let rls_system = super::principal::is_system_principal(&principal.user_id);
-        let rls_owner = context.sender_id.clone().or_else(|| {
-            context
-                .channel
-                .as_ref()
-                .zip(context.raw_sender.as_ref())
-                .map(|(channel, sender)| format!("anonymous:{channel}:{sender}"))
-        });
+        // C03 / V02-R5 / R-B1d D-1: for an owner-isolated caller the RLS owner
+        // is the authenticated `owner_id` itself, so the row-level policy and
+        // the SQL predicate gate on the same string by construction. The
+        // non-isolated expression is the historical one, unchanged.
+        let rls_owner_isolated = context.require_owner_match;
+        let rls_owner = if rls_owner_isolated {
+            Self::forget_owner_anchor(&context)
+        } else {
+            context.sender_id.clone().or_else(|| {
+                context
+                    .channel
+                    .as_ref()
+                    .zip(context.raw_sender.as_ref())
+                    .map(|(channel, sender)| format!("anonymous:{channel}:{sender}"))
+            })
+        };
 
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -3837,21 +4484,38 @@ impl Memory for PostgresMemory {
         // can delete its own secrets exactly as on SQLite.
         let (scope_sql, scope_params) = principal.build_sql_scope_pg(2);
         let scope_values = scope_params_to_strings(scope_params);
+        // R-B1d D-1: the delete guard, at the next free placeholder after the
+        // key and the scope values. See `Self::forget_owner_guard`.
+        let owner_guard = Self::forget_owner_guard(&context, scope_values.len() + 2);
+        let owner_value = owner_guard
+            .bound_owner
+            .then(|| Self::forget_owner_anchor(&context))
+            .flatten();
+        let owner_guard_sql = owner_guard.sql;
 
         tokio::task::spawn_blocking(move || -> Result<bool> {
             let stmt = format!(
                 "
                 DELETE FROM {qualified_table}
                 WHERE key = $1
-                  AND ({scope_sql})
+                  AND ({scope_sql}){owner_guard_sql}
                 "
             );
             let deleted = client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    rls_system,
+                    Some(&rls_workspace),
+                    rls_owner.as_deref(),
+                    rls_owner_isolated,
+                )?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
                 for value in &scope_values {
                     params.push(value);
+                }
+                if let Some(owner) = &owner_value {
+                    params.push(owner);
                 }
                 let deleted = tx.execute(&stmt, &params)?;
                 tx.commit()?;
@@ -3954,6 +4618,93 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn project_console_message(&self, event: &MessageEvent) -> Result<()> {
+        event.validate_console_projection()?;
+        let event = event.clone();
+        let client = self.client.clone();
+        let events_table = self.qualified_message_events_table.clone();
+        let sessions_table = self.qualified_sessions_table();
+        let turns_table = self.qualified_conversation_turns_table();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                // The event row lock serializes competing retries of this exact
+                // projection across backend instances, before checking history.
+                let row = tx.query_one(&format!(
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                     FROM {events_table} WHERE event_id = $1 AND workspace_id = $2 AND owner_id = $3 FOR UPDATE"),
+                    &[&event.event_id, &event.workspace_id, &event.owner_id])?;
+                let durable = Self::row_to_message_event(&row)?;
+                anyhow::ensure!(serde_json::to_value(&durable)? == serde_json::to_value(&event)?,
+                    "console projection differs from its durable event");
+                let existing = tx.query(&format!("SELECT session_key, owner_id, role, content FROM {turns_table}
+                    WHERE message_event_id = $1 OR message_id = $1 LIMIT 2"), &[&event.event_id])?;
+                if let Some(row) = existing.first() {
+                    anyhow::ensure!(existing.len() == 1
+                        && Some(row.get::<_, String>(0)) == event.session_key
+                        && row.get::<_, Option<String>>(1) == event.owner_id
+                        && row.get::<_, String>(2) == event.role && row.get::<_, String>(3) == event.content,
+                        "console message projection conflicts with its durable event");
+                    return Ok(());
+                }
+                let preview: String = event.content.chars().take(200).collect();
+                tx.execute(&format!("INSERT INTO {sessions_table} AS current_session
+                    (session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview)
+                    VALUES ($1, $2, $3, $4, $5, $5, 1, $6)
+                    ON CONFLICT(session_key) DO UPDATE SET
+                        message_count = COALESCE(current_session.message_count, 0) + 1,
+                        channel = CASE WHEN EXCLUDED.updated_at >= current_session.updated_at THEN EXCLUDED.channel ELSE current_session.channel END,
+                        sender = CASE WHEN EXCLUDED.updated_at >= current_session.updated_at THEN EXCLUDED.sender ELSE current_session.sender END,
+                        owner_id = CASE WHEN EXCLUDED.updated_at >= current_session.updated_at THEN EXCLUDED.owner_id ELSE current_session.owner_id END,
+                        last_message_preview = CASE WHEN EXCLUDED.updated_at >= current_session.updated_at THEN EXCLUDED.last_message_preview ELSE current_session.last_message_preview END,
+                        updated_at = GREATEST(current_session.updated_at, EXCLUDED.updated_at)"),
+                    &[&event.session_key, &event.channel, &event.sender, &event.owner_id, &event.created_at, &preview])?;
+                tx.execute(&format!("INSERT INTO {turns_table}
+                    (session_key, owner_id, role, content, timestamp, message_id, message_event_id, agent_id, persona_id, visibility)
+                    VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, 'session')"),
+                    &[&event.session_key, &event.owner_id, &event.role, &event.content, &event.created_at,
+                        &event.event_id, &event.agent_id, &event.persona_id])?;
+                tx.commit()?;
+                Ok(())
+            })
+        }).await?
+    }
+
+    async fn list_console_terminal_events(
+        &self,
+        workspace_id: &str,
+        session_key: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<MessageEvent>> {
+        anyhow::ensure!(
+            !workspace_id.is_empty() && !session_key.is_empty(),
+            "console recovery scope is empty"
+        );
+        let workspace_id = workspace_id.to_owned();
+        let session_key = session_key.to_owned();
+        let limit = i64::try_from(limit.clamp(1, 128))?;
+        let client = self.client.clone();
+        let table = self.qualified_message_events_table.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
+            client.with_client(|client| {
+                let rows = client.query(&format!("SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                    FROM {table} WHERE workspace_id = $1 AND session_key = $2
+                    AND source = 'console' AND event_type = 'turn.finalized' AND id > $3
+                    ORDER BY id ASC LIMIT $4"), &[&workspace_id, &session_key, &after_id, &limit])?;
+                rows.iter().map(Self::row_to_message_event).collect()
+            })
+        }).await?
+    }
+
     async fn list_conversation_turns(
         &self,
         principal: &MemoryPrincipal,
@@ -3961,81 +4712,20 @@ impl Memory for PostgresMemory {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversationTurn>> {
-        let client = self.client.clone();
-        let turns_table = self.qualified_conversation_turns_table();
-        let owner_id = principal
-            .owner_id
-            .as_deref()
-            .filter(|owner| !owner.trim().is_empty())
-            .map(str::to_string);
-        let workspace_id = principal.workspace_id.trim().to_string();
-        let session_key = session_key.to_string();
-        #[allow(clippy::cast_possible_wrap)]
-        let limit = limit.clamp(1, 500) as i64;
-        #[allow(clippy::cast_possible_wrap)]
-        let offset = offset.min(100_000) as i64;
-        let system_allowed = Self::is_system_principal(principal);
-        // D4 read-merge: the explicit `session_key` arg is the canonical key
-        // (bound at `$1`); the principal may carry a distinct legacy key bound
-        // at trailing placeholders starting at `$6`.
-        let legacy_session_keys: Vec<String> = principal
-            .legacy_session_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty() && *key != session_key.trim())
-            .map(|key| vec![key.to_string()])
-            .unwrap_or_default();
-        let mut session_indices = vec![1usize];
-        for offset_idx in 0..legacy_session_keys.len() {
-            session_indices.push(6 + offset_idx);
-        }
-        let session_fragment =
-            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<ConversationTurn>> {
-            let stmt = format!(
-                "SELECT id, session_key, role, content, timestamp, message_id
-                 FROM {turns_table}
-                 WHERE {session_fragment}
-                   AND (
-                       $4
-                       OR owner_id = $5
-                       OR owner_id IS NULL
-                       OR owner_id = 'legacy:' || session_key
-                   )
-                 ORDER BY id DESC
-                 LIMIT $2 OFFSET $3",
-                session_fragment = session_fragment.sql,
-            );
-            let rows = client.with_client(|client| {
-                let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, system_allowed, Some(&workspace_id), owner_id.as_deref())?;
-                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> =
-                    vec![&session_key, &limit, &offset, &system_allowed, &owner_id];
-                for key in &legacy_session_keys {
-                    bind.push(key);
-                }
-                let rows = tx.query(&stmt, &bind)?;
-                tx.commit()?;
-                Ok(rows)
-            })?;
-            let mut turns: Vec<ConversationTurn> = rows
-                .iter()
-                .map(|row| ConversationTurn {
-                    id: row.get(0),
-                    session_key: row.get(1),
-                    role: row.get(2),
-                    content: row.get(3),
-                    timestamp: row.get(4),
-                    message_id: row.get(5),
-                })
-                .collect();
-            turns.reverse();
-            Ok(turns)
-        })
-        .await?
+        self.list_conversation_turns_ordered(principal, session_key, limit, offset, false)
+            .await
     }
 
+    async fn list_console_conversation_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationTurn>> {
+        self.list_conversation_turns_ordered(principal, session_key, limit, offset, true)
+            .await
+    }
     async fn load_recent_conversation_histories(
         &self,
         principal: &MemoryPrincipal,
@@ -4106,127 +4796,110 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn append_message_event(&self, input: MessageEventInput) -> Result<MessageEvent> {
-        input.validate()?;
-        let client = self.client.clone();
-        let qualified_message_events_table = self.qualified_message_events_table.clone();
-        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<MessageEvent> {
-            let now = Utc::now();
-            let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            let content_hash = Self::content_hash(&input.content);
-            let visibility = input.visibility.as_str().to_string();
-            let source = input.source.as_str().to_string();
-            let source_ref_json = serde_json::to_string(&input.source)?;
-            let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
-            let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
-
-            let insert_stmt = format!(
-                "
-                INSERT INTO {qualified_message_events_table} (
-                    event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                    parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                    content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-                    $31
-                )
-                ON CONFLICT DO NOTHING
-                "
-            );
-            let select_stmt = format!(
-                "
-                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                FROM {qualified_message_events_table}
-                WHERE event_id = $1
-                   OR ($2::TEXT IS NOT NULL AND workspace_id = $3 AND idempotency_key = $2)
-                ORDER BY CASE WHEN event_id = $1 THEN 0 ELSE 1 END
-                LIMIT 1
-                "
-            );
-            let outbox_stmt = format!(
-                "
-                INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
-                    agent_id, persona_id, visibility, payload_json, created_at
-                )
-                VALUES ($1, $2, $3, $4, 'message_events', $5, $6, $7, $8, $9, NULL, $10)
-                ON CONFLICT (event_id) DO NOTHING
-                "
-            );
-
-            client.with_client(|client| {
-                let mut tx = client.transaction()?;
-                let inserted = tx.execute(
-                    &insert_stmt,
-                    &[
-                        &event_id,
-                        &input.idempotency_key,
-                        &input.workspace_id,
-                        &input.owner_id,
-                        &source,
-                        &input.channel,
-                        &input.session_key,
-                        &input.parent_session_key,
-                        &input.run_id,
-                        &input.parent_run_id,
-                        &input.agent_id,
-                        &input.persona_id,
-                        &input.sender,
-                        &input.recipient,
-                        &input.role,
-                        &input.event_type,
-                        &source_ref_json,
-                        &subject_ref_json,
-                        &input.goal_id,
-                        &input.causation_event_id,
-                        &input.correlation_id,
-                        &input.attempt_id,
-                        &input.lease_epoch,
-                        &config_generation_id,
-                        &input.config_source_revision,
-                        &input.content,
-                        &content_hash,
-                        &input.raw_payload_json,
-                        &visibility,
-                        &now,
-                        &now,
-                    ],
-                )?;
-                let row = tx.query_one(&select_stmt, &[&event_id, &input.idempotency_key, &input.workspace_id])?;
-                let event = Self::row_to_message_event(&row)?;
-                if inserted > 0 {
-                    tx.execute(
-                        &outbox_stmt,
-                        &[
-                            &Uuid::new_v4().to_string(),
-                            &event.workspace_id,
-                            &event.owner_id,
-                            &event.event_type,
-                            &event.event_id,
-                            &event.session_key,
-                            &event.agent_id,
-                            &event.persona_id,
-                            &event.visibility.as_str(),
-                            &Utc::now(),
-                        ],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(event)
-            })
+    async fn acquire_ingress_lifetime(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: Instant,
+    ) -> Result<Arc<dyn crate::memory::ingress_recovery::IngressLifetime>> {
+        let entry = self.ingress_owners.cell(workspace_id)?;
+        let _gate = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            entry.init_gate.clone().lock_owned(),
+        )
+        .await
+        .context("PostgreSQL ingress initialization deadline elapsed")?;
+        let lifetime = if let Some(lifetime) = entry.cell.get() {
+            lifetime.clone()
+        } else {
+            let lifetime = self
+                .new_ingress_lifetime(workspace_id, token, deadline, false)
+                .await?
+                .context("ingress lifetime lock unavailable")?;
+            entry
+                .cell
+                .set(lifetime.clone())
+                .map_err(|_| anyhow::anyhow!("ingress lifetime initialized concurrently"))?;
+            lifetime
+        };
+        lifetime.validate(deadline).await?;
+        Ok(lifetime)
+    }
+    async fn append_ingress_input(
+        &self,
+        input: MessageEventInput,
+        capsule: crate::memory::ingress_recovery::IngressCapsule,
+        lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        deadline: Instant,
+    ) -> Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
+        use crate::memory::ingress_recovery::{AtomicIngressMutation, IngressAppendOutcome};
+        let (event, inserted) = self
+            .ingress_append_atomic(
+                input,
+                AtomicIngressMutation::Input {
+                    capsule,
+                    lifetime,
+                    deadline,
+                },
+            )
+            .await?;
+        Ok(if inserted {
+            IngressAppendOutcome::Inserted(event)
+        } else {
+            IngressAppendOutcome::AlreadyAccepted(event)
         })
-        .await?
+    }
+    async fn list_ingress_recovery_candidates(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        current: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        phase: crate::memory::ingress_recovery::IngressRecoveryScan,
+        after_id: i64,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<crate::memory::ingress_recovery::IngressRecoveryCandidate>> {
+        self.ingress_candidates(scope, current, phase, after_id, limit, deadline)
+            .await
+    }
+    async fn read_ingress_event(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        lookup: &crate::memory::ingress_recovery::IngressEventLookup,
+        deadline: Instant,
+    ) -> Result<Option<MessageEvent>> {
+        self.ingress_read(scope, lookup, deadline).await
+    }
+    async fn claim_ingress_recovery(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: Instant,
+    ) -> Result<Option<crate::memory::ingress_recovery::IngressRecoveryClaim>> {
+        Ok(self
+            .new_ingress_lifetime(workspace_id, token, deadline, true)
+            .await?
+            .map(|lifetime| crate::memory::ingress_recovery::IngressRecoveryClaim { lifetime }))
+    }
+    async fn commit_ingress_recovery(
+        &self,
+        commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> Result<MessageEvent> {
+        self.ingress_append_atomic(
+            commit.evidence.clone(),
+            crate::memory::ingress_recovery::AtomicIngressMutation::Recovery(commit),
+        )
+        .await
+        .map(|(event, _)| event)
+    }
+
+    async fn append_message_event_until(&self, input: MessageEventInput, deadline: Instant) -> Result<MessageEvent> {
+        self.ingress_repair_append(input, deadline).await
+    }
+    async fn project_console_message_until(&self, event: &MessageEvent, deadline: Instant) -> Result<()> {
+        self.ingress_repair_console(event, deadline).await
+    }
+    async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        self.append_message_event_ordinary(input).await
     }
 
     async fn find_message_event_by_idempotency_key(
@@ -4259,6 +4932,92 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_worker_launch_events(
+        &self,
+        workspace_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        anyhow::ensure!(
+            !workspace_id.is_empty() && after_id >= 0 && (1..=128).contains(&limit),
+            "worker launch discovery requires workspace, nonnegative cursor and limit 1..=128"
+        );
+        let workspace_id = workspace_id.to_owned();
+        let limit = i64::try_from(limit)?;
+        let client = self.client.clone();
+        let table = self.qualified_message_events_table.clone();
+        tokio::task::spawn_blocking(move || {
+            client.with_client(|client| {
+                let query = format!(
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                     FROM {table}
+                     WHERE workspace_id = $1 AND event_type IN ('worker.recovery.registered', 'worker.ordinary.recovery.registered', 'worker.operator.recovery.registered') AND id > $2
+                     ORDER BY id ASC LIMIT $3"
+                );
+                client.query(&query, &[&workspace_id, &after_id, &limit])?
+                    .iter().map(Self::row_to_message_event).collect()
+            })
+        })
+        .await?
+    }
+
+    async fn find_owned_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        anyhow::ensure!(
+            !workspace_id.is_empty() && !owner_id.is_empty() && !idempotency_key.is_empty(),
+            "owned event lookup requires workspace, owner and key"
+        );
+        // The workspace/key index yields at most one row; filter owner before
+        // returning any event content to the caller.
+        Ok(self
+            .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+            .await?
+            .filter(|event| event.owner_id.as_deref() == Some(owner_id)))
+    }
+
+    async fn find_owned_message_event(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_id: &str,
+    ) -> Result<Option<MessageEvent>> {
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let workspace_id = workspace_id.to_string();
+        if workspace_id.is_empty() || owner_id.is_empty() || event_id.is_empty() {
+            return Ok(None);
+        }
+        let owner_id = owner_id.to_string();
+        let event_id = event_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            client.with_client(|client| {
+                let stmt = format!(
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                     FROM {qualified_message_events_table}
+                     WHERE workspace_id = $1 AND owner_id = $2 AND event_id = $3
+                     LIMIT 1"
+                );
+                client
+                    .query_opt(&stmt, &[&workspace_id, &owner_id, &event_id])?
+                    .map(|row| Self::row_to_message_event(&row))
+                    .transpose()
+            })
+        })
+        .await?
+    }
+
     async fn list_message_events_since(
         &self,
         principal: &MemoryPrincipal,
@@ -4283,6 +5042,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4299,7 +5067,7 @@ impl Memory for PostgresMemory {
                       OR (
                           workspace_id = $2
                           AND (
-                              visibility = 'workspace'
+                              visibility = 'workspace'{owner_fragment}
                               OR (visibility = 'agent' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
@@ -4309,7 +5077,7 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                                   OR ($6::TEXT IS NOT NULL AND sender = $6)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $7::BOOLEAN)
                           )
                       )
@@ -4319,6 +5087,7 @@ impl Memory for PostgresMemory {
                 ",
                 session_fragment = session_fragment.sql,
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4334,7 +5103,7 @@ impl Memory for PostgresMemory {
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4365,6 +5134,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(8, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4380,7 +5158,7 @@ impl Memory for PostgresMemory {
                       OR (
                           workspace_id = $1
                           AND (
-                              visibility = 'workspace'
+                              visibility = 'workspace'{owner_fragment}
                               OR (visibility = 'agent' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
@@ -4390,7 +5168,7 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                                   OR ($5::TEXT IS NOT NULL AND sender = $5)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
@@ -4400,6 +5178,7 @@ impl Memory for PostgresMemory {
                 ",
                 session_fragment = session_fragment.sql,
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4414,7 +5193,7 @@ impl Memory for PostgresMemory {
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4465,6 +5244,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(12, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4487,7 +5275,7 @@ impl Memory for PostgresMemory {
                           )
                           AND (
                               ($6::BOOLEAN AND $7::TEXT IS NOT NULL)
-                              OR visibility = 'workspace'
+                              OR visibility = 'workspace'{owner_fragment}
                               OR (visibility = 'agent' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
@@ -4497,7 +5285,7 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                                   OR ($5::TEXT IS NOT NULL AND sender = $5)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
@@ -4507,6 +5295,7 @@ impl Memory for PostgresMemory {
                 ",
                 session_fragment = session_fragment.sql,
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4525,7 +5314,7 @@ impl Memory for PostgresMemory {
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4561,6 +5350,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4577,7 +5375,7 @@ impl Memory for PostgresMemory {
                       OR (
                           workspace_id = $2
                           AND (
-                              visibility = 'workspace'
+                              visibility = 'workspace'{owner_required_fragment}
                               OR (visibility = 'agent' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
@@ -4587,7 +5385,7 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                                   OR ($6::TEXT IS NOT NULL AND sender = $6)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $7::BOOLEAN)
                           )
                       )
@@ -4597,6 +5395,7 @@ impl Memory for PostgresMemory {
                 ",
                 session_fragment = session_fragment.sql,
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4612,7 +5411,7 @@ impl Memory for PostgresMemory {
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4666,6 +5465,18 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+        // OV-C: `workspace` is owner-qualified for an owner-isolated reader;
+        // every other reader's statement is byte-identical.
+        let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4680,7 +5491,7 @@ impl Memory for PostgresMemory {
                   AND workspace_id = $2
                   AND {session_fragment}
                   AND (
-                      visibility IN ('global', 'workspace')
+                      {shared_tiers_arm}
                       OR (visibility = 'agent' AND (
                           ($4::TEXT IS NOT NULL AND agent_id = $4)
                           OR ($5::TEXT IS NOT NULL AND persona_id = $5)
@@ -4690,7 +5501,7 @@ impl Memory for PostgresMemory {
                           ($4::TEXT IS NOT NULL AND agent_id = $4)
                           OR ($5::TEXT IS NOT NULL AND persona_id = $5)
                           OR ($6::TEXT IS NOT NULL AND sender = $6)
-                      ){owner_fragment})
+                      ){owner_required_fragment})
                       OR (visibility = 'system' AND $7::BOOLEAN)
                   )
                 ORDER BY id DESC
@@ -4698,6 +5509,7 @@ impl Memory for PostgresMemory {
                 ",
                 session_fragment = session_fragment.sql,
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4713,7 +5525,7 @@ impl Memory for PostgresMemory {
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4806,6 +5618,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            8,
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEvent>> {
             let stmt = format!(
@@ -4819,7 +5640,7 @@ impl Memory for PostgresMemory {
                       OR (
                           workspace_id = $2
                           AND (
-                              visibility = 'workspace'
+                              visibility = 'workspace'{owner_fragment}
                               OR (visibility = 'agent' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
@@ -4828,7 +5649,7 @@ impl Memory for PostgresMemory {
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
@@ -4837,6 +5658,7 @@ impl Memory for PostgresMemory {
                 LIMIT $7
                 ",
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4848,7 +5670,7 @@ impl Memory for PostgresMemory {
                     &system_allowed,
                     &limit_i64,
                 ];
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -4874,6 +5696,15 @@ impl Memory for PostgresMemory {
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            7,
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEvent>> {
             let stmt = format!(
@@ -4886,7 +5717,7 @@ impl Memory for PostgresMemory {
                       OR (
                           workspace_id = $1
                           AND (
-                              visibility = 'workspace'
+                              visibility = 'workspace'{owner_fragment}
                               OR (visibility = 'agent' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
@@ -4895,7 +5726,7 @@ impl Memory for PostgresMemory {
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
-                              ){owner_fragment})
+                              ){owner_required_fragment})
                               OR (visibility = 'system' AND $5::BOOLEAN)
                           )
                       )
@@ -4904,6 +5735,7 @@ impl Memory for PostgresMemory {
                 LIMIT $6
                 ",
                 owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4914,7 +5746,7 @@ impl Memory for PostgresMemory {
                     &system_allowed,
                     &limit_i64,
                 ];
-                if owner_fragment.bound_owner {
+                if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
@@ -5433,12 +6265,15 @@ impl Memory for PostgresMemory {
             let insert_event_stmt = format!(
                 // C03: the ingested document's own owner is recorded in the
                 // column, so a `session`/`private` ingest event is attributed.
+                // V02-R6: the turn's scoping keys are bound too, so the event is
+                // reachable through the `session`/`agent`/`private` arms of the
+                // read predicate instead of carrying unmatchable NULLs.
                 "
                 INSERT INTO {qualified_memory_events_table} (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                     session_key, agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, 'document.ingested', 'documents', $4, NULL, NULL, NULL, $5, $6, $7)
+                VALUES ($1, $2, $3, 'document.ingested', 'documents', $4, $5, $6, $7, $8, $9, $10)
                 "
             );
             let select_document_stmt = format!(
@@ -5454,7 +6289,9 @@ impl Memory for PostgresMemory {
             );
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, false, Some(&workspace_context), Some(&owner_context))?;
+                // Every ingest statement is exact on the document's own owner, so the
+                // narrowest read scope costs nothing and admits no other owner.
+                Self::apply_rls_context_raw(&mut tx, false, Some(&workspace_context), Some(&owner_context), true)?;
                 tx.execute(
                     &insert_document_stmt,
                     &[
@@ -5479,7 +6316,7 @@ impl Memory for PostgresMemory {
                 tx.execute(&delete_chunks_stmt, &[&document_id, &workspace_context, &owner_context])?;
                 let update_chunk_vector_stmt = if pgvector_available {
                     Some(format!(
-                        "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector \
+                        "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::text::vector \
                          WHERE chunk_id = $2 AND workspace_id = $3 AND owner_id = $4"
                     ))
                 } else {
@@ -5539,6 +6376,9 @@ impl Memory for PostgresMemory {
                         &input.workspace_id,
                         &input.owner_id,
                         &document_id,
+                        &input.session_key,
+                        &input.agent_id,
+                        &input.persona_id,
                         &visibility,
                         &payload_json,
                         &Utc::now(),
@@ -5567,11 +6407,38 @@ impl Memory for PostgresMemory {
         let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
         let principal = principal.clone();
         let query = query.trim().to_string();
-        let owner_id = principal
-            .owner_id
-            .clone()
-            .or_else(|| Self::document_owner_for_principal(&principal));
+        let owner_id = if principal.require_owner_match {
+            // V02-R8: a blank `owner_id` is not an owner. Taking it verbatim
+            // would bind whitespace as the caller's identity, here and in the
+            // RLS context below; `document_owner_for_principal` applies the
+            // shared blank rule and yields `None`, which the statements read as
+            // "admit nothing".
+            Self::document_owner_for_principal(&principal)
+        } else {
+            principal
+                .owner_id
+                .clone()
+                .or_else(|| Self::document_owner_for_principal(&principal))
+        };
+        // V02-R8: empty for every non-isolated principal, so all three
+        // statements below stay byte-identical for them.
+        let visibility_guard = Self::document_visibility_guard(&principal);
+        // The decision `isolated_read_without_owner` takes for the keyed reads,
+        // applied to the same blank rule here: an owner-isolated caller with no
+        // usable owner id answers empty rather than erroring.
+        // `apply_rls_context_raw` below rejects a non-system read that carries
+        // no owner, so without this the chunk search would return an error
+        // where the SQLite adapter returns no rows. A non-isolated principal is
+        // never short-circuited.
+        if principal.require_owner_match && owner_id.is_none() {
+            tracing::warn!(
+                operation = "search_document_chunks",
+                "owner-isolated document search carries no owner id; returning no rows"
+            );
+            return Ok(Vec::new());
+        }
         let rls_system = Self::is_system_principal(&principal);
+        let rls_owner_isolated = principal.require_owner_match;
         let rls_workspace = principal.workspace_id.trim().to_string();
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         if query.is_empty() {
@@ -5603,7 +6470,7 @@ impl Memory for PostgresMemory {
                 JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                 WHERE c.workspace_id = $2
                   AND (
-                      d.visibility IN ('global', 'workspace')
+                      d.visibility IN ('global', 'workspace'){visibility_guard}
                       OR ($3::TEXT IS NOT NULL AND c.owner_id = $3)
                   )
                   AND (
@@ -5617,7 +6484,13 @@ impl Memory for PostgresMemory {
             );
             let rows = client.with_client(|client| {
                 let mut tx = client.transaction()?;
-                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), owner_id.as_deref())?;
+                Self::apply_rls_context_raw(
+                    &mut tx,
+                    rls_system,
+                    Some(&rls_workspace),
+                    owner_id.as_deref(),
+                    rls_owner_isolated,
+                )?;
                 let rows = tx.query(&stmt, &[&query, &principal.workspace_id, &owner_id, &limit_i64])?;
                 tx.commit()?;
                 Ok(rows)
@@ -5646,7 +6519,7 @@ impl Memory for PostgresMemory {
                             SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                                    c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                                    c.token_estimate, c.created_at,
-                                   (1.0 - (c.embedding_vector <=> $1::vector))::REAL AS score,
+                                   (1.0 - (c.embedding_vector <=> $1::text::vector))::REAL AS score,
                                    d.source_kind AS source_kind
                             FROM {qualified_document_chunks_table} c
                             JOIN {qualified_documents_table} d ON d.document_id = c.document_id
@@ -5656,10 +6529,10 @@ impl Memory for PostgresMemory {
                               AND c.embedding_dimensions = $4
                               AND c.workspace_id = $5
                               AND (
-                                  d.visibility IN ('global', 'workspace')
+                                  d.visibility IN ('global', 'workspace'){visibility_guard}
                                   OR ($6::TEXT IS NOT NULL AND c.owner_id = $6)
                               )
-                            ORDER BY c.embedding_vector <=> $1::vector
+                            ORDER BY c.embedding_vector <=> $1::text::vector
                             LIMIT $7
                             "
                         );
@@ -5671,6 +6544,7 @@ impl Memory for PostgresMemory {
                                 rls_system,
                                 Some(&rls_workspace),
                                 owner_id.as_deref(),
+                                rls_owner_isolated,
                             )?;
                             let rows = tx.query(
                                 &vector_stmt,
@@ -5729,7 +6603,7 @@ impl Memory for PostgresMemory {
                           AND c.embedding_dimensions = $3
                           AND c.workspace_id = $4
                           AND (
-                              d.visibility IN ('global', 'workspace')
+                              d.visibility IN ('global', 'workspace'){visibility_guard}
                               OR ($5::TEXT IS NOT NULL AND c.owner_id = $5)
                           )
                         ORDER BY c.id
@@ -5738,7 +6612,13 @@ impl Memory for PostgresMemory {
                     );
                     let rows = client.with_client(|client| {
                         let mut tx = client.transaction()?;
-                        Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), owner_id.as_deref())?;
+                        Self::apply_rls_context_raw(
+                            &mut tx,
+                            rls_system,
+                            Some(&rls_workspace),
+                            owner_id.as_deref(),
+                            rls_owner_isolated,
+                        )?;
                         let rows = tx.query(
                             &vector_stmt,
                             &[
@@ -6094,8 +6974,9 @@ impl Memory for PostgresMemory {
                             &[&embedding_bytes, &provider_name, &model_name, &dimensions, &id],
                         )?;
                         if pgvector_available {
-                            let vector_stmt =
-                                format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE id = $2");
+                            let vector_stmt = format!(
+                                "UPDATE {qualified_table} SET embedding_vector = $1::text::vector WHERE id = $2"
+                            );
                             if let Some(embedding_vector) = embedding_vector.as_ref() {
                                 client.execute(&vector_stmt, &[embedding_vector, &id])?;
                             }
@@ -6168,7 +7049,7 @@ impl Memory for PostgresMemory {
                         )?;
                         if pgvector_available {
                             let vector_stmt = format!(
-                                "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector WHERE chunk_id = $2"
+                                "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::text::vector WHERE chunk_id = $2"
                             );
                             if let Some(embedding_vector) = embedding_vector.as_ref() {
                                 client.execute(&vector_stmt, &[embedding_vector, &chunk_id])?;
@@ -6192,6 +7073,23 @@ impl Memory for PostgresMemory {
             .unwrap_or(Ok(false))
             .unwrap_or(false)
     }
+}
+
+/// URL of the live PostgreSQL that the crate's `#[ignore]`d PostgreSQL tests
+/// need (memory, cron, webhook, schema migration and fitness CLI).
+///
+/// Those tests used to `return` early when `OPENPRX_TEST_POSTGRES_URL` was
+/// unset and so reported a skip as a pass. They are now ignored by default
+/// (counted as ignored, never as passed) and run only on request, e.g.
+/// `OPENPRX_TEST_POSTGRES_URL=postgres://... cargo test --all-features --lib
+/// -- --ignored postgres`. Asking for them without the URL is a failure, not a
+/// silent pass. This is the only place in the crate that reads the variable.
+#[cfg(test)]
+pub(crate) fn live_postgres_url() -> String {
+    std::env::var("OPENPRX_TEST_POSTGRES_URL").expect(
+        "test: OPENPRX_TEST_POSTGRES_URL must point at a disposable PostgreSQL \
+         database when the live PostgreSQL tests are run with --ignored",
+    )
 }
 
 #[cfg(test)]
@@ -6342,10 +7240,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_time_range_query_includes_only_configured_worker_descendants_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_fitness_events_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
         for (workspace, content) in [
@@ -6395,10 +7292,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_fitness_prefix_migration_sql_is_exact_and_transactional_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_fitness_migration_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
         let table = mem.qualified_table.clone();
@@ -6496,10 +7392,9 @@ mod tests {
     /// queue instead of fail, and a connection killed server-side is replaced
     /// transparently on the next use.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_connection_pool_saturates_and_recovers_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_pool_{}", Uuid::new_v4().simple());
         const POOL_SIZE: usize = 4;
         const CONCURRENCY: usize = 24;
@@ -6609,10 +7504,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_memory_fabric_conformance_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_test_{}", Uuid::new_v4().simple());
         let table = "memories";
         let mem = PostgresMemory::new(&db_url, &schema, table, Some(5)).unwrap();
@@ -6950,6 +7844,9 @@ mod tests {
                 mime_type: Some("text/plain".to_string()),
                 visibility: MemoryVisibility::Workspace,
                 metadata_json: Some("{\"tool\":\"file_read\"}".to_string()),
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -7071,10 +7968,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_embedding_vector_reindex_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_vector_test_{}", Uuid::new_v4().simple());
         let table = "memories";
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7137,6 +8033,9 @@ mod tests {
             mime_type: Some("text/plain".to_string()),
             visibility: MemoryVisibility::Workspace,
             metadata_json: None,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
         })
         .await
         .unwrap();
@@ -7154,6 +8053,9 @@ mod tests {
             mime_type: Some("text/plain".to_string()),
             visibility: MemoryVisibility::Workspace,
             metadata_json: None,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
         })
         .await
         .unwrap();
@@ -7315,10 +8217,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_vector_rls_denies_missing_and_cross_owner_context_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_vector_rls_test_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::with_embedder(
             &db_url,
@@ -7340,6 +8241,8 @@ mod tests {
             chat_id: Some(format!("chat-{owner}")),
             sender_id: Some(owner.to_string()),
             raw_sender: Some(owner.to_string()),
+            owner_id: None,
+            require_owner_match: false,
         };
         let metadata = |workspace: &str, owner: &str| MemoryStoreMetadata {
             workspace_id: Some(workspace.to_string()),
@@ -7469,10 +8372,9 @@ mod tests {
     ///    bypass intact for the next system checkout -- the contexts cannot
     ///    contaminate each other.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_pool_session_contexts_are_isolated_from_env() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_ctx_{}", Uuid::new_v4().simple());
 
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
@@ -7635,8 +8537,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // C03 / V02-R4: Postgres parity for owner-qualified identity isolation.
     //
-    // Requires a reachable instance: set `OPENPRX_TEST_POSTGRES_URL`. Without
-    // it these return early, exactly like every other Postgres test here.
+    // Requires a reachable instance: set `OPENPRX_TEST_POSTGRES_URL` and run
+    // with `--ignored`, exactly like every other Postgres test here.
     // ---------------------------------------------------------------------
 
     const C03_WORKSPACE: &str = "ws-c03";
@@ -7699,10 +8601,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_c03_owner_isolation_matrix_for_session_and_private_rows() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_c03_isolation_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
         let owner_a = c03_owner("issuer-a");
@@ -7767,8 +8668,8 @@ mod tests {
             "issuer B must still read its own row: {seen_by_b:?}"
         );
         assert!(
-            seen_by_b.iter().any(|content| content == "a-workspace"),
-            "workspace visibility stays shared by contract: {seen_by_b:?}"
+            !seen_by_b.iter().any(|content| content == "a-workspace"),
+            "OWNER-VIS OV-C: an isolated caller no longer reads another owner's workspace row: {seen_by_b:?}"
         );
         assert!(
             !seen_by_b.iter().any(|content| content == "other-workspace"),
@@ -7782,10 +8683,9 @@ mod tests {
             .into_iter()
             .map(|event| event.content)
             .collect::<Vec<_>>();
-        assert_eq!(
-            no_owner,
-            vec!["a-workspace".to_string()],
-            "an isolated principal with no owner id admits only the shared contract: {no_owner:?}"
+        assert!(
+            no_owner.is_empty(),
+            "OWNER-VIS OV-C: an isolated principal with no owner id admits nothing: {no_owner:?}"
         );
 
         let unisolated = mem
@@ -7797,22 +8697,764 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             unisolated.iter().any(|content| content == "a-session")
-                && unisolated.iter().any(|content| content == "a-private"),
-            "a non-isolated principal keeps the pre-C03 semantics: {unisolated:?}"
+                && !unisolated.iter().any(|content| content == "a-private"),
+            "a non-isolated principal keeps the session semantics, and since OWNER-VIS OV-E \
+             reads another owner's private row no longer: {unisolated:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // V02-R8: Postgres parity for owner isolation over `document_chunks`.
+    //
+    // All three chunk search statements — the keyword/ILIKE hybrid, the
+    // pgvector arm and the BYTEA fallback arm — carried the same
+    // `visibility IN ('global','workspace') OR owner matches` disjunct, whose
+    // first half short-circuited the second. The guard below is the twin of the
+    // SQLite one, so `document_search` agrees with `document_get_chunk` on both
+    // backends.
+    //
+    // The pure test runs anywhere. The behavioural matrix is gated like every
+    // other Postgres test in this module: `#[ignore]`d, run only with
+    // `OPENPRX_TEST_POSTGRES_URL` and `--ignored`, so it is **written but not
+    // run** on the authoring host, which has no PostgreSQL.
+    // ---------------------------------------------------------------------
+
+    /// The guard is the SQLite one, in the PostgreSQL dialect: suppressed for
+    /// an owner-isolated principal only, binding nothing either way.
+    ///
+    /// MUTATION GUARD: render the guard unconditionally and the first row goes
+    /// red; render it never and the isolated rows do.
+    #[test]
+    fn postgres_document_visibility_guard_suppresses_the_arm_only_for_an_isolated_principal() {
+        assert_eq!(
+            PostgresMemory::document_visibility_guard(&c03_principal(Some("owner-second"), false)),
+            "",
+            "a non-isolated principal must leave all three statements byte-identical"
+        );
+        for owner in [None, Some("owner-second"), Some("   ")] {
+            let guard = PostgresMemory::document_visibility_guard(&c03_principal(owner, true));
+            assert_eq!(
+                guard, " AND FALSE",
+                "an owner-isolated principal is never admitted by visibility alone (owner: {owner:?})"
+            );
+            assert!(
+                !guard.contains('$'),
+                "the guard binds no parameter, so no placeholder index moves: {guard}"
+            );
+        }
+    }
+
+    /// NOT RUN on this host: no PostgreSQL. Written so the behaviour is pinned
+    /// the moment an instance is attached.
+    ///
+    /// Mirrors `document_chunk_keyword_search_is_owner_qualified_for_an_isolated_principal`
+    /// in the SQLite adapter, over the same four fixture cases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_document_chunk_search_is_owner_qualified_for_an_isolated_principal() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r8_documents_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_first = c03_owner("issuer-a");
+        let owner_second = c03_owner("issuer-b");
+
+        for (document_id, owner_id, content, visibility) in [
+            (
+                "document-first-owner",
+                Some(owner_first.as_str()),
+                "kestrel migration notes recorded for the first owner",
+                MemoryVisibility::Workspace,
+            ),
+            (
+                "document-second-owner",
+                Some(owner_second.as_str()),
+                "kestrel migration notes recorded for the second owner",
+                MemoryVisibility::Workspace,
+            ),
+            (
+                "document-unowned",
+                None,
+                "kestrel migration notes recorded with no owner at all",
+                MemoryVisibility::Workspace,
+            ),
+            (
+                "document-global",
+                Some(owner_first.as_str()),
+                "kestrel migration notes published at global visibility",
+                MemoryVisibility::Global,
+            ),
+        ] {
+            mem.ingest_document(DocumentIngestInput {
+                document_id: Some(document_id.to_string()),
+                workspace_id: C03_WORKSPACE.to_string(),
+                owner_id: owner_id.map(str::to_string),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "conversation_page".to_string(),
+                source_uri: None,
+                title: None,
+                content: content.to_string(),
+                mime_type: Some("text/plain".to_string()),
+                visibility,
+                metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let shared = mem
+            .search_document_chunks(&c03_principal(Some(&owner_second), false), "kestrel", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.len(),
+            4,
+            "a non-isolated principal keeps the workspace-shared view: {shared:?}"
+        );
+
+        let isolated = mem
+            .search_document_chunks(&c03_principal(Some(&owner_second), true), "kestrel", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|result| result.chunk.document_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            isolated,
+            vec!["document-second-owner".to_string()],
+            "an isolated principal reads its own chunk and no other: {isolated:?}"
+        );
+
+        for blank in [None, Some("   ")] {
+            let nothing = mem
+                .search_document_chunks(&c03_principal(blank, true), "kestrel", 10)
+                .await
+                .unwrap();
+            assert!(
+                nothing.is_empty(),
+                "an isolated principal with no usable owner id answers empty rather than erroring \
+                 (owner: {blank:?}): {nothing:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // V02-R5: Postgres parity for owner isolation over the `memories` table.
+    //
+    // Same gating as every other Postgres test in this module: `#[ignore]`d,
+    // run only with `OPENPRX_TEST_POSTGRES_URL` and `--ignored`, so a host
+    // without PostgreSQL counts them as ignored, never as passed. They were
+    // written but **not run** on the authoring host (no PostgreSQL). They need
+    // a reachable instance the test role may create and drop a schema in; the
+    // RLS pin below additionally needs a role that RLS actually applies to (not
+    // a superuser and not `BYPASSRLS`), as `postgres_vector_rls_*` already
+    // requires.
+    // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // V02-R5 follow-up F1: SQLite/PostgreSQL parity on the no-owner path.
+    //
+    // Under isolation the RLS owner follows `context.owner_id` alone. With a
+    // blank or absent owner id that is `None`, and `apply_rls_context_raw`
+    // rejects a non-system read that carries no owner — so the read would
+    // **error** where SQLite answers with an empty result. Both ends of that
+    // divergence need a decision that is provable without a database, because
+    // this repository has no PostgreSQL to run the matrices above against.
+    //
+    // The two tests below are that proof: one pins the decision itself as a
+    // pure function, the other pins that the decision is taken *before* the
+    // RLS context is applied, which is the only placement that turns the error
+    // into the empty answer SQLite already gives.
+    // ---------------------------------------------------------------------
+
+    /// The production text of this file, with its test module removed.
+    fn r5_production_source() -> &'static str {
+        include_str!("postgres.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test: postgres.rs ends with its test module")
+            .0
+    }
+
+    /// Drop every line comment, so a comment that merely *names* a call is not
+    /// mistaken for the call itself.
+    fn r5_without_comments(text: &str) -> String {
+        text.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One method's production text: from its declaration to the next method
+    /// declaration at the same indentation.
+    ///
+    /// Deliberately textual rather than brace-matched: these bodies build SQL
+    /// with `format!`, so their literals carry braces of their own.
+    fn r5_method_text(production: &'static str, declaration: &str) -> &'static str {
+        let start = production
+            .find(declaration)
+            .unwrap_or_else(|| panic!("test: production declaration not found: {declaration}"));
+        let body_start = start + declaration.len();
+        let rest = &production[body_start..];
+        let end = ["\n    async fn ", "\n    fn ", "\n    pub fn ", "\n    pub async fn "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+        &production[start..body_start + end]
+    }
+
+    /// The decision, at the level that runs on a host without PostgreSQL: an
+    /// owner-isolated read whose context carries no usable owner id answers
+    /// empty. SQLite reaches the same answer through the ` AND FALSE` arm of
+    /// the shared predicate; this pins that PostgreSQL agrees rather than
+    /// erroring, and that a blank owner counts as no owner on both.
+    #[test]
+    fn postgres_isolated_read_without_an_owner_id_decides_empty() {
+        for blank in [None, Some(""), Some("   "), Some("\t\n")] {
+            let context = r5_context(blank, true);
+            assert!(
+                PostgresMemory::isolated_read_without_owner(&context),
+                "an isolated context with owner {blank:?} must decide the empty answer"
+            );
+            let base = Principal {
+                user_id: "anonymous:mcp:shared-subject".to_string(),
+                role: Role::Anonymous,
+                projects: Vec::new(),
+                visibility_ceiling: Visibility::Private,
+                blocked_patterns: Vec::new(),
+                current_channel: "mcp".to_string(),
+                current_chat_id: C03_SESSION_KEY.to_string(),
+                current_chat_type: ChatType::Dm,
+                raw_sender: "shared-subject".to_string(),
+                acl_enforced: true,
+                owner_id: None,
+                require_owner_match: false,
+            };
+            let (isolated_sql, isolated_params) = base.clone().with_owner_scope(&context).build_sql_scope_pg(1);
+            let (_, unisolated_params) = base.build_sql_scope_pg(1);
+            assert!(
+                isolated_sql.contains("AND FALSE"),
+                "the shared predicate must fail closed for the same context: {isolated_sql}"
+            );
+            assert_eq!(
+                isolated_params, unisolated_params,
+                "a fail-closed arm binds no owner parameter of its own"
+            );
+        }
+
+        let owned = r5_context(Some("owner:ws:agent:issuer-a.example:shared-subject"), true);
+        assert!(
+            !PostgresMemory::isolated_read_without_owner(&owned),
+            "an isolated context that carries an owner id reads normally"
+        );
+        let mut unisolated = r5_context(None, false);
+        unisolated.sender_id = Some("anonymous:mcp:shared-subject".to_string());
+        assert!(
+            !PostgresMemory::isolated_read_without_owner(&unisolated),
+            "a non-isolated context is never short-circuited, whatever its owner id"
+        );
+    }
+
+    /// MUTATION GUARD: remove either short-circuit and this goes red. The
+    /// placement is the whole point — after `apply_rls_context_raw` the read
+    /// has already failed with "requires a trusted owner context" instead of
+    /// answering empty.
+    #[test]
+    fn postgres_isolated_reads_short_circuit_before_applying_the_rls_owner() {
+        let production = r5_production_source();
+        for declaration in [
+            "    async fn recall_with_context(",
+            "    async fn get_with_context(&self, key: &str, context: Option<&MemoryWriteContext>)",
+        ] {
+            let method = r5_without_comments(r5_method_text(production, declaration));
+            let short_circuit = method.find("isolated_read_without_owner").unwrap_or_else(|| {
+                panic!("{declaration} must short-circuit an isolated read that carries no owner id")
+            });
+            let rls = method
+                .find("apply_rls_context_raw")
+                .unwrap_or_else(|| panic!("{declaration} must still apply the RLS context"));
+            assert!(
+                short_circuit < rls,
+                "{declaration} must decide the empty answer before applying the RLS owner, \
+                 otherwise a blank owner errors instead of reading nothing"
+            );
+        }
+    }
+
+    /// The `memories`-table write context an MCP caller produces: the channel,
+    /// chat id and raw sender are the external subject only, so two issuers
+    /// differ in `owner_id` and nothing else.
+    fn r5_context(owner_id: Option<&str>, isolated: bool) -> MemoryWriteContext {
+        MemoryWriteContext {
+            workspace_id: Some(C03_WORKSPACE.to_string()),
+            channel: Some("mcp".to_string()),
+            chat_type: Some("gateway".to_string()),
+            chat_id: Some(C03_SESSION_KEY.to_string()),
+            sender_id: owner_id.map(str::to_string),
+            raw_sender: Some("shared-subject".to_string()),
+            owner_id: owner_id.map(str::to_string),
+            require_owner_match: isolated,
+        }
+    }
+
+    fn r5_metadata(owner_id: &str) -> MemoryStoreMetadata {
+        MemoryStoreMetadata {
+            workspace_id: Some(C03_WORKSPACE.to_string()),
+            owner_id: Some(owner_id.to_string()),
+            channel: Some("mcp".to_string()),
+            ..MemoryStoreMetadata::default()
+        }
+    }
+
+    async fn r5_seed(mem: &PostgresMemory, owner_id: &str, key: &str, content: &str) {
+        mem.store_with_context_and_metadata(
+            key,
+            content,
+            MemoryCategory::Conversation,
+            None,
+            Some(&r5_context(Some(owner_id), false)),
+            r5_metadata(owner_id),
+        )
+        .await
+        .expect("test: store an owner-attributed memory row");
+    }
+
+    /// Force one seeded row to `public` visibility. `classify_memory` never
+    /// produces `public`, so a deliberately shared row can only be made here.
+    async fn r5_make_public(mem: &PostgresMemory, key: &str) {
+        let client_slot = mem.client.clone();
+        let qualified_table = mem.qualified_table.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            client_slot.with_client(|client| {
+                client.execute(
+                    &format!(
+                        "UPDATE {qualified_table} SET visibility = 'public', sensitivity = 'normal' WHERE key = $1"
+                    ),
+                    &[&key],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("test: publish task")
+        .expect("test: mark the row public");
+    }
+
+    async fn r5_drop_schema(db_url: String, schema: String) {
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url
+                .parse::<postgres::Config>()
+                .expect("test: parse the postgres url")
+                .connect(NoTls)
+                .expect("test: connect to postgres");
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .expect("test: drop the test schema");
+        })
+        .await
+        .expect("test: schema drop task");
+    }
+
+    /// R-INT2A F1, the offline half: the write path a plugin's `memory.store`
+    /// takes (`store_with_metadata`, carrying only the plugin's channel)
+    /// stays system-scoped here. It computes the embedding as the system and
+    /// never applies a caller's RLS context, which would demand a workspace
+    /// and owner a plugin does not have.
+    ///
+    /// MUTATION GUARD: route `store_with_metadata` through
+    /// `store_with_context_and_metadata` or `apply_rls_context_raw` and this
+    /// goes red.
+    #[test]
+    fn postgres_metadata_writes_stay_system_scoped_for_plugin_rows() {
+        let production = r5_production_source();
+        let declaration = "    async fn store_with_metadata(";
+        let method = r5_without_comments(r5_method_text(production, declaration));
+        assert!(
+            method.contains("embedding_metadata_for_category(&category, content, None, None, true)"),
+            "{declaration} must compute its embedding with system scope"
+        );
+        for caller_scoped in [
+            "apply_rls_context_raw",
+            "store_with_context_and_metadata",
+            "resolve_principal",
+        ] {
+            assert!(
+                !method.contains(caller_scoped),
+                "{declaration} must not take the caller-scoped path ({caller_scoped})"
+            );
+        }
+    }
+
+    /// R-INT2A F1, the live half: a plugin's `memory.store` succeeds on
+    /// PostgreSQL and the row is readable. **NOT RUN on this host: no
+    /// PostgreSQL.**
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_plugin_memory_store_succeeds() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_int2af_plugin_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let key =
+            crate::plugins::capabilities::common::store_plugin_memory(&mem, "sample-plugin", "plugin text", "core")
+                .await
+                .expect("test: a plugin write succeeds on PostgreSQL");
+        let stored = mem.get(&key).await.expect("test: read back");
+        assert_eq!(stored.map(|entry| entry.content).as_deref(), Some("plugin text"));
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// The direct analogue of the C03 session/private matrix, over `memories`.
+    ///
+    /// Under a NOSUPERUSER/NOBYPASSRLS role RLS applies to every read here, so
+    /// issuer B sees issuer A's `public` row only through the read-only
+    /// `memories_public_read` policy (D-028); before it, RLS hid that row and
+    /// the `r5-a-public` assertion failed on such a role. Under a superuser the
+    /// RLS half is bypassed and only the SQL predicate is exercised.
+    /// **NOT RUN on this host: no PostgreSQL.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_memory_recall_matrix_for_the_same_subject() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r5_recall_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        r5_seed(&mem, &owner_a, "r5-a", "shared keyword first issuer note").await;
+        r5_seed(&mem, &owner_b, "r5-b", "shared keyword second issuer note").await;
+        r5_seed(&mem, &owner_a, "r5-a-public", "shared keyword announcement").await;
+        mem.store(
+            "r5-legacy",
+            "shared keyword unattributed note",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .expect("test: store a legacy row with no owner");
+        r5_make_public(&mem, "r5-a-public").await;
+
+        let keys = |entries: Vec<MemoryEntry>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<std::collections::HashSet<_>>()
+        };
+
+        let seen_by_b = keys(
+            mem.recall_with_context("shared keyword", 50, None, Some(&r5_context(Some(&owner_b), true)))
+                .await
+                .expect("test: isolated recall as issuer B"),
+        );
+        assert!(!seen_by_b.contains("r5-a"), "{seen_by_b:?}");
+        assert!(!seen_by_b.contains("r5-legacy"), "{seen_by_b:?}");
+        assert!(seen_by_b.contains("r5-b"), "{seen_by_b:?}");
+        assert!(seen_by_b.contains("r5-a-public"), "{seen_by_b:?}");
+
+        let seen_by_a = keys(
+            mem.recall_with_context("shared keyword", 50, None, Some(&r5_context(Some(&owner_a), true)))
+                .await
+                .expect("test: isolated recall as issuer A"),
+        );
+        assert!(seen_by_a.contains("r5-a"), "{seen_by_a:?}");
+        assert!(!seen_by_a.contains("r5-b"), "{seen_by_a:?}");
+
+        // Observe must not reopen the boundary (the backend mode override).
+        let observed = keys(
+            mem.recall_with_context_mode(
+                "shared keyword",
+                50,
+                None,
+                Some(&r5_context(Some(&owner_b), true)),
+                MemoryReadMode::Observe,
+            )
+            .await
+            .expect("test: observe-mode recall under isolation"),
+        );
+        assert!(!observed.contains("r5-a"), "{observed:?}");
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// The same matrix for the exact-key read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_memory_get_matrix_for_the_same_subject() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r5_get_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        r5_seed(&mem, &owner_a, "r5-a", "shared keyword first issuer note").await;
+
+        assert!(
+            mem.get_with_context("r5-a", Some(&r5_context(Some(&owner_b), true)))
+                .await
+                .expect("test: isolated keyed read as issuer B")
+                .is_none(),
+            "an exact key must not cross the owner boundary"
+        );
+        assert!(
+            mem.get_with_context("r5-a", Some(&r5_context(Some(&owner_a), true)))
+                .await
+                .expect("test: isolated keyed read as issuer A")
+                .is_some(),
+            "the owning caller must still read its own row"
+        );
+        assert!(
+            mem.get_with_context_mode("r5-a", Some(&r5_context(Some(&owner_b), true)), MemoryReadMode::Observe)
+                .await
+                .expect("test: observe-mode keyed read under isolation")
+                .is_none(),
+            "Observe must not reopen the owner boundary"
+        );
+        // F1 parity: this is an empty answer, not an error. The isolated
+        // no-owner case is decided before the RLS context is applied, so
+        // PostgreSQL returns `Ok(None)` exactly as SQLite returns no rows.
+        assert!(
+            mem.get_with_context("r5-a", Some(&r5_context(None, true)))
+                .await
+                .expect("test: isolated keyed read with no owner id")
+                .is_none(),
+            "an isolated caller with no owner id must read nothing owned"
+        );
+        assert!(
+            mem.recall_with_context("shared keyword", 50, None, Some(&r5_context(None, true)))
+                .await
+                .expect("test: isolated recall with no owner id")
+                .is_empty(),
+            "the recall half of the same no-owner case must also answer empty"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// The RLS owner an isolated read sets must be the same string the SQL
+    /// predicate gates on. Guards the `recall_with_context` /
+    /// `get_with_context` `rls_owner` change: if the two drifted apart, a read
+    /// whose `sender_id` differs from its `owner_id` would silently fall back
+    /// to the RLS policy alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_rls_owner_matches_the_predicate_owner() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r5_rls_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+
+        r5_seed(&mem, &owner_a, "r5-a", "shared keyword first issuer note").await;
+
+        // `sender_id` deliberately disagrees with `owner_id`: the RLS owner and
+        // the predicate owner must both follow `owner_id` under isolation.
+        let mut divergent = r5_context(Some(&owner_a), true);
+        divergent.sender_id = Some("some-other-anchor".to_string());
+        assert!(
+            mem.get_with_context("r5-a", Some(&divergent))
+                .await
+                .expect("test: isolated keyed read with a divergent sender anchor")
+                .is_some(),
+            "the RLS owner must follow owner_id, not sender_id, under isolation"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// R-B1d D-1, the delete half. The twin of
+    /// `sqlite_owner_isolated_forget_excludes_another_owners_row_by_key` and
+    /// its public-row case, over the one `DELETE` statement this adapter runs.
+    ///
+    /// **NOT RUN on a host without PostgreSQL:** it is `#[ignore]`d there, so
+    /// the runner counts it as ignored rather than printing a vacuous `ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_forget_is_owner_qualified() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_d1_forget_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        r5_seed(&mem, &owner_a, "d1-a", "shared keyword first issuer note").await;
+        assert!(
+            mem.get_with_context("d1-a", Some(&r5_context(Some(&owner_a), true)))
+                .await
+                .expect("test: read back the fixture")
+                .is_some(),
+            "sanity: the fixture row must exist, or every assertion below passes vacuously"
+        );
+
+        assert!(
+            !mem.forget_with_context("d1-a", Some(&r5_context(Some(&owner_b), true)))
+                .await
+                .expect("test: isolated forget as issuer B"),
+            "an isolated caller must not delete another owner's row by key"
+        );
+        // A blank owner is decided before any statement or RLS call runs, so
+        // this is `Ok(false)` and not the "requires a trusted owner context"
+        // error `apply_rls_context_raw` would raise.
+        for blank in [None, Some("")] {
+            assert!(
+                !mem.forget_with_context("d1-a", Some(&r5_context(blank, true)))
+                    .await
+                    .expect("test: isolated forget with no owner id"),
+                "an isolated caller with owner {blank:?} must delete nothing"
+            );
+        }
+        // The public arm the shared visibility predicate leaves open for reads.
+        r5_make_public(&mem, "d1-a").await;
+        assert!(
+            !mem.forget_with_context("d1-a", Some(&r5_context(Some(&owner_b), true)))
+                .await
+                .expect("test: isolated forget of a public row as issuer B"),
+            "a public row is shared for reading, but it is still another owner's row to delete"
+        );
+
+        // Positive control: the owner still deletes its own row.
+        assert!(
+            mem.forget_with_context("d1-a", Some(&r5_context(Some(&owner_a), true)))
+                .await
+                .expect("test: isolated forget as issuer A"),
+            "the owning caller must still delete its own row"
+        );
+        assert!(
+            mem.get_with_context("d1-a", Some(&r5_context(Some(&owner_a), true)))
+                .await
+                .expect("test: read back after the delete")
+                .is_none(),
+            "the row must really be gone"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// The placement, at the level that runs on a host without PostgreSQL: the
+    /// isolated no-owner delete is decided before the RLS context is applied,
+    /// exactly as the two keyed reads decide it.
+    ///
+    /// MUTATION GUARD: move the short-circuit below `apply_rls_context_raw`,
+    /// or let it fall through instead of returning `Ok(false)`, and this goes
+    /// red.
+    #[test]
+    fn postgres_isolated_forget_short_circuits_before_applying_the_rls_owner() {
+        let production = r5_production_source();
+        let declaration = "    async fn forget_with_context(";
+        let method = r5_without_comments(r5_method_text(production, declaration));
+        let short_circuit = method
+            .find("isolated_read_without_owner")
+            .unwrap_or_else(|| panic!("{declaration} must short-circuit an isolated delete with no owner id"));
+        let rls = method
+            .find("apply_rls_context_raw")
+            .unwrap_or_else(|| panic!("{declaration} must still apply the RLS context"));
+        assert!(
+            short_circuit < rls,
+            "{declaration} must decide the empty answer before applying the RLS owner, \
+             otherwise a blank owner errors instead of deleting nothing"
+        );
+        // R-B1g F-6: the call being first is not enough; the branch must
+        // answer. Falling through would still apply the RLS owner.
+        assert!(
+            method
+                .get(short_circuit..rls)
+                .is_some_and(|between| between.contains("return Ok(false)")),
+            "{declaration} must return `Ok(false)` from the short-circuit, not fall through to the delete"
+        );
+    }
+
+    /// The guard itself, runnable without a database: its decision, its
+    /// placeholder, and that a non-isolated delete renders no fragment at all
+    /// so its statement and bind list stay byte-identical.
+    #[test]
+    fn postgres_forget_owner_guard_binds_only_for_an_isolated_caller_with_an_owner() {
+        let owner_a = c03_owner("issuer-a");
+
+        let mut unisolated = r5_context(Some(&owner_a), false);
+        unisolated.sender_id = Some(owner_a.clone());
+        let guard = PostgresMemory::forget_owner_guard(&unisolated, 9);
+        assert_eq!(guard.sql, "", "a non-isolated delete must render no fragment at all");
+        assert!(!guard.bound_owner);
+        assert_eq!(PostgresMemory::forget_owner_anchor(&unisolated), None);
+
+        let isolated = r5_context(Some(&owner_a), true);
+        let guard = PostgresMemory::forget_owner_guard(&isolated, 9);
+        assert_eq!(guard.sql, " AND owner_id = $9");
+        assert!(guard.bound_owner, "one marker, one parameter");
+        assert_eq!(
+            PostgresMemory::forget_owner_anchor(&isolated).as_deref(),
+            Some(owner_a.as_str())
+        );
+
+        // The blank case never reaches the guard — the short-circuit above
+        // answers first — but the seam must still fail closed if it ever did.
+        for blank in [None, Some(""), Some("   ")] {
+            let context = r5_context(blank, true);
+            assert!(PostgresMemory::isolated_read_without_owner(&context));
+            let guard = PostgresMemory::forget_owner_guard(&context, 9);
+            assert_eq!(guard.sql, " AND FALSE", "owner {blank:?} must fail closed");
+            assert!(!guard.bound_owner, "a fail-closed guard binds nothing");
+        }
+    }
+
+    /// Pin what the unscoped compatibility reads do with **no** RLS context.
+    ///
+    /// `recall()` and `get()` never call `apply_rls_context_raw`, so their
+    /// result depends on whether RLS applies to the connected role: an
+    /// unprivileged role sees nothing, a superuser / `BYPASSRLS` role sees
+    /// everything. This records that split as a stated contract instead of an
+    /// accident, and asserts the one thing that must hold either way: the
+    /// *scoped* read is unaffected by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_unscoped_recall_behaviour_under_rls_is_pinned() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r5_unscoped_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        r5_seed(&mem, &owner_a, "r5-a", "shared keyword first issuer note").await;
+
+        let unscoped = mem
+            .recall("shared keyword", 50, None)
+            .await
+            .expect("test: unscoped recall");
+        let bypasses_rls = unscoped.iter().any(|entry| entry.key == "r5-a");
+
+        let scoped = mem
+            .recall_with_context("shared keyword", 50, None, Some(&r5_context(Some(&owner_b), true)))
+            .await
+            .expect("test: isolated recall as issuer B");
+        assert!(
+            !scoped.iter().any(|entry| entry.key == "r5-a"),
+            "the scoped read must isolate regardless of whether the connected role \
+             bypasses RLS (observed bypass: {bypasses_rls})"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
     }
 
     /// C03 (P2-4), Postgres twin: the draft-lifecycle and document-ingest
     /// inserts must record the owner in the `memory_events.owner_id` column.
     /// The draft rows are written at `session` visibility, the arm the owner
     /// predicate guards, so they exercise attribution and isolation; the
-    /// `document.ingested` row has no `session_key`, so it is workspace-visible
-    /// and its attribution is asserted on the column the read path returns.
+    /// `document.ingested` row is written workspace-visible here so this test
+    /// stays about attribution; the `session`-visibility ingest arm has its own
+    /// tests below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_c03_lifecycle_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
         let owner_a = c03_owner("issuer-a");
@@ -7863,6 +9505,9 @@ mod tests {
                 mime_type: Some("text/plain".to_string()),
                 visibility: MemoryVisibility::Workspace,
                 metadata_json: None,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
             })
             .await
             .unwrap();
@@ -7913,10 +9558,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
     async fn postgres_c03_memory_events_are_owner_qualified() {
-        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let db_url = live_postgres_url();
         let schema = format!("prx_c03_events_{}", Uuid::new_v4().simple());
         let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
         let owner_a = c03_owner("issuer-a");
@@ -7969,5 +9613,1077 @@ mod tests {
                 .any(|event| event.owner_id.as_deref() == Some(owner_a.as_str())),
             "the owner column must round-trip through Postgres"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // V02-R6, Postgres twins. `PostgresMemory::ingest_document` requires a
+    // non-empty `owner_id` for vector isolation, so every fixture here sets
+    // one; the SQLite `owner_id: None` cases have no Postgres counterpart.
+    // ---------------------------------------------------------------------
+
+    fn postgres_c03_ingest_input(
+        document_id: &str,
+        owner_id: &str,
+        session_key: Option<&str>,
+        visibility: MemoryVisibility,
+    ) -> DocumentIngestInput {
+        DocumentIngestInput {
+            document_id: Some(document_id.to_string()),
+            workspace_id: C03_WORKSPACE.to_string(),
+            owner_id: Some(owner_id.to_string()),
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: None,
+            content: format!("document body for {document_id}"),
+            mime_type: Some("text/plain".to_string()),
+            visibility,
+            metadata_json: None,
+            session_key: session_key.map(str::to_string),
+            agent_id: None,
+            persona_id: None,
+        }
+    }
+
+    async fn postgres_c03_ingest_subjects(mem: &PostgresMemory, principal: &MemoryPrincipal) -> Vec<String> {
+        mem.list_memory_events_recent(principal, 200)
+            .await
+            .expect("test: recent memory events")
+            .into_iter()
+            .filter(|event| event.event_type == "document.ingested")
+            .map(|event| event.subject_id)
+            .collect()
+    }
+
+    /// The V02-R6 regression on Postgres: the bound `session_key` is what makes
+    /// the `session` arm match at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_c03_session_visibility_ingest_event_is_readable_by_its_own_session() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_c03_ingest_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+
+        mem.ingest_document(postgres_c03_ingest_input(
+            "doc-s",
+            &owner_a,
+            Some(C03_SESSION_KEY),
+            MemoryVisibility::Session,
+        ))
+        .await
+        .expect("test: ingest session-visibility document");
+
+        let events = mem
+            .list_memory_events_recent(&c03_principal(Some(&owner_a), false), 200)
+            .await
+            .expect("test: recent memory events");
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "document.ingested" && event.subject_id == "doc-s")
+            .expect("test: the session ingest event must be readable by its own session");
+        assert_eq!(event.session_key.as_deref(), Some(C03_SESSION_KEY));
+        assert_eq!(event.owner_id.as_deref(), Some(owner_a.as_str()));
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_c03_session_visibility_ingest_event_is_readable_under_owner_isolation() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_c03_ingest_isolated_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+
+        mem.ingest_document(postgres_c03_ingest_input(
+            "doc-s",
+            &owner_a,
+            Some(C03_SESSION_KEY),
+            MemoryVisibility::Session,
+        ))
+        .await
+        .expect("test: ingest session-visibility document");
+
+        let seen = postgres_c03_ingest_subjects(&mem, &c03_principal(Some(&owner_a), true)).await;
+        assert_eq!(
+            seen,
+            vec!["doc-s".to_string()],
+            "an isolated owner must read its own session ingest event: {seen:?}"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_c03_session_visibility_ingest_event_is_hidden_from_another_owner() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_c03_ingest_owners_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (owner, document_id) in [(&owner_a, "doc-a"), (&owner_b, "doc-b")] {
+            mem.ingest_document(postgres_c03_ingest_input(
+                document_id,
+                owner,
+                Some(C03_SESSION_KEY),
+                MemoryVisibility::Session,
+            ))
+            .await
+            .expect("test: ingest session-visibility document");
+        }
+
+        let seen = postgres_c03_ingest_subjects(&mem, &c03_principal(Some(&owner_b), true)).await;
+        assert_eq!(
+            seen,
+            vec!["doc-b".to_string()],
+            "an isolated owner must not read another owner's ingest event: {seen:?}"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_c03_ingest_event_is_hidden_from_another_session() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_c03_ingest_sessions_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+
+        mem.ingest_document(postgres_c03_ingest_input(
+            "doc-other-session",
+            &owner_a,
+            Some("mcp:other-subject"),
+            MemoryVisibility::Session,
+        ))
+        .await
+        .expect("test: ingest session-visibility document");
+
+        for isolated in [false, true] {
+            let seen = postgres_c03_ingest_subjects(&mem, &c03_principal(Some(&owner_a), isolated)).await;
+            assert!(
+                seen.is_empty(),
+                "a foreign session key must not admit the ingest event (isolated={isolated}): {seen:?}"
+            );
+
+            // Positive control, as in the SQLite twin: without it the emptiness
+            // above also holds when the three scoping keys revert to NULL.
+            let owning_session = MemoryPrincipal {
+                session_key: Some("mcp:other-subject".to_string()),
+                ..c03_principal(Some(&owner_a), isolated)
+            };
+            let served = postgres_c03_ingest_subjects(&mem, &owning_session).await;
+            assert_eq!(
+                served,
+                vec!["doc-other-session".to_string()],
+                "the ingesting session must read its own ingest event (isolated={isolated}): {served:?}"
+            );
+        }
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // V02-R9: the owner-isolated `memory_store` upsert.
+    //
+    // The pure test runs anywhere. The behavioural twin is gated like every
+    // other Postgres test in this module: `#[ignore]`d, run only with
+    // `OPENPRX_TEST_POSTGRES_URL` and `--ignored`, so it is **written but not
+    // run** on the authoring host, which has no PostgreSQL.
+    // ---------------------------------------------------------------------
+
+    /// The scoped upsert carries the shared conflict guard, refuses a write
+    /// the guard suppressed, and maps an RLS rejection of the existing row to
+    /// the same refusal; the context-free store path is untouched.
+    ///
+    /// MUTATION GUARD: drop `{owner_guard}`, the zero-rows check or the
+    /// `42501` mapping and this goes red.
+    #[test]
+    fn postgres_scoped_store_upsert_carries_the_owner_conflict_guard_and_maps_both_refusals() {
+        let production = r5_production_source();
+        let scoped = r5_method_text(production, "async fn store_with_context_and_metadata(");
+        for needle in [
+            "isolated_store_owner(Some(&context))?",
+            "policy_version = EXCLUDED.policy_version{owner_guard}",
+            "store_conflict_guard(PG_DIALECT, &qualified_table, isolated_owner.is_some())",
+            "SqlState::INSUFFICIENT_PRIVILEGE",
+            "if isolated_owner.is_some() && written == 0 {",
+        ] {
+            assert!(
+                scoped.contains(needle),
+                "store_with_context_and_metadata lost `{needle}`"
+            );
+        }
+        let plain = r5_method_text(production, "async fn store_with_metadata(");
+        assert!(
+            !plain.contains("owner_guard"),
+            "a write without a context is never owner-isolated and keeps its historical statement"
+        );
+    }
+
+    /// SP-MCP test 10. **NOT RUN on this host: no PostgreSQL.**
+    ///
+    /// An owner-isolated caller that names another owner's key is refused and
+    /// changes nothing, for a `workspace`-visible existing row (admitted by the
+    /// RLS `USING` clause, so only the conflict guard stops it) and for a
+    /// non-shared one (where RLS may reject first; either way the caller sees
+    /// the one refusal). Its own key still updates. Needs a role RLS applies to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_store_refuses_a_cross_owner_upsert() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_r9_store_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let qualified = format!("{}.{}", quote_identifier(&schema), quote_identifier("memories"));
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (key, visibility) in [("r9-shared-key", "workspace"), ("r9-private-key", "private")] {
+            mem.store_with_context(
+                key,
+                "first owner note",
+                MemoryCategory::Core,
+                None,
+                Some(&r5_context(Some(&owner_a), true)),
+            )
+            .await
+            .expect("test: the first owner stores its key");
+            let update = format!("UPDATE {qualified} SET visibility = $1 WHERE key = $2");
+            mem.client
+                .with_client(|client| {
+                    client.execute(&update, &[&visibility, &key])?;
+                    Ok(())
+                })
+                .expect("test: set the seeded row's visibility");
+
+            let refused = mem
+                .store_with_context(
+                    key,
+                    "second owner overwrite",
+                    MemoryCategory::Core,
+                    None,
+                    Some(&r5_context(Some(&owner_b), true)),
+                )
+                .await
+                .expect_err("test: a cross-owner write must fail");
+            assert_eq!(
+                refused.to_string(),
+                format!("key '{key}' is not available to this caller"),
+                "{visibility}: one refusal, whichever layer stopped the write"
+            );
+
+            let select = format!("SELECT content, owner_id FROM {qualified} WHERE key = $1");
+            let (content, owner): (String, Option<String>) = mem
+                .client
+                .with_client(|client| {
+                    let row = client.query_one(&select, &[&key])?;
+                    Ok((row.get(0), row.get(1)))
+                })
+                .expect("test: read the seeded row back");
+            assert_eq!(content, "first owner note", "{visibility}: content untouched");
+            assert_eq!(
+                owner.as_deref(),
+                Some(owner_a.as_str()),
+                "{visibility}: owner untouched"
+            );
+        }
+
+        mem.store_with_context(
+            "r9-shared-key",
+            "first owner update",
+            MemoryCategory::Core,
+            None,
+            Some(&r5_context(Some(&owner_a), true)),
+        )
+        .await
+        .expect("test: the owner still updates its own key");
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // OWNER-VIS: event reads. The text guards run anywhere; the behavioural
+    // twins are gated like every other Postgres test in this module and are
+    // **written but not run** on the authoring host, which has no PostgreSQL.
+    // ---------------------------------------------------------------------
+
+    /// The seven event readers, as production text.
+    fn ov_event_readers() -> &'static str {
+        let production = r5_production_source();
+        let start = production
+            .find("    async fn list_message_events_since(")
+            .expect("test: the first event reader");
+        let end = production
+            .find("    async fn create_memory_draft(")
+            .expect("test: the end of the event readers");
+        &production[start..end]
+    }
+
+    /// OV-C: every `workspace` arm of every event reader carries the
+    /// owner-isolation fragment (empty for a non-isolated reader, so its
+    /// statement is byte-identical), and the session-context read renders its
+    /// shared tiers through the shared seam.
+    ///
+    /// MUTATION GUARD: drop `{owner_fragment}` from any `workspace` arm and
+    /// this goes red.
+    #[test]
+    fn postgres_event_readers_owner_qualify_the_workspace_arm() {
+        let readers = ov_event_readers();
+        assert!(
+            !readers.contains("visibility = 'workspace'\n"),
+            "no event reader may keep an unqualified workspace arm"
+        );
+        assert_eq!(
+            readers.matches("visibility = 'workspace'{").count(),
+            6,
+            "six readers carry an owner fragment on their workspace arm"
+        );
+        assert!(readers.contains("session_context_shared_tiers(&owner_fragment)"));
+        assert!(!readers.contains("visibility IN ('global', 'workspace')"));
+    }
+
+    fn ov_memory_event(
+        owner_id: Option<&str>,
+        visibility: MemoryVisibility,
+        agent_id: Option<&str>,
+        marker: &str,
+    ) -> MemoryEventInput {
+        MemoryEventInput {
+            owner_id: owner_id.map(str::to_string),
+            event_id: None,
+            workspace_id: C03_WORKSPACE.to_string(),
+            event_type: "task.spawned".to_string(),
+            subject_table: "tasks".to_string(),
+            subject_id: marker.to_string(),
+            session_key: Some(C03_SESSION_KEY.to_string()),
+            run_id: Some(marker.to_string()),
+            parent_run_id: None,
+            agent_id: agent_id.map(str::to_string),
+            persona_id: None,
+            visibility,
+            payload_json: Some(serde_json::json!({ "task": marker }).to_string()),
+        }
+    }
+
+    async fn ov_reads(mem: &PostgresMemory, principal: &MemoryPrincipal) -> Vec<(&'static str, Vec<String>)> {
+        let contents = |events: Vec<MessageEvent>| events.into_iter().map(|event| event.content).collect::<Vec<_>>();
+        let query = || SharedContextQuery {
+            principal: principal.clone(),
+            since_event_id: None,
+            limit: 50,
+            include_roles: Vec::new(),
+        };
+        vec![
+            (
+                "message recent",
+                contents(
+                    mem.list_message_events_recent(principal, 50)
+                        .await
+                        .expect("test: recent"),
+                ),
+            ),
+            (
+                "shared context",
+                contents(mem.load_recent_shared_context(query()).await.expect("test: shared")),
+            ),
+            (
+                "session context",
+                contents(
+                    mem.load_recent_session_context(SessionContextQuery {
+                        principal: principal.clone(),
+                        since_event_id: None,
+                        limit: 50,
+                        include_roles: Vec::new(),
+                    })
+                    .await
+                    .expect("test: session"),
+                ),
+            ),
+            (
+                "memory recent",
+                mem.list_memory_events_recent(principal, 50)
+                    .await
+                    .expect("test: memory recent")
+                    .into_iter()
+                    .map(|event| event.subject_id)
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// OV-C behavioural twin. **NOT RUN on this host: no PostgreSQL.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_owner_isolated_event_reads_exclude_another_owners_workspace_rows() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_ov_c_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+        for (owner, marker) in [
+            (Some(owner_a.as_str()), "a-workspace"),
+            (Some(owner_b.as_str()), "b-workspace"),
+            (None, "null-workspace"),
+        ] {
+            mem.append_message_event(c03_message_input(
+                C03_WORKSPACE,
+                owner,
+                C03_SESSION_KEY,
+                MemoryVisibility::Workspace,
+                marker,
+            ))
+            .await
+            .expect("test: message event");
+            mem.append_memory_event(ov_memory_event(owner, MemoryVisibility::Workspace, None, marker))
+                .await
+                .expect("test: memory event");
+        }
+        for (reader, seen) in ov_reads(&mem, &c03_principal(Some(&owner_b), true)).await {
+            assert!(seen.iter().any(|row| row == "b-workspace"), "{reader}: {seen:?}");
+            assert!(
+                !seen.iter().any(|row| row == "a-workspace" || row == "null-workspace"),
+                "{reader}: {seen:?}"
+            );
+        }
+        // The shared-context feed is confined for every reader (OV-D).
+        for (reader, seen) in ov_reads(&mem, &c03_principal(Some(&owner_b), false))
+            .await
+            .into_iter()
+            .filter(|(reader, _)| *reader != "shared context")
+        {
+            assert!(
+                seen.iter().any(|row| row == "a-workspace"),
+                "{reader}: control: {seen:?}"
+            );
+        }
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// OV-E: the `private` arm of every event reader requires the owner for
+    /// every reader, and the owner is bound whenever that fragment binds.
+    ///
+    /// MUTATION GUARD: put `{owner_fragment}` back on a private arm, or bind on
+    /// `owner_fragment.bound_owner`, and this goes red.
+    #[test]
+    fn postgres_event_readers_require_the_owner_on_the_private_arm() {
+        let readers = ov_event_readers();
+        assert_eq!(readers.matches("){owner_required_fragment})").count(), 7);
+        assert!(!readers.contains("){owner_fragment})"));
+        assert_eq!(readers.matches("if owner_required_fragment.bound_owner {").count(), 7);
+        assert!(!readers.contains("if owner_fragment.bound_owner {"));
+        assert_eq!(
+            readers.matches("owner_match_suffix(\n            PG_DIALECT,").count(),
+            14,
+            "each reader renders one isolation fragment and one owner-required fragment"
+        );
+    }
+
+    /// OV-E behavioural twin. **NOT RUN on this host: no PostgreSQL.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_private_event_is_not_readable_by_a_same_named_agent_under_another_owner() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_ov_e_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+        mem.append_memory_event(ov_memory_event(
+            Some(&owner_a),
+            MemoryVisibility::Private,
+            Some("researcher"),
+            "a-private-event",
+        ))
+        .await
+        .expect("test: memory event");
+        let reader = |owner: Option<&str>| MemoryPrincipal {
+            agent_id: Some("researcher".to_string()),
+            ..c03_principal(owner, false)
+        };
+        let seen = |events: Vec<MemoryEvent>| events.into_iter().map(|event| event.subject_id).collect::<Vec<_>>();
+        assert!(
+            seen(
+                mem.list_memory_events_recent(&reader(Some(&owner_b)), 50)
+                    .await
+                    .expect("test: b")
+            )
+            .is_empty()
+        );
+        assert!(
+            seen(
+                mem.list_memory_events_recent(&reader(None), 50)
+                    .await
+                    .expect("test: none")
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            seen(
+                mem.list_memory_events_recent(&reader(Some(&owner_a)), 50)
+                    .await
+                    .expect("test: a")
+            ),
+            ["a-private-event"]
+        );
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// OV-D: the shared-context feed's `workspace` arm requires the owner for
+    /// every reader; the other five `workspace` arms keep the isolation-only
+    /// fragment.
+    ///
+    /// MUTATION GUARD: put `{owner_fragment}` back on the shared-context
+    /// `workspace` arm and this goes red.
+    #[test]
+    fn postgres_shared_context_feed_requires_the_owner_on_the_workspace_arm() {
+        let shared = r5_method_text(r5_production_source(), "async fn load_recent_shared_context(");
+        assert!(shared.contains("visibility = 'workspace'{owner_required_fragment}"));
+        assert!(!shared.contains("visibility = 'workspace'{owner_fragment}"));
+        assert_eq!(
+            ov_event_readers()
+                .matches("visibility = 'workspace'{owner_fragment}")
+                .count(),
+            5
+        );
+    }
+
+    /// OV-D behavioural twin. **NOT RUN on this host: no PostgreSQL.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_shared_context_excludes_another_owners_workspace_events() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_ov_d_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+        for (owner, session, marker) in [
+            (Some(owner_a.as_str()), "session-a", "owner a spawn task text"),
+            (Some(owner_b.as_str()), "session-b-earlier", "owner b earlier event"),
+            (None, "session-unowned", "unowned workspace event"),
+        ] {
+            mem.append_message_event(c03_message_input(
+                C03_WORKSPACE,
+                owner,
+                session,
+                MemoryVisibility::Workspace,
+                marker,
+            ))
+            .await
+            .expect("test: message event");
+        }
+        let principal = MemoryPrincipal {
+            session_key: Some("session-b-now".to_string()),
+            ..c03_principal(Some(&owner_b), false)
+        };
+        let seen = mem
+            .load_recent_shared_context(SharedContextQuery {
+                principal,
+                since_event_id: None,
+                limit: 24,
+                include_roles: Vec::new(),
+            })
+            .await
+            .expect("test: shared context")
+            .into_iter()
+            .map(|event| event.content)
+            .collect::<Vec<_>>();
+        assert_eq!(seen, ["owner b earlier event"]);
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // OQ-8 / D-019 (B2): the vector RLS policies close their shared
+    // `global`/`workspace` read arm to owner-isolated callers, so the policy
+    // floor matches the shared SQL predicate instead of being wider than it.
+    //
+    // The policy text, the transaction flag and the call-site bits are pinned
+    // offline below. The behavioural twin needs a live PostgreSQL and a role
+    // RLS applies to; it is **written but not run** on the authoring host.
+    // ---------------------------------------------------------------------
+
+    fn b2_collapse_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Split one policy DDL into its `USING` and `WITH CHECK` halves.
+    fn b2_policy_halves(sql: &str) -> (String, String) {
+        let sql = b2_collapse_whitespace(sql);
+        let (using, check) = sql
+            .split_once("WITH CHECK")
+            .expect("test: the policy DDL has a WITH CHECK clause");
+        (using.to_string(), check.to_string())
+    }
+
+    const B2_ISOLATION_GATE: &str = "COALESCE(current_setting('prx.owner_isolated', true), '') <> 'on'";
+
+    #[test]
+    fn vector_rls_shared_read_arm_is_closed_to_owner_isolated_callers() {
+        for policy in ["memories_owner_isolation", "document_chunks_owner_isolation"] {
+            let (using, check) = b2_policy_halves(&PostgresMemory::vector_rls_policy_sql("s.t", policy, true));
+            assert!(
+                using.contains(&format!(
+                    "OR (visibility IN ('global', 'workspace') AND {B2_ISOLATION_GATE}))"
+                )),
+                "{policy}: the shared read arm must be gated on the caller not being \
+                 owner-isolated: {using}"
+            );
+            assert!(
+                using.contains("(owner_id = current_setting('prx.current_owner', true) OR"),
+                "{policy}: the caller's own rows stay readable: {using}"
+            );
+            for required in ["prx.current_workspace", "prx.current_owner", "prx.rls_bypass"] {
+                assert!(
+                    using.contains(required) && check.contains(required),
+                    "{policy}: {required}"
+                );
+            }
+            assert!(
+                !check.contains("visibility") && !check.contains("prx.owner_isolated"),
+                "{policy}: writes stay owner exact and independent of the flag: {check}"
+            );
+            assert!(
+                check.contains("AND owner_id = current_setting('prx.current_owner', true)"),
+                "{policy}: {check}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_rls_embedding_cache_policy_has_no_shared_arm() {
+        let (using, check) = b2_policy_halves(&PostgresMemory::vector_rls_policy_sql(
+            "s.t",
+            "embedding_cache_owner_isolation",
+            false,
+        ));
+        for half in [&using, &check] {
+            assert!(!half.contains("visibility"), "{half}");
+            assert!(!half.contains("prx.owner_isolated"), "{half}");
+            assert!(
+                half.contains("owner_id = current_setting('prx.current_owner', true)"),
+                "{half}"
+            );
+        }
+    }
+
+    /// `apply_rls_context_raw` must set the flag the policy reads, always
+    /// (both values), transaction-local, and only on the non-system path.
+    #[test]
+    fn apply_rls_context_raw_sets_the_owner_isolation_flag() {
+        let source = r5_production_source();
+        let start = source
+            .find("    fn apply_rls_context_raw<C: GenericClient>(")
+            .expect("test: apply_rls_context_raw exists");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("test: apply_rls_context_raw ends")];
+        let bypass_return = body.find("return Ok(());").expect("test: system early return");
+        let flag = body
+            .find("set_config('prx.owner_isolated', $2, true)")
+            .expect("test: the owner isolation flag is set transaction-local");
+        assert!(flag > bypass_return, "the flag is set on the non-system path");
+        assert!(body.contains("if owner_isolated { \"on\" } else { \"off\" }"), "{body}");
+    }
+
+    /// Every production call site passes the caller's isolation bit. A literal
+    /// `false` is only acceptable where the policy has no shared arm (the
+    /// embedding cache); ingest passes `true` because all its statements are
+    /// exact on the document's own owner.
+    #[test]
+    fn apply_rls_context_raw_call_sites_pass_the_callers_isolation_bit() {
+        let source = r5_without_comments(r5_production_source());
+        let mut last_args = Vec::new();
+        for (offset, _) in source.match_indices("Self::apply_rls_context_raw(") {
+            let call = &source[offset..];
+            let call = &call[..call.find(")?;").expect("test: call ends with )?;")];
+            let args = b2_collapse_whitespace(&call["Self::apply_rls_context_raw(".len()..]);
+            let last = args
+                .trim_end_matches(',')
+                .rsplit(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            last_args.push(last);
+        }
+        let count = |value: &str| last_args.iter().filter(|arg| arg.as_str() == value).count();
+        assert_eq!(count("false"), 2, "only the two embedding-cache calls: {last_args:?}");
+        assert_eq!(count("true"), 1, "only ingest: {last_args:?}");
+        assert!(
+            last_args
+                .iter()
+                .all(|arg| ["false", "true", "rls_owner_isolated", "owner_isolated"].contains(&arg.as_str())),
+            "{last_args:?}"
+        );
+        assert!(count("rls_owner_isolated") >= 7, "{last_args:?}");
+    }
+
+    #[test]
+    fn vector_rls_owner_isolated_reads_is_a_recorded_migration() {
+        let registry = PostgresMemory::memory_schema_migration_registry();
+        assert!(
+            registry.windows(2).all(|pair| matches!(pair, [a, b] if a.0 < b.0)),
+            "migration versions stay strictly increasing"
+        );
+        let (_, name, descriptor) = registry
+            .iter()
+            .find(|(version, _, _)| *version == 23)
+            .expect("test: OQ-8 migration 23 is registered");
+        assert_eq!(*name, "vector_rls_owner_isolated_reads");
+        assert_eq!(
+            *descriptor,
+            "memories + document_chunks POLICY *_owner_isolation USING: shared global/workspace read arm additionally requires COALESCE(current_setting('prx.owner_isolated', true), '') <> 'on'; prx.owner_isolated set transaction-local from require_owner_match; WITH CHECK and embedding_cache unchanged",
+            "migration 23's recorded text must not change (checksum mismatch bails at startup)"
+        );
+        let (_, _, a04) = registry
+            .iter()
+            .find(|(version, _, _)| *version == 21)
+            .expect("test: A04 migration 21 is registered");
+        assert!(
+            a04.starts_with("memories + document_chunks + embedding_cache scoped by workspace_id/owner_id"),
+            "migration 21's recorded text must not change (checksum mismatch bails at startup)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D-028 (B2-f): `public` memory rows are readable across owners through a
+    // separate, read-only `FOR SELECT` policy; the owner-isolation policy that
+    // also governs writes never names `public`. Pinned offline; the live
+    // behaviour is covered by the recall matrix above, NOT RUN on this host.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn memories_public_read_policy_is_read_only_and_workspace_scoped() {
+        let sql = b2_collapse_whitespace(&PostgresMemory::memories_public_read_policy_sql(
+            "s.memories",
+            MEMORIES_PUBLIC_READ_POLICY,
+        ));
+        assert!(
+            sql.contains("CREATE POLICY memories_public_read ON s.memories FOR SELECT USING ("),
+            "the public grant must be a FOR SELECT policy on memories: {sql}"
+        );
+        assert!(
+            !sql.contains("WITH CHECK"),
+            "a read-only policy has no WITH CHECK: {sql}"
+        );
+        for command in ["FOR ALL", "FOR UPDATE", "FOR DELETE", "FOR INSERT", "AS RESTRICTIVE"] {
+            assert!(!sql.contains(command), "{command}: {sql}");
+        }
+        for required in [
+            "NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL",
+            "NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL",
+            "workspace_id = current_setting('prx.current_workspace', true)",
+            "visibility = 'public'",
+        ] {
+            assert!(sql.contains(required), "{required}: {sql}");
+        }
+        assert!(
+            !sql.contains("prx.owner_isolated") && !sql.contains("prx.rls_bypass") && !sql.contains("owner_id"),
+            "public reads are the same for every caller and are not an owner grant: {sql}"
+        );
+    }
+
+    #[test]
+    fn owner_isolation_policies_never_grant_public_rows() {
+        for (policy, shared) in [
+            ("memories_owner_isolation", true),
+            ("document_chunks_owner_isolation", true),
+            ("embedding_cache_owner_isolation", false),
+        ] {
+            let sql = PostgresMemory::vector_rls_policy_sql("s.t", policy, shared);
+            assert!(
+                !sql.contains("'public'"),
+                "{policy}: the policy that also governs writes must not name `public`: {sql}"
+            );
+        }
+    }
+
+    /// `init_vector_rls` installs the public grant exactly once, on the
+    /// memories table, inside the same transaction as the isolation policies.
+    #[test]
+    fn init_vector_rls_installs_the_public_read_policy_on_memories_only() {
+        let source = r5_production_source();
+        let start = source
+            .find("    fn init_vector_rls(")
+            .expect("test: init_vector_rls exists");
+        let body = &source[start..];
+        let body = b2_collapse_whitespace(&body[..body.find("\n    }\n").expect("test: init_vector_rls ends")]);
+        assert_eq!(body.matches("memories_public_read_policy_sql(").count(), 1, "{body}");
+        assert!(
+            body.contains(
+                "tx.batch_execute(&Self::memories_public_read_policy_sql( qualified_memories_table, MEMORIES_PUBLIC_READ_POLICY, ))?; tx.commit()?;"
+            ),
+            "{body}"
+        );
+    }
+
+    /// Migration 24's descriptor is checksummed into every database that
+    /// recorded it, so any edit to the text bails at startup there. It is
+    /// pinned verbatim and looked up by version, so appending migration 25
+    /// leaves this test alone (R-B2 F-6).
+    #[test]
+    fn memories_public_read_policy_is_a_recorded_migration() {
+        let (_, name, descriptor) = PostgresMemory::memory_schema_migration_registry()
+            .iter()
+            .find(|(version, _, _)| *version == 24)
+            .expect("test: migration 24 is registered");
+        assert_eq!(*name, "memories_public_read_policy");
+        assert_eq!(
+            *descriptor,
+            "memories POLICY memories_public_read FOR SELECT USING: transaction-local workspace and owner present AND workspace_id = prx.current_workspace AND visibility = 'public'; permissive, read only (UPDATE/DELETE/INSERT still need memories_owner_isolation); independent of prx.owner_isolated; document_chunks and embedding_cache unchanged"
+        );
+    }
+
+    /// R-B2 F-5, the offline half: the evidence accepts exactly the policy
+    /// set `init_vector_rls` installs and refuses a stray policy, a missing
+    /// one, and a restrictive or role-limited variant.
+    #[test]
+    fn policy_inventory_is_exact_permissive_and_public() {
+        let row = |name: &str, permissive: &str, roles: &[&str]| PolicyRow {
+            name: name.to_string(),
+            permissive: permissive.to_string(),
+            roles: roles.iter().map(ToString::to_string).collect(),
+        };
+        let expected = ["memories_owner_isolation", MEMORIES_PUBLIC_READ_POLICY];
+        let installed = vec![
+            row("memories_owner_isolation", "PERMISSIVE", &["public"]),
+            row(MEMORIES_PUBLIC_READ_POLICY, "PERMISSIVE", &["public"]),
+        ];
+        check_policy_inventory("memories", &installed, &expected).expect("test: the installed set passes");
+
+        let mut stray = installed;
+        stray.push(row("dba_convenience_read", "PERMISSIVE", &["public"]));
+        assert!(
+            check_policy_inventory("memories", &stray, &expected).is_err(),
+            "a stray policy"
+        );
+
+        let missing = vec![row("memories_owner_isolation", "PERMISSIVE", &["public"])];
+        assert!(
+            check_policy_inventory("memories", &missing, &expected).is_err(),
+            "a missing policy"
+        );
+
+        let restrictive = vec![
+            row("memories_owner_isolation", "PERMISSIVE", &["public"]),
+            row(MEMORIES_PUBLIC_READ_POLICY, "RESTRICTIVE", &["public"]),
+        ];
+        assert!(
+            check_policy_inventory("memories", &restrictive, &expected).is_err(),
+            "a restrictive variant"
+        );
+
+        let role_limited = vec![
+            row("memories_owner_isolation", "PERMISSIVE", &["public"]),
+            row(MEMORIES_PUBLIC_READ_POLICY, "PERMISSIVE", &["reporting"]),
+        ];
+        assert!(
+            check_policy_inventory("memories", &role_limited, &expected).is_err(),
+            "a role-limited variant"
+        );
+    }
+
+    async fn b2_make_workspace(mem: &PostgresMemory, key: &str) {
+        let client_slot = mem.client.clone();
+        let qualified_table = mem.qualified_table.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            client_slot.with_client(|client| {
+                client.execute(
+                    &format!("UPDATE {qualified_table} SET visibility = 'workspace' WHERE key = $1"),
+                    &[&key],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("test: visibility task")
+        .expect("test: mark the row workspace-visible");
+    }
+
+    /// OQ-8 behavioural twin: under a role RLS applies to, a raw statement
+    /// with no SQL owner predicate still sees another owner's `workspace` row
+    /// for a non-isolated context, and does not for an isolated one.
+    /// **NOT RUN on this host: no PostgreSQL.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_vector_rls_hides_other_owners_workspace_rows_from_isolated_callers() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_b2_rls_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+        r5_seed(&mem, &owner_a, "b2-a", "b2 workspace note").await;
+        b2_make_workspace(&mem, "b2-a").await;
+
+        let qualified_table = mem.qualified_table.clone();
+        let url = db_url.clone();
+        let (shared, isolated) = tokio::task::spawn_blocking(move || -> Result<(i64, i64)> {
+            let mut client = url.parse::<postgres::Config>()?.connect(NoTls)?;
+            let row = client.query_one(
+                "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+                &[],
+            )?;
+            let (is_super, bypasses): (bool, bool) = (row.get(0), row.get(1));
+            anyhow::ensure!(
+                !is_super && !bypasses,
+                "this test only proves anything under a NOSUPERUSER/NOBYPASSRLS role"
+            );
+            let count_stmt = format!("SELECT COUNT(*) FROM {qualified_table} WHERE key = 'b2-a'");
+            let mut probe = |isolated: bool| -> Result<i64> {
+                let mut tx = client.transaction()?;
+                PostgresMemory::apply_rls_context_raw(&mut tx, false, Some(C03_WORKSPACE), Some(&owner_b), isolated)?;
+                let count: i64 = tx.query_one(&count_stmt, &[])?.get(0);
+                tx.commit()?;
+                Ok(count)
+            };
+            Ok((probe(false)?, probe(true)?))
+        })
+        .await
+        .expect("test: rls probe task")
+        .expect("test: rls probe");
+        assert_eq!(shared, 1, "a non-isolated context keeps the tenant-wide workspace read");
+        assert_eq!(
+            isolated, 0,
+            "an owner-isolated context must not see another owner's workspace row"
+        );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+}
+
+impl PostgresMemory {
+    async fn append_message_event_ordinary(&self, input: MessageEventInput) -> Result<MessageEvent> {
+        input.validate()?;
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<MessageEvent> {
+            let now = Utc::now();
+            let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let content_hash = Self::content_hash(&input.content);
+            let visibility = input.visibility.as_str().to_string();
+            let source = input.source.as_str().to_string();
+            let source_ref_json = serde_json::to_string(&input.source)?;
+            let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
+            let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
+
+            let insert_stmt = format!(
+                "
+                INSERT INTO {qualified_message_events_table} (
+                    event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                    parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                    sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                    content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+                    $31
+                )
+                ON CONFLICT DO NOTHING
+                "
+            );
+            let select_stmt = format!(
+                "
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                FROM {qualified_message_events_table}
+                WHERE event_id = $1
+                   OR ($2::TEXT IS NOT NULL AND workspace_id = $3 AND idempotency_key = $2)
+                ORDER BY CASE WHEN event_id = $1 THEN 0 ELSE 1 END
+                LIMIT 1
+                "
+            );
+            let outbox_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_events_table} (
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
+                    agent_id, persona_id, visibility, payload_json, created_at
+                )
+                VALUES ($1, $2, $3, $4, 'message_events', $5, $6, $7, $8, $9, NULL, $10)
+                ON CONFLICT (event_id) DO NOTHING
+                "
+            );
+
+            client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                let inserted = tx.execute(
+                    &insert_stmt,
+                    &[
+                        &event_id,
+                        &input.idempotency_key,
+                        &input.workspace_id,
+                        &input.owner_id,
+                        &source,
+                        &input.channel,
+                        &input.session_key,
+                        &input.parent_session_key,
+                        &input.run_id,
+                        &input.parent_run_id,
+                        &input.agent_id,
+                        &input.persona_id,
+                        &input.sender,
+                        &input.recipient,
+                        &input.role,
+                        &input.event_type,
+                        &source_ref_json,
+                        &subject_ref_json,
+                        &input.goal_id,
+                        &input.causation_event_id,
+                        &input.correlation_id,
+                        &input.attempt_id,
+                        &input.lease_epoch,
+                        &config_generation_id,
+                        &input.config_source_revision,
+                        &input.content,
+                        &content_hash,
+                        &input.raw_payload_json,
+                        &visibility,
+                        &now,
+                        &now,
+                    ],
+                )?;
+                let row = tx.query_one(&select_stmt, &[&event_id, &input.idempotency_key, &input.workspace_id])?;
+                let event = Self::row_to_message_event(&row)?;
+                if inserted > 0 {
+                    tx.execute(
+                        &outbox_stmt,
+                        &[
+                            &Uuid::new_v4().to_string(),
+                            &event.workspace_id,
+                            &event.owner_id,
+                            &event.event_type,
+                            &event.event_id,
+                            &event.session_key,
+                            &event.agent_id,
+                            &event.persona_id,
+                            &event.visibility.as_str(),
+                            &Utc::now(),
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(event)
+            })
+        })
+        .await?
     }
 }

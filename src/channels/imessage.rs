@@ -1,6 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
 #[cfg(test)]
 use std::path::Path;
@@ -143,8 +142,8 @@ end tell"#
 
         // Query the Messages SQLite database for new messages
         // The database is at ~/Library/Messages/chat.db
-        let db_path = UserDirs::new()
-            .map(|u| u.home_dir().join("Library/Messages/chat.db"))
+        let db_path = crate::config::user_home_dir()
+            .map(|home| home.join("Library/Messages/chat.db"))
             .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
 
         if !db_path.exists() {
@@ -267,8 +266,8 @@ end tell"#
             return false;
         }
 
-        let db_path = UserDirs::new()
-            .map(|u| u.home_dir().join("Library/Messages/chat.db"))
+        let db_path = crate::config::user_home_dir()
+            .map(|home| home.join("Library/Messages/chat.db"))
             .unwrap_or_default();
 
         db_path.exists()
