@@ -4068,6 +4068,11 @@ impl SessionsSpawnTool {
         }
 
         let run_id = reserved_run_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
+        // A native issued child owns a distinct session before its durable input
+        // is issued. Ordinary and operator spawning retain their shared scope.
+        let session_scope_key = child_grant.as_ref().map_or(session_scope_key, |grant| {
+            format!("{}:child:{run_id}", grant.parent().session_key())
+        });
 
         let selected_agent = match agent_name.as_deref() {
             Some(name) => match agents.get(name) {

@@ -221,7 +221,12 @@ owner, visibility and complete lineage. Worker model segments and worker-result
 events retain their separate worker scope. Logical terminal issuance and the
 final draft use the same original task identity; receipt, backend, signature and
 scope checks remain mandatory. This does not create a new grant or accept an
-unsigned completion. Runtime validation remains pending. No configuration or
+unsigned completion. For a native issued child grant, a new child session is
+derived from the authenticated parent session and the runtime-reserved child run
+ID before recording the input. The original parent session remains separate
+lineage. Ordinary and operator spawning retain their existing session behavior;
+recovery uses the recorded child session without rewriting existing records.
+Runtime validation remains pending. No configuration or
 stored-data migration is required; reverting the scope repair restores the prior
 refusal when the worker projection differs from the original task identity.
 
