@@ -1012,6 +1012,14 @@ async fn authorize_console_decision_control(
             .inspect_pending_decision_approval(&principal.owner_id, session, decision_id)
             .await?;
     }
+    if matches!(action, ConsoleDecisionControl::Resume) {
+        // Pending metadata remains inspectable after a grant is consumed.
+        // Refuse a closed or unreviewed operation before recording new ingress;
+        // the final execution path still owns the atomic one-use claim.
+        service
+            .validate_pending_decision_resume(&principal.owner_id, session, decision_id)
+            .await?;
+    }
     tracing::info!(
         owner = %principal.owner_id,
         decision_id = %decision_id,

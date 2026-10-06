@@ -551,6 +551,20 @@ impl TurnDecisionService {
             .await
     }
 
+    /// Read-only ingress preflight for a previously reviewed operation. This
+    /// returns no grant or execution authority; dispatch must independently
+    /// revalidate and win the durable atomic one-use resolution.
+    pub(crate) async fn validate_pending_decision_resume(
+        &self,
+        owner: &str,
+        session: &str,
+        decision_id: DecisionId,
+    ) -> anyhow::Result<()> {
+        self.load_reviewed_decision_approval(owner, session, decision_id)
+            .await
+            .map(|_| ())
+    }
+
     /// Revocation reads authenticated metadata even when a resolution already
     /// exists. The durable writer still requires that resolution to be the
     /// matching revocation; it never turns an existing consumption into one.
