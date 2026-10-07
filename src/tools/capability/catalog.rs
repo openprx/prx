@@ -549,9 +549,6 @@ impl CapabilityCatalog {
             {
                 return Err(ParityError);
             }
-            let root_entry = self.entry_for_public_name(&entry.root).ok_or(ParityError)?;
-            let root = exec.current_descriptor(&entry.root).ok_or(ParityError)?;
-            verify_child_descriptor(root_entry, &root)?;
             let current_binding = match &entry.target {
                 ExecutionTarget::Tool(name) => {
                     let (exact, binding) = exec
@@ -561,6 +558,9 @@ impl CapabilityCatalog {
                     binding
                 }
                 ExecutionTarget::Skill { name, .. } | ExecutionTarget::Node { id: name, .. } => {
+                    let root_entry = self.entry_for_public_name(&entry.root).ok_or(ParityError)?;
+                    let root = exec.current_descriptor(&entry.root).ok_or(ParityError)?;
+                    verify_child_descriptor(root_entry, &root)?;
                     let argument = if matches!(entry.target, ExecutionTarget::Skill { .. }) {
                         "name"
                     } else {
@@ -634,13 +634,13 @@ impl CapabilityCatalog {
             if matches!(entry.exposure, Exposure::Unavailable { .. }) {
                 continue;
             }
-            let current = live_for(&entry.root)?;
             if let ExecutionTarget::Tool(name) = &entry.target {
                 let exact = live_for(name)?;
                 if exact.backend_name != entry.root || exact.spec.fingerprint() != entry.fingerprint {
                     return Err(ParityError);
                 }
             } else {
+                let current = live_for(&entry.root)?;
                 if !current.configured {
                     return Err(ParityError);
                 }
@@ -994,6 +994,118 @@ mod tests {
                 description: "Read local evidence",
             }),
         ]
+    }
+
+    // Public aliases need not export their backend identity as another capability.
+    struct AliasOnlyParityTool {
+        backend: &'static str,
+        state: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for AliasOnlyParityTool {
+        fn name(&self) -> &str {
+            self.backend
+        }
+
+        fn description(&self) -> &str {
+            "PRX alias parity fixture"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            if self.state.load(Ordering::SeqCst) == 1 {
+                json!({"type":"object","properties":{"value":{"type":"string"}}})
+            } else {
+                json!({"type":"object","properties":{}})
+            }
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            if self.state.load(Ordering::SeqCst) == 2 {
+                return Vec::new();
+            }
+            vec![ToolSpec {
+                name: "prx_exact_alias".into(),
+                description: self.description().into(),
+                parameters: self.parameters_schema(),
+            }]
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            name == "prx_exact_alias" && self.state.load(Ordering::SeqCst) != 2
+        }
+
+        fn availability(&self) -> CapabilityAvailability {
+            if self.state.load(Ordering::SeqCst) == 3 {
+                CapabilityAvailability {
+                    level: CapabilityAvailabilityLevel::Declared,
+                    reason: "PRX fixture is no longer configured".into(),
+                }
+            } else {
+                CapabilityAvailability::ready("PRX fixture configured")
+            }
+        }
+
+        async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
+            anyhow::bail!("parity fixture does not execute effects")
+        }
+    }
+
+    #[test]
+    fn alias_only_tool_parity_preserves_exact_identity_and_live_contract() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(AliasOnlyParityTool {
+            backend: "prx_alias_backend",
+            state: Arc::clone(&state),
+        })];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let entry = catalog.entry_for_public_name("prx_exact_alias").unwrap();
+        let reference = CapabilityRef {
+            id: entry.id.clone(),
+            generation: entry.generation,
+            fingerprint: entry.fingerprint,
+        };
+        let allowed = BTreeSet::from([reference.clone()]);
+        let service =
+            ToolExecutionService::with_security_policy(registry, Arc::new(crate::security::SecurityPolicy::default()));
+        assert!(catalog.entry_for_public_name("prx_alias_backend").is_none());
+        assert!(service.current_descriptor("prx_alias_backend").is_none());
+        assert!(catalog.check_parity(&service).is_ok());
+        assert!(catalog.check_published_parity(&service, &allowed).is_ok());
+
+        let wrong_backend = ToolExecutionService::with_security_policy(
+            vec![Box::new(AliasOnlyParityTool {
+                backend: "prx_other_backend",
+                state: Arc::clone(&state),
+            })],
+            Arc::new(crate::security::SecurityPolicy::default()),
+        );
+        assert!(catalog.check_parity(&wrong_backend).is_err());
+        assert!(catalog.check_published_parity(&wrong_backend, &allowed).is_err());
+        let mut stale = reference.clone();
+        stale.generation = CatalogGeneration([0; 32]);
+        assert_ne!(stale.generation, reference.generation);
+        assert!(
+            catalog
+                .check_published_parity(&service, &BTreeSet::from([stale]))
+                .is_err()
+        );
+        let mut changed = reference;
+        changed.fingerprint = SchemaFingerprint([0; 32]);
+        assert_ne!(changed.fingerprint, entry.fingerprint);
+        assert!(
+            catalog
+                .check_published_parity(&service, &BTreeSet::from([changed]))
+                .is_err()
+        );
+        // Schema drift, disappearance and loss of configured availability each
+        // independently invalidate the original immutable publication.
+        for mode in [1, 2, 3] {
+            state.store(mode, Ordering::SeqCst);
+            assert!(catalog.check_parity(&service).is_err());
+            assert!(catalog.check_published_parity(&service, &allowed).is_err());
+        }
     }
 
     struct BlankReasonAvailabilityTool;
