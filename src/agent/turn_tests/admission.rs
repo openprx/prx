@@ -220,6 +220,45 @@ impl AdmittedTurn {
         .await
     }
 
+    /// One prompt-guided delegation fixture with actual transport and issued child scope.
+    pub(crate) fn configured_delegation<'a>(
+        mut config: crate::config::Config,
+        input: &'a str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        endpoint: &'a str,
+        provider: &'a dyn crate::providers::Provider,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Self> + 'a>> {
+        Box::pin(async move {
+            let capabilities = provider.capabilities();
+            assert!(
+                !capabilities.native_tool_calling && !capabilities.vision,
+                "parent fixture implements prompt-guided chat only"
+            );
+            crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
+                .expect("actual configured delegation endpoint");
+            let memory: Arc<dyn crate::memory::Memory> =
+                Arc::new(crate::memory::SqliteMemory::new(&config.workspace_dir).expect("owned delegation SQLite"));
+            let admitted = Self::build_mode(
+                config,
+                input,
+                registry,
+                memory,
+                FixtureOrigin::Cli { recorded: true },
+                ("ollama", "prx-local-model"),
+                Some(false),
+            )
+            .await;
+            assert!(
+                matches!(
+                    admitted.context.directive(),
+                    crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
+                ),
+                "configured parent must receive actual issued delegation"
+            );
+            admitted
+        })
+    }
+
     async fn build_mode(
         mut config: crate::config::Config,
         input: &str,

@@ -12,6 +12,7 @@ const DECISION_MODEL: &str = "prx-native-decision";
 struct State {
     action: &'static str,
     target: &'static str,
+    child_target: Option<&'static str>,
     requests: parking_lot::Mutex<Vec<Value>>,
     replies: parking_lot::Mutex<Vec<Result<Value, String>>>,
 }
@@ -20,7 +21,26 @@ async fn reply(
     axum::Json(body): axum::Json<Value>,
 ) -> axum::response::Response {
     state.requests.lock().push(body.clone());
-    let result = decision_answers(&body, state.action, state.target).map_err(|error| format!("{error:#}"));
+    let result = (|| {
+        let (action, target) = if let Some(child_target) = state.child_target {
+            let candidates = body
+                .pointer("/state/candidates")
+                .and_then(Value::as_array)
+                .context("actual delegation candidate projection")?;
+            if candidates
+                .iter()
+                .any(|candidate| candidate.get("action").and_then(Value::as_str) == Some("delegate"))
+            {
+                ("delegate", "session")
+            } else {
+                ("use_tool", child_target)
+            }
+        } else {
+            (state.action, state.target)
+        };
+        decision_answers(&body, action, target)
+    })()
+    .map_err(|error| format!("{error:#}"));
     state.replies.lock().push(result.clone());
     result.map_or_else(
         |_| axum::http::StatusCode::BAD_REQUEST.into_response(),
@@ -42,12 +62,23 @@ impl Driver {
     pub(crate) async fn start_answer() -> Result<Self> {
         Self::start_action("answer", "none").await
     }
+    pub(crate) async fn start_delegation(child_target: &'static str) -> Result<Self> {
+        Self::start_plan("delegate", "session", Some(child_target)).await
+    }
     async fn start_action(action: &'static str, target: &'static str) -> Result<Self> {
+        Self::start_plan(action, target, None).await
+    }
+    async fn start_plan(
+        action: &'static str,
+        target: &'static str,
+        child_target: Option<&'static str>,
+    ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let state = Arc::new(State {
             action,
             target,
+            child_target,
             requests: parking_lot::Mutex::new(Vec::new()),
             replies: parking_lot::Mutex::new(Vec::new()),
         });
@@ -152,6 +183,33 @@ impl Driver {
                     assert!(
                         replies.iter().all(Result::is_ok),
                         "controlled decision response rejected; no fallback counts as positive backend admission: {diagnostic}"
+                    );
+                }
+                if let Some(child_target) = self.state.child_target {
+                    assert!(
+                        requests.iter().any(|request| request
+                            .pointer("/state/candidates")
+                            .and_then(Value::as_array)
+                            .is_some_and(|candidates| candidates.iter().any(|candidate| candidate
+                                .get("action")
+                                .and_then(Value::as_str)
+                                == Some("delegate")
+                                && candidate.get("target").and_then(Value::as_str) == Some("session")))),
+                        "actual parent delegation request required"
+                    );
+                    assert!(
+                        requests.iter().any(|request| request
+                            .pointer("/state/candidates")
+                            .and_then(Value::as_array)
+                            .is_some_and(|candidates| !candidates
+                                .iter()
+                                .any(|candidate| candidate.get("action").and_then(Value::as_str) == Some("delegate"))
+                                && candidates
+                                    .iter()
+                                    .any(|candidate| candidate.get("action").and_then(Value::as_str)
+                                        == Some("use_tool")
+                                        && candidate.get("target").and_then(Value::as_str) == Some(child_target)))),
+                        "actual child tool decision request required"
                     );
                 }
                 result

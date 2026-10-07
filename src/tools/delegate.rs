@@ -1533,6 +1533,10 @@ impl Observer for NoopObserver {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "delegate_diagnostic.rs"]
+mod delegate_diagnostic;
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
@@ -2341,6 +2345,67 @@ mod tests {
         }
     }
 
+    tokio::task_local! { static CONFIGURED_DELEGATE_ENDPOINT: String; }
+
+    async fn run_configured_delegate_fixture(
+        allowed_tools: Vec<String>,
+        parent_tools: Vec<Arc<dyn Tool>>,
+        tool_name: &'static str,
+        arguments: serde_json::Value,
+        provider_error: Option<&'static str>,
+        custom_userinfo: bool,
+        context: Option<&str>,
+    ) -> (ToolResult, Vec<serde_json::Value>) {
+        use futures::FutureExt as _;
+        let retained = tempfile::tempdir().expect("private decision evidence").keep();
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
+            .await
+            .expect("owned compatible decision listener")
+            .retain_evidence_at(retained);
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run_factory(true, move || async move {
+                let cleanup =
+                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                        .expect("delegate fixture cleanup owner");
+                let mut observed = None;
+                let drained = cleanup
+                    .run(async {
+                        observed = Some(
+                            CONFIGURED_DELEGATE_ENDPOINT
+                                .scope(
+                                    endpoint,
+                                    std::panic::AssertUnwindSafe(run_admitted_delegate_fixture(
+                                        allowed_tools,
+                                        parent_tools,
+                                        tool_name,
+                                        arguments,
+                                        provider_error,
+                                        custom_userinfo,
+                                        context,
+                                    ))
+                                    .catch_unwind(),
+                                )
+                                .await,
+                        );
+                        Ok(())
+                    })
+                    .await;
+                match observed {
+                    Some(Err(panic)) => std::panic::resume_unwind(panic),
+                    Some(Ok(value)) => {
+                        drained.expect("delegate fixture writers drained");
+                        value
+                    }
+                    None => {
+                        drained.expect("delegate fixture cleanup entered");
+                        panic!("delegate fixture did not run")
+                    }
+                }
+            })
+            .await
+    }
+
     async fn run_admitted_delegate_fixture(
         allowed_tools: Vec<String>,
         parent_tools: Vec<Arc<dyn Tool>>,
@@ -2351,6 +2416,8 @@ mod tests {
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
         let workspace = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let workspace = super::delegate_diagnostic::workspace(workspace);
         let requests = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
         let capture = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2432,16 +2499,21 @@ mod tests {
             Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path())),
         )
         .with_parent_tools(Arc::new(parent_tools));
-        let result = dispatch_admitted_delegate(
+        use futures::FutureExt as _;
+        let result = std::panic::AssertUnwindSafe(dispatch_admitted_delegate(
             config,
             delegate,
             json!({"agent":"tester", "prompt":tool_name, "context":context}),
-        )
+        ))
+        .catch_unwind()
         .await;
         server.0.abort();
         let _ = (&mut server.0).await;
         let requests = requests.lock().clone();
-        (result, requests)
+        match result {
+            Ok(result) => (result, requests),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     pub(super) async fn dispatch_admitted_delegate(
@@ -2463,112 +2535,171 @@ mod tests {
         result.expect("delegate must actually execute")
     }
 
+    // Construct the large observer state in a separate synchronous frame.
+    // The enclosing async function still defers all work until first poll.
+    #[inline(never)]
+    fn boxed_delegate_observation<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = (Option<ToolResult>, usize, Vec<ChatMessage>)>,
+    {
+        Box::pin(make_work())
+    }
+
     async fn observe_delegate_dispatch(
         config: crate::config::Config,
         delegate: DelegateTool,
         arguments: serde_json::Value,
         channel: Option<crate::channels::traits::ChannelMessage>,
     ) -> (Option<ToolResult>, usize, Vec<ChatMessage>) {
-        let workspace = config.workspace_dir.clone();
-        let memory = delegate.memory.clone();
-        let parent_tools = delegate.parent_tools.as_ref().clone();
-        let captured = Arc::new(parking_lot::Mutex::new(None));
-        let executions = Arc::new(AtomicUsize::new(0));
-        let mut tools: Vec<Box<dyn Tool>> = parent_tools
-            .into_iter()
-            .filter(|tool| tool.name() != "delegate")
-            .map(|tool| Box::new(ToolArcRef::new(tool)) as Box<dyn Tool>)
-            .collect();
-        tools.push(Box::new(CapturedDelegate {
-            inner: delegate,
-            result: Arc::clone(&captured),
-            executions: Arc::clone(&executions),
-        }));
-        let registry = crate::agent::test_admission::registry_with_search(tools);
-        let input = format!("delegate {}", arguments["prompt"].as_str().unwrap_or_default());
-        let parent_provider = DelegateParentProvider { arguments };
-        let admitted = match (channel, memory) {
-            (Some(mut message), Some(memory)) => {
-                message.content = input.clone();
-                crate::agent::test_admission::AdmittedTurn::with_channel_memory(
+        boxed_delegate_observation(move || async move {
+            let workspace = config.workspace_dir.clone();
+            let memory = delegate.memory.clone();
+            let parent_tools = delegate.parent_tools.as_ref().clone();
+            let captured = Arc::new(parking_lot::Mutex::new(None));
+            let executions = Arc::new(AtomicUsize::new(0));
+            let mut tools: Vec<Box<dyn Tool>> = parent_tools
+                .into_iter()
+                .filter(|tool| tool.name() != "delegate")
+                .map(|tool| Box::new(ToolArcRef::new(tool)) as Box<dyn Tool>)
+                .collect();
+            tools.push(Box::new(CapturedDelegate {
+                inner: delegate,
+                result: Arc::clone(&captured),
+                executions: Arc::clone(&executions),
+            }));
+            let registry = crate::agent::test_admission::registry_with_search(tools);
+            let input = format!("delegate {}", arguments["prompt"].as_str().unwrap_or_default());
+            let parent_provider = DelegateParentProvider { arguments };
+            let configured_endpoint = CONFIGURED_DELEGATE_ENDPOINT.try_with(Clone::clone).ok();
+            let admitted = if let Some(endpoint) = configured_endpoint.as_deref() {
+                assert!(
+                    channel.is_none() && memory.is_none(),
+                    "configured alias owns its CLI SQLite source"
+                );
+                crate::agent::test_admission::AdmittedTurn::configured_delegation(
                     config,
-                    message,
+                    &input,
                     Arc::clone(&registry),
-                    memory,
+                    endpoint,
+                    &parent_provider,
                 )
                 .await
+            } else {
+                match (channel, memory) {
+                    (Some(mut message), Some(memory)) => {
+                        message.content = input.clone();
+                        crate::agent::test_admission::AdmittedTurn::with_channel_memory(
+                            config,
+                            message,
+                            Arc::clone(&registry),
+                            memory,
+                        )
+                        .await
+                    }
+                    (Some(_), None) => panic!("channel delegate fixture requires its observed memory"),
+                    (None, Some(memory)) => {
+                        crate::agent::test_admission::AdmittedTurn::with_memory(
+                            config,
+                            &input,
+                            Arc::clone(&registry),
+                            memory,
+                        )
+                        .await
+                    }
+                    (None, None) => {
+                        crate::agent::test_admission::AdmittedTurn::with_config(config, &input, Arc::clone(&registry))
+                            .await
+                    }
+                }
+            };
+            #[cfg(unix)]
+            if super::delegate_diagnostic::active() {
+                super::delegate_diagnostic::admission(admitted.decision().context, parent_provider.capabilities());
             }
-            (Some(_), None) => panic!("channel delegate fixture requires its observed memory"),
-            (None, Some(memory)) => {
-                crate::agent::test_admission::AdmittedTurn::with_memory(config, &input, Arc::clone(&registry), memory)
-                    .await
-            }
-            (None, None) => {
-                crate::agent::test_admission::AdmittedTurn::with_config(config, &input, Arc::clone(&registry)).await
-            }
-        };
-        let mut history = vec![crate::providers::ChatMessage::user(input)];
-        let hooks = HookManager::new(workspace);
-        let multimodal = crate::config::MultimodalConfig::default();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            crate::agent::turn_engine::run_turn(
-                &mut history,
-                crate::agent::turn_request::TurnRequest {
-                    channel_name: "agent",
-                    scope: None,
-                    mode: Default::default(),
-                    silent: true,
-                    expose_stay_silent: false,
-                    multimodal: &multimodal,
-                    schedule: crate::agent::turn_request::TurnSchedule {
-                        read_only_tool_concurrency_window: 2,
-                        priority_scheduling_enabled: false,
-                        low_priority_tool_names: Vec::new(),
+            let mut history = vec![crate::providers::ChatMessage::user(input)];
+            let hooks = HookManager::new(workspace);
+            let multimodal = crate::config::MultimodalConfig::default();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                crate::agent::turn_engine::run_turn(
+                    &mut history,
+                    crate::agent::turn_request::TurnRequest {
+                        channel_name: "agent",
+                        scope: None,
+                        mode: Default::default(),
+                        silent: true,
+                        expose_stay_silent: false,
+                        multimodal: &multimodal,
+                        schedule: crate::agent::turn_request::TurnSchedule {
+                            read_only_tool_concurrency_window: 2,
+                            priority_scheduling_enabled: false,
+                            low_priority_tool_names: Vec::new(),
+                        },
+                        compaction: Some(admitted.compaction()),
+                        decision: admitted.decision(),
                     },
-                    compaction: Some(admitted.compaction()),
-                    decision: admitted.decision(),
-                },
-                crate::agent::turn_request::TurnServices {
-                    provider: &parent_provider,
-                    provider_name: "ollama",
-                    model: "prx-local-model",
-                    temperature: 0.0,
-                    tools_registry: registry,
-                    observer: &NoopObserver,
-                    hooks: &hooks,
-                    approval: None,
-                    approval_resolver: None,
-                    runtime_adapter: Some(admitted.adapter()),
-                    memory: admitted.memory_runtime(),
-                },
-                crate::agent::turn_request::TurnDelivery {
-                    cancellation: None,
-                    on_delta: None,
-                    on_tool_call: None,
-                },
-            ),
-        )
-        .await;
-        result
-            .expect("bounded local delegate fixture")
-            .expect("parent execution");
-        let result = captured.lock().take();
-        (result, executions.load(Ordering::SeqCst), history)
+                    crate::agent::turn_request::TurnServices {
+                        provider: &parent_provider,
+                        provider_name: "ollama",
+                        model: "prx-local-model",
+                        temperature: 0.0,
+                        tools_registry: registry,
+                        observer: &NoopObserver,
+                        hooks: &hooks,
+                        approval: None,
+                        approval_resolver: None,
+                        runtime_adapter: Some(admitted.adapter()),
+                        memory: admitted.memory_runtime(),
+                    },
+                    crate::agent::turn_request::TurnDelivery {
+                        cancellation: None,
+                        on_delta: None,
+                        on_tool_call: None,
+                    },
+                ),
+            )
+            .await;
+            #[cfg(unix)]
+            if super::delegate_diagnostic::active() {
+                let kind = match &result {
+                    Err(_) => "timeout",
+                    Ok(Err(_)) => "engine_error",
+                    Ok(Ok(_)) => "engine_success",
+                };
+                super::delegate_diagnostic::outcome(kind, executions.load(Ordering::SeqCst), captured.lock().is_some());
+            }
+            if configured_endpoint.is_some() {
+                let _ = admitted.decision().context.terminal_execution_trace();
+            }
+            result
+                .expect("bounded local delegate fixture")
+                .expect("parent execution");
+            let result = captured.lock().take();
+            (result, executions.load(Ordering::SeqCst), history)
+        })
+        .await
     }
 
     #[tokio::test]
     async fn agentic_mode_accepts_and_executes_one_explicit_dynamic_alias() {
-        let (result, requests) = run_admitted_delegate_fixture(
-            vec!["dynamic_alias".to_owned()],
-            vec![Arc::new(DynamicAliasTool)],
-            "dynamic_alias",
-            json!({}),
-            None,
-            false,
-            None,
-        )
-        .await;
+        let work = || {
+            run_configured_delegate_fixture(
+                vec!["dynamic_alias".to_owned()],
+                vec![Arc::new(DynamicAliasTool)],
+                "dynamic_alias",
+                json!({}),
+                None,
+                false,
+                None,
+            )
+        };
+        #[cfg(unix)]
+        let (result, requests) = super::delegate_diagnostic::scope(work)
+            .await
+            .expect("complete private delegate diagnostic");
+        #[cfg(not(unix))]
+        let (result, requests) = work().await;
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.ends_with("\ndone"));
         assert_eq!(requests.len(), 2, "child must call its tool and finish");
