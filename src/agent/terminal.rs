@@ -478,7 +478,7 @@ where
     C::Error: Into<anyhow::Error>,
 {
     let commit = commit.try_into().map_err(Into::into)?;
-    boxed_terminal_work(fabric, commit, cost_config, workspace_dir, false).await
+    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, false).await
 }
 
 #[cfg(test)]
@@ -493,26 +493,21 @@ where
     C::Error: Into<anyhow::Error>,
 {
     let commit = commit.try_into().map_err(Into::into)?;
-    boxed_terminal_work(fabric, commit, cost_config, workspace_dir, true).await
+    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, true).await
 }
 
 // Construct terminal work before polling it. A single owned box keeps the
 // finalizer state out of the nested entry, cleanup and terminal-guard futures.
 // Conversion and rejection of an invalid draft remain in the lazy wrappers.
-fn boxed_terminal_work<'a>(
-    fabric: &'a MemoryFabric,
-    commit: TurnTerminalCommit,
-    cost_config: &'a CostConfig,
-    workspace_dir: &'a Path,
-    stop_after_marker: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a>> {
-    Box::pin(finalize_turn_impl(
-        fabric,
-        commit,
-        cost_config,
-        workspace_dir,
-        stop_after_marker,
-    ))
+#[inline(never)]
+fn boxed_terminal_work<'a, F, Fut>(
+    make_work: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a,
+{
+    Box::pin(make_work())
 }
 
 async fn finalize_turn_impl(
@@ -522,361 +517,368 @@ async fn finalize_turn_impl(
     workspace_dir: &Path,
     stop_after_marker: bool,
 ) -> anyhow::Result<TurnTerminalReceipt> {
-    anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
-    ensure_runtime_authority(&commit.scope, "start").await?;
-    let mut execution_trace = None;
-    let mut prepared_replay = None;
-    commit.decision.validate_terminal_scope(
-        fabric,
-        &commit.scope,
-        commit.history_scope.as_ref(),
-        workspace_dir,
-        cost_config,
-    )?;
-    commit
-        .decision
-        .context
-        .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
-    if let Some(served) = commit.decision.context.served_auxiliary() {
-        anyhow::ensure!(
-            commit.status == TurnTerminalStatus::Completed,
-            "auxiliary reply cannot be attached to an incomplete terminal"
-        );
-        served.validate_reply(
-            &commit
-                .history
-                .as_ref()
-                .context("auxiliary reply projection missing")?
-                .assistant_content,
+    boxed_terminal_work(move || async move {
+        anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
+        ensure_runtime_authority(&commit.scope, "start").await?;
+        let mut execution_trace = None;
+        let mut prepared_replay = None;
+        commit.decision.validate_terminal_scope(
+            fabric,
+            &commit.scope,
+            commit.history_scope.as_ref(),
+            workspace_dir,
+            cost_config,
         )?;
-    }
-    if commit.decision.is_recorded() {
-        let decision = &commit.decision;
-        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-        decision.validate_durable_chain().await?;
-        let mut prepared = replay::PreparedReplay::capture(decision, &commit).await?;
-        execution_trace = Some(decision.context.terminal_execution_trace());
-        // An idempotency key already committed for another decision must not
-        // authorize even a usage or cost replay under the new decision.
-        let final_key = format!("turn:{}:final", commit.terminal_id);
-        if let Some(existing) = fabric
-            .memory()
-            .find_message_event_by_idempotency_key(fabric.workspace_id(), &final_key)
-            .await?
-        {
+        commit
+            .decision
+            .context
+            .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
+        if let Some(served) = commit.decision.context.served_auxiliary() {
+            anyhow::ensure!(
+                commit.status == TurnTerminalStatus::Completed,
+                "auxiliary reply cannot be attached to an incomplete terminal"
+            );
+            served.validate_reply(
+                &commit
+                    .history
+                    .as_ref()
+                    .context("auxiliary reply projection missing")?
+                    .assistant_content,
+            )?;
+        }
+        if commit.decision.is_recorded() {
+            let decision = &commit.decision;
+            let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+            decision.validate_durable_chain().await?;
+            let mut prepared = replay::PreparedReplay::capture(decision, &commit).await?;
+            execution_trace = Some(decision.context.terminal_execution_trace());
+            // An idempotency key already committed for another decision must not
+            // authorize even a usage or cost replay under the new decision.
+            let final_key = format!("turn:{}:final", commit.terminal_id);
+            if let Some(existing) = fabric
+                .memory()
+                .find_message_event_by_idempotency_key(fabric.workspace_id(), &final_key)
+                .await?
+            {
+                verify_terminal_replay(
+                    fabric.memory().as_ref(),
+                    &recorded.reader,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    fabric.workspace_id(),
+                    commit.scope.owner_id.as_deref().context("terminal owner is missing")?,
+                    &commit.terminal_id,
+                    &existing,
+                )
+                .await?;
+                let payload: serde_json::Value = serde_json::from_str(
+                    existing
+                        .raw_payload_json
+                        .as_deref()
+                        .context("terminal marker has no payload")?,
+                )?;
+                anyhow::ensure!(
+                    existing.role == "event"
+                        && existing.event_type == "turn.finalized"
+                        && existing.source == commit.scope.source
+                        && existing.workspace_id == fabric.workspace_id()
+                        && existing.owner_id == commit.scope.owner_id
+                        && existing.session_key == commit.scope.session_key
+                        && existing.run_id == commit.scope.run_id
+                        && existing.channel == commit.scope.channel
+                        && existing.idempotency_key.as_deref() == Some(final_key.as_str())
+                        && payload.get("terminal_id").and_then(serde_json::Value::as_str)
+                            == Some(commit.terminal_id.as_str())
+                        && payload.get("decision_id").and_then(serde_json::Value::as_str)
+                            == Some(decision.decision_id.to_string().as_str())
+                        && payload.get("status").and_then(serde_json::Value::as_str)
+                            == Some(match commit.status {
+                                TurnTerminalStatus::Completed => "completed",
+                                TurnTerminalStatus::Silent => "silent",
+                                TurnTerminalStatus::Failed => "failed",
+                                TurnTerminalStatus::Cancelled => "cancelled",
+                            }),
+                    "existing terminal marker conflicts with the pinned decision or scope"
+                );
+            }
+            // The workspace-scoped idempotency key is unique in the durable
+            // message store. Its insert/readback transaction elects one decision
+            // before any usage, cost or assistant write, including across
+            // processes. A retry of the same decision may reuse the claim.
+            let claim_key = format!("turn:{}:decision-claim", commit.terminal_id);
+            // A keyed, versioned digest binds the facts that can change terminal
+            // side effects. Redaction precedes the digest, and the durable key
+            // prevents offline guessing of short private replies or targets.
+            let mut claim_outcome = commit.provider_outcome.clone();
+            if let Some(outcome) = claim_outcome.as_mut() {
+                outcome.redact_provider_labels();
+            }
+            let trusted = decision
+                .context
+                .audit_hops()
+                .last()
+                .context("decision has no final hop")?
+                .state
+                .trusted
+                .parts();
+            // Version two prevents a valid claim from being transplanted to
+            // another terminal or decision, including across a process restart.
+            // Unsigned and version-one claims cannot authorize this path.
+            let semantic = redact_persisted_json(serde_json::json!({
+                "version": 2,
+                "terminal_id": commit.terminal_id,
+                "decision_id": decision.decision_id.to_string(),
+                "execution_trace": execution_trace,
+                "decision_chain": decision.context.hop_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "workspace_id": trusted.workspace_id,
+                "source_event_id": trusted.source_event_id,
+                "catalog_generation": trusted.catalog_generation.to_hex(),
+                "policy_version": trusted.policy_version,
+                "status": commit.status,
+                "scope": terminal_semantic_scope(&commit.scope),
+                "history": commit.history,
+                "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
+                "provider_outcome": claim_outcome,
+                "telemetry": commit.telemetry,
+                "delivery_intent": commit.delivery_intent,
+            }));
+            let semantic = {
+                let mut semantic = semantic;
+                if let Some(event) = decision
+                    .context
+                    .served_auxiliary()
+                    .and_then(served_auxiliary::ServedAuxiliaryLink::event)
+                {
+                    use sha2::Digest;
+                    semantic
+                        .as_object_mut()
+                        .context("terminal claim is not an object")?
+                        .insert(
+                            "served_auxiliary".to_owned(),
+                            serde_json::json!({
+                                "event_id": event.event_id,
+                                "sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(event)?)),
+                            }),
+                        );
+                }
+                semantic
+            };
+            let semantic_bytes = serde_json::to_vec(&semantic)?;
+            let semantic_mac = hex::encode(
+                recorded
+                    .key
+                    .hmac(KeyDomain::TerminalClaim, &[b"terminal-claim-v2", &semantic_bytes]),
+            );
+            let claim = fabric
+                .record_runtime_event_idempotent(
+                    commit.scope.clone(),
+                    "turn.decision.claimed",
+                    format!("terminal_id={}", commit.terminal_id),
+                    Some(
+                        serde_json::json!({
+                            "terminal_id": commit.terminal_id,
+                            "decision_id": decision.decision_id.to_string(),
+                            "semantic_mac_v2": semantic_mac,
+                        })
+                        .to_string(),
+                    ),
+                    &claim_key,
+                )
+                .await?;
+            let claim_payload: serde_json::Value = serde_json::from_str(
+                claim
+                    .raw_payload_json
+                    .as_deref()
+                    .context("decision claim has no payload")?,
+            )?;
+            anyhow::ensure!(
+                claim.role == "event"
+                    && claim.event_type == "turn.decision.claimed"
+                    && claim.source == commit.scope.source
+                    && claim.workspace_id == fabric.workspace_id()
+                    && claim.owner_id == commit.scope.owner_id
+                    && claim.session_key == commit.scope.session_key
+                    && claim.run_id == commit.scope.run_id
+                    && claim.channel == commit.scope.channel
+                    && claim.idempotency_key.as_deref() == Some(claim_key.as_str())
+                    && claim_payload.get("terminal_id").and_then(serde_json::Value::as_str)
+                        == Some(commit.terminal_id.as_str())
+                    && claim_payload.get("decision_id").and_then(serde_json::Value::as_str)
+                        == Some(decision.decision_id.to_string().as_str())
+                    && claim_payload.get("semantic_mac_v2").and_then(serde_json::Value::as_str)
+                        == Some(semantic_mac.as_str()),
+                "terminal decision claim conflicts with the pinned decision or scope"
+            );
+            prepared.bind_claim(&recorded.key, &claim)?;
+            prepared_replay = Some(prepared);
+        }
+        // Everything below persists the reply and the outcome (the assistant
+        // message event, usage settlement, cost ledger, attempt events, the
+        // terminal marker). Every surface finalizes here, so both are redacted
+        // once, here, at write: the outcome's provider labels lose their URL
+        // userinfo, and secrets in the reply and in every outcome string (provider
+        // errors included) are replaced by the one redactor, which never
+        // truncates (D-054).
+        let mut commit = commit;
+        if let Some(outcome) = commit.provider_outcome.as_mut() {
+            outcome.redact_provider_labels();
+            *outcome = crate::security::redaction::redact_json_structure(&*outcome)?;
+        }
+        if let Some(history) = commit.history.as_mut() {
+            history.assistant_content = redact_persisted_text(&history.assistant_content);
+        }
+
+        let usage_settlement = commit
+            .provider_outcome
+            .as_ref()
+            .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
+
+        // The canonical usage event is written before the JSONL projection. A
+        // crash can therefore leave usage awaiting projection, but can no longer
+        // leave an untraceable cost-only settlement.
+        if let Some(usage) = usage_settlement.as_ref() {
+            let usage_json = serde_json::to_string(usage)?;
+            fabric
+                .record_runtime_event_idempotent(
+                    commit.scope.clone(),
+                    "usage.settled",
+                    format!("settlement_id={}", commit.terminal_id),
+                    Some(usage_json),
+                    format!("turn:{}:usage", commit.terminal_id),
+                )
+                .await?;
+        }
+
+        let cost_settlement = match usage_settlement.as_ref() {
+            Some(usage) => {
+                let cost_config = cost_config.clone();
+                let workspace_dir = workspace_dir.to_path_buf();
+                let usage = usage.clone();
+                Some(
+                    match crate::runtime::blocking::spawn_blocking(move || {
+                        let tracker = crate::cost::tracker::CostTracker::for_workspace(cost_config, &workspace_dir)?;
+                        tracker.settle_metered(&usage)
+                    })
+                    .await
+                    {
+                        Ok(Ok(settlement)) => settlement,
+                        Ok(Err(error)) => CostSettlement::Failed {
+                            error: error.to_string(),
+                        },
+                        Err(error) => CostSettlement::Failed {
+                            error: format!("cost settlement task failed: {error}"),
+                        },
+                    },
+                )
+            }
+            None => None,
+        };
+        ensure_runtime_authority(&commit.scope, "projection").await?;
+
+        let assistant_event = match commit.history.as_ref() {
+            Some(history) if commit.status == TurnTerminalStatus::Completed => Some(
+                fabric
+                    .record_assistant_message_idempotent(
+                        commit.history_scope.clone().unwrap_or_else(|| commit.scope.clone()),
+                        history.assistant_content.clone(),
+                        format!("turn:{}:assistant", commit.terminal_id),
+                    )
+                    .await?,
+            ),
+            _ => None,
+        };
+
+        if let Some(outcome) = commit.provider_outcome.as_ref() {
+            crate::llm::route_decision::record_provider_outcome_events(fabric, commit.scope.clone(), outcome).await?;
+        }
+
+        let decision_id = commit
+            .decision
+            .is_recorded()
+            .then(|| commit.decision.decision_id.to_string());
+        let payload = TurnTerminalPayload {
+            terminal_id: &commit.terminal_id,
+            decision_id: decision_id.as_deref(),
+            status: commit.status,
+            history: &commit.history,
+            history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
+            execution_trace: execution_trace.as_ref(),
+            assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
+            provider_outcome: &commit.provider_outcome,
+            served_auxiliary: commit
+                .decision
+                .context
+                .served_auxiliary()
+                .and_then(served_auxiliary::ServedAuxiliaryLink::projection),
+            usage_settlement: &usage_settlement,
+            cost_settlement: &cost_settlement,
+            telemetry: &commit.telemetry,
+            delivery_intent: &commit.delivery_intent,
+            attempt_id: commit.scope.attempt_id.as_deref(),
+            lease_epoch: commit.scope.lease_epoch,
+        };
+        // The marker also carries the telemetry summary and the delivery intent,
+        // which callers fill with error text (and, for sub-agents, the result
+        // text): every string in it passes the same redactor.
+        let mut payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
+        if let Some(prepared) = prepared_replay {
+            let decision = &commit.decision;
+            let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+            prepared.seal(&recorded.key, &mut payload_value, assistant_event.as_ref())?;
+        }
+        let payload_json = serde_json::to_string(&payload_value)?;
+        ensure_runtime_authority(&commit.scope, "terminal-marker").await?;
+        let terminal_event = fabric
+            .record_runtime_event_idempotent(
+                commit.scope,
+                "turn.finalized",
+                format!("terminal_id={} status={:?}", commit.terminal_id, commit.status),
+                Some(payload_json),
+                format!("turn:{}:final", commit.terminal_id),
+            )
+            .await?;
+
+        if commit.decision.is_recorded() {
+            let decision = &commit.decision;
+            let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             verify_terminal_replay(
                 fabric.memory().as_ref(),
                 &recorded.reader,
                 &recorded.key,
                 &recorded.store_workspace_id,
                 fabric.workspace_id(),
-                commit.scope.owner_id.as_deref().context("terminal owner is missing")?,
+                terminal_event
+                    .owner_id
+                    .as_deref()
+                    .context("terminal owner is missing")?,
                 &commit.terminal_id,
-                &existing,
+                &terminal_event,
             )
             .await?;
-            let payload: serde_json::Value = serde_json::from_str(
-                existing
-                    .raw_payload_json
-                    .as_deref()
-                    .context("terminal marker has no payload")?,
-            )?;
+        }
+        let receipt = TurnTerminalReceipt {
+            terminal_id: commit.terminal_id,
+            terminal_event,
+            assistant_event,
+            usage_settlement,
+            cost_settlement,
+            delivery_intent: commit.delivery_intent,
+        };
+        if stop_after_marker {
+            return Ok(receipt);
+        }
+        if commit.decision.is_recorded() {
+            let decision = &commit.decision;
+            let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
+            let facts = TerminalFacts::from_receipt(&decision.context, &receipt)?;
             anyhow::ensure!(
-                existing.role == "event"
-                    && existing.event_type == "turn.finalized"
-                    && existing.source == commit.scope.source
-                    && existing.workspace_id == fabric.workspace_id()
-                    && existing.owner_id == commit.scope.owner_id
-                    && existing.session_key == commit.scope.session_key
-                    && existing.run_id == commit.scope.run_id
-                    && existing.channel == commit.scope.channel
-                    && existing.idempotency_key.as_deref() == Some(final_key.as_str())
-                    && payload.get("terminal_id").and_then(serde_json::Value::as_str)
-                        == Some(commit.terminal_id.as_str())
-                    && payload.get("decision_id").and_then(serde_json::Value::as_str)
-                        == Some(decision.decision_id.to_string().as_str())
-                    && payload.get("status").and_then(serde_json::Value::as_str)
-                        == Some(match commit.status {
-                            TurnTerminalStatus::Completed => "completed",
-                            TurnTerminalStatus::Silent => "silent",
-                            TurnTerminalStatus::Failed => "failed",
-                            TurnTerminalStatus::Cancelled => "cancelled",
-                        }),
-                "existing terminal marker conflicts with the pinned decision or scope"
+                OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued,
+                "decision outcome could not be queued after terminal commit"
             );
         }
-        // The workspace-scoped idempotency key is unique in the durable
-        // message store. Its insert/readback transaction elects one decision
-        // before any usage, cost or assistant write, including across
-        // processes. A retry of the same decision may reuse the claim.
-        let claim_key = format!("turn:{}:decision-claim", commit.terminal_id);
-        // A keyed, versioned digest binds the facts that can change terminal
-        // side effects. Redaction precedes the digest, and the durable key
-        // prevents offline guessing of short private replies or targets.
-        let mut claim_outcome = commit.provider_outcome.clone();
-        if let Some(outcome) = claim_outcome.as_mut() {
-            outcome.redact_provider_labels();
-        }
-        let trusted = decision
-            .context
-            .audit_hops()
-            .last()
-            .context("decision has no final hop")?
-            .state
-            .trusted
-            .parts();
-        // Version two prevents a valid claim from being transplanted to
-        // another terminal or decision, including across a process restart.
-        // Unsigned and version-one claims cannot authorize this path.
-        let mut semantic = redact_persisted_json(serde_json::json!({
-            "version": 2,
-            "terminal_id": commit.terminal_id,
-            "decision_id": decision.decision_id.to_string(),
-            "execution_trace": execution_trace,
-            "decision_chain": decision.context.hop_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "workspace_id": trusted.workspace_id,
-            "source_event_id": trusted.source_event_id,
-            "catalog_generation": trusted.catalog_generation.to_hex(),
-            "policy_version": trusted.policy_version,
-            "status": commit.status,
-            "scope": terminal_semantic_scope(&commit.scope),
-            "history": commit.history,
-            "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
-            "provider_outcome": claim_outcome,
-            "telemetry": commit.telemetry,
-            "delivery_intent": commit.delivery_intent,
-        }));
-        if let Some(event) = decision
-            .context
-            .served_auxiliary()
-            .and_then(served_auxiliary::ServedAuxiliaryLink::event)
-        {
-            use sha2::Digest;
-            semantic
-                .as_object_mut()
-                .context("terminal claim is not an object")?
-                .insert(
-                    "served_auxiliary".to_owned(),
-                    serde_json::json!({
-                        "event_id": event.event_id,
-                        "sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(event)?)),
-                    }),
-                );
-        }
-        let semantic_bytes = serde_json::to_vec(&semantic)?;
-        let semantic_mac = hex::encode(
-            recorded
-                .key
-                .hmac(KeyDomain::TerminalClaim, &[b"terminal-claim-v2", &semantic_bytes]),
-        );
-        let claim = fabric
-            .record_runtime_event_idempotent(
-                commit.scope.clone(),
-                "turn.decision.claimed",
-                format!("terminal_id={}", commit.terminal_id),
-                Some(
-                    serde_json::json!({
-                        "terminal_id": commit.terminal_id,
-                        "decision_id": decision.decision_id.to_string(),
-                        "semantic_mac_v2": semantic_mac,
-                    })
-                    .to_string(),
-                ),
-                &claim_key,
-            )
-            .await?;
-        let claim_payload: serde_json::Value = serde_json::from_str(
-            claim
-                .raw_payload_json
-                .as_deref()
-                .context("decision claim has no payload")?,
-        )?;
-        anyhow::ensure!(
-            claim.role == "event"
-                && claim.event_type == "turn.decision.claimed"
-                && claim.source == commit.scope.source
-                && claim.workspace_id == fabric.workspace_id()
-                && claim.owner_id == commit.scope.owner_id
-                && claim.session_key == commit.scope.session_key
-                && claim.run_id == commit.scope.run_id
-                && claim.channel == commit.scope.channel
-                && claim.idempotency_key.as_deref() == Some(claim_key.as_str())
-                && claim_payload.get("terminal_id").and_then(serde_json::Value::as_str)
-                    == Some(commit.terminal_id.as_str())
-                && claim_payload.get("decision_id").and_then(serde_json::Value::as_str)
-                    == Some(decision.decision_id.to_string().as_str())
-                && claim_payload.get("semantic_mac_v2").and_then(serde_json::Value::as_str)
-                    == Some(semantic_mac.as_str()),
-            "terminal decision claim conflicts with the pinned decision or scope"
-        );
-        prepared.bind_claim(&recorded.key, &claim)?;
-        prepared_replay = Some(prepared);
-    }
-    // Everything below persists the reply and the outcome (the assistant
-    // message event, usage settlement, cost ledger, attempt events, the
-    // terminal marker). Every surface finalizes here, so both are redacted
-    // once, here, at write: the outcome's provider labels lose their URL
-    // userinfo, and secrets in the reply and in every outcome string (provider
-    // errors included) are replaced by the one redactor, which never
-    // truncates (D-054).
-    let mut commit = commit;
-    if let Some(outcome) = commit.provider_outcome.as_mut() {
-        outcome.redact_provider_labels();
-        *outcome = crate::security::redaction::redact_json_structure(&*outcome)?;
-    }
-    if let Some(history) = commit.history.as_mut() {
-        history.assistant_content = redact_persisted_text(&history.assistant_content);
-    }
-
-    let usage_settlement = commit
-        .provider_outcome
-        .as_ref()
-        .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
-
-    // The canonical usage event is written before the JSONL projection. A
-    // crash can therefore leave usage awaiting projection, but can no longer
-    // leave an untraceable cost-only settlement.
-    if let Some(usage) = usage_settlement.as_ref() {
-        let usage_json = serde_json::to_string(usage)?;
-        fabric
-            .record_runtime_event_idempotent(
-                commit.scope.clone(),
-                "usage.settled",
-                format!("settlement_id={}", commit.terminal_id),
-                Some(usage_json),
-                format!("turn:{}:usage", commit.terminal_id),
-            )
-            .await?;
-    }
-
-    let cost_settlement = match usage_settlement.as_ref() {
-        Some(usage) => {
-            let cost_config = cost_config.clone();
-            let workspace_dir = workspace_dir.to_path_buf();
-            let usage = usage.clone();
-            Some(
-                match crate::runtime::blocking::spawn_blocking(move || {
-                    let tracker = crate::cost::tracker::CostTracker::for_workspace(cost_config, &workspace_dir)?;
-                    tracker.settle_metered(&usage)
-                })
-                .await
-                {
-                    Ok(Ok(settlement)) => settlement,
-                    Ok(Err(error)) => CostSettlement::Failed {
-                        error: error.to_string(),
-                    },
-                    Err(error) => CostSettlement::Failed {
-                        error: format!("cost settlement task failed: {error}"),
-                    },
-                },
-            )
-        }
-        None => None,
-    };
-    ensure_runtime_authority(&commit.scope, "projection").await?;
-
-    let assistant_event = match commit.history.as_ref() {
-        Some(history) if commit.status == TurnTerminalStatus::Completed => Some(
-            fabric
-                .record_assistant_message_idempotent(
-                    commit.history_scope.clone().unwrap_or_else(|| commit.scope.clone()),
-                    history.assistant_content.clone(),
-                    format!("turn:{}:assistant", commit.terminal_id),
-                )
-                .await?,
-        ),
-        _ => None,
-    };
-
-    if let Some(outcome) = commit.provider_outcome.as_ref() {
-        crate::llm::route_decision::record_provider_outcome_events(fabric, commit.scope.clone(), outcome).await?;
-    }
-
-    let decision_id = commit
-        .decision
-        .is_recorded()
-        .then(|| commit.decision.decision_id.to_string());
-    let payload = TurnTerminalPayload {
-        terminal_id: &commit.terminal_id,
-        decision_id: decision_id.as_deref(),
-        status: commit.status,
-        history: &commit.history,
-        history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
-        execution_trace: execution_trace.as_ref(),
-        assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
-        provider_outcome: &commit.provider_outcome,
-        served_auxiliary: commit
-            .decision
-            .context
-            .served_auxiliary()
-            .and_then(served_auxiliary::ServedAuxiliaryLink::projection),
-        usage_settlement: &usage_settlement,
-        cost_settlement: &cost_settlement,
-        telemetry: &commit.telemetry,
-        delivery_intent: &commit.delivery_intent,
-        attempt_id: commit.scope.attempt_id.as_deref(),
-        lease_epoch: commit.scope.lease_epoch,
-    };
-    // The marker also carries the telemetry summary and the delivery intent,
-    // which callers fill with error text (and, for sub-agents, the result
-    // text): every string in it passes the same redactor.
-    let mut payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
-    if let Some(prepared) = prepared_replay {
-        let decision = &commit.decision;
-        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-        prepared.seal(&recorded.key, &mut payload_value, assistant_event.as_ref())?;
-    }
-    let payload_json = serde_json::to_string(&payload_value)?;
-    ensure_runtime_authority(&commit.scope, "terminal-marker").await?;
-    let terminal_event = fabric
-        .record_runtime_event_idempotent(
-            commit.scope,
-            "turn.finalized",
-            format!("terminal_id={} status={:?}", commit.terminal_id, commit.status),
-            Some(payload_json),
-            format!("turn:{}:final", commit.terminal_id),
-        )
-        .await?;
-
-    if commit.decision.is_recorded() {
-        let decision = &commit.decision;
-        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-        verify_terminal_replay(
-            fabric.memory().as_ref(),
-            &recorded.reader,
-            &recorded.key,
-            &recorded.store_workspace_id,
-            fabric.workspace_id(),
-            terminal_event
-                .owner_id
-                .as_deref()
-                .context("terminal owner is missing")?,
-            &commit.terminal_id,
-            &terminal_event,
-        )
-        .await?;
-    }
-    let receipt = TurnTerminalReceipt {
-        terminal_id: commit.terminal_id,
-        terminal_event,
-        assistant_event,
-        usage_settlement,
-        cost_settlement,
-        delivery_intent: commit.delivery_intent,
-    };
-    if stop_after_marker {
-        return Ok(receipt);
-    }
-    if commit.decision.is_recorded() {
-        let decision = &commit.decision;
-        let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-        let facts = TerminalFacts::from_receipt(&decision.context, &receipt)?;
-        anyhow::ensure!(
-            OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued,
-            "decision outcome could not be queued after terminal commit"
-        );
-    }
-    Ok(receipt)
+        Ok(receipt)
+    })
+    .await
 }
 
 /// Test support for the D-053 per-surface probes: a secret one surface's turn
