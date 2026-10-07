@@ -158,7 +158,7 @@ impl AdmittedTurn {
         origin: FixtureOrigin,
         selection: (&str, &str),
     ) -> Self {
-        Self::build_mode(config, input, registry, memory, origin, selection, false).await
+        Self::build_mode(config, input, registry, memory, origin, selection, None).await
     }
 
     /// Explicit engine-only Answer fixture; existing Off/Builtin helpers are unchanged.
@@ -186,7 +186,36 @@ impl AdmittedTurn {
             memory,
             FixtureOrigin::Cli { recorded: true },
             ("ollama", "prx-local-model"),
-            true,
+            Some(false),
+        )
+        .await
+    }
+
+    /// Explicit real native-schema fixture; legacy disabled helpers are unchanged.
+    pub(crate) async fn configured_native_schema(
+        mut config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        endpoint: &str,
+        provider: &dyn crate::providers::Provider,
+    ) -> Self {
+        let capabilities = provider.capabilities();
+        assert!(
+            capabilities.native_tool_calling,
+            "actual fixture provider must consume native schemas"
+        );
+        assert!(!capabilities.vision, "this fixture declares no vision operation");
+        crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
+            .expect("actual configured native decision endpoint");
+        Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            ("ollama", "prx-local-model"),
+            Some(capabilities.native_tool_calling),
         )
         .await
     }
@@ -198,17 +227,17 @@ impl AdmittedTurn {
         memory: Arc<dyn crate::memory::Memory>,
         origin: FixtureOrigin,
         selection: (&str, &str),
-        configured_answer: bool,
+        configured_native_tools: Option<bool>,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
-        if !configured_answer {
+        if configured_native_tools.is_none() {
             config.causal_tree.enabled = false;
         }
         config.providers.models.push(
             serde_json::from_value(serde_json::json!({
                 "provider": selection.0, "model": selection.1,
-                "operations": ["chat"], "native_tools": !configured_answer,
+                "operations": ["chat"], "native_tools": configured_native_tools.unwrap_or(true),
             }))
             .expect("local fixture model descriptor"),
         );
@@ -272,7 +301,7 @@ impl AdmittedTurn {
                     ..Default::default()
                 },
                 provider_catalog: &provider_catalog,
-                transports: if configured_answer {
+                transports: if configured_native_tools.is_some() {
                     &crate::decision::compatible_http::HttpDecisionTransports
                 } else {
                     &NoExternalTransport
@@ -288,7 +317,7 @@ impl AdmittedTurn {
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
         .expect("fixture loop runtime");
-        if configured_answer {
+        if configured_native_tools.is_some() {
             crate::runtime::turn_cleanup::current_tracker()
                 .expect("Answer fixture must have an actual cleanup owner")
                 .retain_service(Arc::clone(&service));
