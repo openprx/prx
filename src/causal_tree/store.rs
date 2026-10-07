@@ -3366,6 +3366,12 @@ mod tests {
 
             let path = db_path(temp.path());
             let conn = Connection::open(&path).expect("downgrade fixture");
+            conn.execute_batch(
+                "DROP TABLE child_outcomes; \
+                 DROP INDEX decisions_scope_time; \
+                 CREATE INDEX decisions_scope_time ON decisions(workspace_id, owner_id, created_at_ms);",
+            )
+            .expect("remove v5 child settlements and restore the v1 scope index");
             conn.execute_batch("ALTER TABLE decisions DROP COLUMN prior_decision_id")
                 .expect("remove v3 column");
             if version == 1 {
