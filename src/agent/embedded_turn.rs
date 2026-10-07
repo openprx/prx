@@ -696,9 +696,7 @@ async fn run_work(
                         };
                         eprintln!("PRX_AUTOMIX_ADMISSION_DIAGNOSTIC stage={admission_stage} reason={reason}");
                     }
-                    source
-                        .record_automix_admission_refusal(&automix.premium_model_id)
-                        .await?;
+                    source.record_automix_budget_refusal(&automix.premium_model_id).await?;
                 }
             }
         }

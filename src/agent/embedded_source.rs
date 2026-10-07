@@ -713,7 +713,7 @@ impl EmbeddedAgentSource {
     }
 
     #[cfg(feature = "llm-router")]
-    pub(super) async fn record_automix_admission_refusal(&self, premium: &str) -> anyhow::Result<()> {
+    pub(super) async fn record_automix_budget_refusal(&self, premium: &str) -> anyhow::Result<()> {
         let scope = self.envelope.message_scope();
         let summary = "premium attempt not dispatched: local admission not confirmed";
         let payload = serde_json::json!({
