@@ -84,59 +84,16 @@ fn truncate_to_utf8_boundary(mut bytes: Vec<u8>, max_bytes: usize) -> Vec<u8> {
     bytes
 }
 
-#[async_trait]
-impl Tool for FileReadTool {
-    fn name(&self) -> &str {
-        "file_read"
-    }
-
-    fn description(&self) -> &str {
-        "Read the contents of a file in the workspace"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file within the workspace"
-                },
-                "max_bytes": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Optional maximum bytes to return"
-                }
-            },
-            "required": ["path"]
-        })
-    }
-
-    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
-        static SPEC: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
-        Some(std::slice::from_ref(SPEC.get_or_init(|| self.spec())))
-    }
-
-    fn catalog_availability_is_configured(&self) -> bool {
-        // FileRead uses the Tool default Ready availability in both ACL modes.
-        true
-    }
-
-    async fn execute_with_cancellation(
-        &self,
-        args: serde_json::Value,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> anyhow::Result<ToolResult> {
-        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
-    }
-
-    fn supports_owner_filesystem(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+impl FileReadTool {
+    async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(scope) = super::owner_filesystem_dispatch::current() {
-            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+            return super::owner_filesystem_dispatch::apply_file_operation(
+                scope,
+                &self.security,
+                super::owner_filesystem_dispatch::NativeFileOperation::Read,
+                args,
+            )
+            .await;
         }
         let path = args
             .get("path")
@@ -259,6 +216,65 @@ impl Tool for FileReadTool {
                 error: Some(format!("Failed to read file: {e}")),
             }),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for FileReadTool {
+    fn name(&self) -> &str {
+        "file_read"
+    }
+
+    fn description(&self) -> &str {
+        "Read the contents of a file in the workspace"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path to the file within the workspace"
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional maximum bytes to return"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+        static SPEC: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        Some(std::slice::from_ref(SPEC.get_or_init(|| self.spec())))
+    }
+
+    fn catalog_availability_is_configured(&self) -> bool {
+        // FileRead uses the Tool default Ready availability in both ACL modes.
+        true
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::supervise_file_operation(
+            || Box::pin(self.execute_operation(args)),
+            cancellation,
+        )
+        .await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_operation(args).await
     }
 
     fn tier(&self) -> ToolTier {

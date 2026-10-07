@@ -29,62 +29,16 @@ impl FileEditTool {
     }
 }
 
-#[async_trait]
-impl Tool for FileEditTool {
-    fn name(&self) -> &str {
-        "file_edit"
-    }
-
-    fn description(&self) -> &str {
-        "Perform an exact string replacement in an existing workspace file (like Claude Code's Edit). \
-         Reads the file, replaces 'old_string' with 'new_string', and writes it back. \
-         Prefer this over file_write for targeted edits to large files — it never rewrites \
-         unrelated content. By default 'old_string' must match exactly once: include enough \
-         surrounding context to make it unique. Set 'replace_all' to true to replace every \
-         occurrence (e.g. renaming a symbol). If 'old_string' is missing or not unique the file \
-         is left unchanged and an error is returned."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file within the workspace"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact text to replace. Must match the file content verbatim, including whitespace and indentation."
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The text to replace it with. Must differ from old_string."
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences instead of requiring a unique match. Default: false."
-                }
-            },
-            "required": ["path", "old_string", "new_string"]
-        })
-    }
-
-    async fn execute_with_cancellation(
-        &self,
-        args: serde_json::Value,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> anyhow::Result<ToolResult> {
-        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
-    }
-
-    fn supports_owner_filesystem(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+impl FileEditTool {
+    async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(scope) = super::owner_filesystem_dispatch::current() {
-            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+            return super::owner_filesystem_dispatch::apply_file_operation(
+                scope,
+                &self.security,
+                super::owner_filesystem_dispatch::NativeFileOperation::Edit,
+                args,
+            )
+            .await;
         }
         let path = args
             .get("path")
@@ -317,6 +271,68 @@ impl Tool for FileEditTool {
                 error: Some(format!("Failed to write file: {e}")),
             }),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for FileEditTool {
+    fn name(&self) -> &str {
+        "file_edit"
+    }
+
+    fn description(&self) -> &str {
+        "Perform an exact string replacement in an existing workspace file (like Claude Code's Edit). \
+         Reads the file, replaces 'old_string' with 'new_string', and writes it back. \
+         Prefer this over file_write for targeted edits to large files — it never rewrites \
+         unrelated content. By default 'old_string' must match exactly once: include enough \
+         surrounding context to make it unique. Set 'replace_all' to true to replace every \
+         occurrence (e.g. renaming a symbol). If 'old_string' is missing or not unique the file \
+         is left unchanged and an error is returned."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path to the file within the workspace"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact text to replace. Must match the file content verbatim, including whitespace and indentation."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The text to replace it with. Must differ from old_string."
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace all occurrences instead of requiring a unique match. Default: false."
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::supervise_file_operation(
+            || Box::pin(self.execute_operation(args)),
+            cancellation,
+        )
+        .await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_operation(args).await
     }
 
     fn tier(&self) -> ToolTier {

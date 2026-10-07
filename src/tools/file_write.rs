@@ -22,48 +22,16 @@ impl FileWriteTool {
     }
 }
 
-#[async_trait]
-impl Tool for FileWriteTool {
-    fn name(&self) -> &str {
-        "file_write"
-    }
-
-    fn description(&self) -> &str {
-        "Write contents to a file in the workspace"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file within the workspace"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        })
-    }
-
-    async fn execute_with_cancellation(
-        &self,
-        args: serde_json::Value,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> anyhow::Result<ToolResult> {
-        super::owner_filesystem_dispatch::execute_with_cancellation(self, args, cancellation).await
-    }
-
-    fn supports_owner_filesystem(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+impl FileWriteTool {
+    async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(scope) = super::owner_filesystem_dispatch::current() {
-            return super::owner_filesystem_dispatch::execute(scope, &self.security, self.name(), args).await;
+            return super::owner_filesystem_dispatch::apply_file_operation(
+                scope,
+                &self.security,
+                super::owner_filesystem_dispatch::NativeFileOperation::Write,
+                args,
+            )
+            .await;
         }
         let path = args
             .get("path")
@@ -229,6 +197,54 @@ impl Tool for FileWriteTool {
                 error: Some(format!("Failed to write file: {e}")),
             }),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for FileWriteTool {
+    fn name(&self) -> &str {
+        "file_write"
+    }
+
+    fn description(&self) -> &str {
+        "Write contents to a file in the workspace"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path to the file within the workspace"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write to the file"
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        super::owner_filesystem_dispatch::supervise_file_operation(
+            || Box::pin(self.execute_operation(args)),
+            cancellation,
+        )
+        .await
+    }
+
+    fn supports_owner_filesystem(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_operation(args).await
     }
 
     fn tier(&self) -> ToolTier {
