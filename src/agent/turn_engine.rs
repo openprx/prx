@@ -175,6 +175,18 @@ fn neutralize_middleware_user_messages(before: &[ChatMessage], candidate: Vec<Ch
         .collect()
 }
 
+/// Apply a valid middleware replacement to its actual prior message buffer.
+#[cfg(feature = "wasm-plugins")]
+fn apply_middleware_messages(history: &mut Vec<ChatMessage>, transformed: &serde_json::Value) {
+    if let Some(messages) = transformed.get("messages")
+        && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
+        && !candidate.is_empty()
+        && candidate.iter().all(|message| !message.role.trim().is_empty())
+    {
+        *history = neutralize_middleware_user_messages(history, candidate);
+    }
+}
+
 /// The bytes an accepted turn delivers once outbound middleware has had its say.
 ///
 /// `accepted` is the text the terminal branch accepted; `transformed` is what
@@ -307,13 +319,7 @@ async fn run_turn_unguarded(
                     serde_json::json!({"channel": channel_name, "messages": history}),
                 )
                 .await;
-            if let Some(messages) = transformed.get("messages")
-                && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
-                && !candidate.is_empty()
-                && candidate.iter().all(|message| !message.role.trim().is_empty())
-            {
-                *history = neutralize_middleware_user_messages(history, candidate);
-            }
+            apply_middleware_messages(history, &transformed);
         }
         let spec = lease.proposal_spec();
         let mut proposal_messages = history.clone();
@@ -331,13 +337,7 @@ async fn run_turn_unguarded(
                     }),
                 )
                 .await;
-            if let Some(messages) = transformed.get("messages")
-                && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
-                && !candidate.is_empty()
-                && candidate.iter().all(|message| !message.role.trim().is_empty())
-            {
-                proposal_messages = neutralize_middleware_user_messages(&proposal_messages, candidate);
-            }
+            apply_middleware_messages(&mut proposal_messages, &transformed);
             if let Some(tools) = transformed.get("tools")
                 && let Ok(candidate) = serde_json::from_value::<Vec<crate::tools::ToolSpec>>(tools.clone())
             {
@@ -573,13 +573,7 @@ async fn run_turn_unguarded(
                 }),
             )
             .await;
-        if let Some(messages) = transformed.get("messages")
-            && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
-            && !candidate.is_empty()
-            && candidate.iter().all(|message| !message.role.trim().is_empty())
-        {
-            *history = neutralize_middleware_user_messages(history, candidate);
-        }
+        apply_middleware_messages(history, &transformed);
     }
 
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
