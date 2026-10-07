@@ -151,20 +151,64 @@ impl AdmittedTurn {
     }
 
     async fn build(
-        mut config: crate::config::Config,
+        config: crate::config::Config,
         input: &str,
         registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
         memory: Arc<dyn crate::memory::Memory>,
         origin: FixtureOrigin,
         selection: (&str, &str),
     ) -> Self {
+        Self::build_mode(config, input, registry, memory, origin, selection, false).await
+    }
+
+    /// Explicit engine-only Answer fixture; existing Off/Builtin helpers are unchanged.
+    pub(crate) async fn configured_answer(workspace: &Path, input: &str, endpoint: &str) -> Self {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_owned();
+        config.config_path = workspace.join("config.toml");
+        crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
+            .expect("actual configured decision endpoint");
+        config.cost.prices.insert(
+            "ollama/prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace).expect("owned Answer fixture SQLite"));
+        Self::build_mode(
+            config,
+            input,
+            Arc::new(Vec::new()),
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            ("ollama", "prx-local-model"),
+            true,
+        )
+        .await
+    }
+
+    async fn build_mode(
+        mut config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        origin: FixtureOrigin,
+        selection: (&str, &str),
+        configured_answer: bool,
+    ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
-        config.causal_tree.enabled = false;
+        if !configured_answer {
+            config.causal_tree.enabled = false;
+        }
         config.providers.models.push(
             serde_json::from_value(serde_json::json!({
                 "provider": selection.0, "model": selection.1,
-                "operations": ["chat"], "native_tools": true,
+                "operations": ["chat"], "native_tools": !configured_answer,
             }))
             .expect("local fixture model descriptor"),
         );
@@ -228,7 +272,11 @@ impl AdmittedTurn {
                     ..Default::default()
                 },
                 provider_catalog: &provider_catalog,
-                transports: &NoExternalTransport,
+                transports: if configured_answer {
+                    &crate::decision::compatible_http::HttpDecisionTransports
+                } else {
+                    &NoExternalTransport
+                },
                 events: Arc::new(SilentEvents),
                 memory: Arc::clone(&memory),
                 security,
@@ -240,6 +288,11 @@ impl AdmittedTurn {
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
         .expect("fixture loop runtime");
+        if configured_answer {
+            crate::runtime::turn_cleanup::current_tracker()
+                .expect("Answer fixture must have an actual cleanup owner")
+                .retain_service(Arc::clone(&service));
+        }
         let (proof, envelope): (Box<dyn TurnSourceProof>, _) = match origin {
             FixtureOrigin::Channel(message) => {
                 let (proof, envelope) = crate::channels::decision_source::recorded_fixture_source(

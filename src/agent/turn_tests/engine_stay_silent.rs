@@ -61,6 +61,64 @@ async fn run_without_tools(
     (outcome, history)
 }
 
+async fn run_without_tools_configured_answer(
+    responses: Vec<&str>,
+    workspace: &std::path::Path,
+    endpoint: &str,
+) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
+    let provider = ScriptedProvider::from_text_responses(responses);
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+    assert!(!provider.capabilities().native_tool_calling);
+    assert!(!provider.capabilities().vision);
+    let admission =
+        crate::agent::turn_tests::admission::AdmittedTurn::configured_answer(workspace, "hi", endpoint).await;
+    admission.assert_selected_specs(&[]);
+    let outcome = run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "terminal",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry,
+            observer: &NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admission.adapter()),
+            memory: ToolLoopMemory::none(),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await;
+    let _ = admission.decision().context.terminal_execution_trace();
+    assert!(
+        provider.responses.lock().expect("responses lock").is_empty(),
+        "both original scripted responses consumed"
+    );
+    (outcome, history)
+}
+
 #[test]
 fn tool_summary_only_response_requires_an_exact_standalone_marker() {
     assert!(is_tool_summary_only_response("[Used tools: shell]"));
@@ -76,7 +134,36 @@ fn tool_summary_only_response_requires_an_exact_standalone_marker() {
 
 #[tokio::test]
 async fn empty_assistant_response_retries_and_returns_real_answer() {
-    let (result, history) = run_without_tools(vec!["   \n", "Recovered answer."]).await;
+    use futures::FutureExt;
+    let workspace = TempDir::new().expect("owned retry workspace").keep();
+    eprintln!("owned_retry_workspace={}", workspace.display());
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned actual compatible Answer endpoint");
+    let endpoint = driver.endpoint().to_owned();
+    let (result, history) = driver
+        .run_factory(true, || async {
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("actual retry cleanup owner");
+            let caught = cleanup
+                .run(async {
+                    Ok(std::panic::AssertUnwindSafe(run_without_tools_configured_answer(
+                        vec!["   \n", "Recovered answer."],
+                        &workspace,
+                        &endpoint,
+                    ))
+                    .catch_unwind()
+                    .await)
+                })
+                .await
+                .expect("both actual service queues and owner must drain");
+            match caught {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+        .await;
     let (outcome, _trace) = result.expect("empty response corrective retry should complete");
 
     assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
