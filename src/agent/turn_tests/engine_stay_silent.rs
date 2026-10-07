@@ -119,6 +119,42 @@ async fn run_without_tools_configured_answer(
     (outcome, history)
 }
 
+// Explicit enabled Answer admission for downstream no-tool retry semantics.
+// The original disabled helper and its remaining callers stay unchanged.
+async fn run_owned_no_tool_retry(
+    responses: Vec<&str>,
+) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
+    use futures::FutureExt;
+    let workspace = TempDir::new().expect("owned retry workspace").keep();
+    eprintln!("owned_retry_workspace={}", workspace.display());
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned actual compatible Answer endpoint")
+        .retain_evidence_at(workspace.clone());
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("actual retry cleanup owner");
+            let caught = cleanup
+                .run(async {
+                    Ok(std::panic::AssertUnwindSafe(run_without_tools_configured_answer(
+                        responses, &workspace, &endpoint,
+                    ))
+                    .catch_unwind()
+                    .await)
+                })
+                .await
+                .expect("both actual service queues and owner must drain");
+            match caught {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+        .await
+}
+
 #[test]
 fn tool_summary_only_response_requires_an_exact_standalone_marker() {
     assert!(is_tool_summary_only_response("[Used tools: shell]"));
@@ -240,7 +276,7 @@ async fn empty_response_retry_keeps_one_leading_system_message_unchanged() {
 
 #[tokio::test]
 async fn repeated_empty_assistant_response_fails_without_polluting_history() {
-    let (result, history) = run_without_tools(vec!["", " \n "]).await;
+    let (result, history) = run_owned_no_tool_retry(vec!["", " \n "]).await;
     let error = result.expect_err("a repeated empty response must fail closed");
 
     assert!(error.to_string().contains("after one corrective retry"));
@@ -250,7 +286,8 @@ async fn repeated_empty_assistant_response_fails_without_polluting_history() {
 
 #[tokio::test]
 async fn tool_summary_only_response_retries_and_returns_real_answer() {
-    let (result, history) = run_without_tools(vec!["[Used tools: shell]", "The requested check completed."]).await;
+    let (result, history) =
+        run_owned_no_tool_retry(vec!["[Used tools: shell]", "The requested check completed."]).await;
     let (outcome, _trace) = result.expect("corrective retry should complete");
 
     assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The requested check completed."));
@@ -270,7 +307,7 @@ async fn tool_summary_only_response_retries_and_returns_real_answer() {
 
 #[tokio::test]
 async fn repeated_tool_summary_only_response_fails_without_polluting_history() {
-    let (result, history) = run_without_tools(vec!["[Used tools: shell]", "[Used tools: shell]"]).await;
+    let (result, history) = run_owned_no_tool_retry(vec!["[Used tools: shell]", "[Used tools: shell]"]).await;
     let error = result.expect_err("a repeated summary-only response must fail closed");
 
     assert!(error.to_string().contains("after one corrective retry"));
