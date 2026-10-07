@@ -4328,6 +4328,7 @@ mod tests {
         for catalog_size in [64_usize, 0, 64, 0] {
             let workspace = tempfile::tempdir().expect("test workspace");
             let mut config = crate::config::Config::default();
+            config.causal_tree.enabled = false;
             config.workspace_dir = workspace.path().to_path_buf();
             let generation = crate::config::new_shared(config.clone()).pin();
             let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
@@ -5317,6 +5318,7 @@ mod tests {
     fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config.agent.compaction.max_context_tokens = 32_768;
         config.agent.compaction.max_context_tokens_explicit = true;
@@ -5545,6 +5547,7 @@ mod tests {
     async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.backend.max_request_bytes = 4096;
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -6693,6 +6696,7 @@ mod tests {
     fn agent_hint_route_drift_is_refused_before_credential_resolution() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config.model_routes.push(crate::config::ModelRouteConfig {
             hint: "fast".to_string(),
@@ -6750,6 +6754,7 @@ mod tests {
     fn verified_native_tools_requires_matching_source_selection() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config
             .providers
@@ -6890,6 +6895,7 @@ mod tests {
     fn disabled_service_uses_an_independent_read_only_view_when_a_writer_is_shared() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config.clone()).pin();
         let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
@@ -8433,6 +8439,7 @@ mod tests {
         std::fs::create_dir(workspace.path().join("self")).expect("test self directory");
         symlink(outside.path(), workspace.path().join("self/causal_tree")).expect("test unsafe store path");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config.clone()).pin();
         let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
