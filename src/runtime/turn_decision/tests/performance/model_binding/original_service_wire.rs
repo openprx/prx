@@ -94,12 +94,6 @@ async fn run_witness(slow: bool) {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.clone();
         config.config_path = workspace.join("config.toml");
-        config.causal_tree.enabled = true;
-        config.causal_tree.policy.extra_latency_budget_ms = 500;
-        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
-        config.causal_tree.backend.endpoint = endpoint.clone();
-        config.causal_tree.backend.model = "prx-decision-model".to_owned();
-        config.causal_tree.backend.timeout_ms = 100;
         let provider = format!("custom:{endpoint}");
         for declaration in [
             json!({"provider":"ollama","model":"prx-local-model","operations":["chat"],"native_tools":true}),
@@ -109,6 +103,26 @@ async fn run_witness(slow: bool) {
             config.cost.prices.insert(key, crate::config::schema::ModelPricing { input:1.0, output:1.0, cache_write:1.0, cache_read:1.0 });
         }
         assert!(matches!(crate::llm::route_decision::usage_cost_resolution(&provider,"prx-decision-model",1,0,0,0,&config.cost),crate::llm::route_decision::UsagePrice::Priced(cost) if cost>0.0));
+        config = crate::config::manage::mutation::causal::CausalConfigService::mutate(
+            &config,
+            &[
+                crate::config::manage::mutation::causal::CausalMutation::SetEnabled(true),
+                crate::config::manage::mutation::causal::CausalMutation::SetPolicy(
+                    crate::config::manage::mutation::causal::PolicyPatch {
+                        extra_latency_budget_ms: Some(500),
+                        ..Default::default()
+                    },
+                ),
+                crate::config::manage::mutation::causal::CausalMutation::SetBackend {
+                    kind: crate::decision::BackendKind::CompatibleHttp,
+                    endpoint: Some(endpoint.clone()),
+                    model: Some("prx-decision-model".to_owned()),
+                    pinned_snapshot: None,
+                    timeout_ms: Some(100),
+                },
+            ],
+        )
+        .expect("actual fixture decision configuration through its owner");
         config.causal_tree.validate().expect("unchanged 100/500ms legal policy");
         let generation = crate::config::new_shared(config.clone()).pin();
         let registry = Arc::new(Vec::<Box<dyn Tool>>::new());
