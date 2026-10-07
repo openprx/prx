@@ -713,7 +713,6 @@ explicit signal from the upstream.
 - Stream idle timeout is controlled by
   `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default 45 seconds, minimum 5).
 
-
 A resolved keyless root connection for Ollama (non-cloud models) or an
 OpenAI-compatible `custom:` endpoint keeps its configured endpoint and
 provider-owned rotation keys. Its initial provider is constructed without
