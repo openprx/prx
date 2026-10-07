@@ -456,3 +456,176 @@ fn an_unlisted_kimi_code_model_is_still_refused() {
     assert!(format!("{error:#}").contains("kimi-code"), "{error:#}");
     resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3")).expect("test: a listed model");
 }
+
+/// Real wire plus actual factory lookup observation: no header-only inference.
+#[tokio::test]
+async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
+    use futures_util::FutureExt;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    struct Server(tokio::task::JoinHandle<std::io::Result<()>>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    for label in ["ollama", "custom", "openai"] {
+        let temp = tempfile::tempdir().expect("owned configuration");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("owned listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
+        let handler = axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let capture = Arc::clone(&capture);
+            async move {
+                capture.lock().push(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .map(|value| value.to_str().expect("neutral header").to_owned()),
+                );
+                axum::Json(serde_json::json!({
+                    "model": "prx-local-model", "done": true,
+                    "message": {"role":"assistant", "content":"PRX keyless reply"},
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"PRX keyless reply"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                }))
+            }
+        });
+        let app = axum::Router::new()
+            .route("/api/chat", handler.clone())
+            .route("/chat/completions", handler.clone())
+            .route("/v1/chat/completions", handler);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let mut server = Server(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let mut config = isolated_config(&temp);
+            config.causal_tree.enabled = false;
+            config.api_key = None;
+            config.api_url = Some(endpoint.clone());
+            let provider_label = if label == "custom" {
+                format!("custom:{endpoint}/v1")
+            } else {
+                label.to_owned()
+            };
+            config.default_provider = Some(provider_label.clone());
+            config.default_model = Some("prx-local-model".to_owned());
+            config.secrets.encrypt = false;
+            let store = crate::auth::profiles::AuthProfilesStore::new(temp.path(), false);
+            store
+                .upsert_profile(
+                    crate::auth::profiles::AuthProfile::new_token(
+                        &provider_label,
+                        "default",
+                        "PRX-CONFLICTING-PROFILE".into(),
+                    ),
+                    true,
+                )
+                .expect("owned conflicting profile");
+            let choice = resolve_agent_model_choice(&config, None, None).expect("actual resolved connection");
+            let options = crate::providers::provider_runtime_options_from_config(&config);
+            if label != "openai" {
+                let selection = agent_provider_selection(&config, &choice);
+                let mut changed = config.clone();
+                changed.model_routes.push(crate::config::ModelRouteConfig {
+                    hint: "prx_route".into(),
+                    provider: provider_label.clone(),
+                    model: "prx-local-model".into(),
+                    api_key: Some("PRX-CHANGED-ROUTE".into()),
+                    credential_ref: None,
+                });
+                let (refused, counts) = crate::providers::credential_resolution_observation::observe(|| {
+                    selection.build_provider(&changed, &options)
+                });
+                assert!(refused.is_err());
+                assert_eq!(counts, [0, 0, 0]);
+                assert!(seen.lock().is_empty());
+            }
+            let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
+                agent_provider_selection(&config, &choice).build_provider(&config, &options)
+            });
+            let provider = provider.expect("actual provider construction");
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.simple_chat("ping", "prx-local-model", 0.0),
+            )
+            .await
+            .expect("bounded wire")
+            .expect("actual reply");
+            assert_eq!(reply, "PRX keyless reply");
+            {
+                let requests = seen.lock();
+                assert_eq!(requests.len(), 1);
+                if label == "openai" {
+                    assert!(counts.first().is_some_and(|count| *count > 0));
+                    assert!(counts.get(1).is_some_and(|count| *count > 0));
+                    assert_eq!(
+                        requests.first().and_then(Option::as_deref),
+                        Some("Bearer PRX-CONFLICTING-PROFILE")
+                    );
+                } else {
+                    assert_eq!(counts, [0, 0, 0]);
+                    assert!(requests.first().is_some_and(Option::is_none));
+                }
+            }
+            // The typed PMM factory must preserve the same absence independently
+            // of the CLI routed entry, with the same non-vacuous legacy control.
+            let catalog = crate::providers::selection::catalog_for(&config);
+            let (typed, typed_counts) = crate::providers::credential_resolution_observation::observe(|| {
+                crate::providers::create_provider_for(&choice.resolved, &catalog, &config.reliability, &options)
+            });
+            let typed = typed.expect("typed resolved construction");
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                typed.simple_chat("ping", "prx-local-model", 0.0),
+            )
+            .await
+            .expect("bounded typed wire")
+            .expect("typed reply");
+            assert_eq!(reply, "PRX keyless reply");
+            {
+                let requests = seen.lock();
+                assert_eq!(requests.len(), 2);
+                if label == "openai" {
+                    assert!(typed_counts.first().is_some_and(|count| *count > 0));
+                    assert!(typed_counts.get(1).is_some_and(|count| *count > 0));
+                    assert!(
+                        requests
+                            .iter()
+                            .all(|header| header.as_deref() == Some("Bearer PRX-CONFLICTING-PROFILE"))
+                    );
+                } else {
+                    assert_eq!(typed_counts, [0, 0, 0]);
+                    assert!(requests.iter().all(Option::is_none));
+                }
+            }
+            let generation = crate::config::new_shared(config).pin();
+            let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
+                .with_config_generation(&generation);
+            let proof = issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice);
+            assert_eq!(proof.is_ok(), label != "openai");
+        })
+        .catch_unwind()
+        .await;
+        let _ = stop.send(());
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), &mut server.0).await;
+        if completion.is_err() {
+            server.0.abort();
+            let _ = (&mut server.0).await;
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        completion
+            .expect("server drain deadline")
+            .expect("server task")
+            .expect("server result");
+    }
+}

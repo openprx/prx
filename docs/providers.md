@@ -712,3 +712,14 @@ explicit signal from the upstream.
   `provider_response_parse_error`.
 - Stream idle timeout is controlled by
   `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default 45 seconds, minimum 5).
+
+
+A resolved keyless root connection for Ollama (non-cloud models) or an
+OpenAI-compatible `custom:` endpoint keeps its configured endpoint and
+provider-owned rotation keys. Its initial provider is constructed without
+looking up an auth profile. This applies to a PMM-resolved root connection;
+legacy provider-store lookup and explicit profile/OAuth flows keep their existing
+behavior. Key-required providers such as OpenAI still use their configured
+profile fallback when the root has no key, and that fallback cannot attest a
+root credential for CLI decision authority. A connection is never released to a
+different provider identity.

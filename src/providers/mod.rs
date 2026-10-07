@@ -648,6 +648,8 @@ fn claude_code_token_expired(credentials: &ClaudeCodeCredentials) -> bool {
 }
 
 fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
+    #[cfg(test)]
+    credential_resolution_observation::record(2);
     let client_id = qwen_oauth_client_id();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -804,6 +806,8 @@ static OAUTH_TEST_OVERRIDES: parking_lot::RwLock<OauthTestOverrides> = parking_l
 });
 
 pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
+    #[cfg(test)]
+    credential_resolution_observation::record(2);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -1050,6 +1054,8 @@ fn resolve_claude_code_context(credential_override: Option<&str>, refresh: Oauth
 }
 
 fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
+    #[cfg(test)]
+    credential_resolution_observation::record(2);
     let endpoint = oauth_token_endpoint(OauthTokenEndpoint::Minimax(minimax_oauth_region(name)));
     let client_id = minimax_oauth_client_id();
     let client = reqwest::blocking::Client::builder()
@@ -1751,6 +1757,8 @@ fn resolve_provider_credentials_with(
     options: &ProviderRuntimeOptions,
     refresh: OauthRefresh,
 ) -> ResolvedProviderCredentials {
+    #[cfg(test)]
+    credential_resolution_observation::record(0);
     if is_qwen_oauth_alias(name) {
         let context = resolve_qwen_oauth_context(credential_override, refresh);
         return ResolvedProviderCredentials {
@@ -1828,6 +1836,8 @@ pub(crate) fn probe_credential(
 }
 
 fn resolve_auth_profile_credential(name: &str, options: &ProviderRuntimeOptions) -> Option<String> {
+    #[cfg(test)]
+    credential_resolution_observation::record(1);
     let openprx_dir = options.openprx_dir.as_ref()?;
     let store = AuthProfilesStore::new(openprx_dir, options.secrets_encrypt);
     let data = store.load_read_only().ok()?;
@@ -2633,7 +2643,7 @@ pub fn create_provider_with_options(
     }
     match name {
         "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options))),
-        _ => create_provider_with_url_and_options(name, api_key, None, options),
+        _ => create_provider_with_url_and_options(name, api_key.into(), None, options),
     }
 }
 
@@ -2648,14 +2658,14 @@ pub fn create_provider_with_url(
         return crate::plugins::runtime::resolve_process_provider(name)
             .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not loaded in this process"));
     }
-    create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
+    create_provider_with_url_and_options(name, api_key.into(), api_url, &ProviderRuntimeOptions::default())
 }
 
 /// Factory: create provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_provider_with_url_and_options(
     name: &str,
-    api_key: Option<&str>,
+    credential: ProviderCredentialInput<'_>,
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
@@ -2664,7 +2674,15 @@ fn create_provider_with_url_and_options(
         return crate::plugins::runtime::resolve_process_provider(name)
             .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not loaded in this process"));
     }
-    let resolved = resolve_provider_credentials(name, api_key, options);
+    let resolved = match credential {
+        ProviderCredentialInput::Legacy(api_key) => resolve_provider_credentials(name, api_key, options),
+        ProviderCredentialInput::PinnedKeyless(owned) => {
+            if !owned.matches_connection(name, None, api_url, owned.resolved.credential().rotation_keys()) {
+                anyhow::bail!("resolved keyless connection changed before construction");
+            }
+            ResolvedProviderCredentials::default()
+        }
+    };
     // Break static-analysis taint chain from the sensitive-named input before
     // downstream provider storage.
     let resolved_credential = resolved
@@ -3158,7 +3176,82 @@ pub fn create_provider_for(
         }
     }
     let credential = resolved.credential();
-    create_resilient_provider_with_options(label, credential.api_key(), credential.api_url(), &reliability, &scoped)
+    create_resilient_provider_with_pinned_root(
+        label,
+        credential.api_key(),
+        credential.api_url(),
+        &reliability,
+        &scoped,
+        KeylessRoot::from_resolved(resolved),
+    )
+}
+
+enum ProviderCredentialInput<'a> {
+    Legacy(Option<&'a str>),
+    PinnedKeyless(KeylessRoot<'a>),
+}
+
+impl<'a> From<Option<&'a str>> for ProviderCredentialInput<'a> {
+    fn from(key: Option<&'a str>) -> Self {
+        Self::Legacy(key)
+    }
+}
+
+/// A concrete Root connection whose supported provider can run without auth.
+/// Only resolver-owned identity/material can create this factory witness.
+#[derive(Clone, Copy)]
+pub(crate) struct KeylessRoot<'a> {
+    resolved: &'a catalog::ResolvedModel,
+}
+
+impl<'a> KeylessRoot<'a> {
+    pub(crate) fn from_resolved(resolved: &'a catalog::ResolvedModel) -> Option<Self> {
+        let credential = resolved.credential();
+        let endpoint = reqwest::Url::parse(credential.api_url()?).ok()?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return None;
+        }
+        let supported = match classify_provider(resolved.provider_label()) {
+            ProviderIdentity::Catalog(name) => name == "ollama" && !resolved.model().ends_with(":cloud"),
+            ProviderIdentity::ByoEndpoint {
+                dialect: ByoDialect::OpenAiCompatible,
+                ..
+            } => true,
+            _ => false,
+        };
+        (supported
+            && resolved.provider_label().trim() == resolved.provider_label()
+            && matches!(
+                credential.reference(),
+                credentials::CredentialRef::LegacyInline(credentials::LegacySlot::Root)
+            )
+            && credential.api_key().is_none()
+            && credential.api_url().is_some())
+        .then_some(Self { resolved })
+    }
+
+    pub(crate) fn matches_connection(
+        self,
+        name: &str,
+        key: Option<&str>,
+        url: Option<&str>,
+        rotation: &[String],
+    ) -> bool {
+        name == self.resolved.provider_label()
+            && ProviderId::of(name) == *self.resolved.provider()
+            && key.is_none()
+            && url == self.resolved.credential().api_url()
+            && rotation == self.resolved.credential().rotation_keys()
+    }
+
+    fn construct(self, options: &ProviderRuntimeOptions) -> anyhow::Result<Box<dyn Provider>> {
+        create_provider_with_url_and_options(
+            self.resolved.provider_label(),
+            ProviderCredentialInput::PinnedKeyless(self),
+            self.resolved.credential().api_url(),
+            options,
+        )
+    }
 }
 
 /// Create provider chain with retry and fallback behavior.
@@ -3185,24 +3278,42 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_resilient_provider_with_pinned_root(primary_name, api_key, api_url, reliability, options, None)
+}
+
+fn create_resilient_provider_with_pinned_root(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+    pinned: Option<KeylessRoot<'_>>,
+) -> anyhow::Result<Box<dyn Provider>> {
     #[cfg(feature = "wasm-plugins")]
     if primary_name.starts_with("wasm:") {
         return crate::plugins::runtime::resolve_process_provider(primary_name)
             .ok_or_else(|| anyhow::anyhow!("WASM provider '{primary_name}' is not loaded in this process"));
     }
-    let availability = summarize_provider_availability(primary_name, api_key, reliability, options);
+    if pinned.is_some_and(|owned| !owned.matches_connection(primary_name, api_key, api_url, &reliability.api_keys)) {
+        anyhow::bail!("resolved keyless connection changed before construction");
+    }
+    let mut prepared = pinned.map(|owned| owned.construct(options)).transpose()?;
+    let availability = summarize_provider_availability_inner(primary_name, api_key, reliability, options, pinned);
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     let mut unavailable = availability.unavailable.clone();
 
     for provider_name in &availability.available {
         let explicit_key = (provider_name == primary_name).then_some(api_key).flatten();
         let creation_result = if provider_name == primary_name {
-            match primary_name {
-                "openai-codex" | "openai_codex" | "codex" => {
-                    create_provider_with_options(provider_name, explicit_key, options)
-                }
-                _ => create_provider_with_url_and_options(provider_name, explicit_key, api_url, options),
-            }
+            prepared.take().map_or_else(
+                || match primary_name {
+                    "openai-codex" | "openai_codex" | "codex" => {
+                        create_provider_with_options(provider_name, explicit_key, options)
+                    }
+                    _ => create_provider_with_url_and_options(provider_name, explicit_key.into(), api_url, options),
+                },
+                Ok,
+            )
         } else {
             create_provider_with_options(provider_name, None, options)
         };
@@ -3223,7 +3334,7 @@ pub fn create_resilient_provider_with_options(
                         let rotated = if is_openai_codex_alias(primary_name) {
                             create_provider_with_options(primary_name, Some(extra_key), options)
                         } else {
-                            create_provider_with_url_and_options(primary_name, Some(extra_key), api_url, options)
+                            create_provider_with_url_and_options(primary_name, Some(extra_key).into(), api_url, options)
                         };
                         match rotated {
                             Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
@@ -3316,8 +3427,40 @@ pub fn create_routed_provider_with_options(
     default_model: &str,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_routed_provider_with_pinned_root(
+        primary_name,
+        &ProviderConnection {
+            api_key,
+            api_url,
+            released: false,
+        },
+        reliability,
+        model_routes,
+        default_model,
+        options,
+        None,
+    )
+}
+
+pub(crate) fn create_routed_provider_with_pinned_root(
+    primary_name: &str,
+    connection: &ProviderConnection<'_>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    default_model: &str,
+    options: &ProviderRuntimeOptions,
+    pinned: Option<KeylessRoot<'_>>,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let (api_key, api_url) = (connection.api_key, connection.api_url);
     if model_routes.is_empty() {
-        return create_resilient_provider_with_options(primary_name, api_key, api_url, reliability, options);
+        return create_resilient_provider_with_pinned_root(
+            primary_name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+            pinned,
+        );
     }
 
     // Collect unique provider names needed
@@ -3343,7 +3486,14 @@ pub fn create_routed_provider_with_options(
         let (connection, chain_reliability) =
             routed_connection(name, primary_name, routed_credential, api_key, api_url, reliability);
         let (key, url) = (connection.api_key, connection.api_url);
-        match create_resilient_provider_with_options(name, key, url, &chain_reliability, options) {
+        match create_resilient_provider_with_pinned_root(
+            name,
+            key,
+            url,
+            &chain_reliability,
+            options,
+            if name == primary_name { pinned } else { None },
+        ) {
             Ok(provider) => providers.push((name.clone(), provider)),
             Err(e) => {
                 if name == primary_name {
@@ -3688,6 +3838,16 @@ pub fn summarize_provider_availability(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> ProviderAvailabilitySummary {
+    summarize_provider_availability_inner(primary_name, api_key, reliability, options, None)
+}
+
+fn summarize_provider_availability_inner(
+    primary_name: &str,
+    api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+    validated_primary: Option<KeylessRoot<'_>>,
+) -> ProviderAvailabilitySummary {
     let mut configured = vec![primary_name.to_string()];
     for fallback in &reliability.fallback_providers {
         if !configured.iter().any(|name| name == fallback) {
@@ -3699,6 +3859,11 @@ pub fn summarize_provider_availability(
     let mut unavailable = Vec::new();
 
     for provider in &configured {
+        if provider == primary_name && validated_primary.is_some() {
+            // The same pinned primary has already passed its real constructor.
+            available.push(provider.clone());
+            continue;
+        }
         if let Err(error) = create_provider_with_options(provider, None, options) {
             unavailable.push((provider.clone(), format!("invalid provider: {error}")));
             continue;
@@ -7267,5 +7432,35 @@ mod credential_containment_tests {
             Some(format!("Bearer {ROOT_SENTINEL}").as_str()),
             "the respelled route must present the root key, not a rotation key alone"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod credential_resolution_observation {
+    use std::cell::Cell;
+    thread_local! { static ACTIVE: Cell<Option<[usize; 3]>> = const { Cell::new(None) }; }
+    pub(super) fn record(stage: usize) {
+        ACTIVE.with(|active| {
+            if let Some(mut counts) = active.get() {
+                if let Some(count) = counts.get_mut(stage) {
+                    *count += 1;
+                }
+                active.set(Some(counts));
+            }
+        });
+    }
+    struct Scope(Option<[usize; 3]>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+    /// Synchronous construction only: no task can migrate during this scope.
+    pub(crate) fn observe<T>(work: impl FnOnce() -> T) -> (T, [usize; 3]) {
+        let scope = Scope(ACTIVE.with(|active| active.replace(Some([0; 3]))));
+        let result = work();
+        let counts = ACTIVE.with(|active| active.get().expect("active construction observation"));
+        drop(scope);
+        (result, counts)
     }
 }

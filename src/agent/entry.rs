@@ -1278,6 +1278,7 @@ pub(crate) struct AgentModelChoice {
     provider_name: String,
     model_name: String,
     model_binding: AgentModelBinding,
+    resolved: crate::providers::catalog::ResolvedModel,
 }
 
 impl AgentModelChoice {
@@ -1309,6 +1310,35 @@ impl AgentModelChoice {
     /// The routed factory builds one provider per exact name and takes the
     /// first route for that provider, whether keyed or not. Deny a decision proof whenever
     /// that source could differ from the PMM selection's credential slot.
+    fn pinned_keyless_root<'a>(&'a self, config: &Config) -> Option<providers::KeylessRoot<'a>> {
+        // Keyed/profile routes retain their existing provenance/refusal path.
+        if self.model_binding.route.is_some()
+            || config.model_routes.iter().any(|route| {
+                route.provider == self.provider_name
+                    && (route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+                        || route.credential_ref.as_deref().is_some_and(|id| !id.trim().is_empty()))
+            })
+        {
+            return None;
+        }
+        let owned = providers::KeylessRoot::from_resolved(&self.resolved)?;
+        let connection = providers::configured_connection_for(
+            &self.provider_name,
+            providers::selection::default_provider(config),
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+        );
+        let reliability = providers::scoped_reliability(&config.reliability, &connection);
+        owned
+            .matches_connection(
+                &self.provider_name,
+                connection.api_key,
+                connection.api_url,
+                &reliability.api_keys,
+            )
+            .then_some(owned)
+    }
+
     pub(crate) fn factory_credential_source_matches(&self, config: &Config) -> bool {
         // A URL or rotation list makes PMM label the root slot as present,
         // yet a missing primary key lets the provider factory look up a key
@@ -1317,6 +1347,7 @@ impl AgentModelChoice {
             self.model_binding.credential_ref,
             crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
         ) && config.api_key.as_deref().is_none_or(|key| key.trim().is_empty())
+            && self.pinned_keyless_root(config).is_none()
         {
             return false;
         }
@@ -1476,6 +1507,7 @@ pub(crate) fn resolve_agent_model_choice(
         provider_name: provider_name.to_string(),
         model_name: model_name.to_string(),
         model_binding: AgentModelBinding::from_resolved(&resolved, route),
+        resolved,
     })
 }
 
@@ -1491,6 +1523,7 @@ pub(crate) struct AgentProviderSelection<'a> {
     pub(crate) model_name: &'a str,
     pub(crate) connection: providers::ProviderConnection<'a>,
     pub(crate) reliability: Cow<'a, crate::config::ReliabilityConfig>,
+    pinned_keyless_root: Option<providers::KeylessRoot<'a>>,
 }
 
 /// Scope the connection for a resolved selection. Resolution already ran in
@@ -1511,6 +1544,7 @@ pub(crate) fn agent_provider_selection<'a>(
         model_name: &choice.model_name,
         connection,
         reliability,
+        pinned_keyless_root: choice.pinned_keyless_root(config),
     }
 }
 
@@ -1521,14 +1555,14 @@ impl AgentProviderSelection<'_> {
         config: &Config,
         options: &providers::ProviderRuntimeOptions,
     ) -> Result<Box<dyn Provider>> {
-        providers::create_routed_provider_with_options(
+        providers::create_routed_provider_with_pinned_root(
             self.provider_name,
-            self.connection.api_key,
-            self.connection.api_url,
+            &self.connection,
             &self.reliability,
             &config.model_routes_with_references(),
             self.model_name,
             options,
+            self.pinned_keyless_root,
         )
     }
 }
