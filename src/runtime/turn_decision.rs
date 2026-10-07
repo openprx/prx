@@ -3187,8 +3187,12 @@ pub(crate) fn build_turn_decision_service(
 }
 
 #[cfg(test)]
+pub(crate) use tests::with_worker_probe_manifest;
+
+#[cfg(test)]
 mod tests {
     mod child_process;
+    pub(crate) use child_process::worker_probe::with_manifest as with_worker_probe_manifest;
     mod discovery_surface;
     mod exact_call_approval;
     mod ledger_probe;

@@ -2,6 +2,8 @@
 //! AUT component slice: genuine parent grant, real worker and verified close.
 //! The parent decision backend is controlled; this is not release C21-07.
 
+pub(crate) mod worker_probe;
+
 use super::*;
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::providers::{ChatRequest, ChatResponse, Provider};
@@ -276,6 +278,17 @@ fn boxed_parent_process_case(
     Box::pin(actual_parent_process_case(non_root_route))
 }
 
+struct ParentConfigScope {
+    previous: Option<std::path::PathBuf>,
+    _lock: parking_lot::MutexGuard<'static, ()>,
+}
+impl Drop for ParentConfigScope {
+    fn drop(&mut self) {
+        // Restore while the existing global test lock is still held.
+        crate::config::schema::swap_process_config_dir_for_tests(self.previous.take());
+    }
+}
+
 async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> {
     let artifact = worker_artifact()?;
     let route_capture = non_root_route.then(|| {
@@ -288,16 +301,6 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
     // the same owned config directory that the actual child CLI receives before
     // either side resolves its lazy session-worker signing key. Keep it through
     // the common cleanup tail, and restore even after a panic.
-    struct ParentConfigScope {
-        previous: Option<std::path::PathBuf>,
-        _lock: parking_lot::MutexGuard<'static, ()>,
-    }
-    impl Drop for ParentConfigScope {
-        fn drop(&mut self) {
-            // Restore while the existing global test lock is still held.
-            crate::config::schema::swap_process_config_dir_for_tests(self.previous.take());
-        }
-    }
     let config_lock = crate::config::schema::process_config_dir_test_lock();
     let _parent_config_scope = ParentConfigScope {
         previous: crate::config::schema::swap_process_config_dir_for_tests(Some(scratch.path().join("config"))),

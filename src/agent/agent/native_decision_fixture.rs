@@ -77,9 +77,31 @@ impl Driver {
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
-    pub(crate) async fn run<T>(mut self, require_request: bool, future: impl std::future::Future<Output = T>) -> T {
+    pub(crate) async fn run<T>(self, require_request: bool, future: impl std::future::Future<Output = T>) -> T {
+        self.run_boxed(require_request, Box::pin(future)).await
+    }
+
+    // Construct the worker fixture future in this frame, before its owner polls it.
+    // The factory only returns a lazy future; the listener join remains in run_boxed.
+    #[inline(never)]
+    pub(crate) fn run_factory<T, F, Fut>(
+        self,
+        require_request: bool,
+        make_future: F,
+    ) -> impl std::future::Future<Output = T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.run_boxed(require_request, Box::pin(make_future()))
+    }
+
+    async fn run_boxed<T, Fut>(mut self, require_request: bool, future: std::pin::Pin<Box<Fut>>) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
         // All test panics and ordinary returns pass the listener join before escape.
-        let result = std::panic::AssertUnwindSafe(Box::pin(future)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
         self.stop.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.task).await;
         if joined.is_err() {
