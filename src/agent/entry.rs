@@ -1633,8 +1633,8 @@ pub(crate) async fn run_with_runtime_envelope(
         }
     }
 
-    // Build the CLI work in a separate frame; cleanup owns the same future.
-    let work = boxed_cli_work(CliWork {
+    // Capture invocation state without constructing the large async work yet.
+    let work = CliWork {
         ctx: &ctx,
         choice: &choice,
         message,
@@ -1644,6 +1644,1060 @@ pub(crate) async fn run_with_runtime_envelope(
         scheduled_tool_scope,
         scoped_run_id,
         scheduled_admission: &scheduled_admission,
+    };
+    // The synchronous factory invokes this closure in its own frame before
+    // returning the boxed future. The actual engine work remains owned here.
+    let work = boxed_cli_work(move || async move {
+        let CliWork {
+            ctx,
+            choice,
+            message,
+            temperature,
+            shutdown,
+            runtime_envelope_override,
+            scheduled_tool_scope,
+            scoped_run_id,
+            scheduled_admission,
+        } = work;
+        // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
+        // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so all the
+        // `config.xxx` accesses below are unchanged.
+        let config = Arc::clone(&ctx.config);
+
+        let observer = Arc::clone(&ctx.observer);
+        let hooks = Arc::clone(&ctx.hooks);
+        // security is consumed only by tool construction, which now happens inside the
+        // bootstrap; it is not re-bound here on purpose (no downstream use in `run`).
+        // The local runtime adapter is likewise built and consumed inside the
+        // bootstrap, so it is no longer constructed here.
+
+        // ── Memory (the brain) ────────────────────────────────────────
+        // The Interactive profile always builds memory, so it is Some here; take it
+        // explicitly without panicking (iron rules 1/6).
+        let mem: Arc<dyn Memory> = ctx
+            .memory
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for the agent CLI"))?;
+        let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config());
+        // D8-3: run_id is per-turn (generated inside each turn branch as `turn_run_id`),
+        // no longer a single per-run id held here.
+        let mut fabric_turn_seq: u64 = 0;
+
+        // ── Tools ────────────────────────────────────────────────────
+        // The Interactive profile built the tool registry inside the bootstrap
+        // (security + runtime + memory all ready) using the identical
+        // `all_tools_with_runtime` call with the same arguments; take it explicitly.
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
+            .tools
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
+
+        // ── Provider (resolved before the bootstrap) ─────────────────
+        let selection = agent_provider_selection(&config, choice);
+        let provider_name = selection.provider_name;
+        let model_name = selection.model_name;
+
+        let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+
+        let provider: Box<dyn Provider> = selection.build_provider(&config, &provider_runtime_options)?;
+        let effective_compaction = crate::router::resolve_effective_compaction_config(
+            &config.agent.compaction,
+            provider_name,
+            model_name,
+            &config.router,
+            &config.model_routes,
+        );
+        crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+
+        observer.record_event(&ObserverEvent::AgentStart {
+            provider: provider_name.to_string(),
+            model: model_name.to_string(),
+        });
+        hooks
+            .emit(
+                HookEvent::AgentStart,
+                serde_json::json!({
+                    "provider": provider_name,
+                    "model": model_name,
+                }),
+            )
+            .await;
+
+        // ── Build system prompt from the canonical prompt context ──
+        let native_tools = provider
+            .capabilities_for(model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
+            .native_tool_calling;
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+        // ── Approval manager (supervised mode) ───────────────────────
+        let approval_manager = Arc::new(ApprovalManager::new());
+
+        // ── Execute ──────────────────────────────────────────────────
+        let start = Instant::now();
+
+        let mut final_output = String::new();
+
+        if let Some(msg) = message {
+            // ── Single-shot mode (D5/D9 step 2) ──────────────────────────
+            // A single non-interactive turn: race the work against the external
+            // shutdown token so a root cancel (e.g. ctrl_c wired by dispatch in A6)
+            // aborts the in-flight turn instead of waiting it out. The interactive
+            // branch below cannot do this because it blocks on synchronous
+            // `stdin().read_line()`, which `tokio::select!` cannot poll.
+            fabric_turn_seq += 1;
+            // Keep the turn identity outside the raced future so a shutdown that
+            // drops it can still close the shared terminal boundary as Cancelled.
+            let turn_run_id = scoped_run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let mut runtime_envelope = scheduled_admission.as_ref().map_or_else(
+                || {
+                    resolve_agent_turn_envelope(
+                        runtime_envelope_override.as_ref(),
+                        memory_fabric.workspace_id(),
+                        &turn_run_id,
+                    )
+                },
+                |admission| admission.envelope().clone(),
+            );
+            if runtime_envelope.config_source_revision.is_none() {
+                runtime_envelope = runtime_envelope.with_config_generation(&ctx.config_generation);
+            }
+            let mut fabric_scope = runtime_envelope
+                .message_scope()
+                .with_recipient(format!("{provider_name}/{model_name}"));
+            let cancel_turn_id = turn_run_id.clone();
+            let cancel_scope = parking_lot::Mutex::new(runtime_envelope.message_scope());
+            let turn_started_at = chrono::Utc::now();
+            let decision_settlement = Arc::new(parking_lot::Mutex::new(
+                None::<crate::agent::terminal::DecisionSettlementRef>,
+            ));
+            let admission_proof = std::sync::OnceLock::<AgentTurnProof>::new();
+            let terminal_guard = std::sync::OnceLock::<crate::runtime::turn_terminal::TurnTerminalGuard>::new();
+            let mut cli_admission_guard = None;
+            let mut scheduled_input_guard = None;
+            let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
+            let single_shot = boxed_cli_single_shot(async {
+                let agent_user_event = if scheduled_admission.is_none() {
+                    let owner = crate::runtime::turn_cleanup::current_tracker()
+                        .ok_or_else(|| anyhow::anyhow!("CLI input cleanup owner missing"))?;
+                    let (event, guard) = CliPendingInput {
+                        fabric: memory_fabric.clone(),
+                        generation: Arc::clone(&ctx.config_generation),
+                        envelope: runtime_envelope.clone(),
+                        scope: fabric_scope.clone(),
+                        choice: choice.clone(),
+                        input: msg.clone(),
+                        key: format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
+                        ticket: owner.register(shutdown.clone())?,
+                    }
+                    .record()
+                    .await?;
+                    cli_admission_guard = Some(guard);
+                    event
+                } else {
+                    let admission = scheduled_admission
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("scheduled admission source missing"))?;
+                    let owner = crate::runtime::turn_cleanup::current_tracker()
+                        .ok_or_else(|| anyhow::anyhow!("scheduled input cleanup owner missing"))?;
+                    let (event, guard) = admission
+                        .record_guarded(
+                            memory_fabric.clone(),
+                            Arc::clone(&ctx.config_generation),
+                            (
+                                msg.clone(),
+                                format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
+                                choice.clone(),
+                            ),
+                            owner.register(shutdown.clone())?,
+                        )
+                        .await?;
+                    scheduled_input_guard = Some(guard);
+                    event
+                };
+
+                let decision_turn = {
+                    let service = ctx
+                        .turn_decisions
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("agent decision service is missing"))?;
+                    let proof = if let Some(admission) = &scheduled_admission {
+                        let source = admission
+                            .bind_input(
+                                mem.as_ref(),
+                                &ctx.config_generation,
+                                &runtime_envelope,
+                                (&msg, choice),
+                                agent_user_event.as_ref(),
+                                shutdown,
+                            )
+                            .await?;
+                        AgentTurnProof {
+                            workspace_id: Arc::from(source.envelope.workspace_id.as_str()),
+                            owner_id: Arc::from(source.envelope.resolved_owner_id()),
+                            session_key: Arc::from(source.envelope.session_key.as_str()),
+                            run_id: Arc::from(turn_run_id.as_str()),
+                            source_event_id: source.envelope.source_message_event_id.as_deref().map(Arc::from),
+                            routing_input: Arc::from(msg.as_str()),
+                            memory_scope: source
+                                .envelope
+                                .memory_write_context(source.execution.chat_type.as_str()),
+                            provider_name: Arc::from(choice.provider_name()),
+                            model_name: Arc::from(choice.model_name()),
+                            model_binding: choice.binding().clone(),
+                            config_generation_id: ctx.config_generation.id.0,
+                            config_source_revision: Arc::from(
+                                ctx.config_generation.source_revision.fingerprint_sha256.as_str(),
+                            ),
+                            retrieval_principal: source.envelope.memory_principal(),
+                            scheduled: Some(Box::new(source)),
+                        }
+                    } else {
+                        issue_cli_agent_turn_proof(
+                            None,
+                            &runtime_envelope,
+                            &ctx.config_generation,
+                            &turn_run_id,
+                            &msg,
+                            agent_user_event.as_ref(),
+                            choice,
+                        )?
+                    };
+                    if let Some(source) = proof.scheduled.as_ref() {
+                        runtime_envelope = source.envelope.clone();
+                        fabric_scope = runtime_envelope
+                            .message_scope()
+                            .with_recipient(format!("{provider_name}/{model_name}"));
+                        *cancel_scope.lock() = runtime_envelope.message_scope();
+                    }
+                    let proof = admission_proof.get_or_init(|| proof);
+                    if scheduled_admission.is_some() {
+                        // Mark before polling decision work: a failed or interrupted
+                        // admission can already have a durable decision identity.
+                        super::scheduled_source::begin_decision()?;
+                    }
+                    let decision = service
+                        .decide_agent_initial(
+                            proof,
+                            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                            shutdown,
+                        )
+                        .await?;
+                    *decision_settlement.lock() = Some(service.terminal_settlement_ref(Arc::clone(&decision))?);
+                    let cleanup_ticket = if scheduled_admission.is_some() {
+                        scheduled_input_guard
+                            .take()
+                            .ok_or_else(|| anyhow::anyhow!("scheduled input cleanup guard missing"))?
+                            .into_terminal_ticket()?
+                    } else {
+                        cli_admission_guard
+                            .take()
+                            .ok_or_else(|| anyhow::anyhow!("CLI input cleanup guard missing"))?
+                            .into_terminal_ticket()?
+                    };
+                    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+                        provider_name,
+                        model_name.to_string(),
+                        runtime_envelope.resolved_owner_id(),
+                        runtime_envelope.session_key.clone(),
+                        runtime_envelope.source_message_event_id.clone(),
+                        None,
+                        "agent_cli_single",
+                        u32::try_from(msg.chars().count() / 4).unwrap_or(u32::MAX),
+                        !tools_registry.is_empty(),
+                        false,
+                    );
+                    let guard = crate::runtime::turn_terminal::TurnTerminalGuard::new(
+                        cleanup_ticket,
+                        Arc::clone(service),
+                        Arc::clone(&decision),
+                        memory_fabric.clone(),
+                        Arc::clone(&config),
+                        runtime_envelope.clone(),
+                        None,
+                    )?
+                    .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
+                    terminal_guard
+                        .set(guard)
+                        .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
+                    anyhow::ensure!(
+                        !matches!(
+                            decision.disposition()?,
+                            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
+                        ),
+                        "ingress has no approval collection adapter"
+                    );
+                    if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
+                        let ports = CliDecisionClose {
+                            terminal_guard: terminal_guard.get(),
+                            service,
+                            fabric: &memory_fabric,
+                            config: &config,
+                            scope: runtime_envelope.message_scope(),
+                            terminal_id: turn_run_id.clone(),
+                            history_commit_len: 2,
+                            started_at: turn_started_at,
+                        };
+                        service
+                            .close_agent_directive_turn(proof, Arc::clone(&decision), &ports, shutdown)
+                            .await?;
+                        final_output = reply.to_string();
+                        println!("{reply}");
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    (service, proof, decision, route_decision)
+                };
+
+                let (decision_service, decision_proof, decision_context, route_decision) = &decision_turn;
+                let decision_proof = *decision_proof;
+                let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
+                let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
+
+                // Auto-save user message to memory (skip short/trivial messages)
+                if config.memory.should_auto_promote_user_message(&msg) {
+                    let user_key = autosave_memory_key("user_msg");
+                    let _ = memory_fabric
+                        .record_semantic_memory_from_event(
+                            &user_key,
+                            &msg,
+                            MemoryCategory::Conversation,
+                            None,
+                            agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
+                // Inject memory context into user message. The routing input is
+                // pinned from `msg` here, ahead of the enrichment below.
+                let memory_runtime = cli_turn_memory_runtime(
+                    &mem,
+                    &config.workspace_dir,
+                    &runtime_envelope,
+                    &memory_fabric,
+                    &fabric_scope,
+                    agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                );
+                let mem_context = crate::agent::context_recall::RecalledMemoryContext {
+                    preamble: crate::agent::memory_loader::format_selected_context(
+                        None,
+                        decision_context.retrieved()?,
+                    )?,
+                    ids: Vec::new(),
+                };
+                let context = mem_context.preamble.clone();
+                let enriched = if context.is_empty() {
+                    msg.clone()
+                } else {
+                    format!("{context}{msg}")
+                };
+
+                let mut history = vec![
+                    ChatMessage::system(&system_prompt),
+                    crate::agent::turn_contracts::inbound_user_message(&enriched),
+                ];
+
+                // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
+                // single-shot agent turn inherits parent_run_id = the per-turn run_id.
+                let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                    turn_run_id.clone(),
+                    runtime_envelope.session_key.clone(),
+                );
+                let provider_started_at = chrono::Utc::now();
+                let runtime_adapter = Some({
+                    let mut adapter =
+                        configured_cli_tool_adapter(&ctx.security, &tools_registry, &approval_manager, &memory_runtime);
+                    {
+                        let proof = decision_proof;
+                        let mut envelope = runtime_envelope.clone();
+                        if let Some(event_id) = proof.source_event_id() {
+                            envelope = envelope.with_source_message_event_id(event_id);
+                        }
+                        adapter.tool_execution_context = proof.scheduled.as_ref().map_or_else(
+                            || crate::tools::ToolExecutionContext::new(envelope, "private"),
+                            |source| source.execution.clone(),
+                        );
+                    }
+                    adapter.provider_trace = Some(Arc::clone(&retained_provider_trace));
+                    adapter
+                });
+                let turn_result = crate::tools::execution::with_scheduled_job_tool_scope(
+                    scheduled_tool_scope,
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(turn_spawn_ctx, async {
+                        run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: false,
+                                expose_stay_silent: false,
+                                multimodal: &config.multimodal,
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
+                                    priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
+                                    low_priority_tool_names: config.agent.low_priority_tools.clone(),
+                                },
+                                compaction: Some(decision_context.main_compaction()),
+                                decision: crate::agent::turn_request::TurnDecision {
+                                    service: decision_service,
+                                    context: decision_context,
+                                    proof: decision_proof,
+                                },
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider.as_ref(),
+                                provider_name,
+                                model: model_name,
+                                temperature,
+                                tools_registry: Arc::clone(&tools_registry),
+                                observer: observer.as_ref(),
+                                hooks: &hooks,
+                                approval: Some(Arc::clone(&approval_manager)),
+                                approval_resolver: None,
+                                runtime_adapter,
+                                memory: memory_runtime,
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .map(|(outcome, trace)| (outcome.into_text(), trace))
+                    }),
+                )
+                .await;
+                let (response, turn_trace) = match turn_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let provider_outcome =
+                            crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                                &route_decision,
+                                provider_started_at,
+                                &error,
+                            );
+                        if let Err(finalize_error) = crate::runtime::turn_terminal::commit_terminal(
+                            terminal_guard.get(),
+                            &memory_fabric,
+                            crate::agent::terminal::TurnTerminalDraft {
+                                decision: decision_settlement_snapshot(&decision_settlement),
+                                terminal_id: turn_run_id.clone(),
+                                scope: runtime_envelope.message_scope(),
+                                status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                                history: None,
+                                history_scope: None,
+                                provider_outcome: Some(provider_outcome),
+                                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                    summary: error.to_string(),
+                                    started_at: provider_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                },
+                                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                            },
+                            &config,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %finalize_error, "Failed to commit failed single-shot agent terminal event");
+                        }
+                        return Err(error);
+                    }
+                };
+                {
+                    let decision = decision_context;
+                    anyhow::ensure!(
+                        turn_trace.execution_trace.as_ref() == Some(&decision.terminal_execution_trace()),
+                        "tool loop trace differs from the owning decision's execution facts"
+                    );
+                }
+                let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
+                    &route_decision,
+                    provider_started_at,
+                    turn_trace,
+                );
+                if let Err(error) = crate::runtime::turn_terminal::commit_terminal(
+                    terminal_guard.get(),
+                    &memory_fabric,
+                    crate::agent::terminal::TurnTerminalDraft {
+                        decision: decision_settlement_snapshot(&decision_settlement),
+                        terminal_id: turn_run_id.clone(),
+                        scope: runtime_envelope.message_scope(),
+                        status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                        history: Some(crate::agent::terminal::TurnHistoryProjection {
+                            assistant_content: response.clone(),
+                            history_commit_len: history.len(),
+                        }),
+                        history_scope: Some(
+                            fabric_scope
+                                .clone()
+                                .with_sender(format!("{provider_name}/{model_name}"))
+                                .with_recipient("local-user"),
+                        ),
+                        provider_outcome: Some(provider_outcome),
+                        telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                            summary: "single-shot agent turn completed".to_string(),
+                            started_at: provider_started_at,
+                            finished_at: chrono::Utc::now(),
+                        },
+                        delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                    },
+                    &config,
+                )
+                .await
+                {
+                    return Err(error);
+                }
+                if terminal_guard.get().is_none() && config.causal_tree.enabled {
+                    decision_service
+                        .rejoin_terminal(&turn_run_id, decision_proof.owner_id())
+                        .await?;
+                }
+                increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
+                final_output = response.clone();
+                println!("{response}");
+                observer.record_event(&ObserverEvent::TurnComplete);
+                hooks
+                    .emit(
+                        HookEvent::TurnComplete,
+                        serde_json::json!({
+                            "mode": "single",
+                            "response_chars": response.chars().count(),
+                        }),
+                    )
+                    .await;
+                Ok::<(), anyhow::Error>(())
+            });
+            let single_result = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    if terminal_guard.get().is_none()
+                        && let Some(settlement) = decision_settlement_snapshot(&decision_settlement)
+                    {
+                    let cancelled_scope = cancel_scope.lock().clone();
+                    if let Err(error) = crate::agent::terminal::finalize_turn(
+                        &memory_fabric,
+                        crate::agent::terminal::TurnTerminalDraft {
+                            decision: Some(settlement),
+                            terminal_id: cancel_turn_id,
+                            scope: cancelled_scope,
+                            status: crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                            history: None,
+                            history_scope: None,
+                            provider_outcome: None,
+                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                summary: "single-shot agent cancelled by shutdown signal".to_string(),
+                                started_at: turn_started_at,
+                                finished_at: chrono::Utc::now(),
+                            },
+                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::None,
+                        },
+                        &config.cost,
+                        &config.workspace_dir,
+                    ).await {
+                        tracing::warn!(error = %error, "Failed to commit cancelled single-shot agent terminal event");
+                    }
+                    }
+                    Err(anyhow::anyhow!("agent single-shot run cancelled by shutdown signal"))
+                }
+                result = single_shot => result,
+            };
+            if let (Err(error), Some(guard)) = (&single_result, terminal_guard.get()) {
+                guard.finish_failure(error, shutdown.is_cancelled()).await?;
+            }
+            if let Err(error) = &single_result
+                && let Some(mut guard) = cli_admission_guard.take()
+            {
+                guard
+                    .finish_failure(shutdown.is_cancelled(), &error.to_string())
+                    .await
+                    .map_err(|record_error| {
+                        anyhow::anyhow!(
+                            "CLI admission failed: {error}; failure persistence is unconfirmed: {record_error}"
+                        )
+                    })?;
+            }
+            if single_result.is_err()
+                && let Some(mut guard) = scheduled_input_guard.take()
+            {
+                guard
+                    .finish_failure(shutdown.is_cancelled())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("scheduled admission failure persistence is unconfirmed"))?;
+            }
+            single_result?;
+        } else {
+            boxed_cli_interactive(async {
+            println!("🦀 OpenPRX Interactive Mode");
+            println!("Type /help for commands.\n");
+            let cli = crate::channels::CliChannel::new();
+
+            // Persistent conversation history across turns
+            let mut history = if config.skill_rag.available() {
+                Vec::new()
+            } else {
+                vec![ChatMessage::system(build_runtime_system_prompt(
+                    &config,
+                    model_name,
+                    &skills,
+                    native_tools,
+                ))]
+            };
+
+            loop {
+                print!("> ");
+                let _ = std::io::stdout().flush();
+
+                let mut input = String::new();
+                match std::io::stdin().read_line(&mut input) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("\nError reading input: {e}\n");
+                        break;
+                    }
+                }
+
+                let user_input = input.trim().to_string();
+                if user_input.is_empty() {
+                    continue;
+                }
+                match user_input.as_str() {
+                    "/quit" | "/exit" => break,
+                    "/help" => {
+                        println!("Available commands:");
+                        println!("  /help        Show this help message");
+                        println!("  /clear /new  Clear conversation history");
+                        println!("  /quit /exit  Exit interactive mode\n");
+                        continue;
+                    }
+                    "/clear" | "/new" => {
+                        println!("This will clear the current conversation and delete all session memory.");
+                        println!("Core memories (long-term facts/preferences) will be preserved.");
+                        print!("Continue? [y/N] ");
+                        let _ = std::io::stdout().flush();
+
+                        let mut confirm = String::new();
+                        if std::io::stdin().read_line(&mut confirm).is_err() {
+                            continue;
+                        }
+                        if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
+                            println!("Cancelled.\n");
+                            continue;
+                        }
+
+                        history.clear();
+                        if !config.skill_rag.available() {
+                            history.push(ChatMessage::system(build_runtime_system_prompt(
+                                &config,
+                                model_name,
+                                &skills,
+                                native_tools,
+                            )));
+                        }
+                        // Clear conversation and daily memory
+                        let mut cleared = 0;
+                        for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+                            let entries = mem.list(Some(&category), None).await.unwrap_or_default();
+                            for entry in entries {
+                                if mem.forget(&entry.key).await.unwrap_or(false) {
+                                    cleared += 1;
+                                }
+                            }
+                        }
+                        if cleared > 0 {
+                            println!("Conversation cleared ({cleared} memory entries removed).\n");
+                        } else {
+                            println!("Conversation cleared.\n");
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                fabric_turn_seq += 1;
+                // D8-3: one run_id per turn (was per-run). Generated at the turn entry
+                // and used for both the message-event envelope and the user op-id.
+                let turn_run_id = Uuid::new_v4().to_string();
+                let runtime_envelope =
+                    RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
+                        .with_recipient("cli:local-user")
+                        .with_config_generation(&ctx.config_generation);
+                let fabric_scope = runtime_envelope
+                    .message_scope()
+                    .with_recipient(format!("{provider_name}/{model_name}"));
+                let owner = crate::runtime::turn_cleanup::current_tracker()
+                    .ok_or_else(|| anyhow::anyhow!("CLI input cleanup owner missing"))?;
+                let (agent_user_event, mut admission_guard) = CliPendingInput {
+                    fabric: memory_fabric.clone(),
+                    generation: Arc::clone(&ctx.config_generation),
+                    envelope: runtime_envelope.clone(),
+                    scope: fabric_scope.clone(),
+                    choice: choice.clone(),
+                    input: user_input.clone(),
+                    key: format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
+                    ticket: owner.register(shutdown.clone())?,
+                }
+                .record()
+                .await?;
+
+                let decision_turn = {
+                    let service = ctx
+                        .turn_decisions
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("interactive agent decision service is missing"))?;
+                    let proof = issue_cli_agent_turn_proof(
+                        None,
+                        &runtime_envelope,
+                        &ctx.config_generation,
+                        &turn_run_id,
+                        &user_input,
+                        agent_user_event.as_ref(),
+                        choice,
+                    )?;
+                    let decision =
+                        match service
+                            .decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::Repl, shutdown)
+                            .await
+                        {
+                            Ok(decision) => decision,
+                            Err(error) => {
+                                admission_guard.finish_failure(
+                                shutdown.is_cancelled(), &error.to_string(),
+                            ).await.map_err(|record_error| anyhow::anyhow!(
+                                "CLI admission failed: {error}; failure persistence is unconfirmed: {record_error}"
+                            ))?;
+                                return Err(anyhow::Error::from(error));
+                            }
+                        };
+                    let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
+                    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+                        provider_name,
+                        model_name.to_string(),
+                        runtime_envelope.resolved_owner_id(),
+                        runtime_envelope.session_key.clone(),
+                        runtime_envelope.source_message_event_id.clone(),
+                        None,
+                        "agent_cli_interactive",
+                        u32::try_from(user_input.chars().count() / 4).unwrap_or(u32::MAX),
+                        !tools_registry.is_empty(),
+                        false,
+                    );
+                    let terminal_guard = crate::runtime::turn_terminal::TurnTerminalGuard::new(
+                        admission_guard.into_terminal_ticket()?,
+                        Arc::clone(service),
+                        Arc::clone(&decision),
+                        memory_fabric.clone(),
+                        Arc::clone(&config),
+                        runtime_envelope.clone(),
+                        None,
+                    )?
+                    .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
+                    anyhow::ensure!(
+                        !matches!(
+                            decision.disposition()?,
+                            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
+                        ),
+                        "ingress has no approval collection adapter"
+                    );
+                    if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
+                        if history.is_empty() {
+                            history.push(ChatMessage::system(""));
+                        }
+                        let ports = CliDecisionClose {
+                            terminal_guard: Some(&terminal_guard),
+                            service,
+                            fabric: &memory_fabric,
+                            config: &config,
+                            scope: runtime_envelope.message_scope(),
+                            terminal_id: turn_run_id.clone(),
+                            history_commit_len: history.len() + 2,
+                            started_at: chrono::Utc::now(),
+                        };
+                        service
+                            .close_agent_directive_turn(&proof, Arc::clone(&decision), &ports, shutdown)
+                            .await?;
+                        history.push(crate::agent::turn_contracts::inbound_user_message(&user_input));
+                        history.push(ChatMessage::assistant(reply.as_ref()));
+                        final_output = reply.to_string();
+                        println!("{reply}\n");
+                        observer.record_event(&ObserverEvent::TurnComplete);
+                        hooks
+                            .emit(
+                                HookEvent::TurnComplete,
+                                serde_json::json!({"mode":"interactive","response_chars":reply.chars().count()}),
+                            )
+                            .await;
+                        continue;
+                    }
+                    (
+                        service,
+                        proof,
+                        decision,
+                        route_decision,
+                        terminal_guard,
+                        retained_provider_trace,
+                    )
+                };
+                let (
+                    decision_service,
+                    decision_proof,
+                    decision_context,
+                    route_decision,
+                    terminal_guard,
+                    retained_provider_trace,
+                ) = &decision_turn;
+                let decision_settlement = Some(decision_service.terminal_settlement_ref(Arc::clone(decision_context))?);
+
+                // Auto-save conversation turns (skip short/trivial messages)
+                if config.memory.should_auto_promote_user_message(&user_input) {
+                    let user_key = autosave_memory_key("user_msg");
+                    let _ = memory_fabric
+                        .record_semantic_memory_from_event(
+                            &user_key,
+                            &user_input,
+                            MemoryCategory::Conversation,
+                            None,
+                            agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
+                // Inject memory context into user message. The routing input is
+                // pinned from `user_input` here, ahead of the enrichment below.
+                let memory_runtime = cli_turn_memory_runtime(
+                    &mem,
+                    &config.workspace_dir,
+                    &runtime_envelope,
+                    &memory_fabric,
+                    &fabric_scope,
+                    agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                );
+                let mem_context = crate::agent::context_recall::RecalledMemoryContext {
+                    preamble: crate::agent::memory_loader::format_selected_context(None, decision_context.retrieved()?)?,
+                    ids: Vec::new(),
+                };
+                let context = mem_context.preamble.clone();
+                let enriched = if context.is_empty() {
+                    user_input.clone()
+                } else {
+                    format!("{context}{user_input}")
+                };
+
+                let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
+                let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
+                if history.is_empty() {
+                    history.push(ChatMessage::system(system_prompt));
+                } else if let Some(first) = history.first_mut() {
+                    *first = ChatMessage::system(system_prompt);
+                }
+                history.push(crate::agent::turn_contracts::inbound_user_message(&enriched));
+
+                // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
+                // interactive agent turn inherits parent_run_id = the per-turn run_id.
+                let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                    turn_run_id.clone(),
+                    format!("agent:{turn_run_id}"),
+                );
+                let provider_started_at = chrono::Utc::now();
+                let mut runtime_adapter =
+                    configured_cli_tool_adapter(&ctx.security, &tools_registry, &approval_manager, &memory_runtime);
+                {
+                    let proof = decision_proof;
+                    let mut envelope = runtime_envelope.clone();
+                    if let Some(event_id) = proof.source_event_id() {
+                        envelope = envelope.with_source_message_event_id(event_id);
+                    }
+                    runtime_adapter.tool_execution_context = crate::tools::ToolExecutionContext::new(envelope, "private");
+                }
+                runtime_adapter.provider_trace = Some(Arc::clone(retained_provider_trace));
+                let response = match crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                    .scope(turn_spawn_ctx, async {
+                        run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: false,
+                                expose_stay_silent: false,
+                                multimodal: &config.multimodal,
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
+                                    priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
+                                    low_priority_tool_names: config.agent.low_priority_tools.clone(),
+                                },
+                                compaction: Some(decision_context.main_compaction()),
+                                decision: crate::agent::turn_request::TurnDecision {
+                                    service: decision_service,
+                                    context: decision_context,
+                                    proof: decision_proof,
+                                },
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider.as_ref(),
+                                provider_name,
+                                model: model_name,
+                                temperature,
+                                tools_registry: Arc::clone(&tools_registry),
+                                observer: observer.as_ref(),
+                                hooks: &hooks,
+                                approval: Some(Arc::clone(&approval_manager)),
+                                approval_resolver: None,
+                                runtime_adapter: Some(runtime_adapter),
+                                memory: memory_runtime,
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: Some(shutdown.child_token()),
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .map(|(outcome, trace)| (outcome.into_text(), trace))
+                    })
+                    .await
+                {
+                    Ok((response, turn_trace)) => {
+                        {
+                            let decision = decision_context;
+                            anyhow::ensure!(
+                                turn_trace.execution_trace.as_ref() == Some(&decision.terminal_execution_trace()),
+                                "interactive tool loop trace differs from its owning decision"
+                            );
+                        }
+                        let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
+                            &route_decision,
+                            provider_started_at,
+                            turn_trace,
+                        );
+                        if let Err(error) = crate::runtime::turn_terminal::commit_terminal(
+                            Some(terminal_guard),
+                            &memory_fabric,
+                            crate::agent::terminal::TurnTerminalDraft {
+                                decision: decision_settlement.clone(),
+                                terminal_id: turn_run_id.clone(),
+                                scope: runtime_envelope.message_scope(),
+                                status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                                history: Some(crate::agent::terminal::TurnHistoryProjection {
+                                    assistant_content: response.clone(),
+                                    history_commit_len: history.len(),
+                                }),
+                                history_scope: Some(
+                                    fabric_scope
+                                        .clone()
+                                        .with_sender(format!("{provider_name}/{model_name}"))
+                                        .with_recipient("local-user"),
+                                ),
+                                provider_outcome: Some(provider_outcome),
+                                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                    summary: "interactive agent turn completed".to_string(),
+                                    started_at: provider_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                },
+                                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                            },
+                            &config,
+                        )
+                        .await
+                        {
+                            return Err(error);
+                        }
+                        response
+                    }
+                    Err(e) => {
+                        let cancelled = crate::agent::turn_contracts::is_tool_loop_cancelled(&e);
+                        let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                            &route_decision,
+                            provider_started_at,
+                            &e,
+                        );
+                        if let Err(finalize_error) = crate::runtime::turn_terminal::commit_terminal(
+                            Some(terminal_guard),
+                            &memory_fabric,
+                            crate::agent::terminal::TurnTerminalDraft {
+                                decision: decision_settlement.clone(),
+                                terminal_id: turn_run_id.clone(),
+                                scope: runtime_envelope.message_scope(),
+                                status: if cancelled {
+                                    crate::agent::terminal::TurnTerminalStatus::Cancelled
+                                } else {
+                                    crate::agent::terminal::TurnTerminalStatus::Failed
+                                },
+                                history: None,
+                                history_scope: None,
+                                provider_outcome: (!cancelled).then_some(provider_outcome),
+                                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                    summary: e.to_string(),
+                                    started_at: provider_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                },
+                                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                            },
+                            &config,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %finalize_error, "Failed to commit failed interactive agent terminal event");
+                        }
+                        if cancelled {
+                            return Err(e);
+                        }
+                        eprintln!("\nError: {e}\n");
+                        hooks
+                            .emit(HookEvent::Error, payload_error("agent-turn", &e.to_string()))
+                            .await;
+                        continue;
+                    }
+                };
+                increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
+                final_output = response.clone();
+                if let Err(e) = crate::channels::Channel::send(
+                    &cli,
+                    &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+                )
+                .await
+                {
+                    eprintln!("\nError sending CLI response: {e}\n");
+                }
+                observer.record_event(&ObserverEvent::TurnComplete);
+                hooks
+                    .emit(
+                        HookEvent::TurnComplete,
+                        serde_json::json!({
+                            "mode": "interactive",
+                            "response_chars": response.chars().count(),
+                        }),
+                    )
+                    .await;
+            }
+            Ok(())
+            }).await?;
+        }
+
+        let duration = start.elapsed();
+        observer.record_event(&ObserverEvent::AgentEnd {
+            provider: provider_name.to_string(),
+            model: model_name.to_string(),
+            duration,
+            tokens_used: None,
+            cost_usd: None,
+        });
+        hooks
+            .emit(
+                HookEvent::AgentEnd,
+                serde_json::json!({
+                    "duration_ms": duration.as_millis(),
+                    "tokens_used": serde_json::Value::Null,
+                }),
+            )
+            .await;
+
+        Ok::<String, anyhow::Error>(final_output)
     });
     let result = match caller_cleanup {
         Some(cleanup) => cleanup.run(work).await,
@@ -1672,11 +2726,17 @@ struct CliWork<'a> {
     scheduled_admission: &'a Option<super::scheduled_source::ScheduledAdmission>,
 }
 
-// Separate construction of the large work state from the entry poll frame.
-fn boxed_cli_work(
-    work: CliWork<'_>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
-    Box::pin(cli_work(work))
+// Invoke the small capture closure here so the large future is constructed
+// outside the canonical entry poll frame, then preserve the existing heap seam.
+#[inline(never)]
+fn boxed_cli_work<'a, F, Fut>(
+    make_work: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>> + Send + 'a,
+{
+    Box::pin(make_work())
 }
 
 // Keep the single-turn poll state out of the enclosing CLI select frame.
@@ -1694,1051 +2754,6 @@ fn boxed_cli_interactive<'a>(
     work: impl std::future::Future<Output = Result<()>> + Send + 'a,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(work)
-}
-
-#[allow(clippy::too_many_lines)]
-async fn cli_work(work: CliWork<'_>) -> Result<String> {
-    let CliWork {
-        ctx,
-        choice,
-        message,
-        temperature,
-        shutdown,
-        runtime_envelope_override,
-        scheduled_tool_scope,
-        scoped_run_id,
-        scheduled_admission,
-    } = work;
-    // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
-    // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so all the
-    // `config.xxx` accesses below are unchanged.
-    let config = Arc::clone(&ctx.config);
-
-    let observer = Arc::clone(&ctx.observer);
-    let hooks = Arc::clone(&ctx.hooks);
-    // security is consumed only by tool construction, which now happens inside the
-    // bootstrap; it is not re-bound here on purpose (no downstream use in `run`).
-    // The local runtime adapter is likewise built and consumed inside the
-    // bootstrap, so it is no longer constructed here.
-
-    // ── Memory (the brain) ────────────────────────────────────────
-    // The Interactive profile always builds memory, so it is Some here; take it
-    // explicitly without panicking (iron rules 1/6).
-    let mem: Arc<dyn Memory> = ctx
-        .memory
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for the agent CLI"))?;
-    let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
-        .with_event_recording(config.memory.event_recording_config());
-    // D8-3: run_id is per-turn (generated inside each turn branch as `turn_run_id`),
-    // no longer a single per-run id held here.
-    let mut fabric_turn_seq: u64 = 0;
-
-    // ── Tools ────────────────────────────────────────────────────
-    // The Interactive profile built the tool registry inside the bootstrap
-    // (security + runtime + memory all ready) using the identical
-    // `all_tools_with_runtime` call with the same arguments; take it explicitly.
-    let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
-        .tools
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
-
-    // ── Provider (resolved before the bootstrap) ─────────────────
-    let selection = agent_provider_selection(&config, choice);
-    let provider_name = selection.provider_name;
-    let model_name = selection.model_name;
-
-    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
-
-    let provider: Box<dyn Provider> = selection.build_provider(&config, &provider_runtime_options)?;
-    let effective_compaction = crate::router::resolve_effective_compaction_config(
-        &config.agent.compaction,
-        provider_name,
-        model_name,
-        &config.router,
-        &config.model_routes,
-    );
-    crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
-
-    observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.to_string(),
-        model: model_name.to_string(),
-    });
-    hooks
-        .emit(
-            HookEvent::AgentStart,
-            serde_json::json!({
-                "provider": provider_name,
-                "model": model_name,
-            }),
-        )
-        .await;
-
-    // ── Build system prompt from the canonical prompt context ──
-    let native_tools = provider
-        .capabilities_for(model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
-        .native_tool_calling;
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-
-    // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = Arc::new(ApprovalManager::new());
-
-    // ── Execute ──────────────────────────────────────────────────
-    let start = Instant::now();
-
-    let mut final_output = String::new();
-
-    if let Some(msg) = message {
-        // ── Single-shot mode (D5/D9 step 2) ──────────────────────────
-        // A single non-interactive turn: race the work against the external
-        // shutdown token so a root cancel (e.g. ctrl_c wired by dispatch in A6)
-        // aborts the in-flight turn instead of waiting it out. The interactive
-        // branch below cannot do this because it blocks on synchronous
-        // `stdin().read_line()`, which `tokio::select!` cannot poll.
-        fabric_turn_seq += 1;
-        // Keep the turn identity outside the raced future so a shutdown that
-        // drops it can still close the shared terminal boundary as Cancelled.
-        let turn_run_id = scoped_run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let mut runtime_envelope = scheduled_admission.as_ref().map_or_else(
-            || {
-                resolve_agent_turn_envelope(
-                    runtime_envelope_override.as_ref(),
-                    memory_fabric.workspace_id(),
-                    &turn_run_id,
-                )
-            },
-            |admission| admission.envelope().clone(),
-        );
-        if runtime_envelope.config_source_revision.is_none() {
-            runtime_envelope = runtime_envelope.with_config_generation(&ctx.config_generation);
-        }
-        let mut fabric_scope = runtime_envelope
-            .message_scope()
-            .with_recipient(format!("{provider_name}/{model_name}"));
-        let cancel_turn_id = turn_run_id.clone();
-        let cancel_scope = parking_lot::Mutex::new(runtime_envelope.message_scope());
-        let turn_started_at = chrono::Utc::now();
-        let decision_settlement = Arc::new(parking_lot::Mutex::new(
-            None::<crate::agent::terminal::DecisionSettlementRef>,
-        ));
-        let admission_proof = std::sync::OnceLock::<AgentTurnProof>::new();
-        let terminal_guard = std::sync::OnceLock::<crate::runtime::turn_terminal::TurnTerminalGuard>::new();
-        let mut cli_admission_guard = None;
-        let mut scheduled_input_guard = None;
-        let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
-        let single_shot = boxed_cli_single_shot(async {
-            let agent_user_event = if scheduled_admission.is_none() {
-                let owner = crate::runtime::turn_cleanup::current_tracker()
-                    .ok_or_else(|| anyhow::anyhow!("CLI input cleanup owner missing"))?;
-                let (event, guard) = CliPendingInput {
-                    fabric: memory_fabric.clone(),
-                    generation: Arc::clone(&ctx.config_generation),
-                    envelope: runtime_envelope.clone(),
-                    scope: fabric_scope.clone(),
-                    choice: choice.clone(),
-                    input: msg.clone(),
-                    key: format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
-                    ticket: owner.register(shutdown.clone())?,
-                }
-                .record()
-                .await?;
-                cli_admission_guard = Some(guard);
-                event
-            } else {
-                let admission = scheduled_admission
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("scheduled admission source missing"))?;
-                let owner = crate::runtime::turn_cleanup::current_tracker()
-                    .ok_or_else(|| anyhow::anyhow!("scheduled input cleanup owner missing"))?;
-                let (event, guard) = admission
-                    .record_guarded(
-                        memory_fabric.clone(),
-                        Arc::clone(&ctx.config_generation),
-                        (
-                            msg.clone(),
-                            format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
-                            choice.clone(),
-                        ),
-                        owner.register(shutdown.clone())?,
-                    )
-                    .await?;
-                scheduled_input_guard = Some(guard);
-                event
-            };
-
-            let decision_turn = {
-                let service = ctx
-                    .turn_decisions
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("agent decision service is missing"))?;
-                let proof = if let Some(admission) = &scheduled_admission {
-                    let source = admission
-                        .bind_input(
-                            mem.as_ref(),
-                            &ctx.config_generation,
-                            &runtime_envelope,
-                            (&msg, choice),
-                            agent_user_event.as_ref(),
-                            shutdown,
-                        )
-                        .await?;
-                    AgentTurnProof {
-                        workspace_id: Arc::from(source.envelope.workspace_id.as_str()),
-                        owner_id: Arc::from(source.envelope.resolved_owner_id()),
-                        session_key: Arc::from(source.envelope.session_key.as_str()),
-                        run_id: Arc::from(turn_run_id.as_str()),
-                        source_event_id: source.envelope.source_message_event_id.as_deref().map(Arc::from),
-                        routing_input: Arc::from(msg.as_str()),
-                        memory_scope: source
-                            .envelope
-                            .memory_write_context(source.execution.chat_type.as_str()),
-                        provider_name: Arc::from(choice.provider_name()),
-                        model_name: Arc::from(choice.model_name()),
-                        model_binding: choice.binding().clone(),
-                        config_generation_id: ctx.config_generation.id.0,
-                        config_source_revision: Arc::from(
-                            ctx.config_generation.source_revision.fingerprint_sha256.as_str(),
-                        ),
-                        retrieval_principal: source.envelope.memory_principal(),
-                        scheduled: Some(Box::new(source)),
-                    }
-                } else {
-                    issue_cli_agent_turn_proof(
-                        None,
-                        &runtime_envelope,
-                        &ctx.config_generation,
-                        &turn_run_id,
-                        &msg,
-                        agent_user_event.as_ref(),
-                        choice,
-                    )?
-                };
-                if let Some(source) = proof.scheduled.as_ref() {
-                    runtime_envelope = source.envelope.clone();
-                    fabric_scope = runtime_envelope
-                        .message_scope()
-                        .with_recipient(format!("{provider_name}/{model_name}"));
-                    *cancel_scope.lock() = runtime_envelope.message_scope();
-                }
-                let proof = admission_proof.get_or_init(|| proof);
-                if scheduled_admission.is_some() {
-                    // Mark before polling decision work: a failed or interrupted
-                    // admission can already have a durable decision identity.
-                    super::scheduled_source::begin_decision()?;
-                }
-                let decision = service
-                    .decide_agent_initial(
-                        proof,
-                        crate::runtime::turn_decision::AgentTurnKind::SingleShot,
-                        shutdown,
-                    )
-                    .await?;
-                *decision_settlement.lock() = Some(service.terminal_settlement_ref(Arc::clone(&decision))?);
-                let cleanup_ticket = if scheduled_admission.is_some() {
-                    scheduled_input_guard
-                        .take()
-                        .ok_or_else(|| anyhow::anyhow!("scheduled input cleanup guard missing"))?
-                        .into_terminal_ticket()?
-                } else {
-                    cli_admission_guard
-                        .take()
-                        .ok_or_else(|| anyhow::anyhow!("CLI input cleanup guard missing"))?
-                        .into_terminal_ticket()?
-                };
-                let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-                    provider_name,
-                    model_name.to_string(),
-                    runtime_envelope.resolved_owner_id(),
-                    runtime_envelope.session_key.clone(),
-                    runtime_envelope.source_message_event_id.clone(),
-                    None,
-                    "agent_cli_single",
-                    u32::try_from(msg.chars().count() / 4).unwrap_or(u32::MAX),
-                    !tools_registry.is_empty(),
-                    false,
-                );
-                let guard = crate::runtime::turn_terminal::TurnTerminalGuard::new(
-                    cleanup_ticket,
-                    Arc::clone(service),
-                    Arc::clone(&decision),
-                    memory_fabric.clone(),
-                    Arc::clone(&config),
-                    runtime_envelope.clone(),
-                    None,
-                )?
-                .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
-                terminal_guard
-                    .set(guard)
-                    .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
-                anyhow::ensure!(
-                    !matches!(
-                        decision.disposition()?,
-                        crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-                    ),
-                    "ingress has no approval collection adapter"
-                );
-                if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
-                    let ports = CliDecisionClose {
-                        terminal_guard: terminal_guard.get(),
-                        service,
-                        fabric: &memory_fabric,
-                        config: &config,
-                        scope: runtime_envelope.message_scope(),
-                        terminal_id: turn_run_id.clone(),
-                        history_commit_len: 2,
-                        started_at: turn_started_at,
-                    };
-                    service
-                        .close_agent_directive_turn(proof, Arc::clone(&decision), &ports, shutdown)
-                        .await?;
-                    final_output = reply.to_string();
-                    println!("{reply}");
-                    return Ok::<(), anyhow::Error>(());
-                }
-                (service, proof, decision, route_decision)
-            };
-
-            let (decision_service, decision_proof, decision_context, route_decision) = &decision_turn;
-            let decision_proof = *decision_proof;
-            let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
-            let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
-
-            // Auto-save user message to memory (skip short/trivial messages)
-            if config.memory.should_auto_promote_user_message(&msg) {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = memory_fabric
-                    .record_semantic_memory_from_event(
-                        &user_key,
-                        &msg,
-                        MemoryCategory::Conversation,
-                        None,
-                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-                        None,
-                        None,
-                    )
-                    .await;
-            }
-
-            // Inject memory context into user message. The routing input is
-            // pinned from `msg` here, ahead of the enrichment below.
-            let memory_runtime = cli_turn_memory_runtime(
-                &mem,
-                &config.workspace_dir,
-                &runtime_envelope,
-                &memory_fabric,
-                &fabric_scope,
-                agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-            );
-            let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                preamble: crate::agent::memory_loader::format_selected_context(None, decision_context.retrieved()?)?,
-                ids: Vec::new(),
-            };
-            let context = mem_context.preamble.clone();
-            let enriched = if context.is_empty() {
-                msg.clone()
-            } else {
-                format!("{context}{msg}")
-            };
-
-            let mut history = vec![
-                ChatMessage::system(&system_prompt),
-                crate::agent::turn_contracts::inbound_user_message(&enriched),
-            ];
-
-            // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
-            // single-shot agent turn inherits parent_run_id = the per-turn run_id.
-            let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
-                turn_run_id.clone(),
-                runtime_envelope.session_key.clone(),
-            );
-            let provider_started_at = chrono::Utc::now();
-            let runtime_adapter = Some({
-                let mut adapter =
-                    configured_cli_tool_adapter(&ctx.security, &tools_registry, &approval_manager, &memory_runtime);
-                {
-                    let proof = decision_proof;
-                    let mut envelope = runtime_envelope.clone();
-                    if let Some(event_id) = proof.source_event_id() {
-                        envelope = envelope.with_source_message_event_id(event_id);
-                    }
-                    adapter.tool_execution_context = proof.scheduled.as_ref().map_or_else(
-                        || crate::tools::ToolExecutionContext::new(envelope, "private"),
-                        |source| source.execution.clone(),
-                    );
-                }
-                adapter.provider_trace = Some(Arc::clone(&retained_provider_trace));
-                adapter
-            });
-            let turn_result = crate::tools::execution::with_scheduled_job_tool_scope(
-                scheduled_tool_scope,
-                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(turn_spawn_ctx, async {
-                    run_turn(
-                        &mut history,
-                        crate::agent::turn_request::TurnRequest {
-                            channel_name: "cli",
-                            scope: None,
-                            mode: ChatMode::default(),
-                            silent: false,
-                            expose_stay_silent: false,
-                            multimodal: &config.multimodal,
-                            schedule: crate::agent::turn_request::TurnSchedule {
-                                read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
-                                priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
-                                low_priority_tool_names: config.agent.low_priority_tools.clone(),
-                            },
-                            compaction: Some(decision_context.main_compaction()),
-                            decision: crate::agent::turn_request::TurnDecision {
-                                service: decision_service,
-                                context: decision_context,
-                                proof: decision_proof,
-                            },
-                        },
-                        crate::agent::turn_request::TurnServices {
-                            provider: provider.as_ref(),
-                            provider_name,
-                            model: model_name,
-                            temperature,
-                            tools_registry: Arc::clone(&tools_registry),
-                            observer: observer.as_ref(),
-                            hooks: &hooks,
-                            approval: Some(Arc::clone(&approval_manager)),
-                            approval_resolver: None,
-                            runtime_adapter,
-                            memory: memory_runtime,
-                        },
-                        crate::agent::turn_request::TurnDelivery {
-                            cancellation: None,
-                            on_delta: None,
-                            on_tool_call: None,
-                        },
-                    )
-                    .await
-                    .map(|(outcome, trace)| (outcome.into_text(), trace))
-                }),
-            )
-            .await;
-            let (response, turn_trace) = match turn_result {
-                Ok(result) => result,
-                Err(error) => {
-                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                        &route_decision,
-                        provider_started_at,
-                        &error,
-                    );
-                    if let Err(finalize_error) = crate::runtime::turn_terminal::commit_terminal(
-                        terminal_guard.get(),
-                        &memory_fabric,
-                        crate::agent::terminal::TurnTerminalDraft {
-                            decision: decision_settlement_snapshot(&decision_settlement),
-                            terminal_id: turn_run_id.clone(),
-                            scope: runtime_envelope.message_scope(),
-                            status: crate::agent::terminal::TurnTerminalStatus::Failed,
-                            history: None,
-                            history_scope: None,
-                            provider_outcome: Some(provider_outcome),
-                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                                summary: error.to_string(),
-                                started_at: provider_started_at,
-                                finished_at: chrono::Utc::now(),
-                            },
-                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-                        },
-                        &config,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %finalize_error, "Failed to commit failed single-shot agent terminal event");
-                    }
-                    return Err(error);
-                }
-            };
-            {
-                let decision = decision_context;
-                anyhow::ensure!(
-                    turn_trace.execution_trace.as_ref() == Some(&decision.terminal_execution_trace()),
-                    "tool loop trace differs from the owning decision's execution facts"
-                );
-            }
-            let provider_outcome =
-                crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, turn_trace);
-            if let Err(error) = crate::runtime::turn_terminal::commit_terminal(
-                terminal_guard.get(),
-                &memory_fabric,
-                crate::agent::terminal::TurnTerminalDraft {
-                    decision: decision_settlement_snapshot(&decision_settlement),
-                    terminal_id: turn_run_id.clone(),
-                    scope: runtime_envelope.message_scope(),
-                    status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                    history: Some(crate::agent::terminal::TurnHistoryProjection {
-                        assistant_content: response.clone(),
-                        history_commit_len: history.len(),
-                    }),
-                    history_scope: Some(
-                        fabric_scope
-                            .clone()
-                            .with_sender(format!("{provider_name}/{model_name}"))
-                            .with_recipient("local-user"),
-                    ),
-                    provider_outcome: Some(provider_outcome),
-                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                        summary: "single-shot agent turn completed".to_string(),
-                        started_at: provider_started_at,
-                        finished_at: chrono::Utc::now(),
-                    },
-                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-                },
-                &config,
-            )
-            .await
-            {
-                return Err(error);
-            }
-            if terminal_guard.get().is_none() && config.causal_tree.enabled {
-                decision_service
-                    .rejoin_terminal(&turn_run_id, decision_proof.owner_id())
-                    .await?;
-            }
-            increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
-            final_output = response.clone();
-            println!("{response}");
-            observer.record_event(&ObserverEvent::TurnComplete);
-            hooks
-                .emit(
-                    HookEvent::TurnComplete,
-                    serde_json::json!({
-                        "mode": "single",
-                        "response_chars": response.chars().count(),
-                    }),
-                )
-                .await;
-            Ok::<(), anyhow::Error>(())
-        });
-        let single_result = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => {
-                if terminal_guard.get().is_none()
-                    && let Some(settlement) = decision_settlement_snapshot(&decision_settlement)
-                {
-                let cancelled_scope = cancel_scope.lock().clone();
-                if let Err(error) = crate::agent::terminal::finalize_turn(
-                    &memory_fabric,
-                    crate::agent::terminal::TurnTerminalDraft {
-                        decision: Some(settlement),
-                        terminal_id: cancel_turn_id,
-                        scope: cancelled_scope,
-                        status: crate::agent::terminal::TurnTerminalStatus::Cancelled,
-                        history: None,
-                        history_scope: None,
-                        provider_outcome: None,
-                        telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                            summary: "single-shot agent cancelled by shutdown signal".to_string(),
-                            started_at: turn_started_at,
-                            finished_at: chrono::Utc::now(),
-                        },
-                        delivery_intent: crate::agent::terminal::TurnDeliveryIntent::None,
-                    },
-                    &config.cost,
-                    &config.workspace_dir,
-                ).await {
-                    tracing::warn!(error = %error, "Failed to commit cancelled single-shot agent terminal event");
-                }
-                }
-                Err(anyhow::anyhow!("agent single-shot run cancelled by shutdown signal"))
-            }
-            result = single_shot => result,
-        };
-        if let (Err(error), Some(guard)) = (&single_result, terminal_guard.get()) {
-            guard.finish_failure(error, shutdown.is_cancelled()).await?;
-        }
-        if let Err(error) = &single_result
-            && let Some(mut guard) = cli_admission_guard.take()
-        {
-            guard
-                .finish_failure(shutdown.is_cancelled(), &error.to_string())
-                .await
-                .map_err(|record_error| {
-                    anyhow::anyhow!("CLI admission failed: {error}; failure persistence is unconfirmed: {record_error}")
-                })?;
-        }
-        if single_result.is_err()
-            && let Some(mut guard) = scheduled_input_guard.take()
-        {
-            guard
-                .finish_failure(shutdown.is_cancelled())
-                .await
-                .map_err(|_| anyhow::anyhow!("scheduled admission failure persistence is unconfirmed"))?;
-        }
-        single_result?;
-    } else {
-        boxed_cli_interactive(async {
-        println!("🦀 OpenPRX Interactive Mode");
-        println!("Type /help for commands.\n");
-        let cli = crate::channels::CliChannel::new();
-
-        // Persistent conversation history across turns
-        let mut history = if config.skill_rag.available() {
-            Vec::new()
-        } else {
-            vec![ChatMessage::system(build_runtime_system_prompt(
-                &config,
-                model_name,
-                &skills,
-                native_tools,
-            ))]
-        };
-
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
-
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
-                    break;
-                }
-            }
-
-            let user_input = input.trim().to_string();
-            if user_input.is_empty() {
-                continue;
-            }
-            match user_input.as_str() {
-                "/quit" | "/exit" => break,
-                "/help" => {
-                    println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
-                    continue;
-                }
-                "/clear" | "/new" => {
-                    println!("This will clear the current conversation and delete all session memory.");
-                    println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
-                    let _ = std::io::stdout().flush();
-
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
-                        continue;
-                    }
-                    if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
-                        println!("Cancelled.\n");
-                        continue;
-                    }
-
-                    history.clear();
-                    if !config.skill_rag.available() {
-                        history.push(ChatMessage::system(build_runtime_system_prompt(
-                            &config,
-                            model_name,
-                            &skills,
-                            native_tools,
-                        )));
-                    }
-                    // Clear conversation and daily memory
-                    let mut cleared = 0;
-                    for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
-                        for entry in entries {
-                            if mem.forget(&entry.key).await.unwrap_or(false) {
-                                cleared += 1;
-                            }
-                        }
-                    }
-                    if cleared > 0 {
-                        println!("Conversation cleared ({cleared} memory entries removed).\n");
-                    } else {
-                        println!("Conversation cleared.\n");
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-
-            fabric_turn_seq += 1;
-            // D8-3: one run_id per turn (was per-run). Generated at the turn entry
-            // and used for both the message-event envelope and the user op-id.
-            let turn_run_id = Uuid::new_v4().to_string();
-            let runtime_envelope =
-                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
-                    .with_recipient("cli:local-user")
-                    .with_config_generation(&ctx.config_generation);
-            let fabric_scope = runtime_envelope
-                .message_scope()
-                .with_recipient(format!("{provider_name}/{model_name}"));
-            let owner = crate::runtime::turn_cleanup::current_tracker()
-                .ok_or_else(|| anyhow::anyhow!("CLI input cleanup owner missing"))?;
-            let (agent_user_event, mut admission_guard) = CliPendingInput {
-                fabric: memory_fabric.clone(),
-                generation: Arc::clone(&ctx.config_generation),
-                envelope: runtime_envelope.clone(),
-                scope: fabric_scope.clone(),
-                choice: choice.clone(),
-                input: user_input.clone(),
-                key: format!("agent:{turn_run_id}:{fabric_turn_seq}:user"),
-                ticket: owner.register(shutdown.clone())?,
-            }
-            .record()
-            .await?;
-
-            let decision_turn = {
-                let service = ctx
-                    .turn_decisions
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("interactive agent decision service is missing"))?;
-                let proof = issue_cli_agent_turn_proof(
-                    None,
-                    &runtime_envelope,
-                    &ctx.config_generation,
-                    &turn_run_id,
-                    &user_input,
-                    agent_user_event.as_ref(),
-                    choice,
-                )?;
-                let decision =
-                    match service
-                        .decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::Repl, shutdown)
-                        .await
-                    {
-                        Ok(decision) => decision,
-                        Err(error) => {
-                            admission_guard.finish_failure(
-                            shutdown.is_cancelled(), &error.to_string(),
-                        ).await.map_err(|record_error| anyhow::anyhow!(
-                            "CLI admission failed: {error}; failure persistence is unconfirmed: {record_error}"
-                        ))?;
-                            return Err(anyhow::Error::from(error));
-                        }
-                    };
-                let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
-                let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-                    provider_name,
-                    model_name.to_string(),
-                    runtime_envelope.resolved_owner_id(),
-                    runtime_envelope.session_key.clone(),
-                    runtime_envelope.source_message_event_id.clone(),
-                    None,
-                    "agent_cli_interactive",
-                    u32::try_from(user_input.chars().count() / 4).unwrap_or(u32::MAX),
-                    !tools_registry.is_empty(),
-                    false,
-                );
-                let terminal_guard = crate::runtime::turn_terminal::TurnTerminalGuard::new(
-                    admission_guard.into_terminal_ticket()?,
-                    Arc::clone(service),
-                    Arc::clone(&decision),
-                    memory_fabric.clone(),
-                    Arc::clone(&config),
-                    runtime_envelope.clone(),
-                    None,
-                )?
-                .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
-                anyhow::ensure!(
-                    !matches!(
-                        decision.disposition()?,
-                        crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-                    ),
-                    "ingress has no approval collection adapter"
-                );
-                if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
-                    if history.is_empty() {
-                        history.push(ChatMessage::system(""));
-                    }
-                    let ports = CliDecisionClose {
-                        terminal_guard: Some(&terminal_guard),
-                        service,
-                        fabric: &memory_fabric,
-                        config: &config,
-                        scope: runtime_envelope.message_scope(),
-                        terminal_id: turn_run_id.clone(),
-                        history_commit_len: history.len() + 2,
-                        started_at: chrono::Utc::now(),
-                    };
-                    service
-                        .close_agent_directive_turn(&proof, Arc::clone(&decision), &ports, shutdown)
-                        .await?;
-                    history.push(crate::agent::turn_contracts::inbound_user_message(&user_input));
-                    history.push(ChatMessage::assistant(reply.as_ref()));
-                    final_output = reply.to_string();
-                    println!("{reply}\n");
-                    observer.record_event(&ObserverEvent::TurnComplete);
-                    hooks
-                        .emit(
-                            HookEvent::TurnComplete,
-                            serde_json::json!({"mode":"interactive","response_chars":reply.chars().count()}),
-                        )
-                        .await;
-                    continue;
-                }
-                (
-                    service,
-                    proof,
-                    decision,
-                    route_decision,
-                    terminal_guard,
-                    retained_provider_trace,
-                )
-            };
-            let (
-                decision_service,
-                decision_proof,
-                decision_context,
-                route_decision,
-                terminal_guard,
-                retained_provider_trace,
-            ) = &decision_turn;
-            let decision_settlement = Some(decision_service.terminal_settlement_ref(Arc::clone(decision_context))?);
-
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.should_auto_promote_user_message(&user_input) {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = memory_fabric
-                    .record_semantic_memory_from_event(
-                        &user_key,
-                        &user_input,
-                        MemoryCategory::Conversation,
-                        None,
-                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-                        None,
-                        None,
-                    )
-                    .await;
-            }
-
-            // Inject memory context into user message. The routing input is
-            // pinned from `user_input` here, ahead of the enrichment below.
-            let memory_runtime = cli_turn_memory_runtime(
-                &mem,
-                &config.workspace_dir,
-                &runtime_envelope,
-                &memory_fabric,
-                &fabric_scope,
-                agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-            );
-            let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                preamble: crate::agent::memory_loader::format_selected_context(None, decision_context.retrieved()?)?,
-                ids: Vec::new(),
-            };
-            let context = mem_context.preamble.clone();
-            let enriched = if context.is_empty() {
-                user_input.clone()
-            } else {
-                format!("{context}{user_input}")
-            };
-
-            let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
-            let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
-            if history.is_empty() {
-                history.push(ChatMessage::system(system_prompt));
-            } else if let Some(first) = history.first_mut() {
-                *first = ChatMessage::system(system_prompt);
-            }
-            history.push(crate::agent::turn_contracts::inbound_user_message(&enriched));
-
-            // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
-            // interactive agent turn inherits parent_run_id = the per-turn run_id.
-            let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
-                turn_run_id.clone(),
-                format!("agent:{turn_run_id}"),
-            );
-            let provider_started_at = chrono::Utc::now();
-            let mut runtime_adapter =
-                configured_cli_tool_adapter(&ctx.security, &tools_registry, &approval_manager, &memory_runtime);
-            {
-                let proof = decision_proof;
-                let mut envelope = runtime_envelope.clone();
-                if let Some(event_id) = proof.source_event_id() {
-                    envelope = envelope.with_source_message_event_id(event_id);
-                }
-                runtime_adapter.tool_execution_context = crate::tools::ToolExecutionContext::new(envelope, "private");
-            }
-            runtime_adapter.provider_trace = Some(Arc::clone(retained_provider_trace));
-            let response = match crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
-                .scope(turn_spawn_ctx, async {
-                    run_turn(
-                        &mut history,
-                        crate::agent::turn_request::TurnRequest {
-                            channel_name: "cli",
-                            scope: None,
-                            mode: ChatMode::default(),
-                            silent: false,
-                            expose_stay_silent: false,
-                            multimodal: &config.multimodal,
-                            schedule: crate::agent::turn_request::TurnSchedule {
-                                read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
-                                priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
-                                low_priority_tool_names: config.agent.low_priority_tools.clone(),
-                            },
-                            compaction: Some(decision_context.main_compaction()),
-                            decision: crate::agent::turn_request::TurnDecision {
-                                service: decision_service,
-                                context: decision_context,
-                                proof: decision_proof,
-                            },
-                        },
-                        crate::agent::turn_request::TurnServices {
-                            provider: provider.as_ref(),
-                            provider_name,
-                            model: model_name,
-                            temperature,
-                            tools_registry: Arc::clone(&tools_registry),
-                            observer: observer.as_ref(),
-                            hooks: &hooks,
-                            approval: Some(Arc::clone(&approval_manager)),
-                            approval_resolver: None,
-                            runtime_adapter: Some(runtime_adapter),
-                            memory: memory_runtime,
-                        },
-                        crate::agent::turn_request::TurnDelivery {
-                            cancellation: Some(shutdown.child_token()),
-                            on_delta: None,
-                            on_tool_call: None,
-                        },
-                    )
-                    .await
-                    .map(|(outcome, trace)| (outcome.into_text(), trace))
-                })
-                .await
-            {
-                Ok((response, turn_trace)) => {
-                    {
-                        let decision = decision_context;
-                        anyhow::ensure!(
-                            turn_trace.execution_trace.as_ref() == Some(&decision.terminal_execution_trace()),
-                            "interactive tool loop trace differs from its owning decision"
-                        );
-                    }
-                    let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
-                        &route_decision,
-                        provider_started_at,
-                        turn_trace,
-                    );
-                    if let Err(error) = crate::runtime::turn_terminal::commit_terminal(
-                        Some(terminal_guard),
-                        &memory_fabric,
-                        crate::agent::terminal::TurnTerminalDraft {
-                            decision: decision_settlement.clone(),
-                            terminal_id: turn_run_id.clone(),
-                            scope: runtime_envelope.message_scope(),
-                            status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                            history: Some(crate::agent::terminal::TurnHistoryProjection {
-                                assistant_content: response.clone(),
-                                history_commit_len: history.len(),
-                            }),
-                            history_scope: Some(
-                                fabric_scope
-                                    .clone()
-                                    .with_sender(format!("{provider_name}/{model_name}"))
-                                    .with_recipient("local-user"),
-                            ),
-                            provider_outcome: Some(provider_outcome),
-                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                                summary: "interactive agent turn completed".to_string(),
-                                started_at: provider_started_at,
-                                finished_at: chrono::Utc::now(),
-                            },
-                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-                        },
-                        &config,
-                    )
-                    .await
-                    {
-                        return Err(error);
-                    }
-                    response
-                }
-                Err(e) => {
-                    let cancelled = crate::agent::turn_contracts::is_tool_loop_cancelled(&e);
-                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                        &route_decision,
-                        provider_started_at,
-                        &e,
-                    );
-                    if let Err(finalize_error) = crate::runtime::turn_terminal::commit_terminal(
-                        Some(terminal_guard),
-                        &memory_fabric,
-                        crate::agent::terminal::TurnTerminalDraft {
-                            decision: decision_settlement.clone(),
-                            terminal_id: turn_run_id.clone(),
-                            scope: runtime_envelope.message_scope(),
-                            status: if cancelled {
-                                crate::agent::terminal::TurnTerminalStatus::Cancelled
-                            } else {
-                                crate::agent::terminal::TurnTerminalStatus::Failed
-                            },
-                            history: None,
-                            history_scope: None,
-                            provider_outcome: (!cancelled).then_some(provider_outcome),
-                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                                summary: e.to_string(),
-                                started_at: provider_started_at,
-                                finished_at: chrono::Utc::now(),
-                            },
-                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-                        },
-                        &config,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %finalize_error, "Failed to commit failed interactive agent terminal event");
-                    }
-                    if cancelled {
-                        return Err(e);
-                    }
-                    eprintln!("\nError: {e}\n");
-                    hooks
-                        .emit(HookEvent::Error, payload_error("agent-turn", &e.to_string()))
-                        .await;
-                    continue;
-                }
-            };
-            increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
-            final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
-                &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-            )
-            .await
-            {
-                eprintln!("\nError sending CLI response: {e}\n");
-            }
-            observer.record_event(&ObserverEvent::TurnComplete);
-            hooks
-                .emit(
-                    HookEvent::TurnComplete,
-                    serde_json::json!({
-                        "mode": "interactive",
-                        "response_chars": response.chars().count(),
-                    }),
-                )
-                .await;
-        }
-        Ok(())
-        }).await?;
-    }
-
-    let duration = start.elapsed();
-    observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name.to_string(),
-        model: model_name.to_string(),
-        duration,
-        tokens_used: None,
-        cost_usd: None,
-    });
-    hooks
-        .emit(
-            HookEvent::AgentEnd,
-            serde_json::json!({
-                "duration_ms": duration.as_millis(),
-                "tokens_used": serde_json::Value::Null,
-            }),
-        )
-        .await;
-
-    Ok::<String, anyhow::Error>(final_output)
 }
 
 fn resolve_agent_turn_envelope(
