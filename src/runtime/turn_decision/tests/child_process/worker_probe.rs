@@ -30,8 +30,8 @@ where
     let owned_runs = Arc::new(tokio::sync::RwLock::new(Vec::<SubAgentRun>::new()));
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
     let outcome = cleanup
-        .run(Box::pin(async {
-            Ok(std::panic::AssertUnwindSafe(async {
+        .run(boxed_parent_issuance(|| async {
+            Ok(std::panic::AssertUnwindSafe(boxed_parent_issuance(|| async {
                 let generation = crate::config::new_shared(config.clone()).pin();
                 let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));
                 let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
@@ -185,7 +185,7 @@ where
                 drop(context);
                 drop(service);
                 result
-            })
+            }))
             .catch_unwind()
             .await)
         }))
@@ -195,6 +195,17 @@ where
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+// Construct the existing boxed parent work before the cleanup owner polls it.
+// The closure returns a lazy future; all issuance and catch logic stays inside.
+#[inline(never)]
+fn boxed_parent_issuance<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    Box::pin(make_work())
 }
 
 // Construct the callback future in this separate frame before the parent
