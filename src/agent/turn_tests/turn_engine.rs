@@ -426,88 +426,118 @@ impl Provider for EchoTailRetryProvider {
 /// `append_corrective_aside` and the split below finds no marker.
 #[tokio::test]
 async fn a_corrective_aside_stays_attributable_when_the_model_echoes_it() {
-    let provider = EchoTailRetryProvider {
-        calls: AtomicUsize::new(0),
-    };
-    let tmp = TempDir::new().expect("test: tempdir");
-    let mut history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("summarise the release notes"),
-    ];
-    let admission =
-        crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "summarise the release notes").await;
-    let (outcome, _trace) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(Vec::new()),
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("test: the corrective retry must complete the turn");
+    use futures::FutureExt;
+    let tmp = TempDir::new().expect("test: tempdir").keep();
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned actual Answer decision endpoint")
+        .retain_evidence_at(tmp.clone());
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("actual corrective-aside cleanup owner");
+            let caught = cleanup
+                .run(async {
+                    Ok(std::panic::AssertUnwindSafe(async {
+                        let provider = EchoTailRetryProvider {
+                            calls: AtomicUsize::new(0),
+                        };
+                        let mut history = vec![
+                            ChatMessage::system("sys"),
+                            ChatMessage::user("summarise the release notes"),
+                        ];
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_answer(
+                            tmp.as_path(),
+                            "summarise the release notes",
+                            &endpoint,
+                        )
+                        .await;
+                        let result = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry: Arc::new(Vec::new()),
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(tmp.as_path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: ToolLoopMemory::none(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await;
+                        let _ = admission.decision().context.terminal_execution_trace();
+                        let (outcome, _trace) = result.expect("test: the corrective retry must complete the turn");
 
-    let ToolLoopOutcome::Text(answer) = outcome else {
-        panic!("test: the echo fixture returns text");
-    };
-    // Fixture proof: the model really did echo the instruction back.
-    assert!(
-        answer.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE),
-        "the fixture must echo the corrective instruction: {answer}"
-    );
-    // Every copy of the instruction the runtime put into the request carries
-    // the marker, so the echo splits cleanly into operator text and aside.
-    let (operator_text, aside) = answer
-        .split_once(CORRECTIVE_ASIDE_PREFIX)
-        .expect("the corrective instruction must be labelled wherever it is emitted");
-    assert_eq!(
-        operator_text.trim(),
-        "summarise the release notes",
-        "everything before the marker must be exactly what the operator wrote: {answer}"
-    );
-    assert!(
-        aside.trim().starts_with("The previous assistant response was empty."),
-        "the marker must sit immediately before the runtime's instruction: {aside}"
-    );
-    // And the aside was only ever a request-local edit: the operator's own
-    // turn in the conversation is untouched, so the next turn cannot carry
-    // the instruction forward.
-    assert_eq!(
-        history
-            .iter()
-            .find(|message| message.role == "user")
-            .map(|message| message.content.as_str()),
-        Some("summarise the release notes"),
-        "the corrective aside must not be written back into the operator's turn: {history:?}"
-    );
+                        let ToolLoopOutcome::Text(answer) = outcome else {
+                            panic!("test: the echo fixture returns text");
+                        };
+                        // Fixture proof: the model really did echo the instruction back.
+                        assert!(
+                            answer.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE),
+                            "the fixture must echo the corrective instruction: {answer}"
+                        );
+                        // Every copy of the instruction the runtime put into the request carries
+                        // the marker, so the echo splits cleanly into operator text and aside.
+                        let (operator_text, aside) = answer
+                            .split_once(CORRECTIVE_ASIDE_PREFIX)
+                            .expect("the corrective instruction must be labelled wherever it is emitted");
+                        assert_eq!(
+                            operator_text.trim(),
+                            "summarise the release notes",
+                            "everything before the marker must be exactly what the operator wrote: {answer}"
+                        );
+                        assert!(
+                            aside.trim().starts_with("The previous assistant response was empty."),
+                            "the marker must sit immediately before the runtime's instruction: {aside}"
+                        );
+                        // And the aside was only ever a request-local edit: the operator's own
+                        // turn in the conversation is untouched, so the next turn cannot carry
+                        // the instruction forward.
+                        assert_eq!(
+                            history
+                                .iter()
+                                .find(|message| message.role == "user")
+                                .map(|message| message.content.as_str()),
+                            Some("summarise the release notes"),
+                            "the corrective aside must not be written back into the operator's turn: {history:?}"
+                        );
+                    })
+                    .catch_unwind()
+                    .await)
+                })
+                .await
+                .expect("actual service queues and owner must drain");
+            if let Err(panic) = caught {
+                std::panic::resume_unwind(panic);
+            }
+        })
+        .await;
 }
 
 /// FIX-P2-02: a thin `Memory` decorator that counts `ingest_document` calls
