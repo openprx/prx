@@ -94,7 +94,7 @@ Windows equivalents:
 
 ## Source Build
 
-The repository pins Rust 1.97.1. A source install requires Rust 1.97.1 or newer,
+The repository pins Rust 1.99.0. A source install requires Rust 1.99.0 or newer,
 Cargo, Git, a C/C++ build toolchain, and platform development libraries.
 
 From a checkout:

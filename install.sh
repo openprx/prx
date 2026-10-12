@@ -2,7 +2,7 @@
 set -eu
 
 REPOSITORY="openprx/prx"
-REQUIRED_RUST_VERSION="1.97.1"
+REQUIRED_RUST_VERSION="1.99.0"
 VERSION="latest"
 INSTALL_DIR="${PRX_INSTALL_DIR:-${HOME}/.local/bin}"
 SOURCE_BUILD="false"
@@ -25,7 +25,7 @@ Usage:
 Options:
   --version <version>   Install an exact release (default: latest)
   --install-dir <path>  Destination directory (default: ~/.local/bin)
-  --source              Build from source with Rust 1.97.1 or newer
+  --source              Build from source with Rust 1.99.0 or newer
   -h, --help            Show this help
 
 The default binary path does not require Rust, Cargo, Git, or sudo.

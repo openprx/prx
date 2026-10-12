@@ -110,7 +110,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
 
       - name: Ensure target is installed

@@ -76,7 +76,7 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.97.1
+                  toolchain: 1.99.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run rust quality gate
@@ -102,7 +102,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.97.1
+                  toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run tests (HOME is a guard home, the network is denied except loopback; no test may touch ~/.openprx, a credential store or another host)
               run: ./scripts/ci/test_home_guard.sh --locked --all-features --verbose
@@ -118,7 +118,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.97.1
+                  toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
@@ -133,7 +133,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.97.1
+                  toolchain: 1.99.0
                   targets: x86_64-pc-windows-msvc
             - name: Install system dependencies
               run: choco install protoc --yes

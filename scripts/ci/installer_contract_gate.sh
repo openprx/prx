@@ -123,9 +123,9 @@ grep -q "require glibc" "$temp_dir/musl.out" \
 if HOME="$temp_dir/home" PATH="$test_path" "$installer" \
     --source \
     --install-dir "$temp_dir/source/bin" >"$temp_dir/source.out" 2>&1; then
-    fail "source installer accepted Rust older than 1.97.1"
+    fail "source installer accepted Rust older than 1.99.0"
 fi
-grep -q "Rust 1.97.1 or newer is required" "$temp_dir/source.out" \
+grep -q "Rust 1.99.0 or newer is required" "$temp_dir/source.out" \
     || fail "source Rust version error is not actionable"
 
 echo "Installer contract gate passed."

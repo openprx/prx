@@ -15,7 +15,7 @@ on:
       toolchain:
         description: "Rust toolchain channel/version."
         required: false
-        default: "1.97.1"
+        default: "1.99.0"
         type: string
       components:
         description: "Optional rustup components."

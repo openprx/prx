@@ -63,7 +63,7 @@ checksum, and installs it without requiring Rust or Git. See the
 [installation guide](docs/one-click-bootstrap.md) for exact versions, source
 builds, supported platforms, upgrades, and removal.
 
-To build from a checkout with the pinned Rust 1.97.1 toolchain:
+To build from a checkout with the pinned Rust 1.99.0 toolchain:
 
 ```bash
 git clone https://github.com/openprx/prx.git
