@@ -50,6 +50,7 @@ pub(crate) fn registry_with_search(
 enum FixtureOrigin {
     Cli { recorded: bool },
     Channel(Box<crate::channels::traits::ChannelMessage>),
+    OrdinaryControlledChannel(Box<crate::channels::traits::ChannelMessage>),
 }
 
 pub(crate) struct AdmittedTurn {
@@ -132,6 +133,27 @@ impl AdmittedTurn {
         Self::with_channel_memory(config, message, registry, memory).await
     }
 
+    /// Q67 only; PMM operation metadata remains true while serving wire stays original.
+    pub(crate) async fn ordinary_controlled_channel(
+        config: crate::config::Config,
+        message: crate::channels::traits::ChannelMessage,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    ) -> Self {
+        assert!(!config.causal_tree.enabled, "ordinary child fixture starts disabled");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(&config.workspace_dir).expect("ordinary fixture memory"));
+        let input = message.content.clone();
+        Self::build(
+            config,
+            &input,
+            registry,
+            memory,
+            FixtureOrigin::OrdinaryControlledChannel(Box::new(message)),
+            ("ollama", "prx-local-model"),
+        )
+        .await
+    }
+
     pub(crate) async fn with_channel_memory(
         config: crate::config::Config,
         message: crate::channels::traits::ChannelMessage,
@@ -158,7 +180,7 @@ impl AdmittedTurn {
         origin: FixtureOrigin,
         selection: (&str, &str),
     ) -> Self {
-        Self::build_mode(config, input, registry, memory, origin, selection, None).await
+        Self::build_mode(config, input, registry, memory, origin, selection, None, None).await
     }
 
     /// Explicit engine-only Answer fixture; existing Off/Builtin helpers are unchanged.
@@ -187,8 +209,123 @@ impl AdmittedTurn {
             FixtureOrigin::Cli { recorded: true },
             ("ollama", "prx-local-model"),
             Some(false),
+            None,
         )
         .await
+    }
+
+    /// Opt-in Q61/Q62 mechanics admission; legacy Builtin fixtures are unchanged.
+    pub(crate) async fn configured_mechanics(
+        mut config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        endpoint: &str,
+        provider: &dyn crate::providers::Provider,
+    ) -> Self {
+        let capabilities = provider.capabilities();
+        assert!(!capabilities.vision, "mechanics fixture has no vision operation");
+        crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
+            .expect("owned mechanics decision endpoint");
+        // Q66: retain original PMM model-operation evidence independently of
+        // the original provider's native/prompt-guided serving wire capability.
+        let admitted = Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            ("ollama", "prx-local-model"),
+            Some(true),
+            None,
+        )
+        .await;
+        if admitted
+            .service
+            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+            .is_err()
+        {
+            use crate::causal_tree::directive::TurnExecutionDirective as Directive;
+            let (kind, code) = match admitted.context.directive() {
+                Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
+                Directive::Refuse { policy_code } => ("Refuse", Some(policy_code.as_str())),
+                Directive::Execute { .. } => ("Execute", None),
+                Directive::AnswerDirectly => ("AnswerDirectly", None),
+                Directive::Retrieve { .. } => ("Retrieve", None),
+                Directive::Discover { .. } => ("Discover", None),
+                Directive::Delegate { .. } => ("Delegate", None),
+                Directive::RequestApproval { .. } => ("RequestApproval", None),
+                Directive::CollectApprovalArguments(_) => ("CollectApprovalArguments", None),
+            };
+            let reason = match code {
+                Some("commit_threshold_or_margin") => "commit_threshold_or_margin",
+                Some("insufficient_evidence") => "insufficient_evidence",
+                Some("no_legal_path") => "no_legal_path",
+                Some("hop_stopped") => "hop_stopped",
+                Some(_) => "unclassified_code",
+                None => "not_applicable",
+            };
+            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+        }
+        admitted
+    }
+
+    /// Q63-only native mechanics admission; legacy Builtin fixtures are unchanged.
+    pub(crate) async fn configured_native_mechanics(
+        mut config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        endpoint: &str,
+        provider: &dyn crate::providers::Provider,
+    ) -> Self {
+        let capabilities = provider.capabilities();
+        assert!(
+            capabilities.native_tool_calling,
+            "Q63 serving provider must support native tools"
+        );
+        assert!(!capabilities.vision, "mechanics fixture has no vision operation");
+        crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
+            .expect("owned mechanics decision endpoint");
+        let admitted = Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            ("ollama", "prx-local-model"),
+            Some(capabilities.native_tool_calling),
+            None,
+        )
+        .await;
+        if admitted
+            .service
+            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+            .is_err()
+        {
+            use crate::causal_tree::directive::TurnExecutionDirective as Directive;
+            let (kind, code) = match admitted.context.directive() {
+                Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
+                Directive::Refuse { policy_code } => ("Refuse", Some(policy_code.as_str())),
+                Directive::Execute { .. } => ("Execute", None),
+                Directive::AnswerDirectly => ("AnswerDirectly", None),
+                Directive::Retrieve { .. } => ("Retrieve", None),
+                Directive::Discover { .. } => ("Discover", None),
+                Directive::Delegate { .. } => ("Delegate", None),
+                Directive::RequestApproval { .. } => ("RequestApproval", None),
+                Directive::CollectApprovalArguments(_) => ("CollectApprovalArguments", None),
+            };
+            let reason = match code {
+                Some("commit_threshold_or_margin") => "commit_threshold_or_margin",
+                Some("insufficient_evidence") => "insufficient_evidence",
+                Some("no_legal_path") => "no_legal_path",
+                Some("hop_stopped") => "hop_stopped",
+                Some(_) => "unclassified_code",
+                None => "not_applicable",
+            };
+            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+        }
+        admitted
     }
 
     /// Explicit real native-schema fixture; legacy disabled helpers are unchanged.
@@ -216,46 +353,42 @@ impl AdmittedTurn {
             FixtureOrigin::Cli { recorded: true },
             ("ollama", "prx-local-model"),
             Some(capabilities.native_tool_calling),
+            None,
         )
         .await
     }
 
-    /// One prompt-guided delegation fixture with actual transport and issued child scope.
+    /// One native delegation fixture with actual transport and issued child scope.
     pub(crate) fn configured_delegation<'a>(
         mut config: crate::config::Config,
         input: &'a str,
         registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
         endpoint: &'a str,
         provider: &'a dyn crate::providers::Provider,
+        audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Self> + 'a>> {
         Box::pin(async move {
             let capabilities = provider.capabilities();
             assert!(
-                !capabilities.native_tool_calling && !capabilities.vision,
-                "parent fixture implements prompt-guided chat only"
+                capabilities.native_tool_calling && !capabilities.vision,
+                "parent fixture implements actual native delegate calls"
             );
+            config.tool_tiering.always_include.push("delegate".to_owned());
             crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
                 .expect("actual configured delegation endpoint");
             let memory: Arc<dyn crate::memory::Memory> =
                 Arc::new(crate::memory::SqliteMemory::new(&config.workspace_dir).expect("owned delegation SQLite"));
-            let admitted = Self::build_mode(
+            Self::build_mode(
                 config,
                 input,
                 registry,
                 memory,
                 FixtureOrigin::Cli { recorded: true },
                 ("ollama", "prx-local-model"),
-                Some(false),
+                Some(capabilities.native_tool_calling),
+                audit,
             )
-            .await;
-            assert!(
-                matches!(
-                    admitted.context.directive(),
-                    crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
-                ),
-                "configured parent must receive actual issued delegation"
-            );
-            admitted
+            .await
         })
     }
 
@@ -267,6 +400,7 @@ impl AdmittedTurn {
         origin: FixtureOrigin,
         selection: (&str, &str),
         configured_native_tools: Option<bool>,
+        audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
@@ -280,7 +414,11 @@ impl AdmittedTurn {
             }))
             .expect("local fixture model descriptor"),
         );
-        let channel_surface = matches!(&origin, FixtureOrigin::Channel(_));
+        let ordinary_controlled = matches!(&origin, FixtureOrigin::OrdinaryControlledChannel(_));
+        let channel_surface = matches!(
+            &origin,
+            FixtureOrigin::Channel(_) | FixtureOrigin::OrdinaryControlledChannel(_)
+        );
         if channel_surface {
             config.tool_tiering = config.tool_tiering.for_channel_surface();
         }
@@ -289,13 +427,16 @@ impl AdmittedTurn {
             &config.autonomy,
             workspace,
         ));
-        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
-            Arc::clone(&registry),
-            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
-            Arc::new(DenyApprovalStrategy),
-            Arc::new(AdapterOwnedPreparation),
-            Arc::new(TracingToolExecutionAudit),
-        ));
+        let execution = Arc::new(
+            ToolExecutionService::from_shared_boxed_registry(
+                Arc::clone(&registry),
+                Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+                Arc::new(DenyApprovalStrategy),
+                Arc::new(AdapterOwnedPreparation),
+                audit.unwrap_or_else(|| Arc::new(TracingToolExecutionAudit)),
+            )
+            .with_idempotency_memory(Arc::clone(&memory)),
+        );
         let hooks = crate::hooks::HookDiagnostics {
             configured: false,
             valid: true,
@@ -309,7 +450,7 @@ impl AdmittedTurn {
             blocked: None,
         };
         let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
-        let service = build_turn_decision_service(
+        let mut service = build_turn_decision_service(
             if channel_surface {
                 TurnSurfaceKind::Channel
             } else {
@@ -356,13 +497,17 @@ impl AdmittedTurn {
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
         .expect("fixture loop runtime");
-        if configured_native_tools.is_some() {
+        if ordinary_controlled {
+            TurnDecisionService::install_ordinary_child_fixture(&mut service, "delegate", "session")
+                .expect("unshared genuine ordinary parent service");
+        }
+        if configured_native_tools.is_some() || ordinary_controlled {
             crate::runtime::turn_cleanup::current_tracker()
                 .expect("Answer fixture must have an actual cleanup owner")
                 .retain_service(Arc::clone(&service));
         }
         let (proof, envelope): (Box<dyn TurnSourceProof>, _) = match origin {
-            FixtureOrigin::Channel(message) => {
+            FixtureOrigin::Channel(message) | FixtureOrigin::OrdinaryControlledChannel(message) => {
                 let (proof, envelope) = crate::channels::decision_source::recorded_fixture_source(
                     &generation,
                     Arc::clone(&memory),

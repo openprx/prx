@@ -9,17 +9,43 @@ use anyhow::Context;
 use futures::FutureExt;
 use serde_json::{Value, json};
 use std::{
-    cell::Cell,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
+#[derive(Clone)]
 struct Capture {
     directory: std::path::PathBuf,
-    failed: Cell<bool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 tokio::task_local! { static CAPTURE: Capture; }
+
+/// Carry only the opt-in fixture capture across the owned child task boundary.
+/// The failure bit remains shared with the original parent diagnostic oracle.
+pub(super) fn inherit<F: std::future::Future>(work: F) -> impl std::future::Future<Output = F::Output> {
+    let capture = CAPTURE.try_with(Clone::clone).ok();
+    async move {
+        match capture {
+            Some(capture) => CAPTURE.scope(capture, work).await,
+            None => work.await,
+        }
+    }
+}
+
+/// Fixed filenames only; existing capture owns private permissions and bounds.
+pub(super) fn phase(name: &'static str) {
+    record(name, || Ok(json!({"entered":true})));
+}
+
+/// Infer F through the closure type without invoking it or constructing F.
+pub(super) fn future_layout<M, F>(name: &'static str, _: &M)
+where
+    M: FnOnce() -> F,
+    F: std::future::Future,
+{
+    record(name, || Ok(json!({"future_bytes":std::mem::size_of::<F>()})));
+}
 
 pub(super) fn active() -> bool {
     CAPTURE.try_with(|_| ()).is_ok()
@@ -65,13 +91,13 @@ where
     }));
     let capture = Capture {
         directory,
-        failed: Cell::new(false),
+        failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     CAPTURE
         .scope(capture, async {
             let work = boxed_work(make);
             let result = std::panic::AssertUnwindSafe(work).catch_unwind().await;
-            let failed = CAPTURE.with(|capture| capture.failed.get());
+            let failed = CAPTURE.with(|capture| capture.failed.load(std::sync::atomic::Ordering::SeqCst));
             match result {
                 Err(panic) => std::panic::resume_unwind(panic),
                 Ok(result) => {
@@ -103,7 +129,7 @@ fn write(capture: &Capture, name: &str, value: &Value) -> anyhow::Result<()> {
 fn record(name: &str, make: impl FnOnce() -> anyhow::Result<Value>) {
     let _ = CAPTURE.try_with(|capture| {
         if make().and_then(|value| write(capture, name, &value)).is_err() {
-            capture.failed.set(true);
+            capture.failed.store(true, std::sync::atomic::Ordering::SeqCst);
             // Independent failure evidence; never overwrite the original business panic.
             let _ = write(capture, "diagnostic-failed.json", &json!({"complete":false}));
         }
@@ -131,7 +157,7 @@ pub(super) fn workspace(directory: tempfile::TempDir) -> Workspace {
     Workspace::Retained(path)
 }
 
-fn code(value: &'static str) -> anyhow::Result<&'static str> {
+fn code(value: &str) -> anyhow::Result<&str> {
     anyhow::ensure!(
         value.len() <= 80
             && value
@@ -235,9 +261,55 @@ pub(super) fn admission(
     });
 }
 
-pub(super) fn outcome(kind: &'static str, executions: usize, captured: bool) {
+#[derive(Default)]
+pub(super) struct DispatchAudit {
+    state: parking_lot::Mutex<DispatchAuditState>,
+}
+#[derive(Default)]
+struct DispatchAuditState {
+    statuses: Vec<(crate::tools::execution::ToolExecutionStatus, bool)>,
+    overflow: bool,
+}
+impl crate::tools::execution::ToolExecutionAuditSink for DispatchAudit {
+    fn record(&self, record: crate::tools::execution::ToolExecutionAuditRecord) {
+        if record.capability == "delegate" {
+            let mut state = self.state.lock();
+            if state.statuses.len() == 64 {
+                state.overflow = true;
+            } else {
+                state
+                    .statuses
+                    .push((record.status, record.preparation_strategy.is_some()));
+            }
+        }
+        crate::tools::execution::ToolExecutionAuditSink::record(
+            &crate::tools::execution::TracingToolExecutionAudit,
+            record,
+        );
+    }
+}
+
+pub(super) fn outcome(
+    kind: &'static str,
+    executions: usize,
+    captured: bool,
+    trace: &crate::tools::capability::execution_trace::ExecutionTraceSnapshot,
+    audit: Option<&DispatchAudit>,
+) {
     record("outcome.json", || {
+        anyhow::ensure!(trace.calls.len() <= 64, "bounded dispatch statuses");
+        let statuses = trace
+            .calls
+            .iter()
+            .map(|call| code(&call.status))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let audit_projection = audit.map(|audit| {
+            let state = audit.state.lock();
+            json!({"statuses":state.statuses.iter().map(|(status,prepared)| json!({"status":status,"preparation_present":prepared})).collect::<Vec<_>>(), "overflow":state.overflow})
+        });
         Ok(json!({"stage":"engine_returned","kind":code(kind)?,
-        "executions":executions,"captured_result":captured}))
+        "executions":executions,"captured_result":captured,"dispatch_statuses":statuses,
+        "denied_attempts":trace.denied_attempts,"failed_attempts":trace.failed_attempts,
+        "unbound_attempts":trace.unbound_attempts,"incomplete":trace.incomplete,"actual_dispatch_audit":audit_projection}))
     });
 }

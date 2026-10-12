@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn creates_with_empty_contacts() {
         let ch = IMessageChannel::new(vec![]);
-        assert!(ch.allowed_contacts.is_empty());
+        assert!(ch.allowed_contacts.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -680,7 +680,7 @@ mod tests {
         let (_dir, db_path) = create_test_db();
         let result = fetch_new_messages(&db_path, 0).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(result.unwrap().is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
@@ -960,6 +960,6 @@ mod tests {
 
         // Very large rowid should return empty (no messages after this)
         let result = fetch_new_messages(&db_path, i64::MAX - 1).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 }

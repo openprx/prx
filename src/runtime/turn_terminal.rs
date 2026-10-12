@@ -509,6 +509,11 @@ impl TurnTerminalGuard {
     }
 
     async fn flush(&self) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+        #[cfg(test)]
+        let stage = super::turn_cleanup::diagnostic::Stage::ticket(
+            self.cleanup_ticket.as_ref(),
+            super::turn_cleanup::diagnostic::StageName::TerminalFlush,
+        );
         let mut proposal = self
             .state
             .lock()
@@ -530,6 +535,8 @@ impl TurnTerminalGuard {
                 .await?;
         }
         self.state.lock().finished = true;
+        #[cfg(test)]
+        stage.finish();
         Ok(receipt)
     }
 
@@ -586,15 +593,24 @@ async fn finalize_and_rejoin(
     config: &crate::config::Config,
     proposal: crate::agent::terminal::TurnTerminalDraft,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+    #[cfg(test)]
+    let mut stage =
+        super::turn_cleanup::diagnostic::Stage::current(super::turn_cleanup::diagnostic::StageName::TerminalFinalize);
     let receipt = crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await?;
+    #[cfg(test)]
+    stage.next(super::turn_cleanup::diagnostic::StageName::TerminalReceiptOwner);
     let owner = receipt
         .terminal_event
         .owner_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("runtime terminal owner missing"))?;
+    #[cfg(test)]
+    stage.next(super::turn_cleanup::diagnostic::StageName::TerminalRejoin);
     if config.causal_tree.enabled {
         service.rejoin_terminal(&receipt.terminal_id, owner).await?;
     }
+    #[cfg(test)]
+    stage.finish();
     Ok(receipt)
 }
 
@@ -626,6 +642,8 @@ impl Drop for TurnTerminalGuard {
         let config = Arc::clone(&self.config);
         let cleanup_ack = self.cleanup_ack.take();
         let cleanup_ticket = self.cleanup_ticket.take();
+        #[cfg(test)]
+        let diagnostic_binding = super::turn_cleanup::diagnostic::terminal_binding(cleanup_ticket.as_ref());
         let usage_collector = self.usage_collector.take();
         let context = Arc::clone(&self.context);
         let observation_envelope = usage_collector.as_ref().map(|_| self.envelope.clone());
@@ -633,7 +651,12 @@ impl Drop for TurnTerminalGuard {
         let auxiliary_call = self.auxiliary_call.take();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
+                let work = async move {
+                    #[cfg(test)]
+                    let stage = super::turn_cleanup::diagnostic::Stage::ticket(
+                        cleanup_ticket.as_ref(),
+                        super::turn_cleanup::diagnostic::StageName::TerminalDropFinalize,
+                    );
                     let result = async {
                         if let Some(call) = auxiliary_call {
                             persist_auxiliary_reply(&call, &fabric, &config, &context, &mut proposal).await?;
@@ -651,6 +674,12 @@ impl Drop for TurnTerminalGuard {
                         Ok::<_, anyhow::Error>(receipt)
                     }
                     .await;
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        stage.finish();
+                    } else {
+                        drop(stage);
+                    }
                     if let Err(error) = &result {
                         tracing::error!(error = %error, "Runtime interrupted terminal cleanup remains incomplete");
                     }
@@ -664,7 +693,10 @@ impl Drop for TurnTerminalGuard {
                                 .map_err(|_| "terminal cleanup persistence failed".to_owned()),
                         );
                     }
-                });
+                };
+                #[cfg(test)]
+                let work = super::turn_cleanup::diagnostic::terminal_scope(diagnostic_binding, work);
+                handle.spawn(work);
             }
             Err(_) => {
                 tracing::error!("Runtime terminal cleanup has no runtime; completion is unconfirmed");

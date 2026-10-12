@@ -1528,7 +1528,7 @@ mod tests {
         );
         assert_eq!(reports[0].0, "a-1");
         assert_eq!(reports[0].1, ResultStatus::Failed);
-        assert!(!reports[0].2.trim().is_empty());
+        assert!(!reports[0].2.trim().is_empty(), "expected a non-empty value");
     }
 
     #[tokio::test]

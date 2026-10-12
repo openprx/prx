@@ -539,8 +539,11 @@ mod tests {
         let state = load_model_cache_state(temp.path()).expect("test: load");
         assert_eq!(state.version, 0);
         assert_eq!(state.entries[0].models, ["vendor/a", "vendor/b"]);
-        assert!(state.entries[0].descriptors.is_empty());
-        assert!(cached_descriptors(temp.path()).expect("test: descriptors").is_empty());
+        assert!(state.entries[0].descriptors.is_empty(), "expected an empty value");
+        assert!(
+            cached_descriptors(temp.path()).expect("test: descriptors").is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]

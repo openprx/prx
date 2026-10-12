@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn image_info_tool_description() {
         let tool = ImageInfoTool::new(test_security());
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
         assert!(tool.description().contains("image"));
     }
 

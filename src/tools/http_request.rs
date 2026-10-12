@@ -617,21 +617,24 @@ mod tests {
                 &schema,
                 &json!({"url": "https://example.com", "method": "POST", "headers": {"x-id": "1"}})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             !crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"url": "https://example.com", "method": "TRACE"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
         assert!(
             !crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"url": "https://example.com", "headers": {"x-id": 1}})
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
     }
 

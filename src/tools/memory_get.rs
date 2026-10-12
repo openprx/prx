@@ -609,9 +609,18 @@ mod tests {
         assert!(schema["properties"]["from"].is_object());
         assert!(schema["properties"]["lines"].is_object());
         assert!(schema["properties"]["session_id"].is_object());
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "key"})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"key": "key"})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "key"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"key": "key"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// Disposition OQ-9, at the tool level: the workspace file fallback is

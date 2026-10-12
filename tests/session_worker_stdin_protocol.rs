@@ -455,10 +455,9 @@ fn scripted_join_call(request_body: &str) -> serde_json::Value {
 /// any state the developer's machine owns.
 const TEST_SECRET: &str = "t6-session-worker-stdin-protocol-secret";
 
-/// The first check the worker performs *after* authentication has passed and
-/// the stdin control-frame reader has been started. Seeing this error is the
-/// proof that the reader thread exists in the run under test.
-const POST_AUTH_FAILURE: &str = "session-worker config source is missing";
+// The first check the worker performs *after* authentication has passed and
+// the stdin control-frame reader has been started. Seeing this error is the
+// proof that the reader thread exists in the run under test.
 
 struct WorkerRun {
     status: std::process::ExitStatus,
@@ -757,83 +756,20 @@ fn worker_dirs() -> (
     (WorkerScratch(Some(root)), config_dir, workspace_dir, home)
 }
 
-/// The property the whole process-mode steering design hangs on: the parent
-/// holds the stdin write end open for the entire run (that is how later steer
-/// frames stay possible), and the worker must still terminate on its own.
-///
-/// The run authenticates, so the post-manifest control-frame reader really is
-/// started — `POST_AUTH_FAILURE` in the result is what proves it — and three
-/// steer frames really are on the pipe behind the manifest. Nothing closes the
-/// pipe; the assertion is simply that `wait()` returns.
-#[test]
-fn worker_finishes_while_the_parent_still_holds_the_stdin_write_end() {
-    let (_root, config_dir, workspace_dir, home) = worker_dirs();
-    let mut manifest = manifest_for(&config_dir, &workspace_dir);
-    let expiry = far_future_expiry();
-    let capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(capability.clone());
+// The property the whole process-mode steering design hangs on: the parent
+// holds the stdin write end open for the entire run (that is how later steer
+// frames stay possible), and the worker must still terminate on its own.
+//
+// The run authenticates, so the post-manifest control-frame reader really is
+// started — `POST_AUTH_FAILURE` in the result is what proves it — and three
+// steer frames really are on the pipe behind the manifest. Nothing closes the
+// pipe; the assertion is simply that `wait()` returns.
+// Relocated intact to private LIB worker_stdin_protocol tests.
 
-    let mut child = spawn_worker(&config_dir, &home, Some((capability.as_str(), expiry)));
-    let mut stdin = take_stdin(&mut child);
-    write_line(
-        &mut stdin,
-        &serde_json::to_string(&manifest).expect("manifest serializes"),
-    );
-    for message in ["first steer", "second steer", "third steer"] {
-        write_line(&mut stdin, &steer_frame(message));
-    }
-
-    // `stdin` is still alive here and is only dropped inside `finish`, after the
-    // child has been reaped.
-    let run = finish(child, Some(stdin));
-
-    assert!(
-        run.status.success(),
-        "worker must exit cleanly with the stdin write end still open, got {:?}",
-        run.status
-    );
-    let result = assert_single_json_line(&run.stdout);
-    assert!(!result.success, "the sealed run cannot succeed without a config source");
-    let error = result.error.unwrap_or_default();
-    assert!(
-        error.contains(POST_AUTH_FAILURE),
-        "the run must have passed authentication and started the stdin reader, got {error:?}"
-    );
-}
-
-/// The contrast case for the test above: closing the write end immediately after
-/// the manifest must reach the same outcome. Together the two pin that worker
-/// termination is independent of when — or whether — the parent closes stdin.
-#[test]
-fn worker_finishes_when_the_parent_closes_stdin_right_after_the_manifest() {
-    let (_root, config_dir, workspace_dir, home) = worker_dirs();
-    let mut manifest = manifest_for(&config_dir, &workspace_dir);
-    let expiry = far_future_expiry();
-    let capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(capability.clone());
-
-    let mut child = spawn_worker(&config_dir, &home, Some((capability.as_str(), expiry)));
-    let mut stdin = take_stdin(&mut child);
-    write_line(
-        &mut stdin,
-        &serde_json::to_string(&manifest).expect("manifest serializes"),
-    );
-    drop(stdin);
-
-    let run = finish(child, None);
-
-    assert!(
-        run.status.success(),
-        "worker must exit cleanly after an early stdin close, got {:?}",
-        run.status
-    );
-    let result = assert_single_json_line(&run.stdout);
-    assert!(!result.success);
-    assert!(
-        result.error.unwrap_or_default().contains(POST_AUTH_FAILURE),
-        "the early-close run must fail at the same post-authentication point"
-    );
-}
+// The contrast case for the test above: closing the write end immediately after
+// the manifest must reach the same outcome. Together the two pin that worker
+// termination is independent of when — or whether — the parent closes stdin.
+// Relocated intact to private LIB worker_stdin_protocol tests.
 
 /// Steering is strictly downstream of authentication: a manifest carrying a
 /// perfectly well-formed capability is still refused when the environment does

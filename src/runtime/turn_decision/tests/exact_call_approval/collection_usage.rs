@@ -189,7 +189,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
         .as_ref()
         .expect("terminal keeps the actual empty trace");
     assert_eq!(physical.started_attempts, 0);
-    assert!(physical.calls.is_empty());
+    assert!(physical.calls.is_empty(), "expected an empty value");
     assert!(f.context.execution_refs().is_empty());
     assert!(f.context.collected_pending_event().is_some());
     let outcome = crate::agent::terminal::provider_outcome_from_trace(&route, started_at, trace);

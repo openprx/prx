@@ -4185,7 +4185,7 @@ mod tests {
 
         // A stale sweep now must NOT reap it (lease far in the future).
         let reaped = mark_steps_stale(&config, Utc::now()).unwrap();
-        assert!(reaped.is_empty());
+        assert!(reaped.is_empty(), "expected an empty value");
         assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Running);
     }
 

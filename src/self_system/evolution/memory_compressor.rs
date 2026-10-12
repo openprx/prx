@@ -400,7 +400,7 @@ mod tests {
             entry("b", "updated quarterly budget and forecast numbers"),
         ];
         let redundant = detector.detect_redundant_ids(&entries).await.unwrap();
-        assert!(redundant.is_empty());
+        assert!(redundant.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

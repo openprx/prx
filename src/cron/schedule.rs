@@ -44,21 +44,19 @@ pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> 
         Schedule::Cron { expr, .. } => {
             let _ = normalize_expression(expr)?;
             let _ = next_run_for_schedule(schedule, now)?;
-            Ok(())
         }
         Schedule::At { at } => {
             if *at <= now {
                 anyhow::bail!("Invalid schedule: 'at' must be in the future");
             }
-            Ok(())
         }
         Schedule::Every { every_ms } => {
             if *every_ms == 0 {
                 anyhow::bail!("Invalid schedule: every_ms must be > 0");
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 pub fn schedule_cron_expression(schedule: &Schedule) -> Option<String> {

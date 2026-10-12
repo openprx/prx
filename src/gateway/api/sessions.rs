@@ -628,6 +628,7 @@ fn media_content_type_for_path(path: &StdPath) -> &'static str {
     }
 }
 
+#[allow(clippy::result_large_err)] // the axum `Response` is the error contract of these parsers
 async fn parse_json_message(state: &AppState, request: Request) -> Result<String, Response> {
     let Json(payload) = Json::<SendMessageRequest>::from_request(request, state)
         .await
@@ -641,6 +642,7 @@ async fn parse_json_message(state: &AppState, request: Request) -> Result<String
     Ok(message)
 }
 
+#[allow(clippy::result_large_err)]
 async fn parse_multipart_message(state: &AppState, request: Request) -> Result<String, Response> {
     let mut multipart = Multipart::from_request(request, state)
         .await
@@ -739,6 +741,7 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
     Ok(combined)
 }
 
+#[allow(clippy::result_large_err)]
 async fn parse_message_from_request(state: &AppState, request: Request) -> Result<String, Response> {
     let content_type = request
         .headers()

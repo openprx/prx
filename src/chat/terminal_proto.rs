@@ -416,7 +416,7 @@ mod tests {
     fn theme_dark_default() {
         let theme = ChatTheme::dark();
         assert!(theme.user_color.contains("\x1b["));
-        assert!(!ChatTheme::reset().is_empty());
+        assert!(!ChatTheme::reset().is_empty(), "expected a non-empty value");
     }
 
     #[test]

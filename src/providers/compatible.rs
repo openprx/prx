@@ -4700,7 +4700,7 @@ mod tests {
         let mut b4 = String::from("\u{20ac}\n\u{20ac}\n");
         let lines = split_lines(&mut b4);
         assert_eq!(lines, vec!["\u{20ac}\n".to_string(), "\u{20ac}\n".to_string()]);
-        assert!(b4.is_empty());
+        assert!(b4.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
@@ -4743,7 +4743,7 @@ mod tests {
         assert!(emitted.is_empty(), "no name => no streaming chunk yet");
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0].id, "call_x");
-        assert!(buf[0].name.is_empty());
+        assert!(buf[0].name.is_empty(), "expected an empty value");
         assert!(!buf[0].opened);
 
         // Now name arrives; expect the leading open chunk.
@@ -4955,7 +4955,10 @@ mod tests {
             .find_map(|r| r.as_ref().err())
             .expect("test: a name-only call ended by stop must fail the stream");
         assert!(error.to_string().contains("incomplete"), "got {error}");
-        assert!(compatible_completed_calls(&results).is_empty());
+        assert!(
+            compatible_completed_calls(&results).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// Guard: a complete call ended by `stop` (a server quirk) still runs.
@@ -4991,7 +4994,10 @@ mod tests {
             .expect("test: an out-of-range index must end the stream");
         assert!(matches!(error, StreamError::InvalidSse(_)), "got {error:?}");
         assert!(error.to_string().contains("1000"), "got {error}");
-        assert!(compatible_completed_calls(&results).is_empty());
+        assert!(
+            compatible_completed_calls(&results).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// COMPAT-STREAM: once the consumer drops the stream, the background task

@@ -384,7 +384,7 @@ mod tests {
         assert!(ring.last_pushed_at().is_some());
         assert_eq!(ring.drain_new(), vec!["a".to_string(), "b".to_string()]);
         // Nothing new yet.
-        assert!(ring.drain_new().is_empty());
+        assert!(ring.drain_new().is_empty(), "expected an empty value");
         ring.push("c".into());
         assert_eq!(ring.drain_new(), vec!["c".to_string()]);
     }

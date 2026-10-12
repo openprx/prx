@@ -1398,7 +1398,7 @@ mod tests {
         let json = r#"{"app_id":"a","app_secret":"s"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.verification_token.is_none());
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
     }

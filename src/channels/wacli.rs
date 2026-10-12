@@ -2465,8 +2465,14 @@ mod tests {
             lid_alias_chat_ids(store.path(), "995599060775@s.whatsapp.net"),
             vec!["212017185054924@lid".to_string()]
         );
-        assert!(lid_alias_chat_ids(store.path(), "120363409895005261@g.us").is_empty());
-        assert!(lid_alias_chat_ids(store.path(), "not-a-jid").is_empty());
+        assert!(
+            lid_alias_chat_ids(store.path(), "120363409895005261@g.us").is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            lid_alias_chat_ids(store.path(), "not-a-jid").is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// A device-qualified JID must still find the bare chat row.
@@ -2707,7 +2713,10 @@ mod tests {
         let resp = app.oneshot(req).await.expect("test: response");
         assert_eq!(resp.status(), StatusCode::OK);
         let msg = rx.try_recv().expect("test: forwarded message");
-        assert!(crate::multimodal::parse_image_markers(&msg.content).1.is_empty());
+        assert!(
+            crate::multimodal::parse_image_markers(&msg.content).1.is_empty(),
+            "expected an empty value"
+        );
         assert!(msg.content.contains("resolved_image_markers=0"));
     }
 
@@ -2817,7 +2826,10 @@ mod tests {
         let resp = app.oneshot(req).await.expect("test: response");
         assert_eq!(resp.status(), StatusCode::OK);
         let msg = rx.try_recv().expect("test: forwarded message");
-        assert!(crate::multimodal::parse_image_markers(&msg.content).1.is_empty());
+        assert!(
+            crate::multimodal::parse_image_markers(&msg.content).1.is_empty(),
+            "expected an empty value"
+        );
         assert!(msg.content.contains("resolved_image_markers=0"));
         assert!(msg.content.contains("media_status=unavailable"));
         assert!(!msg.content.contains(source.to_str().expect("test: utf8 source path")));
@@ -3162,8 +3174,14 @@ mod tests {
     #[test]
     fn extract_mentioned_numbers_parses_digits() {
         assert_eq!(extract_mentioned_numbers("hi @123 and @4567 ok"), vec!["123", "4567"]);
-        assert!(extract_mentioned_numbers("no mentions").is_empty());
-        assert!(extract_mentioned_numbers("@notdigits").is_empty());
+        assert!(
+            extract_mentioned_numbers("no mentions").is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            extract_mentioned_numbers("@notdigits").is_empty(),
+            "expected an empty value"
+        );
     }
 
     // ── allowlist ───────────────────────────────────────────────
@@ -3979,7 +3997,7 @@ mod outbound_media_tests {
         let invocations = fixture.cli.invocations();
         assert_eq!(invocations.len(), 1);
         assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
-        assert!(fixture.cli.staged_paths().is_empty());
+        assert!(fixture.cli.staged_paths().is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
@@ -4004,7 +4022,7 @@ mod outbound_media_tests {
                 "[IMAGE:huge.png]",
             ])
         );
-        assert!(fixture.cli.staged_paths().is_empty());
+        assert!(fixture.cli.staged_paths().is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
@@ -4268,7 +4286,7 @@ mod outbound_media_tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("empty recipient"));
-        assert!(fixture.cli.invocations().is_empty());
+        assert!(fixture.cli.invocations().is_empty(), "expected an empty value");
     }
 
     // ── Evidence 4: the staged temp file never outlives the send ─────────────

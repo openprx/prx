@@ -1381,4 +1381,65 @@ mod tests {
         assert!(shadow_fields(&decision).next_action.is_none());
         assert!(shadow_fields(&decision).capability_target.is_none());
     }
+    #[test]
+    fn deterministic_record_keeps_selection_propensity_without_explored_flag() {
+        let key = fixtures::key();
+        let state = fixtures::state(&key, "neutral request");
+        let candidate = fixtures::candidate(&key, CausalActionKind::Answer, CapabilityTarget::None, None).candidate;
+        let candidate_id = candidate.candidate_id().clone();
+        let gates = GateReport {
+            outcomes: BTreeMap::from([(candidate_id.clone(), GateOutcome::Passed)]),
+            gate_set_hash: [0; 32],
+        };
+        let mut decision = EngineDecision {
+            decision_id: DecisionId::new_runtime(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            elapsed_ms: 1,
+            state,
+            candidates: CandidateSet::Legal {
+                candidates: vec![candidate],
+                exact_mentions: BTreeSet::new(),
+                truncated: Vec::new(),
+                discoverable_families: Default::default(),
+                approval_scopes: BTreeMap::new(),
+                report: gates.clone(),
+            },
+            selection: Selection::Commit {
+                candidate_id: candidate_id.clone(),
+                propensity: 1.0,
+            },
+            exploration_propensities: BTreeMap::new(),
+            prediction: None,
+            request_compiled: false,
+            audit_trace: None,
+            fallback_cause: None,
+            scores: BTreeMap::new(),
+            scored_count: 0,
+            rehearsal: BTreeMap::new(),
+            post_rehearsal: gates.clone(),
+            pre_commit: gates,
+            call_fingerprints: BTreeMap::new(),
+            outgoing_child: None,
+            outgoing_parent_allowed: None,
+        };
+
+        let record =
+            DecisionRecordBuilder::build_hop(&decision, &key, None, true, false).expect("deterministic record");
+        assert_eq!(record.propensity, 1.0);
+        assert!(!record.explored);
+        assert!(record.candidates.iter().all(|candidate| candidate.propensity.is_none()));
+        decision.exploration_propensities.insert(candidate_id.clone(), 0.75);
+        decision.selection = Selection::Commit {
+            candidate_id,
+            propensity: 0.75,
+        };
+        let sampled =
+            DecisionRecordBuilder::build_hop(&decision, &key, None, true, false).expect("recorded sampling metadata");
+        assert!(sampled.explored);
+        assert_eq!(sampled.propensity, 0.75);
+        assert_eq!(
+            sampled.candidates.first().expect("one candidate").propensity,
+            Some(0.75)
+        );
+    }
 }

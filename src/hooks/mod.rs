@@ -1096,7 +1096,7 @@ mod tests {
             HookEvent::Error,
         ];
         for e in &events {
-            assert!(!e.as_str().is_empty());
+            assert!(!e.as_str().is_empty(), "expected a non-empty value");
         }
     }
 

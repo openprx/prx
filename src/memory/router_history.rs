@@ -324,12 +324,11 @@ pub(super) fn decode_vector(bytes: &[u8], dimensions: u16) -> Result<Vec<f32>> {
         "Router history vector exceeds its fixed encoding bounds"
     );
     let vector = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| {
-            let value: [u8; 4] = chunk
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid Router vector encoding"))?;
-            let value = f32::from_le_bytes(value);
+            let value = f32::from_le_bytes(*chunk);
             ensure!(value.is_finite(), "Router history vector is non-finite");
             Ok(value)
         })

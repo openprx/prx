@@ -79,11 +79,9 @@ impl CausalSelector {
             ..
         } = &base
         else {
-            let mut distribution = BTreeMap::new();
-            if let Selection::Commit { candidate_id, .. } = &base {
-                distribution.insert(candidate_id.clone(), 1.0);
-            }
-            return Ok((base, distribution));
+            // The selection retains its deterministic propensity. This map
+            // records only actual exploration and controls the persisted flag.
+            return Ok((base, BTreeMap::new()));
         };
         if evaluation.exploration != super::config::ExplorationMode::ReadOnly
             || evaluation.exploration_rate <= 0.0
@@ -329,9 +327,29 @@ impl CausalSelector {
         let target_missing = top.target() != CapabilityTarget::None
             && (!context.direct_candidates.contains(top.candidate_id())
                 || target_probability < policy.minimum_choice_confidence);
-        if (insufficient || target_missing)
-            && let Some(candidate) = discover
-        {
+        let target_discover = passed
+            .iter()
+            .find(|(candidate, _, _)| {
+                candidate.action() == CausalActionKind::Discover
+                    && candidate.target() == top.target()
+                    && matches!(
+                        top.target(),
+                        CapabilityTarget::Skill
+                            | CapabilityTarget::Mcp
+                            | CapabilityTarget::NativeTool
+                            | CapabilityTarget::Wasm
+                            | CapabilityTarget::Hook
+                    )
+            })
+            .map(|(candidate, _, _)| *candidate);
+        let recovery = if insufficient {
+            discover
+        } else if target_missing {
+            target_discover
+        } else {
+            None
+        };
+        if let Some(candidate) = recovery {
             return Ok(Selection::Recover {
                 candidate_id: candidate.candidate_id().clone(),
                 reason_code: "discover_capability",
@@ -831,6 +849,117 @@ mod tests {
     }
 
     #[test]
+    fn missing_target_discovery_matches_supported_family_and_passed_candidate() {
+        for (action, family, matching_present, matching_passed, expected_recovery) in [
+            (
+                CausalActionKind::Delegate,
+                CapabilityTarget::Session,
+                true,
+                false,
+                false,
+            ),
+            (
+                CausalActionKind::UseTool,
+                CapabilityTarget::NativeTool,
+                true,
+                true,
+                true,
+            ),
+            (
+                CausalActionKind::UseTool,
+                CapabilityTarget::NativeTool,
+                true,
+                false,
+                false,
+            ),
+            (
+                CausalActionKind::UseTool,
+                CapabilityTarget::NativeTool,
+                false,
+                true,
+                false,
+            ),
+        ] {
+            let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+            let top = candidate(action, family);
+            let unrelated = candidate(CausalActionKind::Discover, CapabilityTarget::Mcp);
+            let matching = candidate(CausalActionKind::Discover, CapabilityTarget::NativeTool);
+            let original_score = scores.values().next().unwrap().clone();
+            let original_prediction = evidence.candidates.values().next().unwrap().clone();
+            for score in scores.values_mut() {
+                score.execution_utility = 0.1;
+            }
+            for (item, utility) in [(&top, 0.95), (&unrelated, 0.8), (&matching, 0.7)] {
+                let mut score = original_score.clone();
+                score.execution_utility = utility;
+                scores.insert(item.candidate_id().clone(), score);
+                evidence
+                    .candidates
+                    .insert(item.candidate_id().clone(), original_prediction.clone());
+                report.outcomes.insert(item.candidate_id().clone(), GateOutcome::Passed);
+            }
+            if !matching_passed {
+                report.outcomes.insert(
+                    matching.candidate_id().clone(),
+                    GateOutcome::Blocked {
+                        gate: 9,
+                        reason_code: "explicit_restriction",
+                    },
+                );
+            }
+            if let CandidateSet::Legal { candidates, .. } = &mut set {
+                candidates.extend([top.clone(), unrelated]);
+                if matching_present {
+                    candidates.push(matching.clone());
+                }
+            }
+            context.direct_candidates.remove(top.candidate_id());
+            evidence.chosen_action = if action == CausalActionKind::Delegate {
+                "delegate"
+            } else {
+                "use_tool"
+            }
+            .to_owned();
+            evidence.chosen_target = if family == CapabilityTarget::Session {
+                "session"
+            } else {
+                "native_tool"
+            }
+            .to_owned();
+            evidence.target_probabilities.insert(family, 0.9);
+            let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
+            if expected_recovery {
+                assert_eq!(
+                    selection,
+                    Selection::Recover {
+                        candidate_id: matching.candidate_id().clone(),
+                        reason_code: "discover_capability",
+                    }
+                );
+            } else {
+                assert!(matches!(selection, Selection::Abstain { .. }));
+            }
+            // The established insufficient-evidence path retains retrieval precedence.
+            evidence.evidence_sufficient = 0.0;
+            let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
+            let CandidateSet::Legal { candidates, .. } = &set else {
+                panic!("expected legal candidates");
+            };
+            let retrieval = candidates
+                .iter()
+                .find(|item| item.action() == CausalActionKind::Retrieve)
+                .unwrap();
+            assert_eq!(
+                selection,
+                Selection::Recover {
+                    candidate_id: retrieval.candidate_id().clone(),
+                    reason_code: "retrieve_evidence",
+                }
+            );
+        }
+    }
+
+    #[test]
     fn missing_exact_direct_candidate_does_not_commit() {
         let (set, mut scores, mut evidence, report, policy, mut context) = fixture(0.5);
         let CandidateSet::Legal { candidates, .. } = &set else {
@@ -1221,5 +1350,34 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn deterministic_commit_retains_unit_propensity_without_exploration_distribution() {
+        let (set, scores, evidence, report, policy, context) = fixture(0.5);
+        let key = fixtures::key();
+        let expected = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
+        assert!(matches!(expected, Selection::Commit { propensity: 1.0, .. }));
+        for evaluation in [
+            EvaluationConfig::default(),
+            EvaluationConfig {
+                exploration: super::super::config::ExplorationMode::ReadOnly,
+                exploration_rate: 0.1,
+            },
+        ] {
+            let (actual, distribution) = CausalSelector::select_with_exploration(
+                &set,
+                &scores,
+                &evidence,
+                &report,
+                &policy,
+                &context,
+                &evaluation,
+                &key,
+                "prx-deterministic",
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert!(distribution.is_empty(), "a deterministic commit did not explore");
+        }
     }
 }

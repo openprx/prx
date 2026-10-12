@@ -1104,7 +1104,7 @@ mod tests {
 
         assert_eq!(classified.visibility, Visibility::Owner);
         assert_eq!(classified.sensitivity, Sensitivity::Sensitive);
-        assert!(!classified.risk_signals.is_empty());
+        assert!(!classified.risk_signals.is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -1187,7 +1187,7 @@ mod tests {
         let principal = base_principal(Role::Owner, Visibility::Public);
         let (scope, params) = principal.build_sql_scope();
         assert_eq!(scope, "1=1");
-        assert!(params.is_empty());
+        assert!(params.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -1270,7 +1270,7 @@ mod tests {
         let principal = base_principal(Role::Owner, Visibility::Public);
         let (scope, params) = principal.build_sql_scope();
         assert_eq!(scope, "1=1");
-        assert!(params.is_empty());
+        assert!(params.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -1280,7 +1280,7 @@ mod tests {
         principal.acl_enforced = false;
         let (scope, params) = principal.build_sql_scope();
         assert_eq!(scope, "1=1");
-        assert!(params.is_empty());
+        assert!(params.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -1485,7 +1485,7 @@ AND tp.user_id = ?\
         ownerless.acl_enforced = false;
         let (scope, params) = ownerless.build_sql_scope();
         assert_eq!(scope, "1=1 AND FALSE");
-        assert!(params.is_empty());
+        assert!(params.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -1580,13 +1580,13 @@ AND tp.user_id = ?\
     fn scope_predicate_owner_and_acl_disabled_are_unconditional() {
         let owner = base_principal(Role::Owner, Visibility::Public).build_scope_predicate();
         assert_eq!(owner.template, "1=1");
-        assert!(owner.params.is_empty());
+        assert!(owner.params.is_empty(), "expected an empty value");
 
         let mut member = base_principal(Role::Member, Visibility::Public);
         member.acl_enforced = false;
         let disabled = member.build_scope_predicate();
         assert_eq!(disabled.template, "1=1");
-        assert!(disabled.params.is_empty());
+        assert!(disabled.params.is_empty(), "expected an empty value");
     }
 
     // ----------------------------------------------------------------------
@@ -1600,7 +1600,7 @@ AND tp.user_id = ?\
         let principal = base_principal(Role::Owner, Visibility::Public);
         let (sql, params) = principal.build_sql_scope_pg(4);
         assert_eq!(sql, "1=1");
-        assert!(params.is_empty());
+        assert!(params.is_empty(), "expected an empty value");
     }
 
     #[test]

@@ -632,7 +632,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
         assert_eq!(tool.name(), "gateway");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -813,6 +813,7 @@ mod tests {
             config_path: config_path.clone(),
             ..Config::default()
         };
+        cfg.causal_tree.enabled = false;
         cfg.causal_tree.policy.max_candidates = 5;
 
         cfg.save().await.unwrap();

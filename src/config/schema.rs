@@ -8369,7 +8369,7 @@ min_chars = 12
     #[test]
     async fn storage_provider_config_defaults() {
         let storage = StorageConfig::default();
-        assert!(storage.provider.config.provider.is_empty());
+        assert!(storage.provider.config.provider.is_empty(), "expected an empty value");
         assert!(storage.provider.config.db_url.is_none());
         assert_eq!(storage.provider.config.schema, "public");
         assert_eq!(storage.provider.config.table, "memories");
@@ -9629,7 +9629,7 @@ model = "override-beta"
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.allowed_contacts.is_empty());
+        assert!(parsed.allowed_contacts.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -9753,7 +9753,7 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"http_url":"http://127.0.0.1:16866","account":"+1234567890"}"#;
         let parsed: SignalConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.group_id.is_none());
-        assert!(parsed.allowed_from.is_empty());
+        assert!(parsed.allowed_from.is_empty(), "expected an empty value");
         assert!(!parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
         assert_eq!(parsed.storm_protection.dedupe_ttl_secs, 60);
@@ -9818,7 +9818,7 @@ allowed_users = ["@ops:matrix.org"]
         // Old configs won't have allowed_users — serde(default) should fill vec![]
         let json = r#"{"bot_token":"tok","guild_id":"123"}"#;
         let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -9832,7 +9832,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn slack_config_deserializes_without_allowed_users() {
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -9849,7 +9849,7 @@ bot_token = "tok"
 guild_id = "123"
 "#;
         let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
         assert_eq!(parsed.bot_token, "tok");
     }
 
@@ -9860,7 +9860,7 @@ bot_token = "xoxb-tok"
 channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
     }
 
@@ -9937,7 +9937,7 @@ channel_id = "C123"
     async fn whatsapp_config_deserializes_without_allowed_numbers() {
         let json = r#"{"access_token":"tok","phone_number_id":"123","verify_token":"ver"}"#;
         let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.allowed_numbers.is_empty());
+        assert!(parsed.allowed_numbers.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -10337,13 +10337,13 @@ default_temperature = 0.7
         assert!(c.auth.codex_auth_json_auto_import);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(c.browser.allowed_domains.is_empty());
+        assert!(c.browser.allowed_domains.is_empty(), "expected an empty value");
     }
 
     #[test]
     async fn browser_config_default_minimal() {
         let b = BrowserConfig::default();
-        assert!(b.allowed_domains.is_empty());
+        assert!(b.allowed_domains.is_empty(), "expected an empty value");
         assert!(b.computer_use.api_key.is_none());
     }
 
@@ -10370,7 +10370,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(parsed.browser.allowed_domains.is_empty());
+        assert!(parsed.browser.allowed_domains.is_empty(), "expected an empty value");
     }
 
     // ── Environment variable test helpers ─────────
@@ -10810,7 +10810,7 @@ default_model = "legacy-model"
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
-        assert!(g.paired_tokens.is_empty());
+        assert!(g.paired_tokens.is_empty(), "expected an empty value");
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
@@ -10944,7 +10944,7 @@ allowed_from = ["*"]
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.encrypt_key.is_none());
         assert!(parsed.verification_token.is_none());
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
         assert!(!parsed.use_feishu);
     }
 
@@ -10985,7 +10985,7 @@ allowed_from = ["*"]
         let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
         let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.webhook_secret.is_none());
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
     }
 
     // ── Config file permission hardening (Unix only) ───────────────
@@ -11222,8 +11222,8 @@ allowed_from = ["*"]
     #[test]
     async fn smart_group_config_defaults_and_validation() {
         let cfg = SmartGroupConfig::default();
-        assert!(cfg.classifier_provider.is_empty());
-        assert!(cfg.classifier_model.is_empty());
+        assert!(cfg.classifier_provider.is_empty(), "expected an empty value");
+        assert!(cfg.classifier_model.is_empty(), "expected an empty value");
         assert_eq!(cfg.classifier_timeout_secs, 5);
         assert_eq!(cfg.classifier_max_context_messages, 3);
         cfg.validate().expect("default smart_group config is valid");
@@ -12248,7 +12248,10 @@ circuit_breaker_cooldown_secs = 60
         let (_dir, loaded) = load(SAVED_BY_8A5D160D);
         let loaded = loaded.expect("test: the legacy save loads");
         assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
-        assert!(!loaded.causal_tree.enabled, "the default stays off until CDP-31");
+        assert!(
+            loaded.causal_tree.enabled,
+            "CDP-31 enables the local decision plane by default"
+        );
     }
 
     /// V8.06: upgraded configs keep operator values.
@@ -12340,10 +12343,7 @@ circuit_breaker_cooldown_secs = 60
             assert!(!saved.contains(legacy), "{legacy} in {saved}");
         }
         assert!(saved.contains("max_candidates = 5"), "{saved}");
-        assert!(
-            saved.contains("enabled = false"),
-            "`enabled` is always written: {saved}"
-        );
+        assert!(saved.contains("enabled = true"), "`enabled` is always written: {saved}");
 
         assert!(
             saved.contains("schema_version = 1"),
@@ -12435,7 +12435,7 @@ circuit_breaker_cooldown_secs = 60
             .expect("test: save");
         let saved = saved_text(dir.path());
         assert!(
-            saved.contains("schema_version = 1") && saved.contains("enabled = false"),
+            saved.contains("schema_version = 1") && saved.contains("enabled = true"),
             "{saved}"
         );
     }

@@ -68,7 +68,12 @@ Builtin and cache-only paths do not create an accounting owner or open a ledger.
 An estimate is not a vendor billing cap. Fully reported usage is settled before
 semantic response acceptance, at the full actual token count and price. Missing,
 partial or estimated usage keeps the hold, including across timeout and recovery;
-reserving the remaining allowance can therefore leave no capacity for a retry.
+the first hold is never refunded merely to fund a retry. Compatible loopback
+decisions and health probes allocate the remaining token estimate equally across
+the transport-owned remaining sends (two initially, one on retry), under the
+same aggregate token/money ceiling. Each tranche must pass the full-body input
+preflight. Remote and auxiliary attempts reserve the full remaining allowance.
+The versioned local estimate does not impose a vendor output-token cap.
 Remote decision retries remain prohibited. Unsupported transports, missing owned
 scope, unknown pricing and insufficient budget remain explicit refusal cases.
 These source changes still require assembled lifecycle and performance validation.
@@ -121,6 +126,14 @@ receipt outlives that window. Metrics are published only after the database
 transaction confirms the update. Owned cleanup jobs retain real backend work
 through cancellation using one absolute deadline; an uncertain write remains
 failed/unconfirmed rather than being treated as rolled back or free.
+
+Execution observations retain at most 64 tool-call samples and 128 provider-attempt
+samples. Counters still describe every observed attempt. Overflow marks the trace
+incomplete; its bounded terminal outcome remains partial with no coverage claim.
+That partial outcome can be persisted and replayed without authorizing intentional
+silence or inheritance of incomplete predecessor observations. The producer and
+store share the 128-sample bound; execution budgets and cleanup acknowledgement
+requirements are unchanged.
 
 Terminal replay authenticates the historical input, both actual decision rows,
 model transition and serving trace. Failed phases retain their fixed stage and

@@ -332,7 +332,7 @@ mod tests {
         });
         let tool = make_tool(p);
         assert_eq!(tool.name(), "image");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
         assert!(tool.description().contains("vision"));
     }
 
@@ -347,9 +347,18 @@ mod tests {
         assert!(schema["properties"]["image"].is_object());
         assert!(schema["properties"]["images"].is_object());
         assert!(schema["properties"]["prompt"].is_object());
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"image": "image.png"})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"images": ["image.png"]})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"image": "image.png"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"images": ["image.png"]})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[tokio::test]

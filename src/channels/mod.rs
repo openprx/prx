@@ -35,6 +35,8 @@ pub mod nextcloud_talk;
 pub mod outbound_registry;
 pub mod pre_gate;
 pub mod qq;
+#[cfg(test)]
+mod recording_fixture;
 pub mod signal;
 pub mod signal_native;
 pub mod slack;
@@ -6104,6 +6106,7 @@ mod tests {
         clippy::needless_collect,
         clippy::unreadable_literal
     )]
+    mod factory_reload_fixture;
     mod signal_accounted;
 
     use super::*;
@@ -10316,91 +10319,45 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// The command/classifier getter retains cached-provider preference.
+    /// Admitted message turns use their separately validated factory path.
     #[tokio::test]
-    async fn process_channel_message_prefers_cached_default_provider_instance() {
-        let channel_impl = Arc::new(TelegramRecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
+    async fn generation_provider_getter_prefers_cached_default_instance() {
         let startup_provider_impl = Arc::new(ModelCaptureProvider::default());
         let startup_provider: Arc<dyn Provider> = startup_provider_impl.clone();
         let reloaded_provider_impl = Arc::new(ModelCaptureProvider::default());
         let reloaded_provider: Arc<dyn Provider> = reloaded_provider_impl.clone();
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.provider = startup_provider;
+        ctx.provider_cache
+            .lock()
+            .insert("test-provider".to_string(), Arc::clone(&reloaded_provider));
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), reloaded_provider);
+        let selected = get_or_create_provider_for_generation(&ctx, "test-provider", &ctx.config_generation)
+            .await
+            .expect("cached generation provider");
+        assert!(Arc::ptr_eq(&selected, &reloaded_provider));
+        let response = selected
+            .chat_with_history(
+                &[ChatMessage::user("hello cached default provider")],
+                "default-model",
+                0.0,
+            )
+            .await
+            .expect("cached fixture response");
 
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::clone(&startup_provider),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
-            model: Arc::new("default-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            memory_event_recording: MemoryEventRecording::default(),
-            read_only_tool_concurrency_window: 2,
-            priority_scheduling_enabled: false,
-            low_priority_tools: Vec::new(),
-
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-
-            tool_tiering: crate::config::ToolTieringConfig::default(),
-            signal_inbound_policy: None,
-            whatsapp_inbound_policy: None,
-            bot_names: vec!["prx".to_string()],
-            bot_uuids: vec![],
-            mention_only_by_channel: HashMap::new(),
-            group_reply_mode_by_channel: HashMap::new(),
-            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
-                security: Arc::new(crate::security::SecurityPolicy::default()),
-            })),
-            test_inbound_authorizer: None,
-        });
-
-        process_channel_message(
-            runtime_ctx,
-            traits::ChannelMessage {
-                id: "msg-default-provider-cache".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-1".to_string(),
-                content: "hello cached default provider".to_string(),
-                channel: "telegram".to_string(),
-                timestamp: 3,
-                thread_ts: None,
-                chat_kind: crate::channels::traits::ChatKind::Dm,
-                chat_title: None,
-                sender_display: None,
-                mentioned_uuids: vec![],
-                mentioned: false,
-                is_group_hint: false,
-                sender_is_bot: false,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
+        assert_eq!(response, "ok");
         assert_eq!(startup_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(reloaded_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reloaded_provider_impl.models.lock().as_slice(),
+            &["default-model".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_prefers_cached_default_provider_instance() {
+        factory_reload_fixture::run().await;
     }
 
     #[tokio::test]
@@ -11104,7 +11061,14 @@ BTC is currently around $65,000 based on latest tool output."#
                         )
                         .expect("real channel provider factory"),
                     );
-                    assert!(provider.capabilities().native_tool_calling);
+                    assert!(
+                        provider
+                            .capabilities_for(
+                                "prx-channel-probe",
+                                crate::providers::traits::ProviderRequestMode::NonStreaming,
+                            )
+                            .native_tool_calling
+                    );
                     let security = crate::security::SecurityPolicy::from_config(&config.autonomy, tmp.path());
                     let mut ctx = channel_turn_probe_ctx(tmp, memory, provider, channel);
                     let owned = Arc::get_mut(&mut ctx).expect("unshared physical channel context");
@@ -11961,14 +11925,25 @@ BTC is currently around $65,000 based on latest tool output."#
     /// autosave branch is actually reachable for this message under allow.
     #[tokio::test]
     async fn process_channel_message_autosave_gate_allowed_writes_memory() {
+        let workspace = TempDir::new().expect("channel recording fixture workspace");
         let memory = Arc::new(CountingMemory::default());
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
         opts.auto_save_memory = true;
-        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+        let mut ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
 
-        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+        let recorded = super::recording_fixture::attach(
+            Arc::get_mut(&mut ctx).expect("unique channel fixture context"),
+            workspace.path(),
+        );
+
+        run_owned_channel_probe(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+
+        assert!(
+            recorded.owned_readbacks() > 0,
+            "channel input must be durably reread by owner"
+        );
 
         assert!(
             memory.store_calls.load(Ordering::SeqCst) >= 1,
@@ -13114,7 +13089,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(result.is_ok(), "truncate_with_ellipsis should never panic on UTF-8");
 
         let truncated = result.unwrap();
-        assert!(!truncated.is_empty());
+        assert!(!truncated.is_empty(), "expected a non-empty value");
         assert!(truncated.is_char_boundary(truncated.len()));
     }
 
@@ -13755,7 +13730,7 @@ After"#;
 </tool_call>"#;
 
         let result = sanitize_channel_response(input, &tools);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
@@ -14074,7 +14049,7 @@ After"#;
             .as_str()
             .unwrap_or("")
             .to_string();
-        assert!(!first_last_ok.is_empty());
+        assert!(!first_last_ok.is_empty(), "expected a non-empty value");
 
         tokio::time::sleep(Duration::from_millis(70)).await;
         let second_last_ok = crate::health::snapshot_json()["components"][&component_name]["last_ok"]

@@ -137,13 +137,19 @@ async fn run_witness(slow: bool) {
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(&generation,Arc::clone(&memory),"Hello PRX, reply with a brief greeting.","prx_original_wire_run").await;
         let cancellation = CancellationToken::new();
         let started=Instant::now();
-        let (context, observed)=diagnostic_timing.scope(Box::pin(crate::causal_tree::decision_engine::original_observation::capture("actual-compatible-service-wire",service.decide_agent_initial(&proof,AgentTurnKind::Repl,&cancellation)))).await.expect("actual original observer");
-        let elapsed=started.elapsed();
+        let (context, observed)=diagnostic_timing.scope(Box::pin(crate::causal_tree::decision_engine::original_observation::material::capture("actual-compatible-service-wire",service.decide_agent_initial(&proof,AgentTurnKind::Repl,&cancellation)))).await.expect("actual original observer");
+
         let context=context.expect("actual configured decision or bounded builtin fallback");
         let hops=context.audit_hops().collect::<Vec<_>>();
         let sidecar=observed.checked_sidecar(&hops).expect("actual original objects match returned hop inventory");
         assert!(observed.checked_sidecar(&[]).is_err());
-        std::fs::write(output.join("original-sidecar.json"),serde_json::to_vec_pretty(&sidecar)? )?;
+        let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
+        drop(sidecar);
+        let original_material = observed.finish_material(&hops, false).expect("complete actual wire material");
+        let elapsed=started.elapsed();
+        std::fs::write(output.join("original-sidecar.json"), &sidecar_bytes)?;
+        std::fs::write(output.join("original-material.json"), &original_material)?;
+        let original_material: Value = serde_json::from_slice(&original_material)?;
         assert!(service.drain_writes(Instant::now()+Duration::from_secs(5)).await,"both actual durable queues acknowledged before readback");
         let mut primary=0;
         for hop in &hops {
@@ -160,7 +166,13 @@ async fn run_witness(slow: bool) {
         }
         let bodies=capture.raw.lock();
         assert!(!bodies.is_empty(),"configured service must physically reach owned HTTP; builtin alone cannot pass");
+        let sends = original_material.get("transport").and_then(Value::as_array).expect("actual transport events")
+            .iter().filter(|event| event.get("kind").and_then(Value::as_str) == Some("send_begin"))
+            .map(|event| hex::decode(event.get("guarded_bytes_hex").and_then(Value::as_str).expect("actual send bytes")).expect("exact hex bytes"))
+            .collect::<Vec<_>>();
+        let mut remaining = sends.iter();
         for (index,(request,response)) in bodies.iter().enumerate() {
+            assert!(remaining.any(|sent| sent.as_slice() == request.as_slice()), "ordered receiver bytes must match actual send attempts");
             std::fs::write(output.join(format!("request-{index}.bin")),request)?;
             std::fs::write(output.join(format!("constructed-response-{index}.bin")),response)?;
             let parsed:Value=serde_json::from_slice(request)?;

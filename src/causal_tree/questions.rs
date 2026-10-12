@@ -621,7 +621,10 @@ mod tests {
             second.request.manifest().request_fingerprint()
         );
         assert_ne!(first.request.request_id(), second.request.request_id());
-        assert!(first.request.manifest().projection_audit().truncated_fields.is_empty());
+        assert!(
+            first.request.manifest().projection_audit().truncated_fields.is_empty(),
+            "expected an empty value"
+        );
         let projected = first.request.state().as_json()["candidates"].as_array().unwrap();
         for (index, item) in projected.iter().enumerate() {
             let id = item["id"].as_str().unwrap();
@@ -801,7 +804,10 @@ mod tests {
                 .keys()
                 .all(|id| !id.as_str().contains(&gated_id))
         );
-        assert!(state_v1_violations(compiled.request.state().as_json()).is_empty());
+        assert!(
+            state_v1_violations(compiled.request.state().as_json()).is_empty(),
+            "expected an empty value"
+        );
         assert!(
             matches!(&admitted, CandidateSet::Legal { candidates, .. } if candidates.iter().any(|candidate| candidate.required_capabilities().first().is_some_and(|reference| view.entries().iter().any(|entry| entry.id == reference.id && entry.public_name == "prx_search"))))
         );
@@ -921,7 +927,10 @@ mod tests {
             assert!(!body.contains("PRX_SCHEMA_SENTINEL"));
             assert!(!body.contains("zz_extra_"));
             assert!(body.contains("Fixed compact summary"));
-            assert!(state_v1_violations(compiled.request.state().as_json()).is_empty());
+            assert!(
+                state_v1_violations(compiled.request.state().as_json()).is_empty(),
+                "expected an empty value"
+            );
             wire_lengths.push(body.len());
         }
         let first = wire_lengths

@@ -1239,7 +1239,7 @@ mod tests {
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let providers = manager.create_provider_adapters(None).await;
         assert!(providers.value.is_empty());
-        assert!(providers.errors.is_empty());
+        assert!(providers.errors.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
@@ -1248,6 +1248,6 @@ mod tests {
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let storages = manager.create_storage_adapters(None).await;
         assert!(storages.value.is_empty());
-        assert!(storages.errors.is_empty());
+        assert!(storages.errors.is_empty(), "expected an empty value");
     }
 }

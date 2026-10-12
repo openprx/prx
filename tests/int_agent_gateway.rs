@@ -33,6 +33,8 @@ use axum::{Json, Router};
 use openprx::HookManager;
 #[path = "support/embedded_agent.rs"]
 mod embedded_agent;
+#[path = "support/native_agent.rs"]
+mod native_agent;
 use embedded_agent::EmbeddedAgentFixture;
 use openprx::agent::dispatcher::NativeToolDispatcher;
 use openprx::config::{Config, new_shared};
@@ -136,6 +138,104 @@ impl Provider for HangingProvider {
             });
         }
         Ok(guard.remove(0))
+    }
+}
+
+/// Validate real feedback before forwarding the original positive scripts.
+struct PositiveFeedbackProvider {
+    inner: Box<dyn Provider>,
+    round_trip: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl PositiveFeedbackProvider {
+    fn new(inner: Box<dyn Provider>, round_trip: bool) -> Self {
+        Self {
+            inner,
+            round_trip,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn tool_content(request: ChatRequest<'_>, id: &str) -> Result<String> {
+        let mut found = None;
+        for message in request.messages.iter().filter(|message| message.role == "tool") {
+            let envelope: serde_json::Value = serde_json::from_str(&message.content)?;
+            if envelope.get("tool_call_id").and_then(serde_json::Value::as_str) == Some(id) {
+                anyhow::ensure!(found.is_none(), "duplicate original tool result");
+                found = Some(
+                    envelope
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("tool result content absent"))?
+                        .to_owned(),
+                );
+            }
+        }
+        found.ok_or_else(|| anyhow::anyhow!("actual tool result absent"))
+    }
+}
+#[async_trait]
+impl Provider for PositiveFeedbackProvider {
+    async fn chat_with_system(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> Result<String> {
+        self.inner.chat_with_system(system, message, model, temperature).await
+    }
+    async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.round_trip {
+            match call {
+                1 => anyhow::ensure!(
+                    Self::tool_content(request, "tc1")? == "call #1",
+                    "actual counter result"
+                ),
+                2 => {
+                    let result = Self::tool_content(request, "prx_search_echo")?;
+                    let search: serde_json::Value = serde_json::from_str(&result)?;
+                    let hits = search
+                        .get("hits")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| anyhow::anyhow!("actual search hits absent"))?;
+                    anyhow::ensure!(hits.len() == 1, "exact Echo search hit");
+                    let hit = &hits[0];
+                    anyhow::ensure!(
+                        hit.pointer("/schema/name").and_then(serde_json::Value::as_str) == Some("echo"),
+                        "actual Echo schema"
+                    );
+                    for field in ["id", "fingerprint", "generation"] {
+                        anyhow::ensure!(
+                            hit.get("capability")
+                                .and_then(|binding| binding.get(field))
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|value| !value.is_empty()),
+                            "actual capability binding"
+                        );
+                    }
+                }
+                3 => {
+                    anyhow::ensure!(
+                        Self::tool_content(request, "tc2")? == "tool result fed back",
+                        "actual Echo execution result"
+                    );
+                    anyhow::ensure!(
+                        request
+                            .tools
+                            .is_some_and(|tools| tools.iter().any(|tool| tool.name == "echo")),
+                        "Echo schema appended after admission"
+                    );
+                }
+                _ => {}
+            }
+        } else if call == 1 {
+            anyhow::ensure!(
+                Self::tool_content(request, "tc1")? == "first call ok",
+                "Echo executes before original hang"
+            );
+        }
+        self.inner.chat(request, model, temperature).await
     }
 }
 
@@ -513,6 +613,11 @@ async fn int_agent_gateway_ap01_tool_dispatch_round_trip() {
             name: "counter".into(),
             arguments: "{}".into(),
         }]),
+        tool_response(vec![ToolCall {
+            id: "prx_search_echo".into(),
+            name: "capability_search".into(),
+            arguments: r#"{"query":"echo","limit":1}"#.into(),
+        }]),
         // Second response: provider asks to call "echo" tool
         tool_response(vec![ToolCall {
             id: "tc2".into(),
@@ -523,18 +628,26 @@ async fn int_agent_gateway_ap01_tool_dispatch_round_trip() {
         text_response("Agent dispatched both tools successfully"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool), Box::new(EchoTool)]);
+    let provider = Box::new(PositiveFeedbackProvider::new(provider, true));
+    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(
+            builder.tools(vec![Box::new(counting_tool), Box::new(EchoTool)]),
+            workspace,
+        );
 
-    let response = agent.turn("dispatch test").await.expect("test: agent turn");
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty final text response after tool dispatch"
-    );
-    assert_eq!(
-        *count.lock().expect("test: read count"),
-        1,
-        "Counter tool should have been called exactly once"
-    );
+        let response = agent.turn("dispatch test").await.expect("test: agent turn");
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty final text response after tool dispatch"
+        );
+        assert_eq!(
+            *count.lock().expect("test: read count"),
+            1,
+            "Counter tool should have been called exactly once"
+        );
+    })
+    .await
+    .expect("genuine native round-trip fixture");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -598,29 +711,34 @@ async fn int_agent_gateway_ap03_provider_timeout_during_tool_loop() {
     ));
 
     let attempts = Arc::clone(&provider.call_count);
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let provider = Box::new(PositiveFeedbackProvider::new(provider, false));
+    native_agent::run(provider, "echo", 1, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(EchoTool)]), workspace);
 
-    // Use a timeout to prevent the test from hanging forever.
-    let result = tokio::time::timeout(Duration::from_secs(5), agent.turn("timeout test")).await;
+        // Use a timeout to prevent the test from hanging forever.
+        let result = tokio::time::timeout(Duration::from_secs(5), agent.turn("timeout test")).await;
 
-    assert!(
-        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "timeout evidence requires reaching the actual hanging provider call"
-    );
-    match result {
-        Ok(Ok(response)) => {
-            // If the agent returns a partial result, that is acceptable.
-            assert!(!response.is_empty(), "Expected non-empty partial response on timeout");
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "timeout evidence requires reaching the actual hanging provider call"
+        );
+        match result {
+            Ok(Ok(response)) => {
+                // If the agent returns a partial result, that is acceptable.
+                assert!(!response.is_empty(), "Expected non-empty partial response on timeout");
+            }
+            Ok(Err(_e)) => {
+                // An error is also acceptable — the agent detected the hang.
+            }
+            Err(_timeout_err) => {
+                // Timeout at the test level is also valid — it proves the provider hung
+                // and we protected the test with a timeout wrapper. The agent itself
+                // would need a configured timeout to handle this in production.
+            }
         }
-        Ok(Err(_e)) => {
-            // An error is also acceptable — the agent detected the hang.
-        }
-        Err(_timeout_err) => {
-            // Timeout at the test level is also valid — it proves the provider hung
-            // and we protected the test with a timeout wrapper. The agent itself
-            // would need a configured timeout to handle this in production.
-        }
-    }
+    })
+    .await
+    .expect("genuine native timeout fixture");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

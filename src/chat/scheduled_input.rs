@@ -369,12 +369,30 @@ mod tests {
         let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
         let schema = tool.parameters_schema();
 
-        assert!(!validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "schedule"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "cancel"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "schedule", "message": "wake"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "cancel", "id": 1})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "schedule"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "cancel"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "schedule", "message": "wake"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "cancel", "id": 1})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[tokio::test]

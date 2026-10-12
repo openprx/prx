@@ -1481,7 +1481,7 @@ mod tests {
         let entries = [local("filter.ev.clean", "./evil"), later];
         // A `command` scope entry with no file origin is not repository
         // content, and it is the effective value.
-        assert!(overrides(&entries).is_empty());
+        assert!(overrides(&entries).is_empty(), "expected an empty value");
     }
 
     #[test]

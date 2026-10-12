@@ -20,9 +20,15 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+#[path = "support/answer_agent.rs"]
+mod answer_agent;
 #[path = "support/embedded_agent.rs"]
 mod embedded_agent;
+#[path = "support/native_agent.rs"]
+mod native_agent;
 use embedded_agent::EmbeddedAgentFixture;
+#[path = "support/selected_memory.rs"]
+mod selected_memory;
 use openprx::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
 use openprx::agent::memory_loader::SelectedMemoryFormatter;
 use openprx::memory::Memory;
@@ -199,15 +205,26 @@ impl SelectedMemoryFormatter for SelectedContextFormatter {
     }
 }
 
-async fn build_selected_memory_agent(provider: RecordingProvider, content: &str) -> EmbeddedAgentFixture {
-    let workspace = tempfile::tempdir().unwrap();
+async fn build_selected_memory_agent(
+    provider: RecordingProvider,
+    content: &str,
+) -> (selected_memory::AgentFixture, selected_memory::Driver) {
+    let workspace = tempfile::Builder::new()
+        .prefix("prx-selected-memory-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut config = openprx::config::Config {
-        workspace_dir: workspace.path().to_owned(),
-        config_path: workspace.path().join("config.toml"),
+        workspace_dir: workspace.as_path().to_owned(),
+        config_path: workspace.as_path().join("config.toml"),
         default_model: Some("prx-local-model".to_owned()),
         ..openprx::config::Config::default()
     };
-    config.causal_tree.enabled = false;
     config.memory.auto_save = false;
     config.autonomy.level = openprx::security::AutonomyLevel::ReadOnly;
     config.cost.prices.insert(
@@ -226,43 +243,32 @@ async fn build_selected_memory_agent(provider: RecordingProvider, content: &str)
         )
         .unwrap(),
     );
-    let memory = Arc::new(openprx::memory::SqliteMemory::new(workspace.path()).unwrap());
-    let envelope =
-        openprx::runtime::envelope::RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_fixture_seed")
-            .with_channel("agent_api")
-            .with_sender("embedded-caller");
-    let owner = envelope.resolved_owner_id();
-    let mut scope = envelope.memory_write_context("private");
-    scope.owner_id = Some(owner.clone());
-    scope.require_owner_match = true;
-    memory
-        .store_with_context_and_metadata(
-            "prx_selected_fact",
-            content,
-            openprx::memory::MemoryCategory::Core,
-            None,
-            Some(&scope),
-            openprx::memory::MemoryStoreMetadata {
-                workspace_id: Some(envelope.workspace_id.clone()),
-                owner_id: Some(owner),
-                channel: Some("agent_api".to_owned()),
-                ..Default::default()
-            },
-        )
+    let memory = Arc::new(openprx::memory::SqliteMemory::new(workspace.as_path()).unwrap());
+    let driver = selected_memory::Driver::start(Arc::clone(&memory), workspace.clone(), content)
         .await
         .unwrap();
-    let shared: Arc<dyn Memory> = memory;
-    let tool =
-        openprx::tools::memory_search::MemorySearchTool::new(workspace.path().to_owned(), Arc::clone(&shared), true);
-    let builder = openprx::agent::agent::Agent::builder()
-        .runtime_config(config, "ollama")
-        .provider(Box::new(provider))
-        .tools(vec![Box::new(tool)])
-        .memory(shared)
-        .observer(Arc::new(openprx::observability::NoopObserver {}))
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .selected_memory_formatter(Box::new(SelectedContextFormatter));
-    EmbeddedAgentFixture::finish(builder, workspace)
+    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        selected_memory::configure(&mut config, &driver.endpoint).unwrap();
+        let shared: Arc<dyn Memory> = memory;
+        let tool = openprx::tools::memory_search::MemorySearchTool::new(
+            workspace.as_path().to_owned(),
+            Arc::clone(&shared),
+            true,
+        );
+        let builder = openprx::agent::agent::Agent::builder()
+            .runtime_config(config, "ollama")
+            .provider(Box::new(provider))
+            .tools(vec![Box::new(tool)])
+            .memory(shared)
+            .observer(driver.observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .selected_memory_formatter(Box::new(SelectedContextFormatter));
+        selected_memory::AgentFixture(builder.build().unwrap())
+    }));
+    match setup {
+        Ok(agent) => (agent, driver),
+        Err(panic) => driver.run(0, async { std::panic::resume_unwind(panic) }).await,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -293,11 +299,6 @@ fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Embedd
 
 fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
     let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(XmlToolDispatcher));
-    EmbeddedAgentFixture::finish(builder, workspace)
-}
-
-fn build_recording_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> EmbeddedAgentFixture {
-    let (builder, workspace) = embedded_agent::prepare(provider, tools, Box::new(NativeToolDispatcher));
     EmbeddedAgentFixture::finish(builder, workspace)
 }
 
@@ -351,10 +352,14 @@ async fn e2e_multi_step_tool_chain() {
         text_response("Done after 2 tool calls"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
-    let response = agent.turn("count twice").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool chain");
-    assert_eq!(*count.lock().unwrap(), 2);
+    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
+        let response = agent.turn("count twice").await.unwrap();
+        assert!(!response.is_empty(), "Expected non-empty response after tool chain");
+        assert_eq!(*count.lock().unwrap(), 2);
+    })
+    .await
+    .expect("genuine native counter fixture");
 }
 
 /// Validates that the XML dispatcher path also works end-to-end.
@@ -388,18 +393,22 @@ async fn e2e_multi_turn_conversation() {
         text_response("Third response"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    Box::pin(answer_agent::run(provider, 3, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(EchoTool)]), workspace);
 
-    let r1 = agent.turn("turn 1").await.unwrap();
-    assert!(!r1.is_empty(), "Expected non-empty first response");
+        let r1 = agent.turn("turn 1").await.unwrap();
+        assert!(!r1.is_empty(), "Expected non-empty first response");
 
-    let r2 = agent.turn("turn 2").await.unwrap();
-    assert!(!r2.is_empty(), "Expected non-empty second response");
-    assert_ne!(r1, r2, "Sequential turn responses should be distinct");
+        let r2 = agent.turn("turn 2").await.unwrap();
+        assert!(!r2.is_empty(), "Expected non-empty second response");
+        assert_ne!(r1, r2, "Sequential turn responses should be distinct");
 
-    let r3 = agent.turn("turn 3").await.unwrap();
-    assert!(!r3.is_empty(), "Expected non-empty third response");
-    assert_ne!(r2, r3, "Sequential turn responses should be distinct");
+        let r3 = agent.turn("turn 3").await.unwrap();
+        assert!(!r3.is_empty(), "Expected non-empty third response");
+        assert_ne!(r2, r3, "Sequential turn responses should be distinct");
+    }))
+    .await
+    .expect("genuine configured Answer fixture");
 }
 
 /// Validates that the agent handles unknown tool names gracefully.
@@ -443,13 +452,17 @@ async fn e2e_parallel_tool_dispatch() {
         text_response("Both tools ran"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
-    let response = agent.turn("run both").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after parallel dispatch"
-    );
-    assert_eq!(*count.lock().unwrap(), 2);
+    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
+        let response = agent.turn("run both").await.unwrap();
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response after parallel dispatch"
+        );
+        assert_eq!(*count.lock().unwrap(), 2);
+    })
+    .await
+    .expect("genuine native counter fixture");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -466,56 +479,62 @@ async fn e2e_multi_turn_history_fidelity() {
         text_response("response 3"),
     ]);
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![]);
+    Box::pin(answer_agent::run(Box::new(provider), 3, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder, workspace);
 
-    let r1 = agent.turn("msg 1").await.unwrap();
-    assert_eq!(r1, "response 1");
+        let r1 = agent.turn("msg 1").await.unwrap();
+        assert_eq!(r1, "response 1");
 
-    let r2 = agent.turn("msg 2").await.unwrap();
-    assert_eq!(r2, "response 2");
+        let r2 = agent.turn("msg 2").await.unwrap();
+        assert_eq!(r2, "response 2");
 
-    let r3 = agent.turn("msg 3").await.unwrap();
-    assert_eq!(r3, "response 3");
+        let r3 = agent.turn("msg 3").await.unwrap();
+        assert_eq!(r3, "response 3");
 
-    let requests = recorded.lock().unwrap();
-    assert_eq!(requests.len(), 3, "Provider should receive 3 requests");
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 3, "Provider should receive 3 requests");
 
-    // Request 1: system + user("msg 1")
-    let req1 = &requests[0];
-    assert!(req1.len() >= 2);
-    assert_eq!(req1[0].role, "system");
-    assert_eq!(req1[1].role, "user");
-    assert!(req1[1].content.contains("msg 1"));
+        // Request 1: system + user("msg 1")
+        let req1 = &requests[0];
+        assert!(req1.len() >= 2);
+        assert_eq!(req1[0].role, "system");
+        assert_eq!(req1[1].role, "user");
+        assert!(req1[1].content.contains("msg 1"));
 
-    // Request 2: system + user("msg 1") + assistant("response 1") + user("msg 2")
-    let req2 = &requests[1];
-    let req2_users: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "user").collect();
-    let req2_assts: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "assistant").collect();
-    assert_eq!(req2_users.len(), 2, "Request 2: expected 2 user messages");
-    assert_eq!(req2_assts.len(), 1, "Request 2: expected 1 assistant message");
-    assert!(req2_users[0].content.contains("msg 1"));
-    assert!(req2_users[1].content.contains("msg 2"));
-    assert_eq!(req2_assts[0].content, "response 1");
+        // Request 2: system + user("msg 1") + assistant("response 1") + user("msg 2")
+        let req2 = &requests[1];
+        let req2_users: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "user").collect();
+        let req2_assts: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(req2_users.len(), 2, "Request 2: expected 2 user messages");
+        assert_eq!(req2_assts.len(), 1, "Request 2: expected 1 assistant message");
+        assert!(req2_users[0].content.contains("msg 1"));
+        assert!(req2_users[1].content.contains("msg 2"));
+        assert_eq!(req2_assts[0].content, "response 1");
 
-    // Request 3: full history — 3 user + 2 assistant messages
-    let req3 = &requests[2];
-    let req3_users: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "user").collect();
-    let req3_assts: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "assistant").collect();
-    assert_eq!(req3_users.len(), 3, "Request 3: expected 3 user messages");
-    assert_eq!(req3_assts.len(), 2, "Request 3: expected 2 assistant messages");
-    assert!(req3_users[0].content.contains("msg 1"));
-    assert!(req3_users[1].content.contains("msg 2"));
-    assert!(req3_users[2].content.contains("msg 3"));
-    assert_eq!(req3_assts[0].content, "response 1");
-    assert_eq!(req3_assts[1].content, "response 2");
+        // Request 3: full history — 3 user + 2 assistant messages
+        let req3 = &requests[2];
+        let req3_users: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "user").collect();
+        let req3_assts: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(req3_users.len(), 3, "Request 3: expected 3 user messages");
+        assert_eq!(req3_assts.len(), 2, "Request 3: expected 2 assistant messages");
+        assert!(req3_users[0].content.contains("msg 1"));
+        assert!(req3_users[1].content.contains("msg 2"));
+        assert!(req3_users[2].content.contains("msg 3"));
+        assert_eq!(req3_assts[0].content, "response 1");
+        assert_eq!(req3_assts[1].content, "response 2");
 
-    // Verify agent history: system + 3*(user + assistant) = 7
-    let history = agent.history();
-    assert_eq!(history.len(), 7);
-    assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
-    assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
-    assert!(matches!(&history[2], ConversationMessage::Chat(c) if c.role == "assistant"));
-    assert!(matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3"));
+        // Verify agent history: system + 3*(user + assistant) = 7
+        let history = agent.history();
+        assert_eq!(history.len(), 7);
+        assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
+        assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
+        assert!(matches!(&history[2], ConversationMessage::Chat(c) if c.role == "assistant"));
+        assert!(
+            matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3")
+        );
+    }))
+    .await
+    .unwrap();
 }
 
 /// Validates that source-scoped `SQLite` evidence selected by the builtin decision
@@ -524,40 +543,43 @@ async fn e2e_multi_turn_history_fidelity() {
 async fn e2e_memory_enrichment_injects_context() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("enriched response")]);
 
-    let mut agent = build_selected_memory_agent(provider, "hello user_name: test_user").await;
+    let (mut agent, driver) = build_selected_memory_agent(provider, "hello user_name: test_user").await;
+    driver
+        .run(1, async {
+            let response = agent.turn("hello").await.unwrap();
+            assert_eq!(response, "enriched response");
 
-    let response = agent.turn("hello").await.unwrap();
-    assert_eq!(response, "enriched response");
+            // Provider received enriched message
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
+            assert!(
+                user_msg.content.starts_with("[Memory context]"),
+                "User message should start with memory context, got: {}",
+                user_msg.content,
+            );
+            assert!(
+                user_msg.content.contains("user_name: test_user"),
+                "User message should contain memory key-value pair",
+            );
+            assert!(
+                user_msg.content.ends_with("hello"),
+                "User message should end with original text, got: {}",
+                user_msg.content,
+            );
 
-    // Provider received enriched message
-    let requests = recorded.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-    assert!(
-        user_msg.content.starts_with("[Memory context]"),
-        "User message should start with memory context, got: {}",
-        user_msg.content,
-    );
-    assert!(
-        user_msg.content.contains("user_name: test_user"),
-        "User message should contain memory key-value pair",
-    );
-    assert!(
-        user_msg.content.ends_with("hello"),
-        "User message should end with original text, got: {}",
-        user_msg.content,
-    );
-
-    // Agent history also stores enriched message
-    let history = agent.history();
-    match &history[1] {
-        ConversationMessage::Chat(c) => {
-            assert_eq!(c.role, "user");
-            assert!(c.content.starts_with("[Memory context]"));
-            assert!(c.content.ends_with("hello"));
-        }
-        other => panic!("Expected Chat variant for user message, got: {other:?}"),
-    }
+            // Agent history also stores enriched message
+            let history = agent.history();
+            match &history[1] {
+                ConversationMessage::Chat(c) => {
+                    assert_eq!(c.role, "user");
+                    assert!(c.content.starts_with("[Memory context]"));
+                    assert!(c.content.ends_with("hello"));
+                }
+                other => panic!("Expected Chat variant for user message, got: {other:?}"),
+            }
+        })
+        .await;
 }
 
 /// Validates multi-turn conversation with memory enrichment: every user
@@ -566,42 +588,45 @@ async fn e2e_memory_enrichment_injects_context() {
 async fn e2e_multi_turn_with_memory_enrichment() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let mut agent = build_selected_memory_agent(provider, "first second question project: openprx").await;
+    let (mut agent, driver) = build_selected_memory_agent(provider, "first second question project: openprx").await;
+    driver
+        .run(2, async {
+            let r1 = agent.turn("first question").await.unwrap();
+            assert_eq!(r1, "answer 1");
 
-    let r1 = agent.turn("first question").await.unwrap();
-    assert_eq!(r1, "answer 1");
+            let r2 = agent.turn("second question").await.unwrap();
+            assert_eq!(r2, "answer 2");
 
-    let r2 = agent.turn("second question").await.unwrap();
-    assert_eq!(r2, "answer 2");
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2);
 
-    let requests = recorded.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+            // Turn 1: user message is enriched
+            let req1_user = requests[0].iter().find(|m| m.role == "user").unwrap();
+            assert!(req1_user.content.contains("[Memory context]"));
+            assert!(req1_user.content.contains("project: openprx"));
+            assert!(req1_user.content.ends_with("first question"));
 
-    // Turn 1: user message is enriched
-    let req1_user = requests[0].iter().find(|m| m.role == "user").unwrap();
-    assert!(req1_user.content.contains("[Memory context]"));
-    assert!(req1_user.content.contains("project: openprx"));
-    assert!(req1_user.content.ends_with("first question"));
+            // Turn 2: both user messages enriched, assistant from turn 1 present
+            let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
+            assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
 
-    // Turn 2: both user messages enriched, assistant from turn 1 present
-    let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
-    assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
+            // Turn 1 user message still enriched in history
+            assert!(req2_users[0].content.contains("[Memory context]"));
+            assert!(req2_users[0].content.ends_with("first question"));
 
-    // Turn 1 user message still enriched in history
-    assert!(req2_users[0].content.contains("[Memory context]"));
-    assert!(req2_users[0].content.ends_with("first question"));
+            // Turn 2 user message also enriched
+            assert!(req2_users[1].content.contains("[Memory context]"));
+            assert!(req2_users[1].content.ends_with("second question"));
 
-    // Turn 2 user message also enriched
-    assert!(req2_users[1].content.contains("[Memory context]"));
-    assert!(req2_users[1].content.ends_with("second question"));
+            // Assistant response from turn 1 preserved
+            let req2_assts: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "assistant").collect();
+            assert_eq!(req2_assts.len(), 1);
+            assert_eq!(req2_assts[0].content, "answer 1");
 
-    // Assistant response from turn 1 preserved
-    let req2_assts: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "assistant").collect();
-    assert_eq!(req2_assts.len(), 1);
-    assert_eq!(req2_assts[0].content, "answer 1");
-
-    // History: system + 2*(enriched_user + assistant) = 5
-    assert_eq!(agent.history().len(), 5);
+            // History: system + 2*(enriched_user + assistant) = 5
+            assert_eq!(agent.history().len(), 5);
+        })
+        .await;
 }
 
 /// Without selected memory, the formatter is not called and raw input passes through unchanged.
@@ -615,21 +640,28 @@ async fn e2e_empty_memory_context_passthrough() {
     }
     let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
 
-    let (builder, workspace) = embedded_agent::prepare(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
-    let mut agent = EmbeddedAgentFixture::finish(
-        builder.selected_memory_formatter(Box::new(UnexpectedMemoryFormatter)),
-        workspace,
-    );
+    Box::pin(answer_agent::run(
+        Box::new(provider),
+        1,
+        |builder, workspace| async move {
+            let mut agent = EmbeddedAgentFixture::finish(
+                builder.selected_memory_formatter(Box::new(UnexpectedMemoryFormatter)),
+                workspace,
+            );
 
-    let response = agent.turn("hello").await.unwrap();
-    assert_eq!(response, "plain response");
+            let response = agent.turn("hello").await.unwrap();
+            assert_eq!(response, "plain response");
 
-    let requests = recorded.lock().unwrap();
-    let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-    assert_eq!(
-        user_msg.content, "hello",
-        "Empty context should not prepend anything to user message",
-    );
+            let requests = recorded.lock().unwrap();
+            let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
+            assert_eq!(
+                user_msg.content, "hello",
+                "Empty context should not prepend anything to user message",
+            );
+        },
+    ))
+    .await
+    .unwrap();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

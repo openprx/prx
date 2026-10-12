@@ -462,8 +462,8 @@ mod tests {
     fn pkce_generation_is_valid() {
         let pkce = generate_pkce_state();
         assert!(pkce.code_verifier.len() >= 43);
-        assert!(!pkce.code_challenge.is_empty());
-        assert!(!pkce.state.is_empty());
+        assert!(!pkce.code_challenge.is_empty(), "expected a non-empty value");
+        assert!(!pkce.state.is_empty(), "expected a non-empty value");
     }
 
     #[test]

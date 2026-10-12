@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn recovery_hint_no_match() {
         let hint = recovery_hint("shell", "Some random error");
-        assert!(hint.is_empty());
+        assert!(hint.is_empty(), "expected an empty value");
     }
 
     #[test]

@@ -10,6 +10,7 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
         .parse()
         .expect("numeric N");
     assert!([0, 1, 16, 64, 256, 512].contains(&extra));
+    let total_inventory = extra.checked_add(1).expect("fixed seed plus additional inventory");
     let workspace = tempfile::tempdir().expect("isolated workspace");
     let ((service, proof, mcp, transports, dispatches, setup_us), setup_allocations) =
         crate::decision::builtin::allocation_counter::count_process_future(async {
@@ -38,9 +39,15 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
                 config.mcp.clone(),
                 workspace.path().to_path_buf(),
             ));
-            mcp.test_publish_inventory("prx_inventory", extra)
+            mcp.test_publish_inventory("prx_inventory", total_inventory)
                 .expect("actual snapshot publication without transport");
-            let mut tools = vec![tool("file_read", &[], &dispatches)];
+            let mut tools: Vec<Box<dyn Tool>> = vec![
+                Box::new(CountedInventoryFileRead {
+                    inner: crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false),
+                    dispatches: Arc::clone(&dispatches),
+                }),
+                Box::new(crate::tools::capability::search_tool::CapabilitySearchTool),
+            ];
             tools.push(mcp.test_boxed_tool());
             let registry = Arc::new(tools);
             let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
@@ -72,8 +79,8 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
                 &hooks,
                 0,
             );
-            assert_eq!(catalog_sources.mcp.len(), extra);
-            let service = build_turn_decision_service(
+            assert_eq!(catalog_sources.mcp.len(), total_inventory);
+            let mut service = build_turn_decision_service(
                 TurnSurfaceKind::AgentLoop,
                 TurnServiceBuild {
                     parent_grant: None,
@@ -94,6 +101,7 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
                 },
             )
             .expect("actual published service");
+            install_inventory_evidence_backend(&mut service);
             let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
                 &generation,
                 Arc::clone(&memory),
@@ -149,17 +157,49 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
         .iter_entries()
         .filter(|entry| entry.root == "mcp_call" && entry.public_name != "mcp_call")
         .count();
-    assert_eq!(live_aliases, extra, "actual published MCP aliases");
-    let semantics = semantic_context(&service, &proof, &context);
+    assert_eq!(live_aliases, total_inventory, "actual seed plus additional MCP aliases");
+    // N varies only the inventory beyond a genuine, always-admitted seed.
+    let mut hops = context.audit_hops();
+    let hop = hops.next().expect("one owned decision hop");
+    assert!(hops.next().is_none(), "fixed one-hop workload");
+    let admitted = candidates(&hop.candidates);
+    assert_eq!(
+        admitted.len(),
+        6,
+        "fixed admitted workload including both discovery families"
+    );
+    for (target, expected_ref) in [
+        (
+            crate::causal_tree::branch::CapabilityTarget::Mcp,
+            "mcp:prx_inventory:mcp__prx_inventory__inventory_0000",
+        ),
+        (
+            crate::causal_tree::branch::CapabilityTarget::NativeTool,
+            "native_tool:native:mcp_call",
+        ),
+    ] {
+        let mut matching = admitted.iter().filter(|candidate| {
+            candidate.action() == crate::causal_tree::branch::CausalActionKind::Discover && candidate.target() == target
+        });
+        let candidate = matching.next().expect("required discovery family retained");
+        assert!(matching.next().is_none(), "one representative per discovery family");
+        let [reference] = candidate.required_capabilities() else {
+            panic!("discovery representative has one original catalog ref")
+        };
+        assert_eq!(reference.id.as_str(), expected_ref);
+    }
+    let semantics = semantic_witness::capture_mcp_inventory(&service, &proof, &context);
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     assert_eq!(mcp.test_invocation_count(), 0);
     use std::io::Write;
     writeln!(std::io::stdout().lock(), "PRX_CDP_MCP_INVENTORY {}", json!({
-        "schema":"owned-mcp-inventory-profile-v1", "extra_inventory":extra,
+        "schema":"owned-mcp-inventory-profile-v2", "extra_inventory":extra,
+        "baseline_inventory":1, "total_inventory":total_inventory,
+        "inventory_domain":"N additional aliases beyond always-present inventory_0000",
         "rust_allocation_attempts":allocations, "decision_and_drains_us":elapsed_us,
         "setup_rust_allocation_attempts":setup_allocations, "setup_and_drains_us":setup_us,
-        "setup_scope":"config, real MCP publication, registry/service/SQLite/owned ingress and required drains; tempdir creation excluded",
+        "setup_scope":"config, real MCP seed plus additional inventory publication, registry/service/SQLite/owned ingress and required drains; tempdir creation excluded",
         "provider_transport_calls":transports.0.load(Ordering::SeqCst),
         "file_fixture_dispatches":dispatches.load(Ordering::SeqCst),
         "actual_mcp_invocations":mcp.test_invocation_count(),

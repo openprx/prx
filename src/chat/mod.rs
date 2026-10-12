@@ -12768,7 +12768,7 @@ async fn run_git_diff_bounded(workspace_dir: &std::path::Path, cached: bool) -> 
         .stdout
         .take()
         .ok_or_else(|| "diff unavailable: failed to capture git stdout".to_string())?
-        .take(u64::try_from(DIFF_MAX_BYTES.saturating_add(1)).map_or(u64::MAX, |value| value));
+        .take(u64::try_from(DIFF_MAX_BYTES.saturating_add(1)).unwrap_or(u64::MAX));
     let mut stdout_bytes = Vec::new();
     stdout
         .read_to_end(&mut stdout_bytes)
@@ -12782,7 +12782,7 @@ async fn run_git_diff_bounded(workspace_dir: &std::path::Path, cached: bool) -> 
 
     let mut stderr_bytes = Vec::new();
     if let Some(stderr) = child.stderr.take() {
-        let mut stderr = stderr.take(u64::try_from(DIFF_ERROR_MAX_BYTES).map_or(u64::MAX, |value| value));
+        let mut stderr = stderr.take(u64::try_from(DIFF_ERROR_MAX_BYTES).unwrap_or(u64::MAX));
         let _ = stderr.read_to_end(&mut stderr_bytes).await;
     }
 
@@ -15998,76 +15998,102 @@ mod legacy_chat_compaction_audit_tests {
     /// run lineage).
     #[tokio::test]
     async fn chat_per_turn_run_ids_are_distinct_and_have_no_parent() {
-        let tmp = TempDir::new().unwrap();
-        let mem: Arc<dyn crate::memory::Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let fabric = MemoryFabric::new(mem, "workspace-d8".to_string()).with_event_recording(
-            crate::memory::MemoryEventRecording {
-                enabled: true,
-                record_user_messages: true,
-                record_assistant_messages: true,
-                ..crate::memory::MemoryEventRecording::default()
-            },
-        );
-        let session = session::ChatSession::new("test-provider", "test-model");
-        let session_key = format!("chat:{}", session.id);
+        let tmp = TempDir::new().unwrap().keep();
+        use futures_util::FutureExt as _;
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("owned lineage fixture cleanup");
+        let mut outcome = None;
+        let cleanup_result = cleanup
+            .run(async {
+                let mut retained = None;
+                outcome = Some(
+                    std::panic::AssertUnwindSafe(async {
+                        let mem: Arc<dyn crate::memory::Memory> = Arc::new(SqliteMemory::new(tmp.as_path()).unwrap());
+                        let fabric = MemoryFabric::new(mem, tmp.to_string_lossy().into_owned()).with_event_recording(
+                            crate::memory::MemoryEventRecording {
+                                enabled: true,
+                                record_user_messages: true,
+                                record_assistant_messages: true,
+                                ..crate::memory::MemoryEventRecording::default()
+                            },
+                        );
+                        let session = session::ChatSession::new("test-provider", "test-model");
+                        let session_key = format!("chat:{}", session.id);
 
-        // Two turns, each with its own freshly generated run_id (mirroring the
-        // per-turn generation at the turn-loop entry).
-        let turn1_run_id = uuid::Uuid::new_v4().to_string();
-        let (binding, service, user1) = decision_source::admission_failure_tests::decided_binding_for_input(
-            &fabric,
-            &session_key,
-            &turn1_run_id,
-            "first turn",
-        )
-        .await;
-        let route = RouteDecision::single_candidate("ollama", "prx-local-model");
-        let asst1 = finalize_chat_success_turn(
-            Some(binding.as_ref()),
-            &fabric,
-            &session_key,
-            &turn1_run_id,
-            "ollama",
-            "prx-local-model",
-            binding.envelope().message_scope(),
-            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
-            Some("first reply".to_string()),
-            1,
-            "test reply",
-            &crate::config::schema::CostConfig::default(),
-            tmp.path(),
-        )
-        .await
-        .unwrap()
-        .assistant_event
-        .unwrap();
-        service
-            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                        // Two turns, each with its own freshly generated run_id (mirroring the
+                        // per-turn generation at the turn-loop entry).
+                        let turn1_run_id = uuid::Uuid::new_v4().to_string();
+                        let (binding, service, user1) =
+                            decision_source::admission_failure_tests::decided_binding_for_input_retained(
+                                &fabric,
+                                &session_key,
+                                &turn1_run_id,
+                                "first turn",
+                                &mut retained,
+                            )
+                            .await;
+                        let route = RouteDecision::single_candidate("ollama", "prx-local-model");
+                        let asst1 = finalize_chat_success_turn(
+                            Some(binding.as_ref()),
+                            &fabric,
+                            &session_key,
+                            &turn1_run_id,
+                            "ollama",
+                            "prx-local-model",
+                            binding.envelope().message_scope(),
+                            ProviderExecutionOutcome::success_for_decision(&route, chrono::Utc::now()),
+                            Some("first reply".to_string()),
+                            1,
+                            "test reply",
+                            &crate::config::schema::CostConfig::default(),
+                            tmp.as_path(),
+                        )
+                        .await
+                        .unwrap()
+                        .assistant_event
+                        .unwrap();
+                        service
+                            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                            .await;
+
+                        let turn2_run_id = uuid::Uuid::new_v4().to_string();
+                        let user2 = record_chat_user_message_event(
+                            &fabric,
+                            &session,
+                            &session_key,
+                            &turn2_run_id,
+                            "test-provider",
+                            "test-model",
+                            2,
+                            "second turn",
+                        )
+                        .await
+                        .unwrap();
+
+                        assert_eq!(user1.run_id.as_deref(), Some(turn1_run_id.as_str()));
+                        assert_eq!(asst1.run_id.as_deref(), Some(turn1_run_id.as_str()));
+                        assert_eq!(user2.run_id.as_deref(), Some(turn2_run_id.as_str()));
+                        assert_ne!(turn1_run_id, turn2_run_id, "each turn must get a distinct run_id");
+                        assert!(!turn1_run_id.is_empty() && !turn2_run_id.is_empty());
+                        assert!(
+                            user1.parent_run_id.is_none()
+                                && asst1.parent_run_id.is_none()
+                                && user2.parent_run_id.is_none(),
+                            "chat turns must not set parent_run_id (session relation is via session_key)"
+                        );
+                    })
+                    .catch_unwind()
+                    .await,
+                );
+                drop(retained);
+                Ok(())
+            })
             .await;
-
-        let turn2_run_id = uuid::Uuid::new_v4().to_string();
-        let user2 = record_chat_user_message_event(
-            &fabric,
-            &session,
-            &session_key,
-            &turn2_run_id,
-            "test-provider",
-            "test-model",
-            2,
-            "second turn",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(user1.run_id.as_deref(), Some(turn1_run_id.as_str()));
-        assert_eq!(asst1.run_id.as_deref(), Some(turn1_run_id.as_str()));
-        assert_eq!(user2.run_id.as_deref(), Some(turn2_run_id.as_str()));
-        assert_ne!(turn1_run_id, turn2_run_id, "each turn must get a distinct run_id");
-        assert!(!turn1_run_id.is_empty() && !turn2_run_id.is_empty());
-        assert!(
-            user1.parent_run_id.is_none() && asst1.parent_run_id.is_none() && user2.parent_run_id.is_none(),
-            "chat turns must not set parent_run_id (session relation is via session_key)"
-        );
+        match outcome {
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            Some(Ok(())) => cleanup_result.expect("lineage fixture queues and accounting drained"),
+            None => panic!("lineage fixture did not enter cleanup scope"),
+        }
     }
 
     #[tokio::test]
@@ -19115,10 +19141,10 @@ mod p3_directional_switch_tests {
         let second = fresh_chat_session("provider-a", "model-a", commands::ChatMode::Plan);
 
         assert_ne!(first.id, second.id);
-        assert!(first.title.is_empty());
+        assert!(first.title.is_empty(), "expected an empty value");
         assert!(first.turns.is_empty());
-        assert!(first.token_usage_records.is_empty());
-        assert!(first.background_sessions.is_empty());
+        assert!(first.token_usage_records.is_empty(), "expected an empty value");
+        assert!(first.background_sessions.is_empty(), "expected an empty value");
         assert_eq!(first.provider, "provider-a");
         assert_eq!(first.model, "model-a");
         assert_eq!(first.mode, commands::ChatMode::Plan);
@@ -21244,7 +21270,7 @@ mod p3_directional_switch_tests {
                 } => {
                     assert_eq!(draft_id, expected_draft);
                     assert_eq!(final_text, expected_assistant);
-                    assert!(reasoning.is_empty());
+                    assert!(reasoning.is_empty(), "expected an empty value");
                 }
                 other => panic!("expected StreamCompleted, got {other:?}"),
             }
@@ -22029,9 +22055,9 @@ mod p7b_branch_rewind_tests {
         let short_rewind = rewound_chat_session_from(&source, 2);
 
         assert_eq!(full_branch.background_sessions.len(), 1);
-        assert!(short_branch.background_sessions.is_empty());
+        assert!(short_branch.background_sessions.is_empty(), "expected an empty value");
         assert_eq!(full_rewind.background_sessions.len(), 1);
-        assert!(short_rewind.background_sessions.is_empty());
+        assert!(short_rewind.background_sessions.is_empty(), "expected an empty value");
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -22221,8 +22247,8 @@ mod regfix_approval_switch_tests {
         assert_eq!(chat_session_key, "chat:loaded-session");
         assert_eq!(fabric_turn_seq, 1);
         assert!(announced_started_sessions.is_empty());
-        assert!(last_sessions_summary.is_empty());
-        assert!(last_sessions_entries.is_empty());
+        assert!(last_sessions_summary.is_empty(), "expected an empty value");
+        assert!(last_sessions_entries.is_empty(), "expected an empty value");
         assert!(attached_follow.is_none());
         assert!(attached_follow_seq.is_none());
         {

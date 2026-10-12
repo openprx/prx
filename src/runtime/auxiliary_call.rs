@@ -316,6 +316,7 @@ impl crate::providers::attempt_accounting::AttemptAccounting for AuxiliaryAccoun
                 transport_binding: &binding,
                 request_id: self.purpose.label(),
                 deadline: self.scope.deadline(),
+                remaining_attempts: 1,
             })
             .await?;
         Ok(Box::new(AuxiliaryReceipt(receipt)))

@@ -483,7 +483,7 @@ pub fn find_secrets(text: &str) -> Vec<Range<usize>> {
     // Sorting and merging: proportional to the number of spans (times its
     // logarithm for the sort, counted as the bit length).
     #[cfg(test)]
-    record_redaction_work(spans.len() * (usize::try_from(usize::BITS - spans.len().leading_zeros()).unwrap_or(0) + 1));
+    record_redaction_work(spans.len() * (usize::try_from(spans.len().bit_width()).unwrap_or(0) + 1));
     spans.retain(|span| !span.is_empty());
     spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(spans.len());

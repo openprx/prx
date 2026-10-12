@@ -4156,7 +4156,7 @@ mod tests {
         let autonomy = crate::config::AutonomyConfig::default();
         assert_eq!(p.autonomy, AutonomyLevel::Full);
         assert!(p.workspace_only);
-        assert!(!p.forbidden_paths.is_empty());
+        assert!(!p.forbidden_paths.is_empty(), "expected a non-empty value");
         assert_eq!(p.workspace_only, autonomy.workspace_only);
         assert_eq!(p.forbidden_paths, autonomy.forbidden_paths);
         assert_eq!(p.max_cost_per_day_cents, autonomy.max_cost_per_day_cents);

@@ -13,6 +13,17 @@ use anyhow::Context;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+// Closed internal distinctions; never retain the acknowledgement's raw error text.
+#[derive(Debug, thiserror::Error)]
+enum CleanupConfirmationError {
+    #[error("previous embedded turn cleanup was not confirmed: cleanup state already failed")]
+    AlreadyFailed,
+    #[error("previous embedded turn cleanup was not confirmed: failed cleanup acknowledgement")]
+    AcknowledgementFailed,
+    #[error("previous embedded turn cleanup was not confirmed: cleanup acknowledgement sender lost")]
+    SenderLost,
+}
+
 /// A cancelled caller leaves its cleanup receiver on the Agent. Waiting on
 /// it is cancellation-safe; a lost/failed acknowledgement poisons subsequent
 /// admission rather than allowing another turn over unconfirmed writes.
@@ -27,16 +38,18 @@ impl CleanupState {
     pub(super) async fn confirm(&mut self) -> anyhow::Result<()> {
         let outcome = match self {
             Self::Ready => return Ok(()),
-            Self::Failed => anyhow::bail!("previous embedded turn cleanup was not confirmed"),
+            Self::Failed => return Err(CleanupConfirmationError::AlreadyFailed.into()),
             Self::Pending(receiver) => receiver.await,
         };
         *self = Self::Failed;
-        anyhow::ensure!(
-            matches!(outcome, Ok(Ok(()))),
-            "previous embedded turn cleanup was not confirmed"
-        );
-        *self = Self::Ready;
-        Ok(())
+        match outcome {
+            Ok(Ok(())) => {
+                *self = Self::Ready;
+                Ok(())
+            }
+            Ok(Err(_)) => Err(CleanupConfirmationError::AcknowledgementFailed.into()),
+            Err(_) => Err(CleanupConfirmationError::SenderLost.into()),
+        }
     }
 
     fn arm(&mut self) -> anyhow::Result<tokio::sync::oneshot::Sender<Result<(), String>>> {
@@ -822,8 +835,18 @@ mod tests {
             } else {
                 drop(sender);
             }
-            assert!(state.confirm().await.is_err());
-            assert!(state.confirm().await.is_err());
+            let first = state.confirm().await.unwrap_err();
+            assert!(
+                matches!(first.downcast_ref::<CleanupConfirmationError>(),
+                Some(CleanupConfirmationError::AcknowledgementFailed) if send_failure)
+                    || matches!(first.downcast_ref::<CleanupConfirmationError>(),
+                    Some(CleanupConfirmationError::SenderLost) if !send_failure)
+            );
+            let later = state.confirm().await.unwrap_err();
+            assert!(matches!(
+                later.downcast_ref::<CleanupConfirmationError>(),
+                Some(CleanupConfirmationError::AlreadyFailed)
+            ));
             assert!(state.arm().is_err());
         }
     }

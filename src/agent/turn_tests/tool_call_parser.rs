@@ -97,7 +97,7 @@ fn parse_tool_calls_openai_format_without_content() {
         r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty()); // No content field
+    assert!(text.is_empty(), "expected an empty value"); // No content field
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "memory_recall");
 }
@@ -111,7 +111,7 @@ fn parse_tool_calls_handles_markdown_json_inside_tool_call_tag() {
 </tool_call>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "file_write");
     assert_eq!(calls[0].arguments.get("path").unwrap().as_str().unwrap(), "test.py");
@@ -125,7 +125,7 @@ I will now call the tool with this payload:
 </tool_call>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "pwd");
@@ -188,7 +188,7 @@ fn parse_tool_calls_handles_toolcall_tag_alias() {
 </toolcall>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
@@ -201,7 +201,7 @@ fn parse_tool_calls_handles_tool_dash_call_tag_alias() {
 </tool-call>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "whoami");
@@ -214,7 +214,7 @@ fn parse_tool_calls_handles_tool_call_tag_with_attributes() {
 </tool_call>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
@@ -227,7 +227,7 @@ fn parse_tool_calls_handles_invoke_tag_alias() {
 </invoke>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "uptime");
@@ -240,7 +240,7 @@ date
 "#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments["command"], "date");
@@ -255,7 +255,7 @@ pwd
 "#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments["command"], "pwd");
@@ -268,7 +268,7 @@ fn parse_tool_calls_handles_assistant_recipient_format_with_json_arguments() {
 </assistant>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "file_read");
     assert_eq!(calls[0].arguments["path"], "README.md");
@@ -281,7 +281,7 @@ ls -la
 </assistant>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments["command"], "ls -la");
@@ -310,7 +310,7 @@ fn parse_tool_calls_recovers_mismatched_close_tag() {
 </arg_value>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "uptime");
@@ -323,7 +323,7 @@ fn parse_tool_calls_recovers_cross_alias_closing_tags() {
 </tool_call>"#;
 
     let (text, calls) = parse_tool_calls(response);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
 }
@@ -351,12 +351,15 @@ fn tools_to_openai_format_produces_valid_schema() {
     let tools = crate::tools::default_tools(security);
     let formatted = tools_to_openai_format(&tools);
 
-    assert!(!formatted.is_empty());
+    assert!(!formatted.is_empty(), "expected a non-empty value");
     for tool_json in &formatted {
         assert_eq!(tool_json["type"], "function");
         assert!(tool_json["function"]["name"].is_string());
         assert!(tool_json["function"]["description"].is_string());
-        assert!(!tool_json["function"]["name"].as_str().unwrap().is_empty());
+        assert!(
+            !tool_json["function"]["name"].as_str().unwrap().is_empty(),
+            "expected a non-empty value"
+        );
     }
     // Verify known tools are present
     let names: Vec<&str> = formatted
@@ -436,14 +439,14 @@ fn parse_arguments_value_handles_none() {
 fn extract_json_values_handles_empty_string() {
     // Recovery: Empty input should return empty vec
     let result = extract_json_values("");
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "expected an empty value");
 }
 
 #[test]
 fn extract_json_values_handles_whitespace_only() {
     // Recovery: Whitespace only should return empty vec
     let result = extract_json_values("   \n\t  ");
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "expected an empty value");
 }
 
 #[test]
@@ -600,7 +603,7 @@ fn parse_glm_style_tool_call_integration() {
 fn parse_glm_style_rejects_non_http_url_param() {
     let response = "browser_open/url>javascript:alert(1)";
     let calls = parse_glm_style_tool_calls(response);
-    assert!(calls.is_empty());
+    assert!(calls.is_empty(), "expected an empty value");
 }
 
 #[test]

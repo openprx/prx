@@ -8,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct CleanupTracker {
     state: parking_lot::Mutex<State>,
     changed: tokio::sync::Notify,
+    #[cfg(test)]
+    diagnostic: diagnostic::Binding,
 }
 
 #[derive(Default)]
@@ -71,6 +73,9 @@ impl CleanupTracker {
             .ok_or_else(|| anyhow::anyhow!("runtime cleanup identity exhausted"))?;
         state.next_id = id;
         state.pending.insert(id, cancel);
+        #[cfg(test)]
+        self.diagnostic
+            .record("ticket_registered", id, state.pending.len(), state.failed, None);
         Ok(CleanupTicket {
             tracker: Arc::clone(self),
             id,
@@ -107,6 +112,9 @@ impl CleanupTracker {
         let cancellations = {
             let mut state = self.state.lock();
             state.closed = true;
+            #[cfg(test)]
+            self.diagnostic
+                .record("drain_started", 0, state.pending.len(), state.failed, None);
             state.pending.values().cloned().collect::<Vec<_>>()
         };
         for cancel in cancellations {
@@ -119,17 +127,36 @@ impl CleanupTracker {
             {
                 let state = self.state.lock();
                 if state.pending.is_empty() {
+                    #[cfg(test)]
+                    self.diagnostic
+                        .record("pending_empty", 0, 0, state.failed, Some(!state.failed));
                     break (state.services.clone(), state.failed);
                 }
             }
-            tokio::time::timeout_at(deadline, changed)
-                .await
-                .map_err(|_| anyhow::anyhow!("runtime terminal cleanup drain timed out"))?;
+            tokio::time::timeout_at(deadline, changed).await.map_err(|_| {
+                #[cfg(test)]
+                {
+                    let state = self.state.lock();
+                    self.diagnostic
+                        .record("pending_timeout", 0, state.pending.len(), state.failed, Some(false));
+                }
+                anyhow::anyhow!("runtime terminal cleanup drain timed out")
+            })?;
         };
         let mut queues_drained = true;
         for service in services {
-            queues_drained &= service.drain_writes(deadline.into_std()).await;
+            #[cfg(test)]
+            let drained = self.diagnostic.scope(service.drain_writes(deadline.into_std())).await;
+            #[cfg(not(test))]
+            let drained = service.drain_writes(deadline.into_std()).await;
+            queues_drained &= drained;
+            #[cfg(test)]
+            self.diagnostic
+                .record("service_queues_drained", 0, 0, failed, Some(drained));
         }
+        #[cfg(test)]
+        self.diagnostic
+            .record("drain_completed", 0, 0, failed, Some(!failed && queues_drained));
         anyhow::ensure!(!failed, "runtime terminal cleanup has unconfirmed failures");
         anyhow::ensure!(queues_drained, "runtime decision queues did not drain");
         Ok(())
@@ -150,6 +177,10 @@ impl CleanupTicket {
             if let Some(owner) = owner.upgrade() {
                 let mut state = owner.state.lock();
                 state.failed = true;
+                #[cfg(test)]
+                owner
+                    .diagnostic
+                    .record("ingress_lifetime_lost", 0, state.pending.len(), true, Some(false));
                 for cancellation in state.pending.values() {
                     cancellation.cancel();
                 }
@@ -192,6 +223,14 @@ impl CleanupTicket {
         let mut state = self.tracker.state.lock();
         state.pending.remove(&self.id);
         state.failed |= !success;
+        #[cfg(test)]
+        self.tracker.diagnostic.record(
+            "ticket_released",
+            self.id,
+            state.pending.len(),
+            state.failed,
+            Some(success),
+        );
         self.finished = true;
         drop(state);
         self.tracker.changed.notify_waiters();
@@ -200,6 +239,17 @@ impl CleanupTicket {
 
 impl Drop for CleanupTicket {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if !self.finished {
+            let state = self.tracker.state.lock();
+            self.tracker.diagnostic.record(
+                "unfinished_ticket_dropped",
+                self.id,
+                state.pending.len(),
+                state.failed,
+                Some(false),
+            );
+        }
         self.release(false);
     }
 }
@@ -227,6 +277,8 @@ pub(crate) struct CleanupScope {
     retirement_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     finished: bool,
+    #[cfg(test)]
+    diagnostic_completion: Option<diagnostic::Completion>,
 }
 
 impl CleanupScope {
@@ -234,13 +286,32 @@ impl CleanupScope {
         let parent_ticket = parent
             .map(|parent| parent.register_child(cancellation.clone()))
             .transpose()?;
+        #[cfg(test)]
+        let tracker = Arc::new(CleanupTracker {
+            diagnostic: diagnostic::Binding::for_parent(parent.map(|p| &p.diagnostic)),
+            ..Default::default()
+        });
+        #[cfg(not(test))]
+        let tracker = Arc::new(CleanupTracker::default());
+        #[cfg(test)]
+        tracker.diagnostic.record(
+            "scope_created_parent_owner",
+            parent.map_or(0, |p| p.diagnostic.owner()),
+            0,
+            false,
+            None,
+        );
+        #[cfg(test)]
+        let diagnostic_completion = tracker.diagnostic.start_completion();
         Ok(Self {
-            tracker: Arc::new(CleanupTracker::default()),
+            tracker,
             parent_ticket,
             cancellation,
             retirement_guard: None,
             cleanup_ack: None,
             finished: false,
+            #[cfg(test)]
+            diagnostic_completion,
         })
     }
 
@@ -296,14 +367,28 @@ impl CleanupScope {
             ticket.finish(cleanup.is_ok());
         }
         if let Some(ack) = self.cleanup_ack.take() {
-            let _ = ack.send(
+            let sent = ack.send(
                 cleanup
                     .as_ref()
                     .map(|_| ())
                     .map_err(|_| "child terminal cleanup is unconfirmed".to_owned()),
             );
+            #[cfg(not(test))]
+            drop(sent);
+            #[cfg(test)]
+            self.tracker
+                .diagnostic
+                .record("ack_normal_cleanup", 0, 0, cleanup.is_err(), Some(cleanup.is_ok()));
+            #[cfg(test)]
+            self.tracker
+                .diagnostic
+                .record("ack_normal_sender", 0, 0, cleanup.is_err(), Some(sent.is_ok()));
         }
         self.finished = true;
+        #[cfg(test)]
+        if let Some(completion) = &mut self.diagnostic_completion {
+            completion.mark_finished();
+        }
         cleanup.map_err(|error| error.context(CleanupIncomplete))?;
         result
     }
@@ -323,10 +408,17 @@ impl Drop for CleanupScope {
         let parent_ticket = self.parent_ticket.take();
         let retirement_guard = self.retirement_guard.take();
         let cleanup_ack = self.cleanup_ack.take();
+        #[cfg(test)]
+        let diagnostic_completion = self.diagnostic_completion.take();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    #[cfg(test)]
+                    let mut diagnostic_completion = diagnostic_completion;
+                    #[cfg(not(test))]
                     let _retirement_guard = retirement_guard;
+                    #[cfg(test)]
+                    let retirement_guard = retirement_guard;
                     let result = tracker.drain(cleanup_deadline()).await;
                     if result.is_err() {
                         tracing::error!("Interrupted runtime cleanup remains unconfirmed");
@@ -335,16 +427,48 @@ impl Drop for CleanupScope {
                         ticket.finish(result.is_ok());
                     }
                     if let Some(ack) = cleanup_ack {
-                        let _ = ack.send(result.map_err(|_| "child terminal cleanup is unconfirmed".to_owned()));
+                        #[cfg(test)]
+                        tracker
+                            .diagnostic
+                            .record("ack_drop_cleanup", 0, 0, result.is_err(), Some(result.is_ok()));
+                        let sent = ack.send(result.map_err(|_| "child terminal cleanup is unconfirmed".to_owned()));
+                        #[cfg(not(test))]
+                        drop(sent);
+                        #[cfg(test)]
+                        tracker
+                            .diagnostic
+                            .record("ack_drop_sender", 0, 0, false, Some(sent.is_ok()));
+                    }
+                    #[cfg(test)]
+                    {
+                        // Release task-owned resources before signalling its end to the fixture.
+                        drop(retirement_guard);
+                        drop(tracker);
+                        if let Some(completion) = &mut diagnostic_completion {
+                            completion.mark_finished();
+                        }
                     }
                 });
             }
             Err(_) => {
+                #[cfg(test)]
+                let _diagnostic_completion = diagnostic_completion;
                 // Dropping the parent ticket records a failure, not success.
                 tracing::error!("Interrupted runtime cleanup has no runtime to acknowledge writes");
                 if let Some(ack) = cleanup_ack {
-                    let _ = ack.send(Err("child terminal cleanup runtime is unavailable".to_owned()));
+                    #[cfg(test)]
+                    self.tracker
+                        .diagnostic
+                        .record("ack_no_runtime_cleanup", 0, 0, true, Some(false));
+                    let sent = ack.send(Err("child terminal cleanup runtime is unavailable".to_owned()));
+                    #[cfg(not(test))]
+                    drop(sent);
+                    #[cfg(test)]
+                    self.tracker
+                        .diagnostic
+                        .record("ack_no_runtime_sender", 0, 0, true, Some(sent.is_ok()));
                 }
+                drop(parent_ticket);
             }
         }
     }
@@ -352,3 +476,6 @@ impl Drop for CleanupScope {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod diagnostic;

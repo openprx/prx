@@ -59,6 +59,7 @@ impl AttemptAccounting for RouterEmbeddingAccounting {
                 transport_binding: &binding,
                 request_id: &request_id,
                 deadline: self.deadline,
+                remaining_attempts: 1,
             })
             .await?;
         Ok(Box::new(RouterEmbeddingReceipt {

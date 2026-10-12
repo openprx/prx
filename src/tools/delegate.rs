@@ -14,6 +14,29 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::Instrument as _;
+
+// Keep the measured owned suspension fields off the caller's poll frame.
+// Construct inside this synchronous boundary and erase the concrete poll type.
+#[inline(never)]
+fn boxed_delegate_field<'a, F>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>>
+where
+    F: std::future::Future + Send + 'a,
+{
+    Box::pin(make())
+}
+
+#[inline(never)]
+fn try_boxed_delegate_field<'a, F>(
+    make: impl FnOnce() -> anyhow::Result<F>,
+) -> anyhow::Result<std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>>>
+where
+    F: std::future::Future + Send + 'a,
+{
+    Ok(Box::pin(make()?))
+}
 
 #[expect(
     clippy::large_enum_variant,
@@ -70,7 +93,7 @@ pub struct DelegateTool {
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
     /// Model-aware compaction resolver inherited from root config.
-    compaction_resolver: CompactionResolver,
+    compaction_resolver: Arc<CompactionResolver>,
     /// Shared memory fabric backend for normalized delegation events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -102,6 +125,19 @@ impl DelegateScope {
             config_generation_id: context.envelope.config_generation_id,
             config_source_revision: context.envelope.config_source_revision.clone(),
         }
+    }
+}
+
+// Only a typed unsupported-provider refusal is an operational tool failure.
+// Credential, route, generation and authority errors keep their original Result.
+fn delegate_provider_failure(error: anyhow::Error) -> anyhow::Result<ToolResult> {
+    match error.downcast_ref::<providers::catalog::ResolutionError>() {
+        Some(refusal @ providers::catalog::ResolutionError::UnknownProvider { .. }) => Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(refusal.to_string()),
+        }),
+        _ => Err(error),
     }
 }
 
@@ -234,7 +270,9 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: CompactionResolver::from_base(crate::config::AgentCompactionConfig::default()),
+            compaction_resolver: Arc::new(CompactionResolver::from_base(
+                crate::config::AgentCompactionConfig::default(),
+            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -273,7 +311,9 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: CompactionResolver::from_base(crate::config::AgentCompactionConfig::default()),
+            compaction_resolver: Arc::new(CompactionResolver::from_base(
+                crate::config::AgentCompactionConfig::default(),
+            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -376,10 +416,11 @@ impl DelegateTool {
 
     /// Attach model-aware compaction resolution for agentic sub-agent loops.
     pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = resolver;
+        self.compaction_resolver = Arc::new(resolver);
         self
     }
 
+    #[cfg(test)]
     fn resolve_child_compaction(
         &self,
         provider: &str,
@@ -490,6 +531,8 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        #[cfg(all(test, unix))]
+        delegate_diagnostic::phase("delegate-body.json");
         let child_grant = crate::runtime::child_source::outgoing_grant();
         let caller = crate::tools::execution::current_child_call_context();
         if let Some(caller) = caller.as_ref() {
@@ -558,10 +601,13 @@ impl Tool for DelegateTool {
         if let (Some(publication), Some(caller)) = (ordinary_publication, caller.as_ref()) {
             publication.verify_caller(caller.context())?;
         }
-        anyhow::ensure!(
-            child_grant.is_some() || ordinary_publication.is_some(),
-            "delegation requires an admitted parent source"
-        );
+        if child_grant.is_none() && ordinary_publication.is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("delegation requires an admitted parent source".into()),
+            });
+        }
         let security = match child_grant.as_ref() {
             Some(grant) => grant.security(),
             None => ordinary_publication
@@ -640,7 +686,7 @@ impl Tool for DelegateTool {
             .unwrap_or_else(|| agent_config.provider.clone());
         let mut effective_model = model_override.clone().unwrap_or_else(|| agent_config.model.clone());
 
-        let child_binding = {
+        let child_binding_result = {
             let config = child_config;
 
             let owns_provider =
@@ -671,7 +717,7 @@ impl Tool for DelegateTool {
                     &effective_provider,
                     &effective_model,
                     credential,
-                )?,
+                ),
                 None => crate::runtime::child_source::ChildProviderBinding::build_ordinary(
                     config,
                     &self.model_catalog,
@@ -679,8 +725,12 @@ impl Tool for DelegateTool {
                     &effective_model,
                     credential,
                     ordinary_publication,
-                )?,
+                ),
             }
+        };
+        let child_binding = match child_binding_result {
+            Ok(binding) => binding,
+            Err(error) => return delegate_provider_failure(error),
         };
         effective_provider = child_binding.provider_name().to_owned();
         effective_model = child_binding.model().to_owned();
@@ -719,23 +769,27 @@ impl Tool for DelegateTool {
                 caller.as_ref(),
             )?;
         }
-        let source_receipt = crate::runtime::child_source::record_child_input(
-            &memory_fabric,
-            event_scope.clone(),
-            &full_prompt,
-            Some(format!("delegate:{delegate_run_id}:request")),
-            Some(
-                json!({
-                    "agent": agent_name,
-                    "provider": display_provider,
-                    "model": effective_model,
-                    "agentic": agent_config.agentic,
-                    "has_context": !context.is_empty()
-                })
-                .to_string(),
-            ),
-            child_grant.as_deref(),
-        )
+        // Box the measured owned input-recording future at its construction boundary.
+        // The parent retains cancellation ownership and awaits it in the same position.
+        let source_receipt = boxed_delegate_field(|| {
+            crate::runtime::child_source::record_child_input(
+                &memory_fabric,
+                event_scope.clone(),
+                &full_prompt,
+                Some(format!("delegate:{delegate_run_id}:request")),
+                Some(
+                    json!({
+                        "agent": agent_name,
+                        "provider": display_provider,
+                        "model": effective_model,
+                        "agentic": agent_config.agentic,
+                        "has_context": !context.is_empty()
+                    })
+                    .to_string(),
+                ),
+                child_grant.as_deref(),
+            )
+        })
         .await?;
         record_delegate_task_event(
             &memory_fabric,
@@ -793,17 +847,15 @@ impl Tool for DelegateTool {
         // Every model call belongs to the admitted shared child turn, including
         // non-agentic children. Their G7 constraints forbid tool execution.
         let execution = self
-            .execute_tool_loop(
-                agent_name,
-                agent_config,
-                &effective_provider,
-                &effective_model,
-                &*provider,
-                &full_prompt,
+            .spawn_delegate_loop(DelegateTaskRequest {
+                agent_name: agent_name.to_owned(),
+                effective_provider: effective_provider.clone(),
+                effective_model: effective_model.clone(),
+                provider,
+                full_prompt,
                 temperature,
-                scope.as_ref(),
-                Some(child_source),
-            )
+                child_source,
+            })
             .await?;
         anyhow::ensure!(
             execution.child_terminal_committed || (!execution.result.success && execution.trace.is_none()),
@@ -814,7 +866,7 @@ impl Tool for DelegateTool {
         let tool_result = execution.result;
         {
             let result = Ok(tool_result.clone());
-            record_delegate_result_event(&memory_fabric, event_scope.clone(), &result).await;
+            boxed_delegate_field(|| record_delegate_result_event(&memory_fabric, event_scope.clone(), &result)).await;
             record_delegate_terminal_task_event(
                 &memory_fabric,
                 event_scope,
@@ -939,7 +991,258 @@ async fn record_delegate_terminal_task_event(
     .await;
 }
 
+// Only shared immutable resource handles cross the task boundary. All turn
+// state, admission, cancellation and cleanup ownership move into the task.
+struct DelegateTaskRequest {
+    agent_name: String,
+    effective_provider: String,
+    effective_model: String,
+    provider: Arc<dyn Provider>,
+    full_prompt: String,
+    temperature: f64,
+    child_source: DelegateChildSource,
+}
+
+struct DelegateLoopRequest<'a> {
+    agent_name: &'a str,
+    agent_config: &'a DelegateAgentConfig,
+    effective_provider: &'a str,
+    effective_model: &'a str,
+    provider: &'a dyn Provider,
+    full_prompt: &'a str,
+    temperature: f64,
+    scope: Option<&'a DelegateScope>,
+    child_source: Option<DelegateChildSource>,
+    task_context: Option<DelegateTaskContext>,
+}
+
+struct DelegateLoopResources {
+    security: Arc<SecurityPolicy>,
+    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    compaction_resolver: Arc<CompactionResolver>,
+}
+
+struct DelegateTaskContext {
+    cancellation: tokio_util::sync::CancellationToken,
+    cleanup_owner: Option<Arc<crate::runtime::turn_cleanup::CleanupTracker>>,
+    // Drop the cleanup owner before its acknowledgement receiver, as before.
+    loop_cleanup: crate::runtime::turn_cleanup::CleanupScope,
+    cleanup_confirmed: tokio::sync::oneshot::Receiver<Result<(), String>>,
+}
+
+impl DelegateTaskContext {
+    fn new() -> anyhow::Result<Self> {
+        let cleanup_owner = crate::runtime::turn_cleanup::current_tracker();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (cleanup_ack, cleanup_confirmed) = tokio::sync::oneshot::channel();
+        let loop_cleanup =
+            crate::runtime::turn_cleanup::CleanupScope::new(cleanup_owner.as_ref(), cancellation.clone())?
+                .with_acknowledgement(Some(cleanup_ack));
+        Ok(Self {
+            cancellation,
+            cleanup_owner,
+            loop_cleanup,
+            cleanup_confirmed,
+        })
+    }
+}
+
+struct DelegateTask(tokio::task::JoinHandle<anyhow::Result<DelegateAgenticExecution>>);
+
+impl Drop for DelegateTask {
+    fn drop(&mut self) {
+        // Abort is a request, not cleanup confirmation. The moved CleanupScope
+        // retains the parent's ticket until its existing owned drain finishes.
+        self.0.abort();
+    }
+}
+
 impl DelegateTool {
+    fn loop_resources(&self) -> DelegateLoopResources {
+        DelegateLoopResources {
+            security: Arc::clone(&self.security),
+            parent_tools: Arc::clone(&self.parent_tools),
+            compaction_resolver: Arc::clone(&self.compaction_resolver),
+        }
+    }
+
+    async fn spawn_delegate_loop(&self, request: DelegateTaskRequest) -> anyhow::Result<DelegateAgenticExecution> {
+        let DelegateTaskRequest {
+            agent_name,
+            effective_provider,
+            effective_model,
+            provider,
+            full_prompt,
+            temperature,
+            child_source,
+        } = request;
+        let resources = self.loop_resources();
+        let config = match &child_source.authority {
+            DelegateChildAuthority::Granted(grant) => Arc::clone(&grant.generation().effective),
+            DelegateChildAuthority::Ordinary { publication, .. } => Arc::clone(&publication.generation().effective),
+        };
+        // Register before spawn: even cancellation before the first poll keeps
+        // the child represented in the parent's cleanup tracker.
+        let task_context = DelegateTaskContext::new()?;
+        let owner = Arc::clone(
+            task_context
+                .cleanup_owner
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("delegate child cleanup owner missing"))?,
+        );
+        // Carry lineage and restriction metadata, never the parent's mutable
+        // terminal collector or incoming/outgoing execution authority.
+        let spawn_metadata = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+            .try_with(|parent| {
+                let mut metadata = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                    parent.run_id.clone(),
+                    parent.session_scope_key.clone(),
+                )
+                .with_channel_excluded_tools(parent.channel_excluded_tools.clone());
+                metadata.spawn_depth = parent.spawn_depth;
+                metadata.is_turn_root = parent.is_turn_root;
+                metadata.owner_id = parent.owner_id.clone();
+                metadata.topic_id = parent.topic_id.clone();
+                metadata.source_message_event_id = parent.source_message_event_id.clone();
+                metadata
+            })
+            .ok();
+        let parent_work = crate::runtime::registry::current_work_id();
+        let progress = crate::agent::idle::current_beat();
+        let span = tracing::debug_span!("delegate_child_segment");
+        let work = async move {
+            owner
+                .scope(async move {
+                    let agent_config = config
+                        .agents
+                        .get(&agent_name)
+                        .ok_or_else(|| anyhow::anyhow!("delegate admitted agent configuration missing"))?;
+                    resources
+                        .boxed_delegate_loop(DelegateLoopRequest {
+                            agent_name: &agent_name,
+                            agent_config,
+                            effective_provider: &effective_provider,
+                            effective_model: &effective_model,
+                            provider: provider.as_ref(),
+                            full_prompt: &full_prompt,
+                            temperature,
+                            scope: None,
+                            child_source: Some(child_source),
+                            task_context: Some(task_context),
+                        })
+                        .await
+                })
+                .await
+        }
+        .instrument(span);
+        let work = async move {
+            let work = async move {
+                match spawn_metadata {
+                    Some(metadata) => {
+                        crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                            .scope(metadata, work)
+                            .await
+                    }
+                    None => work.await,
+                }
+            };
+            let work = crate::agent::idle::scope_beat(progress, work);
+            match parent_work {
+                Some(id) => crate::runtime::registry::scope_current(id, work).await,
+                None => work.await,
+            }
+        };
+        #[cfg(all(test, unix))]
+        let work = delegate_diagnostic::inherit(work);
+        let mut task = DelegateTask(tokio::spawn(work));
+        match (&mut task.0).await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(anyhow::Error::new(error).context(crate::runtime::turn_cleanup::CleanupIncomplete)),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn boxed_delegate_loop(
+        &self,
+        agent_name: &str,
+        agent_config: &DelegateAgentConfig,
+        effective_provider: &str,
+        effective_model: &str,
+        provider: &dyn Provider,
+        full_prompt: &str,
+        temperature: f64,
+        scope: Option<&DelegateScope>,
+        child_source: Option<DelegateChildSource>,
+    ) -> anyhow::Result<DelegateAgenticExecution> {
+        self.loop_resources()
+            .boxed_delegate_loop(DelegateLoopRequest {
+                agent_name,
+                agent_config,
+                effective_provider,
+                effective_model,
+                provider,
+                full_prompt,
+                temperature,
+                scope,
+                child_source,
+                task_context: None,
+            })
+            .await
+    }
+}
+
+impl DelegateLoopResources {
+    fn resolve_child_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::router::context::EffectiveCompactionConfig {
+        self.compaction_resolver.resolve(provider, model)
+    }
+
+    #[inline(never)]
+    fn boxed_delegate_loop<'a>(
+        &'a self,
+        request: DelegateLoopRequest<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<DelegateAgenticExecution>> + 'a>> {
+        let DelegateLoopRequest {
+            agent_name,
+            agent_config,
+            effective_provider,
+            effective_model,
+            provider,
+            full_prompt,
+            temperature,
+            scope,
+            child_source,
+            task_context,
+        } = request;
+        // Return the owned child state before its first poll. This changes no
+        // authority, cancellation, cleanup or terminal-settlement boundary.
+        let make = move || {
+            self.execute_tool_loop(
+                agent_name,
+                agent_config,
+                effective_provider,
+                effective_model,
+                provider,
+                full_prompt,
+                temperature,
+                scope,
+                child_source,
+                task_context,
+            )
+        };
+        #[cfg(all(test, unix))]
+        delegate_diagnostic::future_layout("child-future-layout.json", &make);
+        let work = Box::pin(make());
+        #[cfg(all(test, unix))]
+        delegate_diagnostic::phase("child-constructor-returned.json");
+        work
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_tool_loop(
         &self,
@@ -952,7 +1255,10 @@ impl DelegateTool {
         temperature: f64,
         _scope: Option<&DelegateScope>,
         child_source: Option<DelegateChildSource>,
+        task_context: Option<DelegateTaskContext>,
     ) -> anyhow::Result<DelegateAgenticExecution> {
+        #[cfg(all(test, unix))]
+        delegate_diagnostic::phase("child-body-entered.json");
         let security = match child_source.as_ref().map(|source| &source.authority) {
             Some(DelegateChildAuthority::Ordinary { publication, .. }) => Arc::clone(publication.security()),
             Some(DelegateChildAuthority::Granted(grant)) => Arc::clone(grant.security()),
@@ -1146,12 +1452,15 @@ impl DelegateTool {
         );
 
         let registry = Arc::new(sub_tools);
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let cleanup_owner = crate::runtime::turn_cleanup::current_tracker();
-        let (cleanup_ack, cleanup_confirmed) = tokio::sync::oneshot::channel();
-        let loop_cleanup =
-            crate::runtime::turn_cleanup::CleanupScope::new(cleanup_owner.as_ref(), cancellation.clone())?
-                .with_acknowledgement(Some(cleanup_ack));
+        let DelegateTaskContext {
+            cancellation,
+            cleanup_owner,
+            loop_cleanup,
+            cleanup_confirmed,
+        } = match task_context {
+            Some(context) => context,
+            None => DelegateTaskContext::new()?,
+        };
         let (mut child_turn, child_config) = {
             let source = child_source;
             let allowed_tools = (!inherit_all).then(|| {
@@ -1186,19 +1495,22 @@ impl DelegateTool {
                     (service, Arc::clone(&publication.generation().effective))
                 }
             };
-            let turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
-                service,
-                (source.proof, source.execution),
-                source.fabric,
-                Arc::clone(&config),
-                cleanup_owner
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("delegate child cleanup owner missing"))?,
-                &cancellation,
-                None,
-            )
-            .await?
-            .with_child_cleanup(cleanup_confirmed);
+            let admitted = try_boxed_delegate_field(|| {
+                Ok(crate::runtime::child_turn::ChildSegmentTurn::admit(
+                    service,
+                    (source.proof, source.execution),
+                    source.fabric,
+                    Arc::clone(&config),
+                    cleanup_owner
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("delegate child cleanup owner missing"))?,
+                    &cancellation,
+                    None,
+                ))
+            })?
+            .await?;
+            // Drop the admission future before attaching its cleanup receiver.
+            let turn = admitted.with_child_cleanup(cleanup_confirmed);
             (turn, config)
         };
         let mut history = Vec::new();
@@ -1285,16 +1597,17 @@ impl DelegateTool {
         let result = match result {
             Ok((outcome, trace)) => {
                 child_turn.project_history(history.len());
-                child_turn.complete(&outcome, &trace).await?;
+                boxed_delegate_field(|| child_turn.complete(&outcome, &trace)).await?;
                 Ok((outcome.into_text(), trace))
             }
             Err(error) => {
-                child_turn
-                    .fail(
+                boxed_delegate_field(|| {
+                    child_turn.fail(
                         &error,
                         cancellation.is_cancelled() || crate::agent::turn_contracts::is_tool_loop_cancelled(&error),
                     )
-                    .await?;
+                })
+                .await?;
                 if error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>() {
                     return Err(error);
                 }
@@ -1536,6 +1849,72 @@ impl Observer for NoopObserver {
 #[cfg(all(test, unix))]
 #[path = "delegate_diagnostic.rs"]
 mod delegate_diagnostic;
+
+#[cfg(test)]
+mod task_boundary_tests {
+    use super::{DelegateTask, DelegateTaskContext};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn abort_before_first_poll_retains_parent_cleanup_until_drain() {
+        let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        owner
+            .scope(async {
+                let context = DelegateTaskContext::new().expect("child task context");
+                let entered_child = Arc::clone(&entered);
+                let task = DelegateTask(tokio::spawn(async move {
+                    let _context = context;
+                    entered_child.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending().await
+                }));
+                // This current-thread test has not yielded since spawn.
+                drop(task);
+                owner
+                    .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                    .await
+                    .expect("aborted unpolled child cleanup acknowledged");
+            })
+            .await;
+        assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn abort_pending_child_drops_work_before_cleanup_confirmation() {
+        struct WorkDropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for WorkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        owner
+            .scope(async {
+                let context = DelegateTaskContext::new().expect("child task context");
+                let work_dropped = WorkDropped(Arc::clone(&dropped));
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let task = DelegateTask(tokio::spawn(async move {
+                    context
+                        .loop_cleanup
+                        .run(async move {
+                            let _work_dropped = work_dropped;
+                            entered.send(()).expect("parent remains waiting");
+                            std::future::pending().await
+                        })
+                        .await
+                }));
+                started.await.expect("child was polled");
+                drop(task);
+                owner
+                    .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                    .await
+                    .expect("aborted polled child cleanup acknowledged");
+            })
+            .await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
 
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
@@ -1809,7 +2188,7 @@ mod tests {
     #[test]
     fn description_not_empty() {
         let tool = DelegateTool::new(sample_agents(), test_security());
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -1961,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_context_is_prepended_to_prompt() {
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["dynamic_alias".to_owned()],
             vec![Arc::new(DynamicAliasTool)],
             "dynamic_alias",
@@ -2210,7 +2589,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_empty_context_omits_prefix() {
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["dynamic_alias".to_owned()],
             vec![Arc::new(DynamicAliasTool)],
             "dynamic_alias",
@@ -2297,8 +2676,13 @@ mod tests {
             self.inner.categories()
         }
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            #[cfg(unix)]
+            super::delegate_diagnostic::phase("captor-entered.json");
             self.executions.fetch_add(1, Ordering::SeqCst);
-            let result = self.inner.execute(args).await?;
+            let make = || self.inner.execute(args);
+            #[cfg(unix)]
+            super::delegate_diagnostic::future_layout("delegate-trait-future-layout.json", &make);
+            let result = make().await?;
             *self.result.lock() = Some(result.clone());
             Ok(result)
         }
@@ -2338,6 +2722,47 @@ mod tests {
         }
     }
 
+    struct NativeDelegateParentProvider {
+        arguments: serde_json::Value,
+    }
+
+    #[async_trait]
+    impl Provider for NativeDelegateParentProvider {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            anyhow::bail!("fixture must use the shared parent tool loop")
+        }
+        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            if request.messages.iter().any(|message| {
+                message.role == "tool"
+                    || (message.role == "user"
+                        && message
+                            .content
+                            .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX))
+            }) {
+                return Ok(ChatResponse {
+                    text: Some("parent complete".to_owned()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![crate::providers::traits::ToolCall {
+                    id: "prx-parent-delegate".to_owned(),
+                    name: "delegate".to_owned(),
+                    arguments: self.arguments.to_string(),
+                }],
+                reasoning_content: None,
+            })
+        }
+    }
+
     struct DelegateFixtureServer(tokio::task::JoinHandle<()>);
     impl Drop for DelegateFixtureServer {
         fn drop(&mut self) {
@@ -2370,26 +2795,28 @@ mod tests {
                         .expect("delegate fixture cleanup owner");
                 let mut observed = None;
                 let drained = cleanup
-                    .run(async {
+                    .run(boxed_delegate_observation(|| async {
                         observed = Some(
                             CONFIGURED_DELEGATE_ENDPOINT
                                 .scope(
                                     endpoint,
-                                    std::panic::AssertUnwindSafe(run_admitted_delegate_fixture(
-                                        allowed_tools,
-                                        parent_tools,
-                                        tool_name,
-                                        arguments,
-                                        provider_error,
-                                        custom_userinfo,
-                                        context,
-                                    ))
+                                    std::panic::AssertUnwindSafe(boxed_delegate_observation(|| {
+                                        run_admitted_delegate_fixture(
+                                            allowed_tools,
+                                            parent_tools,
+                                            tool_name,
+                                            arguments,
+                                            provider_error,
+                                            custom_userinfo,
+                                            context,
+                                        )
+                                    }))
                                     .catch_unwind(),
                                 )
                                 .await,
                         );
                         Ok(())
-                    })
+                    }))
                     .await;
                 match observed {
                     Some(Err(panic)) => std::panic::resume_unwind(panic),
@@ -2484,9 +2911,30 @@ mod tests {
             "ollama".to_owned()
         };
         agent.model = "prx-local-model".to_owned();
+        if custom_userinfo {
+            config.providers.models.push(
+                serde_json::from_value(json!({
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "operations": ["chat"],
+                    "native_tools": true,
+                }))
+                .expect("custom child fixture model descriptor"),
+            );
+        }
+        if !custom_userinfo {
+            // The local Ollama fixture owns one root connection: key and URL
+            // must resolve together, not mix an agent key with a root URL.
+            config.api_key = agent.api_key.take();
+        }
+        let fixture_price_key = if custom_userinfo {
+            format!("{}/{}", agent.provider, agent.model)
+        } else {
+            "prx-local-model".to_owned()
+        };
         config.agents.insert("tester".to_owned(), agent);
         config.cost.prices.insert(
-            "prx-local-model".to_owned(),
+            fixture_price_key,
             crate::config::schema::ModelPricing {
                 input: 1.0,
                 output: 1.0,
@@ -2500,13 +2948,13 @@ mod tests {
         )
         .with_parent_tools(Arc::new(parent_tools));
         use futures::FutureExt as _;
-        let result = std::panic::AssertUnwindSafe(dispatch_admitted_delegate(
-            config,
-            delegate,
-            json!({"agent":"tester", "prompt":tool_name, "context":context}),
-        ))
-        .catch_unwind()
-        .await;
+        let mut arguments = json!({"agent":"tester", "prompt":tool_name});
+        if let Some(context) = context {
+            arguments["context"] = json!(context);
+        }
+        let result = std::panic::AssertUnwindSafe(dispatch_admitted_delegate(config, delegate, arguments))
+            .catch_unwind()
+            .await;
         server.0.abort();
         let _ = (&mut server.0).await;
         let requests = requests.lock().clone();
@@ -2541,7 +2989,7 @@ mod tests {
     fn boxed_delegate_observation<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = (Option<ToolResult>, usize, Vec<ChatMessage>)>,
+        Fut: std::future::Future,
     {
         Box::pin(make_work())
     }
@@ -2570,8 +3018,21 @@ mod tests {
             }));
             let registry = crate::agent::test_admission::registry_with_search(tools);
             let input = format!("delegate {}", arguments["prompt"].as_str().unwrap_or_default());
-            let parent_provider = DelegateParentProvider { arguments };
             let configured_endpoint = CONFIGURED_DELEGATE_ENDPOINT.try_with(Clone::clone).ok();
+            let parent_provider: Box<dyn Provider> = if configured_endpoint.is_some() {
+                Box::new(NativeDelegateParentProvider { arguments })
+            } else {
+                Box::new(DelegateParentProvider { arguments })
+            };
+            #[cfg(unix)]
+            let dispatch_audit = (configured_endpoint.is_some() && super::delegate_diagnostic::active())
+                .then(|| Arc::new(super::delegate_diagnostic::DispatchAudit::default()));
+            #[cfg(unix)]
+            let audit_sink = dispatch_audit
+                .as_ref()
+                .map(|audit| Arc::clone(audit) as Arc<dyn crate::tools::execution::ToolExecutionAuditSink>);
+            #[cfg(not(unix))]
+            let audit_sink = None;
             let admitted = if let Some(endpoint) = configured_endpoint.as_deref() {
                 assert!(
                     channel.is_none() && memory.is_none(),
@@ -2582,7 +3043,8 @@ mod tests {
                     &input,
                     Arc::clone(&registry),
                     endpoint,
-                    &parent_provider,
+                    parent_provider.as_ref(),
+                    audit_sink,
                 )
                 .await
             } else {
@@ -2617,6 +3079,15 @@ mod tests {
             if super::delegate_diagnostic::active() {
                 super::delegate_diagnostic::admission(admitted.decision().context, parent_provider.capabilities());
             }
+            if configured_endpoint.is_some() {
+                assert!(
+                    matches!(
+                        admitted.decision().context.directive(),
+                        crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
+                    ),
+                    "configured parent must receive actual issued delegation"
+                );
+            }
             let mut history = vec![crate::providers::ChatMessage::user(input)];
             let hooks = HookManager::new(workspace);
             let multimodal = crate::config::MultimodalConfig::default();
@@ -2640,7 +3111,7 @@ mod tests {
                         decision: admitted.decision(),
                     },
                     crate::agent::turn_request::TurnServices {
-                        provider: &parent_provider,
+                        provider: parent_provider.as_ref(),
                         provider_name: "ollama",
                         model: "prx-local-model",
                         temperature: 0.0,
@@ -2667,7 +3138,13 @@ mod tests {
                     Ok(Err(_)) => "engine_error",
                     Ok(Ok(_)) => "engine_success",
                 };
-                super::delegate_diagnostic::outcome(kind, executions.load(Ordering::SeqCst), captured.lock().is_some());
+                super::delegate_diagnostic::outcome(
+                    kind,
+                    executions.load(Ordering::SeqCst),
+                    captured.lock().is_some(),
+                    &admitted.decision().context.terminal_execution_trace(),
+                    dispatch_audit.as_deref(),
+                );
             }
             if configured_endpoint.is_some() {
                 let _ = admitted.decision().context.terminal_execution_trace();
@@ -2743,7 +3220,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
 
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["dynamic_alias".to_owned()],
             vec![Arc::new(DynamicAliasTool)],
             "dynamic_alias",
@@ -2775,12 +3252,13 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_inherits_parent_tools_only_with_explicit_wildcard() {
         let executions = Arc::new(AtomicUsize::new(0));
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["*".to_owned()],
             vec![
                 Arc::new(EchoTool {
                     executions: Arc::clone(&executions),
                 }),
+                Arc::new(crate::tools::capability::search_tool::CapabilitySearchTool),
                 Arc::new(DelegateTool::new(HashMap::new(), test_security())),
             ],
             "echo_tool",
@@ -2809,7 +3287,7 @@ mod tests {
         let provider = OneToolThenFinalProvider;
 
         let result = tool
-            .execute_tool_loop(
+            .boxed_delegate_loop(
                 "agentic",
                 &config,
                 "openrouter",
@@ -2837,7 +3315,7 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let executions = Arc::new(AtomicUsize::new(0));
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["echo_tool".to_owned()],
             vec![
                 Arc::new(EchoTool {
@@ -2887,7 +3365,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_tool_loop(
+            .boxed_delegate_loop(
                 "agentic",
                 &config,
                 "openrouter",
@@ -2915,7 +3393,7 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_propagates_provider_errors() {
         let executions = Arc::new(AtomicUsize::new(0));
-        let (result, requests) = run_admitted_delegate_fixture(
+        let (result, requests) = run_configured_delegate_fixture(
             vec!["echo_tool".to_owned()],
             vec![Arc::new(EchoTool {
                 executions: Arc::clone(&executions),
@@ -3419,7 +3897,8 @@ mod credential_containment_tests {
         assert!(
             providers::scoped_reliability(&tool.reliability, &different)
                 .api_keys
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
 
         // On the wire.
@@ -3673,5 +4152,92 @@ mod credential_containment_tests {
         // The workspace, the SQLite memory and the provider runtime dir are
         // all this temp dir.
         assert_nothing_under_persists_the_probe_secret(temp.path());
+    }
+}
+
+#[cfg(test)]
+mod result_contract_tests {
+    use super::{DelegateTool, delegate_provider_failure};
+    use crate::providers::catalog::ResolutionError;
+    use crate::security::SecurityPolicy;
+    use crate::tools::traits::Tool;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn missing_parent_returns_unsuccessful_result() -> anyhow::Result<()> {
+        let delegate = DelegateTool::new(HashMap::new(), Arc::new(SecurityPolicy::default()));
+        let result = delegate
+            .execute(serde_json::json!({"agent": "prx_agent", "prompt": "task"}))
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.is_empty(), "refused delegation produces no output");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("delegation requires an admitted parent source")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_provider_returns_unsuccessful_result() -> anyhow::Result<()> {
+        let refusal = ResolutionError::UnknownProvider {
+            provider: "prx_unsupported".into(),
+        };
+        let expected = refusal.to_string();
+        let result = delegate_provider_failure(refusal.into())?;
+        assert!(!result.success);
+        assert!(result.output.is_empty(), "refused delegation produces no output");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_and_selection_errors_preserve_typed_failure() {
+        let errors = [
+            ResolutionError::CredentialOwnerMismatch {
+                provider: "prx_provider".into(),
+                reference: "profile:prx_profile".into(),
+            },
+            ResolutionError::CredentialMissing {
+                provider: "prx_provider".into(),
+                reference: "profile:prx_profile".into(),
+            },
+            ResolutionError::CredentialRequired {
+                provider: "prx_provider".into(),
+            },
+            ResolutionError::CredentialLookup {
+                provider: "prx_provider".into(),
+                reason: "unavailable".into(),
+            },
+            ResolutionError::UnknownRouteHint {
+                provider: "prx_provider".into(),
+                hint: "prx_route".into(),
+                configured: String::new(),
+            },
+            ResolutionError::ModelIncompatible {
+                provider: "prx_provider".into(),
+                model: "prx_model".into(),
+                detail: "incompatible".into(),
+            },
+        ];
+        for refusal in errors {
+            let actual = delegate_provider_failure(refusal.clone().into());
+            assert!(matches!(actual, Err(error) if error.downcast_ref::<ResolutionError>() == Some(&refusal)));
+        }
+    }
+
+    #[test]
+    fn opaque_integrity_and_factory_errors_remain_errors() {
+        for message in [
+            "delegate caller authority mismatch",
+            "ordinary child requires disabled decision plane",
+            "worker provider or credential provenance differs from issued selection",
+            "provider 'prx_provider' is not one PRX can construct",
+            "provider factory construction failed",
+        ] {
+            let actual = delegate_provider_failure(anyhow::anyhow!(message));
+            assert!(matches!(actual, Err(error) if error.to_string() == message));
+        }
     }
 }

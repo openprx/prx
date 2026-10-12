@@ -202,7 +202,10 @@ mod tests {
             description: "Read a file".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        assert!(render_hardware_access_guidance(&ordinary).is_empty());
+        assert!(
+            render_hardware_access_guidance(&ordinary).is_empty(),
+            "expected an empty value"
+        );
 
         let hardware = vec![ToolSpec {
             name: "gpio_read".to_string(),

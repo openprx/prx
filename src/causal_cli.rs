@@ -1082,6 +1082,188 @@ async fn execute(admin: &DecisionAdmin, json: bool, command: CausalReadCommands,
 mod tests {
     use super::*;
 
+    // Exercise the production admin accounting entry under its real cleanup owner.
+    #[tokio::test]
+    async fn admin_accounting_accepts_real_configured_physical_slot() {
+        let workspace = tempfile::tempdir().expect("private admin accounting workspace");
+        let mut config = Config {
+            workspace_dir: workspace.path().to_owned(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
+        config.causal_tree.backend.model = "prx-admin-accounting-model".to_owned();
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider":"custom:http://127.0.0.1:12345",
+                "model":"prx-admin-accounting-model", "operations":["decision_endpoint"]
+            }))
+            .expect("actual decision model declaration"),
+        );
+        config.cost.prices.insert(
+            "custom:http://127.0.0.1:12345/prx-admin-accounting-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
+        let plane = HttpPlane {
+            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                crate::observability::NoopObserver,
+            ))),
+        };
+        use crate::causal_tree::admin::DecisionPlaneBuilder as _;
+        let factory = plane
+            .build(&config, Some(Arc::clone(&key)))
+            .expect("actual configured factory");
+        let slots = factory.status().order;
+        assert!(
+            slots
+                .iter()
+                .any(|slot| slot.identity.kind == BackendKind::CompatibleHttp && slot.identity.provider.is_some()),
+            "factory must contain the physical provider"
+        );
+        assert_eq!(slots.len(), 1, "configured factory status contains one physical slot");
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot.identity.kind != BackendKind::Builtin && slot.identity.provider.is_some()),
+            "builtin fallback is not a physical status slot"
+        );
+        let provider = slots
+            .first()
+            .expect("actual physical slot")
+            .identity
+            .provider
+            .as_ref()
+            .expect("actual physical provider");
+        let effective = crate::router::resolve_effective_compaction_config(
+            &config.agent.compaction,
+            provider.as_str(),
+            &slots.first().expect("actual physical slot").identity.configured_model,
+            &config.router,
+            &config.model_routes,
+        );
+        let expected_tokens = u64::try_from(
+            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(&effective.config)
+                .expect("actual effective decision reservation")
+                .decision_tokens,
+        )
+        .expect("bounded decision reservation");
+        let expected_cost = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
+            &config.cost,
+            &config.workspace_dir,
+            config.autonomy.max_cost_per_day_cents,
+        )
+        .expect("actual remaining cost ceiling");
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("actual admin cleanup owner");
+        cleanup
+            .run(async {
+                let scope = admin_accounting_scope(
+                    &config,
+                    &factory,
+                    key,
+                    b"configured-test",
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(config.causal_tree.policy.extra_latency_budget_ms),
+                )
+                .await?;
+                let allowance = scope.remaining_budgets();
+                assert_eq!(
+                    allowance.tokens, expected_tokens,
+                    "exact effective decision token allowance"
+                );
+                assert!(allowance.tokens > 0, "physical decision retains token allowance");
+                assert_eq!(allowance.micro_usd, expected_cost, "actual remaining cost ceiling");
+                assert!(allowance.micro_usd > 0, "actual remaining-cost ceiling is available");
+                assert!(
+                    allowance.latency_ms <= config.causal_tree.policy.extra_latency_budget_ms,
+                    "elapsed time cannot widen the original latency ceiling"
+                );
+                Ok(())
+            })
+            .await
+            .expect("accounting and cleanup must complete");
+    }
+
+    #[tokio::test]
+    async fn admin_physical_accounting_rejects_builtin_only_factory_without_allowance() {
+        let workspace = tempfile::tempdir().expect("private builtin accounting workspace");
+        let mut config = Config {
+            workspace_dir: workspace.path().to_owned(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(BackendKind::Builtin);
+        let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
+        let plane = HttpPlane {
+            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                crate::observability::NoopObserver,
+            ))),
+        };
+        use crate::causal_tree::admin::DecisionPlaneBuilder as _;
+        let factory = plane
+            .build(&config, Some(Arc::clone(&key)))
+            .expect("actual builtin factory");
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("actual admin cleanup owner");
+        cleanup
+            .run(async {
+                let result = admin_accounting_scope(
+                    &config,
+                    &factory,
+                    key,
+                    b"configured-test",
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(config.causal_tree.policy.extra_latency_budget_ms),
+                )
+                .await;
+                let error = match result {
+                    Ok(_) => panic!("builtin cannot supply physical allowance"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.to_string(), "admin decision allowance unavailable");
+                Ok(())
+            })
+            .await
+            .expect("rejection must still drain cleanup");
+    }
+
+    #[test]
+    fn admin_factory_rejects_undeclared_physical_model_before_accounting() {
+        let workspace = tempfile::tempdir().expect("private selection workspace");
+        let mut config = Config {
+            workspace_dir: workspace.path().to_owned(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
+        config.causal_tree.backend.model = "prx-undeclared-admin-model".to_owned();
+        config.providers.models.clear();
+        let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
+        let plane = HttpPlane {
+            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                crate::observability::NoopObserver,
+            ))),
+        };
+        use crate::causal_tree::admin::DecisionPlaneBuilder as _;
+        assert!(
+            matches!(plane.build(&config, Some(key)), Err(FactoryBuildError::Selection(_))),
+            "unconfigured physical model must fail genuine strict selection"
+        );
+    }
+
     fn apply() -> CausalApplyArgs {
         CausalApplyArgs {
             yes: false,
@@ -1320,3 +1502,7 @@ mod tests {
         assert!(parse_time("yesterday", false).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "causal_cli/backend_transport_tests.rs"]
+mod backend_transport_tests;

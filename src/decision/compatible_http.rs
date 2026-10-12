@@ -347,6 +347,7 @@ impl CompatibleHttpBackend {
         deadline: Instant,
         accounting: Option<&dyn DecisionAttemptAccounting>,
         request_id: &str,
+        remaining_attempts: u8,
     ) -> Result<DecisionResponse, Failure> {
         let started = Instant::now();
         let mut builder = self
@@ -368,6 +369,7 @@ impl CompatibleHttpBackend {
                 guarded_body: body.bytes(),
                 request_id,
                 deadline,
+                remaining_attempts,
             })
             .await?;
         let owner_controls_deadline = receipt.deadline() <= deadline;
@@ -382,9 +384,14 @@ impl CompatibleHttpBackend {
         if Instant::now() >= deadline {
             return Err(DecisionError::BudgetExceeded.into());
         }
+        #[cfg(test)]
+        let mut material_send =
+            crate::causal_tree::decision_engine::original_observation::material::send(request_id, body.bytes());
         let sent = tokio::time::timeout_at(deadline.into(), builder.send())
             .await
             .map_err(|_| Failure::from(deadline_error()))?;
+        #[cfg(test)]
+        material_send.returned();
         let mut response = sent.map_err(|error| Failure::from(transport_class(&error)))?;
         if self.transport == BackendLocality::Loopback
             && !response.remote_addr().is_some_and(|peer| peer.ip().is_loopback())
@@ -497,7 +504,18 @@ impl DecisionBackend for CompatibleHttpBackend {
         let mut retried = false;
         loop {
             match self
-                .attempt(&codec, body, deadline, accounting, request.request_id())
+                .attempt(
+                    &codec,
+                    body,
+                    deadline,
+                    accounting,
+                    request.request_id(),
+                    if !retried && self.locality == BackendLocality::Loopback {
+                        2
+                    } else {
+                        1
+                    },
+                )
                 .await
             {
                 Ok(response) => return Ok(response),

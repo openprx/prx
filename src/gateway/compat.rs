@@ -2378,7 +2378,7 @@ qwIDAQAB\n\
     #[test]
     fn a2a_empty_allow_list_rejects_any_asserted_peer() {
         let config = crate::config::A2aConfig::default();
-        assert!(config.allowed_peer_issuers.is_empty());
+        assert!(config.allowed_peer_issuers.is_empty(), "expected an empty value");
         let mut headers = HeaderMap::new();
         headers.insert("x-spiffe-id", HeaderValue::from_static("spiffe://any/peer"));
         assert!(!peer_issuer_allowed(&headers, &config));
@@ -4666,11 +4666,11 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
     #[tokio::test]
     async fn mcp_sessions_reads_admit_nothing_when_the_caller_carries_no_owner_id() {
         const UNOWNED_RUN_TASK: &str = "prx unowned registry run";
+        const OWNED_RUN_TASK: &str = "prx owned registry run";
 
         let workspace = TempDir::new().expect("test: temp workspace");
         let config = production_mcp_test_config(workspace.path());
         let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
-        let registry = production_sessions_registry(&config, &memory);
         let owner = production_isolation_identity("issuer-a.example", workspace.path());
         // The same authenticated shape, but with a blank owner id: this is what
         // the envelope carries when identity derivation produced no usable
@@ -4689,26 +4689,61 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         )
         .await;
 
-        // An in-process run with no owner at all, registered by the gateway's
-        // own `sessions_spawn` into the registry the read tools share.
-        let spawn = registry
-            .iter()
-            .find(|tool| tool.supports_name("sessions_spawn"))
-            .expect("test: the production registry must publish sessions_spawn");
-        let spawned = spawn
-            .execute(serde_json::json!({
-                "task": UNOWNED_RUN_TASK,
-                "_zc_scope_trusted": true,
-                "_zc_scope": {
-                    "sender": "prx_operator",
-                    "channel": "gateway",
-                    "chat_type": "direct",
-                    "chat_id": "prx_channel",
-                },
+        // Restore explicit historical metadata, including a legacy unowned row
+        // predating owner enforcement. This is not a source-less spawn and gives
+        // neither row a driver or an authority token. Both persist in SQLite and
+        // occupy the production registrar's actual shared runtime registry.
+        let mut rows = Vec::new();
+        for (run_id, task, row_owner) in [
+            ("prx-legacy-unowned", UNOWNED_RUN_TASK, None),
+            ("prx-existing-owned", OWNED_RUN_TASK, Some(owner.prx_owner_id.clone())),
+        ] {
+            use crate::memory::Memory as _;
+            let input: crate::memory::MessageEventInput = serde_json::from_value(serde_json::json!({
+                "workspace_id": workspace.path().to_string_lossy(),
+                "owner_id": row_owner,
+                "source": "sessions_spawn",
+                "channel": "gateway",
+                "session_key": "prx_historical_session",
+                "run_id": run_id,
+                "sender": "prx_fixture",
+                "role": "user",
+                "event_type": "message.user",
+                "visibility": "workspace",
+                "content": task,
             }))
-            .await
-            .expect("test: the spawn must be accepted");
-        assert!(spawned.success, "test: spawn failed: {:?}", spawned.error);
+            .expect("historical persisted row");
+            memory
+                .append_message_event(input)
+                .await
+                .expect("persist historical fixture row");
+            rows.push(crate::tools::sessions_spawn::SubAgentRun {
+                id: run_id.to_owned(),
+                task: task.to_owned(),
+                owner_id: row_owner,
+                topic_id: None,
+                source_message_event_id: None,
+                started_at: chrono::Utc::now(),
+                finished_at: Some(chrono::Utc::now()),
+                status: crate::tools::sessions_spawn::SubAgentStatus::Completed("historical fixture".to_owned()),
+                recipient: None,
+                channel_name: Some("gateway".to_owned()),
+                abort_handle: None,
+                process_control: None,
+                task_control: None,
+                history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: "prx_historical_session".to_owned(),
+                spawn_depth: 0,
+                token_usage_records: Vec::new(),
+                progress: crate::agent::idle::child_beat(),
+                batch_id: None,
+            });
+        }
+        let registry = super::super::legacy_session_fixture::with_rows(workspace.path(), rows, || {
+            production_sessions_registry(&config, &memory)
+        });
 
         let listed = run_sessions_tool_on(
             Arc::clone(&registry),
@@ -4738,6 +4773,10 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         assert!(
             !listed_text.contains("manageable=true"),
             "a run the caller is not admitted to must never be handed back as steerable: {listed_text}"
+        );
+        assert!(
+            !listed_text.contains(OWNED_RUN_TASK),
+            "ownerless caller must not see the owned registry row"
         );
         // ...and not through the recovered projection either. The probe run's
         // lifecycle event is `workspace`-visibility, which SQL admits to every
@@ -4772,6 +4811,20 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             "the refusal must not leak the transcript it withheld: {history_text}"
         );
 
+        for run_id in ["prx-legacy-unowned", "prx-existing-owned"] {
+            let hidden = run_sessions_tool_on(
+                Arc::clone(&registry),
+                &config,
+                &ownerless,
+                "sessions_history",
+                serde_json::json!({"run_id": run_id}),
+            )
+            .await;
+            let text = response_text(&hidden);
+            assert!(hidden.is_error && text.contains("No run found"));
+            assert!(!text.contains(UNOWNED_RUN_TASK) && !text.contains(OWNED_RUN_TASK));
+        }
+
         // Non-vacuity: the probe run really is in the shared registry and in
         // memory. A non-isolated in-process read of the same registry names it,
         // so the assertions above measure the owner boundary and not an empty
@@ -4789,6 +4842,26 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             "sanity: the probe run must actually exist, or every assertion above passes \
              vacuously: {}",
             in_process.output
+        );
+        assert!(in_process.output.contains(OWNED_RUN_TASK));
+        assert!(in_process.output.contains("source=runtime, manageable=true"));
+        let shared: Arc<dyn crate::memory::Memory> = memory.clone();
+        let recovered = crate::tools::sessions_read_model::recover_task_runs(
+            Some(&shared),
+            &workspace.path().to_string_lossy(),
+            &serde_json::json!({}),
+            20,
+        )
+        .await
+        .expect("historical rows recover through the original read model");
+        assert!(
+            recovered
+                .iter()
+                .any(|run| run.run_id == "prx-legacy-unowned" && run.owner_id.is_none())
+        );
+        assert!(
+            recovered.iter().any(|run| run.run_id == "prx-existing-owned"
+                && run.owner_id.as_deref() == Some(owner.prx_owner_id.as_str()))
         );
     }
 
@@ -6260,6 +6333,11 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         }
 
         let workspace = TempDir::new().expect("test: temp workspace");
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let config = production_mcp_test_config(workspace.path());
         let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
         let registry = production_sessions_registry(&config, &memory);
@@ -6754,8 +6832,7 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         let alice_document = document_id(&alice);
         assert!(
             serde_json::from_str::<Value>(&handler_text(&alice))
-                .ok()
-                .is_some_and(|record| record.get("workspace_id").is_none()),
+                .is_ok_and(|record| record.get("workspace_id").is_none()),
             "the record leaves out the adapter's workspace id: {alice}"
         );
         let (status, mallory) = ingest(

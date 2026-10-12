@@ -178,9 +178,9 @@ impl LocalHashEmbedding {
             return;
         };
         let index = usize::try_from(u64::from_le_bytes(index_bytes) % len).unwrap_or(0);
-        let sign = if sign_byte & 1 == 0 { 1.0 } else { -1.0 };
+        let signed_weight = if sign_byte & 1 == 0 { weight } else { -weight };
         if let Some(value) = vector.get_mut(index) {
-            *value += sign * weight;
+            *value += signed_weight;
         }
     }
 
@@ -453,7 +453,7 @@ mod tests {
     async fn noop_embed_returns_empty() {
         let p = NoopEmbedding;
         let result = p.embed(&["hello"]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -580,14 +580,14 @@ mod tests {
     async fn noop_embed_empty_batch() {
         let p = NoopEmbedding;
         let result = p.embed(&[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
     async fn noop_embed_multiple_texts() {
         let p = NoopEmbedding;
         let result = p.embed(&["a", "b", "c"]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 
     #[test]

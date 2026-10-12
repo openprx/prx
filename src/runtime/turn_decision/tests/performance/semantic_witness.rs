@@ -179,7 +179,91 @@ fn question_body(question: &DecisionQuestion) -> Value {
     }
 }
 
-fn component_request(service: &TurnDecisionService, hop: &EngineDecision, ids: &CanonicalIds, model: &str) -> Value {
+#[derive(Clone, Copy)]
+enum ExpectedApprovalMetadata {
+    None,
+    McpCatalog,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedBackend {
+    Builtin,
+    ControlledInventory,
+}
+
+impl ExpectedBackend {
+    fn identity(self) -> BackendIdentity {
+        match self {
+            Self::Builtin => BuiltinDecisionBackend::identity(),
+            Self::ControlledInventory => BackendIdentity {
+                kind: BackendKind::Mock,
+                provider: None,
+                configured_model: Arc::from("prx-local-model"),
+            },
+        }
+    }
+    fn response(self, request: &DecisionRequest) -> Result<DecisionResponse, DecisionError> {
+        if matches!(self, Self::Builtin) {
+            return BuiltinDecisionBackend::answer(request);
+        }
+        // Independent expected-answer oracle for the approved Q14/Q18 fixture.
+        let mut response = BuiltinDecisionBackend::answer(request)?;
+        response.backend = "mock".to_owned();
+        response.resolved_model = "prx-local-model".to_owned();
+        for (id, answer) in &mut response.answers {
+            // Both profiles explicitly name file_read. Favor that scoped
+            // candidate over the unscoped family fallback in controlled answers.
+            let work = id.as_str().starts_with("candidate.use_tool-filesystem-");
+            match answer {
+                DecisionAnswer::Choice(choice) => {
+                    let code = if id == &QuestionId::global(GlobalQuestion::NextAction) {
+                        "use_tool"
+                    } else {
+                        "filesystem"
+                    };
+                    if let Some(chosen) = choice.probabilities.keys().find(|key| key.as_str() == code).cloned() {
+                        for (key, probability) in &mut choice.probabilities {
+                            *probability = Probability::new(if key == &chosen { 1.0 } else { 0.0 })?;
+                        }
+                        choice.chosen = chosen;
+                        choice.confidence = Probability::new(1.0)?;
+                    }
+                }
+                DecisionAnswer::Noul(noul) => {
+                    noul.probability_true = Probability::new(
+                        if id == &QuestionId::global(GlobalQuestion::EvidenceSufficient) || work {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    )?;
+                }
+                DecisionAnswer::Score(score) => {
+                    let gain = id.as_str().ends_with("gain") && (work || !id.as_str().starts_with("candidate."));
+                    let chosen = if gain {
+                        score.distribution.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                    for (index, probability) in score.distribution.iter_mut().enumerate() {
+                        *probability = Probability::new(if index == chosen { 1.0 } else { 0.0 })?;
+                    }
+                    score.expected = f64::from(u32::try_from(chosen).expect("bounded score level"));
+                    score.confidence = Probability::new(1.0)?;
+                }
+            }
+        }
+        Ok(response)
+    }
+}
+
+fn component_request(
+    service: &TurnDecisionService,
+    hop: &EngineDecision,
+    ids: &CanonicalIds,
+    model: &str,
+    expected_backend: ExpectedBackend,
+) -> Value {
     if !hop.request_compiled {
         assert!(hop.audit_trace.is_none());
         return Value::Null;
@@ -269,6 +353,35 @@ fn component_request(service: &TurnDecisionService, hop: &EngineDecision, ids: &
     };
     let component = crate::decision::DecisionResponseValidator::validate(request, response, &validation)
         .expect("actual component response validation");
+    let component = match expected_backend {
+        ExpectedBackend::Builtin => component,
+        ExpectedBackend::ControlledInventory => {
+            for id in request.questions().keys() {
+                assert_eq!(
+                    answer_value(component.answer(id).expect("expected genuine builtin shadow answer")),
+                    answer_value(
+                        hop.prediction
+                            .as_ref()
+                            .expect("prediction")
+                            .builtin_shadow
+                            .answer(id)
+                            .expect("actual shadow answer")
+                    )
+                );
+            }
+            let response = expected_backend.response(request).expect("expected component response");
+            let validation = crate::decision::ValidationContext {
+                received_at: Instant::now(),
+                max_response_bytes: service.generation.effective.causal_tree.backend.max_response_bytes,
+                version_policy: crate::decision::validate::ModelVersionPolicy::ExactPinned(
+                    expected_backend.identity().configured_model,
+                ),
+                local_backend: expected_backend.identity(),
+            };
+            crate::decision::DecisionResponseValidator::validate(request, response, &validation)
+                .expect("actual component response validation")
+        }
+    };
     let original = &hop.prediction.as_ref().expect("original prediction").served;
     let originals: BTreeMap<_, _> = request
         .questions()
@@ -443,6 +556,66 @@ fn assert_record_checksum(connection: &rusqlite::Connection, workspace: &str, ow
 }
 
 pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, context: &TurnDecisionContext) -> Value {
+    capture_expected(
+        service,
+        proof,
+        context,
+        ExpectedBackend::Builtin,
+        ExpectedApprovalMetadata::None,
+    )
+}
+
+pub(super) fn capture_inventory(
+    service: &TurnDecisionService,
+    proof: &AgentTurnProof,
+    context: &TurnDecisionContext,
+) -> Value {
+    assert_eq!(
+        service.generation.effective.causal_tree.evaluation.exploration,
+        crate::causal_tree::config::ExplorationMode::Off
+    );
+    assert_eq!(
+        service.generation.effective.causal_tree.evaluation.exploration_rate,
+        0.0
+    );
+    capture_expected(
+        service,
+        proof,
+        context,
+        ExpectedBackend::ControlledInventory,
+        ExpectedApprovalMetadata::None,
+    )
+}
+
+pub(super) fn capture_mcp_inventory(
+    service: &TurnDecisionService,
+    proof: &AgentTurnProof,
+    context: &TurnDecisionContext,
+) -> Value {
+    assert_eq!(
+        service.generation.effective.causal_tree.evaluation.exploration,
+        crate::causal_tree::config::ExplorationMode::Off
+    );
+    assert_eq!(
+        service.generation.effective.causal_tree.evaluation.exploration_rate,
+        0.0
+    );
+    capture_expected(
+        service,
+        proof,
+        context,
+        ExpectedBackend::ControlledInventory,
+        ExpectedApprovalMetadata::McpCatalog,
+    )
+}
+
+fn capture_expected(
+    service: &TurnDecisionService,
+    proof: &AgentTurnProof,
+    context: &TurnDecisionContext,
+    expected_backend: ExpectedBackend,
+    expected_approval_metadata: ExpectedApprovalMetadata,
+) -> Value {
     let catalog = service.catalog.view(&CatalogScope::default());
     let model = service.resolve_agent_model(proof).expect("actual pinned model");
     let model_ref = format!("{}:{}", model.provider_label(), model.model());
@@ -520,11 +693,55 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
             CandidateSet::NoLegalPath { approval_only, .. } => assert!(approval_only.is_empty()),
         }
         assert!(hop.exploration_propensities.is_empty(), "these fixtures never explore");
-        for candidate in admitted {
+        for candidate in admitted
+            .iter()
+            .filter(|_| matches!(expected_approval_metadata, ExpectedApprovalMetadata::None))
+        {
             assert_eq!(
                 candidate.approval(),
                 &crate::causal_tree::branch::ApprovalRequirement::None
             );
+        }
+        if matches!(expected_approval_metadata, ExpectedApprovalMetadata::McpCatalog) {
+            for candidate in admitted {
+                use crate::causal_tree::branch::ApprovalRequirement;
+                assert!(
+                    !matches!(
+                        candidate.action(),
+                        crate::causal_tree::branch::CausalActionKind::RequestApproval
+                    ),
+                    "no approval terminal in MCP inventory fixture"
+                );
+                match candidate.required_capabilities() {
+                    [] => assert_eq!(candidate.approval(), &ApprovalRequirement::None),
+                    [reference] => {
+                        let entry = catalog.entry_any(&reference.id).expect("exact admitted catalog ref");
+                        assert_eq!(reference.generation, catalog.generation());
+                        assert_eq!(reference.fingerprint, entry.fingerprint);
+                        if entry.root == "mcp_call" {
+                            assert_eq!(
+                                entry.approval,
+                                ApprovalRequirement::Required {
+                                    op_ids: entry.op_ids.clone()
+                                }
+                            );
+                            if entry.public_name == "mcp_call" {
+                                assert!(entry.op_ids.is_empty(), "root operations are argument-scoped");
+                            } else {
+                                assert_eq!(entry.op_ids.len(), 1, "published MCP alias has one exact operation");
+                            }
+                        } else {
+                            assert_eq!(entry.approval, ApprovalRequirement::None);
+                        }
+                        assert_eq!(
+                            candidate.approval(),
+                            &entry.approval,
+                            "exact catalog metadata, never a grant"
+                        );
+                    }
+                    _ => panic!("inventory fixture candidates require at most one original catalog ref"),
+                }
+            }
         }
         raw_bindings.push(json!({"index":index,"decision_id":hop.decision_id.to_string(),
             "catalog_generation":catalog.generation().to_hex(),"state_fingerprint":hop.state.material_fingerprint(&service.state_key),
@@ -545,7 +762,11 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
         assert_eq!(initial.outcomes.get(&selected), Some(&GateOutcome::Passed));
         assert_eq!(hop.pre_commit.outcomes.get(&selected), Some(&GateOutcome::Passed));
         assert_eq!(hop.post_rehearsal.outcomes.get(&selected), Some(&GateOutcome::Passed));
-        if let Some(prediction) = &hop.prediction {
+        if let Some(prediction) = hop
+            .prediction
+            .as_ref()
+            .filter(|_| matches!(expected_backend, ExpectedBackend::Builtin))
+        {
             assert_eq!(
                 prediction.served, prediction.builtin_shadow,
                 "exact builtin-only shadow"
@@ -556,7 +777,7 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
                 prediction.served.claimed_model(),
                 prediction.served.identity().configured_model.as_ref()
             );
-            assert!(!prediction.served.request_id().is_empty());
+            assert!(!prediction.served.request_id().is_empty(), "expected a non-empty value");
             assert_eq!(prediction.served.usage(), &crate::decision::DecisionUsage::default());
             assert!(prediction.served.provider_request_id().is_none() && prediction.served.response_sha256().is_none());
             assert!(hop.request_compiled && hop.scored_count > 0 && hop.audit_trace.is_some());
@@ -568,10 +789,41 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
                 &crate::decision::builtin::BuiltinDecisionBackend::identity()
             );
             assert_eq!(prediction.reason, None);
-            assert!(prediction.attempts.is_empty());
+            assert!(prediction.attempts.is_empty(), "expected an empty value");
             assert_eq!(
                 prediction.fallback_order,
                 vec![crate::decision::builtin::BuiltinDecisionBackend::identity()]
+            );
+            assert!(hop.fallback_cause.is_none());
+        } else if let Some(prediction) = &hop.prediction {
+            assert!(matches!(expected_backend, ExpectedBackend::ControlledInventory));
+            let expected_identity = expected_backend.identity();
+            assert_eq!(prediction.served.identity(), &expected_identity);
+            assert_eq!(prediction.served.claimed_backend(), expected_identity.kind.as_str());
+            assert_eq!(
+                prediction.served.claimed_model(),
+                expected_identity.configured_model.as_ref()
+            );
+            assert!(prediction.served_endpoint.is_none());
+            assert!(!prediction.served.request_id().is_empty(), "expected a non-empty value");
+            assert_eq!(prediction.served.usage(), &crate::decision::DecisionUsage::default());
+            assert!(prediction.served.provider_request_id().is_none() && prediction.served.response_sha256().is_none());
+            assert!(hop.request_compiled && hop.scored_count > 0 && hop.audit_trace.is_some());
+            assert_eq!(prediction.served_locality, BackendLocality::Builtin);
+            assert_eq!(prediction.reason, None);
+            assert_eq!(
+                prediction.builtin_shadow.identity(),
+                &BuiltinDecisionBackend::identity()
+            );
+            assert_eq!(prediction.served_by, ServedBy::Primary);
+            let [attempt] = prediction.attempts.as_slice() else {
+                panic!("exactly one controlled local attempt");
+            };
+            assert_eq!(attempt.identity, expected_identity);
+            assert_eq!(attempt.outcome, crate::decision::factory::AttemptOutcome::Served);
+            assert_eq!(
+                prediction.fallback_order,
+                vec![expected_identity, BuiltinDecisionBackend::identity()]
             );
             assert!(hop.fallback_cause.is_none());
         } else {
@@ -737,7 +989,7 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
             "protocol_version":record.protocol_version,"scorer_version":record.scorer_version,
             "truncated_candidates":[],"approval_scopes":{},"exploration_propensities":{},
             "durable_enabled":row.enabled_snapshot,"durable_directive":row.directive_kind,
-            "component_request":component_request(service,hop,&ids,model.model())}));
+            "component_request":component_request(service,hop,&ids,model.model(),expected_backend)}));
     }
     assert!(
         context
@@ -752,6 +1004,10 @@ pub(super) fn capture(service: &TurnDecisionService, proof: &AgentTurnProof, con
             assert!(catalog.contains(&reference.id));
             let entry = catalog.entry_any(&reference.id).expect("actual retained execution ref");
             assert_eq!(reference.fingerprint, entry.fingerprint);
+            if matches!(expected_approval_metadata, ExpectedApprovalMetadata::McpCatalog) {
+                assert_eq!(entry.public_name, "file_read");
+                assert_eq!(entry.approval, crate::causal_tree::branch::ApprovalRequirement::None);
+            }
             json!({"id":reference.id.as_str(),"fingerprint":format!("{:?}",reference.fingerprint)})
         })
         .collect();

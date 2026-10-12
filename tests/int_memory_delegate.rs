@@ -12,6 +12,12 @@
     clippy::unreadable_literal
 )]
 
+#[path = "support/embedded_agent.rs"]
+mod embedded_agent;
+// Native-only entry is unused in this integration module.
+#[allow(dead_code)]
+#[path = "support/native_agent.rs"]
+mod native_agent;
 use openprx::config::{DelegateAgentConfig, ScopeRule};
 use openprx::memory::snapshot::{export_snapshot, hydrate_from_snapshot};
 use openprx::memory::sqlite::SqliteMemory;
@@ -258,6 +264,131 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
     );
 }
 
+// Obtain configured Delegate authority through a real public Agent turn.
+async fn dispatch_depth_fixture(
+    delegate: DelegateTool,
+    agents: HashMap<String, DelegateAgentConfig>,
+    arguments: serde_json::Value,
+) -> anyhow::Result<openprx::tools::ToolResult> {
+    use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
+    struct Parent(serde_json::Value);
+    #[async_trait::async_trait]
+    impl Provider for Parent {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            anyhow::bail!("depth fixture requires its actual native tool loop")
+        }
+        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            let completed = request.messages.iter().any(|message| message.role == "tool");
+            Ok(ChatResponse {
+                text: completed.then(|| "depth fixture complete".to_owned()),
+                tool_calls: if completed {
+                    Vec::new()
+                } else {
+                    vec![ToolCall {
+                        id: "prx_depth_delegate".to_owned(),
+                        name: "delegate".to_owned(),
+                        arguments: self.0.to_string(),
+                    }]
+                },
+                reasoning_content: None,
+            })
+        }
+    }
+    struct Captured {
+        inner: DelegateTool,
+        result: Arc<parking_lot::Mutex<Option<openprx::tools::ToolResult>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for Captured {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn description(&self) -> &str {
+            self.inner.description()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            self.inner.parameters_schema()
+        }
+        fn tier(&self) -> openprx::tools::traits::ToolTier {
+            self.inner.tier()
+        }
+        fn categories(&self) -> &'static [openprx::tools::traits::ToolCategory] {
+            self.inner.categories()
+        }
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<openprx::tools::ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = self.inner.execute(args).await?;
+            *self.result.lock() = Some(result.clone());
+            Ok(result)
+        }
+    }
+
+    let result = Arc::new(parking_lot::Mutex::new(None));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = Captured {
+        inner: delegate,
+        result: Arc::clone(&result),
+        calls: Arc::clone(&calls),
+    };
+    Box::pin(native_agent::run_delegate(
+        Box::new(Parent(arguments)),
+        agents,
+        |builder, workspace| async move {
+            let capture_path = workspace.path().join("delegate-depth-observation.json");
+            let mut agent =
+                embedded_agent::EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(captured)]), workspace);
+            let turn_result = agent.turn("delegate depth boundary").await;
+            let capture = {
+                let captured = result.lock();
+                json!({
+                    "schema": 1,
+                    "captor_calls": calls.load(std::sync::atomic::Ordering::SeqCst),
+                    "result_present": captured.is_some(),
+                    "result_success": captured.as_ref().map(|result| result.success),
+                    "depth_limit": captured.as_ref().map(|result| result.error.as_deref()
+                        .is_some_and(|error| error.contains("depth limit"))),
+                    "turn_returned_ok": turn_result.is_ok(),
+                })
+            };
+            let retained = (|| -> anyhow::Result<()> {
+                use std::io::Write as _;
+                let bytes = serde_json::to_vec_pretty(&capture)?;
+                anyhow::ensure!(bytes.len() <= 4096, "depth observation byte bound");
+                let mut options = std::fs::OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(capture_path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if retained.is_err() {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "delegate depth scalar capture failed");
+            }
+            turn_result?;
+            retained?;
+            anyhow::ensure!(
+                calls.load(std::sync::atomic::Ordering::SeqCst) == 1,
+                "actual depth fixture backend executes exactly once"
+            );
+            result
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("actual depth fixture result absent"))
+        },
+    ))
+    .await?
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // INT-DAS-02: Delegate tool respects max depth
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,10 +419,13 @@ async fn int_das_02_delegate_respects_max_depth() {
     // Create delegate at depth=2, which equals max_depth=2 → should be blocked
     let delegate_at_max = DelegateTool::with_depth(agents.clone(), security.clone(), 2);
 
-    let result = delegate_at_max
-        .execute(json!({"agent": "deep-agent", "prompt": "go deeper"}))
-        .await
-        .expect("test: execute should not error at Result level");
+    let result = dispatch_depth_fixture(
+        delegate_at_max,
+        agents.clone(),
+        json!({"agent": "deep-agent", "prompt": "go deeper"}),
+    )
+    .await
+    .expect("test: execute should not error at Result level");
 
     assert!(!result.success, "delegation at max depth should fail");
     assert!(
@@ -525,4 +659,41 @@ async fn int_e2e_04_scope_denied_audit_log_error_response() {
         recall_allowed,
         "memory_recall should still be allowed for telegram users"
     );
+}
+
+// Supplemental admission proof; the original INT-DAS-02 body remains unchanged.
+#[tokio::test]
+async fn admitted_delegate_under_depth_reports_unsupported_provider() -> anyhow::Result<()> {
+    let security = Arc::new(SecurityPolicy::default());
+    let mut agents = HashMap::new();
+    agents.insert(
+        "prx_depth_agent".to_string(),
+        DelegateAgentConfig {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            credential_ref: None,
+            temperature: None,
+            max_depth: 2,
+            agentic: false,
+            allowed_tools: vec![],
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        },
+    );
+    let delegate = DelegateTool::with_depth(agents.clone(), security, 1);
+    let result = dispatch_depth_fixture(
+        delegate,
+        agents,
+        json!({"agent": "prx_depth_agent", "prompt": "shallower delegation"}),
+    )
+    .await?;
+    assert!(!result.success);
+    let error = result.error.as_deref().unwrap_or("");
+    assert!(error.contains("provider 'test' is not one PRX can construct"));
+    assert!(!error.contains("depth limit"));
+    assert!(!error.contains("admitted parent source"));
+    Ok(())
 }

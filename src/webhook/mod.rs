@@ -1780,7 +1780,7 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let topic_id = parsed.get("topic_id").and_then(serde_json::Value::as_str).unwrap();
-        assert!(!topic_id.is_empty());
+        assert!(!topic_id.is_empty(), "expected a non-empty value");
 
         let conn = Connection::open(db_path).unwrap();
         let topic_count: i64 = conn
@@ -2604,7 +2604,7 @@ mod tests {
             outcome => panic!("expected acquired PostgreSQL claim, got {outcome:?}"),
         };
         let topic_id = repository.commit(&claim, &event, &event.content, true).await.unwrap();
-        assert!(!topic_id.is_empty());
+        assert!(!topic_id.is_empty(), "expected a non-empty value");
 
         assert!(matches!(
             repository

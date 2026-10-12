@@ -1195,6 +1195,15 @@ and terminal events use its bound memory fabric. A configuration reload does not
 replace these settings halfway through an admitted child turn. These candidate
 changes still require centralized behavior, recovery and performance acceptance.
 
+Delegate calls with no admitted parent return an unsuccessful tool result
+(`success = false`) before agent lookup or child execution. Invalid present
+caller or publication authority remains an error. After admission, the typed
+unknown-provider selection refusal also returns an unsuccessful tool result;
+credential ownership, credential lookup, route, generation and other binding or
+factory errors retain their error classification. This changes failure reporting
+only and grants no child authority. Reverting this mapping restores the earlier
+outer-error behavior for missing-parent and unknown-provider refusals.
+
 A decision-issued child capability manifest may have an empty allowed set for
 model-only work. This grants no tools and is valid only as a strict subset of
 the parent's nonempty authority; owner, cost ceiling, catalog generation and
@@ -1411,3 +1420,27 @@ an approved fresh-resume end-to-end case. They do not establish release or
 performance acceptance. Rollback must preserve source and terminal evidence;
 reverting the decision projection leaves the existing late Plan interceptor in
 place but restores the known predecision policy mismatch.
+
+### Worker manifest transport
+
+Unix process workers receive a versioned local snapshot reference on stdin line
+one. The parent writes the complete sealed manifest, including all capability
+schemas and grants, into a fresh private directory under the worker workspace.
+The reference binds its path, one-use nonce, run, configuration generation,
+expiry and exact content digest with the existing worker-channel key. The worker
+verifies that reference before opening the snapshot and retains the existing
+full-manifest, configuration and catalog verification after reading it.
+
+The reference line remains below 3072 bytes; the complete snapshot is bounded
+at 16 MiB and larger manifests fail explicitly. Snapshot directories require
+owner-only access, and snapshot files require a single-link regular file owned
+by the worker user with read-only owner permissions. Symlinks are rejected. An
+exclusive claim prevents a second consumer of the same reference. Parent cleanup
+removes the snapshot after confirmed child termination; unconfirmed termination
+retains it with the existing worker workspace for owned recovery. Snapshot data
+may contain credentials and must not be copied into diagnostics or reports.
+
+Readers continue to accept the previous inline JSON manifest. Non-Unix parents
+retain that existing transport. Parent and child use the same executable; rolling
+back this transport means reverting both writer and reader together. Existing
+control frames and capability-expiry rules are unchanged.

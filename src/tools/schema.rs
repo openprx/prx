@@ -2691,8 +2691,14 @@ mod tests {
                 .is_some_and(|description| description.contains("Defaults to 'call' when omitted.")),
             "the published description must state the default the executor applies"
         );
-        assert!(validate_tool_arguments(&schema, &json!({"server": "s"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"server": "s"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty(),
+            "expected an empty value"
+        );
         let implicit = validate_tool_arguments(&schema, &json!({}));
         assert!(implicit.iter().any(|issue| issue.path == "$.server"));
     }
@@ -2707,8 +2713,14 @@ mod tests {
         let second = json!({"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]});
 
         let compiled = compiled_tool_schema(name, &first);
-        assert!(compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
-        assert!(!compiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
+        assert!(
+            compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !compiled.validate_tool_arguments(&json!({"b": 1})).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             Arc::ptr_eq(&compiled, &compiled_tool_schema(name, &first)),
             "an unchanged contract must be served from the cache"
@@ -2716,8 +2728,14 @@ mod tests {
 
         let recompiled = compiled_tool_schema(name, &second);
         assert!(!Arc::ptr_eq(&compiled, &recompiled));
-        assert!(recompiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
-        assert!(!recompiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
+        assert!(
+            recompiled.validate_tool_arguments(&json!({"b": 1})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !recompiled.validate_tool_arguments(&json!({"a": "x"})).is_empty(),
+            "expected a non-empty value"
+        );
     }
 
     #[test]
@@ -3035,11 +3053,17 @@ mod tests {
             }],
         );
 
-        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty(),
+            "expected an empty value"
+        );
         let missing = validate_tool_arguments(&schema, &json!({"action": "create"}));
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].path, "$.name");
-        assert!(validate_tool_arguments(&schema, &json!({"action": "create", "name": "x"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "create", "name": "x"})).is_empty(),
+            "expected an empty value"
+        );
         let empty = validate_tool_arguments(&schema, &json!({"action": "create", "name": ""}));
         assert_eq!(empty[0].path, "$.name");
     }
@@ -3061,9 +3085,18 @@ mod tests {
             &[&["tool_slug"], &["action_name"]],
         );
 
-        assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "tool_slug": "x"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "action_name": "x"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "execute"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "execute", "tool_slug": "x"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "execute", "action_name": "x"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "execute"})).is_empty(),
+            "expected a non-empty value"
+        );
     }
 
     #[test]
@@ -3079,10 +3112,22 @@ mod tests {
             &[&["path"], &["key"]],
         );
 
-        assert!(validate_tool_arguments(&schema, &json!({"path": "a"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"key": "a"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"key": ""})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"path": "a"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"key": "a"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"key": ""})).is_empty(),
+            "expected a non-empty value"
+        );
     }
 
     #[test]
@@ -3102,11 +3147,21 @@ mod tests {
             &[&["delay"], &["run_at"]],
         );
 
-        assert!(validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"action": "once", "run_at": "time"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "once"})).is_empty());
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m", "run_at": "time"})).is_empty()
+            validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "once", "run_at": "time"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "once"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m", "run_at": "time"})).is_empty(),
+            "expected a non-empty value"
         );
     }
 
@@ -3118,7 +3173,10 @@ mod tests {
             "additionalProperties": {"type": "string"}
         });
 
-        assert!(validate_tool_arguments(&schema, &json!({"header": "value"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"header": "value"})).is_empty(),
+            "expected an empty value"
+        );
         let issues = validate_tool_arguments(&schema, &json!({"header": 1}));
         assert_eq!(issues[0].path, "$.header");
     }
@@ -3141,7 +3199,10 @@ mod tests {
         });
         let issues = validate_tool_arguments(&schema, &json!({"steps": [{}]}));
         assert_eq!(issues[0].path, "$.steps[0].name");
-        assert!(!validate_tool_arguments(&schema, &json!({"steps": "wrong"})).is_empty());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"steps": "wrong"})).is_empty(),
+            "expected a non-empty value"
+        );
     }
 
     #[test]
@@ -3189,8 +3250,14 @@ mod tests {
         });
 
         assert!(SchemaCleanr::validate(&schema).is_ok());
-        assert!(validate_tool_arguments(&schema, &json!({"value": "ok"})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"value": null})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"value": "ok"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"value": null})).is_empty(),
+            "expected an empty value"
+        );
         assert!(
             validate_tool_arguments(&schema, &json!({"value": 7}))
                 .iter()
@@ -3326,7 +3393,10 @@ mod tests {
     fn integer_accepts_whole_numbers_written_as_floats() {
         // 2d: JSON Schema defines `integer` by value, not by spelling.
         let schema = json!({"type": "object", "properties": {"limit": {"type": "integer"}}});
-        assert!(validate_tool_arguments(&schema, &json!({"limit": 1})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"limit": 1})).is_empty(),
+            "expected an empty value"
+        );
         assert!(
             validate_tool_arguments(&schema, &json!({"limit": 1.0})).is_empty(),
             "1.0 is an integer"
@@ -3384,7 +3454,10 @@ mod tests {
             "oneOf": [{"required": ["expression"]}, {"required": ["schedule"]}],
             "properties": {"expression": {"type": "string"}, "schedule": {"type": "string"}}
         });
-        assert!(validate_tool_arguments(&schema, &json!({"expression": "1+1"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"expression": "1+1"})).is_empty(),
+            "expected an empty value"
+        );
         let both = validate_tool_arguments(&schema, &json!({"expression": "1+1", "schedule": "daily"}));
         assert!(
             both.iter().any(|issue| issue.message.contains("exactly one")),
@@ -3405,7 +3478,10 @@ mod tests {
             "then": {"required": ["path"]},
             "else": {"required": ["url"]}
         });
-        assert!(validate_tool_arguments(&schema, &json!({"mode": "local", "path": "/tmp"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"mode": "local", "path": "/tmp"})).is_empty(),
+            "expected an empty value"
+        );
         let missing_path = validate_tool_arguments(&schema, &json!({"mode": "local"}));
         assert!(
             missing_path.iter().any(|issue| issue.path == "$.path"),
@@ -3416,7 +3492,10 @@ mod tests {
             missing_url.iter().any(|issue| issue.path == "$.url"),
             "the `else` branch must bind: {missing_url:?}"
         );
-        assert!(validate_tool_arguments(&schema, &json!({"mode": "remote", "url": "https://x"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"mode": "remote", "url": "https://x"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -3435,7 +3514,10 @@ mod tests {
                 }
             }
         });
-        assert!(validate_tool_arguments(&schema, &json!({"target": {"host": "h", "port": 1}})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"target": {"host": "h", "port": 1}})).is_empty(),
+            "expected an empty value"
+        );
         let missing = validate_tool_arguments(&schema, &json!({"target": {}}));
         assert!(
             missing.iter().any(|issue| issue.path == "$.target.host"),
@@ -3452,8 +3534,14 @@ mod tests {
             "properties": {"target": {"$ref": "#/definitions/Target"}},
             "definitions": {"Target": {"type": "string", "minLength": 2}}
         });
-        assert!(validate_tool_arguments(&draft07, &json!({"target": "ok"})).is_empty());
-        assert!(!validate_tool_arguments(&draft07, &json!({"target": "x"})).is_empty());
+        assert!(
+            validate_tool_arguments(&draft07, &json!({"target": "ok"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&draft07, &json!({"target": "x"})).is_empty(),
+            "expected a non-empty value"
+        );
     }
 
     #[test]
@@ -3464,10 +3552,16 @@ mod tests {
             "type": "object",
             "properties": {"target": {"$ref": "https://example.test/schema.json#/Target"}}
         });
-        assert!(validate_tool_arguments(&external, &json!({"target": {"anything": true}})).is_empty());
+        assert!(
+            validate_tool_arguments(&external, &json!({"target": {"anything": true}})).is_empty(),
+            "expected an empty value"
+        );
 
         let missing = json!({"type": "object", "properties": {"target": {"$ref": "#/$defs/Absent"}}});
-        assert!(validate_tool_arguments(&missing, &json!({"target": 1})).is_empty());
+        assert!(
+            validate_tool_arguments(&missing, &json!({"target": 1})).is_empty(),
+            "expected an empty value"
+        );
 
         // A cycle must terminate, and must still enforce the part it walked.
         let circular = json!({
@@ -3481,7 +3575,10 @@ mod tests {
                 }
             }
         });
-        assert!(validate_tool_arguments(&circular, &json!({"node": {"name": "a", "child": {"name": "b"}}})).is_empty());
+        assert!(
+            validate_tool_arguments(&circular, &json!({"node": {"name": "a", "child": {"name": "b"}}})).is_empty(),
+            "expected an empty value"
+        );
         let broken = validate_tool_arguments(&circular, &json!({"node": {"child": {}}}));
         assert!(
             broken.iter().any(|issue| issue.path == "$.node.name"),
@@ -3564,8 +3661,14 @@ mod tests {
                 "the second contract must stay cached while the first is in use"
             );
         }
-        assert!(first_compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
-        assert!(second_compiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
+        assert!(
+            first_compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            second_compiled.validate_tool_arguments(&json!({"b": 1})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -3833,7 +3936,10 @@ mod tests {
             "type": "object",
             "properties": {"limit": {"allOf": [{"type": "integer", "minimum": 1}]}}
         });
-        assert!(validate_tool_arguments(&schema, &json!({"limit": 5})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"limit": 5})).is_empty(),
+            "expected an empty value"
+        );
         let wrong_type = validate_tool_arguments(&schema, &json!({"limit": "invalid"}));
         assert!(
             wrong_type.iter().any(|issue| issue.path == "$.limit"),
@@ -3861,8 +3967,14 @@ mod tests {
                 }
             }
         });
-        assert!(validate_tool_arguments(&schema, &json!({"window": 15})).is_empty());
-        assert!(validate_tool_arguments(&schema, &json!({"window": 5})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"window": 15})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"window": 5})).is_empty(),
+            "expected an empty value"
+        );
         let above_then = validate_tool_arguments(&schema, &json!({"window": 25}));
         assert!(
             above_then.iter().any(|issue| issue.path == "$.window"),
@@ -3888,7 +4000,10 @@ mod tests {
                 }
             }
         });
-        assert!(validate_tool_arguments(&schema, &json!({"tags": ["ops", "prod"]})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"tags": ["ops", "prod"]})).is_empty(),
+            "expected an empty value"
+        );
         let empty = validate_tool_arguments(&schema, &json!({"tags": []}));
         assert!(
             empty.iter().any(|issue| issue.path == "$.tags"),
@@ -3914,17 +4029,38 @@ mod tests {
     #[test]
     fn root_composition_binds_documents_that_are_not_objects() {
         let scalar_root = json!({"allOf": [{"type": "string", "minLength": 3}]});
-        assert!(validate_tool_arguments(&scalar_root, &json!("ops")).is_empty());
-        assert!(!validate_tool_arguments(&scalar_root, &json!("no")).is_empty());
-        assert!(!validate_tool_arguments(&scalar_root, &json!(7)).is_empty());
+        assert!(
+            validate_tool_arguments(&scalar_root, &json!("ops")).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&scalar_root, &json!("no")).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&scalar_root, &json!(7)).is_empty(),
+            "expected a non-empty value"
+        );
 
         let array_root = json!({"type": "array", "allOf": [{"maxItems": 2}]});
-        assert!(validate_tool_arguments(&array_root, &json!([1])).is_empty());
-        assert!(!validate_tool_arguments(&array_root, &json!([1, 2, 3])).is_empty());
+        assert!(
+            validate_tool_arguments(&array_root, &json!([1])).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&array_root, &json!([1, 2, 3])).is_empty(),
+            "expected a non-empty value"
+        );
 
         let conditional_root = json!({"if": {"type": "string"}, "then": {"minLength": 2}});
-        assert!(validate_tool_arguments(&conditional_root, &json!("ok")).is_empty());
-        assert!(!validate_tool_arguments(&conditional_root, &json!("x")).is_empty());
+        assert!(
+            validate_tool_arguments(&conditional_root, &json!("ok")).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&conditional_root, &json!("x")).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             validate_tool_arguments(&conditional_root, &json!(1)).is_empty(),
             "a document the `if` does not select stays unconstrained"
@@ -3940,7 +4076,10 @@ mod tests {
             "type": "object",
             "properties": {"limit": {"allOf": [{"$ref": "https://example.test/schema.json#/Limit"}]}}
         });
-        assert!(validate_tool_arguments(&external, &json!({"limit": "invalid"})).is_empty());
+        assert!(
+            validate_tool_arguments(&external, &json!({"limit": "invalid"})).is_empty(),
+            "expected an empty value"
+        );
 
         let cyclic = json!({
             "type": "object",

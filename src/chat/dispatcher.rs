@@ -4384,6 +4384,104 @@ mod real_mode_tests {
     }
 
     /// Build complete EffectDeps with mock providers / memory / channel / hooks.
+    // Explicit Q42 call sites only; original serving objects are borrowed unchanged.
+    async fn admit_start_turn_fixture(
+        deps: &EffectDeps,
+        run: &str,
+        input: &str,
+        native_tools: bool,
+    ) -> anyhow::Result<Arc<crate::chat::decision_source::ChatTurnBinding>> {
+        let model = deps.model.current();
+        let mut config = crate::config::Config {
+            workspace_dir: deps.tool_security_policy.workspace_dir.clone(),
+            default_provider: Some("ollama".to_owned()),
+            default_model: Some(model.to_string()),
+            ..crate::config::Config::default()
+        };
+        config.config_path = config.workspace_dir.join("config.toml");
+        config.autonomy.level = deps.tool_security_policy.autonomy;
+        config.providers.models.push(serde_json::from_value(serde_json::json!({
+            "provider":"ollama", "model":model.to_string(), "operations":["chat"],
+            "native_tools":native_tools, "streaming":deps.provider.supports_streaming()
+        }))?);
+        config.cost.prices.insert(
+            format!("ollama/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let generation = crate::config::new_shared(config).pin();
+        let ledger: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&generation.effective.workspace_dir)?);
+        let registry = deps.tools_registry.clone().unwrap_or_else(|| Arc::new(Vec::new()));
+        let service = crate::runtime::turn_publication::TurnDecisionPublication {
+            generation: Arc::clone(&generation),
+            registry,
+            mcp_tool: None,
+            security: Arc::clone(&deps.tool_security_policy),
+            observer: Arc::clone(&deps.observer),
+            hooks: Arc::clone(&deps.hooks),
+            memory: Arc::clone(&ledger),
+            plugin_generation: 0,
+        }
+        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .await?;
+        crate::runtime::turn_cleanup::current_tracker()
+            .expect("Q42 scoped fixture owner")
+            .retain_service(Arc::clone(&service));
+        let session = run;
+        let envelope =
+            crate::chat::chat_runtime_envelope(&generation.effective.workspace_dir.to_string_lossy(), session)
+                .with_config_generation(&generation)
+                .with_run_id(run.to_owned());
+        let fabric = crate::memory::MemoryFabric::new(
+            Arc::clone(&ledger),
+            generation.effective.workspace_dir.to_string_lossy(),
+        )
+        .with_event_recording(generation.effective.memory.event_recording_config());
+        let event = fabric
+            .record_inbound_user_message(envelope.message_scope(), input, None, None)
+            .await?;
+        let receipt = crate::chat::decision_source::ChatSourceReceipt::issue(
+            ledger.as_ref(),
+            &generation,
+            session,
+            run,
+            input,
+            &event,
+        )
+        .await?;
+        let selected =
+            crate::chat::decision_source::ChatProviderBinding::capture(&generation, &deps.provider, "ollama", &model)?
+                .expect("Q42 original serving provider binding");
+        let binding = receipt.bind_provider(
+            &selected,
+            crate::chat::decision_source::ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
+        )?;
+        let context = binding.decide(&service, &CancellationToken::new()).await?;
+        use crate::causal_tree::directive::TurnExecutionDirective;
+        let prerequisite = match context.directive() {
+            TurnExecutionDirective::Clarify { reason_code } => Some(("Clarify", reason_code.as_str())),
+            TurnExecutionDirective::Refuse { policy_code } => Some(("Refuse", policy_code.as_str())),
+            _ => None,
+        };
+        if let Some((directive, reason)) = prerequisite {
+            let reason = match reason {
+                "insufficient_evidence"
+                | "commit_threshold_or_margin"
+                | "no_legal_path"
+                | "hop_stopped"
+                | "choice_outside_legal_set"
+                | "all_gated" => reason,
+                _ => "unclassified",
+            };
+            eprintln!("PRX_Q42_ADMISSION directive={directive} reason_code={reason}");
+        }
+        Ok(binding)
+    }
+
     fn build_deps(
         memory: Arc<dyn Memory>,
         shutdown: CancellationToken,
@@ -5091,65 +5189,77 @@ mod real_mode_tests {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        let start = std::time::Instant::now();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-real".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let binding = admit_start_turn_fixture(&fixture_deps, "draft-real", "stream the fixture reply", false)
+                    .await
+                    .expect("Q42 genuine admission prerequisite");
+                let start = std::time::Instant::now();
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-real".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+                // execute() returns immediately; the spawned subtask really calls the provider and feeds Actions back.
+                assert!(
+                    start.elapsed() < Duration::from_millis(100),
+                    "StartTurn should not block (Codex P0-1)"
+                );
+
+                // first Action: the default stream implementation emits one error chunk (delta=error message,
+                // is_final=true), which is converted into StreamChunkReceived (because delta is non-empty).
+                let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
+                    .await
+                    .expect("action within 1s")
+                    .expect("action received");
+                match action {
+                    Action::StreamChunkReceived { draft_id, version, .. } => {
+                        assert_eq!(draft_id, "draft-real", "draft_id must propagate");
+                        assert!(version >= 1, "version must start at 1+");
+                    }
+                    other => panic!("expected StreamChunkReceived, got {other:?}"),
+                }
+
+                // T3-3-fixB B5: the second one is RecordAssistantTurn (sent before StreamCompleted).
+                let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
+                    .await
+                    .expect("RecordAssistantTurn within 1s")
+                    .expect("RecordAssistantTurn received");
+                match action {
+                    Action::RecordAssistantTurn { .. } => {}
+                    other => panic!("expected RecordAssistantTurn (fixB B5 precondition), got {other:?}"),
+                }
+
+                // third: is_final=true breaks out of the loop and sends StreamCompleted.
+                let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
+                    .await
+                    .expect("completion within 1s")
+                    .expect("completion received");
+                match action {
+                    Action::StreamCompleted { draft_id, .. } => {
+                        assert_eq!(draft_id, "draft-real", "completion draft_id must propagate");
+                    }
+                    other => panic!("expected StreamCompleted, got {other:?}"),
+                }
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-        // execute() returns immediately; the spawned subtask really calls the provider and feeds Actions back.
-        assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "StartTurn should not block (Codex P0-1)"
-        );
-
-        // first Action: the default stream implementation emits one error chunk (delta=error message,
-        // is_final=true), which is converted into StreamChunkReceived (because delta is non-empty).
-        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
             .await
-            .expect("action within 1s")
-            .expect("action received");
-        match action {
-            Action::StreamChunkReceived { draft_id, version, .. } => {
-                assert_eq!(draft_id, "draft-real", "draft_id must propagate");
-                assert!(version >= 1, "version must start at 1+");
-            }
-            other => panic!("expected StreamChunkReceived, got {other:?}"),
-        }
-
-        // T3-3-fixB B5: the second one is RecordAssistantTurn (sent before StreamCompleted).
-        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
-            .await
-            .expect("RecordAssistantTurn within 1s")
-            .expect("RecordAssistantTurn received");
-        match action {
-            Action::RecordAssistantTurn { .. } => {}
-            other => panic!("expected RecordAssistantTurn (fixB B5 precondition), got {other:?}"),
-        }
-
-        // third: is_final=true breaks out of the loop and sends StreamCompleted.
-        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
-            .await
-            .expect("completion within 1s")
-            .expect("completion received");
-        match action {
-            Action::StreamCompleted { draft_id, .. } => {
-                assert_eq!(draft_id, "draft-real", "completion draft_id must propagate");
-            }
-            other => panic!("expected StreamCompleted, got {other:?}"),
-        }
+            .expect("Q42 fixture cleanup");
     }
 
     /// Step 5a-2 — StartTurn sends StreamCancelled immediately after a cancel pre-trigger.
@@ -5254,104 +5364,117 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(FakeStreamProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-stream".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-stream", "stream the fixture reply", false)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-stream".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                // receive chunk 1 (delta="hello ")
+                let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("first chunk within 1.5s")
+                    .expect("first chunk received");
+                match a1 {
+                    Action::StreamChunkReceived {
+                        draft_id,
+                        delta,
+                        version,
+                    } => {
+                        assert_eq!(draft_id, "draft-stream");
+                        assert_eq!(delta, "hello ");
+                        assert_eq!(version, 1, "first delta version must be 1");
+                    }
+                    other => panic!("expected StreamChunkReceived#1, got {other:?}"),
+                }
+
+                // F1: reasoning chunks are now dispatched as Actions too, so the TUI shows progress while thinking;
+                // they share the same version counter as text deltas.
+                let a_reasoning = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("reasoning progress within 1.5s")
+                    .expect("reasoning progress received");
+                match a_reasoning {
+                    Action::StreamReasoningReceived {
+                        draft_id,
+                        delta,
+                        version,
+                    } => {
+                        assert_eq!(draft_id, "draft-stream");
+                        assert_eq!(delta, "thinking…");
+                        assert_eq!(version, 2, "reasoning shares the text delta version counter");
+                    }
+                    other => panic!("expected StreamReasoningReceived, got {other:?}"),
+                }
+
+                // the next one is still chunk 2 (delta="world"), and the version keeps increasing strictly
+                let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("second chunk within 1.5s")
+                    .expect("second chunk received");
+                match a2 {
+                    Action::StreamChunkReceived { delta, version, .. } => {
+                        assert_eq!(delta, "world");
+                        assert_eq!(version, 3, "second delta version must strictly increase");
+                    }
+                    other => panic!("expected StreamChunkReceived#2, got {other:?}"),
+                }
+
+                // T3-3-fixB B5: RecordAssistantTurn is sent before StreamCompleted, and
+                // final_text matches the RecordAssistantTurn content.
+                let a_record = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("RecordAssistantTurn within 1.5s")
+                    .expect("RecordAssistantTurn received");
+                match a_record {
+                    Action::RecordAssistantTurn { content: text, .. } => {
+                        assert_eq!(text, "hello world", "RecordAssistantTurn content must match final_text");
+                    }
+                    other => panic!("expected RecordAssistantTurn (fixB B5 precondition), got {other:?}"),
+                }
+
+                // finally StreamCompleted, with accumulated final_text and reasoning containing the thinking text.
+                let a3 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("completion within 1.5s")
+                    .expect("completion received");
+                match a3 {
+                    Action::StreamCompleted {
+                        draft_id,
+                        final_text,
+                        reasoning,
+                    } => {
+                        assert_eq!(draft_id, "draft-stream");
+                        assert_eq!(final_text, "hello world");
+                        assert_eq!(reasoning, "thinking…");
+                    }
+                    other => panic!("expected StreamCompleted, got {other:?}"),
+                }
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        // receive chunk 1 (delta="hello ")
-        let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
             .await
-            .expect("first chunk within 1.5s")
-            .expect("first chunk received");
-        match a1 {
-            Action::StreamChunkReceived {
-                draft_id,
-                delta,
-                version,
-            } => {
-                assert_eq!(draft_id, "draft-stream");
-                assert_eq!(delta, "hello ");
-                assert_eq!(version, 1, "first delta version must be 1");
-            }
-            other => panic!("expected StreamChunkReceived#1, got {other:?}"),
-        }
-
-        // F1: reasoning chunks are now dispatched as Actions too, so the TUI shows progress while thinking;
-        // they share the same version counter as text deltas.
-        let a_reasoning = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-            .await
-            .expect("reasoning progress within 1.5s")
-            .expect("reasoning progress received");
-        match a_reasoning {
-            Action::StreamReasoningReceived {
-                draft_id,
-                delta,
-                version,
-            } => {
-                assert_eq!(draft_id, "draft-stream");
-                assert_eq!(delta, "thinking…");
-                assert_eq!(version, 2, "reasoning shares the text delta version counter");
-            }
-            other => panic!("expected StreamReasoningReceived, got {other:?}"),
-        }
-
-        // the next one is still chunk 2 (delta="world"), and the version keeps increasing strictly
-        let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-            .await
-            .expect("second chunk within 1.5s")
-            .expect("second chunk received");
-        match a2 {
-            Action::StreamChunkReceived { delta, version, .. } => {
-                assert_eq!(delta, "world");
-                assert_eq!(version, 3, "second delta version must strictly increase");
-            }
-            other => panic!("expected StreamChunkReceived#2, got {other:?}"),
-        }
-
-        // T3-3-fixB B5: RecordAssistantTurn is sent before StreamCompleted, and
-        // final_text matches the RecordAssistantTurn content.
-        let a_record = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-            .await
-            .expect("RecordAssistantTurn within 1.5s")
-            .expect("RecordAssistantTurn received");
-        match a_record {
-            Action::RecordAssistantTurn { content: text, .. } => {
-                assert_eq!(text, "hello world", "RecordAssistantTurn content must match final_text");
-            }
-            other => panic!("expected RecordAssistantTurn (fixB B5 precondition), got {other:?}"),
-        }
-
-        // finally StreamCompleted, with accumulated final_text and reasoning containing the thinking text.
-        let a3 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-            .await
-            .expect("completion within 1.5s")
-            .expect("completion received");
-        match a3 {
-            Action::StreamCompleted {
-                draft_id,
-                final_text,
-                reasoning,
-            } => {
-                assert_eq!(draft_id, "draft-stream");
-                assert_eq!(final_text, "hello world");
-                assert_eq!(reasoning, "thinking…");
-            }
-            other => panic!("expected StreamCompleted, got {other:?}"),
-        }
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -5416,63 +5539,76 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(FakeTaskScopedStreamProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: Some(task_id),
-                draft_id: "draft-task-scoped".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-task-scoped", "stream the fixture reply", false)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: Some(task_id),
+                        draft_id: "draft-task-scoped".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                // F1: a reasoning delta sandwiched between text deltas is dispatched separately as thinking progress.
+                let mut text_deltas = Vec::new();
+                let mut reasoning_deltas = Vec::new();
+                while text_deltas.len() < 2 {
+                    let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                        .await
+                        .expect("stream action within 1.5s")
+                        .expect("stream action received");
+                    match action {
+                        Action::StreamChunkReceived { delta, .. } => text_deltas.push(delta),
+                        Action::StreamReasoningReceived { delta, .. } => reasoning_deltas.push(delta),
+                        other => panic!("expected stream delta action, got {other:?}"),
+                    }
+                }
+                assert_eq!(text_deltas, vec!["ordered ".to_string(), "commit".to_string()]);
+                assert_eq!(
+                    reasoning_deltas,
+                    vec!["gate".to_string()],
+                    "thinking progress must be dispatched live, not only on completion"
+                );
+
+                let terminal = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("ready signal within 1.5s")
+                    .expect("ready signal received");
+                match terminal {
+                    Action::ProviderTurnReadyForCommit {
+                        draft_id,
+                        final_text,
+                        reasoning,
+                    } => {
+                        assert_eq!(draft_id, "draft-task-scoped");
+                        assert_eq!(final_text, "ordered commit");
+                        assert_eq!(reasoning, "gate");
+                    }
+                    other => {
+                        panic!("task-scoped completion must wait for ordered commit gate, got {other:?}")
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        // F1: a reasoning delta sandwiched between text deltas is dispatched separately as thinking progress.
-        let mut text_deltas = Vec::new();
-        let mut reasoning_deltas = Vec::new();
-        while text_deltas.len() < 2 {
-            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-                .await
-                .expect("stream action within 1.5s")
-                .expect("stream action received");
-            match action {
-                Action::StreamChunkReceived { delta, .. } => text_deltas.push(delta),
-                Action::StreamReasoningReceived { delta, .. } => reasoning_deltas.push(delta),
-                other => panic!("expected stream delta action, got {other:?}"),
-            }
-        }
-        assert_eq!(text_deltas, vec!["ordered ".to_string(), "commit".to_string()]);
-        assert_eq!(
-            reasoning_deltas,
-            vec!["gate".to_string()],
-            "thinking progress must be dispatched live, not only on completion"
-        );
-
-        let terminal = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
             .await
-            .expect("ready signal within 1.5s")
-            .expect("ready signal received");
-        match terminal {
-            Action::ProviderTurnReadyForCommit {
-                draft_id,
-                final_text,
-                reasoning,
-            } => {
-                assert_eq!(draft_id, "draft-task-scoped");
-                assert_eq!(final_text, "ordered commit");
-                assert_eq!(reasoning, "gate");
-            }
-            other => {
-                panic!("task-scoped completion must wait for ordered commit gate, got {other:?}")
-            }
-        }
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -6671,54 +6807,69 @@ mod real_mode_tests {
         deps.provider = Arc::new(ToolCallProvider);
         // explicit: no registry provided → the driver must fail.
         deps.tools_registry = None;
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        let cancel = CancellationToken::new();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-no-registry".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel,
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let cancel = CancellationToken::new();
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-no-registry", "stream the fixture reply", true)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-no-registry".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel,
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                // skip a potential ToolStarted (not sent on the no-registry path, since the registry check precedes it).
+                let mut got_failed = false;
+                for _ in 0..6 {
+                    let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                        .await
+                        .expect("driver must respond within 1.5s")
+                        .expect("action must be received");
+                    match action {
+                        Action::StreamFailed {
+                            draft_id,
+                            err,
+                            retryable,
+                        } => {
+                            assert_eq!(draft_id, "draft-no-registry");
+                            assert!(!retryable, "no-registry rejection is permanent");
+                            assert!(
+                                err.contains("tools_registry") || err.contains("tool_calls"),
+                                "err must hint at missing registry / tool_calls (got: {err})"
+                            );
+                            got_failed = true;
+                            break;
+                        }
+                        Action::StreamChunkReceived { .. }
+                        | Action::ToolStarted { .. }
+                        | Action::ToolFinished { .. } => {
+                            // permitted pre-failure noise; keep draining.
+                        }
+                        other => panic!("unexpected action before StreamFailed: {other:?}"),
+                    }
+                }
+                assert!(got_failed, "driver must emit StreamFailed within 6 actions");
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        // skip a potential ToolStarted (not sent on the no-registry path, since the registry check precedes it).
-        let mut got_failed = false;
-        for _ in 0..6 {
-            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-                .await
-                .expect("driver must respond within 1.5s")
-                .expect("action must be received");
-            match action {
-                Action::StreamFailed {
-                    draft_id,
-                    err,
-                    retryable,
-                } => {
-                    assert_eq!(draft_id, "draft-no-registry");
-                    assert!(!retryable, "no-registry rejection is permanent");
-                    assert!(
-                        err.contains("tools_registry") || err.contains("tool_calls"),
-                        "err must hint at missing registry / tool_calls (got: {err})"
-                    );
-                    got_failed = true;
-                    break;
-                }
-                Action::StreamChunkReceived { .. } | Action::ToolStarted { .. } | Action::ToolFinished { .. } => {
-                    // permitted pre-failure noise; keep draining.
-                }
-                other => panic!("unexpected action before StreamFailed: {other:?}"),
-            }
-        }
-        assert!(got_failed, "driver must emit StreamFailed within 6 actions");
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **5a-6 happy path**: the driver receives a tool_call → executes it through tools_registry → feeds the
@@ -6832,80 +6983,93 @@ mod real_mode_tests {
             captured_tool_counts: Arc::clone(&captured_tool_counts),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(EchoTool) as Box<dyn crate::tools::Tool>]));
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        let cancel = CancellationToken::new();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-tool-happy".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel,
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
+                let cancel = CancellationToken::new();
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-tool-happy", "stream the fixture reply", true)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-tool-happy".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel,
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        let mut saw_tool_started = false;
-        let mut saw_tool_finished_success = false;
-        let mut saw_completion = false;
-        let mut final_text_seen = String::new();
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("driver should respond within 2s per action")
-                .expect("action must arrive");
-            match action {
-                Action::ToolStarted { name, .. } => {
-                    assert_eq!(name, "echo-tool");
-                    saw_tool_started = true;
-                }
-                Action::ToolFinished {
-                    name, success, result, ..
-                } => {
-                    assert_eq!(name, "echo-tool");
-                    if success {
-                        saw_tool_finished_success = true;
-                        assert!(
-                            result.as_deref().is_some_and(|s| s.contains("echoed")),
-                            "tool result must echo back text arg (got {result:?})"
-                        );
+                let mut saw_tool_started = false;
+                let mut saw_tool_finished_success = false;
+                let mut saw_completion = false;
+                let mut final_text_seen = String::new();
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver should respond within 2s per action")
+                        .expect("action must arrive");
+                    match action {
+                        Action::ToolStarted { name, .. } => {
+                            assert_eq!(name, "echo-tool");
+                            saw_tool_started = true;
+                        }
+                        Action::ToolFinished {
+                            name, success, result, ..
+                        } => {
+                            assert_eq!(name, "echo-tool");
+                            if success {
+                                saw_tool_finished_success = true;
+                                assert!(
+                                    result.as_deref().is_some_and(|s| s.contains("echoed")),
+                                    "tool result must echo back text arg (got {result:?})"
+                                );
+                            }
+                        }
+                        Action::StreamChunkReceived { delta, .. } => {
+                            final_text_seen.push_str(&delta);
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            saw_completion = true;
+                            assert!(
+                                final_text.contains("done"),
+                                "final text must contain 'done' (got {final_text:?})"
+                            );
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should not fail in happy path: {err}");
+                        }
+                        _ => {}
                     }
                 }
-                Action::StreamChunkReceived { delta, .. } => {
-                    final_text_seen.push_str(&delta);
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    saw_completion = true;
-                    assert!(
-                        final_text.contains("done"),
-                        "final text must contain 'done' (got {final_text:?})"
-                    );
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should not fail in happy path: {err}");
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_tool_started, "must see ToolStarted");
-        assert!(saw_tool_finished_success, "must see ToolFinished(success=true)");
-        assert!(saw_completion, "must see StreamCompleted");
-        assert!(
-            final_text_seen.contains("done"),
-            "streaming delta must include 'done' (got {final_text_seen:?})"
-        );
-        assert_eq!(
-            *captured_tool_counts.lock(),
-            vec![1, 1],
-            "driver must pass registered tool specs to each streaming request"
-        );
+                assert!(saw_tool_started, "must see ToolStarted");
+                assert!(saw_tool_finished_success, "must see ToolFinished(success=true)");
+                assert!(saw_completion, "must see StreamCompleted");
+                assert!(
+                    final_text_seen.contains("done"),
+                    "streaming delta must include 'done' (got {final_text_seen:?})"
+                );
+                assert_eq!(
+                    *captured_tool_counts.lock(),
+                    vec![1, 1],
+                    "driver must pass registered tool specs to each streaming request"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **D8-4 redux-path real fix regression**: a tool executed *inside* the
@@ -7186,54 +7350,67 @@ mod real_mode_tests {
         deps.tools_registry = Some(Arc::new(vec![Box::new(DeniedTool {
             exec_count: Arc::clone(&exec_count),
         }) as Box<dyn crate::tools::Tool>]));
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        let cancel = CancellationToken::new();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-unrecoverable".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel,
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let cancel = CancellationToken::new();
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-unrecoverable", "stream the fixture reply", true)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-unrecoverable".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel,
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                let mut got_failed = false;
+                let mut failed_err = String::new();
+                for _ in 0..32 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver should respond per action within 2s")
+                        .expect("action must arrive");
+                    if let Action::StreamFailed { err, retryable, .. } = &action {
+                        assert!(!retryable, "unrecoverable stop is permanent");
+                        failed_err = err.clone();
+                        got_failed = true;
+                        break;
+                    }
+                }
+                assert!(
+                    got_failed,
+                    "driver must emit StreamFailed on repeated unrecoverable failure"
+                );
+                assert!(
+                    failed_err.contains("unrecoverable") && failed_err.contains("shell"),
+                    "must stop with the unrecoverable message naming the blocked tool (got: {failed_err})"
+                );
+                // The blocked tool must have run only a small number of times (the first
+                // failure plus the one retry that trips the early-stop).
+                let runs = exec_count.load(AtomicOrdering::SeqCst);
+                assert!(
+                    (1..=3).contains(&runs),
+                    "blocked tool should run ~twice before early-stop, not retry indefinitely (ran {runs} times)"
+                );
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        let mut got_failed = false;
-        let mut failed_err = String::new();
-        for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("driver should respond per action within 2s")
-                .expect("action must arrive");
-            if let Action::StreamFailed { err, retryable, .. } = &action {
-                assert!(!retryable, "unrecoverable stop is permanent");
-                failed_err = err.clone();
-                got_failed = true;
-                break;
-            }
-        }
-        assert!(
-            got_failed,
-            "driver must emit StreamFailed on repeated unrecoverable failure"
-        );
-        assert!(
-            failed_err.contains("unrecoverable") && failed_err.contains("shell"),
-            "must stop with the unrecoverable message naming the blocked tool (got: {failed_err})"
-        );
-        // The blocked tool must have run only a small number of times (the first
-        // failure plus the one retry that trips the early-stop).
-        let runs = exec_count.load(AtomicOrdering::SeqCst);
-        assert!(
-            (1..=3).contains(&runs),
-            "blocked tool should run ~twice before early-stop, not retry indefinitely (ran {runs} times)"
-        );
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// P1-2: cancel mid-turn on the driver path — the select! inside drive_start_turn_stream takes the cancel branch.
@@ -7296,47 +7473,60 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(PendingStreamProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        let cancel = CancellationToken::new();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-cancel-mid".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: cancel.clone(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let cancel = CancellationToken::new();
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-cancel-mid", "stream the fixture reply", false)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-cancel-mid".to_string(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: cancel.clone(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                // receive one delta (partial) first, proving the stream is already active.
+                let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("first delta within 1.5s")
+                    .expect("first delta received");
+                assert!(
+                    matches!(a1, Action::StreamChunkReceived { ref delta, .. } if delta == "partial"),
+                    "expected first partial delta, got {a1:?}"
+                );
+
+                // cancel mid-turn
+                cancel.cancel();
+
+                // StreamCancelled must arrive immediately.
+                let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                    .await
+                    .expect("StreamCancelled within 1.5s after cancel")
+                    .expect("StreamCancelled received");
+                match a2 {
+                    Action::StreamCancelled { draft_id } => assert_eq!(draft_id, "draft-cancel-mid"),
+                    other => panic!("expected StreamCancelled after mid-turn cancel, got {other:?}"),
+                }
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        // receive one delta (partial) first, proving the stream is already active.
-        let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
             .await
-            .expect("first delta within 1.5s")
-            .expect("first delta received");
-        assert!(
-            matches!(a1, Action::StreamChunkReceived { ref delta, .. } if delta == "partial"),
-            "expected first partial delta, got {a1:?}"
-        );
-
-        // cancel mid-turn
-        cancel.cancel();
-
-        // StreamCancelled must arrive immediately.
-        let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
-            .await
-            .expect("StreamCancelled within 1.5s after cancel")
-            .expect("StreamCancelled received");
-        match a2 {
-            Action::StreamCancelled { draft_id } => assert_eq!(draft_id, "draft-cancel-mid"),
-            other => panic!("expected StreamCancelled after mid-turn cancel, got {other:?}"),
-        }
+            .expect("Q42 fixture cleanup");
     }
 
     /// P0-1 simplified: try_dispatch returns ChannelClosed when the channel is closed
@@ -7543,56 +7733,69 @@ mod real_mode_tests {
             counter: Arc::new(AtomicUsize::new(0)),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-t31-streaming".into(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-t31-streaming", "stream the fixture reply", true)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-t31-streaming".into(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                let mut saw_tool_started = false;
+                let mut saw_tool_finished = false;
+                let mut saw_completion = false;
+                for _ in 0..32 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::ToolStarted { name, .. } => {
+                            assert_eq!(name, "ping");
+                            saw_tool_started = true;
+                        }
+                        Action::ToolFinished { success, name, .. } => {
+                            assert_eq!(name, "ping");
+                            assert!(success);
+                            saw_tool_finished = true;
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("done"), "want 'done' got {final_text:?}");
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should not fail in happy path: {err}")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(saw_tool_started, "must see ToolStarted");
+                assert!(saw_tool_finished, "must see ToolFinished");
+                assert!(saw_completion, "must see StreamCompleted");
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        let mut saw_tool_started = false;
-        let mut saw_tool_finished = false;
-        let mut saw_completion = false;
-        for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::ToolStarted { name, .. } => {
-                    assert_eq!(name, "ping");
-                    saw_tool_started = true;
-                }
-                Action::ToolFinished { success, name, .. } => {
-                    assert_eq!(name, "ping");
-                    assert!(success);
-                    saw_tool_finished = true;
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("done"), "want 'done' got {final_text:?}");
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should not fail in happy path: {err}")
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_tool_started, "must see ToolStarted");
-        assert!(saw_tool_finished, "must see ToolFinished");
-        assert!(saw_completion, "must see StreamCompleted");
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -7688,56 +7891,74 @@ mod real_mode_tests {
             second_history: Arc::clone(&second_history),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
-        let executor = EffectExecutor::new_with_deps(deps);
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-reasoning-tool-history".into(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-reasoning-tool-history",
+                    "stream the fixture reply",
+                    true,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("done"));
-                    break;
-                }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
-                _ => {}
-            }
-        }
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-reasoning-tool-history".into(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        let history = second_history.lock().clone().expect("second request history captured");
-        let assistant = history
-            .iter()
-            .find(|message| message.role == "assistant")
-            .expect("assistant tool-call history expected");
-        let value: serde_json::Value = serde_json::from_str(&assistant.content).expect("assistant payload JSON");
-        assert_eq!(
-            value.get("reasoning_content").and_then(serde_json::Value::as_str),
-            Some("Need to call ping.")
-        );
-        let call_id = value
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|calls| calls.first())
-            .and_then(|call| call.get("id"))
-            .and_then(serde_json::Value::as_str);
-        assert_eq!(call_id, Some("call-ping"));
+                for _ in 0..32 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("done"));
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                        _ => {}
+                    }
+                }
+
+                let history = second_history.lock().clone().expect("second request history captured");
+                let assistant = history
+                    .iter()
+                    .find(|message| message.role == "assistant")
+                    .expect("assistant tool-call history expected");
+                let value: serde_json::Value =
+                    serde_json::from_str(&assistant.content).expect("assistant payload JSON");
+                assert_eq!(
+                    value.get("reasoning_content").and_then(serde_json::Value::as_str),
+                    Some("Need to call ping.")
+                );
+                let call_id = value
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|calls| calls.first())
+                    .and_then(|call| call.get("id"))
+                    .and_then(serde_json::Value::as_str);
+                assert_eq!(call_id, Some("call-ping"));
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **S3 T3-1 Step 3**: context overflow → automatic compact + retry while making progress → success.
@@ -7808,54 +8029,66 @@ mod real_mode_tests {
         deps.provider = Arc::new(OverflowOnceProvider {
             counter: Arc::new(AtomicUsize::new(0)),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-overflow".into(),
-                history: (0..30)
-                    .map(|index| crate::providers::traits::ChatMessage {
-                        role: "user".into(),
-                        content: format!("history turn {index}"),
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let binding = admit_start_turn_fixture(&fixture_deps, "draft-overflow", "history turn 29", false)
+                    .await
+                    .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-overflow".into(),
+                        history: (0..30)
+                            .map(|index| crate::providers::traits::ChatMessage {
+                                role: "user".into(),
+                                content: format!("history turn {index}"),
+                            })
+                            .collect(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
                     })
-                    .collect(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
+                    .await;
 
-        let mut saw_compacted = false;
-        let mut saw_completion = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompacted {
-                    reason: crate::chat::action::CompactReason::ContextOverflow,
-                } => {
-                    saw_compacted = true;
+                let mut saw_compacted = false;
+                let mut saw_completion = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompacted {
+                            reason: crate::chat::action::CompactReason::ContextOverflow,
+                        } => {
+                            saw_compacted = true;
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("recovered"), "want 'recovered' got {final_text:?}");
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should retry on overflow, not fail: {err}");
+                        }
+                        _ => {}
+                    }
                 }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("recovered"), "want 'recovered' got {final_text:?}");
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should retry on overflow, not fail: {err}");
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_compacted, "must emit HistoryCompacted on overflow");
-        assert!(saw_completion, "must complete after compact+retry");
+                assert!(saw_compacted, "must emit HistoryCompacted on overflow");
+                assert!(saw_completion, "must complete after compact+retry");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// A `switch` preflight that cannot resolve provenance answers the turn on a
@@ -7912,74 +8145,97 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(PlainProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
-        // Switch mode with no durable transcript scope: provenance can never
-        // resolve, so the rollover produces no patch at all.
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Switch,
-            reserve_tokens: 10,
-            keep_recent_messages: 2,
-            memory_flush: false,
-            max_context_tokens: 160,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..24 {
-            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
-        }
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                // Switch mode with no durable transcript scope: provenance can never
+                // resolve, so the rollover produces no patch at all.
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Switch,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 2,
+                    memory_flush: false,
+                    max_context_tokens: 160,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..24 {
+                    history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+                }
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-switch-degraded".into(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut dropped = None;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-switch-degraded",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompactionDegraded { dropped_messages, .. } => dropped = Some(dropped_messages),
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("answered anyway"), "got {final_text:?}");
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("degrading must not end the turn: {err}")
-                }
-                _ => {}
-            }
-        }
-        let dropped = dropped.expect("a lossy switch fallback must announce itself to the user");
-        assert!(dropped > 0, "the notice must report the messages the trim removed");
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-switch-degraded".into(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        // The reducer turns that action into exactly one visible line.
-        let mut reducer_state =
-            crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-        let effects = reducer_state.reduce(Action::HistoryCompactionDegraded {
-            reason: crate::chat::action::CompactReason::ContextOverflow,
-            dropped_messages: dropped,
-        });
-        assert!(
-            effects.iter().any(|effect| matches!(
-                effect,
-                crate::chat::state::Effect::SurfaceNotice { text } if text.contains("lossy")
-            )),
-            "the degradation action must reach the user as a notice"
-        );
+                let mut dropped = None;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompactionDegraded { dropped_messages, .. } => dropped = Some(dropped_messages),
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("answered anyway"), "got {final_text:?}");
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("degrading must not end the turn: {err}")
+                        }
+                        _ => {}
+                    }
+                }
+                let dropped = dropped.expect("a lossy switch fallback must announce itself to the user");
+                assert!(dropped > 0, "the notice must report the messages the trim removed");
+
+                // The reducer turns that action into exactly one visible line.
+                let mut reducer_state =
+                    crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+                let effects = reducer_state.reduce(Action::HistoryCompactionDegraded {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                    dropped_messages: dropped,
+                });
+                assert!(
+                    effects.iter().any(|effect| matches!(
+                        effect,
+                        crate::chat::state::Effect::SurfaceNotice { text } if text.contains("lossy")
+                    )),
+                    "the degradation action must reach the user as a notice"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -8061,109 +8317,132 @@ mod real_mode_tests {
             summary_calls: Arc::clone(&summary_calls),
             first_history: Arc::clone(&first_history),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
-            reserve_tokens: 10,
-            keep_recent_messages: 2,
-            memory_flush: false,
-            max_context_tokens: 160,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..24 {
-            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
-        }
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Safeguard,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 2,
+                    memory_flush: false,
+                    max_context_tokens: 160,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..24 {
+                    history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+                }
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-budget-preflight".into(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_summary_patch = false;
-        let mut saw_feedback = false;
-        let mut saw_context_update = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-budget-preflight",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompactionPatchApplied { patch, .. } => {
-                    saw_summary_patch = true;
-                    assert!(
-                        patch
-                            .replacement
-                            .iter()
-                            .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
-                        "summary patch must carry provider summary marker"
-                    );
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-budget-preflight".into(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                let mut saw_summary_patch = false;
+                let mut saw_feedback = false;
+                let mut saw_context_update = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { patch, .. } => {
+                            saw_summary_patch = true;
+                            assert!(
+                                patch
+                                    .replacement
+                                    .iter()
+                                    .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
+                                "summary patch must carry provider summary marker"
+                            );
+                        }
+                        Action::HistoryCompacted { .. } => {
+                            panic!("preflight summary path must not dispatch lossy HistoryCompacted");
+                        }
+                        Action::ContextWindowUpdated {
+                            used_context_tokens: Some(used),
+                            max_context_tokens: Some(max),
+                        } => {
+                            saw_context_update = true;
+                            assert_eq!(max, 160);
+                            assert!(
+                                used <= 150,
+                                "context window update must reflect compacted budget: {used}"
+                            );
+                        }
+                        Action::SystemMessageAdded { text } => {
+                            saw_feedback = true;
+                            assert!(
+                                text.contains("Compacted context") || text.contains("Context already compact"),
+                                "preflight feedback should describe compaction result: {text}"
+                            );
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("budget-ok"));
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                        _ => {}
+                    }
                 }
-                Action::HistoryCompacted { .. } => {
-                    panic!("preflight summary path must not dispatch lossy HistoryCompacted");
-                }
-                Action::ContextWindowUpdated {
-                    used_context_tokens: Some(used),
-                    max_context_tokens: Some(max),
-                } => {
-                    saw_context_update = true;
-                    assert_eq!(max, 160);
-                    assert!(
-                        used <= 150,
-                        "context window update must reflect compacted budget: {used}"
-                    );
-                }
-                Action::SystemMessageAdded { text } => {
-                    saw_feedback = true;
-                    assert!(
-                        text.contains("Compacted context") || text.contains("Context already compact"),
-                        "preflight feedback should describe compaction result: {text}"
-                    );
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("budget-ok"));
-                    break;
-                }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
-                _ => {}
-            }
-        }
-        assert!(saw_summary_patch, "preflight must dispatch exact summary patch");
-        assert!(saw_feedback, "preflight must dispatch user-visible compact feedback");
-        assert!(
-            saw_context_update,
-            "preflight must update context-window UI metadata after compaction"
-        );
-        assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
-        let captured = first_history.lock().clone().expect("first stream history");
-        assert!(
-            captured
-                .iter()
-                .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
-            "first stream request must contain provider summary marker"
-        );
-        assert!(
-            captured
-                .iter()
-                .all(|message| !message.content.contains("compact-in-place")),
-            "first stream request must not contain old lossy compact marker"
-        );
-        assert!(
-            first_tokens.load(AtomicOrdering::SeqCst) <= 150,
-            "redux first provider call must be below literal hard limit 150 tokens"
-        );
+                assert!(saw_summary_patch, "preflight must dispatch exact summary patch");
+                assert!(saw_feedback, "preflight must dispatch user-visible compact feedback");
+                assert!(
+                    saw_context_update,
+                    "preflight must update context-window UI metadata after compaction"
+                );
+                assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
+                let captured = first_history.lock().clone().expect("first stream history");
+                assert!(
+                    captured
+                        .iter()
+                        .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
+                    "first stream request must contain provider summary marker"
+                );
+                assert!(
+                    captured
+                        .iter()
+                        .all(|message| !message.content.contains("compact-in-place")),
+                    "first stream request must not contain old lossy compact marker"
+                );
+                assert!(
+                    first_tokens.load(AtomicOrdering::SeqCst) <= 150,
+                    "redux first provider call must be below literal hard limit 150 tokens"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -8320,64 +8599,89 @@ mod real_mode_tests {
             summary_calls: Arc::clone(&summary_calls),
             streamed_history: Arc::clone(&streamed_history),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-resume-compacted".to_string(),
-                history: resumed.session.history.clone(),
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_completion = false;
-        for _ in 0..8 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-resume-compacted",
+                    resumed
+                        .session
+                        .history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original resumed user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("driver action should arrive");
-            match action {
-                Action::HistoryCompactionPatchApplied { .. } => {
-                    panic!("resumed compacted history must not dispatch another summary patch");
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("resume-ok"));
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
-                _ => {}
-            }
-        }
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-resume-compacted".to_string(),
+                        history: resumed.session.history.clone(),
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        assert!(
-            saw_completion,
-            "driver must stream normally from compacted resume history"
-        );
-        assert_eq!(
-            summary_calls.load(AtomicOrdering::SeqCst),
-            0,
-            "resuming an already-compacted session must not invoke the summarizer again"
-        );
-        let streamed = streamed_history
-            .lock()
-            .clone()
-            .expect("provider-bound history should be captured");
-        assert_eq!(
-            streamed
-                .iter()
-                .map(|message| (message.role.as_str(), message.content.as_str()))
-                .collect::<Vec<_>>(),
-            resumed_pairs,
-            "provider should receive the compacted resume shape"
-        );
+                let mut saw_completion = false;
+                for _ in 0..8 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("driver action should arrive");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { .. } => {
+                            panic!("resumed compacted history must not dispatch another summary patch");
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("resume-ok"));
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                        _ => {}
+                    }
+                }
+
+                assert!(
+                    saw_completion,
+                    "driver must stream normally from compacted resume history"
+                );
+                assert_eq!(
+                    summary_calls.load(AtomicOrdering::SeqCst),
+                    0,
+                    "resuming an already-compacted session must not invoke the summarizer again"
+                );
+                let streamed = streamed_history
+                    .lock()
+                    .clone()
+                    .expect("provider-bound history should be captured");
+                assert_eq!(
+                    streamed
+                        .iter()
+                        .map(|message| (message.role.as_str(), message.content.as_str()))
+                        .collect::<Vec<_>>(),
+                    resumed_pairs,
+                    "provider should receive the compacted resume shape"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -8449,79 +8753,102 @@ mod real_mode_tests {
         deps.provider = Arc::new(CaptureStreamProvider {
             captured_history: Arc::clone(&captured_history),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
-            reserve_tokens: 10,
-            keep_recent_messages: 1,
-            memory_flush: false,
-            max_context_tokens: 180,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..24 {
-            history.push(PMsg::user(format!("old turn {i} {}", "long context ".repeat(40))));
-        }
-        history.push(PMsg::user(current_question));
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Safeguard,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 1,
+                    memory_flush: false,
+                    max_context_tokens: 180,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..24 {
+                    history.push(PMsg::user(format!("old turn {i} {}", "long context ".repeat(40))));
+                }
+                history.push(PMsg::user(current_question));
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-iss-037-redux".to_string(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_summary_patch = false;
-        let mut saw_completion = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-iss-037-redux",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("driver action should arrive");
-            match action {
-                Action::HistoryCompactionPatchApplied { .. } => {
-                    saw_summary_patch = true;
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(
-                        final_text.contains(current_question),
-                        "assistant response must be bound to the real current user question"
-                    );
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
-                _ => {}
-            }
-        }
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-iss-037-redux".to_string(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        assert!(saw_summary_patch, "preflight must apply a summary compaction patch");
-        assert!(saw_completion, "driver must complete");
-        let captured = captured_history
-            .lock()
-            .clone()
-            .expect("provider-bound history should be captured");
-        let last = captured.last().expect("provider-bound history should not be empty");
-        assert_eq!(last.role, "user");
-        assert_eq!(last.content, current_question);
-        let refresh_index = captured
-            .iter()
-            .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
-            .expect("refresh marker should be present");
-        assert!(
-            refresh_index + 1 < captured.len(),
-            "refresh marker must not be the trailing provider-bound message"
-        );
+                let mut saw_summary_patch = false;
+                let mut saw_completion = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("driver action should arrive");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { .. } => {
+                            saw_summary_patch = true;
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(
+                                final_text.contains(current_question),
+                                "assistant response must be bound to the real current user question"
+                            );
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                        _ => {}
+                    }
+                }
+
+                assert!(saw_summary_patch, "preflight must apply a summary compaction patch");
+                assert!(saw_completion, "driver must complete");
+                let captured = captured_history
+                    .lock()
+                    .clone()
+                    .expect("provider-bound history should be captured");
+                let last = captured.last().expect("provider-bound history should not be empty");
+                assert_eq!(last.role, "user");
+                assert_eq!(last.content, current_question);
+                let refresh_index = captured
+                    .iter()
+                    .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
+                    .expect("refresh marker should be present");
+                assert!(
+                    refresh_index + 1 < captured.len(),
+                    "refresh marker must not be the trailing provider-bound message"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -9334,81 +9661,104 @@ mod real_mode_tests {
             first_tokens: Arc::clone(&first_tokens),
             summary_calls: Arc::clone(&summary_calls),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Off,
-            reserve_tokens: 10,
-            keep_recent_messages: 2,
-            memory_flush: false,
-            max_context_tokens: 120,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..24 {
-            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
-        }
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Off,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 2,
+                    memory_flush: false,
+                    max_context_tokens: 120,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..24 {
+                    history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+                }
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-budget-off-preflight".into(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_history_compacted = false;
-        let mut saw_summary_patch = false;
-        let mut saw_completion = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-budget-off-preflight",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompacted { .. } => {
-                    saw_history_compacted = true;
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-budget-off-preflight".into(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                let mut saw_history_compacted = false;
+                let mut saw_summary_patch = false;
+                let mut saw_completion = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompacted { .. } => {
+                            saw_history_compacted = true;
+                        }
+                        Action::HistoryCompactionPatchApplied { .. } => {
+                            saw_summary_patch = true;
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("off-budget-ok"));
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should trim in Off mode before stream request, not fail: {err}");
+                        }
+                        _ => {}
+                    }
                 }
-                Action::HistoryCompactionPatchApplied { .. } => {
-                    saw_summary_patch = true;
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("off-budget-ok"));
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should trim in Off mode before stream request, not fail: {err}");
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            saw_completion,
-            "driver must complete after Off-mode trim-only preflight"
-        );
-        assert!(
-            !saw_history_compacted,
-            "Off mode must not dispatch HistoryCompacted because reducer compacts lossy"
-        );
-        assert!(!saw_summary_patch, "Off mode must not dispatch summary patch action");
-        assert_eq!(
-            summary_calls.load(AtomicOrdering::SeqCst),
-            0,
-            "Off mode must not call summarizer"
-        );
-        assert!(
-            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
-            "Off-mode first provider call must be below literal hard limit 110 tokens"
-        );
+                assert!(
+                    saw_completion,
+                    "driver must complete after Off-mode trim-only preflight"
+                );
+                assert!(
+                    !saw_history_compacted,
+                    "Off mode must not dispatch HistoryCompacted because reducer compacts lossy"
+                );
+                assert!(!saw_summary_patch, "Off mode must not dispatch summary patch action");
+                assert_eq!(
+                    summary_calls.load(AtomicOrdering::SeqCst),
+                    0,
+                    "Off mode must not call summarizer"
+                );
+                assert!(
+                    first_tokens.load(AtomicOrdering::SeqCst) <= 110,
+                    "Off-mode first provider call must be below literal hard limit 110 tokens"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -9479,78 +9829,101 @@ mod real_mode_tests {
             first_tokens: Arc::clone(&first_tokens),
             summary_calls: Arc::clone(&summary_calls),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
-            reserve_tokens: 10,
-            keep_recent_messages: 2,
-            memory_flush: false,
-            max_context_tokens: 120,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..24 {
-            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
-        }
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Safeguard,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 2,
+                    memory_flush: false,
+                    max_context_tokens: 120,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..24 {
+                    history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+                }
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-summary-failure".into(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_local_guard_patch = false;
-        let mut saw_completion = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-summary-failure",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompactionPatchApplied { patch, .. } => {
-                    saw_local_guard_patch = patch.replacement.iter().any(|message| {
-                        message
-                            .content
-                            .contains("Summary unavailable; compacted conservatively.")
-                    });
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("trim-fallback-ok"));
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should fail soft to trim: {err}")
-                }
-                _ => {}
-            }
-        }
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-summary-failure".into(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        assert!(saw_completion, "driver must complete after summary failure trim");
-        assert!(
-            saw_local_guard_patch,
-            "summary failure must dispatch the deterministic local guard patch"
-        );
-        assert_eq!(
-            summary_calls.load(AtomicOrdering::SeqCst),
-            2,
-            "Safeguard mode must stop requesting summaries once compaction cannot progress"
-        );
-        assert!(
-            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
-            "summary failure fallback must stream under literal hard limit 110"
-        );
+                let mut saw_local_guard_patch = false;
+                let mut saw_completion = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { patch, .. } => {
+                            saw_local_guard_patch = patch.replacement.iter().any(|message| {
+                                message
+                                    .content
+                                    .contains("Summary unavailable; compacted conservatively.")
+                            });
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("trim-fallback-ok"));
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should fail soft to trim: {err}")
+                        }
+                        _ => {}
+                    }
+                }
+
+                assert!(saw_completion, "driver must complete after summary failure trim");
+                assert!(
+                    saw_local_guard_patch,
+                    "summary failure must dispatch the deterministic local guard patch"
+                );
+                assert_eq!(
+                    summary_calls.load(AtomicOrdering::SeqCst),
+                    2,
+                    "Safeguard mode must stop requesting summaries once compaction cannot progress"
+                );
+                assert!(
+                    first_tokens.load(AtomicOrdering::SeqCst) <= 110,
+                    "summary failure fallback must stream under literal hard limit 110"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     #[tokio::test]
@@ -9632,110 +10005,133 @@ mod real_mode_tests {
             summary_calls: Arc::clone(&summary_calls),
             retry_history: Arc::clone(&retry_history),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
-            reserve_tokens: 10,
-            keep_recent_messages: 2,
-            memory_flush: false,
-            max_context_tokens: 2_500,
-            max_context_tokens_explicit: true,
-            ..crate::config::AgentCompactionConfig::default()
-        };
-        let mut history = vec![PMsg::system("sys")];
-        for i in 0..12 {
-            history.push(PMsg::user(format!("turn {i} {}", "overflow context ".repeat(18))));
-        }
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Safeguard,
+                    reserve_tokens: 10,
+                    keep_recent_messages: 2,
+                    memory_flush: false,
+                    max_context_tokens: 2_500,
+                    max_context_tokens_explicit: true,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let mut history = vec![PMsg::system("sys")];
+                for i in 0..12 {
+                    history.push(PMsg::user(format!("turn {i} {}", "overflow context ".repeat(18))));
+                }
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-overflow-summary".into(),
-                history,
-                compaction_guard_history: None,
-                compaction_config: Some(config),
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
-
-        let mut saw_summary_patch = false;
-        let mut saw_feedback = false;
-        let mut saw_context_update = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                let binding = admit_start_turn_fixture(
+                    &fixture_deps,
+                    "draft-overflow-summary",
+                    history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "user")
+                        .expect("original user input")
+                        .content
+                        .as_str(),
+                    false,
+                )
                 .await
-                .expect("driver action within 2s")
-                .expect("must arrive");
-            match action {
-                Action::HistoryCompactionPatchApplied { patch, .. } => {
-                    saw_summary_patch = true;
-                    assert!(
-                        patch
-                            .replacement
-                            .iter()
-                            .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
-                        "overflow retry patch must carry provider summary"
-                    );
-                }
-                Action::HistoryCompacted { .. } => {
-                    panic!("overflow retry with config must not use lossy HistoryCompacted");
-                }
-                Action::ContextWindowUpdated {
-                    used_context_tokens: Some(used),
-                    max_context_tokens: Some(max),
-                } => {
-                    saw_context_update = true;
-                    assert_eq!(max, 2_500);
-                    assert!(
-                        used <= 2_490,
-                        "overflow context window update should use compacted history: {used}"
-                    );
-                }
-                Action::SystemMessageAdded { text } => {
-                    saw_feedback = true;
-                    assert!(
-                        text.contains("Compacted context") || text.contains("Context already compact"),
-                        "overflow feedback should describe compaction result: {text}"
-                    );
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("summary-retry-ok"));
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should recover after summary retry: {err}")
-                }
-                _ => {}
-            }
-        }
+                .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-overflow-summary".into(),
+                        history,
+                        compaction_guard_history: None,
+                        compaction_config: Some(config),
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        assert!(saw_summary_patch, "overflow retry must dispatch exact summary patch");
-        assert!(
-            saw_feedback,
-            "overflow retry must dispatch user-visible compact feedback"
-        );
-        assert!(
-            saw_context_update,
-            "overflow retry must update context-window UI metadata after mid-turn compaction"
-        );
-        assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(
-            stream_calls.load(AtomicOrdering::SeqCst),
-            2,
-            "this fixture should recover on its first progress-making retry"
-        );
-        let retry = retry_history.lock().clone().expect("retry history");
-        assert!(
-            retry
-                .iter()
-                .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
-            "retry provider request must include summary"
-        );
+                let mut saw_summary_patch = false;
+                let mut saw_feedback = false;
+                let mut saw_context_update = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("driver action within 2s")
+                        .expect("must arrive");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { patch, .. } => {
+                            saw_summary_patch = true;
+                            assert!(
+                                patch
+                                    .replacement
+                                    .iter()
+                                    .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
+                                "overflow retry patch must carry provider summary"
+                            );
+                        }
+                        Action::HistoryCompacted { .. } => {
+                            panic!("overflow retry with config must not use lossy HistoryCompacted");
+                        }
+                        Action::ContextWindowUpdated {
+                            used_context_tokens: Some(used),
+                            max_context_tokens: Some(max),
+                        } => {
+                            saw_context_update = true;
+                            assert_eq!(max, 2_500);
+                            assert!(
+                                used <= 2_490,
+                                "overflow context window update should use compacted history: {used}"
+                            );
+                        }
+                        Action::SystemMessageAdded { text } => {
+                            saw_feedback = true;
+                            assert!(
+                                text.contains("Compacted context") || text.contains("Context already compact"),
+                                "overflow feedback should describe compaction result: {text}"
+                            );
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("summary-retry-ok"));
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should recover after summary retry: {err}")
+                        }
+                        _ => {}
+                    }
+                }
+
+                assert!(saw_summary_patch, "overflow retry must dispatch exact summary patch");
+                assert!(
+                    saw_feedback,
+                    "overflow retry must dispatch user-visible compact feedback"
+                );
+                assert!(
+                    saw_context_update,
+                    "overflow retry must update context-window UI metadata after mid-turn compaction"
+                );
+                assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(
+                    stream_calls.load(AtomicOrdering::SeqCst),
+                    2,
+                    "this fixture should recover on its first progress-making retry"
+                );
+                let retry = retry_history.lock().clone().expect("retry history");
+                assert!(
+                    retry
+                        .iter()
+                        .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
+                    "retry provider request must include summary"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **S3 T3-1 Step 3**: more than one context overflow retry → StreamFailed.
@@ -9788,42 +10184,54 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(AlwaysOverflowProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-overflow-fail".into(),
-                history: vec![crate::providers::traits::ChatMessage {
-                    role: "user".into(),
-                    content: "x".repeat(1000),
-                }],
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let binding = admit_start_turn_fixture(&fixture_deps, "draft-overflow-fail", &"x".repeat(1000), false)
+                    .await
+                    .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-overflow-fail".into(),
+                        history: vec![crate::providers::traits::ChatMessage {
+                            role: "user".into(),
+                            content: "x".repeat(1000),
+                        }],
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        let mut saw_failed = false;
-        for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("action within 2s")
-                .expect("must arrive");
-            if let Action::StreamFailed { err, .. } = &action {
-                assert!(
-                    err.contains("context overflow") || err.contains("context_length_exceeded"),
-                    "err must mention overflow: {err}"
-                );
-                saw_failed = true;
-                break;
-            }
-        }
-        assert!(saw_failed, "must emit StreamFailed after overflow retries exhausted");
+                let mut saw_failed = false;
+                for _ in 0..16 {
+                    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                        .await
+                        .expect("action within 2s")
+                        .expect("must arrive");
+                    if let Action::StreamFailed { err, .. } = &action {
+                        assert!(
+                            err.contains("context overflow") || err.contains("context_length_exceeded"),
+                            "err must mention overflow: {err}"
+                        );
+                        saw_failed = true;
+                        break;
+                    }
+                }
+                assert!(saw_failed, "must emit StreamFailed after overflow retries exhausted");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **S3 T3-1 Step 4**: basic ApprovalRouter resolve / register path.
@@ -9933,107 +10341,120 @@ mod real_mode_tests {
         // test interceptor: when it sees `Action::ToolApprovalRequested` it calls router.resolve(true)
         // itself, simulating the end-to-end auto-approve behaviour of dispatcher_task + the EffectExecutor stub.
         let router_for_resolve = Arc::clone(&deps.approval_router);
-        let executor = EffectExecutor::new_with_deps(deps);
-        let shutdown_d = CancellationToken::new();
-        let (sink_tx, mut sink_rx) = mpsc::channel::<Action>(64);
-        let router_handle = Arc::clone(&router_for_resolve);
-        let shutdown_clone = shutdown_d.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = shutdown_clone.cancelled() => break,
-                    maybe = action_rx.recv() => {
-                        match maybe {
-                            Some(action) => {
-                                if let Action::ToolApprovalRequested { tool_id, .. } = &action {
-                                    router_handle.resolve(tool_id, true);
-                                    // simulate the stub sending ToolApprovalReceived back to the observer:
-                                    let _ = sink_tx
-                                        .send(Action::ToolApprovalReceived {
-                                            tool_id: tool_id.clone(),
-                                            approved: true,
-                                        })
-                                        .await;
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let shutdown_d = CancellationToken::new();
+                let (sink_tx, mut sink_rx) = mpsc::channel::<Action>(64);
+                let router_handle = Arc::clone(&router_for_resolve);
+                let shutdown_clone = shutdown_d.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            () = shutdown_clone.cancelled() => break,
+                            maybe = action_rx.recv() => {
+                                match maybe {
+                                    Some(action) => {
+                                        if let Action::ToolApprovalRequested { tool_id, .. } = &action {
+                                            router_handle.resolve(tool_id, true);
+                                            // simulate the stub sending ToolApprovalReceived back to the observer:
+                                            let _ = sink_tx
+                                                .send(Action::ToolApprovalReceived {
+                                                    tool_id: tool_id.clone(),
+                                                    approved: true,
+                                                })
+                                                .await;
+                                        }
+                                        let _ = sink_tx.send(action).await;
+                                    }
+                                    None => break,
                                 }
-                                let _ = sink_tx.send(action).await;
                             }
-                            None => break,
                         }
                     }
-                }
-            }
-        });
+                });
 
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-approval".into(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-approval", "stream the fixture reply", true)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-approval".into(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
+
+                let mut saw_request = false;
+                let mut saw_received = false;
+                let mut saw_tool_started = false;
+                let mut saw_tool_finished = false;
+                let mut saw_completion = false;
+                for _ in 0..32 {
+                    let action = tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
+                        .await
+                        .expect("action within 3s")
+                        .expect("must arrive");
+                    match action {
+                        Action::ToolApprovalRequested { tool_id, name, .. } => {
+                            assert_eq!(tool_id, "call-shell");
+                            assert_eq!(name, "shell");
+                            saw_request = true;
+                        }
+                        Action::ToolApprovalReceived { tool_id, approved } => {
+                            assert_eq!(tool_id, "call-shell");
+                            assert!(approved, "stub should auto-approve");
+                            saw_received = true;
+                        }
+                        Action::ToolStarted { name, .. } => {
+                            assert_eq!(name, "shell");
+                            saw_tool_started = true;
+                        }
+                        Action::ToolFinished { success, name, .. } => {
+                            assert_eq!(name, "shell");
+                            assert!(success);
+                            saw_tool_finished = true;
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("ok"));
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                        _ => {}
+                    }
+                }
+                shutdown_d.cancel();
+                assert!(saw_request, "must see ToolApprovalRequested");
+                assert!(saw_received, "must see ToolApprovalReceived");
+                assert!(saw_tool_started, "must see ToolStarted after approval");
+                assert!(saw_tool_finished, "must see ToolFinished after approval");
+                assert!(saw_completion, "must see StreamCompleted after approval");
+                let args = approved_arguments.lock().clone().unwrap_or_default();
+                assert_eq!(
+                    args.get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG),
+                    Some(&serde_json::Value::Bool(true))
+                );
+                assert!(
+                    args.get(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG).is_some(),
+                    "TUI approval strategy must inject the trusted command-bound grant"
+                );
+                Ok::<_, anyhow::Error>(())
             })
-            .await;
-
-        let mut saw_request = false;
-        let mut saw_received = false;
-        let mut saw_tool_started = false;
-        let mut saw_tool_finished = false;
-        let mut saw_completion = false;
-        for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
-                .await
-                .expect("action within 3s")
-                .expect("must arrive");
-            match action {
-                Action::ToolApprovalRequested { tool_id, name, .. } => {
-                    assert_eq!(tool_id, "call-shell");
-                    assert_eq!(name, "shell");
-                    saw_request = true;
-                }
-                Action::ToolApprovalReceived { tool_id, approved } => {
-                    assert_eq!(tool_id, "call-shell");
-                    assert!(approved, "stub should auto-approve");
-                    saw_received = true;
-                }
-                Action::ToolStarted { name, .. } => {
-                    assert_eq!(name, "shell");
-                    saw_tool_started = true;
-                }
-                Action::ToolFinished { success, name, .. } => {
-                    assert_eq!(name, "shell");
-                    assert!(success);
-                    saw_tool_finished = true;
-                }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("ok"));
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
-                _ => {}
-            }
-        }
-        shutdown_d.cancel();
-        assert!(saw_request, "must see ToolApprovalRequested");
-        assert!(saw_received, "must see ToolApprovalReceived");
-        assert!(saw_tool_started, "must see ToolStarted after approval");
-        assert!(saw_tool_finished, "must see ToolFinished after approval");
-        assert!(saw_completion, "must see StreamCompleted after approval");
-        let args = approved_arguments.lock().clone().unwrap_or_default();
-        assert_eq!(
-            args.get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert!(
-            args.get(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG).is_some(),
-            "TUI approval strategy must inject the trusted command-bound grant"
-        );
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// **S3 T3-1 Step 4**: approval rejected → the tool is not executed + ToolFinished(success=false, "User rejected").
@@ -10319,55 +10740,68 @@ mod real_mode_tests {
         deps.provider = Arc::new(FlakyProvider {
             counter: Arc::new(AtomicUsize::new(0)),
         });
-        let executor = EffectExecutor::new_with_deps(deps);
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-flaky".into(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let binding = admit_start_turn_fixture(&fixture_deps, "draft-flaky", "stream the fixture reply", false)
+                    .await
+                    .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-flaky".into(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        let mut retry_attempts: u8 = 0;
-        let mut saw_completion = false;
-        // total time budget: ~3.5s of real sleep + some RTT, with 8s of headroom.
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let action = match tokio::time::timeout(remaining.min(Duration::from_secs(4)), action_rx.recv()).await {
-                Ok(Some(a)) => a,
-                Ok(None) => break,
-                Err(_) => continue,
-            };
-            match action {
-                Action::StreamRetryAttempt { attempt, .. } => {
-                    retry_attempts = retry_attempts.max(attempt);
+                let mut retry_attempts: u8 = 0;
+                let mut saw_completion = false;
+                // total time budget: ~3.5s of real sleep + some RTT, with 8s of headroom.
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let action =
+                        match tokio::time::timeout(remaining.min(Duration::from_secs(4)), action_rx.recv()).await {
+                            Ok(Some(a)) => a,
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        };
+                    match action {
+                        Action::StreamRetryAttempt { attempt, .. } => {
+                            retry_attempts = retry_attempts.max(attempt);
+                        }
+                        Action::StreamCompleted { final_text, .. } => {
+                            assert!(final_text.contains("recovered"));
+                            saw_completion = true;
+                            break;
+                        }
+                        Action::StreamFailed { err, .. } => {
+                            panic!("driver should retry, not fail: {err}");
+                        }
+                        _ => {}
+                    }
                 }
-                Action::StreamCompleted { final_text, .. } => {
-                    assert!(final_text.contains("recovered"));
-                    saw_completion = true;
-                    break;
-                }
-                Action::StreamFailed { err, .. } => {
-                    panic!("driver should retry, not fail: {err}");
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            retry_attempts >= 1,
-            "must emit at least one StreamRetryAttempt (got {retry_attempts})"
-        );
-        assert!(saw_completion, "must complete after backoff retries");
+                assert!(
+                    retry_attempts >= 1,
+                    "must emit at least one StreamRetryAttempt (got {retry_attempts})"
+                );
+                assert!(saw_completion, "must complete after backoff retries");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     /// A network error after any model output is not safe to retry: replaying
@@ -10527,42 +10961,56 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(AlwaysIoErrProvider);
-        let executor = EffectExecutor::new_with_deps(deps);
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-net-fail".into(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: CancellationToken::new(),
-                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-                routing_input: None,
-                turn_binding: None,
-            })
-            .await;
+        let fixture_deps = deps.clone();
+        let fixture_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("Q42 fixture cleanup owner");
+        fixture_cleanup
+            .run(async {
+                let executor = EffectExecutor::new_with_deps(deps);
+                let binding =
+                    admit_start_turn_fixture(&fixture_deps, "draft-net-fail", "stream the fixture reply", false)
+                        .await
+                        .expect("Q42 genuine admission prerequisite");
+                executor
+                    .execute(Effect::StartTurn {
+                        provider_turn_task_id: None,
+                        draft_id: "draft-net-fail".into(),
+                        history: Vec::new(),
+                        compaction_guard_history: None,
+                        compaction_config: None,
+                        cancel: CancellationToken::new(),
+                        chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                        turn_spawn_ctx: None,
+                        turn_message_send_ctx: None,
+                        routing_input: None,
+                        turn_binding: Some(binding),
+                    })
+                    .await;
 
-        let mut saw_failed = false;
-        // backoff = 500ms + 1s + 2s = 3.5s + RTT, with 10s of headroom.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let action = match tokio::time::timeout(remaining.min(Duration::from_secs(5)), action_rx.recv()).await {
-                Ok(Some(a)) => a,
-                Ok(None) => break,
-                Err(_) => continue,
-            };
-            if let Action::StreamFailed { err, retryable, .. } = action {
-                assert!(!retryable, "exhausted retries must be non-retryable");
-                assert!(err.contains("network retries exhausted"), "err={err}");
-                saw_failed = true;
-                break;
-            }
-        }
-        assert!(saw_failed, "must emit StreamFailed after exhausting network retries");
+                let mut saw_failed = false;
+                // backoff = 500ms + 1s + 2s = 3.5s + RTT, with 10s of headroom.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let action =
+                        match tokio::time::timeout(remaining.min(Duration::from_secs(5)), action_rx.recv()).await {
+                            Ok(Some(a)) => a,
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        };
+                    if let Action::StreamFailed { err, retryable, .. } = action {
+                        assert!(!retryable, "exhausted retries must be non-retryable");
+                        assert!(err.contains("network retries exhausted"), "err={err}");
+                        saw_failed = true;
+                        break;
+                    }
+                }
+                assert!(saw_failed, "must emit StreamFailed after exhausting network retries");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     // ─── S2.5 T2.5-3: Effect replay idempotency tests ──────────────────────────

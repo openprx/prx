@@ -47,7 +47,7 @@ async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize) -> Rep
         assert!(ids.len() <= 128, "fixture must not truncate event evidence");
         ids
     }; // Close the read-only observer connection before awaiting the actual repository readback.
-    assert!(!event_ids.is_empty());
+    assert!(!event_ids.is_empty(), "expected a non-empty value");
     let mut events = Vec::new();
     for event_id in event_ids {
         let event = memory
@@ -417,7 +417,7 @@ fn verify_recovery(completed: bool) {
             .pointer("/terminal_replay_v1/store_workspace_id")
             .and_then(serde_json::Value::as_str)
             .expect("original store namespace");
-        assert!(!store.is_empty());
+        assert!(!store.is_empty(), "expected a non-empty value");
         assert_eq!(
             new.pointer("/terminal_replay_v1/store_workspace_id")
                 .and_then(serde_json::Value::as_str),

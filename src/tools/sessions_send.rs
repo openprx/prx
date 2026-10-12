@@ -352,7 +352,7 @@ mod tests {
         let runs = Arc::new(RwLock::new(Vec::new()));
         let tool = SessionsSendTool::new(runs);
         assert_eq!(tool.name(), "sessions_send");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[tokio::test]

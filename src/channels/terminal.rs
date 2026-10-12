@@ -1103,7 +1103,7 @@ mod tests {
         assert!(result.is_ok());
         let draft_id = result.unwrap();
         assert!(draft_id.is_some());
-        assert!(!draft_id.unwrap().is_empty());
+        assert!(!draft_id.unwrap().is_empty(), "expected a non-empty value");
     }
 
     #[tokio::test]

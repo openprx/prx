@@ -1059,8 +1059,8 @@ nickname = "bot"
         assert_eq!(parsed.port, 6697); // default
         assert_eq!(parsed.nickname, "bot");
         assert!(parsed.username.is_none());
-        assert!(parsed.channels.is_empty());
-        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.channels.is_empty(), "expected an empty value");
+        assert!(parsed.allowed_users.is_empty(), "expected an empty value");
         assert!(parsed.server_password.is_none());
         assert!(parsed.nickserv_password.is_none());
         assert!(parsed.sasl_password.is_none());

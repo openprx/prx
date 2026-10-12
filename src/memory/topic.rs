@@ -710,6 +710,6 @@ mod tests {
     fn search_topics_fts_rejects_short_or_unsafe_tokens() {
         let (_tmp, conn) = setup_conn();
         let result = search_topics_fts(&conn, "qa b :topic", 5).unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 }

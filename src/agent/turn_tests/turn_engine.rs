@@ -1076,6 +1076,15 @@ async fn a_loop_turn_records_its_provider_without_url_userinfo() {
 
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    config.cost.prices.insert(
+        "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1/mock-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
         config,
         &history.last().expect("source input").content,
@@ -1145,97 +1154,101 @@ async fn a_loop_turn_records_its_provider_without_url_userinfo() {
 
 #[tokio::test]
 async fn compiled_request_context_is_persisted_with_transcript_lineage_without_prompt_content() {
-    let tmp = TempDir::new().unwrap();
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-    let mut history = vec![
-        ChatMessage::system("private system instructions"),
-        ChatMessage::user("hello"),
-    ];
+    // Q52: evidence prerequisite only; preserve sensitive prompt exclusion and source lineage.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let mut history = vec![
+            ChatMessage::system("private system instructions"),
+            ChatMessage::user("hello"),
+        ];
 
-    let tools_registry = Arc::new(Vec::new());
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = tmp.path().to_path_buf();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        config,
-        &history.last().expect("source input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_selected_specs(&[]);
-    let runtime = admission.memory_runtime();
+        let tools_registry = Arc::new(Vec::new());
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            config,
+            &history.last().expect("source input").content,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        admission.assert_selected_specs(&[]);
+        let runtime = admission.memory_runtime();
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 1,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &ScriptedProvider::from_text_responses(vec!["done"]),
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .unwrap();
-    assert_eq!(result, "done");
+            crate::agent::turn_request::TurnServices {
+                provider: &ScriptedProvider::from_text_responses(vec!["done"]),
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .unwrap();
+        assert_eq!(result, "done");
 
-    let principal = admission.principal();
-    let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
-    let event = events
-        .iter()
-        .find(|event| event.event_type == "llm.request.context.compiled")
-        .expect("compiled request context event");
-    let source = events
-        .iter()
-        .find(|event| event.role == "user" && event.event_type == "message.created")
-        .expect("durable original user event");
-    assert!(source.id > 0);
-    assert_eq!(event.workspace_id, source.workspace_id);
-    assert_eq!(event.owner_id, source.owner_id);
-    assert_eq!(event.session_key, source.session_key);
-    assert_eq!(event.run_id, source.run_id);
-    assert_eq!(event.causation_event_id.as_deref(), Some(source.event_id.as_str()));
-    let payload: serde_json::Value =
-        serde_json::from_str(event.raw_payload_json.as_deref().expect("request context payload")).unwrap();
-    assert_eq!(payload["schema_version"], 1);
-    assert_eq!(payload["iteration"], 1);
-    assert_eq!(payload["tool_snapshot"]["count"], 0);
-    assert_eq!(payload["system_prompt"]["sha256"].as_str().map(str::len), Some(64));
-    assert!(
-        !event
-            .raw_payload_json
-            .as_deref()
-            .unwrap_or_default()
-            .contains("private system instructions"),
-        "durable provenance must not duplicate system prompt content"
-    );
+        let principal = admission.principal();
+        let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "llm.request.context.compiled")
+            .expect("compiled request context event");
+        let source = events
+            .iter()
+            .find(|event| event.role == "user" && event.event_type == "message.created")
+            .expect("durable original user event");
+        assert!(source.id > 0);
+        assert_eq!(event.workspace_id, source.workspace_id);
+        assert_eq!(event.owner_id, source.owner_id);
+        assert_eq!(event.session_key, source.session_key);
+        assert_eq!(event.run_id, source.run_id);
+        assert_eq!(event.causation_event_id.as_deref(), Some(source.event_id.as_str()));
+        let payload: serde_json::Value =
+            serde_json::from_str(event.raw_payload_json.as_deref().expect("request context payload")).unwrap();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["iteration"], 1);
+        assert_eq!(payload["tool_snapshot"]["count"], 0);
+        assert_eq!(payload["system_prompt"]["sha256"].as_str().map(str::len), Some(64));
+        assert!(
+            !event
+                .raw_payload_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("private system instructions"),
+            "durable provenance must not duplicate system prompt content"
+        );
+    })
+    .await;
 }
 
 /// Native tool schemas are part of the request the provider receives, so the
@@ -1244,125 +1257,129 @@ async fn compiled_request_context_is_persisted_with_transcript_lineage_without_p
 /// body, a prompt body or a tool argument.
 #[tokio::test]
 async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
-    let tmp = TempDir::new().unwrap();
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("wide_schema_probe"))];
-    let mut history = vec![
-        ChatMessage::system("compact system instructions"),
-        ChatMessage::user("Use wide_schema_probe."),
-    ];
+    // Q45: Compiled-request telemetry accounts for real prompt and schema sizes.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("wide_schema_probe"))];
+        let mut history = vec![
+            ChatMessage::system("compact system instructions"),
+            ChatMessage::user("Use wide_schema_probe."),
+        ];
 
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = tmp.path().to_path_buf();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        config,
-        &history.last().expect("source input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs_of(&tools_registry));
-    let runtime = admission.memory_runtime();
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            config,
+            &history.last().expect("source input").content,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+        let runtime = admission.memory_runtime();
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 1,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &NativeToolProvider::returning("done"),
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .unwrap();
-    assert_eq!(result, "done");
+            crate::agent::turn_request::TurnServices {
+                provider: &NativeToolProvider::returning("done"),
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .unwrap();
+        assert_eq!(result, "done");
 
-    let principal = admission.principal();
-    let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
-    let event = events
-        .iter()
-        .find(|event| event.event_type == "llm.request.context.compiled")
-        .expect("compiled request context event");
-    let raw = event.raw_payload_json.as_deref().expect("request context payload");
-    let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let principal = admission.principal();
+        let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "llm.request.context.compiled")
+            .expect("compiled request context event");
+        let raw = event.raw_payload_json.as_deref().expect("request context payload");
+        let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
 
-    // The admitted business tool and the search control both enter the request.
-    assert_eq!(payload["tool_snapshot"]["count"], 2);
-    assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
+        // The admitted business tool and the search control both enter the request.
+        assert_eq!(payload["tool_snapshot"]["count"], 2);
+        assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
 
-    let estimate = &payload["request_estimate"];
-    let messages_bytes = estimate["messages_bytes"].as_u64().expect("messages byte count");
-    let messages_chars = estimate["messages_chars"].as_u64().expect("messages char count");
-    let messages_tokens = estimate["messages_tokens"].as_u64().expect("messages token estimate");
-    let tool_bytes = estimate["native_tool_bytes"].as_u64().expect("native tool byte count");
-    let tool_tokens = estimate["native_tool_tokens"]
-        .as_u64()
-        .expect("native tool token estimate");
-    let total_tokens = estimate["total_tokens"].as_u64().expect("total request token estimate");
+        let estimate = &payload["request_estimate"];
+        let messages_bytes = estimate["messages_bytes"].as_u64().expect("messages byte count");
+        let messages_chars = estimate["messages_chars"].as_u64().expect("messages char count");
+        let messages_tokens = estimate["messages_tokens"].as_u64().expect("messages token estimate");
+        let tool_bytes = estimate["native_tool_bytes"].as_u64().expect("native tool byte count");
+        let tool_tokens = estimate["native_tool_tokens"]
+            .as_u64()
+            .expect("native tool token estimate");
+        let total_tokens = estimate["total_tokens"].as_u64().expect("total request token estimate");
 
-    assert!(messages_bytes > 0, "the prompt must be measured");
-    assert!(messages_chars > 0, "the prompt must be measured in characters too");
-    assert!(
-        messages_tokens > 0,
-        "the prompt token estimate must be deterministic and non-zero"
-    );
-    assert!(
-        tool_bytes > u64::try_from(WIDE_SCHEMA_TOOL_DESCRIPTION_CHARS).unwrap_or(u64::MAX),
-        "the serialized native tool payload must cover the whole schema, got {tool_bytes} bytes"
-    );
-    assert!(tool_tokens > 0, "the native tool payload must carry a token estimate");
-    assert_eq!(
-        total_tokens,
-        messages_tokens.saturating_add(tool_tokens),
-        "the reported total must be the prompt estimate plus the tool payload estimate"
-    );
-    assert_eq!(
-        estimate["token_source"].as_str(),
-        Some(if cfg!(feature = "llm-router") {
-            "cl100k_proxy"
-        } else {
-            "heuristic"
-        }),
-        "the event must name the estimator it used"
-    );
+        assert!(messages_bytes > 0, "the prompt must be measured");
+        assert!(messages_chars > 0, "the prompt must be measured in characters too");
+        assert!(
+            messages_tokens > 0,
+            "the prompt token estimate must be deterministic and non-zero"
+        );
+        assert!(
+            tool_bytes > u64::try_from(WIDE_SCHEMA_TOOL_DESCRIPTION_CHARS).unwrap_or(u64::MAX),
+            "the serialized native tool payload must cover the whole schema, got {tool_bytes} bytes"
+        );
+        assert!(tool_tokens > 0, "the native tool payload must carry a token estimate");
+        assert_eq!(
+            total_tokens,
+            messages_tokens.saturating_add(tool_tokens),
+            "the reported total must be the prompt estimate plus the tool payload estimate"
+        );
+        assert_eq!(
+            estimate["token_source"].as_str(),
+            Some(if cfg!(feature = "llm-router") {
+                "cl100k_proxy"
+            } else {
+                "heuristic"
+            }),
+            "the event must name the estimator it used"
+        );
 
-    assert!(
-        !raw.contains(WIDE_SCHEMA_TOOL_BODY_MARKER),
-        "durable provenance must not duplicate tool schema bodies"
-    );
-    assert!(
-        !raw.contains("compact system instructions"),
-        "durable provenance must not duplicate system prompt content"
-    );
+        assert!(
+            !raw.contains(WIDE_SCHEMA_TOOL_BODY_MARKER),
+            "durable provenance must not duplicate tool schema bodies"
+        );
+        assert!(
+            !raw.contains("compact system instructions"),
+            "durable provenance must not duplicate system prompt content"
+        );
+    })
+    .await;
 }
 
 /// Number of alias specs the MCP fixture publishes beside its root.
@@ -1429,14 +1446,6 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        config,
-        &history.last().expect("source input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    let runtime = admission.memory_runtime();
     let discovered = std::iter::once("mcp_call".to_owned())
         .chain((0..MCP_ALIAS_FIXTURE_ALIASES).map(|index| format!("mcp__fixture__alias_{index}")))
         .collect::<Vec<_>>();
@@ -1475,76 +1484,118 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
     ];
     rounds.extend(final_rounds);
     let provider = NativeScriptedProvider::new(rounds);
+    // All targeted fixture tools use native adapters with no filesystem/memory category.
+    // Driver validates an actual use_tool/native_tool candidate in the compiled request.
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_native_mechanics(
+                            config,
+                            &history.last().expect("source input").content,
+                            Arc::clone(&tools_registry),
+                            Arc::clone(&memory),
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let runtime = admission.memory_runtime();
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 1,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .unwrap();
-    assert_eq!(result, "done");
+                        let result = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 1,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: runtime,
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .map(|(outcome, _trace)| outcome.into_text())
+                        .unwrap();
+                        assert_eq!(result, "done");
 
-    let principal = admission.principal();
-    let events = memory.list_message_events_since(&principal, 0, 256).await.unwrap();
-    let event = events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == "llm.request.context.compiled")
-        .expect("compiled request context event");
-    let payload: serde_json::Value =
-        serde_json::from_str(event.raw_payload_json.as_deref().expect("request context payload")).unwrap();
+                        let principal = admission.principal();
+                        let events = memory.list_message_events_since(&principal, 0, 256).await.unwrap();
+                        let event = events
+                            .iter()
+                            .rev()
+                            .find(|event| event.event_type == "llm.request.context.compiled")
+                            .expect("compiled request context event");
+                        let payload: serde_json::Value =
+                            serde_json::from_str(event.raw_payload_json.as_deref().expect("request context payload"))
+                                .unwrap();
 
-    assert_eq!(payload["iteration"], 3, "measure the actual appended surface");
-    let alias_count = u64::try_from(MCP_ALIAS_FIXTURE_ALIASES).unwrap();
-    assert_eq!(payload["tool_snapshot"]["count"], 3 + alias_count);
-    let surface = &payload["tool_surface"];
-    assert_eq!(surface["registry_roots"], 3, "{surface}");
-    assert_eq!(surface["routed_roots"], 3, "{surface}");
-    assert_eq!(surface["published_specs"], 3 + alias_count, "{surface}");
-    assert_eq!(surface["by_adapter"]["native"], 3, "{surface}");
-    assert_eq!(surface["by_adapter"]["mcp_alias"], alias_count, "{surface}");
-    assert_eq!(surface["by_adapter"]["skill"], 0, "{surface}");
-    assert_eq!(surface["by_adapter"]["wasm"], 0, "{surface}");
-    let published = surface["published_specs"].as_u64().expect("published spec count");
-    let routed = surface["routed_roots"].as_u64().expect("routed root count");
-    assert_eq!(
-        published - routed,
-        surface["by_adapter"]["mcp_alias"].as_u64().expect("alias count"),
-        "with one alias-publishing root, the specs beyond the roots are exactly its aliases"
-    );
+                        assert_eq!(payload["iteration"], 3, "measure the actual appended surface");
+                        let alias_count = u64::try_from(MCP_ALIAS_FIXTURE_ALIASES).unwrap();
+                        assert_eq!(payload["tool_snapshot"]["count"], 3 + alias_count);
+                        let surface = &payload["tool_surface"];
+                        assert_eq!(surface["registry_roots"], 3, "{surface}");
+                        assert_eq!(surface["routed_roots"], 3, "{surface}");
+                        assert_eq!(surface["published_specs"], 3 + alias_count, "{surface}");
+                        assert_eq!(surface["by_adapter"]["native"], 3, "{surface}");
+                        assert_eq!(surface["by_adapter"]["mcp_alias"], alias_count, "{surface}");
+                        assert_eq!(surface["by_adapter"]["skill"], 0, "{surface}");
+                        assert_eq!(surface["by_adapter"]["wasm"], 0, "{surface}");
+                        let published = surface["published_specs"].as_u64().expect("published spec count");
+                        let routed = surface["routed_roots"].as_u64().expect("routed root count");
+                        assert_eq!(
+                            published - routed,
+                            surface["by_adapter"]["mcp_alias"].as_u64().expect("alias count"),
+                            "with one alias-publishing root, the specs beyond the roots are exactly its aliases"
+                        );
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 /// The compiled tool snapshot is rebuilt on every iteration so dynamic
@@ -1603,14 +1654,6 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        config,
-        &history.last().expect("source input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    let runtime = admission.memory_runtime();
     let discovered = ["mcp_probe", "automation_probe", "extra_probe"]
         .into_iter()
         .map(str::to_owned)
@@ -1645,99 +1688,140 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
     ];
     rounds.extend(final_rounds);
     let provider = NativeScriptedProvider::new(rounds);
+    // All targeted fixture tools use native adapters with no filesystem/memory category.
+    // Driver validates an actual use_tool/native_tool candidate in the compiled request.
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                            config,
+                            &history.last().expect("source input").content,
+                            Arc::clone(&tools_registry),
+                            Arc::clone(&memory),
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let runtime = admission.memory_runtime();
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("discovery followed by two stable iterations should complete");
-    assert_eq!(result, "done");
+                        let result = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: runtime,
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .map(|(outcome, _trace)| outcome.into_text())
+                        .expect("discovery followed by two stable iterations should complete");
+                        assert_eq!(result, "done");
 
-    let principal = admission.principal();
-    let events = memory.list_message_events_since(&principal, 0, 256).await.unwrap();
-    let mut payloads = events
-        .iter()
-        .filter(|event| event.event_type == "llm.request.context.compiled")
-        .filter_map(|event| event.raw_payload_json.as_deref())
-        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .collect::<Vec<_>>();
-    payloads.sort_by_key(|payload| payload["iteration"].as_u64().unwrap_or_default());
-    assert_eq!(payloads.len(), 4, "search, append and two stable iterations");
-    let payloads = &payloads[2..];
-    assert_eq!(payloads[0]["iteration"], 3);
-    assert_eq!(payloads[1]["iteration"], 4);
+                        let principal = admission.principal();
+                        let events = memory.list_message_events_since(&principal, 0, 256).await.unwrap();
+                        let mut payloads = events
+                            .iter()
+                            .filter(|event| event.event_type == "llm.request.context.compiled")
+                            .filter_map(|event| event.raw_payload_json.as_deref())
+                            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                            .collect::<Vec<_>>();
+                        payloads.sort_by_key(|payload| payload["iteration"].as_u64().unwrap_or_default());
+                        assert_eq!(payloads.len(), 4, "search, append and two stable iterations");
+                        let payloads = &payloads[2..];
+                        assert_eq!(payloads[0]["iteration"], 3);
+                        assert_eq!(payloads[1]["iteration"], 4);
 
-    assert_eq!(payloads[0]["tool_snapshot"]["count"], 5);
-    assert_eq!(
-        payloads[0]["tool_snapshot"]["sha256"], payloads[1]["tool_snapshot"]["sha256"],
-        "an unchanged tool set must fingerprint identically across iterations"
-    );
-    assert_eq!(
-        payloads[0]["system_prompt"]["sha256"], payloads[1]["system_prompt"]["sha256"],
-        "the system prefix must stay byte-identical across iterations of one turn"
-    );
-    assert_eq!(payloads[0]["tool_snapshot_render"]["hits"], 1);
-    assert_eq!(payloads[0]["tool_snapshot_render"]["misses"], 2);
-    assert_eq!(
-        payloads[1]["tool_snapshot_render"]["hits"], 2,
-        "iteration 4 must reuse iteration 3's rendered snapshot"
-    );
-    assert_eq!(
-        payloads[1]["tool_snapshot_render"]["misses"], 2,
-        "iteration 4 must not re-render or re-fingerprint the snapshot"
-    );
+                        assert_eq!(payloads[0]["tool_snapshot"]["count"], 5);
+                        assert_eq!(
+                            payloads[0]["tool_snapshot"]["sha256"], payloads[1]["tool_snapshot"]["sha256"],
+                            "an unchanged tool set must fingerprint identically across iterations"
+                        );
+                        assert_eq!(
+                            payloads[0]["system_prompt"]["sha256"], payloads[1]["system_prompt"]["sha256"],
+                            "the system prefix must stay byte-identical across iterations of one turn"
+                        );
+                        assert_eq!(payloads[0]["tool_snapshot_render"]["hits"], 1);
+                        assert_eq!(payloads[0]["tool_snapshot_render"]["misses"], 2);
+                        assert_eq!(
+                            payloads[1]["tool_snapshot_render"]["hits"], 2,
+                            "iteration 4 must reuse iteration 3's rendered snapshot"
+                        );
+                        assert_eq!(
+                            payloads[1]["tool_snapshot_render"]["misses"], 2,
+                            "iteration 4 must not re-render or re-fingerprint the snapshot"
+                        );
 
-    let names = payloads[0]["tool_snapshot"]["tools"]
-        .as_array()
-        .expect("test: fingerprinted tool list")
-        .iter()
-        .filter_map(|tool| tool["name"].as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        vec![
-            "capability_search",
-            "delay_progress",
-            "automation_probe",
-            "extra_probe",
-            "mcp_probe"
-        ],
-        "the sorted core stays first; discovered entries are sorted within the appended segment",
-    );
+                        let names = payloads[0]["tool_snapshot"]["tools"]
+                            .as_array()
+                            .expect("test: fingerprinted tool list")
+                            .iter()
+                            .filter_map(|tool| tool["name"].as_str())
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            names,
+                            vec![
+                                "capability_search",
+                                "delay_progress",
+                                "automation_probe",
+                                "extra_probe",
+                                "mcp_probe"
+                            ],
+                            "the sorted core stays first; discovered entries are sorted within the appended segment",
+                        );
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -1821,6 +1905,15 @@ async fn the_vision_refusal_names_the_provider_without_url_userinfo() {
     )];
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    config.cost.prices.insert(
+        "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1/mock-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
         config,
         &history.last().expect("source input").content,
@@ -1949,69 +2042,73 @@ async fn run_tool_call_loop_rejects_oversized_image_payload() {
 
 #[tokio::test]
 async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let provider = VisionProvider {
-        calls: Arc::clone(&calls),
-        expected_user_text: None,
-    };
+    // Q45: Valid image payload reaches the original vision provider once.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+            expected_user_text: None,
+        };
 
-    let mut history = vec![ChatMessage::user(
-        "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-    )];
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-    let observer = NoopObserver;
+        let mut history = vec![ChatMessage::user(
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
 
-    let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
-        &history.last().expect("source input").content,
-    )
-    .await;
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            // no document ingest
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let workspace = TempDir::new().expect("multimodal fixture workspace");
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+            workspace.path(),
+            &history.last().expect("source input").content,
+        )
+        .await;
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                // no document ingest
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(tools_registry),
-            observer: &observer,
-            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            // no tool tiering
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            // no scope context
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("valid multimodal payload should pass");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(tools_registry),
+                observer: &observer,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                // no tool tiering
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                // no scope context
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("valid multimodal payload should pass");
 
-    assert_eq!(result, "vision-ok");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result, "vision-ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    })
+    .await;
 }
 
 /// Production incident 2026-08-22: a WhatsApp session went permanently mute.
@@ -2022,146 +2119,154 @@ async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
 /// is missing.
 #[tokio::test]
 async fn quoted_image_marker_fossil_still_completes_the_turn() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let provider = PayloadCapturingProvider {
-        captured: Arc::clone(&captured),
-    };
+    // Q45: Quoted historical image marker does not alter current payload completion.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = PayloadCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
 
-    let live_question = "N: does wacli support sending files?";
-    let mut history = vec![ChatMessage::user(format!(
-        "[Current session context]\n\
-             - [assistant:prx] Media markers (`[IMAGE:...]` etc.) are not mapped to `wacli send file`.\n\n\
-             {live_question}"
-    ))];
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-    let observer = NoopObserver;
+        let live_question = "N: does wacli support sending files?";
+        let mut history = vec![ChatMessage::user(format!(
+            "[Current session context]\n\
+                 - [assistant:prx] Media markers (`[IMAGE:...]` etc.) are not mapped to `wacli send file`.\n\n\
+                 {live_question}"
+        ))];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
 
-    let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
-        &history.last().expect("source input").content,
-    )
-    .await;
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let workspace = TempDir::new().expect("multimodal fixture workspace");
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+            workspace.path(),
+            &history.last().expect("source input").content,
+        )
+        .await;
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(tools_registry),
-            observer: &observer,
-            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("a quoted marker fossil must not abort the turn");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(tools_registry),
+                observer: &observer,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("a quoted marker fossil must not abort the turn");
 
-    assert_eq!(result, "answered");
-    let payload = captured.lock().expect("captured payload").clone();
-    let user_text: String = payload
-        .iter()
-        .filter(|message| message.role == "user")
-        .map(|message| message.content.clone())
-        .collect();
-    assert!(
-        user_text.contains(live_question),
-        "the live question must reach the model: {user_text}"
-    );
+        assert_eq!(result, "answered");
+        let payload = captured.lock().expect("captured payload").clone();
+        let user_text: String = payload
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .collect();
+        assert!(
+            user_text.contains(live_question),
+            "the live question must reach the model: {user_text}"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn run_tool_call_loop_forwards_audio_transcript_with_image_payload() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let provider = VisionProvider {
-        calls: Arc::clone(&calls),
-        expected_user_text: Some("Audio transcript: the package label says fragile"),
-    };
+    // Q45: Audio transcript and image reach the original vision provider together.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+            expected_user_text: Some("Audio transcript: the package label says fragile"),
+        };
 
-    let mut history = vec![ChatMessage::user(
-        "Audio transcript: the package label says fragile\nAnalyze the attached image too \
-             [IMAGE:data:image/png;base64,iVBORw0KGgo=]"
-            .to_string(),
-    )];
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-    let observer = NoopObserver;
+        let mut history = vec![ChatMessage::user(
+            "Audio transcript: the package label says fragile\nAnalyze the attached image too \
+                 [IMAGE:data:image/png;base64,iVBORw0KGgo=]"
+                .to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
 
-    let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
-        &history.last().expect("source input").content,
-    )
-    .await;
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            // no document ingest
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let workspace = TempDir::new().expect("multimodal fixture workspace");
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+            workspace.path(),
+            &history.last().expect("source input").content,
+        )
+        .await;
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                // no document ingest
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(tools_registry),
-            observer: &observer,
-            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            // no tool tiering
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            // no scope context
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("image plus audio transcript should reach the vision provider");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(tools_registry),
+                observer: &observer,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                // no tool tiering
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                // no scope context
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("image plus audio transcript should reach the vision provider");
 
-    assert_eq!(result, "vision-ok");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result, "vision-ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    })
+    .await;
 }
 
 /// Records entry into the backend and returns a failed tool result. Its
@@ -2234,65 +2339,69 @@ impl Tool for SteadyTool {
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history() {
-    let temp = TempDir::new().unwrap();
-    let plugin_dir = temp.path().join("plugins/pipeline-middleware");
-    std::fs::create_dir_all(&plugin_dir).unwrap();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
-    std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
-    std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+    // Q45: Wasm middleware transforms delivered text and persisted history consistently.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = temp.path().join("plugins/pipeline-middleware");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
+        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
 
-    let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
-    let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
-    hooks.set_plugin_runtime(runtime).await;
-    let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(temp.path(), "hello").await;
-    let (outcome, _) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "whatsapp",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
+        let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
+        hooks.set_plugin_runtime(runtime).await;
+        let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(temp.path(), "hello").await;
+        let (outcome, _) = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "whatsapp",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(Vec::new()),
-            observer: &NoopObserver,
-            hooks: &hooks,
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] plain response"
-    ));
-    assert_eq!(
-        history.last().map(|message| message.content.as_str()),
-        Some("[wasm-middleware] plain response")
-    );
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(Vec::new()),
+                observer: &NoopObserver,
+                hooks: &hooks,
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] plain response"
+        ));
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("[wasm-middleware] plain response")
+        );
+    })
+    .await;
 }
 
 /// `Outbound` runs exactly once per accepted, delivered turn.
@@ -2539,149 +2648,158 @@ mod outbound_middleware_lifecycle {
 
     #[tokio::test]
     async fn outbound_middleware_skips_corrective_retry_responses() {
-        reset_outbound_middleware_calls();
-        let temp = TempDir::new().expect("test: temporary workspace");
-        let hooks = hooks_with_middleware(temp.path()).await;
-        // The first response is a tool-summary-only line, which the terminal
-        // branch rejects and replaces with one corrective retry. It is never
-        // delivered, so it must never reach the outbound stage.
-        let provider = ScriptedProvider::from_text_responses(vec!["[Used tools: file_read]", "The report is ready."]);
-        let remaining = Arc::clone(&provider.responses);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("read the report")];
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-            temp.path(),
-            &history.last().expect("source input").content,
-        )
-        .await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+        // Q52: evidence prerequisite only; preserve fabricated-marker retry must not reach outbound middleware.
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+            reset_outbound_middleware_calls();
+            let temp = TempDir::new().expect("test: temporary workspace");
+            let hooks = hooks_with_middleware(temp.path()).await;
+            // The first response is a tool-summary-only line, which the terminal
+            // branch rejects and replaces with one corrective retry. It is never
+            // delivered, so it must never reach the outbound stage.
+            let provider =
+                ScriptedProvider::from_text_responses(vec!["[Used tools: file_read]", "The report is ready."]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("read the report")];
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+                temp.path(),
+                &history.last().expect("source input").content,
+            )
+            .await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &hooks,
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: admission.memory_runtime(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("test: the corrective retry must produce a deliverable answer");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &hooks,
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: admission.memory_runtime(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("test: the corrective retry must produce a deliverable answer");
 
-        assert_eq!(
-            remaining.lock().expect("test: responses lock").len(),
-            0,
-            "the premise is a rejected response followed by an accepted one (two provider calls)"
-        );
-        assert_eq!(
-            outbound_middleware_calls(),
-            1,
-            "a response a corrective retry replaces is never delivered, so outbound must not run on it"
-        );
-        assert!(
-            matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] The report is ready."),
-            "only the accepted response is transformed: {outcome:?}"
-        );
-        assert_eq!(
-            history.last().map(|message| message.content.as_str()),
-            Some("[wasm-middleware] The report is ready.")
-        );
+            assert_eq!(
+                remaining.lock().expect("test: responses lock").len(),
+                0,
+                "the premise is a rejected response followed by an accepted one (two provider calls)"
+            );
+            assert_eq!(
+                outbound_middleware_calls(),
+                1,
+                "a response a corrective retry replaces is never delivered, so outbound must not run on it"
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] The report is ready."),
+                "only the accepted response is transformed: {outcome:?}"
+            );
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("[wasm-middleware] The report is ready.")
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn outbound_middleware_skips_silent_non_delivery() {
-        reset_outbound_middleware_calls();
-        let temp = TempDir::new().expect("test: temporary workspace");
-        let hooks = hooks_with_middleware(temp.path()).await;
-        let provider = ScriptedProvider::from_text_responses(vec![
-            "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>",
-        ]);
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::StaySilentTool::new())];
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("some group chatter")];
-        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-            temp.path(),
-            &history.last().expect("source input").content,
-            Arc::clone(&tools_registry),
-        )
-        .await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: true,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+        // Q45: Middleware delivery accounting omits intentional silent non-delivery.
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+            reset_outbound_middleware_calls();
+            let temp = TempDir::new().expect("test: temporary workspace");
+            let hooks = hooks_with_middleware(temp.path()).await;
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>",
+            ]);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::StaySilentTool::new())];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("some group chatter")];
+            let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+                temp.path(),
+                &history.last().expect("source input").content,
+                Arc::clone(&tools_registry),
+            )
+            .await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: true,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry,
-                observer: &NoopObserver,
-                hooks: &hooks,
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: admission.memory_runtime(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("test: a silent decision is a normal terminal outcome");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry,
+                    observer: &NoopObserver,
+                    hooks: &hooks,
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: admission.memory_runtime(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("test: a silent decision is a normal terminal outcome");
 
-        assert!(
-            matches!(outcome, ToolLoopOutcome::Silent { .. }),
-            "the premise is a silent turn: {outcome:?}"
-        );
-        assert_eq!(
-            outbound_middleware_calls(),
-            0,
-            "a turn that delivers nothing must not run the outbound stage"
-        );
-        assert_eq!(
-            history.len(),
-            2,
-            "a silent turn leaves no assistant trace to transform: {history:?}"
-        );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Silent { .. }),
+                "the premise is a silent turn: {outcome:?}"
+            );
+            assert_eq!(
+                outbound_middleware_calls(),
+                0,
+                "a turn that delivers nothing must not run the outbound stage"
+            );
+            assert_eq!(
+                history.len(),
+                2,
+                "a silent turn leaves no assistant trace to transform: {history:?}"
+            );
+        })
+        .await;
     }
 }
 
@@ -2884,7 +3002,7 @@ async fn tool_arguments_are_validated_in_the_serving_models_dialect() {
     // The scripted custom provider has an explicit test tariff; unknown
     // pricing must not be converted into a free admission estimate.
     config.cost.prices.insert(
-        GEMINI_SERVED_MODEL.to_string(),
+        format!("{PER_MODEL_LABEL}/{GEMINI_SERVED_MODEL}"),
         crate::config::schema::ModelPricing {
             input: 1.0,
             output: 1.0,
@@ -3058,7 +3176,7 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
     // The scripted custom provider has an explicit test tariff; unknown
     // pricing must not be converted into a free admission estimate.
     config.cost.prices.insert(
-        MODEL.to_string(),
+        format!("{PRIMARY}/{MODEL}"),
         crate::config::schema::ModelPricing {
             input: 1.0,
             output: 1.0,
@@ -3121,4 +3239,11 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
         1,
         "the fallback's call was validated against a document it was not shown: {history:?}"
     );
+}
+
+#[inline(never)]
+fn q79_boxed_fixture_work<'a, F: std::future::Future + 'a>(
+    work: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + 'a>> {
+    Box::pin(work)
 }

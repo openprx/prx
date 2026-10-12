@@ -657,7 +657,7 @@ mod tests {
 
         let migrated =
             Config::load_from_path(&dir.path().join("config.toml"), dir.path().join("workspace")).expect("test: load");
-        assert!(migrated.providers.tool_dialects.is_empty());
+        assert!(migrated.providers.tool_dialects.is_empty(), "expected an empty value");
         assert_eq!(migrated.providers.models.len(), 1);
         assert!(
             migrated
@@ -746,7 +746,7 @@ mod tests {
         let mut migrated = config;
         assert_eq!(migrate_tool_dialects(&mut migrated.providers), 2);
 
-        assert!(migrated.providers.tool_dialects.is_empty());
+        assert!(migrated.providers.tool_dialects.is_empty(), "expected an empty value");
         assert_eq!(
             migrated.providers.models.len(),
             2,

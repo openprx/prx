@@ -1432,14 +1432,14 @@ mod tests {
     fn response_with_empty_content() {
         let json = r#"{"message":{"role":"assistant","content":""}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.message.content.is_empty());
+        assert!(resp.message.content.is_empty(), "expected an empty value");
     }
 
     #[test]
     fn response_with_missing_content_defaults_to_empty() {
         let json = r#"{"message":{"role":"assistant"}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.message.content.is_empty());
+        assert!(resp.message.content.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -1541,7 +1541,7 @@ mod tests {
     fn response_with_tool_calls_parses_correctly() {
         let json = r#"{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_123","function":{"name":"shell","arguments":{"command":"date"}}}]}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.message.content.is_empty());
+        assert!(resp.message.content.is_empty(), "expected an empty value");
         assert_eq!(resp.message.tool_calls.len(), 1);
         assert_eq!(resp.message.tool_calls[0].function.name, "shell");
     }

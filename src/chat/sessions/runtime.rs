@@ -1604,7 +1604,10 @@ mod tests {
         assert_eq!(finished[0].kind, ManagedKind::Shell);
         assert_eq!(finished[0].status, ManagedStatus::Completed);
         // Reported exactly once.
-        assert!(handle.poll_finished(&mut reported).await.is_empty());
+        assert!(
+            handle.poll_finished(&mut reported).await.is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[tokio::test]
@@ -1658,7 +1661,7 @@ mod tests {
         let seq = handle.add_shell(shell.clone());
         // Shells have no registry history; tail is empty, not an error.
         let lines = handle.tail(seq, 10).await.expect("test: shell tail empty ok");
-        assert!(lines.is_empty());
+        assert!(lines.is_empty(), "expected an empty value");
         // is_terminal_for_seq works for shells too.
         assert!(!handle.is_terminal_for_seq(seq).await.expect("test: shell not terminal"));
         shell.kill().await.expect("test: cleanup kill");

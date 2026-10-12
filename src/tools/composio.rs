@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn composio_tool_has_description() {
         let tool = ComposioTool::new("test-key", None, test_security());
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
         assert!(tool.description().contains("1000+"));
     }
 
@@ -1233,19 +1233,25 @@ mod tests {
                 &schema,
                 &json!({"action": "execute", "action_name": "legacy"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect"})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect"})).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect", "app": "github"}))
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
         assert!(
             crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"action": "connect", "auth_config_id": "config"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         let enum_values = schema["properties"]["action"]["enum"]
             .as_array()

@@ -891,7 +891,7 @@ mod agent_turn_origin_tests {
         assert_eq!(proof.workspace_id(), workspace.path().to_string_lossy());
         assert_eq!(proof.session_key(), "agent:prx_run");
         assert_eq!(proof.run_id(), "prx_run");
-        assert!(!event.event_id.is_empty());
+        assert!(!event.event_id.is_empty(), "expected a non-empty value");
         assert_eq!(proof.source_event_id(), Some(event.event_id.as_str()));
         assert_eq!(proof.routing_input(), "raw request");
         assert_eq!(proof.provider_name(), "ollama");
@@ -957,9 +957,9 @@ mod agent_turn_origin_tests {
             .await
             .expect("disabled user-event recording yields a synthetic receipt");
         assert_eq!(synthetic.id, 0);
-        assert!(!synthetic.event_id.is_empty());
+        assert!(!synthetic.event_id.is_empty(), "expected a non-empty value");
         let failing_fabric = MemoryFabric::new(
-            Arc::new(crate::memory::NoneMemory::new()),
+            Arc::new(crate::memory::MarkdownMemory::new(workspace.path())),
             workspace.path().to_string_lossy(),
         );
         assert!(
@@ -1555,7 +1555,7 @@ impl AgentProviderSelection<'_> {
         config: &Config,
         options: &providers::ProviderRuntimeOptions,
     ) -> Result<Box<dyn Provider>> {
-        providers::create_routed_provider_with_pinned_root(
+        providers::ProviderConnection::create_routed_provider_with_options(
             self.provider_name,
             &self.connection,
             &self.reliability,

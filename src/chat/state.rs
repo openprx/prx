@@ -2115,7 +2115,7 @@ impl ChatState {
             .control
             .tool_buffers
             .get_mut(&key)
-            .map(|buffer| buffer.pending_tool_cards.drain(..).collect::<Vec<_>>())
+            .map(|buffer| std::mem::take(&mut buffer.pending_tool_cards))
             .unwrap_or_default();
         indices.sort_unstable_by(|a, b| b.cmp(a));
         indices.dedup();
@@ -3606,7 +3606,7 @@ mod tests {
     fn test_chatstate_new_default_session() {
         let state = make_state();
         assert!(uuid::Uuid::parse_str(&state.session.id).is_ok());
-        assert!(state.session.title.is_empty());
+        assert!(state.session.title.is_empty(), "expected an empty value");
         assert_eq!(&*state.session.provider, "test-provider");
         assert_eq!(&*state.session.model, "test-model");
         assert!(state.session.turns.is_empty());
@@ -3617,8 +3617,8 @@ mod tests {
     #[test]
     fn test_chatstate_new_default_ui() {
         let state = make_state();
-        assert!(state.ui.conversation_lines.is_empty());
-        assert!(state.ui.input.is_empty());
+        assert!(state.ui.conversation_lines.is_empty(), "expected an empty value");
+        assert!(state.ui.input.is_empty(), "expected an empty value");
         assert_eq!(state.ui.turn_count, 0);
         assert!(!state.ui.ascii_fallback);
         assert_eq!(state.ui.last_ctrlc_ms, 0);
@@ -3637,7 +3637,7 @@ mod tests {
     #[test]
     fn sessions_status_updated_writes_and_dedups() {
         let mut state = make_state();
-        assert!(state.ui.sessions_status.is_empty());
+        assert!(state.ui.sessions_status.is_empty(), "expected an empty value");
 
         let effects = state.reduce(Action::SessionsStatusUpdated {
             summary: "sessions: 1 running".to_string(),
@@ -3656,7 +3656,7 @@ mod tests {
         // Clearing hides the row (empty string flows through).
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert!(state.ui.sessions_status.is_empty());
+        assert!(state.ui.sessions_status.is_empty(), "expected an empty value");
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -3902,7 +3902,7 @@ mod tests {
     fn sessions_entries_updated_writes_snapshot_and_dedups() {
         use crate::chat::sessions::SwitcherEntry;
         let mut state = make_state();
-        assert!(state.ui.sessions_entries.is_empty());
+        assert!(state.ui.sessions_entries.is_empty(), "expected an empty value");
 
         let entries = vec![SwitcherEntry {
             seq: 1,
@@ -3927,7 +3927,7 @@ mod tests {
 
         let effects = state.reduce(Action::SessionsEntriesUpdated { entries: Vec::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert!(state.ui.sessions_entries.is_empty());
+        assert!(state.ui.sessions_entries.is_empty(), "expected an empty value");
     }
 
     /// P2: ActiveSessionViewUpdated writes the focused child viewport snapshot,
@@ -4594,9 +4594,9 @@ mod tests {
         let _ = state.reduce(Action::SessionLoaded(fresh));
 
         assert_eq!(state.session.id, "sess-fresh");
-        assert!(state.session.title.is_empty());
+        assert!(state.session.title.is_empty(), "expected an empty value");
         assert!(state.session.turns.is_empty());
-        assert!(state.session.token_usage_records.is_empty());
+        assert!(state.session.token_usage_records.is_empty(), "expected an empty value");
         assert_eq!(state.ui.turn_count, 0);
         assert_eq!(state.ui.token_usage_summary, MainSessionTokenUsageSummary::default());
         assert!(state.ui.conversation_lines.is_empty());
@@ -5627,7 +5627,7 @@ mod tests {
                 "no transcript lines while streaming"
             );
             let preview = draft.reasoning_preview().expect("test: preview present");
-            assert!(!preview.is_empty());
+            assert!(!preview.is_empty(), "expected a non-empty value");
             assert!(!preview.contains('\n'), "the preview must be folded into a single line");
         }
 
@@ -5726,7 +5726,7 @@ mod tests {
                 effects.is_empty(),
                 "the version counter is shared by both kinds of delta"
             );
-            assert!(live_draft(&state).accumulated.is_empty());
+            assert!(live_draft(&state).accumulated.is_empty(), "expected an empty value");
         }
 
         /// F1: live progress must not change the final reasoning card after StreamCompleted.
@@ -10277,7 +10277,7 @@ mod tests {
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
             assert!(state.control.turn_cancels.is_empty());
-            assert!(state.stream.visible_drafts.is_empty());
+            assert!(state.stream.visible_drafts.is_empty(), "expected an empty value");
             assert!(state.ui.pending_tool_approval.is_none());
         }
 
@@ -10301,7 +10301,7 @@ mod tests {
             assert!(token_b.is_cancelled());
             assert!(state.control.turn_cancels.is_empty());
             assert!(!state.control.generating);
-            assert!(state.stream.visible_drafts.is_empty());
+            assert!(state.stream.visible_drafts.is_empty(), "expected an empty value");
         }
 
         #[test]

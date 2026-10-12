@@ -27,6 +27,77 @@ fn synthetic_channels_fragment() -> String {
     format!("[channels_config]\ncli = true\n\n[channels_config.telegram]\nbot_token = \"{SYNTHETIC_TOKEN}\"\n")
 }
 
+/// Prepare generic reset reporting without stored decision settings in the merged tree.
+fn prepare_generic_reset(config_dir: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let path = config_dir.join("config.toml");
+    let mut expected = openprx::config::files::read_merged_toml_with_gate(&path)
+        .context("test: read case-owned merged configuration")?;
+    expected
+        .as_table_mut()
+        .context("test: merged config table")?
+        .remove("causal_tree");
+    // Read the complete loader-owned manifest before changing any fixture file.
+    let mut paths = vec![path.clone()];
+    for fragment in
+        openprx::config::files::list_config_fragment_paths(&path).context("test: enumerate case-owned fragments")?
+    {
+        let name = fragment
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("test: fragment name")?;
+        if !openprx::config::files::should_skip_fragment(name) {
+            paths.push(fragment);
+        }
+    }
+    let documents: Vec<_> = paths
+        .into_iter()
+        .map(|source| -> anyhow::Result<_> {
+            let text = std::fs::read_to_string(&source).context("test: read case-owned config source")?;
+            let value: toml::Value = toml::from_str(&text).context("test: parse case-owned config source")?;
+            Ok((source, value))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    for (source, original) in documents {
+        let mut prepared = original.clone();
+        let removed = prepared
+            .as_table_mut()
+            .context("test: config source table")?
+            .remove("causal_tree");
+        if removed.is_none() {
+            continue;
+        }
+        std::fs::write(
+            &source,
+            toml::to_string_pretty(&prepared).context("test: serialize prepared source")?,
+        )
+        .context("test: write case-owned source")?;
+        let actual: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&source).context("test: reread prepared source")?)
+                .context("test: parse prepared source")?;
+        assert!(
+            actual == prepared,
+            "generic reset must preserve all other source values"
+        );
+        assert!(
+            actual.get("causal_tree").is_none(),
+            "prepared source has no decision settings"
+        );
+    }
+    let actual = openprx::config::files::read_merged_toml_with_gate(&path)
+        .context("test: reread prepared merged configuration")?;
+    assert!(
+        actual.get("causal_tree").is_none(),
+        "generic reset has no merged decision settings"
+    );
+    assert!(
+        actual == expected,
+        "generic reset must preserve all other merged values"
+    );
+    Ok(())
+}
+
 /// Run the real `prx init` against an isolated home and config directory.
 fn run_init(home: &Path, config_dir: &Path, extra: &[&str]) -> io::Result<Output> {
     std::process::Command::new(env!("CARGO_BIN_EXE_prx"))
@@ -100,6 +171,7 @@ fn a_reset_that_commits_is_reported_even_when_the_run_then_fails() {
     std::fs::write(&channels, synthetic_channels_fragment()).expect("test: write the synthetic fragment");
     obstruct_sessions(&config_dir).expect("test: obstruct workspace/sessions");
 
+    prepare_generic_reset(&config_dir).expect("test: prepare generic-reset baseline");
     let forced = run_init(&home, &config_dir, &["--force"]).expect("test: run the forced init");
     let stdout = String::from_utf8_lossy(&forced.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&forced.stderr).into_owned();
@@ -166,6 +238,7 @@ fn a_second_forced_run_archives_into_its_own_directory() {
     std::fs::write(&channels, synthetic_channels_fragment()).expect("test: write the synthetic fragment");
     obstruct_sessions(&config_dir).expect("test: obstruct workspace/sessions");
 
+    prepare_generic_reset(&config_dir).expect("test: prepare generic-reset baseline");
     let first = run_init(&home, &config_dir, &["--force"]).expect("test: run the first forced init");
     assert!(
         !first.status.success(),
@@ -179,6 +252,7 @@ fn a_second_forced_run_archives_into_its_own_directory() {
         "one archive after one forced run: {after_first:?}"
     );
 
+    prepare_generic_reset(&config_dir).expect("test: prepare generic-reset baseline");
     let second = run_init(&home, &config_dir, &["--force"]).expect("test: run the second forced init");
     let second_output = combined(&second);
     assert!(

@@ -212,7 +212,7 @@ mod tests {
         let record = CostRecord::new("session-123", usage);
 
         assert_eq!(record.session_id, "session-123");
-        assert!(!record.id.is_empty());
+        assert!(!record.id.is_empty(), "expected a non-empty value");
         assert_eq!(record.usage.model, "test/model");
     }
 }

@@ -330,7 +330,7 @@ mod tests {
         );
 
         let err = atomic_write(dir.path(), &target, b"nope").await.unwrap_err();
-        assert!(!err.to_string().is_empty());
+        assert!(!err.to_string().is_empty(), "expected a non-empty value");
         assert!(!outside.path().join("escaped").exists());
     }
 

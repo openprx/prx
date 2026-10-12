@@ -978,7 +978,7 @@ mod tests {
         );
 
         exposure.reset();
-        assert!(exposure.snapshot().is_empty());
+        assert!(exposure.snapshot().is_empty(), "expected an empty value");
         let after_reset = exposure.sticky_surface(&base, &tools, "commit this change");
         assert_eq!(
             session_names(&tools, "commit this change", &after_reset),

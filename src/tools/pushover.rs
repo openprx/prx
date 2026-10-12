@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn pushover_tool_description() {
         let tool = PushoverTool::new(test_security(AutonomyLevel::Full), PathBuf::from("/tmp"));
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]

@@ -1901,9 +1901,7 @@ pub trait Memory: Send + Sync {
             cursor = page.last().map_or(cursor, |event| event.id);
             let page_len = page.len();
             output.extend(page.into_iter().filter(|event| {
-                chrono::DateTime::parse_from_rfc3339(&event.created_at)
-                    .ok()
-                    .is_some_and(|time| time >= start && time < end)
+                chrono::DateTime::parse_from_rfc3339(&event.created_at).is_ok_and(|time| time >= start && time < end)
             }));
             if output.len() >= limit || page_len < 500 {
                 break;

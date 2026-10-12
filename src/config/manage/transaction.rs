@@ -3190,7 +3190,8 @@ mod tests {
                 .expect("test: history")
                 .list()
                 .expect("test: list")
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
     }
 

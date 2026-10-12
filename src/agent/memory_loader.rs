@@ -211,12 +211,12 @@ impl Memory for SelectedMemoryView<'_> {
             "selected custom retrieval deadline expired"
         );
         self.calls
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used < 5).then_some(used + 1)
             })
             .map_err(|_| anyhow::anyhow!("custom retrieval read count exceeds bounds"))?;
         self.reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(limit).filter(|total| *total <= 5)
             })
             .map_err(|_| anyhow::anyhow!("custom retrieval total hit limit exceeded"))?;
@@ -523,7 +523,10 @@ mod tests {
     fn selected_memory_formatter_runs_only_for_admitted_memory_summaries() {
         use std::sync::atomic::Ordering;
         let formatter = SelectedFormatter(std::sync::atomic::AtomicUsize::new(0));
-        assert!(format_selected_memory(Some(&formatter), &[]).unwrap().is_empty());
+        assert!(
+            format_selected_memory(Some(&formatter), &[]).unwrap().is_empty(),
+            "expected an empty value"
+        );
         assert_eq!(formatter.0.load(Ordering::SeqCst), 0);
         let artifacts = [
             selected_memory_artifact("project schedule"),
@@ -606,7 +609,10 @@ mod tests {
             format_selected_context(None, &[memory, document, session]).unwrap(),
             "memory fact\n[Selected document]\ndocument fact\n[Selected session history]\nuser: prior question\n"
         );
-        assert!(format_selected_context(None, &[]).unwrap().is_empty());
+        assert!(
+            format_selected_context(None, &[]).unwrap().is_empty(),
+            "expected an empty value"
+        );
         let mut discovery = selected_memory_artifact("tool metadata");
         discovery.kind = ObservedArtifactKind::Discovery;
         assert!(format_selected_context(None, &[discovery]).is_err());

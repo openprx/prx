@@ -154,7 +154,7 @@ mod tests {
     fn name_and_description() {
         let tool = make_tool_with_config(Config::default());
         assert_eq!(tool.name(), "config_reload");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         let tool = make_tool_with_config(Config::default());
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
-        assert!(required.is_empty());
+        assert!(required.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

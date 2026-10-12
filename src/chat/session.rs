@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(session.schema_version, SCHEMA_VERSION);
         assert_eq!(session.provider, "openrouter");
         assert_eq!(session.model, "anthropic/claude-sonnet-4");
-        assert!(session.title.is_empty());
+        assert!(session.title.is_empty(), "expected an empty value");
         assert!(session.turns.is_empty());
         assert!(session.id.starts_with("chat-"));
         assert!(session.id.chars().all(|ch| ch == '-' || ch.is_ascii_lowercase()));
@@ -555,7 +555,7 @@ mod tests {
         }"#;
         let restored = ChatSession::from_json(legacy).expect("test: legacy blob must load");
         assert_eq!(restored.id, "abc");
-        assert!(restored.background_sessions.is_empty());
+        assert!(restored.background_sessions.is_empty(), "expected an empty value");
     }
 
     #[test]

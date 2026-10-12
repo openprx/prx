@@ -577,7 +577,7 @@ mod tests {
             .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(second).unwrap()).unwrap())
             .unwrap();
 
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
         assert_eq!(
             registry.worker(second).unwrap().state,
             ProviderTurnWorkerState::AwaitingCommit(ProviderTurnWorkerOutcome::Completed)

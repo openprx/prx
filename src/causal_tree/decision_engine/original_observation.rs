@@ -79,6 +79,7 @@ pub(crate) struct Observation {
     requests: Vec<RequestObservation>,
     scores: Vec<ScoreObservation>,
     failure: Option<ObservationError>,
+    material: Option<material::Material>,
 }
 
 struct Recorder {
@@ -390,6 +391,15 @@ async fn capture_bounded<F: Future>(
     event_limit: usize,
     future: F,
 ) -> Result<(F::Output, Observation), ObservationError> {
+    capture_mode(label, event_limit, future, false).await
+}
+
+async fn capture_mode<F: Future>(
+    label: &'static str,
+    event_limit: usize,
+    future: F,
+    material_enabled: bool,
+) -> Result<(F::Output, Observation), ObservationError> {
     if ACTIVE.try_with(|_| ()).is_ok() {
         return Err(ObservationError::NestedScope);
     }
@@ -403,12 +413,16 @@ async fn capture_bounded<F: Future>(
             requests: Vec::new(),
             scores: Vec::new(),
             failure: None,
+            material: material_enabled.then(material::Material::default),
         },
         events: 0,
         bytes: 0,
         event_limit,
     }));
+    let mut incomplete = material::Incomplete::new(material_enabled, &owner);
     let output = ACTIVE.scope(Arc::clone(&owner), future).await;
+    incomplete.disarm();
+    drop(incomplete);
     let recorder = Arc::try_unwrap(owner)
         .map_err(|_| ObservationError::Changed)?
         .into_inner();
@@ -510,3 +524,6 @@ impl Observation {
 
 #[cfg(test)]
 mod tests;
+
+/// Explicitly charged same-invocation material capture.
+pub(crate) mod material;

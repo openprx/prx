@@ -3166,7 +3166,7 @@ bot_token = "***"
              with a reason): {unregistered:#?}"
         );
         for (exempt, reason) in NOT_SECRET {
-            assert!(!reason.is_empty());
+            assert!(!reason.is_empty(), "expected a non-empty value");
             assert!(
                 slots.iter().any(|slot| display_steps(slot) == *exempt),
                 "NOT_SECRET entry {exempt} is not a string slot of the schema any more"

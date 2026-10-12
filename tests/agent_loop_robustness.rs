@@ -21,6 +21,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 #[path = "support/embedded_agent.rs"]
 mod embedded_agent;
+#[path = "support/native_agent.rs"]
+mod native_agent;
 use embedded_agent::EmbeddedAgentFixture;
 use openprx::agent::dispatcher::NativeToolDispatcher;
 use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
@@ -217,7 +219,7 @@ async fn agent_handles_tool_call_with_empty_arguments() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("call with empty args").await.unwrap();
-    assert!(!response.is_empty());
+    assert!(!response.is_empty(), "agent should produce a non-empty response");
 }
 
 /// Agent should handle unknown tool name without crashing (#848 related)
@@ -282,7 +284,7 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool), Box::new(FailingTool)]);
     let response = agent.turn("mixed tools").await.unwrap();
-    assert!(!response.is_empty());
+    assert!(!response.is_empty(), "agent should produce a non-empty response");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -309,14 +311,18 @@ async fn agent_allows_one_thousand_tool_iterations_to_finish() {
     responses.push(text_response("Final response after iterations"));
 
     let provider = Box::new(MockProvider::new(responses));
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
+    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
 
-    let result = agent
-        .turn("keep calling tools")
-        .await
-        .expect("long sequence should finish");
-    assert_eq!(result, "Final response after iterations");
-    assert_eq!(*count.lock().unwrap(), 1_000);
+        let result = agent
+            .turn("keep calling tools")
+            .await
+            .expect("long sequence should finish");
+        assert_eq!(result, "Final response after iterations");
+        assert_eq!(*count.lock().unwrap(), 1_000);
+    })
+    .await
+    .expect("genuine native counter fixture");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -378,7 +384,7 @@ async fn agent_handles_unicode_tool_arguments() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("unicode test").await.unwrap();
-    assert!(!response.is_empty());
+    assert!(!response.is_empty(), "agent should produce a non-empty response");
 }
 
 /// Agent should handle tool arguments with nested JSON
@@ -395,7 +401,7 @@ async fn agent_handles_nested_json_tool_arguments() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("nested json test").await.unwrap();
-    assert!(!response.is_empty());
+    assert!(!response.is_empty(), "agent should produce a non-empty response");
 }
 
 /// Agent should handle tool call followed by immediate text (no second LLM call)

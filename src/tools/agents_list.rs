@@ -125,7 +125,7 @@ mod tests {
     fn name_and_description() {
         let tool = AgentsListTool::new(HashMap::new());
         assert_eq!(tool.name(), "agents_list");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[tokio::test]

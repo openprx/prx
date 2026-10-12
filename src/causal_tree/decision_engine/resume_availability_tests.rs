@@ -76,8 +76,12 @@ fn resume_availability_is_single_current_reference_and_never_catalog_exposure() 
             gate_set_hash: [0; 32],
         },
     };
-    assert!(selector_context(&set, &view, true, None).direct_candidates.is_empty());
-    let selected = selector_context(&set, &view, true, Some(target));
+    assert!(
+        selector_context(&set, &view, true, None, &DiscoveredRefs::empty())
+            .direct_candidates
+            .is_empty()
+    );
+    let selected = selector_context(&set, &view, true, Some(target), &DiscoveredRefs::empty());
     assert_eq!(selected.direct_candidates, BTreeSet::from([first]));
     assert!(!selected.direct_candidates.contains(&second));
     for stale_schema in [true, false] {
@@ -90,7 +94,7 @@ fn resume_availability_is_single_current_reference_and_never_catalog_exposure() 
         .ok_or_else(|| anyhow::anyhow!("empty fixed fingerprint"))?;
         *byte ^= 1;
         assert!(
-            selector_context(&set, &view, true, Some(&stale))
+            selector_context(&set, &view, true, Some(&stale), &DiscoveredRefs::empty())
                 .direct_candidates
                 .is_empty()
         );
@@ -129,11 +133,22 @@ fn resume_availability_is_single_current_reference_and_never_catalog_exposure() 
     };
     assert_eq!(references.len(), 2);
     assert!(
-        selector_context(&compound, &view, true, Some(target))
+        selector_context(&compound, &view, true, Some(target), &DiscoveredRefs::empty())
             .direct_candidates
             .is_empty()
     );
     // Losing the resume input after this selection does not promote the entry.
-    assert!(selector_context(&set, &view, true, None).direct_candidates.is_empty());
+    assert!(
+        selector_context(&set, &view, true, None, &DiscoveredRefs::empty())
+            .direct_candidates
+            .is_empty()
+    );
+    // Filesystem remains unsupported for the selected-discovery path.
+    let unsupported = DiscoveredRefs::from_refs_for_test(BTreeSet::from([target.clone()]));
+    assert!(
+        selector_context(&set, &view, true, None, &unsupported)
+            .direct_candidates
+            .is_empty()
+    );
     Ok(())
 }

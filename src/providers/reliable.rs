@@ -4322,7 +4322,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
         let (text, err) = collect_stream(s).await;
-        assert!(text.is_empty());
+        assert!(text.is_empty(), "expected an empty value");
         assert!(err.is_some(), "all-failed streaming must surface an error");
     }
 
@@ -4675,7 +4675,7 @@ mod tests {
         let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
         let (text, err) = collect_stream(s).await;
 
-        assert!(text.is_empty());
+        assert!(text.is_empty(), "expected an empty value");
         assert!(err.is_some(), "business 429 must surface");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -5142,7 +5142,7 @@ mod tests {
         let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
         let (text, err) = collect_stream(s).await;
 
-        assert!(text.is_empty());
+        assert!(text.is_empty(), "expected an empty value");
         match err {
             Some(StreamError::RateLimited { status, message, .. }) => {
                 assert_eq!(status, 503, "must surface the LAST candidate's status, not the first");
@@ -5197,7 +5197,7 @@ mod tests {
         };
         let s = provider.stream_chat_with_history(&messages, "test", 0.0, opts);
         let (text, err) = collect_stream(s).await;
-        assert!(text.is_empty());
+        assert!(text.is_empty(), "expected an empty value");
         match err {
             Some(StreamError::Provider(msg)) => assert!(msg.contains("No provider supports streaming")),
             other => panic!("expected no-streaming provider error, got {other:?}"),

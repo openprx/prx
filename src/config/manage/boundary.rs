@@ -272,7 +272,10 @@ mod tests {
         restored.api_key = Some("key-rotated-out".into());
         assert_eq!(reintroduced_credentials(Some(&current), &restored), vec!["api_key"]);
         restored.api_key = Some("key-now".into());
-        assert!(reintroduced_credentials(Some(&current), &restored).is_empty());
+        assert!(
+            reintroduced_credentials(Some(&current), &restored).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// RED before SECRETS-OTHER: a redacted proxy URL written back was stored
@@ -338,6 +341,9 @@ mod tests {
             "{reintroduced:?}"
         );
         assert!(!format!("{reintroduced:?}").contains("pmmd8-"), "{reintroduced:?}");
-        assert!(reintroduced_credentials(Some(&restored), &restored).is_empty());
+        assert!(
+            reintroduced_credentials(Some(&restored), &restored).is_empty(),
+            "expected an empty value"
+        );
     }
 }

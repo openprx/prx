@@ -446,9 +446,18 @@ mod tests {
     #[test]
     fn ingest_schema_requires_path_or_content() {
         let schema = common_schema(false);
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "doc.md"})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"content": "body"})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "doc.md"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"content": "body"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[tokio::test]

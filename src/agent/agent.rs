@@ -1175,7 +1175,7 @@ mod tests {
             ] {
                 assert_eq!(outcome.final_provider, provider);
                 assert_eq!(outcome.final_model, model);
-                assert!(!outcome.attempts.is_empty());
+                assert!(!outcome.attempts.is_empty(), "expected a non-empty value");
                 assert!(
                     outcome
                         .attempts
@@ -1246,7 +1246,8 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_custom_memory_loader_runs_only_for_selected_retrieval() {
-        custom_memory_loader_fixture(false).await;
+        crate::runtime::turn_decision::selected_loader_fixture::with_first_other(custom_memory_loader_fixture(false))
+            .await;
     }
 
     #[tokio::test]
@@ -1298,13 +1299,16 @@ mod tests {
             );
         }
         let mut agent = builder.build().unwrap();
-        assert_eq!(
-            agent.turn("hello").await.unwrap(),
-            "What specific information should I use to answer your request?"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(models.lock().unwrap().is_empty());
-        // Establish retrieval evidence only after the empty-memory negative case.
+        // Q56: durable Builtin covers selected retrieval from the original scoped seed.
+        // The first-hello negative control remains only in the Q54 selected-loader Mock fixture.
+        if !record_decisions {
+            assert_eq!(
+                agent.turn("hello").await.unwrap(),
+                "Could you clarify the result you want?"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(models.lock().unwrap().is_empty());
+        }
         agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
         let reply = agent.turn("memory_search: Explain `2 + 2`.").await.unwrap();
         if record_decisions {
@@ -1342,6 +1346,68 @@ mod tests {
                     100,
                 )
                 .unwrap();
+            // Q90 replaces the Q56 every-receipt Builtin oracle with this exact linked pair.
+            type Receipt = (crate::causal_tree::store::DecisionView, String, bool);
+            fn valid_receipts(receipts: &[Receipt]) -> bool {
+                if receipts.len() != 2 {
+                    return false;
+                }
+                let Some((predicted, generation, projection)) =
+                    receipts.iter().find(|(d, _, _)| d.backend_kind == "builtin")
+                else {
+                    return false;
+                };
+                let Some((terminal, terminal_generation, terminal_projection)) =
+                    receipts.iter().find(|(d, _, _)| d.backend_kind == "none")
+                else {
+                    return false;
+                };
+                let distribution_valid = |values: &std::collections::BTreeMap<String, f64>| {
+                    !values.is_empty()
+                        && values
+                            .values()
+                            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                };
+                receipts
+                    .iter()
+                    .all(|(d, _, _)| d.has_owner && d.enabled_snapshot && !d.legacy_v1 && !d.distributions.legacy_v1)
+                    && !generation.is_empty()
+                    && generation == terminal_generation
+                    && predicted.session_key == terminal.session_key
+                    && predicted.run_id == terminal.run_id
+                    && predicted.backend_locality == "builtin"
+                    && predicted.prior_decision_id.is_none()
+                    && predicted.directive_kind == "retrieve"
+                    && predicted.abstention_reason.as_deref() == Some("retrieve_evidence")
+                    && predicted
+                        .selected()
+                        .is_some_and(|candidate| candidate.action == "retrieve" && candidate.target == "memory")
+                    && distribution_valid(&predicted.distributions.next_action)
+                    && distribution_valid(&predicted.distributions.capability_target)
+                    && distribution_valid(&predicted.distributions.features)
+                    && *projection
+                    && predicted.attempts.iter().any(|attempt| {
+                        attempt.backend == "builtin" && attempt.outcome == "served" && attempt.error_class.is_none()
+                    })
+                    && terminal.prior_decision_id.as_ref() == Some(&predicted.decision_id)
+                    && terminal.directive_kind == "answer"
+                    && terminal.abstention_reason.as_deref() == Some("hop_stopped")
+                    && terminal
+                        .selected()
+                        .is_some_and(|candidate| candidate.action == "answer")
+                    && terminal.backend_locality == "none"
+                    && terminal.configured_model == "none"
+                    && terminal.backend_endpoint.is_none()
+                    && terminal.attempts.is_empty()
+                    && terminal.fallback_order.is_empty()
+                    && terminal.distributions.next_action.is_empty()
+                    && terminal.distributions.capability_target.is_empty()
+                    && terminal.distributions.features.is_empty()
+                    && terminal.error_class.is_none()
+                    && !terminal.cache_hit
+                    && !*terminal_projection
+            }
+            let mut matching_receipts = Vec::new();
             let mut diagnostics = Vec::new();
             for decision in decisions {
                 let replay = reader.replay_record(&scope, &decision.decision_id).unwrap().unwrap();
@@ -1350,6 +1416,11 @@ mod tests {
                 }
                 assert_eq!(decision.session_key, source.session_key);
                 assert_eq!(decision.run_id, source.run_id);
+                let projection_present = reader
+                    .inspection_projection(&scope, &decision.decision_id)
+                    .unwrap()
+                    .is_some();
+                matching_receipts.push((decision.clone(), replay.catalog_generation.clone(), projection_present));
                 diagnostics.push(serde_json::json!({
                     "decision_id":decision.decision_id.to_string(), "source_event_id":replay.source_event_id,
                     "directive":decision.directive_kind, "abstention":decision.abstention_reason,
@@ -1365,6 +1436,57 @@ mod tests {
             assert!(
                 !diagnostics.is_empty(),
                 "enabled diagnostic needs actual owned decision receipts"
+            );
+            assert!(
+                valid_receipts(&matching_receipts),
+                "Q90 requires the exact owned predicted retrieval and linked prediction-free terminal"
+            );
+            // Negative checks mutate only copies of the actual owned receipts, never the store.
+            let builtin = matching_receipts
+                .iter()
+                .find(|(d, _, _)| d.backend_kind == "builtin")
+                .unwrap();
+            let terminal = matching_receipts
+                .iter()
+                .find(|(d, _, _)| d.backend_kind == "none")
+                .unwrap();
+            assert!(
+                !valid_receipts(std::slice::from_ref(terminal)),
+                "missing prior Builtin must fail"
+            );
+            assert!(
+                !valid_receipts(&[builtin.clone(), terminal.clone(), terminal.clone()]),
+                "third receipt must fail"
+            );
+            let mut altered = terminal.clone();
+            altered.0.prior_decision_id = None;
+            assert!(
+                !valid_receipts(&[builtin.clone(), altered]),
+                "unlinked terminal must fail"
+            );
+            let mut altered = terminal.clone();
+            altered.0.backend_kind = "remote".into();
+            assert!(
+                !valid_receipts(&[builtin.clone(), altered]),
+                "alternate backend must fail"
+            );
+            let mut altered = terminal.clone();
+            altered.2 = true;
+            assert!(
+                !valid_receipts(&[builtin.clone(), altered]),
+                "terminal prediction projection must fail"
+            );
+            let mut altered = terminal.clone();
+            altered.1.push_str("-different");
+            assert!(
+                !valid_receipts(&[builtin.clone(), altered]),
+                "different catalog generation must fail"
+            );
+            let mut altered = builtin.clone();
+            altered.0.attempts.clear();
+            assert!(
+                !valid_receipts(&[altered, terminal.clone()]),
+                "missing served Builtin attempt must fail"
             );
         }
         assert_eq!(
@@ -2858,7 +2980,7 @@ mod tests {
         let mcp_refreshes = Arc::new(AtomicUsize::new(0));
 
         let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
+            backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
@@ -2867,7 +2989,25 @@ mod tests {
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
 
+        let mut runtime_config = crate::config::Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            default_model: Some("prx-local-model".to_owned()),
+            memory: memory_cfg.clone(),
+            ..crate::config::Config::default()
+        };
+        runtime_config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+
         let mut agent = Agent::builder()
+            .runtime_config(runtime_config, "ollama")
             .provider(Box::new(MockProvider {
                 responses: Mutex::new(vec![]),
             }))
@@ -3039,3 +3179,7 @@ mod automix_integration_tests;
 
 #[cfg(test)]
 pub(crate) mod native_decision_fixture;
+
+#[cfg(all(test, unix))]
+#[path = "agent/cleanup_diagnostic_tests.rs"]
+mod cleanup_diagnostic_tests;

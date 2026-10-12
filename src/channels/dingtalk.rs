@@ -713,7 +713,7 @@ client_id = "id"
 client_secret = "secret"
 "#;
         let config: crate::config::schema::DingTalkConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.allowed_users.is_empty());
+        assert!(config.allowed_users.is_empty(), "expected an empty value");
     }
 
     #[test]

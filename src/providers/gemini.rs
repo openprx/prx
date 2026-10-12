@@ -2030,9 +2030,9 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].delta, "calling tool now");
-        assert!(chunks[0].tool_calls.is_empty());
+        assert!(chunks[0].tool_calls.is_empty(), "expected an empty value");
 
-        assert!(chunks[1].delta.is_empty());
+        assert!(chunks[1].delta.is_empty(), "expected an empty value");
         assert_eq!(chunks[1].tool_calls.len(), 1);
         assert_eq!(chunks[1].tool_calls[0].name, "search");
         assert_eq!(chunks[1].tool_calls[0].status, ToolCallChunkStatus::Completed);

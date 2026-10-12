@@ -403,6 +403,7 @@ impl std::fmt::Debug for OutcomeRecord {
     }
 }
 
+pub(crate) const MAX_RECORDED_PROVIDER_ATTEMPTS: usize = 128;
 const MAX_OUTCOME_STORED_BYTES: usize = 64 * 1024;
 
 fn bounded_code(value: &str, max_len: usize) -> bool {
@@ -528,7 +529,7 @@ impl OutcomeRecord {
             return false;
         }
         if self.provider_attempts.as_ref().is_some_and(|attempts| {
-            attempts.len() > 128
+            attempts.len() > MAX_RECORDED_PROVIDER_ATTEMPTS
                 || attempts.iter().enumerate().any(|(index, attempt)| {
                     attempt.seq != u32::try_from(index + 1).unwrap_or(u32::MAX)
                         || !matches!(attempt.status.as_str(), "success" | "failed" | "skipped")
@@ -3740,6 +3741,78 @@ mod tests {
             incomplete(&events),
             [IncompleteReason::Conflict, IncompleteReason::UnknownDecision]
         );
+    }
+
+    #[tokio::test]
+    async fn partial_outcome_at_provider_retention_boundary_reopens_and_replays() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let events = sink();
+        let decision_id = id(70);
+        let store = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
+        let writer = store.writer().expect("writer");
+        assert_eq!(
+            writer.record_decision(record(decision_id, "ws", Some("prx_user"), now_ms())),
+            Enqueue::Queued
+        );
+        flushed(&store).await;
+        let mut outcome = observed_outcome(decision_id);
+        outcome.provider_attempts = Some(
+            (1..=128)
+                .map(|seq| RecordedOutcomeAttempt {
+                    seq,
+                    status: "success".to_owned(),
+                    error_class: None,
+                })
+                .collect(),
+        );
+        assert_eq!(outcome.completeness, OutcomeCompleteness::Partial);
+        assert_eq!(outcome.coverage, None);
+        assert_eq!(writer.record_outcome(outcome.clone()), Enqueue::Queued);
+        flushed(&store).await;
+        writer.close(Instant::now() + std::time::Duration::from_secs(5)).await;
+        drop(writer);
+        drop(store);
+        let reopened = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
+        let writer = reopened.writer().expect("reopened writer");
+        let row = reopened
+            .reader()
+            .get(&operator(&reopened), &decision_id)
+            .expect("read")
+            .expect("decision");
+        assert_eq!(row.outcomes.len(), 1);
+        let retained = row.outcomes.first().expect("bounded outcome");
+        assert_eq!(retained.provider_attempts, 128);
+        assert_eq!(retained.completeness, "partial");
+        assert!(
+            reopened
+                .reader()
+                .outcome_matches(&operator(&reopened), &outcome)
+                .expect("exact stored payload")
+        );
+        assert!(incomplete(&events).is_empty(), "expected an empty value");
+        assert_eq!(writer.record_outcome(outcome.clone()), Enqueue::Queued);
+        flushed(&reopened).await;
+        assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
+        assert!(
+            reopened
+                .reader()
+                .outcome_matches(&operator(&reopened), &outcome)
+                .expect("exact replay payload")
+        );
+        assert!(incomplete(&events).is_empty(), "expected an empty value");
+        outcome
+            .provider_attempts
+            .as_mut()
+            .expect("attempts")
+            .push(RecordedOutcomeAttempt {
+                seq: 129,
+                status: "success".to_owned(),
+                error_class: None,
+            });
+        assert_eq!(writer.record_outcome(outcome), Enqueue::Dropped);
+        flushed(&reopened).await;
+        assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
+        assert_eq!(incomplete(&events), [IncompleteReason::Conflict]);
     }
 
     #[tokio::test]

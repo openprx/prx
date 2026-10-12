@@ -2368,7 +2368,11 @@ mod tests {
     async fn a_configuration_that_cannot_validate_reports_the_reset_and_exits_non_zero() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
-        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        // Start without stored decision-plane settings; this exercises generic repair.
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
         // A telegram block without `allowed_users` folds in cleanly but fails
         // the staged validation, which is exactly the shape that used to reset
         // the whole tree with a single dropped `tracing::warn!`.
@@ -2675,7 +2679,7 @@ mod tests {
 
         let mut report = InitReport::default();
         report.record_preservation(&outcome, None);
-        assert!(report.dropped_keys().is_empty());
+        assert!(report.dropped_keys().is_empty(), "expected an empty value");
         report.into_result().expect("test: a lossless fold must exit zero");
     }
 
@@ -2687,7 +2691,11 @@ mod tests {
     async fn a_failure_after_the_commit_keeps_the_committed_report() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
-        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        // Start without stored decision-plane settings; this exercises generic repair.
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
 
         // `allowed_users` is required, so the preserved settings cannot validate
         // and `--force` falls back to the shipped templates.
@@ -3418,13 +3426,14 @@ mod tests {
         assert_eq!(soul, "# My custom soul\n", "existing .md files must not be overwritten");
     }
 
-    /// D-074 with X-3: the full template's `[causal_tree]` block, unchanged
-    /// since BASE `8a5d160d`, is the old serialized default: the migration
-    /// reads its bare `enabled = false` as unset, so the CDP-31 default flip
-    /// reaches installs that were never saved.
+    /// D-074 with X-3: the frozen full template from BASE `8a5d160d`
+    /// contains the old serialized default. The migration reads its bare
+    /// `enabled = false` as unset, so the CDP-31 default flip reaches installs
+    /// that were never saved.
     #[test]
     fn the_base_full_template_disable_reads_as_unset() {
-        let mut root: toml::Value = toml::from_str(&agent_template(Spec::Full)).expect("test: template parses");
+        let mut root: toml::Value =
+            toml::from_str(include_str!("fixtures/agent-full-base-8a5d160d.toml")).expect("test: template parses");
         assert_eq!(
             root.get("causal_tree")
                 .and_then(|table| table.as_table())

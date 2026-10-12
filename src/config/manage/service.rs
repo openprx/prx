@@ -1850,6 +1850,7 @@ mod tests {
             .set("openai", "shared", SECRET)
             .expect("test: set");
         let config = loaded(dir.path(), |config| {
+            config.causal_tree.enabled = false;
             config.model_routes.push(ModelRouteConfig {
                 credential_ref: Some("cred-shared".into()),
                 ..route("fast", "openai", "gpt-4o-mini")
@@ -2197,7 +2198,7 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("test: remove model: {error}"));
-        assert!(removed.providers.models.is_empty());
+        assert!(removed.providers.models.is_empty(), "expected an empty value");
     }
 
     /// D-085 F-6 (new read model): every known model — configured

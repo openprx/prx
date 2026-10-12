@@ -290,7 +290,7 @@ mod tests {
 
         let log = mgr.audit_log();
         assert_eq!(log.len(), 1);
-        assert!(!log[0].timestamp.is_empty());
+        assert!(!log[0].timestamp.is_empty(), "expected a non-empty value");
         assert_eq!(log[0].channel, "telegram");
     }
 

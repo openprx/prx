@@ -935,7 +935,24 @@ mod tests {
     #[tokio::test]
     async fn rollback_restores_mode_and_backend_in_one_transaction() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (service, shared) = service(temp.path()).await;
+        let (service, shared) = {
+            let mut config = Config {
+                config_path: temp.path().join("config.toml"),
+                workspace_dir: temp.path().join("workspace"),
+                ..Config::default()
+            };
+            config.causal_tree.enabled = false;
+            config.secrets.encrypt = false;
+            crate::config::files::write_split_config(&config, false)
+                .await
+                .expect("test: write");
+            let loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load");
+            let shared = crate::config::new_shared(loaded);
+            (
+                CausalConfigService::new(ConfigTransactions::new(Arc::clone(&shared))),
+                shared,
+            )
+        };
         let first = apply(
             &service,
             &[CausalMutation::SetEnabled(true), loopback_backend("decider-1")],
@@ -1071,7 +1088,10 @@ mod tests {
             listed.iter().map(|status| status.id.as_str()).collect::<Vec<_>>(),
             [ids[1].as_str()]
         );
-        assert!(orphaned_decision_credentials(&desired).unwrap().is_empty());
+        assert!(
+            orphaned_decision_credentials(&desired).unwrap().is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// D-102 H-3: the previous decision credential is removed only when

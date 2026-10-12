@@ -62,6 +62,10 @@ impl Driver {
     pub(crate) async fn start_answer() -> Result<Self> {
         Self::start_action("answer", "none").await
     }
+    // A denied depth boundary has a real parent delegation and no child decision.
+    pub(crate) async fn start_depth_denial() -> Result<Self> {
+        Self::start_plan("delegate", "session", None).await
+    }
     pub(crate) async fn start_delegation(child_target: &'static str) -> Result<Self> {
         Self::start_plan("delegate", "session", Some(child_target)).await
     }
@@ -241,7 +245,11 @@ pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> R
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     Ok(())
 }
-fn decision_answers(body: &serde_json::Value, action: &str, target: &str) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn decision_answers(
+    body: &serde_json::Value,
+    action: &str,
+    target: &str,
+) -> anyhow::Result<serde_json::Value> {
     use serde_json::{Value, json};
     assert_eq!(body.get("model").and_then(Value::as_str), Some(DECISION_MODEL));
     let candidates = body

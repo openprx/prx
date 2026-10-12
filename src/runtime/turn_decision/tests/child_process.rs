@@ -663,7 +663,69 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         )
         .await?;
         assert_eq!(replay.parent_decision_id(), Some(context.decision_id()));
-        assert_eq!(replay.source().event_id, child_input.event_id);
+        // A segment replay authenticates its own input; the original task
+        // input remains independently linked through the canonical segment.
+        let segment_run_id = format!("child-segment:{}:0", child_input.event_id);
+        let segment_input = memory
+            .find_owned_message_event_by_idempotency_key(
+                proof.workspace_id(),
+                proof.owner_id(),
+                &format!("{segment_run_id}:input"),
+            )
+            .await?
+            .expect("actual first child segment input");
+        assert_eq!(replay.source().event_id, segment_input.event_id);
+        assert_ne!(segment_input.event_id, child_input.event_id);
+        assert_eq!(child_input.source, crate::memory::MessageEventSource::SessionsSpawn);
+        assert_eq!(segment_input.source, crate::memory::MessageEventSource::SessionWorker);
+        assert_eq!(segment_input.run_id.as_deref(), Some(segment_run_id.as_str()));
+        assert_eq!(
+            segment_input.subject,
+            Some(crate::memory::MessageEventSubject::Task(run_id.to_owned()))
+        );
+        assert_eq!(segment_input.workspace_id, child_input.workspace_id);
+        assert_eq!(segment_input.owner_id, child_input.owner_id);
+        assert_eq!(segment_input.session_key, child_input.session_key);
+        assert_eq!(segment_input.parent_session_key, child_input.parent_session_key);
+        assert_eq!(segment_input.parent_run_id, child_input.parent_run_id);
+        assert_eq!(segment_input.config_generation_id, child_input.config_generation_id);
+        assert_eq!(segment_input.config_source_revision, child_input.config_source_revision);
+        let segment_lineage: serde_json::Value = serde_json::from_str(
+            segment_input
+                .raw_payload_json
+                .as_deref()
+                .expect("segment input lineage"),
+        )?;
+        assert_eq!(
+            *segment_lineage
+                .get("task_input_event_id")
+                .expect("segment lineage task_input_event_id field"),
+            child_input.event_id
+        );
+        assert_eq!(
+            *segment_lineage
+                .get("task_run_id")
+                .expect("segment lineage task_run_id field"),
+            run_id
+        );
+        assert_eq!(
+            *segment_lineage
+                .get("segment_index")
+                .expect("segment lineage segment_index field"),
+            0
+        );
+        assert!(
+            segment_lineage
+                .get("previous_segment_input_event_id")
+                .expect("first segment predecessor field")
+                .is_null()
+        );
+        assert_eq!(
+            *segment_lineage
+                .get("parent_decision_id")
+                .expect("segment lineage parent_decision_id field"),
+            context.decision_id().to_string()
+        );
         assert_eq!(replay.decision().backend_kind, "builtin");
         assert!(matches!(
             replay.decision().directive_kind.as_str(),
@@ -963,6 +1025,10 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     assert!(context.record_admitted.load(Ordering::Acquire));
     if level == crate::security::AutonomyLevel::Full {
         assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
+        assert_eq!(
+            context.terminal_outcome_action(),
+            Some(crate::causal_tree::branch::CausalActionKind::Delegate)
+        );
         let selected = service.agent_execution_specs(&proof, &context)?;
         assert_eq!(selected.specs.len(), 1);
         assert_eq!(

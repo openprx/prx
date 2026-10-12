@@ -1335,14 +1335,21 @@ mod tests {
         let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
         let schema = tool.parameters_schema();
 
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "add"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "add", "expression": "0 9 * * *"})).is_empty());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "add"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "add", "expression": "0 9 * * *"})).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             validate_tool_arguments(
                 &schema,
                 &json!({"action": "add", "expression": "0 9 * * *", "command": "date"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             validate_tool_arguments(
@@ -1353,7 +1360,8 @@ mod tests {
                     "payload": {"kind": "agentTurn", "message": "inspect state"}
                 })
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             !validate_tool_arguments(
@@ -1364,18 +1372,24 @@ mod tests {
                     "payload": {"kind": "agentTurn", "message": "inspect state"}
                 })
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "once", "command": "date"})).is_empty());
         assert!(
-            validate_tool_arguments(&schema, &json!({"action": "once", "command": "date", "delay": "5m"})).is_empty()
+            !validate_tool_arguments(&schema, &json!({"action": "once", "command": "date"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "once", "command": "date", "delay": "5m"})).is_empty(),
+            "expected an empty value"
         );
         assert!(
             validate_tool_arguments(
                 &schema,
                 &json!({"action": "once", "command": "date", "run_at": "2030-01-01T00:00:00Z"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             !validate_tool_arguments(
@@ -1387,7 +1401,8 @@ mod tests {
                     "run_at": "2030-01-01T00:00:00Z"
                 })
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
     }
 

@@ -212,7 +212,7 @@ pub(crate) fn masked_word_at(masked: &[char], from: usize) -> (String, usize) {
     (masked[start..index].iter().collect(), index)
 }
 
-pub(crate) fn close_of_group(masked: &[char], open: usize) -> usize {
+pub(crate) const fn close_of_group(masked: &[char], open: usize) -> usize {
     let mut depth = 0usize;
     let mut index = open;
     while index < masked.len() {

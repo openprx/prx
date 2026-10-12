@@ -1683,7 +1683,7 @@ mod tests {
             std::time::Duration::from_millis(10),
         );
         assert_eq!(outcome, ReaderOutcome::Eof);
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "expected an empty value");
     }
 
     #[test]

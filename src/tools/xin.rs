@@ -1426,14 +1426,21 @@ mod tests {
         let tool = XinTool::new(new_shared(config), security);
         let schema = tool.parameters_schema();
 
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "update"})).is_empty());
-        assert!(!validate_tool_arguments(&schema, &json!({"action": "update", "task_id": "task-1"})).is_empty());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "update"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "update", "task_id": "task-1"})).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             validate_tool_arguments(
                 &schema,
                 &json!({"action": "update", "task_id": "task-1", "priority": "high"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
     }
 

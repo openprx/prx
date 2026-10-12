@@ -1018,7 +1018,7 @@ mod tests {
     #[test]
     fn description_non_empty() {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]

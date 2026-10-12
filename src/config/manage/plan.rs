@@ -1990,14 +1990,14 @@ mod tests {
         }
         let summary = ConfigChangeSummary::between(Some(&after), &rotated).expect("test: summary");
         assert_eq!(summary.secret_writes, ["model_routes[0].api_key"]);
-        assert!(summary.secret_clears.is_empty());
+        assert!(summary.secret_clears.is_empty(), "expected an empty value");
 
         let mut cleared = after.clone();
         if let Some(route) = cleared.model_routes.first_mut() {
             route.api_key = None;
         }
         let summary = ConfigChangeSummary::between(Some(&after), &cleared).expect("test: summary");
-        assert!(summary.secret_writes.is_empty());
+        assert!(summary.secret_writes.is_empty(), "expected an empty value");
         assert_eq!(summary.secret_clears, ["model_routes[0].api_key"]);
 
         // RED before PMMH-g (D-104 C-1): two embedding routes sharing a

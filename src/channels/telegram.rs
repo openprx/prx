@@ -2455,7 +2455,7 @@ mod tests {
         let (cleaned, attachments) = parse_attachment_markers(message);
 
         assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
-        assert!(attachments.is_empty());
+        assert!(attachments.is_empty(), "expected an empty value");
     }
 
     #[test]

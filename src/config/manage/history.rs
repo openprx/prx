@@ -613,7 +613,7 @@ mod tests {
                 written.push(entry);
             }
         }
-        assert!(!written.is_empty());
+        assert!(!written.is_empty(), "expected a non-empty value");
         for path in &written {
             assert!(
                 path.starts_with(dir.path().join(HISTORY_DIR)),
@@ -844,7 +844,10 @@ mod tests {
         history.update(&mut done).expect("test: update");
 
         assert_eq!(history.purge().expect("test: purge"), 2);
-        assert!(history.list().expect("test: list").is_empty());
+        assert!(
+            history.list().expect("test: list").is_empty(),
+            "expected an empty value"
+        );
         assert!(history.get(&pending.id).is_err());
         assert_eq!(history.purge().expect("test: purge again"), 0);
     }

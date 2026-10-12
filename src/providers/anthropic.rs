@@ -3191,7 +3191,7 @@ mod tests {
             message.contains("Overloaded"),
             "the upstream message is kept: {message}"
         );
-        assert!(completed_calls(&results).is_empty());
+        assert!(completed_calls(&results).is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

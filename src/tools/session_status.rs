@@ -208,7 +208,7 @@ mod tests {
     fn name_and_description() {
         let tool = make_tool_with_runs(vec![]);
         assert_eq!(tool.name(), "session_status");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]

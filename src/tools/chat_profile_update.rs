@@ -295,13 +295,19 @@ mod tests {
         let tool = ChatProfileUpdateTool::new(memory, Arc::new(SecurityPolicy::default()));
         let schema = tool.parameters_schema();
 
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
         for arguments in [
             json!({"purpose": "purpose"}),
             json!({"notes": "notes"}),
             json!({"tags": ["tag"]}),
         ] {
-            assert!(crate::tools::schema::validate_tool_arguments(&schema, &arguments).is_empty());
+            assert!(
+                crate::tools::schema::validate_tool_arguments(&schema, &arguments).is_empty(),
+                "expected an empty value"
+            );
         }
     }
 

@@ -245,7 +245,7 @@ mod tests {
             .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(second).unwrap()).unwrap())
             .unwrap();
 
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
         assert_eq!(commits.pending_outcomes(), 1);
 
         scheduler.mark_completed(first, 7, "first done").unwrap();
@@ -292,7 +292,7 @@ mod tests {
         commits
             .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(second).unwrap()).unwrap())
             .unwrap();
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
 
         scheduler.request_cancel(first).unwrap();
         scheduler
@@ -342,7 +342,7 @@ mod tests {
         commits
             .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(second).unwrap()).unwrap())
             .unwrap();
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
         commits
             .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(first).unwrap()).unwrap())
             .unwrap();
@@ -472,7 +472,7 @@ mod tests {
 
         scheduler.mark_completed(third, 14, "third done").unwrap();
         record_terminal_outcome(&mut commits, &scheduler, third);
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
         assert_eq!(commits.pending_outcomes(), 1);
 
         scheduler.request_cancel(second).unwrap();
@@ -587,7 +587,7 @@ mod tests {
 
         scheduler.mark_completed(fourth, 24, "fourth done").unwrap();
         record_terminal_outcome(&mut commits, &scheduler, fourth);
-        assert!(commits.drain_ready().is_empty());
+        assert!(commits.drain_ready().is_empty(), "expected an empty value");
         assert_eq!(commits.pending_tasks(), 4);
         assert_eq!(commits.pending_outcomes(), 1);
 

@@ -533,7 +533,7 @@ mod tests {
         let (cleaned, refs) = parse_image_markers(input);
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
-        assert!(refs.is_empty());
+        assert!(refs.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn parse_image_markers_ignores_unicode_ellipsis_placeholder() {
         let (_, refs) = parse_image_markers("see [IMAGE:\u{2026}] here");
-        assert!(refs.is_empty());
+        assert!(refs.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -696,8 +696,11 @@ mod tests {
             assert!(out.contains(&format!("({kind}: ")), "payload must stay readable: {out}");
         }
         assert!(out.contains("/tmp/a.png") && out.contains("/tmp/e.ogg"));
-        assert!(crate::channels::traits::extract_outgoing_media(&out).1.is_empty());
-        assert!(parse_image_markers(&out).1.is_empty());
+        assert!(
+            crate::channels::traits::extract_outgoing_media(&out).1.is_empty(),
+            "expected an empty value"
+        );
+        assert!(parse_image_markers(&out).1.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -740,7 +743,7 @@ mod tests {
         let out = truncate_preserving_media_markers(&content, 30);
 
         assert!(!out.contains("[IMAGE:"), "no marker fragment may survive: {out}");
-        assert!(parse_image_markers(&out).1.is_empty());
+        assert!(parse_image_markers(&out).1.is_empty(), "expected an empty value");
     }
 
     #[test]

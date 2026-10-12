@@ -47,11 +47,10 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
 /// Deserialize bytes to f32 vector (little-endian)
 pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-            f32::from_le_bytes(arr)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -191,9 +190,9 @@ mod tests {
     #[test]
     fn vec_bytes_empty() {
         let bytes = vec_to_bytes(&[]);
-        assert!(bytes.is_empty());
+        assert!(bytes.is_empty(), "expected an empty value");
         let restored = bytes_to_vec(&bytes);
-        assert!(restored.is_empty());
+        assert!(restored.is_empty(), "expected an empty value");
     }
 
     #[test]
@@ -315,7 +314,7 @@ mod tests {
     fn bytes_to_vec_three_bytes_returns_empty() {
         let bytes = vec![1u8, 2, 3];
         let result = bytes_to_vec(&bytes);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "expected an empty value");
     }
 
     #[test]

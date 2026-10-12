@@ -653,7 +653,7 @@ mod tests {
             slot("gateway.paired_tokens").apply(&mut config, CredentialValue::Clear),
             Ok(())
         );
-        assert!(config.gateway.paired_tokens.is_empty());
+        assert!(config.gateway.paired_tokens.is_empty(), "expected an empty value");
         assert!(
             slot("gateway.paired_tokens")
                 .apply(&mut config, CredentialValue::One("x".into()))

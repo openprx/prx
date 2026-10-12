@@ -518,7 +518,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, 200, "{reply}");
-        assert!(served.loaded().providers.models.is_empty());
+        assert!(served.loaded().providers.models.is_empty(), "expected an empty value");
         assert_eq!(served.loaded().default_model.as_deref(), Some(MODEL));
     }
 

@@ -8,6 +8,36 @@ impl OperatorProcessSnapshots {
         config: crate::config::Config,
         key: std::sync::Arc<DecisionKey>,
     ) -> anyhow::Result<Self> {
+        Self::restore_with_generation(manifest, config, key, crate::config::ConfigGeneration::restore_process)
+    }
+
+    /// Parent-only startup failure: the launch retains its exact published generation.
+    pub(crate) fn restore_parent_startup(
+        manifest: &crate::session_worker::protocol::WorkerManifest,
+        generation: &std::sync::Arc<crate::config::ConfigGeneration>,
+        key: std::sync::Arc<DecisionKey>,
+    ) -> anyhow::Result<Self> {
+        Self::restore_with_generation(
+            manifest,
+            generation.effective.as_ref().clone(),
+            key,
+            |_, binding, key| {
+                generation.verify_pinned_process_binding(binding, key)?;
+                Ok(std::sync::Arc::clone(generation))
+            },
+        )
+    }
+
+    fn restore_with_generation(
+        manifest: &crate::session_worker::protocol::WorkerManifest,
+        config: crate::config::Config,
+        key: std::sync::Arc<DecisionKey>,
+        restore: impl FnOnce(
+            crate::config::Config,
+            &crate::config::generation::ProcessGenerationBinding,
+            &DecisionKey,
+        ) -> anyhow::Result<std::sync::Arc<crate::config::ConfigGeneration>>,
+    ) -> anyhow::Result<Self> {
         let source = manifest
             .operator_source
             .as_ref()
@@ -34,7 +64,7 @@ impl OperatorProcessSnapshots {
             publication.workspace() == workspace && manifest.owner_id.as_deref() == Some(publication.owner()),
             "operator worker owner or workspace differs"
         );
-        let generation = crate::config::ConfigGeneration::restore_process(config, &source.config_generation, &key)?;
+        let generation = restore(config, &source.config_generation, &key)?;
         let recording = generation.effective.memory.event_recording_config();
         anyhow::ensure!(
             manifest.memory_event_recording.enabled == recording.enabled

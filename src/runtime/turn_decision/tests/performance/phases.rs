@@ -323,37 +323,58 @@ async fn actual_builtin_phase_characterization() {
         0,
         "fresh fixture has no decision rows before measurement"
     );
-    let prepared = async {
+    let (((context, token, counts, times, started), original_material), total) = count_process_future(async {
         let started = Instant::now();
-        let (token, capture) = capture_process_checkpoint().expect("active owned process allocation window");
-        let capture_us = started.elapsed().as_micros();
-        let context = if mode == "decision" {
-            Some(
-                service
-                    .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
-                    .await
-                    .expect("actual builtin decision"),
+        let prepared = async {
+            let (token, capture) = capture_process_checkpoint().expect("active owned process allocation window");
+            let capture_us = started.elapsed().as_micros();
+            let context = if mode == "decision" {
+                Some(
+                    service
+                        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+                        .await
+                        .expect("actual builtin decision"),
+                )
+            } else {
+                None
+            };
+            let returned = token
+                .read()
+                .expect("same window at actual return or explicit idle boundary");
+            let returned_us = started.elapsed().as_micros();
+            let (counts, times) = acknowledged_phases(&service, &token, started).await;
+            (
+                context,
+                token,
+                [capture, returned, counts[0], counts[1]],
+                [capture_us, returned_us, times[0], times[1]],
+                started,
             )
-        } else {
-            None
         };
-        let returned = token
-            .read()
-            .expect("same window at actual return or explicit idle boundary");
-        let returned_us = started.elapsed().as_micros();
-        let (counts, times) = acknowledged_phases(&service, &token, started).await;
-        (
-            context,
-            token,
-            [capture, returned, counts[0], counts[1]],
-            [capture_us, returned_us, times[0], times[1]],
-            started,
+        let (output, captured) = crate::causal_tree::decision_engine::original_observation::material::capture(
+            "same-invocation-phase",
+            prepared,
         )
-    };
-    let ((context, token, counts, times, started), total) = count_process_future(prepared)
         .await
-        .expect("isolated inclusive process window");
+        .expect("bounded same-invocation phase material");
+        let hops = output
+            .0
+            .as_ref()
+            .map(|context| context.audit_hops().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let material = captured
+            .finish_material(&hops, mode != "decision")
+            .expect("complete original phase material inside measured window");
+        drop(hops);
+        (output, material)
+    })
+    .await
+    .expect("isolated inclusive process window");
     let final_elapsed_us = started.elapsed().as_micros();
+    println!(
+        "PRX_ORIGINAL_MATERIAL {}",
+        std::str::from_utf8(&original_material).expect("encoded material JSON")
+    );
     assert_eq!(
         token.read(),
         Err(CheckpointError::Inactive),

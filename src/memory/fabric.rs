@@ -276,7 +276,11 @@ impl MemoryFabric {
         ticket: &crate::runtime::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Self> {
         let recording = config.memory.event_recording_config();
-        if !config.causal_tree.enabled || !recording.enabled || !recording.record_user_messages {
+        if self.memory.name() == "none"
+            || !config.causal_tree.enabled
+            || !recording.enabled
+            || !recording.record_user_messages
+        {
             return Ok(self);
         }
         anyhow::ensure!(
@@ -758,7 +762,7 @@ impl MemoryFabric {
     }
 
     fn should_record_role(&self, role: &str) -> bool {
-        if !self.event_recording.enabled {
+        if self.memory.name() == "none" || !self.event_recording.enabled {
             return false;
         }
         match role {
@@ -839,6 +843,43 @@ mod tests {
     use super::*;
     use crate::memory::SqliteMemory;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn none_memory_skips_recording_and_ingress_with_enabled_configuration() {
+        let workspace = TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.memory.backend = "sqlite".to_string();
+        config.causal_tree.enabled = true;
+        let config = Arc::new(config);
+        let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let ticket = owner.register(tokio_util::sync::CancellationToken::new()).unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let fabric = MemoryFabric::new(memory, workspace.path().to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config())
+            .with_ingress_recovery(&config, &ticket)
+            .await
+            .unwrap();
+
+        assert!(fabric.ingress.is_none());
+        let event = fabric
+            .record_inbound_user_message(
+                MessageEventScope::new("chat", MemoryVisibility::Workspace),
+                "message body",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(event.id, 0);
+        assert_eq!(event.role, "user");
+        assert_eq!(event.content, "message body");
+        ticket.finish(true);
+        owner
+            .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn fabric_records_inbound_user_message_to_sqlite() {

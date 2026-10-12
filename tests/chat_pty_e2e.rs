@@ -131,6 +131,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         toml::to_string_pretty(&config).expect("serialize chat config"),
     )
     .expect("write chat config");
+    add_owned_chat_fixture_tariff(&guard, &override_provider, "probe-model");
 
     let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -354,7 +355,71 @@ fn new_harness_guard() -> std::io::Result<HarnessGuard> {
     })
 }
 
+/// Every owned PTY config supplies zero tariffs for its exact fixture providers.
+/// Existing configuration values (including daemon and security settings) survive.
+fn add_owned_chat_fixture_tariff(guard: &HarnessGuard, provider: &str, model: &str) {
+    let path = guard.config_dir.join("config.toml");
+    let mut document = if path.exists() {
+        std::fs::read_to_string(&path)
+            .expect("read owned chat config")
+            .parse::<toml::Value>()
+            .expect("parse owned chat config")
+    } else {
+        // The normal missing-file loader serializes this same default. Its
+        // computed workspace/config paths are serde-skipped and stay unchanged.
+        toml::Value::try_from(openprx::config::Config::default()).expect("serialize chat defaults")
+    };
+    let default_cost = toml::Value::try_from(openprx::config::CostConfig::default()).expect("serialize cost defaults");
+    let default_prices = default_cost.get("prices").expect("default cost prices").clone();
+    let cost = document
+        .as_table_mut()
+        .expect("chat config table")
+        .entry("cost")
+        .or_insert(default_cost)
+        .as_table_mut()
+        .expect("cost table");
+    let prices = cost
+        .entry("prices")
+        .or_insert(default_prices)
+        .as_table_mut()
+        .expect("prices table");
+    let price = toml::Value::try_from(openprx::config::schema::ModelPricing {
+        input: 0.0,
+        output: 0.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+    })
+    .expect("serialize zero fixture price");
+    let mut changed = false;
+    for key in ["mock/mock".to_string(), format!("{provider}/{model}")] {
+        if let Some(existing) = prices.get(&key) {
+            assert_eq!(existing, &price, "owned fixture tariff must remain zero");
+        } else {
+            prices.insert(key, price.clone());
+            changed = true;
+        }
+    }
+    // Repeated commands on one harness must not rewrite a live daemon's config.
+    if !changed {
+        return;
+    }
+    let encoded = toml::to_string_pretty(&document).expect("serialize priced chat config");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .expect("open owned chat config")
+        .write_all(encoded.as_bytes())
+        .expect("write fixture tariff");
+}
+
 fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
+    add_owned_chat_fixture_tariff(guard, "mock", "mock");
     let mut cmd = Command::new(prx_binary());
     cmd.arg("chat");
     cmd.arg("-p").arg("mock");

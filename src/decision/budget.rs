@@ -22,8 +22,14 @@ pub struct AttemptBinding<'a> {
     pub(super) guarded_body: &'a [u8],
     pub(super) request_id: &'a str,
     pub(super) deadline: Instant,
+    pub(super) remaining_attempts: u8,
 }
 impl AttemptBinding<'_> {
+    /// Remaining sends in the transport-owned bounded attempt plan.
+    #[must_use]
+    pub const fn remaining_attempts(&self) -> u8 {
+        self.remaining_attempts
+    }
     #[must_use]
     pub const fn backend(&self) -> &BackendIdentity {
         self.backend

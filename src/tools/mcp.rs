@@ -400,7 +400,7 @@ impl McpTool {
     #[cfg(test)]
     pub(crate) fn test_publish_inventory(&self, server: &str, count: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
-            [0, 1, 16, 64, 256, 512].contains(&count),
+            [0, 1, 2, 16, 17, 64, 65, 256, 257, 512, 513].contains(&count),
             "unsupported fixture inventory"
         );
         let mut state = self.state.write();
@@ -2444,7 +2444,7 @@ mod tests {
             McpConfig::default(),
             std::env::temp_dir(),
         );
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -2473,7 +2473,8 @@ mod tests {
         assert!(implicit.iter().any(|issue| issue.path == "$.server"));
         assert!(implicit.iter().any(|issue| issue.path == "$.tool"));
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"server": "s", "tool": "t"})).is_empty()
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"server": "s", "tool": "t"})).is_empty(),
+            "expected an empty value"
         );
     }
 
@@ -3038,6 +3039,7 @@ for line in sys.stdin:
             workspace.path().to_path_buf(),
         );
 
+        tool.refresh_catalog_config();
         let _ = tool.parameters_schema();
         assert!(tool.config_error().is_some());
         assert_eq!(
@@ -3497,7 +3499,7 @@ for line in sys.stdin:
             ("LANG".into(), "en_US.UTF-8".into()),
         ]);
         let removed = McpTool::sanitize_env_vars(&mut env);
-        assert!(removed.is_empty());
+        assert!(removed.is_empty(), "expected an empty value");
         assert_eq!(env.len(), 3);
     }
 

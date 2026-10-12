@@ -616,7 +616,7 @@ mod tests {
             "test: {:?}",
             result.error
         );
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -700,7 +700,7 @@ mod tests {
         .await;
 
         assert_eq!(status, 401);
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -727,7 +727,7 @@ mod tests {
         assert!(body.contains("Unknown channel 'matrix'"), "test: body was {body}");
         assert!(body.contains("Available channels:"), "test: body was {body}");
         assert!(body.contains(CHANNEL), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(status, 400, "test: body was {body}");
         assert!(body.contains("text-only"), "test: body was {body}");
         assert!(body.contains("[IMAGE:]"), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -794,7 +794,7 @@ mod tests {
             "test: {:?}",
             result.error
         );
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(status, 403, "test: body was {body}");
         assert!(body.contains(POLICY_MARKER), "test: body was {body}");
         assert!(!body.contains("text-only"), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -905,7 +905,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, 400, "test: response was {response}");
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -928,7 +928,7 @@ mod tests {
         .await;
 
         assert_eq!(status, 403);
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
     }
 
@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let body = body.0.to_string();
         assert!(body.contains(POLICY_MARKER), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty());
+        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

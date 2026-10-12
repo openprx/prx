@@ -1817,7 +1817,7 @@ mod tests {
     fn cost_tracker_initialization() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
-        assert!(!tracker.session_id().is_empty());
+        assert!(!tracker.session_id().is_empty(), "expected a non-empty value");
     }
 
     #[test]

@@ -1062,6 +1062,11 @@ impl DecisionBackendFactory {
                     continue;
                 }
             };
+            #[cfg(test)]
+            let mut material_boundary = crate::causal_tree::decision_engine::original_observation::material::evaluation(
+                request.request_id(),
+                body.bytes(),
+            );
             events.emit(CausalEventKind::PredictionStarted, Emitter::slot_fields(slot));
             // The attempt is bounded by the slot timeout, or by the turn's
             // deadline when that comes first.
@@ -1097,6 +1102,8 @@ impl DecisionBackendFactory {
                     },
                 )
             });
+            #[cfg(test)]
+            material_boundary.returned();
             let latency = now.elapsed();
             match outcome {
                 Ok(decision) => {
@@ -1433,7 +1440,7 @@ mod tests {
         )
         .with_unproven_budget_gate();
         let status = factory.status();
-        assert!(status.order.is_empty());
+        assert!(status.order.is_empty(), "expected an empty value");
         assert!(
             status
                 .excluded
@@ -1448,7 +1455,7 @@ mod tests {
         assert_eq!(result.served_locality, BackendLocality::Builtin);
         assert_eq!(result.served_endpoint, None);
         assert_eq!(result.reason, Some(FallbackReason::BudgetUnproven));
-        assert!(result.attempts.is_empty());
+        assert!(result.attempts.is_empty(), "expected an empty value");
         assert_eq!(mock.calls(), 0);
         assert!(received.lock().is_empty());
     }
@@ -1710,8 +1717,8 @@ mod tests {
 
     /// `disabled_builds_builtin_only_order_and_no_transport` and V2.09
     /// (`default_config_performs_no_decision_network_io`): with the plane
-    /// disabled, the default configuration, or `auto` without an endpoint,
-    /// no transport is ever built and the builtin serves.
+    /// explicitly disabled, the CDP-31 enabled default with no endpoint, or
+    /// `auto` without an endpoint, no transport is built and the builtin serves.
     #[tokio::test]
     async fn disabled_builds_builtin_only_order_and_no_transport() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
@@ -1723,7 +1730,7 @@ mod tests {
         disabled.causal_tree.enabled = false;
         let auto_without_endpoint = config(&temp, |_| {});
         for (config, reason) in [
-            (&default, Some(FallbackReason::Disabled)),
+            (&default, None),
             (&disabled, Some(FallbackReason::Disabled)),
             (&auto_without_endpoint, None),
         ] {
@@ -1740,9 +1747,9 @@ mod tests {
                 .expect("test: decide");
             assert_eq!(result.served_by, ServedBy::Builtin);
             assert_eq!(result.reason, reason);
-            assert!(result.attempts.is_empty());
+            assert!(result.attempts.is_empty(), "expected an empty value");
             assert_eq!(result.served, result.builtin_shadow);
-            assert!(factory.status().order.is_empty());
+            assert!(factory.status().order.is_empty(), "expected an empty value");
         }
         assert_eq!(transports.builds(), 0, "no transport is ever constructed");
         let disabled_status = build(

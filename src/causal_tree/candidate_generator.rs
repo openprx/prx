@@ -385,9 +385,21 @@ impl CausalCandidateGenerator {
                         policy,
                         gates,
                     )? {
-                        if !proposed
-                            .iter()
-                            .any(|prior: &CausalCandidate| prior.candidate_id() == candidate.candidate_id())
+                        // An admitted exact mention already represents this entry.
+                        // Preserve family fallback for other entries and unmatched input.
+                        let exact_entry_present = proposed.iter().any(|prior: &CausalCandidate| {
+                            exact_mentions.contains(prior.candidate_id())
+                                && prior.required_capabilities().iter().any(|exact| {
+                                    candidate
+                                        .required_capabilities()
+                                        .iter()
+                                        .any(|fallback| exact.id == fallback.id)
+                                })
+                        });
+                        if !exact_entry_present
+                            && !proposed
+                                .iter()
+                                .any(|prior: &CausalCandidate| prior.candidate_id() == candidate.candidate_id())
                         {
                             proposed.push(candidate);
                         }
@@ -599,6 +611,23 @@ fn select_family_candidate<'a>(
         // constructing and pricing it during family fallback selection.
         if state.trusted.parts().side_effect_mode == SideEffectMode::ReadOnly
             && entry.effect > SideEffectClass::ReadOnly
+        {
+            continue;
+        }
+        // These borrowed facts can only reject a transient family probe.
+        // Keep the full gates authoritative for every proposed candidate and
+        // never interpret a model bitmap from a different catalog layout.
+        let trusted = state.trusted.parts();
+        if catalog.surface_excludes(entry)
+            || trusted
+                .exclusions
+                .iter()
+                .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
+            || trusted.model_admission.as_ref().is_some_and(|policy| {
+                policy.matches_layout(catalog.generation().0, catalog.model_admission_layout())
+                    && policy.excludes(catalog.model_admission_entry(entry))
+            })
+            || trusted.channel.is_some() && !entry.channel_eligible
         {
             continue;
         }
@@ -2057,6 +2086,175 @@ mod tests {
     }
 
     #[test]
+    fn exact_mention_dominates_same_entry_family_and_unmatched_input_keeps_fallback() {
+        let key = fixtures::key();
+        let mut state = fixtures::state(&key, "first unrelated request");
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("prx_read")), Box::new(ProbeTool("prx_search"))];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let mut trusted = fixtures::trusted();
+        trusted.catalog_generation = *catalog.generation();
+        trusted.channel = None;
+        trusted.side_effect_mode = SideEffectMode::GuardedWrite;
+        state.trusted = TrustedState::from_runtime(trusted);
+        let cost = CapabilityCostModel {
+            per_capability: BTreeMap::new(),
+            estimates: BTreeMap::from([
+                (
+                    CapabilityTarget::None,
+                    (
+                        CostEstimate {
+                            tokens: 1,
+                            micro_usd: 0,
+                        },
+                        1,
+                    ),
+                ),
+                (
+                    CapabilityTarget::NativeTool,
+                    (
+                        CostEstimate {
+                            tokens: 1,
+                            micro_usd: 0,
+                        },
+                        1,
+                    ),
+                ),
+            ]),
+        };
+        let cost = fixture_cost_for_catalog(&catalog, cost);
+        let counting_cost = CountingCost {
+            inner: &cost,
+            entries: AtomicUsize::new(0),
+        };
+        let view = catalog.view(&CatalogScope::default());
+        let discovered_all: BTreeSet<_> = view
+            .entries()
+            .iter()
+            .map(|entry| CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            })
+            .collect();
+        let discovered_all = DiscoveredRefs::from_refs_for_test(discovered_all);
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 12,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &counting_cost,
+            discovered_refs: &discovered_all,
+        };
+        let mut security = SecurityPolicy::default();
+        security.autonomy = crate::security::AutonomyLevel::Full;
+        let calls_seen = BTreeSet::<[u8; 32]>::new();
+        let calls = BTreeMap::new();
+        let gates = GateInputs {
+            policy: &security,
+            owner_id: "owner-1",
+            sender: "owner-1",
+            policy_channel: "terminal",
+            chat_type: "dm",
+            model_ref: "anthropic:claude",
+            model_can_chat: true,
+            model_can_call_tools: true,
+            decision_endpoint_ready: true,
+            child_scope: None,
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &calls,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &calls_seen,
+            retry_limit: Some(2),
+        };
+        let CandidateSet::Legal { candidates, .. } =
+            CausalCandidateGenerator::generate(&state, &view, &policy, &gates).expect("baseline")
+        else {
+            panic!("legal baseline");
+        };
+        let baseline = candidates
+            .iter()
+            .find(|candidate| candidate.action() == CausalActionKind::UseTool)
+            .expect("unmatched input has family fallback");
+        let fallback_id = &baseline.required_capabilities().first().expect("fallback entry").id;
+        let first = view
+            .entries()
+            .iter()
+            .find(|entry| &entry.id == fallback_id)
+            .expect("fallback catalog entry");
+        let other = view
+            .entries()
+            .iter()
+            .find(|entry| &entry.id != fallback_id)
+            .expect("different same-family entry");
+        for (input, blocked, expected_exact, expected_tools) in [
+            (format!("use {}", first.public_name), false, true, 1),
+            ("unrelated request".to_owned(), false, false, 1),
+            (format!("use {}", other.public_name), false, true, 2),
+            (format!("use {}", first.public_name), true, false, 1),
+        ] {
+            state.routing_input = RawRoutingInput::new(input);
+            let mut trusted = state.trusted.parts().clone();
+            trusted.exclusions.clear();
+            if blocked {
+                trusted.exclusions.push(first.public_name.clone().into());
+            }
+            state.trusted = TrustedState::from_runtime(trusted);
+            let CandidateSet::Legal {
+                candidates,
+                exact_mentions,
+                ..
+            } = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).expect("legal fixture")
+            else {
+                panic!("expected admitted capability");
+            };
+            let tools = candidates
+                .iter()
+                .filter(|candidate| candidate.action() == CausalActionKind::UseTool)
+                .collect::<Vec<_>>();
+            assert_eq!(tools.len(), expected_tools);
+            assert_eq!(!exact_mentions.is_empty(), expected_exact);
+            for entry in [first, other] {
+                let count = tools
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .required_capabilities()
+                            .iter()
+                            .any(|reference| reference.id == entry.id)
+                    })
+                    .count();
+                assert!(count <= 1, "exact and family cannot duplicate an entry");
+            }
+            if blocked {
+                assert!(
+                    tools.iter().all(|candidate| candidate
+                        .required_capabilities()
+                        .iter()
+                        .all(|reference| reference.id != first.id)),
+                    "blocked exact entry remains excluded"
+                );
+                assert!(
+                    tools.iter().any(|candidate| candidate
+                        .required_capabilities()
+                        .iter()
+                        .any(|reference| reference.id == other.id)),
+                    "different fallback survives blocked exact mention"
+                );
+            } else {
+                assert!(
+                    tools.iter().any(|candidate| candidate
+                        .required_capabilities()
+                        .iter()
+                        .any(|reference| reference.id == first.id)),
+                    "original family entry remains represented"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unrelated_user_text_preserves_candidates_and_exact_name_adds_only_its_pair() {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "first unrelated request");
@@ -2346,7 +2544,37 @@ mod tests {
         state.routing_input = RawRoutingInput::new("use prx_read".into());
         let exact = ids(&state);
         assert_eq!(exact.1.len(), 1);
-        assert_eq!(exact.0.len(), baseline.0.len() + 1);
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).expect("exact mention candidates")
+        else {
+            panic!("expected admitted exact mention");
+        };
+        let exact_candidate = candidates
+            .iter()
+            .find(|candidate| exact_mentions.contains(candidate.candidate_id()))
+            .expect("exact mention retained");
+        let exact_ref = exact_candidate
+            .required_capabilities()
+            .first()
+            .expect("exact entry reference");
+        assert!(
+            candidates.iter().all(|candidate| {
+                candidate.candidate_id() == exact_candidate.candidate_id()
+                    || !candidate
+                        .required_capabilities()
+                        .iter()
+                        .any(|reference| reference.id == exact_ref.id)
+                    || candidate.action() != CausalActionKind::UseTool
+            }),
+            "no family duplicate of the exact entry"
+        );
+        assert!(
+            baseline.0.iter().any(|id| id.as_str() == "use_tool-native_tool"),
+            "unmatched input retains its family fallback"
+        );
         let mut trusted = state.trusted.parts().clone();
         trusted.exclusions.push("prx_read".into());
         state.trusted = TrustedState::from_runtime(trusted);
@@ -2406,5 +2634,364 @@ mod tests {
         };
         let generated = CausalCandidateGenerator::generate(&state, &view, &small, &gates).unwrap();
         assert!(matches!(generated, CandidateSet::Legal { candidates, .. } if candidates.len() <= 3));
+    }
+    // Preserve the original transient probe algorithm as the differential oracle.
+    fn unfiltered_family_candidate<'a>(
+        action: CausalActionKind,
+        family: CapabilityTarget,
+        entries: impl IntoIterator<Item = &'a CapabilityEntry>,
+        state: &CausalState,
+        catalog: &CatalogView<'_>,
+        policy: &CandidatePolicy<'_>,
+        gates: &GateInputs<'_>,
+    ) -> Result<Option<CausalCandidate>, GateError> {
+        let mut approval_only = None;
+        for entry in entries {
+            // G9 will reject a write effect under a read-only turn. This
+            // transient probe cannot become Passed or ApprovalOnly, so avoid
+            // constructing and pricing it during family fallback selection.
+            if state.trusted.parts().side_effect_mode == SideEffectMode::ReadOnly
+                && entry.effect > SideEffectClass::ReadOnly
+            {
+                continue;
+            }
+            let candidate = from_entry(action, family, entry, policy, None);
+            let outcome = HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+            match outcome {
+                GateOutcome::Passed => return Ok(Some(candidate)),
+                GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
+                    approval_only = Some(candidate);
+                }
+                _ => {}
+            }
+        }
+        Ok(approval_only)
+    }
+
+    #[test]
+    fn borrowed_exclusions_preserve_family_selection_reports_and_stale_layout() {
+        let key = fixtures::key();
+        let registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(ProbeTool("prx_first")),
+            Box::new(ProbeTool("prx_second")),
+            Box::new(ProbeTool("prx_third")),
+        ];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let cost = fixture_cost_for_catalog(
+            &catalog,
+            CapabilityCostModel {
+                per_capability: BTreeMap::new(),
+                estimates: BTreeMap::from([(
+                    CapabilityTarget::NativeTool,
+                    (
+                        CostEstimate {
+                            tokens: 1,
+                            micro_usd: 0,
+                        },
+                        1,
+                    ),
+                )]),
+            },
+        );
+        let counting_cost = CountingCost {
+            inner: &cost,
+            entries: AtomicUsize::new(0),
+        };
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 3,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &counting_cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+        let mut security = SecurityPolicy::default();
+        security.autonomy = crate::security::AutonomyLevel::Full;
+        let calls = BTreeMap::new();
+        let history = BTreeSet::new();
+        let gates = GateInputs {
+            policy: &security,
+            owner_id: "owner-1",
+            sender: "owner-1",
+            policy_channel: "terminal",
+            chat_type: "dm",
+            model_ref: "anthropic:claude",
+            model_can_chat: true,
+            model_can_call_tools: true,
+            decision_endpoint_ready: true,
+            child_scope: None,
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &calls,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &history,
+            retry_limit: Some(2),
+        };
+        let mut state = fixtures::state(&key, "neutral request");
+        let mut trusted = fixtures::trusted();
+        trusted.catalog_generation = *catalog.generation();
+        trusted.channel = None;
+        trusted.exclusions.clear();
+        trusted.side_effect_mode = SideEffectMode::GuardedWrite;
+        state.trusted = TrustedState::from_runtime(trusted.clone());
+
+        let entries = view.entries();
+        let first = *entries.first().expect("first capability");
+        let second = *entries.get(1).expect("second capability");
+        let third = *entries.get(2).expect("third capability");
+        let other_registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("prx_different_layout"))];
+        let other_catalog =
+            CapabilityCatalog::build(&other_registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        for scenario in 0..6 {
+            trusted.exclusions.clear();
+            trusted.model_admission = None;
+            trusted.channel = None;
+            match scenario {
+                0 => trusted.exclusions.push(Arc::from(first.public_name.as_str())),
+                1 => trusted
+                    .exclusions
+                    .extend(entries.iter().map(|entry| Arc::from(entry.root.as_str()))),
+                2 => {
+                    trusted.model_admission = Some(crate::tools::capability::model_policy::ModelAdmission::fresh(
+                        &registry,
+                        &view,
+                        "prx-model",
+                        &[],
+                        "prx-policy",
+                        &key,
+                    ))
+                }
+                3 => {
+                    trusted.model_admission = Some(crate::tools::capability::model_policy::ModelAdmission::fresh(
+                        &other_registry,
+                        &other_catalog.view(&CatalogScope::default()),
+                        "prx-model",
+                        &[],
+                        "prx-policy",
+                        &key,
+                    ))
+                }
+                4 => {}
+                _ => trusted.channel = Some(Arc::from("terminal")),
+            }
+            let surface = SurfacePolicy {
+                excluded_names: if scenario == 4 {
+                    BTreeSet::from([first.public_name.clone()])
+                } else {
+                    BTreeSet::new()
+                },
+                ..SurfacePolicy::default()
+            };
+            let view = catalog.view(&CatalogScope::default()).with_surface(&surface);
+            state.trusted = TrustedState::from_runtime(trusted.clone());
+            counting_cost.entries.store(0, Ordering::Relaxed);
+            let expected = unfiltered_family_candidate(
+                CausalActionKind::Discover,
+                first.family,
+                [first, second, third],
+                &state,
+                &view,
+                &policy,
+                &gates,
+            )
+            .unwrap();
+            let reference_pricing = counting_cost.entries.load(Ordering::Relaxed);
+            counting_cost.entries.store(0, Ordering::Relaxed);
+            let actual = select_family_candidate(
+                CausalActionKind::Discover,
+                first.family,
+                [first, second, third],
+                &state,
+                &view,
+                &policy,
+                &gates,
+            )
+            .unwrap();
+            let actual_pricing = counting_cost.entries.load(Ordering::Relaxed);
+            assert_eq!(
+                actual.as_ref().map(CausalCandidate::candidate_id),
+                expected.as_ref().map(CausalCandidate::candidate_id)
+            );
+            assert_eq!(
+                actual.as_ref().map(CausalCandidate::required_capabilities),
+                expected.as_ref().map(CausalCandidate::required_capabilities)
+            );
+            let mut expected_proposed = expected.into_iter().collect::<Vec<_>>();
+            expected_proposed.push(terminal(CausalActionKind::Refuse, &policy));
+            let mut actual_proposed = actual.into_iter().collect::<Vec<_>>();
+            actual_proposed.push(terminal(CausalActionKind::Refuse, &policy));
+            for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
+                let expected_report = HardGates::apply(pass, &state, &view, &expected_proposed, &gates).unwrap();
+                let actual_report = HardGates::apply(pass, &state, &view, &actual_proposed, &gates).unwrap();
+                assert_eq!(actual_report.outcomes, expected_report.outcomes);
+                assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
+            }
+            if scenario == 3 {
+                assert_eq!(
+                    actual_pricing, reference_pricing,
+                    "stale bitmap must not skip construction"
+                );
+                assert_eq!(
+                    HardGates::check_one(
+                        GatePass::PrePrediction,
+                        &state,
+                        &view,
+                        &from_entry(CausalActionKind::Discover, first.family, first, &policy, None),
+                        &gates,
+                    ),
+                    GateOutcome::Blocked {
+                        gate: 3,
+                        reason_code: "unavailable_or_stale"
+                    }
+                );
+            } else {
+                assert!(actual_pricing < reference_pricing, "excluded probes must avoid pricing");
+            }
+        }
+    }
+    #[test]
+    fn borrowed_prefilter_preserves_first_approval_and_later_passed() {
+        let key = fixtures::key();
+        let mut sources = CatalogSources::default();
+        for name in ["prx_first", "prx_second"] {
+            sources.mcp.push(McpCapabilitySpec {
+                server: "prx_service".into(),
+                tool: name.into(),
+                state_digest: [2; 32],
+                spec: ToolSpec {
+                    name: name.into(),
+                    description: "Fixture capability".into(),
+                    parameters: json!({"type":"object","properties":{}}),
+                },
+            });
+        }
+        let catalog = CapabilityCatalog::build(&[], &sources, &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let cost = fixture_cost_for_catalog(
+            &catalog,
+            CapabilityCostModel {
+                per_capability: BTreeMap::new(),
+                estimates: BTreeMap::from([(
+                    CapabilityTarget::Mcp,
+                    (
+                        CostEstimate {
+                            tokens: 1,
+                            micro_usd: 0,
+                        },
+                        1,
+                    ),
+                )]),
+            },
+        );
+        let counting_cost = CountingCost {
+            inner: &cost,
+            entries: AtomicUsize::new(0),
+        };
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 3,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &counting_cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+        let mut security = SecurityPolicy::default();
+        security.autonomy = crate::security::AutonomyLevel::Full;
+        let mut calls = BTreeMap::new();
+        calls.insert(
+            CandidateId::new(CausalActionKind::UseTool, CapabilityTarget::Mcp, None),
+            [7; 32],
+        );
+        let history = BTreeSet::new();
+        let mut gates = GateInputs {
+            policy: &security,
+            owner_id: "owner-1",
+            sender: "owner-1",
+            policy_channel: "terminal",
+            chat_type: "dm",
+            model_ref: "anthropic:claude",
+            model_can_chat: true,
+            model_can_call_tools: true,
+            decision_endpoint_ready: true,
+            child_scope: None,
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &calls,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &history,
+            retry_limit: Some(2),
+        };
+        let mut state = fixtures::state(&key, "neutral request");
+        let mut trusted = fixtures::trusted();
+        trusted.catalog_generation = *catalog.generation();
+        trusted.channel = None;
+        trusted.exclusions.clear();
+        trusted.side_effect_mode = SideEffectMode::ApprovalRequired;
+        state.trusted = TrustedState::from_runtime(trusted.clone());
+
+        let entries = view.entries();
+        let first = *entries.first().expect("first MCP capability");
+        let second = *entries.get(1).expect("second MCP capability");
+        for allow_second in [false, true] {
+            gates.verified_approval_calls.clear();
+            if allow_second {
+                gates.verified_approval_calls.insert(
+                    [7; 32],
+                    BTreeSet::from([CapabilityRef {
+                        id: second.id.clone(),
+                        fingerprint: second.fingerprint,
+                        generation: second.generation,
+                    }]),
+                );
+            }
+            let first_probe = from_entry(CausalActionKind::UseTool, CapabilityTarget::Mcp, first, &policy, None);
+            assert!(
+                matches!(HardGates::check_one(GatePass::PrePrediction, &state, &view, &first_probe, &gates), GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty())
+            );
+            let second_probe = from_entry(CausalActionKind::UseTool, CapabilityTarget::Mcp, second, &policy, None);
+            let second_outcome = HardGates::check_one(GatePass::PrePrediction, &state, &view, &second_probe, &gates);
+            if allow_second {
+                assert_eq!(second_outcome, GateOutcome::Passed);
+            } else {
+                assert!(matches!(second_outcome, GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty()));
+            }
+            let expected = unfiltered_family_candidate(
+                CausalActionKind::UseTool,
+                CapabilityTarget::Mcp,
+                [first, second],
+                &state,
+                &view,
+                &policy,
+                &gates,
+            )
+            .unwrap()
+            .expect("reference selection");
+            let actual = select_family_candidate(
+                CausalActionKind::UseTool,
+                CapabilityTarget::Mcp,
+                [first, second],
+                &state,
+                &view,
+                &policy,
+                &gates,
+            )
+            .unwrap()
+            .expect("optimized selection");
+            assert_eq!(actual.required_capabilities(), expected.required_capabilities());
+            assert_eq!(
+                actual.required_capabilities().first().expect("selected ref").id,
+                if allow_second { &second.id } else { &first.id }.clone()
+            );
+            let expected_proposed = [expected, terminal(CausalActionKind::Refuse, &policy)];
+            let actual_proposed = [actual, terminal(CausalActionKind::Refuse, &policy)];
+            for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
+                let expected_report = HardGates::apply(pass, &state, &view, &expected_proposed, &gates).unwrap();
+                let actual_report = HardGates::apply(pass, &state, &view, &actual_proposed, &gates).unwrap();
+                assert_eq!(actual_report.outcomes, expected_report.outcomes);
+                assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
+            }
+        }
     }
 }

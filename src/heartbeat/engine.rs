@@ -184,13 +184,13 @@ mod tests {
 
     #[test]
     fn parse_tasks_empty_content() {
-        assert!(HeartbeatEngine::parse_tasks("").is_empty());
+        assert!(HeartbeatEngine::parse_tasks("").is_empty(), "expected an empty value");
     }
 
     #[test]
     fn parse_tasks_only_comments() {
         let tasks = HeartbeatEngine::parse_tasks("# No tasks here\n\nJust comments\n# Another");
-        assert!(tasks.is_empty());
+        assert!(tasks.is_empty(), "expected an empty value");
     }
 
     #[test]

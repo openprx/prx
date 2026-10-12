@@ -11,6 +11,150 @@ use crate::causal_tree::decision_select::Selection;
 use crate::tools::traits::ToolCategory;
 use serde_json::{Value, json};
 
+// Inventory profiles measure an admitted execution path, not builtin evidence inference.
+// Reuse the approval fixture controlled choice, evidence, and utility answers.
+struct InventoryEvidenceBackend {
+    identity: BackendIdentity,
+}
+
+#[async_trait]
+impl DecisionBackend for InventoryEvidenceBackend {
+    fn identity(&self) -> &BackendIdentity {
+        &self.identity
+    }
+    fn locality(&self) -> BackendLocality {
+        BackendLocality::Builtin
+    }
+    fn version_policy(&self) -> ModelVersionPolicy {
+        ModelVersionPolicy::Unpinned
+    }
+    async fn evaluate_with_accounting(
+        &self,
+        request: &DecisionRequest,
+        body: &GuardedBody,
+        deadline: Instant,
+        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+    ) -> Result<DecisionResponse, DecisionError> {
+        self.evaluate(request, body, deadline).await
+    }
+    async fn evaluate(
+        &self,
+        request: &DecisionRequest,
+        _: &GuardedBody,
+        _: Instant,
+    ) -> Result<DecisionResponse, DecisionError> {
+        let mut response = BuiltinDecisionBackend::answer(request)?;
+        response.backend = "mock".to_owned();
+        response.resolved_model = self.identity.configured_model.to_string();
+        for (id, answer) in &mut response.answers {
+            // Both profiles explicitly name file_read. Favor that scoped
+            // candidate over the unscoped family fallback in controlled answers.
+            let work = id.as_str().starts_with("candidate.use_tool-filesystem-");
+            match answer {
+                DecisionAnswer::Choice(choice) => {
+                    let code = if id == &QuestionId::global(GlobalQuestion::NextAction) {
+                        "use_tool"
+                    } else {
+                        "filesystem"
+                    };
+                    if let Some(chosen) = choice.probabilities.keys().find(|key| key.as_str() == code).cloned() {
+                        for (key, probability) in &mut choice.probabilities {
+                            *probability = Probability::new(if key == &chosen { 1.0 } else { 0.0 })?;
+                        }
+                        choice.chosen = chosen;
+                        choice.confidence = Probability::new(1.0)?;
+                    }
+                }
+                DecisionAnswer::Noul(noul) => {
+                    noul.probability_true = Probability::new(
+                        if id == &QuestionId::global(GlobalQuestion::EvidenceSufficient) || work {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    )?;
+                }
+                DecisionAnswer::Score(score) => {
+                    let gain = id.as_str().ends_with("gain") && (work || !id.as_str().starts_with("candidate."));
+                    let chosen = if gain {
+                        score.distribution.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                    for (index, probability) in score.distribution.iter_mut().enumerate() {
+                        *probability = Probability::new(if index == chosen { 1.0 } else { 0.0 })?;
+                    }
+                    score.expected = f64::from(u32::try_from(chosen).expect("bounded score level"));
+                    score.confidence = Probability::new(1.0)?;
+                }
+            }
+        }
+        Ok(response)
+    }
+}
+
+fn install_inventory_evidence_backend(service: &mut Arc<TurnDecisionService>) {
+    let owning = Arc::get_mut(service).expect("unshared inventory fixture service");
+    owning.factory = DecisionBackendFactory::from_slots(
+        vec![Box::new(InventoryEvidenceBackend {
+            identity: BackendIdentity {
+                kind: BackendKind::Mock,
+                provider: None,
+                configured_model: Arc::from("prx-local-model"),
+            },
+        })],
+        Arc::clone(&owning.state_key),
+        OutboundSecrets::default(),
+        SlotLimits::default(),
+    );
+}
+
+// Preserve the original no-dispatch observation while using the real file tool.
+struct CountedInventoryFileRead {
+    inner: crate::tools::file_read::FileReadTool,
+    dispatches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountedInventoryFileRead {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.inner.parameters_schema()
+    }
+    fn immutable_catalog_specs(&self) -> Option<&[ToolSpec]> {
+        self.inner.immutable_catalog_specs()
+    }
+    fn catalog_availability_is_configured(&self) -> bool {
+        self.inner.catalog_availability_is_configured()
+    }
+    fn supports_owner_filesystem(&self) -> bool {
+        self.inner.supports_owner_filesystem()
+    }
+    fn tier(&self) -> crate::tools::traits::ToolTier {
+        self.inner.tier()
+    }
+    fn categories(&self) -> &'static [ToolCategory] {
+        self.inner.categories()
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        self.inner.execute(args).await
+    }
+    async fn execute_with_cancellation(
+        &self,
+        args: Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        self.inner.execute_with_cancellation(args, cancellation).await
+    }
+}
+
 struct FixtureTool {
     spec: ToolSpec,
     categories: &'static [ToolCategory],
@@ -207,16 +351,27 @@ async fn actual_builtin_fixture_characterization() {
         "original observation must remain outside measured allocation windows"
     );
     let mut original_capture = None;
+    let mut measured_material = None;
     let (mut context, process_measurement) = if process_pilot {
         let ((context, return_us, drained_us), allocations) =
             crate::decision::builtin::allocation_counter::count_process_future(async {
                 let started = Instant::now();
-                let context = service
-                    .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
-                    .await
-                    .expect("actual builtin decision");
+                let (context, captured) = crate::causal_tree::decision_engine::original_observation::material::capture(
+                    "same-invocation-pilot",
+                    service.decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation),
+                )
+                .await
+                .expect("bounded same-invocation pilot material");
+                let context = context.expect("actual builtin decision");
                 let return_us = started.elapsed().as_micros();
                 drain_required(&service).await;
+                let hops = context.audit_hops().collect::<Vec<_>>();
+                measured_material = Some(
+                    captured
+                        .finish_material(&hops, false)
+                        .expect("complete original pilot material inside measured window"),
+                );
+                drop(hops);
                 (context, return_us, started.elapsed().as_micros())
             })
             .await
@@ -238,13 +393,29 @@ async fn actual_builtin_fixture_characterization() {
         original_capture = Some(captured);
         (context, None)
     } else {
-        let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
-            .await
-            .expect("actual builtin decision");
+        let (context, captured) = crate::causal_tree::decision_engine::original_observation::material::capture(
+            "same-invocation-counter-off",
+            service.decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation),
+        )
+        .await
+        .expect("bounded same-invocation counter-off material");
+        let context = context.expect("actual builtin decision");
         drain_required(&service).await;
+        let hops = context.audit_hops().collect::<Vec<_>>();
+        measured_material = Some(
+            captured
+                .finish_material(&hops, false)
+                .expect("complete original counter-off material"),
+        );
+        drop(hops);
         (context, None)
     };
+    if let Some(material) = measured_material {
+        println!(
+            "PRX_ORIGINAL_MATERIAL {}",
+            std::str::from_utf8(&material).expect("encoded material JSON")
+        );
+    }
     if let Some(captured) = original_capture {
         let actual_hops = context.audit_hops().collect::<Vec<_>>();
         let sidecar = captured

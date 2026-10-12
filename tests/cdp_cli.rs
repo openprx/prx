@@ -186,6 +186,17 @@ fn enabled_loopback(temp: &TempDir, endpoint: &str) -> PathBuf {
                 &["causal_tree", "backend", "model"],
                 toml::Value::String("decider-1".to_string()),
             ),
+            // Physical decision accounting requires a price for this exact endpoint/model.
+            (
+                &["cost", "prices", &format!("custom:{endpoint}/decider-1")],
+                toml::Value::try_from(openprx::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                })
+                .expect("test: decision pricing"),
+            ),
             // The model is declared for the decision operation, as the strict
             // selection requires.
             (
@@ -221,14 +232,19 @@ fn prx_causal_status_parses_and_reports_order() {
     );
     assert_eq!(order.last().and_then(|slot| slot["kind"].as_str()), Some("builtin"));
     assert_eq!(status["store"]["mode"], "read_write");
-    assert_eq!(status["store"]["schema_version"], 2);
+    // Keep this CLI literal aligned with store_schema::SCHEMA_VERSION.
+    assert_eq!(status["store"]["schema_version"], 5);
 
     let backends = stdout_json(&causal(&dir, &["backends", "--json"]));
     assert_eq!(backends["order"][0]["kind"], "compatible_http");
     assert_eq!(backends["order"][0]["excluded"], serde_json::Value::Null);
 
     let disabled_temp = TempDir::new().expect("test: temp");
-    let disabled = config_dir(&disabled_temp, &[]);
+    // CDP-31 defaults to enabled; this branch explicitly exercises disable.
+    let disabled = config_dir(
+        &disabled_temp,
+        &[(&["causal_tree", "enabled"], toml::Value::Boolean(false))],
+    );
     let status = stdout_json(&causal(&disabled, &["status", "--json"]));
     assert_eq!(status["enabled"], false);
     assert_eq!(status["store"]["mode"], "read_only");

@@ -561,8 +561,17 @@ fn masked_values_are_never_prefilled_or_sent() {
     let guard = preview
         .find("if (holdsMask(change)) {")
         .expect("test: preview refuses a mask");
-    let send = preview.find("api.planChange(change)").expect("test: preview plans");
-    assert!(guard < send, "the mask guard must come before the request");
+    assert!(flow.contains("transport = { plan: api.planChange, apply: api.applyChange }"));
+    let snapshot = preview
+        .find("const snapshot = JSON.parse(JSON.stringify(change));")
+        .expect("test: preview snapshots the unmasked change");
+    let send = preview
+        .find("this.transport.plan(snapshot)")
+        .expect("test: preview plans");
+    assert!(
+        guard < snapshot && snapshot < send,
+        "the mask guard must precede snapshot and request"
+    );
 
     // Every form field that can receive a loaded provider, model or endpoint
     // is filled only through `unmasked(...)` (or cleared).
@@ -586,7 +595,7 @@ fn masked_values_are_never_prefilled_or_sent() {
 
     let providers = read("console/src/pages/ProvidersPage.svelte");
     assert!(function_body(&providers, "select").contains("if (isMasked(provider)) return;"));
-    assert!(providers.contains("disabled={isMasked(entry.provider)}"));
+    assert!(providers.contains("disabled={credentialBusy || testBusy || isMasked(entry.provider)}"));
     assert!(providers.contains("disabled={flow.busy || isMasked(entry.provider)}"));
     // An empty endpoint field never means "clear": clearing is its own action.
     let endpoint = function_body(&providers, "planEndpoint");
@@ -659,7 +668,16 @@ fn the_hooks_page_has_no_toggle() {
 fn management_pages_load_on_mount_and_on_request_only() {
     for path in MANAGEMENT_SOURCES.iter().filter(|path| path.contains("/pages/")) {
         let page = read(path);
-        assert!(page.contains("import { untrack } from 'svelte';"), "{path}");
+        let imports = page.lines().find_map(|line| {
+            let line = line.trim();
+            let names = line.strip_prefix("import { ")?.strip_suffix(" } from 'svelte';")?;
+            names
+                .split(',')
+                .map(str::trim)
+                .any(|name| name == "untrack")
+                .then_some(names)
+        });
+        assert!(imports.is_some(), "{path} must import untrack from svelte");
         let effect = page
             .find("$effect(() => {")
             .unwrap_or_else(|| panic!("{path} has no mount effect"));
@@ -750,7 +768,10 @@ fn a_high_risk_change_is_confirmed_with_the_refused_revision() {
         "{text}"
     );
     // An apply names the revision its plan was computed against.
-    assert!(flow.contains("(options) => api.applyChange(pending.change, options),\n        pending.plan.revision"));
+    assert!(flow.contains("transport = { plan: api.planChange, apply: api.applyChange }"));
+    assert!(
+        flow.contains("(options) => this.transport.apply(pending.change, options),\n        pending.plan.revision")
+    );
 }
 
 /// D-087 (1): a `403` at `supervised` autonomy carries a `reason`; the

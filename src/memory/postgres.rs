@@ -7373,7 +7373,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(remaining.is_empty());
+        assert!(remaining.is_empty(), "expected an empty value");
         assert!(mem.get("self/fitness/daily_extra/keep").await.unwrap().is_some());
 
         drop(mem);
@@ -10117,7 +10117,8 @@ mod tests {
                     .await
                     .expect("test: b")
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             seen(
@@ -10125,7 +10126,8 @@ mod tests {
                     .await
                     .expect("test: none")
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert_eq!(
             seen(

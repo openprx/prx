@@ -188,7 +188,7 @@ fn carry_buffer_is_capped_at_three_bytes() {
     let mut out = String::new();
     decoder.push(&four_byte[..3], &mut out).unwrap();
     assert_eq!(decoder.pending_len(), 3, "3 bytes is the maximum legal carry");
-    assert!(out.is_empty());
+    assert!(out.is_empty(), "expected an empty value");
     decoder.push(&four_byte[3..], &mut out).unwrap();
     assert_eq!(decoder.pending_len(), 0);
     assert_eq!(out, "𝄞");

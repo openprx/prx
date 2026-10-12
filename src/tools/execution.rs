@@ -1767,7 +1767,7 @@ impl ToolExecutionService {
         decision: ToolExecutionDecision,
         preparation: &ToolExecutionPermit,
         started: Instant,
-    ) -> Result<Option<ToolExecutionLease>, ToolExecutionOutcome> {
+    ) -> Result<Option<ToolExecutionLease>, Box<ToolExecutionOutcome>> {
         let Some(idempotency_key) = command.idempotency_key.as_deref() else {
             return Ok(None);
         };
@@ -1775,7 +1775,7 @@ impl ToolExecutionService {
             if descriptor.effect == ToolEffect::Read {
                 return Ok(None);
             }
-            return Err(self.finish(
+            return Err(Box::new(self.finish(
                 command,
                 context,
                 input_sha256.to_string(),
@@ -1787,7 +1787,7 @@ impl ToolExecutionService {
                 Some("durable tool idempotency ledger is unavailable".to_string()),
                 Some(preparation.clone()),
                 started,
-            ));
+            )));
         };
         let lock = tool_execution_lock(
             &context.envelope.workspace_id,
@@ -1808,7 +1808,7 @@ impl ToolExecutionService {
                     .as_deref()
                     .and_then(|payload| serde_json::from_str::<ToolExecutionTerminalRecord>(payload).ok());
                 let Some(terminal) = terminal else {
-                    return Err(self.finish(
+                    return Err(Box::new(self.finish(
                         command,
                         context,
                         input_sha256.to_string(),
@@ -1820,11 +1820,11 @@ impl ToolExecutionService {
                         Some("persisted tool terminal record is unreadable".to_string()),
                         Some(preparation.clone()),
                         started,
-                    ));
+                    )));
                 };
                 if terminal.reservation.capability != command.name || terminal.reservation.input_sha256 != input_sha256
                 {
-                    return Err(self.finish(
+                    return Err(Box::new(self.finish(
                         command,
                         context,
                         input_sha256.to_string(),
@@ -1836,13 +1836,18 @@ impl ToolExecutionService {
                         Some("idempotency key command fingerprint mismatch".to_string()),
                         Some(preparation.clone()),
                         started,
-                    ));
+                    )));
                 }
-                return Err(self.replay_outcome(command, context, input_sha256, terminal.outcome));
+                return Err(Box::new(self.replay_outcome(
+                    command,
+                    context,
+                    input_sha256,
+                    terminal.outcome,
+                )));
             }
             Ok(None) => {}
             Err(error) => {
-                return Err(self.finish(
+                return Err(Box::new(self.finish(
                     command,
                     context,
                     input_sha256.to_string(),
@@ -1854,7 +1859,7 @@ impl ToolExecutionService {
                     Some(error.to_string()),
                     Some(preparation.clone()),
                     started,
-                ));
+                )));
             }
         }
 
@@ -1871,23 +1876,25 @@ impl ToolExecutionService {
                         .as_deref()
                         .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
                     let Some(existing) = existing else {
-                        return Err(self.finish(
-                            command,
-                            context,
-                            input_sha256.to_string(),
-                            Some(descriptor.clone()),
-                            Some(decision),
-                            ToolExecutionStatus::Indeterminate,
-                            "Error: persisted tool reservation is unreadable; refusing duplicate side effect"
-                                .to_string(),
-                            None,
-                            Some("persisted tool reservation is unreadable".to_string()),
-                            Some(preparation.clone()),
-                            started,
+                        return Err(Box::new(
+                            self.finish(
+                                command,
+                                context,
+                                input_sha256.to_string(),
+                                Some(descriptor.clone()),
+                                Some(decision),
+                                ToolExecutionStatus::Indeterminate,
+                                "Error: persisted tool reservation is unreadable; refusing duplicate side effect"
+                                    .to_string(),
+                                None,
+                                Some("persisted tool reservation is unreadable".to_string()),
+                                Some(preparation.clone()),
+                                started,
+                            ),
                         ));
                     };
                     if existing.capability != command.name || existing.input_sha256 != input_sha256 {
-                        return Err(self.finish(
+                        return Err(Box::new(self.finish(
                             command,
                             context,
                             input_sha256.to_string(),
@@ -1899,7 +1906,7 @@ impl ToolExecutionService {
                             Some("idempotency key command fingerprint mismatch".to_string()),
                             Some(preparation.clone()),
                             started,
-                        ));
+                        )));
                     }
                     let abandonment_key = tool_execution_abandonment_key(&base_reservation_key, attempt);
                     let abandoned = memory
@@ -1921,7 +1928,7 @@ impl ToolExecutionService {
                             )
                         })?;
                     let Some(abandoned) = abandoned else {
-                        return Err(self.finish(
+                        return Err(Box::new(self.finish(
                             command,
                             context,
                             input_sha256.to_string(),
@@ -1937,7 +1944,7 @@ impl ToolExecutionService {
                             ),
                             Some(preparation.clone()),
                             started,
-                        ));
+                        )));
                     };
                     let abandoned = abandoned
                         .raw_payload_json
@@ -1949,19 +1956,21 @@ impl ToolExecutionService {
                             || abandoned.capability != existing.capability
                             || abandoned.input_sha256 != existing.input_sha256
                     }) {
-                        return Err(self.finish(
-                            command,
-                            context,
-                            input_sha256.to_string(),
-                            Some(descriptor.clone()),
-                            Some(decision),
-                            ToolExecutionStatus::Indeterminate,
-                            "Error: persisted tool abandonment is unreadable or does not own the reservation"
-                                .to_string(),
-                            None,
-                            Some("persisted tool abandonment does not match reservation owner".to_string()),
-                            Some(preparation.clone()),
-                            started,
+                        return Err(Box::new(
+                            self.finish(
+                                command,
+                                context,
+                                input_sha256.to_string(),
+                                Some(descriptor.clone()),
+                                Some(decision),
+                                ToolExecutionStatus::Indeterminate,
+                                "Error: persisted tool abandonment is unreadable or does not own the reservation"
+                                    .to_string(),
+                                None,
+                                Some("persisted tool abandonment does not match reservation owner".to_string()),
+                                Some(preparation.clone()),
+                                started,
+                            ),
                         ));
                     }
                     attempt = attempt.checked_add(1).ok_or_else(|| {
@@ -2046,7 +2055,7 @@ impl ToolExecutionService {
                         .as_ref()
                         .is_none_or(|recorded| recorded.owner_token != reservation.owner_token)
                     {
-                        return Err(self.finish(
+                        return Err(Box::new(self.finish(
                             command,
                             context,
                             input_sha256.to_string(),
@@ -2058,7 +2067,7 @@ impl ToolExecutionService {
                             Some("another runtime owns this idempotent tool execution".to_string()),
                             Some(preparation.clone()),
                             started,
-                        ));
+                        )));
                     }
                     return Ok(Some(ToolExecutionLease {
                         _guard: guard,
@@ -2069,7 +2078,7 @@ impl ToolExecutionService {
                     }));
                 }
                 Err(error) => {
-                    return Err(self.finish(
+                    return Err(Box::new(self.finish(
                         command,
                         context,
                         input_sha256.to_string(),
@@ -2081,7 +2090,7 @@ impl ToolExecutionService {
                         Some(error.to_string()),
                         Some(preparation.clone()),
                         started,
-                    ));
+                    )));
                 }
             }
         }
@@ -2630,7 +2639,7 @@ impl ToolExecutionService {
                 if let Some(observation) = exact_call {
                     observation.refused(outcome.status, outcome.replayed);
                 }
-                return outcome;
+                return *outcome;
             }
         };
         #[cfg(test)]

@@ -1187,7 +1187,7 @@ mod tests {
 
         let prompt = aieos_to_system_prompt(&identity);
         // Completely empty identity should produce empty string
-        assert!(prompt.is_empty());
+        assert!(prompt.is_empty(), "expected an empty value");
     }
 
     #[test]

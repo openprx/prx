@@ -227,7 +227,7 @@ impl EventBus {
             ));
         }
         self.active_subscriptions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_SUBSCRIPTIONS).then_some(count + 1)
             })
             .map_err(|_| format!("event bus: subscription limit ({MAX_SUBSCRIPTIONS}) reached"))?;

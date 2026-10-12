@@ -487,7 +487,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(remaining.is_empty());
+        assert!(remaining.is_empty(), "expected an empty value");
         let migration_root = config.workspace_dir.join("self/fitness/migration");
         let backup_dirs = fs::read_dir(migration_root)
             .unwrap()

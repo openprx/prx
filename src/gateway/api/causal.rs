@@ -98,6 +98,7 @@ fn admin(state: &AppState) -> DecisionAdmin {
 
 /// Run `work` over a fresh admin service on a blocking thread (D-091
 /// F-16), then drain its store.
+#[allow(clippy::result_large_err)] // the axum `Response` is the error contract of these helpers
 async fn on_admin<T, F, Fut>(state: &AppState, work: F) -> Result<T, Response>
 where
     F: FnOnce(Arc<DecisionAdmin>) -> Fut + Send + 'static,
@@ -107,6 +108,7 @@ where
     on_pinned_admin(Arc::new(admin(state)), work).await
 }
 
+#[allow(clippy::result_large_err)]
 async fn on_pinned_admin<T, F, Fut>(admin: Arc<DecisionAdmin>, work: F) -> Result<T, Response>
 where
     F: FnOnce(Arc<DecisionAdmin>) -> Fut + Send + 'static,

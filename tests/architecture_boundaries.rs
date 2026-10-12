@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 include!("support/cfg_test_scan.rs");
 
 const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
+    // Architecture review Q73B/Q74: exact test-owned read-only ACL and generation-scoped Retrieve witnesses.
+    "src/channels/tests/factory_reload_fixture.rs::run::let connection = rusqlite::Connection::open_with_flags(",
+    "src/channels/tests/factory_reload_fixture.rs::run::let decisions = rusqlite::Connection::open_with_flags(tmp.path().join(\"self/causal_tree/decisions.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect(\"durable decision evidence\");",
     // Reviewed isolated paid Router/Automix test observers; exact callsites only.
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::embedding::let database = Connection::open_with_flags(",
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let db = Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
@@ -2502,7 +2505,10 @@ fn hand_stripping_ban_covers_every_split_form() {
         let text = format!("let parts = source.{call}({marker});");
         assert!(!hand_stripping_patterns(&text).is_empty(), "`{call}` is not caught");
     }
-    assert!(hand_stripping_patterns("let production = strip_cfg_test_items(&source);").is_empty());
+    assert!(
+        hand_stripping_patterns("let production = strip_cfg_test_items(&source);").is_empty(),
+        "expected an empty value"
+    );
 }
 
 #[test]
@@ -5708,7 +5714,7 @@ fn receiver_expression(characters: &[char], dot: usize) -> String {
 /// their type lives on a struct or on another function's return type, so the
 /// binding rule has nothing to say about them and they fall through to the
 /// reviewed site exceptions.
-fn receiver_is_local_binding(characters: &[char], dot: usize) -> bool {
+const fn receiver_is_local_binding(characters: &[char], dot: usize) -> bool {
     let mut index = dot;
     while index > 0 && characters[index - 1].is_whitespace() {
         index -= 1;
@@ -7080,7 +7086,10 @@ fn the_occurrence_rule_reports_extra_calls_stale_entries_and_duplicates() {
         "src/example.rs",
         "pub async fn handler() {\n    let _ = service.execute(args).await;\n}\n",
     );
-    assert!(non_tool_call_site_errors(&one.sites, &[exception]).is_empty());
+    assert!(
+        non_tool_call_site_errors(&one.sites, &[exception]).is_empty(),
+        "expected an empty value"
+    );
 
     let two = scan_tool_executions(
         "src/example.rs",
@@ -9135,16 +9144,31 @@ fn decision_compiler_uses_typed_ids_and_only_redacted_state() {
     let source = read_source(&repository_root().join("src/causal_tree/questions.rs"));
     assert_eq!(decision_compiler_source_errors(&source), Vec::<&str>::new());
     let planted_id = format!("{source}\nfn planted() {{ let _ = QuestionId::parse(user_text); }}");
-    assert!(!decision_compiler_source_errors(&planted_id).is_empty());
+    assert!(
+        !decision_compiler_source_errors(&planted_id).is_empty(),
+        "expected a non-empty value"
+    );
     let planted_schema = format!("{source}\nfn planted() {{ let _ = entry.schema; }}");
-    assert!(!decision_compiler_source_errors(&planted_schema).is_empty());
+    assert!(
+        !decision_compiler_source_errors(&planted_schema).is_empty(),
+        "expected a non-empty value"
+    );
     let planted_option = format!("{source}\nfn planted() {{ let _ = OptionId::code(state.routing_input.as_str()); }}");
-    assert!(!decision_compiler_source_errors(&planted_option).is_empty());
+    assert!(
+        !decision_compiler_source_errors(&planted_option).is_empty(),
+        "expected a non-empty value"
+    );
     let planted_path =
         format!("{source}\nfn planted() {{ let _ = format!(\"$.candidates[{{}}]\", state.observed.retry_count()); }}");
-    assert!(!decision_compiler_source_errors(&planted_path).is_empty());
+    assert!(
+        !decision_compiler_source_errors(&planted_path).is_empty(),
+        "expected a non-empty value"
+    );
     let planted_state = format!("{source}\nfn planted() {{ parts.state = unredacted_state; }}");
-    assert!(!decision_compiler_source_errors(&planted_state).is_empty());
+    assert!(
+        !decision_compiler_source_errors(&planted_state).is_empty(),
+        "expected a non-empty value"
+    );
     for (old, new) in [
         ("state: projection,", "state: unredacted_state,"),
         (
@@ -9161,7 +9185,10 @@ fn decision_compiler_uses_typed_ids_and_only_redacted_state() {
         ),
     ] {
         assert!(source.contains(old));
-        assert!(!decision_compiler_source_errors(&source.replacen(old, new, 1)).is_empty());
+        assert!(
+            !decision_compiler_source_errors(&source.replacen(old, new, 1)).is_empty(),
+            "expected a non-empty value"
+        );
     }
 }
 

@@ -668,7 +668,7 @@ mod tests {
             );
         }
         let prompt_guided = crate::tools::prompt::render_prompt_guided_tool_protocol(&[fixture_spec()]);
-        assert!(!prompt_guided.is_empty());
+        assert!(!prompt_guided.is_empty(), "expected a non-empty value");
         assert!(
             !wire.system_text(first).contains(prompt_guided.trim()),
             "the prompt-guided protocol must not be rendered into the system prompt"
@@ -1084,7 +1084,7 @@ mod tests {
 
             assert_eq!(run.requests.len(), 1, "no compaction and replay");
             assert_eq!(run.tool_calls, 0);
-            assert!(stream_completions(&run).is_empty());
+            assert!(stream_completions(&run).is_empty(), "expected an empty value");
             assert_eq!(stream_failures(&run).len(), 1, "the failure is visible");
         }
     }

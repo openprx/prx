@@ -446,7 +446,10 @@ mod tests {
             references.remove("openai:default"),
             Err(CredentialReferenceError::NotAReference(_))
         ));
-        assert!(references.list().expect("test: list").is_empty());
+        assert!(
+            references.list().expect("test: list").is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -469,7 +472,10 @@ mod tests {
         );
         assert_eq!(references.remove("cred-a"), Ok(true));
         assert_eq!(references.remove("cred-a"), Ok(false));
-        assert!(references.list().expect("test: list").is_empty());
+        assert!(
+            references.list().expect("test: list").is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// The resolver releases a reference's material only to the provider it

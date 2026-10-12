@@ -168,6 +168,35 @@ impl ConfigGeneration {
         Ok(binding)
     }
 
+    /// Authenticate a parent-owned pinned generation without reopening mutable disk state.
+    pub(crate) fn verify_pinned_process_binding(
+        &self,
+        binding: &ProcessGenerationBinding,
+        key: &crate::decision::key::DecisionKey,
+    ) -> anyhow::Result<()> {
+        let deferred_changes_match = self.deferred_changes.as_ref() == binding.deferred_changes.as_slice();
+        anyhow::ensure!(
+            self.id == binding.id
+                && self.source_revision == binding.source_revision
+                && self.applied_at == binding.applied_at
+                && self.trigger == binding.trigger
+                && deferred_changes_match,
+            "pinned process generation differs from launch"
+        );
+        anyhow::ensure!(
+            key.verify_hmac(
+                crate::decision::key::KeyDomain::StateFingerprint,
+                &[
+                    b"process-effective-config-v1",
+                    &binding.signing_payload(&self.effective)?
+                ],
+                &binding.seal,
+            ),
+            "pinned process effective configuration differs from launch"
+        );
+        Ok(())
+    }
+
     /// Restore only an exact snapshot. A newer disk revision or a configuration
     /// with different effective values cannot borrow the parent's generation id.
     pub(crate) fn restore_process(
@@ -707,7 +736,7 @@ impl ConfigGenerationManager {
                 });
             let id = ConfigGenerationId(
                 self.next_generation
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| next.checked_add(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |next| next.checked_add(1))
                     .map_err(|_| anyhow::anyhow!("configuration generation counter is exhausted"))?,
             );
             let generation = Arc::new(ConfigGeneration {
@@ -1245,7 +1274,7 @@ mod tests {
         assert_eq!(report.applied, vec!["default_temperature"]);
         assert_eq!(report.rebuilt, vec!["default_model"]);
         assert_eq!(report.restarted, vec!["cron"]);
-        assert!(report.restart_required.is_empty());
+        assert!(report.restart_required.is_empty(), "expected an empty value");
     }
 
     /// CONSOLE-OBS-3 (CONSOLE-VERIFY): once the gateway paired, every later
@@ -1604,7 +1633,10 @@ mod tests {
         );
         let mut local = old.clone();
         local.causal_tree.enabled = true;
-        assert!(hand_edited_remote_decisions(&old, &local).is_empty());
+        assert!(
+            hand_edited_remote_decisions(&old, &local).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// D-082 N-4: the hand-edit warning is logged only when the reload is
@@ -1868,5 +1900,114 @@ w_cost = 0.4
             desired.source_revision.fingerprint_sha256, loaded_revision,
             "the desired configuration must carry the revision it was loaded from"
         );
+    }
+}
+
+#[cfg(test)]
+mod pinned_parent_process_binding_tests {
+    use super::*;
+
+    fn fixture() -> anyhow::Result<(tempfile::TempDir, ConfigGeneration, Arc<crate::decision::DecisionKey>)> {
+        let home = tempfile::tempdir()?;
+        let config = Config {
+            config_path: home.path().join("config.toml"),
+            workspace_dir: home.path().join("workspace"),
+            ..Config::default()
+        };
+        std::fs::write(&config.config_path, toml::to_string(&config)?)?;
+        let generation = ConfigGeneration {
+            id: ConfigGenerationId(7),
+            source_revision: ConfigSourceRevision::from_config(&config)?,
+            effective: Arc::new(config),
+            applied_at: Utc::now(),
+            trigger: ConfigReloadTrigger::Test,
+            deferred_changes: Arc::from([]),
+        };
+        let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-parent-binding-fixture");
+        let key =
+            crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")?;
+        Ok((home, generation, key))
+    }
+
+    #[test]
+    fn pinned_parent_binding_survives_removed_source_but_child_restore_rejects() -> anyhow::Result<()> {
+        let (_home, generation, key) = fixture()?;
+        let binding = generation.bind_process(&key)?;
+        generation.verify_pinned_process_binding(&binding, &key)?;
+        ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key)?;
+        std::fs::remove_file(&generation.effective.config_path)?;
+        generation.verify_pinned_process_binding(&binding, &key)?;
+        assert!(ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_parent_binding_survives_changed_source_but_child_restore_rejects() -> anyhow::Result<()> {
+        let (_home, generation, key) = fixture()?;
+        let binding = generation.bind_process(&key)?;
+        std::fs::write(&generation.effective.config_path, "default_temperature = 0.25\n")?;
+        generation.verify_pinned_process_binding(&binding, &key)?;
+        assert!(ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_parent_binding_rejects_metadata_snapshot_paths_and_key_mutation() -> anyhow::Result<()> {
+        let (_home, generation, key) = fixture()?;
+        let binding = generation.bind_process(&key)?;
+        let mut changed = generation.clone();
+        changed.id = ConfigGenerationId(8);
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        let mut changed = generation.clone();
+        changed.source_revision.disk_generation = None;
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        let mut changed = generation.clone();
+        changed.source_revision.fingerprint_sha256 = "0".repeat(64);
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        let mut changed = generation.clone();
+        changed.applied_at += chrono::Duration::seconds(1);
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        let mut changed = generation.clone();
+        changed.trigger = ConfigReloadTrigger::Startup;
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        let mut changed = generation.clone();
+        changed.deferred_changes = vec![DeferredConfigChange {
+            field: "prx-field".to_owned(),
+            reason: "prx-reason".to_owned(),
+        }]
+        .into();
+        assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        for field in ["workspace", "config", "effective"] {
+            let mut changed = generation.clone();
+            let config = Arc::make_mut(&mut changed.effective);
+            match field {
+                "workspace" => config.workspace_dir = std::path::PathBuf::from("/prx-other-workspace"),
+                "config" => config.config_path = std::path::PathBuf::from("/prx-other-config"),
+                _ => config.default_temperature += 0.1,
+            }
+            assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
+        }
+        let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-wrong-binding-key");
+        let wrong =
+            crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")?;
+        assert!(generation.verify_pinned_process_binding(&binding, &wrong).is_err());
+        let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-parent-binding-fixture");
+        for (workspace, run, config) in [
+            ("prx-other-workspace", "prx-run", "prx-config"),
+            ("prx-workspace", "prx-other-run", "prx-config"),
+            ("prx-workspace", "prx-run", "prx-other-config"),
+        ] {
+            let different_scope =
+                crate::decision::DecisionKey::from_worker_channel(&transport, workspace, run, config)?;
+            assert!(
+                generation
+                    .verify_pinned_process_binding(&binding, &different_scope)
+                    .is_err()
+            );
+        }
+        let mut forged = binding;
+        forged.seal = [0; 32];
+        assert!(generation.verify_pinned_process_binding(&forged, &key).is_err());
+        Ok(())
     }
 }

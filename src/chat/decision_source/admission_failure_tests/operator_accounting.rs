@@ -1,7 +1,6 @@
 #![cfg(test)]
 //! Genuine local operator source and task decision accounting; no OS worker claim.
 use super::*;
-use anyhow::Context as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},

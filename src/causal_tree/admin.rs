@@ -1533,6 +1533,19 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn status_projects_the_current_store_schema_version() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admin = admin(true, temp.path(), &calls);
+        let status = admin.status().await;
+        admin.close().await;
+        assert_eq!(status.store.mode, "read_write");
+        assert!(status.store.error.is_none(), "{status:?}");
+        assert_eq!(status.store.schema_version, super::super::store_schema::SCHEMA_VERSION);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "status does not evaluate a backend");
+    }
+
     /// R-I1-phase2 R-1: closing an enabled admin checkpoints and closes the
     /// store's writer, so a CLI run leaves no pending WAL behind.
     #[tokio::test]

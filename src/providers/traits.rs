@@ -1328,16 +1328,16 @@ mod tests {
     fn stream_chunk_delta_has_empty_tool_calls() {
         let c = StreamChunk::delta("hello");
         assert_eq!(c.delta, "hello");
-        assert!(c.tool_calls.is_empty());
+        assert!(c.tool_calls.is_empty(), "expected an empty value");
         assert!(!c.has_tool_calls());
     }
 
     #[test]
     fn stream_chunk_reasoning_has_empty_tool_calls() {
         let c = StreamChunk::reasoning_delta("thinking...");
-        assert!(c.delta.is_empty());
+        assert!(c.delta.is_empty(), "expected an empty value");
         assert!(c.reasoning.is_some());
-        assert!(c.tool_calls.is_empty());
+        assert!(c.tool_calls.is_empty(), "expected an empty value");
         assert!(c.is_reasoning_only());
         assert!(!c.has_tool_calls());
     }
@@ -1358,8 +1358,14 @@ mod tests {
 
     #[test]
     fn stream_chunk_final_and_error_have_no_tool_calls() {
-        assert!(StreamChunk::final_chunk().tool_calls.is_empty());
-        assert!(StreamChunk::error("boom").tool_calls.is_empty());
+        assert!(
+            StreamChunk::final_chunk().tool_calls.is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            StreamChunk::error("boom").tool_calls.is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -1368,8 +1374,8 @@ mod tests {
         // compiles even if it is unaware of 5a-5 — the field is defaulted to Vec::new() and
         // has_tool_calls() == false.
         let c = StreamChunk::default();
-        assert!(c.delta.is_empty());
-        assert!(c.tool_calls.is_empty());
+        assert!(c.delta.is_empty(), "expected an empty value");
+        assert!(c.tool_calls.is_empty(), "expected an empty value");
         assert!(!c.has_tool_calls());
     }
 
@@ -1460,7 +1466,7 @@ mod tests {
         let chunk = ToolCallChunk::default();
         assert_eq!(chunk.status, ToolCallChunkStatus::Completed);
         assert!(chunk.arguments_delta.is_none());
-        assert!(chunk.args.is_empty());
+        assert!(chunk.args.is_empty(), "expected an empty value");
     }
 
     /// Convenience constructor: `streaming_delta` must produce a `Streaming` chunk with empty `args`,

@@ -298,7 +298,7 @@ async fn an_undeclared_endpoint_is_sent_the_published_root_combinator() {
         "the endpoint's own rejection must surface: {error:#}"
     );
     let bodies = stub.bodies();
-    assert!(!bodies.is_empty());
+    assert!(!bodies.is_empty(), "expected a non-empty value");
     assert_eq!(root_combinators_in(&bodies[0]), vec!["allOf".to_string()]);
 }
 
@@ -403,7 +403,7 @@ async fn a_model_scoped_raw_entry_overrides_a_provider_wide_declaration() {
 
     let bodies = stub.bodies();
     assert_eq!(bodies.len(), 2);
-    assert!(root_combinators_in(&bodies[0]).is_empty());
+    assert!(root_combinators_in(&bodies[0]).is_empty(), "expected an empty value");
     assert_eq!(root_combinators_in(&bodies[1]), vec!["allOf".to_string()]);
 }
 
@@ -440,7 +440,7 @@ async fn a_catalog_local_server_honours_its_declaration_on_the_wire() {
     );
     let bodies = stub.bodies();
     assert_eq!(bodies.len(), 1);
-    assert!(root_combinators_in(&bodies[0]).is_empty());
+    assert!(root_combinators_in(&bodies[0]).is_empty(), "expected an empty value");
 }
 
 // ── Red-before: one declaration per endpoint identity (R-INT1 I-2) ────
@@ -566,11 +566,15 @@ async fn a_configured_textual_grammar_is_read_on_a_keyed_endpoint() {
 
 #[tokio::test]
 async fn an_undeclared_endpoint_never_reads_the_textual_grammar() {
-    assert!(textual_calls_through_config(false, None).await.is_empty());
+    assert!(
+        textual_calls_through_config(false, None).await.is_empty(),
+        "expected an empty value"
+    );
     assert!(
         textual_calls_through_config(false, Some("fixture-not-a-credential"))
             .await
-            .is_empty()
+            .is_empty(),
+        "expected an empty value"
     );
 }
 

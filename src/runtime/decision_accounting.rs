@@ -122,6 +122,7 @@ impl DecisionAttemptAccounting for AccountingScope {
             transport_binding: attempt.transport_binding(),
             request_id: attempt.request_id(),
             deadline: attempt.deadline(),
+            remaining_attempts: attempt.remaining_attempts(),
         })
         .await
         .map(|receipt| Box::new(receipt) as Box<dyn DecisionAttemptReceipt>)
@@ -137,11 +138,16 @@ pub(super) struct PhysicalEstimate<'a> {
     pub transport_binding: &'a [u8; 32],
     pub request_id: &'a str,
     pub deadline: Instant,
+    pub remaining_attempts: u8,
 }
 
 impl AccountingScope {
     pub(super) fn scope_id(&self) -> String {
         hex::encode(self.scope_id)
+    }
+    #[cfg(test)]
+    pub(crate) fn scope_id_for_tests(&self) -> String {
+        self.scope_id()
     }
     pub(super) const fn deadline(&self) -> Instant {
         self.deadline
@@ -168,11 +174,28 @@ impl AccountingScope {
                 micro_usd: AtomicU64::new(self.budgets.micro_usd),
             })
         }));
-        let tokens = remaining.tokens.swap(0, Ordering::AcqRel);
-        if tokens == 0 {
-            remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
+        let planned = u64::from(attempt.remaining_attempts);
+        if !(1..=2).contains(&planned) || (auxiliary && planned != 1) {
             return Err(DecisionError::BudgetExceeded);
         }
+        // Allocate the existing allowance across the transport's bounded plan.
+        // This estimate is not an output cap; unknown dispatched usage stays held.
+        let mut available = remaining.tokens.load(Ordering::Acquire);
+        let tokens = loop {
+            let tokens = available / planned;
+            if tokens == 0 {
+                return Err(DecisionError::BudgetExceeded);
+            }
+            match remaining.tokens.compare_exchange_weak(
+                available,
+                available - tokens,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break tokens,
+                Err(current) => available = current,
+            }
+        };
         let maximum = match estimated_cost(&self.config.cost, attempt.provider, attempt.model, tokens) {
             Ok(value) => value,
             Err(error) => {
@@ -182,7 +205,7 @@ impl AccountingScope {
         };
         if remaining
             .micro_usd
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(maximum))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(maximum))
             .is_err()
         {
             remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
@@ -201,7 +224,8 @@ impl AccountingScope {
         let binding = self.key.hmac(
             KeyDomain::TerminalClaim,
             &[
-                b"decision-accounting-estimate-v1",
+                b"decision-accounting-estimate-v2",
+                &attempt.remaining_attempts.to_be_bytes(),
                 &self.scope_id,
                 attempt.transport_binding,
                 attempt.request_id.as_bytes(),
@@ -518,20 +542,55 @@ impl OwnedReceipt {
                     let _ = self
                         .remaining
                         .micro_usd
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                             Some(value.saturating_sub(excess))
                         });
                 }
 
-                self.remaining
-                    .tokens
-                    .fetch_add(self.reserved_tokens.saturating_sub(total), Ordering::AcqRel);
+                reconcile_token_allowance(&self.remaining.tokens, self.reserved_tokens, total);
                 Ok(())
             })();
             ticket.finish(result.is_ok());
             result.map_err(|_| DecisionError::BudgetExceeded)
         });
         work.await.map_err(|_| DecisionError::BudgetExceeded)?
+    }
+}
+
+fn reconcile_token_allowance(remaining: &AtomicU64, reserved: u64, actual: u64) {
+    if actual <= reserved {
+        remaining.fetch_add(reserved - actual, Ordering::AcqRel);
+    } else {
+        let excess = actual - reserved;
+        let _ = remaining.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.saturating_sub(excess))
+        });
+    }
+}
+
+#[cfg(test)]
+mod tranche_tests {
+    use super::*;
+
+    #[test]
+    fn reported_usage_above_tranche_consumes_unallocated_tokens() {
+        let remaining = AtomicU64::new(2048);
+        reconcile_token_allowance(&remaining, 2048, 3000);
+        assert_eq!(remaining.load(Ordering::Acquire), 1096);
+    }
+
+    #[test]
+    fn reported_usage_above_owner_budget_exhausts_tokens() {
+        let remaining = AtomicU64::new(2048);
+        reconcile_token_allowance(&remaining, 2048, 5000);
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn reported_usage_below_tranche_releases_only_unused_estimate() {
+        let remaining = AtomicU64::new(2048);
+        reconcile_token_allowance(&remaining, 2048, 1000);
+        assert_eq!(remaining.load(Ordering::Acquire), 3096);
     }
 }
 

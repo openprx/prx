@@ -784,7 +784,7 @@ The user prefers Rust for systems programming.
     fn parse_snapshot_empty() {
         let input = "# 🧠 OpenPRX Memory Snapshot\n\n> Nothing here.\n";
         let entries = parse_snapshot(input);
-        assert!(entries.is_empty());
+        assert!(entries.is_empty(), "expected an empty value");
     }
 
     #[test]

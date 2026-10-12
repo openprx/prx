@@ -1959,7 +1959,6 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
                 );
                 print_work_items(&listing.unreaped);
             }
-            Ok(())
         }
         TasksCommands::Kill {
             id,
@@ -1997,7 +1996,6 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
             if report.targets.iter().any(|target| target.outcome == "not_killable") {
                 bail!("one or more targets had no termination handle and could not be killed");
             }
-            Ok(())
         }
         TasksCommands::Send {
             id,
@@ -2013,7 +2011,6 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
             } else {
                 println!("{}", render_task_message(&report));
             }
-            Ok(())
         }
         TasksCommands::Pools { json, url, token } => {
             let endpoint = TasksEndpoint::resolve(config, url, token);
@@ -2035,9 +2032,9 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
                 }
                 println!();
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Render one work-item table, shared by the running and unreaped sections.

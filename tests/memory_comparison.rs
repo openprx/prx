@@ -188,8 +188,8 @@ async fn compare_recall_speed() {
     println!("  Markdown: {:?} → {} results", md_dur, md_results.len());
 
     // Both should find results
-    assert!(!sq_results.is_empty());
-    assert!(!md_results.is_empty());
+    assert!(!sq_results.is_empty(), "expected a non-empty value");
+    assert!(!md_results.is_empty(), "expected a non-empty value");
 }
 
 // ── Test 4: Persistence (SQLite wins by design) ────────────────
@@ -382,6 +382,6 @@ async fn compare_category_filter() {
     assert_eq!(sq_all.len(), 4);
 
     // Markdown: categories determined by file location
-    assert!(!md_core.is_empty());
-    assert!(!md_all.is_empty());
+    assert!(!md_core.is_empty(), "expected a non-empty value");
+    assert!(!md_all.is_empty(), "expected a non-empty value");
 }

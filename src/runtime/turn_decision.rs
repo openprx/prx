@@ -5,10 +5,18 @@
 //! and node state, so a source-generation mismatch rejects the service.
 
 #[cfg(test)]
+mod ordinary_child_fixture;
+
+#[cfg(test)]
 use crate::causal_tree::state::ConstraintCode;
 
 #[cfg(test)]
 pub(crate) mod progress_diagnostic;
+
+#[cfg(test)]
+pub(crate) mod evidence_fixture;
+#[cfg(test)]
+pub(crate) mod selected_loader_fixture;
 
 mod accounting;
 mod auxiliary;
@@ -31,6 +39,17 @@ pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router
 mod routing;
 #[cfg(feature = "llm-router")]
 pub(crate) use routing::{RouterEmbedding, RouterModelReadmission, commit_training_owned};
+
+#[cfg(feature = "llm-router")]
+#[inline(never)]
+fn boxed_router_history_field<'a, F>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>>
+where
+    F: std::future::Future + Send + 'a,
+{
+    Box::pin(make())
+}
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -345,14 +364,28 @@ impl TurnDecisionService {
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
         let mut drained = true;
         if let Some(writer) = self.store.writer() {
-            if !writer.drain(deadline).await {
-                drained = false;
+            #[cfg(test)]
+            crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
+            let writer_drained = writer.drain(deadline).await;
+            #[cfg(test)]
+            crate::runtime::turn_cleanup::diagnostic::queue("decision_writer_drained", writer_drained);
+            drained &= writer_drained;
+            if !writer_drained {
                 tracing::warn!("causal decision writer did not drain before shutdown deadline");
             }
         }
+        #[cfg(test)]
+        if self.store.writer().is_none() {
+            crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", false);
+        }
+        #[cfg(test)]
+        crate::runtime::turn_cleanup::diagnostic::queue_presence("event_queue_present", self.durable_events.is_some());
         if let Some(events) = &self.durable_events {
-            if !events.drain(deadline).await {
-                drained = false;
+            let events_drained = events.drain(deadline).await;
+            #[cfg(test)]
+            crate::runtime::turn_cleanup::diagnostic::queue("event_queue_drained", events_drained);
+            drained &= events_drained;
+            if !events_drained {
                 tracing::warn!("causal event queue did not drain before shutdown deadline");
             }
         }
@@ -870,19 +903,18 @@ impl TurnDecisionContext {
         }
     }
 
+    #[cfg(feature = "llm-router")]
     pub(crate) fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
-        #[cfg(feature = "llm-router")]
-        {
-            self.router_transition
-                .as_ref()
-                .map(|transition| transition.replay_facts(self, key))
-                .transpose()
-        }
-        #[cfg(not(feature = "llm-router"))]
-        {
-            let _ = key;
-            Ok(None)
-        }
+        self.router_transition
+            .as_ref()
+            .map(|transition| transition.replay_facts(self, key))
+            .transpose()
+    }
+
+    #[cfg(not(feature = "llm-router"))]
+    pub(crate) const fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
+        let _ = key;
+        Ok(None)
     }
 
     pub(crate) fn claimed_resume_event(&self) -> Option<&crate::memory::MessageEvent> {
@@ -986,6 +1018,7 @@ impl TurnDecisionContext {
         match &self.directive {
             TurnExecutionDirective::AnswerDirectly => Some(CausalActionKind::Answer),
             TurnExecutionDirective::Execute { .. } => Some(CausalActionKind::UseTool),
+            TurnExecutionDirective::Delegate { .. } => Some(CausalActionKind::Delegate),
             TurnExecutionDirective::Clarify { .. } => Some(CausalActionKind::Clarify),
             TurnExecutionDirective::Refuse { .. } => Some(CausalActionKind::Refuse),
             _ => None,
@@ -1447,6 +1480,10 @@ impl TurnDecisionService {
             &Arc<super::turn_cleanup::CleanupTracker>,
         )>,
     ) -> anyhow::Result<Enqueue> {
+        #[cfg(test)]
+        let mut stage = super::turn_cleanup::diagnostic::Stage::current(
+            super::turn_cleanup::diagnostic::StageName::RejoinPreconditions,
+        );
         let workspace_id = self.generation.effective.workspace_dir.to_string_lossy();
         anyhow::ensure!(
             matches!(
@@ -1467,6 +1504,8 @@ impl TurnDecisionService {
             !terminal_id.is_empty() && !owner_id.is_empty(),
             "terminal rejoin scope is empty"
         );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinLookup);
         let final_key = format!("turn:{terminal_id}:final");
         let event = if let Some((scope, deadline, _)) = bounded {
             self.memory
@@ -1486,6 +1525,8 @@ impl TurnDecisionService {
             event.idempotency_key.as_deref() == Some(final_key.as_str()),
             "terminal lookup returned a different marker"
         );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplay);
         let store_workspace_id = self.store.workspace_id().context("store workspace scope is missing")?;
         let replay = if let Some((_, deadline, owner)) = bounded {
             crate::agent::terminal::verify_terminal_replay_until(
@@ -1514,6 +1555,8 @@ impl TurnDecisionService {
             )
             .await?
         };
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplayScope);
         anyhow::ensure!(
             super::turn_source::ingress_event_surface(
                 &replay.source().source,
@@ -1530,19 +1573,29 @@ impl TurnDecisionService {
                     .map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
             "terminal replay belongs to another parent decision"
         );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinFacts);
         let decision = replay.decision();
         let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
             .with_verified_resume(&replay);
         let writer = self.store.writer().context("terminal rejoin writer is missing")?;
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
         let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinRecord);
         let queued = writer.record_outcome(expected.clone());
         anyhow::ensure!(queued == Enqueue::Queued, "rejoined outcome could not be queued");
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinDrain);
         anyhow::ensure!(
             writer
                 .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
                 .await,
             "rejoined outcome persistence timed out"
         );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinConfirmAndRepairs);
         let scope = DecisionScope::Owner {
             workspace_id: store_workspace_id,
             owner_id: Arc::from(owner_id),
@@ -1665,6 +1718,8 @@ impl TurnDecisionService {
                 }
             }
         }
+        #[cfg(test)]
+        stage.finish();
         Ok(queued)
     }
 
@@ -2128,9 +2183,10 @@ impl TurnDecisionService {
         let mut routing_closed = false;
         #[cfg(feature = "llm-router")]
         if let Some(continuation) = routing.as_deref_mut() {
-            let (decision, next) = self
-                .router_history_hop(&state, deadline, continuation, cancellation, &accounting)
-                .await?;
+            let (decision, next) = boxed_router_history_field(|| {
+                self.router_history_hop(&state, deadline, continuation, cancellation, &accounting)
+            })
+            .await?;
             match next {
                 Some(next) => state = next,
                 None => {
@@ -2796,12 +2852,25 @@ impl TurnDecisionService {
                 if cancellation.is_cancelled() {
                     return Err(AgentDecisionError::Cancelled);
                 }
-                stop_hops = progress_operand!(
-                    "same_evidence",
-                    next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
-                ) && progress_operand!(
-                    "same_candidate_bodies",
-                    !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
+                stop_hops = crate::causal_tree::decision_engine::discovery_has_no_progress(
+                    || {
+                        progress_operand!(
+                            "same_evidence",
+                            next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
+                        )
+                    },
+                    || {
+                        progress_operand!(
+                            "same_candidate_bodies",
+                            !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
+                        )
+                    },
+                    || {
+                        !progress_operand!(
+                            "same_direct_readiness",
+                            !next_prepared.gained_direct_candidate_from_prepared(&previous_prepared)
+                        )
+                    },
                 );
             }
             #[cfg(test)]
@@ -3154,6 +3223,10 @@ pub(crate) fn build_turn_decision_service(
             events: Arc::clone(&events),
         },
     )?;
+    #[cfg(test)]
+    let factory = evidence_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
+    #[cfg(test)]
+    let factory = selected_loader_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
         child_recovery: Default::default(),
@@ -3317,10 +3390,16 @@ mod tests {
         assert!(artifact.source_event_id.is_none());
         let mut invalid = hit.clone();
         invalid.role = "system".to_owned();
-        assert!(session_artifacts_from_selected_read(&[invalid], now).is_empty());
+        assert!(
+            session_artifacts_from_selected_read(&[invalid], now).is_empty(),
+            "expected an empty value"
+        );
         let mut oversized = hit;
         oversized.content = "x".repeat(4097);
-        assert!(session_artifacts_from_selected_read(&[oversized], now).is_empty());
+        assert!(
+            session_artifacts_from_selected_read(&[oversized], now).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -3371,7 +3450,8 @@ mod tests {
         assert!(!unicode.summary_was_truncated);
         assert!(!artifacts.iter().any(|artifact| artifact.summary == "sixth result"));
         assert!(
-            memory_artifacts_from_selected_read(&[hit(&"x".repeat(4_097), now.to_rfc3339(), None)], now).is_empty()
+            memory_artifacts_from_selected_read(&[hit(&"x".repeat(4_097), now.to_rfc3339(), None)], now).is_empty(),
+            "expected an empty value"
         );
         assert!(
             !format!("{artifacts:?}").contains("local evidence"),
@@ -4893,7 +4973,7 @@ mod tests {
             match mode {
                 ProbeCancelMode::Never | ProbeCancelMode::Before => {
                     assert_eq!(reads, 0);
-                    assert!(requests.is_empty());
+                    assert!(requests.is_empty(), "expected an empty value");
                 }
                 ProbeCancelMode::Backend => {
                     assert_eq!(reads, 0);
@@ -5415,7 +5495,10 @@ mod tests {
             result.engine().state.trusted.parts().constraints.as_slice()
         );
         assert!(result.execution_refs().is_empty());
-        assert!(result.retrieved().expect("live selected evidence").is_empty());
+        assert!(
+            result.retrieved().expect("live selected evidence").is_empty(),
+            "expected an empty value"
+        );
         assert!(matches!(result.disposition(), Ok(TurnDisposition::Close { .. })));
         // Exercise fresh admission with this actual selected engine decision,
         // not a fabricated selection or an already-consumed context getter.
@@ -5442,7 +5525,10 @@ mod tests {
         ));
         // Fixed local closure remains valid after the decision deadline; it
         // grants no provider execution. Actual terminal closure seals access.
-        assert!(expired.retrieved().expect("already selected evidence").is_empty());
+        assert!(
+            expired.retrieved().expect("already selected evidence").is_empty(),
+            "expected an empty value"
+        );
         assert!(matches!(expired.disposition(), Ok(TurnDisposition::Close { .. })));
         assert_eq!(expired.decision_id(), issued_id);
         assert_eq!(expired.engine().state.routing_input, issued_input);
@@ -5495,11 +5581,26 @@ mod tests {
                 .await
                 .expect("local fixed decision");
             assert!(matches!(context.disposition(), Ok(TurnDisposition::Close { .. })));
+            let decision = if enabled {
+                assert!(!service.durable_key, "corrupt key must not issue durable authority");
+                assert!(!context.record_admitted.load(Ordering::Acquire));
+                assert!(
+                    service.terminal_settlement_ref(Arc::clone(&context)).is_err(),
+                    "enabled keyless context must not issue a terminal decision"
+                );
+                None
+            } else {
+                Some(
+                    service
+                        .terminal_settlement_ref(Arc::clone(&context))
+                        .expect("disabled service issues a genuine same-context terminal decision"),
+                )
+            };
             let now = chrono::Utc::now();
             let ports = FinalizingClosePorts {
                 fabric: MemoryFabric::new(Arc::clone(&memory), proof.workspace_id()),
                 commit: crate::agent::terminal::TurnTerminalDraft {
-                    decision: None,
+                    decision,
                     terminal_id: "prx_unrecorded_close".to_owned(),
                     scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
                         .with_owner_id(proof.owner_id())
@@ -5522,10 +5623,23 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 cancellation: None,
             };
-            service
+            let close = service
                 .close_agent_directive_turn(&proof, Arc::clone(&context), &ports, &CancellationToken::new())
-                .await
-                .expect("ordinary close stays available");
+                .await;
+            if enabled {
+                let error = close.expect_err("enabled keyless close must fail at terminal linkage");
+                assert_eq!(error.to_string(), "terminal draft has no service-issued decision");
+                assert!(
+                    memory
+                        .find_message_event_by_idempotency_key(proof.workspace_id(), "turn:prx_unrecorded_close:final")
+                        .await
+                        .expect("keyless terminal marker lookup")
+                        .is_none(),
+                    "keyless close must not persist a terminal marker"
+                );
+            } else {
+                close.expect("ordinary close stays available");
+            }
             assert_eq!(ports.calls.load(Ordering::SeqCst), 1);
             assert!(!context.record_admitted.load(Ordering::Acquire));
             assert!(service.durable_events.is_none());
@@ -5920,7 +6034,7 @@ mod tests {
             assert_eq!(step.event_id(), &None);
             assert_eq!(next.lineage.hop(), 1);
             assert_eq!(next.lineage.prior_decision_id(), Some(decision.decision_id.as_uuid()));
-            assert!(next.derived.candidates().is_empty());
+            assert!(next.derived.candidates().is_empty(), "expected an empty value");
             assert_eq!(memory.retrieval_calls.load(Ordering::SeqCst), 1);
             {
                 let args = memory.retrieval_args.lock();
@@ -6126,7 +6240,7 @@ mod tests {
                 .await
                 .expect("empty selected read still records a completed step");
             assert!(!empty_observed.fresh_read);
-            assert!(empty_observed.selected_artifacts.is_empty());
+            assert!(empty_observed.selected_artifacts.is_empty(), "expected an empty value");
             let mut empty_comparison = empty_observed.state.clone();
             empty_comparison.derived = decision.state.derived.clone();
             let mut reduced = empty_comparison.trusted.parts().clone();
@@ -6138,7 +6252,7 @@ mod tests {
                 "an empty successful read stays no-progress as latency shrinks"
             );
             let empty_next = empty_observed.state;
-            assert!(empty_next.observed.artifacts().is_empty());
+            assert!(empty_next.observed.artifacts().is_empty(), "expected an empty value");
             assert_eq!(memory.retrieval_calls.load(Ordering::SeqCst), 2);
             let empty_inputs = EngineInputs {
                 state: &empty_next,
@@ -6204,7 +6318,10 @@ mod tests {
                 .await
                 .expect("backend failure closes through an observed step");
             assert!(!failed_observation.fresh_read, "prior evidence cannot authorize Answer");
-            assert!(failed_observation.selected_artifacts.is_empty());
+            assert!(
+                failed_observation.selected_artifacts.is_empty(),
+                "expected an empty value"
+            );
             assert_eq!(failed_observation.state.observed.artifacts().len(), 1);
             let [failed_step] = failed_observation.state.observed.completed_steps() else {
                 panic!("one failed runtime-owned read step");
@@ -6244,7 +6361,7 @@ mod tests {
                 .await
                 .expect("selected read timeout closes through an observed step");
             assert!(!cancelled.fresh_read);
-            assert!(cancelled.selected_artifacts.is_empty());
+            assert!(cancelled.selected_artifacts.is_empty(), "expected an empty value");
             let [cancelled_step] = cancelled.state.observed.completed_steps() else {
                 panic!("one cancelled runtime-owned read step");
             };
@@ -6792,6 +6909,7 @@ mod tests {
     fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         assert!(!config.causal_tree.enabled);
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -7720,12 +7838,16 @@ mod tests {
             workspace.path(),
         )
         .await
-        .expect("committed terminal without typed decision link");
-        assert!(terminal.terminal_event.id > 0, "real persisted marker");
-        assert!(matches!(
-            crate::causal_tree::outcome::TerminalFacts::from_receipt(&context, &terminal),
-            Err(crate::causal_tree::outcome::OutcomeCorrelationError::Marker)
-        ));
+        .expect_err("missing terminal decision must fail before persistence");
+        assert_eq!(terminal.to_string(), "terminal draft has no service-issued decision");
+        assert!(
+            memory
+                .find_message_event_by_idempotency_key(proof.workspace_id(), "turn:unlinked-terminal-1:final")
+                .await
+                .expect("unlinked terminal marker lookup")
+                .is_none(),
+            "an unlinked terminal must not persist a marker"
+        );
         let linked_commit = crate::agent::terminal::TurnTerminalDraft {
             decision: Some(
                 service
@@ -8107,7 +8229,8 @@ mod tests {
                 .expect("read pending decision")
                 .expect("pending decision row")
                 .outcomes
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
         let late_context = service
             .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())

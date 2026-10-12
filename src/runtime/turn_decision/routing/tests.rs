@@ -290,8 +290,8 @@ impl Fixture {
             [], |row| {
                 let bytes: Vec<u8> = row.get(6)?;
                 assert_eq!(bytes.len(), 384 * 4);
-                let embedding = bytes.chunks_exact(4).map(|chunk| {
-                    f32::from_le_bytes(chunk.try_into().unwrap())
+                let embedding = bytes.as_chunks::<4>().0.iter().map(|chunk| {
+                    f32::from_le_bytes(*chunk)
                 }).collect();
                 Ok(RouterHistoryRow {source_sequence: row.get(0)?, terminal_sequence: row.get(1)?,
                     terminal_event_id: row.get(2)?, provider: row.get(3)?, model: row.get(4)?,

@@ -632,7 +632,7 @@ fn agent_and_route_keys_are_bound_to_their_entries_provider() {
 
     let route = run("groq", LegacySlot::ModelRoute("fast".to_string())).expect("the route's own provider");
     assert_eq!(route.credential().api_key(), Some(ROUTE_SENTINEL));
-    assert!(route.credential().rotation_keys().is_empty());
+    assert!(route.credential().rotation_keys().is_empty(), "expected an empty value");
     assert!(matches!(
         run("openai", LegacySlot::ModelRoute("fast".to_string())),
         Err(ResolutionError::CredentialOwnerMismatch { .. })

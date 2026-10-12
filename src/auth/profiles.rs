@@ -153,6 +153,11 @@ impl AuthProfilesStore {
     /// provider's own credential, a credential reference's status), which
     /// write no credential file (D-080, D-083 C-4).
     pub fn load_read_only(&self) -> Result<AuthProfilesData> {
+        // An absent store is an empty snapshot, not an initialization request.
+        // In particular, read-only management must not create its directory.
+        if !self.path.try_exists()? {
+            return Ok(AuthProfilesData::default());
+        }
         let _lock = self.acquire_lock()?;
         self.read_locked(false)
     }
@@ -756,6 +761,21 @@ mod tests {
             !loaded.token.as_deref().unwrap().starts_with("enc2:"),
             "loaded auth profile token must be decrypted before provider use"
         );
+    }
+
+    #[test]
+    fn read_only_absent_store_does_not_initialize_its_directory() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let config_dir = tmp.path().join("prx_config");
+        let store = AuthProfilesStore::new(&config_dir, true);
+
+        let data = store.load_read_only().expect("test: read-only empty store");
+
+        assert!(data.profiles.is_empty());
+        assert!(data.active_profiles.is_empty());
+        assert!(!config_dir.exists(), "read-only load created the directory");
+        assert!(!store.path().exists(), "read-only load created the profiles file");
+        assert!(!store.lock_path.exists(), "read-only load created the lock");
     }
 
     /// D-083 C-4: a read-only load decrypts a legacy `enc:` value in memory

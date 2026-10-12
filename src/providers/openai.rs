@@ -1752,8 +1752,8 @@ mod tests {
         )
         .expect("test: in-range tool-call index");
         // No name yet → no Streaming chunk emitted to the driver.
-        assert!(streaming.is_empty());
-        assert!(flush_tool_call_buffer(&buf).is_empty());
+        assert!(streaming.is_empty(), "expected an empty value");
+        assert!(flush_tool_call_buffer(&buf).is_empty(), "expected an empty value");
     }
 
     /// Test helper: replay a sequence of SSE lines through the parser to
@@ -1837,7 +1837,7 @@ mod tests {
         assert_eq!(text, "hello world");
         assert!(had_finish);
         assert!(final_seen);
-        assert!(calls.is_empty());
+        assert!(calls.is_empty(), "expected an empty value");
     }
 
     #[test]

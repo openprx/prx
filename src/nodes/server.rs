@@ -641,7 +641,7 @@ where
             break;
         }
         let available = budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(read))
             })
             .unwrap_or(0);

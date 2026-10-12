@@ -1161,9 +1161,268 @@ impl crate::runtime::turn_decision::CloseTurnPorts for ChatDecisionClose<'_> {
 #[cfg(test)]
 pub(crate) mod admission_failure_tests {
     mod operator_accounting;
+    #[cfg(unix)]
+    mod worker_stdin_protocol;
     use super::*;
     use crate::agent::terminal::TurnTerminalStatus;
     use crate::memory::{MemoryFabric, SqliteMemory};
+
+    /// Admit only an actual local `/bg` fixture through Chat's private source path.
+    pub(crate) async fn recorded_local_operator_spawn(
+        publication: crate::runtime::turn_publication::TurnDecisionPublication,
+        provider: Arc<dyn crate::providers::Provider>,
+        task: &str,
+    ) -> anyhow::Result<(serde_json::Value, crate::runtime::operator_spawn::OperatorSpawnSource)> {
+        let generation = Arc::clone(&publication.generation);
+        let memory = Arc::clone(&publication.memory);
+        let security = Arc::clone(&publication.security);
+        let config = &generation.effective;
+        let provider_name = config
+            .default_provider
+            .as_deref()
+            .context("operator fixture provider missing")?;
+        let model_name = config
+            .default_model
+            .as_deref()
+            .context("operator fixture model missing")?;
+        let binding = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
+            .context("operator fixture provider binding missing")?;
+        let service = publication
+            .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+            .await?;
+        crate::runtime::turn_cleanup::current_tracker()
+            .context("operator fixture cleanup owner missing")?
+            .retain_service(Arc::clone(&service));
+        let message = crate::channels::traits::ChannelMessage {
+            id: "prx-operator-command".to_owned(),
+            sender: "user".to_owned(),
+            channel: "terminal".to_owned(),
+            content: format!("/bg {task}"),
+            ..Default::default()
+        };
+        ChatOperatorSpawn::capture(
+            &message,
+            task,
+            &binding,
+            &generation,
+            &provider,
+            provider_name,
+            model_name,
+        )?
+        .admit(memory, "prx_operator_session", security, service)
+        .await
+    }
+
+    /// Record and admit a model-origin turn before dispatching its spawn call.
+    /// This preserves the configured decision policy, including an abstention.
+    pub(crate) async fn dispatch_recorded_model_spawn(
+        publication: crate::runtime::turn_publication::TurnDecisionPublication,
+        provider: Arc<dyn crate::providers::Provider>,
+        arguments: serde_json::Value,
+        serving_phase: Arc<std::sync::atomic::AtomicU8>,
+    ) -> anyhow::Result<crate::tools::ToolResult> {
+        use crate::runtime::turn_source::TurnSourceProof as _;
+        let generation = Arc::clone(&publication.generation);
+        let memory = Arc::clone(&publication.memory);
+        let config = &generation.effective;
+        let provider_name = config
+            .default_provider
+            .as_deref()
+            .context("model fixture provider missing")?;
+        let model_name = config.default_model.as_deref().context("model fixture model missing")?;
+        let selected = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
+            .context("model fixture provider binding missing")?;
+        let service = publication
+            .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+            .await?;
+        crate::runtime::turn_cleanup::current_tracker()
+            .context("model fixture cleanup owner missing")?
+            .retain_service(Arc::clone(&service));
+        let input = "spawn model child";
+        let session = "chat:session-1";
+        let run = "turn-run-xyz";
+        let envelope = super::super::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), session)
+            .with_config_generation(&generation)
+            .with_run_id(run.to_owned());
+        let fabric = MemoryFabric::new(Arc::clone(&memory), config.workspace_dir.to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config());
+        let event = fabric
+            .record_inbound_user_message(envelope.message_scope(), input, None, None)
+            .await?;
+        let receipt = ChatSourceReceipt::issue(memory.as_ref(), &generation, session, run, input, &event).await?;
+        let binding = receipt.bind_provider(
+            &selected,
+            ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
+        )?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = binding.decide(&service, &cancellation).await?;
+        use crate::causal_tree::directive::TurnExecutionDirective;
+        let (directive, reason) = match context.directive() {
+            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
+            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.as_str()),
+            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
+            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
+            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),
+            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable"),
+            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable"),
+            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable"),
+            TurnExecutionDirective::CollectApprovalArguments(_) => ("CollectApprovalArguments", "not_applicable"),
+        };
+        let reason = match reason {
+            "insufficient_evidence"
+            | "commit_threshold_or_margin"
+            | "no_legal_path"
+            | "retrieve_evidence"
+            | "hop_stopped"
+            | "choice_outside_legal_set"
+            | "approval_only"
+            | "deadline_exceeded"
+            | "not_applicable" => reason,
+            _ => "unclassified",
+        };
+        eprintln!("PRX_Q47_PARENT_ADMISSION directive={directive} reason_code={reason}");
+        let specs = service.agent_execution_specs(binding.as_ref(), context)?;
+        anyhow::ensure!(
+            specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
+            "genuine model admission did not select sessions_spawn"
+        );
+        let execution_context =
+            crate::tools::ToolExecutionContext::new(binding.envelope().clone(), binding.policy_chat_type());
+        let (execution, execution_context) =
+            service.bind_agent_execution(binding.as_ref(), context, &execution_context, &specs.specs)?;
+        let messages = [crate::providers::ChatMessage::user(input)];
+        let response = provider
+            .chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&specs.specs),
+                },
+                model_name,
+                0.7,
+            )
+            .await?;
+        anyhow::ensure!(response.tool_calls.len() == 1, "one genuine parent tool call required");
+        let call = response.tool_calls.into_iter().next().context("parent call missing")?;
+        anyhow::ensure!(call.name == "sessions_spawn", "unexpected parent tool name");
+        let mut returned_arguments: serde_json::Value = serde_json::from_str(&call.arguments)?;
+        anyhow::ensure!(
+            returned_arguments == serde_json::json!({"task":"model child"}),
+            "parent arguments changed"
+        );
+        let grant_key = crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG;
+        let grant = arguments.get(grant_key).context("host resource grant missing")?.clone();
+        returned_arguments
+            .as_object_mut()
+            .context("parent object required")?
+            .insert(grant_key.to_owned(), grant);
+        serving_phase
+            .compare_exchange(
+                1,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| anyhow::anyhow!("parent response phase was not observed"))?;
+        let outcome = execution
+            .execute(
+                crate::tools::ToolExecutionCommand::new(call.name, returned_arguments),
+                execution_context,
+                Some(cancellation),
+            )
+            .await;
+        outcome
+            .result
+            .context("genuine model dispatch did not return a tool result")
+    }
+
+    /// Record and admit a model-origin turn before dispatching its spawn call.
+    /// This preserves the configured decision policy, including an abstention.
+    pub(crate) async fn dispatch_unknown_agent_fixture(
+        publication: crate::runtime::turn_publication::TurnDecisionPublication,
+        provider: Arc<dyn crate::providers::Provider>,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolResult> {
+        use crate::runtime::turn_source::TurnSourceProof as _;
+        let generation = Arc::clone(&publication.generation);
+        let memory = Arc::clone(&publication.memory);
+        let config = &generation.effective;
+        let provider_name = config
+            .default_provider
+            .as_deref()
+            .context("model fixture provider missing")?;
+        let model_name = config.default_model.as_deref().context("model fixture model missing")?;
+        let selected = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
+            .context("model fixture provider binding missing")?;
+        let service = publication
+            .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+            .await?;
+        crate::runtime::turn_cleanup::current_tracker()
+            .context("model fixture cleanup owner missing")?
+            .retain_service(Arc::clone(&service));
+        let input = "sessions_spawn hello";
+        let session = "chat:unknown-agent";
+        let run = "prx_unknown_agent_parent";
+        let envelope = super::super::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), session)
+            .with_config_generation(&generation)
+            .with_run_id(run.to_owned());
+        let fabric = MemoryFabric::new(Arc::clone(&memory), config.workspace_dir.to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config());
+        let event = fabric
+            .record_inbound_user_message(envelope.message_scope(), input, None, None)
+            .await?;
+        let receipt = ChatSourceReceipt::issue(memory.as_ref(), &generation, session, run, input, &event).await?;
+        let binding = receipt.bind_provider(
+            &selected,
+            ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
+        )?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = binding.decide(&service, &cancellation).await?;
+        use crate::causal_tree::directive::TurnExecutionDirective;
+        let (directive, reason) = match context.directive() {
+            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
+            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.as_str()),
+            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
+            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
+            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),
+            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable"),
+            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable"),
+            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable"),
+            TurnExecutionDirective::CollectApprovalArguments(_) => ("CollectApprovalArguments", "not_applicable"),
+        };
+        let reason = match reason {
+            "insufficient_evidence"
+            | "commit_threshold_or_margin"
+            | "no_legal_path"
+            | "retrieve_evidence"
+            | "hop_stopped"
+            | "choice_outside_legal_set"
+            | "approval_only"
+            | "deadline_exceeded"
+            | "not_applicable" => reason,
+            _ => "unclassified",
+        };
+        let specs = service
+            .agent_execution_specs(binding.as_ref(), context)
+            .with_context(|| format!("unknown-agent parent admission directive={directive} reason_code={reason}"))?;
+        anyhow::ensure!(
+            specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
+            "genuine model admission did not select sessions_spawn"
+        );
+        let execution_context =
+            crate::tools::ToolExecutionContext::new(binding.envelope().clone(), binding.policy_chat_type());
+        let (execution, execution_context) =
+            service.bind_agent_execution(binding.as_ref(), context, &execution_context, &specs.specs)?;
+        let outcome = execution
+            .execute(
+                crate::tools::ToolExecutionCommand::new("sessions_spawn", arguments),
+                execution_context,
+                Some(cancellation),
+            )
+            .await;
+        outcome
+            .result
+            .context("genuine model dispatch did not return a tool result")
+    }
 
     async fn fixture(record_input: bool) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
         fixture_with_plane(record_input, false).await
@@ -1257,6 +1516,70 @@ pub(crate) mod admission_failure_tests {
         Arc<crate::runtime::turn_decision::TurnDecisionService>,
         MessageEvent,
     ) {
+        decided_binding_for_provider_retained(fabric, session_key, run_id, input, provider_name, model_name, None).await
+    }
+
+    pub(in crate::chat) struct FixtureServiceDrain {
+        service: Option<Arc<crate::runtime::turn_decision::TurnDecisionService>>,
+        ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
+    }
+
+    impl Drop for FixtureServiceDrain {
+        fn drop(&mut self) {
+            let Some(service) = self.service.take() else {
+                return;
+            };
+            let Some(ticket) = self.ticket.take() else {
+                return;
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let drained = service
+                        .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                        .await;
+                    ticket.finish(drained);
+                });
+            }
+            // Without a live runtime, dropping the unfinished ticket fails cleanup.
+        }
+    }
+
+    pub(in crate::chat) async fn decided_binding_for_input_retained(
+        fabric: &MemoryFabric,
+        session_key: &str,
+        run_id: &str,
+        input: &str,
+        retained: &mut Option<FixtureServiceDrain>,
+    ) -> (
+        Arc<ChatTurnBinding>,
+        Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        MessageEvent,
+    ) {
+        decided_binding_for_provider_retained(
+            fabric,
+            session_key,
+            run_id,
+            input,
+            "ollama",
+            "prx-local-model",
+            Some(retained),
+        )
+        .await
+    }
+
+    async fn decided_binding_for_provider_retained(
+        fabric: &MemoryFabric,
+        session_key: &str,
+        run_id: &str,
+        input: &str,
+        provider_name: &str,
+        model_name: &str,
+        retained: Option<&mut Option<FixtureServiceDrain>>,
+    ) -> (
+        Arc<ChatTurnBinding>,
+        Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        MessageEvent,
+    ) {
         let mut config = crate::config::Config::default();
         config.workspace_dir = std::path::PathBuf::from(fabric.workspace_id());
         config.config_path = config.workspace_dir.join("config.toml");
@@ -1308,6 +1631,16 @@ pub(crate) mod admission_failure_tests {
             )
             .unwrap();
         let service = service(fabric, &binding).await;
+        if let Some(retained) = retained {
+            let tracker = crate::runtime::turn_cleanup::current_tracker().expect("owned fixture cleanup tracker");
+            let ticket = tracker
+                .register(tokio_util::sync::CancellationToken::new())
+                .expect("owned fixture service ticket");
+            *retained = Some(FixtureServiceDrain {
+                service: Some(Arc::clone(&service)),
+                ticket: Some(ticket),
+            });
+        }
         binding
             .decide(&service, &tokio_util::sync::CancellationToken::new())
             .await

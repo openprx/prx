@@ -20,6 +20,14 @@ pub(crate) struct ChildSegmentTurn {
     history_commit_len: Option<usize>,
 }
 
+// Resources consumed by the synchronous post-decision terminal admission.
+struct ChildTerminalAdmission {
+    fabric: crate::memory::MemoryFabric,
+    config: Arc<crate::config::Config>,
+    usage_collector: Option<Arc<super::turn_terminal::TerminalUsageCollector>>,
+    route: crate::llm::route_decision::RouteDecision,
+}
+
 impl ChildSegmentTurn {
     pub(crate) async fn admit(
         service: Arc<TurnDecisionService>,
@@ -62,6 +70,40 @@ impl ChildSegmentTurn {
         let decision = service
             .decide_agent_segment(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
+        Self::finish_admission(
+            service,
+            proof,
+            decision,
+            execution,
+            ChildTerminalAdmission {
+                fabric,
+                config,
+                usage_collector,
+                route,
+            },
+            owner,
+            cancellation,
+        )
+    }
+
+    // Construct the terminal only after segment work has returned. Keep its
+    // intermediate guards outside the earlier admission poll frame.
+    #[inline(never)]
+    fn finish_admission(
+        service: Arc<TurnDecisionService>,
+        proof: Arc<OwnedTurnSourceProof>,
+        decision: Arc<TurnDecisionContext>,
+        execution: crate::tools::ToolExecutionContext,
+        admission: ChildTerminalAdmission,
+        owner: &Arc<super::turn_cleanup::CleanupTracker>,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<Self> {
+        let ChildTerminalAdmission {
+            fabric,
+            config,
+            usage_collector,
+            route,
+        } = admission;
         // This owner is outside the segment's child-drain scope. Registering
         // inside that scope would make it wait for its own terminal guard.
         let provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());

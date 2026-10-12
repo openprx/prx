@@ -2225,7 +2225,7 @@ mod tests {
 
         // Nothing reached the mailbox.
         let pulled = pull(&session.session_id, &session.token, &[], None).expect("test: pull");
-        assert!(pulled.assignments.is_empty());
+        assert!(pulled.assignments.is_empty(), "expected an empty value");
         deregister(&session.session_id);
     }
 
@@ -2281,7 +2281,8 @@ mod tests {
             pull(&other.session_id, &other.token, &[], None)
                 .expect("test: pull")
                 .assignments
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
         deregister(&named.session_id);
         deregister(&other.session_id);
@@ -2473,7 +2474,7 @@ mod tests {
         .expect("test: third pull");
         assert_eq!(third.acked, 1);
         assert_eq!(third.requeued, 0);
-        assert!(third.assignments.is_empty());
+        assert!(third.assignments.is_empty(), "expected an empty value");
 
         let fourth = pull(&session.session_id, &session.token, &[], None).expect("test: fourth pull");
         assert!(

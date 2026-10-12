@@ -4598,7 +4598,7 @@ fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> Str
     let mut width = 0usize;
     let mut truncated = String::new();
     for ch in input.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).map_or(0, |value| value);
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if width.saturating_add(ch_width) > keep {
             break;
         }
@@ -10907,7 +10907,10 @@ mod tests {
     #[test]
     fn switcher_row_zero_budget_is_empty() {
         let e = pty_entry(1, "x");
-        assert!(render_switcher_row(&e, "⏳", false, 0).is_empty());
+        assert!(
+            render_switcher_row(&e, "⏳", false, 0).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]

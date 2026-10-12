@@ -8420,7 +8420,8 @@ source: tool_output\n\
                 mem.retrieve_decision_documents("kestrel", 5, &principal, deadline())
                     .await
                     .unwrap()
-                    .is_empty()
+                    .is_empty(),
+                "expected an empty value"
             );
         }
         let shared = shared_document_principal("prx_workspace");
@@ -9580,7 +9581,7 @@ source: tool_output\n\
             session_key: None,
             ..Default::default()
         };
-        assert!(none.session_key_candidates().is_empty());
+        assert!(none.session_key_candidates().is_empty(), "expected an empty value");
         // Distinct legacy → two keys, canonical first.
         let two = MemoryPrincipal {
             session_key: Some("canonical".to_string()),
@@ -10924,7 +10925,8 @@ source: tool_output\n\
             mem.retrieve_decision_memory("prx_decision_keyword", 5, &first, None, deadline)
                 .await
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
         assert!(
             mem.retrieve_decision_memory("prx_decision_keyword", 0, &first, None, deadline)
@@ -11467,7 +11469,7 @@ source: tool_output\n\
     #[test]
     fn content_hash_empty_string() {
         let h = SqliteMemory::content_hash("");
-        assert!(!h.is_empty());
+        assert!(!h.is_empty(), "expected a non-empty value");
         assert_eq!(h.len(), 32); // 128-bit = 16 bytes = 32 hex chars
     }
 
@@ -15459,6 +15461,7 @@ impl SqliteMemory {
 #[cfg(test)]
 pub(crate) mod fixture_readback {
     pub(crate) struct TerminalRow {
+        #[cfg(feature = "llm-router")]
         pub(crate) run_id: String,
         pub(crate) owner_id: Option<String>,
         pub(crate) raw_payload: String,
@@ -15469,7 +15472,7 @@ pub(crate) mod fixture_readback {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         connection.prepare("SELECT run_id, owner_id, raw_payload_json FROM message_events WHERE event_type='turn.finalized' ORDER BY id")?
-            .query_map([], |row| Ok(TerminalRow { run_id: row.get(0)?, owner_id: row.get(1)?, raw_payload: row.get(2)? }))?
+            .query_map([], |row| Ok(TerminalRow { #[cfg(feature = "llm-router")] run_id: row.get(0)?, owner_id: row.get(1)?, raw_payload: row.get(2)? }))?
             .collect()
     }
     pub(crate) fn tool_event_count(workspace: &std::path::Path) -> rusqlite::Result<i64> {
@@ -15479,6 +15482,7 @@ pub(crate) mod fixture_readback {
         )?;
         connection.query_row("SELECT count(*) FROM message_events WHERE event_type IN ('tool.execution.reserved','tool.execution.finalized')", [], |row| row.get(0))
     }
+    #[cfg(feature = "llm-router")]
     pub(crate) fn router_consumption_count(
         workspace: &std::path::Path,
         run: &str,
@@ -15507,9 +15511,11 @@ pub(crate) mod fixture_readback {
     }
 
     /// Fixed observations of the actual Automix receipts; connection stays private.
+    #[cfg(feature = "llm-router")]
     pub(crate) struct AutomixReadback {
         connection: rusqlite::Connection,
     }
+    #[cfg(feature = "llm-router")]
     impl AutomixReadback {
         pub(crate) fn open(workspace: &std::path::Path) -> rusqlite::Result<Self> {
             Ok(Self {

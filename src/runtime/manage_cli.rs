@@ -1143,7 +1143,6 @@ async fn run_history(command: HistoryCommands, config: Config, io: &mut Io<'_>) 
                     record.summary.risk
                 )?;
             }
-            Ok(())
         }
         HistoryCommands::Show { id } => {
             let record = service.transactions().history()?.get(id.trim())?;
@@ -1158,7 +1157,6 @@ async fn run_history(command: HistoryCommands, config: Config, io: &mut Io<'_>) 
                 writeln!(io.out, "Reason: {reason}")?;
             }
             write!(io.out, "{}", render_plan(&record.summary, &[]))?;
-            Ok(())
         }
         HistoryCommands::Purge { yes } => {
             if !yes {
@@ -1166,9 +1164,9 @@ async fn run_history(command: HistoryCommands, config: Config, io: &mut Io<'_>) 
             }
             let removed = service.transactions().purge_history().await?;
             writeln!(io.out, "Removed {removed} history records.")?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

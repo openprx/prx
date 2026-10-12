@@ -561,6 +561,8 @@ fn ess(weights: impl Iterator<Item = f64>) -> f64 {
 
 /// IPS and doubly robust values of always taking `(action, target)`, with
 /// the direct model `direct`.
+// Plain `a * b + c` is kept on purpose: `mul_add` changes the rounding of the estimates.
+#[allow(clippy::suboptimal_flops)]
 fn doubly_robust(sample: &[&Explored], action: &str, target: &str, direct: f64) -> (f64, f64) {
     let n = as_f64(sample.len() as u64);
     let (mut ips, mut dr) = (0.0, 0.0);
@@ -665,6 +667,8 @@ fn bootstrap(sample: &[&Explored], action: &str, target: &str, report_id: uuid::
 /// in each explored context, minus the observed mean reward. The propensity
 /// of an action is the sum over its targets; the direct model is the mean
 /// reward of the explored decisions that took the action.
+// Plain `a * b + c` is kept on purpose: `mul_add` changes the rounding of the estimates.
+#[allow(clippy::suboptimal_flops)]
 fn shadow_regret(explored: &[Explored]) -> Availability<f64> {
     let with_shadow: Vec<&Explored> = explored
         .iter()

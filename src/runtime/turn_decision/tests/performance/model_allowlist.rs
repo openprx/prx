@@ -28,9 +28,13 @@ async fn owned_model_allowlist_catalog_growth_profile() {
     let generation = crate::config::new_shared(config.clone()).pin();
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
     let dispatches = Arc::new(AtomicUsize::new(0));
-    let mut tools = vec![
-        tool("file_read", &[], &dispatches),
+    let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(CountedInventoryFileRead {
+            inner: crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false),
+            dispatches: Arc::clone(&dispatches),
+        }),
         tool("image_info", &[], &dispatches),
+        Box::new(crate::tools::capability::search_tool::CapabilitySearchTool),
     ];
     for n in 0..extra {
         tools.push(tool(&format!("prx_policy_{n:04}"), &[], &dispatches));
@@ -46,7 +50,7 @@ async fn owned_model_allowlist_catalog_growth_profile() {
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("SQLite"));
-    let service = build_turn_decision_service(
+    let mut service = build_turn_decision_service(
         TurnSurfaceKind::AgentLoop,
         TurnServiceBuild {
             parent_grant: None,
@@ -67,6 +71,7 @@ async fn owned_model_allowlist_catalog_growth_profile() {
         },
     )
     .expect("actual published service");
+    install_inventory_evidence_backend(&mut service);
     let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
         &generation,
         Arc::clone(&memory),
@@ -119,7 +124,7 @@ async fn owned_model_allowlist_catalog_growth_profile() {
         .expect("denied root");
     assert!(!trusted.excludes_entry(view.model_admission_entry(allowed)));
     assert!(trusted.excludes_entry(view.model_admission_entry(denied)));
-    let semantics = semantic_context(&service, &proof, &context);
+    let semantics = semantic_witness::capture_inventory(&service, &proof, &context);
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     use std::io::Write;

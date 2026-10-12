@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn tool_description_non_empty() {
-        assert!(!make_tool().description().is_empty());
+        assert!(!make_tool().description().is_empty(), "expected a non-empty value");
     }
 
     #[test]

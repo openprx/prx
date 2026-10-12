@@ -121,6 +121,67 @@ async fn verify_bound(
     verify_completion(fabric, &lineage, &key, result, domain).await
 }
 
+/// Authenticate the original parent snapshot and prove startup did no worker execution.
+pub(in crate::tools::sessions_spawn) async fn verify_startup_failure(
+    fabric: &MemoryFabric,
+    worker: &WorkerManifest,
+    generation: &std::sync::Arc<crate::config::ConfigGeneration>,
+    transport_key: &ring::hmac::Key,
+    envelope: &crate::session_worker::startup_failure::WorkerOutput,
+) -> anyhow::Result<()> {
+    let key = crate::decision::key::DecisionKey::from_worker_channel(
+        transport_key,
+        fabric.workspace_id(),
+        &worker.run_id,
+        &worker.config_generation,
+    )?;
+    let snapshots = crate::runtime::operator_spawn::process::OperatorProcessSnapshots::restore_parent_startup(
+        worker,
+        generation,
+        std::sync::Arc::clone(&key),
+    )?;
+    crate::runtime::child_source::operator_process_input::restore_input(fabric, worker, &snapshots).await?;
+    let lineage = CompletionLineage::from_worker(
+        worker,
+        snapshots.publication.id().to_string(),
+        snapshots.parent.session_key().to_owned(),
+    )?;
+    let digest: [u8; 32] = Sha256::digest(super::super::manifest_signing_payload(worker)?.as_bytes()).into();
+    envelope.verify_startup(transport_key, digest, &worker.run_id)?;
+    if lineage.recording_enabled {
+        require_no_startup_segments(
+            fabric,
+            lineage.owner_id.as_deref().context("operator startup owner missing")?,
+            &lineage.run_id,
+        )
+        .await?;
+        let usage = segments::recover_usage(fabric, &lineage, &key).await?;
+        anyhow::ensure!(
+            usage.records.is_empty() && usage.unfinished_segments == 0,
+            "startup failure conflicts with recorded worker execution"
+        );
+    }
+    Ok(())
+}
+
+/// Fail closed on either first journal row, including a zero-cost completed segment.
+async fn require_no_startup_segments(fabric: &MemoryFabric, owner: &str, run_id: &str) -> anyhow::Result<()> {
+    // Legitimate per-process segment indices start at zero. Payload/signature validity
+    // cannot make an observed execution row compatible with this pre-config phase.
+    for kind in ["admission", "terminal"] {
+        let lookup = format!("worker:{run_id}:operator-segment:0:{kind}");
+        anyhow::ensure!(
+            fabric
+                .memory()
+                .find_owned_message_event_by_idempotency_key(fabric.workspace_id(), owner, &lookup,)
+                .await?
+                .is_none(),
+            "startup failure conflicts with recorded worker execution"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn authenticate_launch(
     fabric: &MemoryFabric,
     worker: &WorkerManifest,
@@ -591,4 +652,97 @@ pub(in crate::tools::sessions_spawn) async fn recover_partial_usage(
         });
     }
     segments::recover_usage(fabric, &lineage, &key).await
+}
+
+#[cfg(test)]
+mod startup_segment_boundary_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn record(
+        fabric: &MemoryFabric,
+        owner: &str,
+        run: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        fabric
+            .memory()
+            .append_message_event(crate::memory::MessageEventInput {
+                event_id: None,
+                idempotency_key: Some(format!("worker:{run}:operator-segment:0:{kind}")),
+                workspace_id: fabric.workspace_id().to_owned(),
+                owner_id: Some(owner.to_owned()),
+                source: MessageEventSource::SessionWorker,
+                channel: None,
+                session_key: None,
+                parent_session_key: None,
+                run_id: Some(run.to_owned()),
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                sender: None,
+                recipient: None,
+                role: "event".to_owned(),
+                event_type: format!("worker.operator.segment.{kind}"),
+                subject: Some(MessageEventSubject::Task(run.to_owned())),
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
+                config_generation_id: None,
+                config_source_revision: None,
+                content: String::new(),
+                raw_payload_json: Some(serde_json::to_string(&payload)?),
+                visibility: crate::memory::MemoryVisibility::Workspace,
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_admission_orphan_terminal_and_zero_usage_pair() -> anyhow::Result<()> {
+        for kinds in [
+            ["admission"].as_slice(),
+            ["terminal"].as_slice(),
+            ["admission", "terminal"].as_slice(),
+        ] {
+            let workspace = tempfile::tempdir()?;
+            let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+            let fabric = MemoryFabric::new(memory, workspace.path().to_string_lossy());
+            require_no_startup_segments(&fabric, "prx-owner", "prx-run").await?;
+            // Rows from another run do not poison this launch's lookup.
+            record(
+                &fabric,
+                "prx-owner",
+                "prx-other-run",
+                "admission",
+                serde_json::json!({}),
+            )
+            .await?;
+            require_no_startup_segments(&fabric, "prx-owner", "prx-run").await?;
+            for kind in kinds {
+                // No payload, including a purported successful zero-cost settlement,
+                // permits an execution row in the startup-failure phase. This test
+                // targets the DB guard, not the separate full launch authenticator.
+                record(
+                    &fabric,
+                    "prx-owner",
+                    "prx-run",
+                    kind,
+                    serde_json::json!({"terminal_status":"completed", "usage_settlement":null, "usage":[]}),
+                )
+                .await?;
+            }
+            let error = require_no_startup_segments(&fabric, "prx-owner", "prx-run")
+                .await
+                .expect_err("recorded execution must reject startup failure");
+            assert_eq!(
+                error.to_string(),
+                "startup failure conflicts with recorded worker execution"
+            );
+        }
+        Ok(())
+    }
 }

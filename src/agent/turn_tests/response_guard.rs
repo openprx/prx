@@ -68,7 +68,8 @@ fn strip_assistant_fabricated_tool_markers_handles_both_grains() {
     assert!(
         strip_assistant_fabricated_tool_markers("[Used tools: shell]")
             .as_ref()
-            .is_empty()
+            .is_empty(),
+        "expected an empty value"
     );
 }
 

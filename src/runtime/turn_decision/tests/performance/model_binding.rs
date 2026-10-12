@@ -55,9 +55,33 @@ async fn answer(
 
 #[tokio::test]
 async fn actual_compiler_binds_decision_model_before_real_http() {
-    let workspace = tempfile::tempdir().expect("owned workspace");
+    use futures::FutureExt as _;
+    let workspace = tempfile::tempdir().expect("owned workspace").keep();
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "retained model-binding workspace: {}",
+        workspace.display()
+    );
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+        .expect("actual model-binding cleanup scope");
+    let mut outcome = None;
+    let cleanup_result = cleanup.run(async {
+        let mut retained_service = None;
+        outcome = Some(std::panic::AssertUnwindSafe(async {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("owned loopback");
+    let endpoint = format!("http://{}", listener.local_addr().expect("actual address"));
+    let capture = Capture(Arc::new(parking_lot::Mutex::new(Vec::new())));
+    let router = axum::Router::new()
+        .route("/v1/systemone", axum::routing::post(answer))
+        .with_state(capture.clone());
+    let server = OwnedModelBindingServer::spawn(async move {
+        axum::serve(listener, router).await.expect("owned server");
+    });
     let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace.path().to_path_buf();
+    config.workspace_dir = workspace.as_path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
     config.providers.models.push(
@@ -66,6 +90,11 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
         )
         .expect("verified local main model"),
     );
+    let decision_provider = format!("custom:{endpoint}");
+    config.providers.models.push(serde_json::from_value(json!({"provider":decision_provider,"model":"prx-decision-model","operations":["decision_endpoint"]})).expect("PMM decision declaration before generation"));
+    config.cost.prices.insert(format!("{decision_provider}/prx-decision-model"), crate::config::schema::ModelPricing {
+        input: 1.0, output: 1.0, cache_write: 1.0, cache_read: 1.0,
+    });
     let generation = crate::config::new_shared(config.clone()).pin();
     let dispatches = Arc::new(AtomicUsize::new(0));
     let registry = Arc::new(vec![
@@ -82,7 +111,7 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
     ));
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let memory: Arc<dyn Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("owned actual SQLite"));
+        Arc::new(crate::memory::SqliteMemory::new(workspace.as_path()).expect("owned actual SQLite"));
     let transports = CountingTransports(AtomicUsize::new(0));
     let service = build_turn_decision_service(
         TurnSurfaceKind::AgentLoop,
@@ -105,6 +134,7 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
         },
     )
     .expect("source-owned actual builtin service");
+    retained_service = Some(ModelBindingServiceDrain::new(Arc::clone(&service)));
     assert_eq!(
         service.factory.request_model(),
         None,
@@ -124,17 +154,6 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
     drain_required(&service).await;
     let hop = context.audit_hops().next().expect("actual first hop");
     assert!(hop.request_compiled && hop.scored_count > 0);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("owned loopback");
-    let endpoint = format!("http://{}", listener.local_addr().expect("actual address"));
-    let capture = Capture(Arc::new(parking_lot::Mutex::new(Vec::new())));
-    let router = axum::Router::new()
-        .route("/v1/systemone", axum::routing::post(answer))
-        .with_state(capture.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("owned server");
-    });
     let mut decision_config = config.clone();
     decision_config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
@@ -145,7 +164,6 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
         .causal_tree
         .validate()
         .expect("legal configured component");
-    decision_config.providers.models.push(serde_json::from_value(json!({"provider":format!("custom:{endpoint}"),"model":"prx-decision-model","operations":["decision_endpoint"]})).expect("PMM decision declaration"));
     let catalog = ProviderCatalogView::from_config(&decision_config);
     let factory = DecisionBackendFactory::from_config(
         &decision_config,
@@ -170,14 +188,33 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
     )
     .expect("real compiler over real admitted candidates");
     let request = compiled.request();
+    let accounting = crate::runtime::turn_decision::accounting::TurnAccounting::new(
+        &service, &proof, hop.state.trusted.parts().budgets, context.engine.deadline,
+    );
     let result = factory
-        .decide(request, &CausalLineage::default())
+        .decide_with_accounting(request, &CausalLineage::default(), Some(&accounting))
         .await
         .expect("actual configured response");
+    let journal_path = workspace.join("state/costs.reservations.jsonl");
+    let physical_journal = std::fs::read_to_string(&journal_path).expect("durable physical attempt journal");
+    let events: Vec<Value> = physical_journal.lines().map(|line| serde_json::from_str(line).expect("reservation event")).collect();
+    assert_eq!(events.len(), 2, "one physical attempt reserves then dispatches; absent usage stays held");
+    let reserved = events.first().expect("reserved event exists");
+    let dispatched = events.get(1).expect("dispatched event exists");
+    let reserved_request = reserved.get("request").expect("reserved request exists");
+    let reservation = reserved_request.get("reservation").expect("reservation exists");
+    assert_eq!(reserved.get("event"), Some(&serde_json::json!("estimated_reserved_v1")));
+    assert_eq!(dispatched.get("event"), Some(&serde_json::json!("dispatched")));
+    assert_eq!(reservation.get("attempt_id").expect("reservation attempt id"), dispatched.get("attempt_id").expect("dispatch attempt id"));
+    assert_eq!(reservation.get("turn_id").and_then(Value::as_str), Some(accounting.retained_scope().expect("genuine retained accounting scope").scope_id().as_str()));
+    assert_eq!(reserved_request.get("reserved_tokens").and_then(Value::as_u64), Some(hop.state.trusted.parts().budgets.tokens / 2));
+    assert_eq!(reserved_request.get("turn_token_limit").and_then(Value::as_u64), Some(hop.state.trusted.parts().budgets.tokens));
+    assert!(reservation.get("maximum_micro_usd").and_then(Value::as_u64).is_some_and(|value| value > 0));
     let repeated = factory
-        .decide(request, &CausalLineage::default())
+        .decide_with_accounting(request, &CausalLineage::default(), Some(&accounting))
         .await
         .expect("coherent cache hit");
+    assert_eq!(std::fs::read_to_string(&journal_path).expect("journal after cache hit"), physical_journal, "cache hit creates no attempt or settlement");
     server.abort();
     assert!(server.await.expect_err("owned server cancelled").is_cancelled());
     assert_eq!(request.model(), Some("prx-decision-model"));
@@ -195,7 +232,115 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
         Some(&json!("prx-decision-model"))
     );
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        }).catch_unwind().await);
+        drop(retained_service);
+        Ok(())
+    }).await;
+    if let Err(error) = &cleanup_result {
+        let _ = writeln!(std::io::stderr(), "model-binding cleanup failed: {error:#}");
+    }
+    match outcome {
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        Some(Ok(())) => cleanup_result.expect("model-binding accounting, queues and listener joined"),
+        None => panic!("model-binding fixture did not enter cleanup scope"),
+    }
 }
 
 #[path = "model_binding/original_service_wire.rs"]
 mod original_service_wire;
+
+// These owners are private to this existing compiler/HTTP test, not production authority.
+struct ModelBindingServiceDrain {
+    service: Option<Arc<TurnDecisionService>>,
+    ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
+}
+impl ModelBindingServiceDrain {
+    fn new(service: Arc<TurnDecisionService>) -> Self {
+        let ticket = crate::runtime::turn_cleanup::current_tracker()
+            .expect("actual cleanup tracker")
+            .register(CancellationToken::new())
+            .expect("service drain ticket");
+        Self {
+            service: Some(service),
+            ticket: Some(ticket),
+        }
+    }
+}
+impl Drop for ModelBindingServiceDrain {
+    fn drop(&mut self) {
+        let Some(service) = self.service.take() else {
+            return;
+        };
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let drained = service.drain_writes(Instant::now() + Duration::from_secs(5)).await;
+                ticket.finish(drained);
+            });
+        }
+    }
+}
+struct OwnedModelBindingServer {
+    task: Option<tokio::task::JoinHandle<()>>,
+    ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
+}
+impl OwnedModelBindingServer {
+    fn spawn(work: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let ticket = crate::runtime::turn_cleanup::current_tracker()
+            .expect("actual cleanup tracker")
+            .register(CancellationToken::new())
+            .expect("listener join ticket");
+        Self {
+            task: Some(tokio::spawn(work)),
+            ticket: Some(ticket),
+        }
+    }
+    fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+impl std::future::Future for OwnedModelBindingServer {
+    type Output = Result<(), tokio::task::JoinError>;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let task = this.task.as_mut().expect("owned listener polled only until completion");
+        match std::future::Future::poll(std::pin::Pin::new(task), cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(result) => {
+                let _ = this.task.take();
+                if let Some(ticket) = this.ticket.take() {
+                    ticket.finish(match &result {
+                        Ok(()) => true,
+                        Err(error) => error.is_cancelled(),
+                    });
+                }
+                std::task::Poll::Ready(result)
+            }
+        }
+    }
+}
+impl Drop for OwnedModelBindingServer {
+    fn drop(&mut self) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let joined = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => error.is_cancelled(),
+                    Err(_) => false,
+                };
+                ticket.finish(joined);
+            });
+        }
+    }
+}

@@ -270,7 +270,7 @@ mod tests {
     async fn store_search_empty_returns_empty() {
         let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
         let results = store.search(&[1.0, 0.0, 0.0], 5).await.unwrap();
-        assert!(results.is_empty());
+        assert!(results.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

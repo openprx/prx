@@ -811,14 +811,14 @@ fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
         digest.update(&[u8::from(row.success)]);
         // Preserve the v1 byte stream while amortizing SHA update overhead.
         let mut bytes = [0_u8; 64];
-        let mut chunks = row.embedding.chunks_exact(16);
-        for values in &mut chunks {
-            for (slot, value) in bytes.chunks_exact_mut(4).zip(values) {
-                slot.copy_from_slice(&value.to_le_bytes());
+        let (chunks, remainder) = row.embedding.as_chunks::<16>();
+        for values in chunks {
+            for (slot, value) in bytes.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
+                *slot = value.to_le_bytes();
             }
             digest.update(&bytes);
         }
-        for value in chunks.remainder() {
+        for value in remainder {
             digest.update(&value.to_le_bytes());
         }
     }

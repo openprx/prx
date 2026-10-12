@@ -625,14 +625,16 @@ mod tests {
         for scope in ["services", "service"] {
             assert!(
                 !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "set", "scope": scope}))
-                    .is_empty()
+                    .is_empty(),
+                "expected a non-empty value"
             );
             assert!(
                 crate::tools::schema::validate_tool_arguments(
                     &schema,
                     &json!({"action": "set", "scope": scope, "services": ["provider.openai"]})
                 )
-                .is_empty()
+                .is_empty(),
+                "expected an empty value"
             );
         }
     }

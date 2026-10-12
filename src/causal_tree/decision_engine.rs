@@ -243,6 +243,14 @@ pub(crate) struct PreparedHop<'a, 'catalog, P: PredictionPort> {
     resume_target: Option<&'a CapabilityRef>,
 }
 
+// The borrowed preparation frame returns before either owned branch proceeds.
+// This record retains only the evidence needed for the immediate decision.
+struct CollectionReadyRecord {
+    proof: super::approval_collection::DeferredArgumentProof,
+    post_rehearsal: GateReport,
+    pre_commit: GateReport,
+}
+
 impl<P: PredictionPort> PreparedHop<'_, '_, P> {
     pub(crate) const fn candidate_count(&self) -> usize {
         self.all.len()
@@ -261,6 +269,31 @@ impl<P: PredictionPort> PreparedHop<'_, '_, P> {
 
     pub(crate) fn candidate_bodies_changed_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
         self.candidate_bodies_changed_from(&prior.state)
+    }
+
+    /// Selected discovery can authenticate an unchanged exact candidate.
+    /// Compare borrowed readiness proofs, without creating new candidate sets.
+    pub(crate) fn gained_direct_candidate_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
+        gained_direct_candidate(
+            &self.candidates,
+            &prior.candidates,
+            |candidate| {
+                candidate_is_direct(
+                    candidate,
+                    self.inputs.catalog,
+                    self.resume_target,
+                    self.inputs.discovered_refs,
+                )
+            },
+            |candidate| {
+                candidate_is_direct(
+                    candidate,
+                    prior.inputs.catalog,
+                    prior.resume_target,
+                    prior.inputs.discovered_refs,
+                )
+            },
+        )
     }
 }
 
@@ -692,12 +725,23 @@ impl CausalDecisionEngine {
         })
     }
 
-    /// Source eligibility is supplied by the verified service's sealed ingress proof.
-    /// No backend sees this result and no executable capability is selected.
     pub(crate) async fn decide_prepared_with_collection<P: PredictionPort>(
         mut prepared: PreparedHop<'_, '_, P>,
         adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
     ) -> Result<EngineDecision, EngineError> {
+        match Self::prepare_collection_routing(&mut prepared, adapter)? {
+            Some(ready) => Ok(Self::finish_collection_decision(prepared, ready)),
+            None => Self::decide_prepared(prepared).await,
+        }
+    }
+
+    /// Source eligibility is supplied by the verified service's sealed ingress proof.
+    /// No backend sees this result and no executable capability is selected.
+    #[inline(never)]
+    fn prepare_collection_routing<'a, 'catalog, P: PredictionPort>(
+        prepared: &mut PreparedHop<'a, 'catalog, P>,
+        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
+    ) -> Result<Option<CollectionReadyRecord>, EngineError> {
         let inputs = &prepared.inputs;
         let trusted = prepared.state.trusted.parts();
         let candidate = adapter
@@ -728,7 +772,7 @@ impl CausalDecisionEngine {
                 .map(|candidate| (adapter, candidate))
             });
         let Some((adapter, candidate)) = candidate else {
-            return Self::decide_prepared(prepared).await;
+            return Ok(None);
         };
         let remaining = remaining_budget(inputs, &prepared.state);
         let post_rehearsal = HardGates::apply_with_remaining_budget(
@@ -753,7 +797,7 @@ impl CausalDecisionEngine {
                 Some(GateOutcome::ApprovalDeferred)
             )
         }) {
-            return Self::decide_prepared(prepared).await;
+            return Ok(None);
         }
         match &mut prepared.candidates {
             CandidateSet::Legal { report, .. } | CandidateSet::NoLegalPath { report, .. } => {
@@ -770,7 +814,26 @@ impl CausalDecisionEngine {
             adapter,
             prepared.state.material_fingerprint(inputs.key),
         );
-        Ok(EngineDecision {
+        Ok(Some(CollectionReadyRecord {
+            proof,
+            post_rehearsal,
+            pre_commit,
+        }))
+    }
+
+    // Consume the owned hop only after borrowed preparation has returned.
+    #[inline(never)]
+    fn finish_collection_decision<P: PredictionPort>(
+        prepared: PreparedHop<'_, '_, P>,
+        ready: CollectionReadyRecord,
+    ) -> EngineDecision {
+        let inputs = &prepared.inputs;
+        let CollectionReadyRecord {
+            proof,
+            post_rehearsal,
+            pre_commit,
+        } = ready;
+        EngineDecision {
             decision_id: inputs.decision_id,
             deadline: inputs.deadline,
             elapsed_ms: u64::try_from(prepared.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -791,7 +854,7 @@ impl CausalDecisionEngine {
             call_fingerprints: BTreeMap::new(),
             outgoing_child: None,
             outgoing_parent_allowed: None,
-        })
+        }
     }
 
     pub(crate) async fn decide_prepared<P: PredictionPort>(
@@ -981,7 +1044,13 @@ impl CausalDecisionEngine {
                     &selection_evidence,
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(&candidates, inputs.catalog, trusted.delivery.interactive, resume_target),
+                    &selector_context(
+                        &candidates,
+                        inputs.catalog,
+                        trusted.delivery.interactive,
+                        resume_target,
+                        inputs.discovered_refs,
+                    ),
                     &inputs.config.evaluation,
                     inputs.key,
                     &inputs.decision_id.to_string(),
@@ -994,7 +1063,13 @@ impl CausalDecisionEngine {
                         &selection_evidence,
                         &pre_commit,
                         &inputs.config.policy,
-                        &selector_context(&candidates, inputs.catalog, trusted.delivery.interactive, resume_target),
+                        &selector_context(
+                            &candidates,
+                            inputs.catalog,
+                            trusted.delivery.interactive,
+                            resume_target,
+                            inputs.discovered_refs,
+                        ),
                     )?,
                     BTreeMap::new(),
                 )
@@ -1007,7 +1082,13 @@ impl CausalDecisionEngine {
                     &empty_evidence(),
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(&candidates, inputs.catalog, trusted.delivery.interactive, resume_target),
+                    &selector_context(
+                        &candidates,
+                        inputs.catalog,
+                        trusted.delivery.interactive,
+                        resume_target,
+                        inputs.discovered_refs,
+                    ),
                 )?,
                 BTreeMap::new(),
             )
@@ -1022,7 +1103,13 @@ impl CausalDecisionEngine {
                 &terminal_evidence(&candidates),
                 &pre_commit,
                 &inputs.config.policy,
-                &selector_context(&candidates, inputs.catalog, trusted.delivery.interactive, resume_target),
+                &selector_context(
+                    &candidates,
+                    inputs.catalog,
+                    trusted.delivery.interactive,
+                    resume_target,
+                    inputs.discovered_refs,
+                ),
             )?;
             exploration_propensities.clear();
         }
@@ -1274,37 +1361,90 @@ fn meet_gate_reports(post: &GateReport, mut current: GateReport) -> Result<GateR
     Ok(current)
 }
 
+/// Preserve the runtime's lazy evidence, candidate-body, readiness order.
+pub(crate) fn discovery_has_no_progress(
+    same_evidence: impl FnOnce() -> bool,
+    same_candidate_bodies: impl FnOnce() -> bool,
+    gained_direct_readiness: impl FnOnce() -> bool,
+) -> bool {
+    same_evidence() && same_candidate_bodies() && !gained_direct_readiness()
+}
+
+fn gained_direct_candidate(
+    current: &CandidateSet,
+    previous: &CandidateSet,
+    is_current_direct: impl Fn(&CausalCandidate) -> bool,
+    is_previous_direct: impl Fn(&CausalCandidate) -> bool,
+) -> bool {
+    let CandidateSet::Legal {
+        candidates: current, ..
+    } = current
+    else {
+        return false;
+    };
+    let previous = match previous {
+        CandidateSet::Legal { candidates, .. } => candidates.as_slice(),
+        CandidateSet::NoLegalPath { .. } => &[],
+    };
+    current.iter().any(|candidate| {
+        is_current_direct(candidate)
+            && !previous
+                .iter()
+                .any(|prior| prior.candidate_id() == candidate.candidate_id() && is_previous_direct(prior))
+    })
+}
+
+fn candidate_is_direct(
+    candidate: &CausalCandidate,
+    catalog: &CatalogView<'_>,
+    resume_target: Option<&CapabilityRef>,
+    discovered_refs: &DiscoveredRefs,
+) -> bool {
+    if candidate.required_capabilities().is_empty() {
+        return candidate.action() == CausalActionKind::Answer
+            && candidate.target() == super::branch::CapabilityTarget::None;
+    }
+    candidate.required_capabilities().iter().all(|reference| {
+        catalog.entry_any(&reference.id).is_some_and(|entry| {
+            matches!(entry.exposure, Exposure::Direct)
+                || (candidate.action() == CausalActionKind::Retrieve && is_retrieval_source(entry))
+                // Final-gated selected search exposes only exact current refs.
+                // Selectability never substitutes for an execution grant.
+                || (candidate.action() == CausalActionKind::UseTool
+                    && matches!(entry.exposure, Exposure::Searchable)
+                    && catalog.contains(&reference.id)
+                    && reference.generation == catalog.generation()
+                    && reference.generation == entry.generation
+                    && reference.fingerprint == entry.fingerprint
+                    && matches!(entry.family, super::branch::CapabilityTarget::Skill
+                        | super::branch::CapabilityTarget::Mcp | super::branch::CapabilityTarget::NativeTool
+                        | super::branch::CapabilityTarget::Wasm | super::branch::CapabilityTarget::Hook)
+                    && discovered_refs.contains(reference))
+                // A freshly authenticated exact resume already owns
+                // this concrete capability. It need not rediscover
+                // a Filesystem entry, and does not expose any peer.
+                || (candidate.action() == CausalActionKind::UseTool
+                    && candidate.required_capabilities().len() == 1
+                    && resume_target.is_some_and(|target| target == reference)
+                    && reference.generation == catalog.generation()
+                    && reference.generation == entry.generation
+                    && reference.fingerprint == entry.fingerprint
+                    && matches!(entry.exposure, Exposure::Searchable))
+        })
+    })
+}
+
 fn selector_context(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
     interactive: bool,
     resume_target: Option<&CapabilityRef>,
+    discovered_refs: &DiscoveredRefs,
 ) -> SelectorContext {
     let direct_candidates = match set {
         CandidateSet::Legal { candidates, .. } => candidates
             .iter()
-            .filter(|candidate| {
-                if candidate.required_capabilities().is_empty() {
-                    return candidate.action() == CausalActionKind::Answer
-                        && candidate.target() == super::branch::CapabilityTarget::None;
-                }
-                candidate.required_capabilities().iter().all(|reference| {
-                    catalog.entry_any(&reference.id).is_some_and(|entry| {
-                        matches!(entry.exposure, Exposure::Direct)
-                            || (candidate.action() == CausalActionKind::Retrieve && is_retrieval_source(entry))
-                            // A freshly authenticated exact resume already owns
-                            // this concrete capability. It need not rediscover
-                            // a Filesystem entry, and does not expose any peer.
-                            || (candidate.action() == CausalActionKind::UseTool
-                                && candidate.required_capabilities().len() == 1
-                                && resume_target.is_some_and(|target| target == reference)
-                                && reference.generation == catalog.generation()
-                                && reference.generation == entry.generation
-                                && reference.fingerprint == entry.fingerprint
-                                && matches!(entry.exposure, Exposure::Searchable))
-                    })
-                })
-            })
+            .filter(|candidate| candidate_is_direct(candidate, catalog, resume_target, discovered_refs))
             .map(|candidate| candidate.candidate_id().clone())
             .collect(),
         CandidateSet::NoLegalPath { .. } => BTreeSet::new(),
@@ -2105,10 +2245,34 @@ mod tests {
                 })
             }
         }
-        let tools: Vec<Box<dyn crate::tools::traits::Tool>> = vec![Box::new(PrxSearchableTool)];
+        struct PrxPeerTool;
+        #[async_trait]
+        impl crate::tools::traits::Tool for PrxPeerTool {
+            fn name(&self) -> &str {
+                "prx_peer"
+            }
+            fn description(&self) -> &str {
+                "Searchable peer fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::traits::ToolResult> {
+                Ok(crate::tools::traits::ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+        let tools: Vec<Box<dyn crate::tools::traits::Tool>> = vec![Box::new(PrxSearchableTool), Box::new(PrxPeerTool)];
         let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
         let view = catalog.view(&CatalogScope::default());
-        let entry = view.entries().first().expect("searchable fixture");
+        let entry = view
+            .entries()
+            .iter()
+            .find(|entry| entry.public_name == "prx_searchable")
+            .expect("searchable fixture");
         let reference = CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
@@ -2175,6 +2339,369 @@ mod tests {
                 .unwrap()
                 .contains(&reference)
         );
+        let selected_refs = decision
+            .issue_selected_discovery(&view, &context, "prx_searchable")
+            .unwrap();
+        // Reproduce the alias failure using actual preparations and authenticated
+        // discovery. Scores are deterministic fixture inputs to the real selector.
+        {
+            let mut hop_state = decision.state.clone();
+            let mut parts = hop_state.trusted.parts().clone();
+            parts.side_effect_mode = SideEffectMode::GuardedWrite;
+            parts.delivery.interactive = false;
+            parts.delivery.can_ask_question = false;
+            parts.delivery.approval_channel = false;
+            hop_state.trusted = TrustedState::from_runtime(parts);
+            let policy = SecurityPolicy::default();
+            let fingerprints = BTreeMap::new();
+            let replayed = BTreeSet::new();
+            let gate_inputs = GateInputs {
+                policy: &policy,
+                owner_id: "owner-1",
+                sender: "prx_user",
+                policy_channel: "terminal",
+                chat_type: "dm",
+                model_ref: "anthropic:claude",
+                model_can_chat: true,
+                model_can_call_tools: true,
+                decision_endpoint_ready: true,
+                child_scope: None,
+                verified_approval_calls: BTreeMap::new(),
+                call_fingerprints: &fingerprints,
+                failed_call_counts: BTreeMap::new(),
+                replayed_non_idempotent: &replayed,
+                retry_limit: Some(0),
+            };
+            let cost = super::super::candidate_generator::CapabilityCostModel {
+                per_capability: view
+                    .iter_entries()
+                    .map(|entry| {
+                        (
+                            CapabilityRef {
+                                id: entry.id.clone(),
+                                fingerprint: entry.fingerprint,
+                                generation: entry.generation,
+                            },
+                            (
+                                CostEstimate {
+                                    tokens: 1,
+                                    micro_usd: 0,
+                                },
+                                1,
+                            ),
+                        )
+                    })
+                    .collect(),
+                estimates: CapabilityTarget::ALL
+                    .into_iter()
+                    .map(|target| {
+                        (
+                            target,
+                            (
+                                CostEstimate {
+                                    tokens: 1,
+                                    micro_usd: 0,
+                                },
+                                1,
+                            ),
+                        )
+                    })
+                    .collect(),
+            };
+            let config = CausalTreeConfig::default();
+            let backend = DecisionBackendFactory::from_slots(
+                Vec::new(),
+                Arc::clone(&key),
+                OutboundSecrets::default(),
+                SlotLimits::default(),
+            );
+            let ports = RehearsalPorts {
+                memory: None,
+                catalog: None,
+                skill: None,
+            };
+            let no_refs = DiscoveredRefs::empty();
+            let inputs = EngineInputs {
+                state: &hop_state,
+                catalog: &view,
+                config: &config,
+                key: &key,
+                decision_id: DecisionId::new_runtime(),
+                cost_model: &cost,
+                discovered_refs: &no_refs,
+                gates: &gate_inputs,
+                delegation: None,
+                delegation_max_depth: 0,
+                prediction: backend.prediction_port(None),
+                rehearsal_ports: &ports,
+                request_limits: RequestLimits::default(),
+                model: Some("prx-model"),
+                can_deliver_text: true,
+                may_delegate: false,
+                delegation_target: None,
+                terminal_only: false,
+                allow_terminal_answer: false,
+                deadline: Instant::now() + Duration::from_secs(5),
+                inject_builtin_failure: false,
+                after_prediction_pause: None,
+            };
+            let previous = CausalDecisionEngine::prepare_hop(&inputs).unwrap();
+            let CandidateSet::Legal { candidates, report, .. } = &previous.candidates else {
+                panic!("exact alias fixture must have legal candidates");
+            };
+            let exact = candidates
+                .iter()
+                .find(|candidate| candidate.action() == CausalActionKind::UseTool)
+                .expect("exact mention survives before discovery");
+            let exact_id = exact.candidate_id().clone();
+            let mut evidence = empty_evidence();
+            evidence.action_confidence = 1.0;
+            evidence.target_confidence = 1.0;
+            evidence.chosen_action = "use_tool".to_owned();
+            evidence.chosen_target = "native_tool".to_owned();
+            evidence.target_probabilities.insert(CapabilityTarget::NativeTool, 1.0);
+            evidence.evidence_sufficient = 1.0;
+            let mut scores = BTreeMap::new();
+            for candidate in candidates {
+                let chosen = candidate.candidate_id() == &exact_id;
+                let probability = if chosen { 1.0 } else { 0.0 };
+                scores.insert(
+                    candidate.candidate_id().clone(),
+                    CandidateScore {
+                        semantic_utility: probability,
+                        execution_utility: probability,
+                    },
+                );
+                evidence.candidates.insert(
+                    candidate.candidate_id().clone(),
+                    CandidatePrediction {
+                        choice_probability: probability,
+                        applicability_probability: probability,
+                        success_probability: probability,
+                        expected_gain: probability,
+                        gain_uncertainty: 0.0,
+                        semantic_risk: 0.0,
+                        risk_uncertainty: 0.0,
+                    },
+                );
+            }
+            let selected = CausalSelector::select(
+                &previous.candidates,
+                &scores,
+                &evidence,
+                report,
+                &config.policy,
+                &selector_context(&previous.candidates, &view, false, None, &no_refs),
+            )
+            .unwrap();
+            assert!(
+                matches!(&selected, Selection::Recover { candidate_id, reason_code: "discover_capability" }
+                if candidate_id == &id)
+            );
+            decision.selection = selected;
+            let authenticated = decision
+                .issue_selected_discovery(&view, &context, "prx_searchable")
+                .unwrap();
+            assert!(authenticated.contains(&reference));
+            let mut accumulated = DiscoveredRefs::empty();
+            assert!(
+                accumulated.extend_selected(authenticated),
+                "this is not an empty/repeated search"
+            );
+            let next_inputs = EngineInputs {
+                discovered_refs: &accumulated,
+                ..inputs.clone()
+            };
+            let current = CausalDecisionEngine::prepare_hop(&next_inputs).unwrap();
+            let same_evidence = current.evidence_fingerprint() == previous.evidence_fingerprint();
+            let same_bodies = !current.candidate_bodies_changed_from_prepared(&previous);
+            assert!(same_evidence && same_bodies, "Q44 leaves the same exact candidate body");
+            let old_stop = same_evidence && same_bodies;
+            assert!(
+                old_stop,
+                "the actual old two-operand runtime predicate stops after Discover"
+            );
+            let old_terminal_inputs = EngineInputs {
+                terminal_only: old_stop,
+                ..next_inputs.clone()
+            };
+            let old_terminal = CausalDecisionEngine::decide_terminal_prepared(
+                CausalDecisionEngine::prepare_hop(&old_terminal_inputs).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(old_terminal.fallback_cause, Some(FallbackCause::HopStopped));
+            assert!(matches!(
+                old_terminal.selection,
+                Selection::Abstain {
+                    action: CausalActionKind::Refuse,
+                    reason_code: "hop_stopped",
+                }
+            ));
+            assert!(
+                !discovery_has_no_progress(
+                    || current.evidence_fingerprint() == previous.evidence_fingerprint(),
+                    || !current.candidate_bodies_changed_from_prepared(&previous),
+                    || current.gained_direct_candidate_from_prepared(&previous),
+                ),
+                "the runtime connective must retain authenticated readiness progress"
+            );
+            assert!(
+                discovery_has_no_progress(|| same_evidence, || same_bodies, || false),
+                "negative mutation removing readiness recognition reproduces the old stop"
+            );
+            let CandidateSet::Legal { report, .. } = &current.candidates else {
+                panic!("authenticated preparation remains legal");
+            };
+            assert!(matches!(CausalSelector::select(
+                &current.candidates, &scores, &evidence, report, &config.policy,
+                &selector_context(&current.candidates, &view, false, None, &accumulated),
+            ).unwrap(), Selection::Commit { candidate_id, .. } if candidate_id == exact_id));
+        }
+        let use_candidate = CausalCandidate::new(
+            CausalActionKind::UseTool,
+            entry.family,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: vec![reference.clone()],
+                side_effect: entry.effect,
+                approval: entry.approval.clone(),
+                estimated_cost: None,
+                estimated_latency_ms: None,
+            },
+        );
+        let use_id = use_candidate.candidate_id().clone();
+        let mut available_set = CandidateSet::Legal {
+            candidates: vec![use_candidate],
+            exact_mentions: BTreeSet::new(),
+            truncated: Vec::new(),
+            discoverable_families: Default::default(),
+            approval_scopes: BTreeMap::new(),
+            report: report(BTreeMap::new()),
+        };
+        assert!(
+            selector_context(&available_set, &view, true, None, &DiscoveredRefs::empty())
+                .direct_candidates
+                .is_empty()
+        );
+        assert_eq!(
+            selector_context(&available_set, &view, true, None, &selected_refs).direct_candidates,
+            BTreeSet::from([use_id])
+        );
+        // Genuine selected refs make this unchanged body directly selectable.
+        // Repeat discovery and readiness loss must not authorize another hop.
+        let empty_refs = DiscoveredRefs::empty();
+        let readiness_progress = |current_refs: &DiscoveredRefs, previous_refs: &DiscoveredRefs| {
+            gained_direct_candidate(
+                &available_set,
+                &available_set,
+                |candidate| candidate_is_direct(candidate, &view, None, current_refs),
+                |candidate| candidate_is_direct(candidate, &view, None, previous_refs),
+            )
+        };
+        assert!(readiness_progress(&selected_refs, &empty_refs));
+        assert!(!readiness_progress(&selected_refs, &selected_refs));
+        assert!(!readiness_progress(&empty_refs, &selected_refs));
+        for stale_schema in [true, false] {
+            let mut stale = reference.clone();
+            if stale_schema {
+                stale.fingerprint.0[0] ^= 1;
+            } else {
+                stale.generation.0[0] ^= 1;
+            }
+            let refs = DiscoveredRefs::from_refs_for_test(BTreeSet::from([stale]));
+            assert!(!readiness_progress(&refs, &empty_refs));
+            assert!(
+                selector_context(&available_set, &view, true, None, &refs)
+                    .direct_candidates
+                    .is_empty()
+            );
+        }
+        let peer_entry = view
+            .entries()
+            .iter()
+            .find(|entry| entry.public_name == "prx_peer")
+            .unwrap();
+        let peer = CapabilityRef {
+            id: peer_entry.id.clone(),
+            fingerprint: peer_entry.fingerprint,
+            generation: peer_entry.generation,
+        };
+        assert_eq!(entry.family, CapabilityTarget::NativeTool);
+        assert_eq!(peer_entry.family, CapabilityTarget::NativeTool);
+        assert!(matches!(peer_entry.exposure, Exposure::Searchable));
+        assert_ne!(reference.id, peer.id);
+        assert!(!selected_refs.contains(&peer));
+        let peer_only = DiscoveredRefs::from_refs_for_test(BTreeSet::from([peer.clone()]));
+        assert!(!readiness_progress(&peer_only, &empty_refs));
+        assert!(
+            selector_context(&available_set, &view, true, None, &peer_only)
+                .direct_candidates
+                .is_empty()
+        );
+        let mut compound_set = CandidateSet::Legal {
+            candidates: Vec::new(),
+            exact_mentions: BTreeSet::new(),
+            truncated: Vec::new(),
+            discoverable_families: Default::default(),
+            approval_scopes: BTreeMap::new(),
+            report: report(BTreeMap::new()),
+        };
+        if let CandidateSet::Legal { candidates, .. } = &mut compound_set {
+            candidates.push(CausalCandidate::new(
+                CausalActionKind::UseTool,
+                entry.family,
+                CandidateSpec {
+                    namespace: None,
+                    required_capabilities: vec![reference.clone(), peer],
+                    side_effect: entry.effect,
+                    approval: entry.approval.clone(),
+                    estimated_cost: None,
+                    estimated_latency_ms: None,
+                },
+            ));
+        }
+        assert!(
+            selector_context(&compound_set, &view, true, None, &selected_refs)
+                .direct_candidates
+                .is_empty()
+        );
+        let excluded_view = catalog.view(&CatalogScope {
+            families: BTreeSet::from([CapabilityTarget::Memory]),
+            channel: false,
+        });
+        assert!(!gained_direct_candidate(
+            &available_set,
+            &available_set,
+            |candidate| candidate_is_direct(candidate, &excluded_view, None, &selected_refs),
+            |candidate| candidate_is_direct(candidate, &view, None, &empty_refs),
+        ));
+        assert!(
+            selector_context(&available_set, &excluded_view, true, None, &selected_refs)
+                .direct_candidates
+                .is_empty()
+        );
+        for action in [CausalActionKind::Discover, CausalActionKind::Delegate] {
+            if let CandidateSet::Legal { candidates, .. } = &mut available_set {
+                candidates[0] = CausalCandidate::new(
+                    action,
+                    entry.family,
+                    CandidateSpec {
+                        namespace: None,
+                        required_capabilities: vec![reference.clone()],
+                        side_effect: entry.effect,
+                        approval: entry.approval.clone(),
+                        estimated_cost: None,
+                        estimated_latency_ms: None,
+                    },
+                );
+            }
+            assert!(
+                selector_context(&available_set, &view, true, None, &selected_refs)
+                    .direct_candidates
+                    .is_empty()
+            );
+        }
+        assert!(matches!(entry.exposure, Exposure::Searchable));
         assert!(
             decision
                 .issue_selected_discovery(&view, &context, "foreign query")

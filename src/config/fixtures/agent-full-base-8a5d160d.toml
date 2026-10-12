@@ -1,0 +1,44 @@
+# Agent configuration (full)
+# Agent orchestration, sessions, self-system, causal tree, and delegates.
+# Context retention follows the model-aware token budget.
+
+# Context compaction to manage long conversations.
+[agent.compaction]
+mode = "switch"                       # exact transcript refs; off | switch | safeguard | aggressive
+# max_context_tokens = 128000         # optional explicit override; omitted means derive from model metadata
+# OS-paging: non-destructive eviction + semantic recall of paged-out history.
+[agent.compaction.os_paging]
+max_recalled_pages = 10
+
+# Session spawning for parallel task execution. Concurrency, nesting depth and
+# children per session are uncapped; live runs are listed and ended with
+# `prx tasks`.
+[sessions_spawn]
+process_memory_strategy = "shared_fabric"
+
+# Self-system for autonomous behavior
+[self_system]
+
+[self_system.fitness]
+auto_run = true
+timezone = "UTC"                     # IANA timezone for closed daily windows
+run_at = "00:10"                     # local HH:MM; scores the previous day
+retention_days = 180
+max_backfill_days = 7
+min_samples = 5
+min_coverage = 0.60
+
+# Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs
+# speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)
+# before each turn. Default off; runtime evidence appears as observer CteRun events.
+[causal_tree]
+enabled = false
+
+# Delegate agents for multi-agent workflows
+# [agents.researcher]
+# provider = "anthropic"
+# model = "claude-sonnet-4-6"
+# system_prompt = "You are a research assistant."
+# agentic = true
+# allowed_tools = ["web_search", "read_file"]
+# allowed_tools = ["*"]                # explicit inheritance of eligible parent tools

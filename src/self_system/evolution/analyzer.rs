@@ -756,7 +756,7 @@ mod tests {
         assert!((digest.memory_hit_rate - 0.5).abs() < 1e-6);
         assert!((digest.avg_tokens_consumed - 150.0).abs() < 1e-6);
         assert!((digest.unknown_annotation_ratio - 0.5).abs() < 1e-6);
-        assert!(!digest.alerts.is_empty());
+        assert!(!digest.alerts.is_empty(), "expected a non-empty value");
 
         let persisted = fs::read_to_string(dir.path().join(format!("data/analysis/daily/{day}.json")))
             .await

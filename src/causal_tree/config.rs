@@ -1255,7 +1255,7 @@ mod tests {
         assert!(config.enabled);
         assert!(!config.backend.remote_enabled);
         assert_eq!(config.backend.kind, BackendSelection::Auto);
-        assert!(config.backend.endpoint.is_empty());
+        assert!(config.backend.endpoint.is_empty(), "expected an empty value");
         assert_eq!(config.backend.credential_ref, CredentialRefSetting::Unset);
         assert_eq!(config.policy.max_candidates, 12);
         assert_eq!(config.rehearsal.timeout_ms, 100);
@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn saving_the_defaults_writes_only_the_version_and_enabled() {
         let text = toml::to_string(&valid()).expect("test: serialize");
-        assert_eq!(text.trim(), "schema_version = 1\nenabled = false");
+        assert_eq!(text.trim(), "schema_version = 1\nenabled = true");
 
         let mut config = valid();
         config.rehearsal.timeout_ms = 80;
@@ -1893,7 +1893,8 @@ circuit_breaker_cooldown_secs = 120
             migrate_legacy(&mut causal("title = 1\n"), &nowhere)
                 .expect("test: no table")
                 .moved
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
     }
 }

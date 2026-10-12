@@ -555,7 +555,7 @@ impl TokenUsageSums {
 }
 
 fn clamp_u64_to_u32(value: u64) -> u32 {
-    u32::try_from(value).map_or(u32::MAX, |value| value)
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl Default for FallbackPolicy {

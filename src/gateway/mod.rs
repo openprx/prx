@@ -29,6 +29,8 @@ mod decision_cleanup;
 mod decision_runtime;
 pub(crate) mod decision_source;
 mod jobs;
+#[cfg(test)]
+mod legacy_session_fixture;
 
 /// The reserved issuer component of every built-in (non-bearer) MCP origin.
 ///
@@ -1406,6 +1408,8 @@ fn register_gateway_turn_tools(
         // `GET /mcp/v1/tools/list` advertises (V02-R7). Pushed before
         // `spawn_tool` is moved into the list below.
         let active_runs = spawn_tool.active_runs_arc();
+        #[cfg(test)]
+        legacy_session_fixture::seed_registered_runs(&config.workspace_dir, &active_runs);
         let workspace_id = config.workspace_dir.to_string_lossy().to_string();
         tools_list.push(Box::new(
             tools::SessionsListTool::new(active_runs.clone())
@@ -3830,6 +3834,11 @@ mod tests {
     #[test]
     fn a_gateway_without_signal_still_publishes_sessions_spawn() {
         let workspace = tempfile::tempdir().unwrap();
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             // The builder constructs a real provider chain, which refuses to come
@@ -3908,6 +3917,11 @@ mod tests {
     #[test]
     fn both_gateway_launch_paths_publish_the_same_tool_surface() {
         let workspace = tempfile::tempdir().unwrap();
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             // The provider chain refuses to come up with no credential at all.
@@ -4163,6 +4177,11 @@ mod tests {
     #[test]
     fn every_default_exposed_mcp_tool_resolves_in_the_production_gateway_registry() {
         let workspace = tempfile::tempdir().unwrap();
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             // The builder constructs a real provider chain, which refuses to
@@ -5864,6 +5883,77 @@ for line in sys.stdin:
         }
     }
 
+    async fn owned_bound_gateway_fixture<F, Fut>(mut state: AppState, business: F)
+    where
+        F: FnOnce(AppState) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt as _;
+
+        let generation = state.config.pin();
+        let config = generation.effective.as_ref();
+        let resolved = providers::selection::check(
+            config,
+            providers::selection::default_provider(config),
+            &state.model,
+            &providers::catalog::Requirement::chat(),
+            providers::catalog::UnknownPolicy::Invocation,
+        )
+        .expect("original gateway fixture provider/model must pass PMM");
+        let runtime = TurnRuntimeGeneration {
+            provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                Arc::clone(&state.provider),
+                resolved,
+            ))),
+            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(
+                crate::runtime::bootstrap::build_security_policy(config),
+                0,
+            )),
+            config_generation: generation,
+            provider: Arc::clone(&state.provider),
+            model: state.model.clone(),
+            temperature: state.temperature,
+            tools_registry: Arc::clone(&state.tools_registry),
+            mcp_tool: state.mcp_tool.clone(),
+        };
+        let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+        let owner = Arc::new(GatewayTurnRuntimeOwner::new(
+            runtime,
+            Arc::clone(&state.config),
+            Arc::clone(&state.mem),
+            state.signal.clone(),
+            state.whatsapp.clone(),
+            state.linq.clone(),
+            state.nextcloud_talk.clone(),
+            Arc::clone(&state.hooks),
+            #[cfg(feature = "wasm-plugins")]
+            state.plugin_runtime.clone(),
+        ));
+        state.turn_runtime = Some(Arc::clone(&owner));
+        let jobs = Arc::new(jobs::test_observation::SubmittedJobs::default());
+        let work = Box::pin(async move { business(state).await });
+        let outcome = cleanup
+            .scope(jobs.scope(std::panic::AssertUnwindSafe(work).catch_unwind()))
+            .await;
+        // No caller is spawned by these three bodies; their submitting future is now dropped.
+        let monitor = jobs
+            .wait_terminal(1, tokio::time::Instant::now() + Duration::from_secs(15))
+            .await;
+        let drained = cleanup
+            .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+            .await;
+        drop(owner);
+        let retired = cleanup
+            .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+            .await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(monitor.is_ok(), "original gateway fixture job cleanup unconfirmed");
+        assert!(drained.is_ok(), "original gateway fixture decision cleanup unconfirmed");
+        assert!(retired.is_ok(), "original gateway fixture retired cleanup unconfirmed");
+    }
+
     async fn owned_blocking_webhook_fixture<F, Fut>(business: F)
     where
         F: FnOnce(AppState, Arc<BlockFirstProvider>, Arc<WebhookFixtureCallers>) -> Fut,
@@ -6443,38 +6533,41 @@ for line in sys.stdin:
         let provider_impl = Arc::new(FailFirstProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let state = webhook_test_state(provider);
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-error"));
+        owned_bound_gateway_fixture(state, |state| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-error"));
 
-        let first = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers.clone(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let first = handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                test_uri(),
+                headers.clone(),
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            )
+            .await
+            .into_response();
+            assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let retry = handle_webhook(
-            State(state),
-            test_connect_info(),
-            test_uri(),
-            headers,
-            Bytes::from_static(br#"{"message":"hello"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(retry.status(), StatusCode::CONFLICT);
-        let payload = retry.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["status"], "retry_unavailable");
-        assert_eq!(
-            provider_impl.calls.load(Ordering::SeqCst),
-            1,
-            "a refused redelivery must not reach the provider again"
-        );
+            let retry = handle_webhook(
+                State(state),
+                test_connect_info(),
+                test_uri(),
+                headers,
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            )
+            .await
+            .into_response();
+            assert_eq!(retry.status(), StatusCode::CONFLICT);
+            let payload = retry.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(parsed["status"], "retry_unavailable");
+            assert_eq!(
+                provider_impl.calls.load(Ordering::SeqCst),
+                1,
+                "a refused redelivery must not reach the provider again"
+            );
+        })
+        .await;
     }
 
     /// The autosave key is derived from the idempotency digest, so it neither
@@ -7315,24 +7408,27 @@ for line in sys.stdin:
             plugin_runtime: None,
         };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Signature",
-            HeaderValue::from_str(&format!("sha256={}", compute_whatsapp_signature_hex(&secret, body))).unwrap(),
-        );
+        owned_bound_gateway_fixture(state, |state| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-Webhook-Signature",
+                HeaderValue::from_str(&format!("sha256={}", compute_whatsapp_signature_hex(&secret, body))).unwrap(),
+            );
 
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            test_uri(),
-            headers,
-            Bytes::from_static(body),
-        )
-        .await
-        .into_response();
+            let response = handle_webhook(
+                State(state),
+                test_connect_info(),
+                test_uri(),
+                headers,
+                Bytes::from_static(body),
+            )
+            .await
+            .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
     }
 
     fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
@@ -9367,35 +9463,39 @@ for line in sys.stdin:
         let provider_impl = Arc::new(SecretErrorProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let state = two_token_webhook_state_with(workspace.path(), provider);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer token-alpha-0001"),
-        );
-        let body = serde_json::json!({"message": "hello probe", "reply_target": "client-a"}).to_string();
+        let workspace = &workspace;
+        owned_bound_gateway_fixture(state, |state| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer token-alpha-0001"),
+            );
+            let body = serde_json::json!({"message": "hello probe", "reply_target": "client-a"}).to_string();
 
-        let response = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers,
-            Bytes::from(body),
-        )
-        .await
-        .into_response();
-        assert_eq!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "test: the provider failure must end the turn"
-        );
-        assert!(
-            provider_impl.calls.load(Ordering::SeqCst) >= 1,
-            "test: the turn must have reached the provider"
-        );
-        let events = all_workspace_message_events(&state, workspace.path()).await;
-        assert!(!events.is_empty(), "test: the failed turn recorded message events");
+            let response = handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                test_uri(),
+                headers,
+                Bytes::from(body),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "test: the provider failure must end the turn"
+            );
+            assert!(
+                provider_impl.calls.load(Ordering::SeqCst) >= 1,
+                "test: the turn must have reached the provider"
+            );
+            let events = all_workspace_message_events(&state, workspace.path()).await;
+            assert!(!events.is_empty(), "test: the failed turn recorded message events");
 
-        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(workspace.path());
+            crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(workspace.path());
+        })
+        .await;
     }
 }
 
@@ -9447,6 +9547,11 @@ mod selection_adoption_tests {
     #[test]
     fn a_decision_only_default_is_rejected_and_the_previous_generation_stays() {
         let workspace = tempfile::tempdir().expect("test: temp dir");
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let mut good = decision_only(workspace.path());
         good.default_model = Some("vendor/chat-model".to_string());
         let manager = crate::config::new_shared(good);
@@ -9482,6 +9587,11 @@ mod selection_adoption_tests {
     #[test]
     fn a_hint_default_builds_the_turn_runtime() {
         let workspace = tempfile::tempdir().expect("test: temp dir");
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let mut config = decision_only(workspace.path());
         config.default_model = Some("hint:fast".to_string());
         config.model_routes.push(crate::config::ModelRouteConfig {
@@ -9512,6 +9622,11 @@ mod selection_adoption_tests {
     #[test]
     fn removing_a_live_default_hint_route_keeps_the_previous_generation() {
         let workspace = tempfile::tempdir().expect("test: temp dir");
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let mut good = decision_only(workspace.path());
         good.default_model = Some("hint:fast".to_string());
         good.model_routes.push(crate::config::ModelRouteConfig {

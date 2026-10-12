@@ -415,35 +415,39 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+    // Q45: Text return and genuine public API source recording remain intact.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert_eq!(response, "Hello world");
-    // The public API must persist its own source, not borrow CLI authority.
-    let conn = rusqlite::Connection::open_with_flags(
-        agent.workspace.path().join("memory/brain.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
-            [],
-            |row| row.get(0),
+        let response = agent.turn("hi").await.unwrap();
+        assert_eq!(response, "Hello world");
+        // The public API must persist its own source, not borrow CLI authority.
+        let conn = rusqlite::Connection::open_with_flags(
+            agent.workspace.path().join("memory/brain.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-    assert_eq!(rows, 1);
-    let source: (String, String, String, String, String, String) = conn.query_row(
-        "SELECT source, channel, sender, content, session_key, owner_id FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
-        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-    ).unwrap();
-    assert_eq!(
-        (&*source.0, &*source.1, &*source.2, &*source.3),
-        ("agent", "agent_api", "embedded-caller", "hi")
-    );
-    assert!(source.4.starts_with("agent_api:"));
-    assert!(!source.5.is_empty());
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let source: (String, String, String, String, String, String) = conn.query_row(
+            "SELECT source, channel, sender, content, session_key, owner_id FROM message_events WHERE role = 'user' AND event_type = 'message.created'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).unwrap();
+        assert_eq!(
+            (&*source.0, &*source.1, &*source.2, &*source.3),
+            ("agent", "agent_api", "embedded-caller", "hi")
+        );
+        assert!(source.4.starts_with("agent_api:"));
+        assert!(!source.5.is_empty(), "expected a non-empty value");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -451,8 +455,10 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let provider = Box::new(FailingProvider);
     let (memory, workspace) = make_sqlite_memory();
+    let mut config = fixture_runtime_config(workspace.path());
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
     let mut agent = Agent::builder()
-        .runtime_config(fixture_runtime_config(workspace.path()), "ollama")
+        .runtime_config(config, "ollama")
         .provider(provider)
         .tools(vec![Box::new(MockSessionsSpawnTool { calls: calls.clone() })])
         .memory(memory)
@@ -508,35 +514,51 @@ async fn turn_executes_single_tool_then_returns() {
 
 #[tokio::test]
 async fn turn_handles_multi_step_tool_chain() {
-    let (counting_tool, count) = CountingTool::new();
+    // Q45: Sequential tool rounds execute and return their original final text.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
-        tool_response(vec![ToolCall {
-            id: "tc1".into(),
-            name: "counter".into(),
-            arguments: "{}".into(),
-        }]),
-        tool_response(vec![ToolCall {
-            id: "tc2".into(),
-            name: "counter".into(),
-            arguments: "{}".into(),
-        }]),
-        tool_response(vec![ToolCall {
-            id: "tc3".into(),
-            name: "counter".into(),
-            arguments: "{}".into(),
-        }]),
-        text_response("Done after 3 calls"),
-    ]));
+        let provider = Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "tc1".into(),
+                name: "counter".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_response(vec![ToolCall {
+                id: "tc2".into(),
+                name: "counter".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_response(vec![ToolCall {
+                id: "tc3".into(),
+                name: "counter".into(),
+                arguments: "{}".into(),
+            }]),
+            text_response("Done after 3 calls"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![Box::new(counting_tool)], Box::new(NativeToolDispatcher));
+        let (memory, workspace) = make_sqlite_memory();
+        let mut config = fixture_runtime_config(workspace.path());
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let agent = Agent::builder()
+            .runtime_config(config, "ollama")
+            .provider(provider)
+            .tools(vec![Box::new(counting_tool)])
+            .memory(memory)
+            .observer(make_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .build()
+            .unwrap();
+        let mut agent = TestAgent { agent, workspace };
 
-    let response = agent.turn("count 3 times").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after multi-step chain"
-    );
-    assert_eq!(*count.lock().unwrap(), 3);
+        let response = agent.turn("count 3 times").await.unwrap();
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response after multi-step chain"
+        );
+        assert_eq!(*count.lock().unwrap(), 3);
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -545,29 +567,33 @@ async fn turn_handles_multi_step_tool_chain() {
 
 #[tokio::test]
 async fn turn_handles_unknown_tool_gracefully() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        tool_response(vec![ToolCall {
-            id: "tc1".into(),
-            name: "nonexistent_tool".into(),
-            arguments: "{}".into(),
-        }]),
-        text_response("I couldn't find that tool"),
-    ]));
+    // Q52: evidence prerequisite only; preserve unknown tool rejection and diagnostic recovery.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "tc1".into(),
+                name: "nonexistent_tool".into(),
+                arguments: "{}".into(),
+            }]),
+            text_response("I couldn't find that tool"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("use nonexistent").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after unknown tool recovery"
-    );
+        let response = agent.turn("use nonexistent").await.unwrap();
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response after unknown tool recovery"
+        );
 
-    // Verify the tool result mentioned "unknown tool"
-    let has_tool_result = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::ToolResults(results) => results.iter().any(|r| r.content.contains("unknown tool")),
-        _ => false,
-    });
-    assert!(has_tool_result, "Expected tool result with 'unknown tool' message");
+        // Verify the tool result mentioned "unknown tool"
+        let has_tool_result = agent.history().iter().any(|msg| match msg {
+            ConversationMessage::ToolResults(results) => results.iter().any(|r| r.content.contains("unknown tool")),
+            _ => false,
+        });
+        assert!(has_tool_result, "Expected tool result with 'unknown tool' message");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -620,10 +646,23 @@ async fn turn_recovers_from_tool_error() {
 
 #[tokio::test]
 async fn turn_propagates_provider_error() {
-    let mut agent = build_agent_with(Box::new(FailingProvider), vec![], Box::new(NativeToolDispatcher));
+    // Q52: evidence prerequisite only; preserve provider error propagation.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let mut agent = build_agent_with(Box::new(FailingProvider), vec![], Box::new(NativeToolDispatcher));
 
-    let result = agent.turn("hello").await;
-    assert!(result.is_err(), "Expected provider error to propagate");
+        let result = agent.turn("hello").await;
+        assert!(result.is_err(), "Expected provider error to propagate");
+
+        assert!(
+            result
+                .as_ref()
+                .expect_err("original provider error")
+                .chain()
+                .any(|cause| cause.to_string() == "provider error"),
+            "Q52 must reach the original FailingProvider boundary"
+        );
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -632,24 +671,28 @@ async fn turn_propagates_provider_error() {
 
 #[tokio::test]
 async fn history_is_not_trimmed_by_an_arbitrary_message_count() {
-    let turn_count = 11;
-    let mut responses = vec![];
-    for _ in 0..turn_count {
-        responses.push(text_response("ok"));
-    }
+    // Q45: Conversation retention is governed by token budget rather than message count.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let turn_count = 11;
+        let mut responses = vec![];
+        for _ in 0..turn_count {
+            responses.push(text_response("ok"));
+        }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
-    let mut agent = build_agent_with_config(provider, vec![], AgentConfig::default());
+        let provider = Box::new(ScriptedProvider::new(responses));
+        let mut agent = build_agent_with_config(provider, vec![], AgentConfig::default());
 
-    for i in 0..turn_count {
-        let _ = agent.turn(&format!("msg {i}")).await.unwrap();
-    }
+        for i in 0..turn_count {
+            let _ = agent.turn(&format!("msg {i}")).await.unwrap();
+        }
 
-    assert_eq!(agent.history().len(), turn_count * 2 + 1);
+        assert_eq!(agent.history().len(), turn_count * 2 + 1);
 
-    // System prompt should always be preserved
-    let first = &agent.history()[0];
-    assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
+        // System prompt should always be preserved
+        let first = &agent.history()[0];
+        assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -753,31 +796,64 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 
 #[tokio::test]
 async fn turn_handles_empty_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
-        text: Some(String::new()),
-        tool_calls: vec![],
-        reasoning_content: None,
-    }]));
+    // Q89 supersedes the Ok(empty) oracle: one corrective retry, then the exact error.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+        let error = agent
+            .turn("hi")
+            .await
+            .expect_err("two empty responses must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "model returned an empty response after one corrective retry"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn turn_handles_none_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
-        text: None,
-        tool_calls: vec![],
-        reasoning_content: None,
-    }]));
+    // Q89 supersedes the Ok(empty) oracle: one corrective retry, then the exact error.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            ChatResponse {
+                text: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+        let error = agent
+            .turn("hi")
+            .await
+            .expect_err("two empty responses must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "model returned an empty response after one corrective retry"
+        );
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -786,33 +862,70 @@ async fn turn_handles_none_text_response() {
 
 #[tokio::test]
 async fn turn_preserves_text_alongside_tool_calls() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        ChatResponse {
-            text: Some("Let me check...".into()),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "echo".into(),
-                arguments: r#"{"message": "hi"}"#.into(),
-            }],
-            reasoning_content: None,
-        },
-        text_response("Here are the results"),
-    ]));
+    // Q45: Intermediate text accompanying tool calls remains in history.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some("Let me check...".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"message": "hi"}"#.into(),
+                }],
+                reasoning_content: None,
+            },
+            text_response("Here are the results"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("check something").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty final response after mixed text+tool"
-    );
+        let response = agent.turn("check something").await.unwrap();
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty final response after mixed text+tool"
+        );
 
-    // The intermediate text should be in history
-    let has_intermediate = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
-        _ => false,
-    });
-    assert!(has_intermediate, "Intermediate text should be in history");
+        // The intermediate text should be in history
+        let preserves_intermediate = |msg: &ConversationMessage| match msg {
+            ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
+            ConversationMessage::AssistantToolCalls { text, tool_calls } => {
+                text.as_deref() == Some("Let me check...")
+                    && tool_calls.len() == 1
+                    && tool_calls.first().is_some_and(|call| {
+                        call.id == "tc1" && call.name == "echo" && call.arguments == r#"{"message": "hi"}"#
+                    })
+            }
+            _ => false,
+        };
+        // Q92: Exercise the same history predicate without provider or runtime work.
+        let typed_history =
+            |text: &str, id: &str, name: &str, arguments: &str| ConversationMessage::AssistantToolCalls {
+                text: Some(text.to_owned()),
+                tool_calls: vec![ToolCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    arguments: arguments.to_owned(),
+                }],
+            };
+        let original_arguments = r#"{"message": "hi"}"#;
+        assert!(preserves_intermediate(&typed_history(
+            "Let me check...",
+            "tc1",
+            "echo",
+            original_arguments,
+        )));
+        for (text, id, name, arguments) in [
+            ("different text", "tc1", "echo", original_arguments),
+            ("Let me check...", "different_id", "echo", original_arguments),
+            ("Let me check...", "tc1", "different_tool", original_arguments),
+            ("Let me check...", "tc1", "echo", r#"{"message": "different"}"#),
+        ] {
+            assert!(!preserves_intermediate(&typed_history(text, id, name, arguments)));
+        }
+        let has_intermediate = agent.history().iter().any(preserves_intermediate);
+        assert!(has_intermediate, "Intermediate text should be in history");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -821,37 +934,53 @@ async fn turn_preserves_text_alongside_tool_calls() {
 
 #[tokio::test]
 async fn turn_handles_multiple_tools_in_one_response() {
-    let (counting_tool, count) = CountingTool::new();
+    // Q45: Multiple calls in one response each execute once.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
-        tool_response(vec![
-            ToolCall {
-                id: "tc1".into(),
-                name: "counter".into(),
-                arguments: "{}".into(),
-            },
-            ToolCall {
-                id: "tc2".into(),
-                name: "counter".into(),
-                arguments: "{}".into(),
-            },
-            ToolCall {
-                id: "tc3".into(),
-                name: "counter".into(),
-                arguments: "{}".into(),
-            },
-        ]),
-        text_response("All 3 done"),
-    ]));
+        let provider = Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![
+                ToolCall {
+                    id: "tc1".into(),
+                    name: "counter".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "tc2".into(),
+                    name: "counter".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "tc3".into(),
+                    name: "counter".into(),
+                    arguments: "{}".into(),
+                },
+            ]),
+            text_response("All 3 done"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![Box::new(counting_tool)], Box::new(NativeToolDispatcher));
+        let (memory, workspace) = make_sqlite_memory();
+        let mut config = fixture_runtime_config(workspace.path());
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let agent = Agent::builder()
+            .runtime_config(config, "ollama")
+            .provider(provider)
+            .tools(vec![Box::new(counting_tool)])
+            .memory(memory)
+            .observer(make_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .build()
+            .unwrap();
+        let mut agent = TestAgent { agent, workspace };
 
-    let response = agent.turn("batch").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after multi-tool batch"
-    );
-    assert_eq!(*count.lock().unwrap(), 3, "All 3 tools should have been called");
+        let response = agent.turn("batch").await.unwrap();
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response after multi-tool batch"
+        );
+        assert_eq!(*count.lock().unwrap(), 3, "All 3 tools should have been called");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -860,38 +989,46 @@ async fn turn_handles_multiple_tools_in_one_response() {
 
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+    // Q45: First turn inserts one system prompt.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    assert!(agent.history().is_empty(), "History should start empty");
+        assert!(agent.history().is_empty(), "History should start empty");
 
-    let _ = agent.turn("hi").await.unwrap();
+        let _ = agent.turn("hi").await.unwrap();
 
-    // First message should be the system prompt
-    let first = &agent.history()[0];
-    assert!(
-        matches!(first, ConversationMessage::Chat(c) if c.role == "system"),
-        "First history entry should be system prompt"
-    );
+        // First message should be the system prompt
+        let first = &agent.history()[0];
+        assert!(
+            matches!(first, ConversationMessage::Chat(c) if c.role == "system"),
+            "First history entry should be system prompt"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn system_prompt_not_duplicated_on_second_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        text_response("first"),
-        text_response("second"),
-    ]));
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+    // Q45: Second turn preserves one system prompt.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            text_response("first"),
+            text_response("second"),
+        ]));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let _ = agent.turn("hi").await.unwrap();
-    let _ = agent.turn("hello again").await.unwrap();
+        let _ = agent.turn("hi").await.unwrap();
+        let _ = agent.turn("hello again").await.unwrap();
 
-    let system_count = agent
-        .history()
-        .iter()
-        .filter(|msg| matches!(msg, ConversationMessage::Chat(c) if c.role == "system"))
-        .count();
-    assert_eq!(system_count, 1, "System prompt should appear exactly once");
+        let system_count = agent
+            .history()
+            .iter()
+            .filter(|msg| matches!(msg, ConversationMessage::Chat(c) if c.role == "system"))
+            .count();
+        assert_eq!(system_count, 1, "System prompt should appear exactly once");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -900,39 +1037,43 @@ async fn system_prompt_not_duplicated_on_second_turn() {
 
 #[tokio::test]
 async fn history_contains_all_expected_entries_after_tool_loop() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        tool_response(vec![ToolCall {
-            id: "tc1".into(),
-            name: "echo".into(),
-            arguments: r#"{"message": "tool-out"}"#.into(),
-        }]),
-        text_response("final answer"),
-    ]));
+    // Q45: Tool loop persists the expected message sequence.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "tc1".into(),
+                name: "echo".into(),
+                arguments: r#"{"message": "tool-out"}"#.into(),
+            }]),
+            text_response("final answer"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let _ = agent.turn("test").await.unwrap();
+        let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
-    let history = agent.history();
-    assert!(
-        history.len() >= 5,
-        "Expected at least 5 history entries, got {}",
-        history.len()
-    );
+        // Expected history entries:
+        //   0: system prompt
+        //   1: user message "test"
+        //   2: AssistantToolCalls
+        //   3: ToolResults
+        //   4: assistant "final answer"
+        let history = agent.history();
+        assert!(
+            history.len() >= 5,
+            "Expected at least 5 history entries, got {}",
+            history.len()
+        );
 
-    assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
-    assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
-    assert!(matches!(&history[2], ConversationMessage::AssistantToolCalls { .. }));
-    assert!(matches!(&history[3], ConversationMessage::ToolResults(_)));
-    assert!(
-        matches!(&history[4], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "final answer")
-    );
+        assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
+        assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
+        assert!(matches!(&history[2], ConversationMessage::AssistantToolCalls { .. }));
+        assert!(matches!(&history[3], ConversationMessage::ToolResults(_)));
+        assert!(
+            matches!(&history[4], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "final answer")
+        );
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -958,30 +1099,34 @@ async fn builder_fails_without_provider() {
 
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        text_response("response 1"),
-        text_response("response 2"),
-        text_response("response 3"),
-    ]));
+    // Q45: Successful consecutive replies grow conversation history.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            text_response("response 1"),
+            text_response("response 2"),
+            text_response("response 3"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let r1 = agent.turn("msg 1").await.unwrap();
-    let len_after_1 = agent.history().len();
+        let r1 = agent.turn("msg 1").await.unwrap();
+        let len_after_1 = agent.history().len();
 
-    let r2 = agent.turn("msg 2").await.unwrap();
-    let len_after_2 = agent.history().len();
+        let r2 = agent.turn("msg 2").await.unwrap();
+        let len_after_2 = agent.history().len();
 
-    let r3 = agent.turn("msg 3").await.unwrap();
-    let len_after_3 = agent.history().len();
+        let r3 = agent.turn("msg 3").await.unwrap();
+        let len_after_3 = agent.history().len();
 
-    assert_eq!(r1, "response 1");
-    assert_eq!(r2, "response 2");
-    assert_eq!(r3, "response 3");
+        assert_eq!(r1, "response 1");
+        assert_eq!(r2, "response 2");
+        assert_eq!(r3, "response 3");
 
-    // History should grow with each turn (user + assistant per turn)
-    assert!(len_after_2 > len_after_1, "History should grow after turn 2");
-    assert!(len_after_3 > len_after_2, "History should grow after turn 3");
+        // History should grow with each turn (user + assistant per turn)
+        assert!(len_after_2 > len_after_1, "History should grow after turn 2");
+        assert!(len_after_3 > len_after_2, "History should grow after turn 3");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1240,25 +1385,29 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
 
 #[tokio::test]
 async fn clear_history_resets_conversation() {
-    let provider = Box::new(ScriptedProvider::new(vec![
-        text_response("first"),
-        text_response("second"),
-    ]));
+    // Q45: Clearing history resets subsequent conversation state.
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let provider = Box::new(ScriptedProvider::new(vec![
+            text_response("first"),
+            text_response("second"),
+        ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+        let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let _ = agent.turn("hi").await.unwrap();
-    assert!(!agent.history().is_empty());
+        let _ = agent.turn("hi").await.unwrap();
+        assert!(!agent.history().is_empty());
 
-    agent.clear_history();
-    assert!(agent.history().is_empty());
+        agent.clear_history();
+        assert!(agent.history().is_empty());
 
-    // Next turn should re-inject system prompt
-    let _ = agent.turn("hello again").await.unwrap();
-    assert!(matches!(
-        &agent.history()[0],
-        ConversationMessage::Chat(c) if c.role == "system"
-    ));
+        // Next turn should re-inject system prompt
+        let _ = agent.turn("hello again").await.unwrap();
+        assert!(matches!(
+            &agent.history()[0],
+            ConversationMessage::Chat(c) if c.role == "system"
+        ));
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

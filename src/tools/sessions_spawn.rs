@@ -955,12 +955,263 @@ pub(crate) struct TestWorkerRouteCapture {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestWorkerProtocolCase {
+    HoldAfterThreeSteers,
+    CloseAfterManifest,
+}
+
+#[cfg(test)]
+pub(crate) struct TestWorkerProtocolControl {
+    case: TestWorkerProtocolCase,
+    claimed: std::sync::atomic::AtomicBool,
+    termination_calls: Arc<std::sync::atomic::AtomicUsize>,
+    terminal: parking_lot::Mutex<Option<TestWorkerProtocolTerminal>>,
+    diagnostic: Arc<parking_lot::Mutex<TestWorkerProtocolDiagnostic>>,
+}
+
+#[cfg(test)]
+#[derive(Default, serde::Serialize, Debug)]
+pub(crate) struct TestWorkerProtocolDiagnostic {
+    manifest_bytes: Option<usize>,
+    component_bytes: std::collections::BTreeMap<String, usize>,
+    precondition_passed: Option<bool>,
+    spawned: bool,
+    pid: Option<u32>,
+    actual_pgid: Option<i32>,
+    start_identity: Option<(u64, u64)>,
+    identity_class: Option<&'static str>,
+    registry_id: Option<u64>,
+    launch_persisted: bool,
+    reap_confirmed: bool,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    registration_marked_reaped: bool,
+    lifecycle_class: Option<&'static str>,
+    panic_cleanup_class: Option<&'static str>,
+    finalization: Option<&'static str>,
+    fixture_cleanup_class: Option<&'static str>,
+    process_cleanup_class: Option<&'static str>,
+    owner_cleanup_class: Option<&'static str>,
+}
+
+#[cfg(test)]
+fn test_worker_cleanup_error_class(error: &anyhow::Error) -> &'static str {
+    // Inspect locally; retain only a closed class, never rendered error text.
+    let text = error.to_string();
+    if text.contains("failed to kill session-worker process group") {
+        "group_signal_failed"
+    } else if text.contains("direct-child") || text.contains("direct child") {
+        "direct_child_cleanup_failed"
+    } else if text.contains("wait") || text.contains("reap") {
+        "wait_or_reap_failed"
+    } else {
+        "other_cleanup_error"
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
+fn test_worker_process_identity(pid: u32) -> (Option<i32>, Option<(u64, u64)>, &'static str) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return (None, None, "invalid_pid");
+    };
+    // SAFETY: getpgid observes one actual positive child PID without signalling.
+    let pgid = unsafe { libc::getpgid(pid) };
+    let pgid = (pgid > 0).then_some(pgid);
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: plain C output buffer has the exact PROC_PIDTBSDINFO size.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: pid is the positive spawned child; info is writable for exactly
+        // size bytes of PROC_PIDTBSDINFO. libproc validates pid and writes the buffer.
+        let received = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+        if received == size {
+            return (
+                pgid,
+                Some((info.pbi_start_tvsec, info.pbi_start_tvusec)),
+                "macos_start_time",
+            );
+        }
+        (pgid, None, "start_unavailable")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let start = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|text| {
+                let tail = text.get(text.rfind(')')? + 1..)?;
+                tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+            });
+        (
+            pgid,
+            start.map(|ticks| (ticks, 0)),
+            if start.is_some() {
+                "linux_start_ticks"
+            } else {
+                "start_unavailable"
+            },
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (pgid, None, "start_unsupported")
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestWorkerProtocolTerminal {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdin_held_through_reap: bool,
+}
+
+#[cfg(test)]
+impl TestWorkerProtocolControl {
+    pub(crate) fn new(case: TestWorkerProtocolCase) -> Self {
+        Self {
+            case,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            termination_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            terminal: parking_lot::Mutex::new(None),
+            diagnostic: Arc::new(parking_lot::Mutex::new(TestWorkerProtocolDiagnostic::default())),
+        }
+    }
+
+    fn claim(&self) -> anyhow::Result<()> {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| anyhow::anyhow!("worker protocol control already claimed"))?;
+        Ok(())
+    }
+
+    fn check_serialized_precondition(&self, payload: &str) -> anyhow::Result<()> {
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        let fields = value.as_object().context("serialized worker manifest object missing")?;
+        anyhow::ensure!(fields.len() <= 128, "manifest diagnostic field bound");
+        let mut lengths = std::collections::BTreeMap::new();
+        for (name, value) in fields {
+            anyhow::ensure!(name.len() <= 128, "manifest diagnostic name bound");
+            lengths.insert(name.clone(), serde_json::to_vec(value)?.len());
+        }
+        if let Some(source) = fields.get("operator_source").and_then(serde_json::Value::as_object) {
+            anyhow::ensure!(source.len() <= 32, "operator source diagnostic field bound");
+            for (name, value) in source {
+                anyhow::ensure!(name.len() <= 128, "operator diagnostic name bound");
+                lengths.insert(format!("operator_source.{name}"), serde_json::to_vec(value)?.len());
+            }
+        }
+        let mut diagnostic = self.diagnostic.lock();
+        diagnostic.manifest_bytes = Some(payload.len());
+        diagnostic.component_bytes = lengths;
+        diagnostic.precondition_passed = Some(payload.len() < 3072);
+        anyhow::ensure!(
+            payload.len() < 3072,
+            "worker stdin fixture precondition failed before spawn: manifest_bytes={}",
+            payload.len()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn serialized_precondition_failed(&self) -> bool {
+        self.diagnostic.lock().precondition_passed == Some(false)
+    }
+
+    pub(crate) fn diagnostic_json(&self) -> anyhow::Result<Vec<u8>> {
+        let mut value = serde_json::to_value(&*self.diagnostic.lock())?;
+        let spawned = matches!(value.get("spawned").and_then(serde_json::Value::as_bool), Some(true));
+        let object = value.as_object_mut().context("diagnostic object missing")?;
+        let mut child = serde_json::Map::new();
+        for name in [
+            "pid",
+            "actual_pgid",
+            "start_identity",
+            "identity_class",
+            "registry_id",
+            "launch_persisted",
+            "reap_confirmed",
+            "exit_code",
+            "exit_signal",
+            "registration_marked_reaped",
+            "lifecycle_class",
+            "panic_cleanup_class",
+            "finalization",
+        ] {
+            child.insert(
+                name.to_owned(),
+                object.remove(name).context("diagnostic field missing")?,
+            );
+        }
+        child.insert(
+            "signal_attempts".to_owned(),
+            serde_json::json!(self.termination_calls()),
+        );
+        object.insert(
+            "child".to_owned(),
+            if spawned {
+                serde_json::Value::Object(child)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        serde_json::to_vec_pretty(&value).map_err(Into::into)
+    }
+
+    fn observe_reap_status(&self, status: std::process::ExitStatus) {
+        let mut diagnostic = self.diagnostic.lock();
+        diagnostic.reap_confirmed = true;
+        diagnostic.exit_code = status.code();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            diagnostic.exit_signal = status.signal();
+        }
+    }
+
+    pub(crate) fn observe_cleanup_parts(&self, process: &'static str, owner: &'static str) {
+        let mut diagnostic = self.diagnostic.lock();
+        diagnostic.process_cleanup_class = Some(process);
+        diagnostic.owner_cleanup_class = Some(owner);
+    }
+
+    pub(crate) fn observe_fixture_cleanup(&self, finalization: Option<ProcessFinalization>, class: &'static str) {
+        let mut diagnostic = self.diagnostic.lock();
+        diagnostic.finalization = finalization.map(|value| match value {
+            ProcessFinalization::Natural => "natural",
+            ProcessFinalization::Terminated => "terminated",
+            ProcessFinalization::TerminationFailed => "termination_failed",
+            ProcessFinalization::Unconfirmed => "unconfirmed",
+        });
+        diagnostic.fixture_cleanup_class = Some(class);
+    }
+
+    pub(crate) fn termination_calls(&self) -> usize {
+        self.termination_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_terminal(&self) -> anyhow::Result<TestWorkerProtocolTerminal> {
+        self.terminal
+            .lock()
+            .take()
+            .context("actual worker terminal observation missing")
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 struct TestWorkerExecutable {
     path: PathBuf,
     sha256: String,
     private_home: PathBuf,
     route_observer: Option<Arc<parking_lot::Mutex<TestWorkerRouteCapture>>>,
+    protocol: Option<Arc<TestWorkerProtocolControl>>,
 }
 
 #[cfg(test)]
@@ -1404,9 +1655,19 @@ impl SessionsSpawnTool {
             sha256,
             private_home,
             route_observer: None,
+            protocol: None,
         };
         executable.verify()?;
         self.test_worker_executable = Some(executable);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_worker_protocol(mut self, control: Arc<TestWorkerProtocolControl>) -> anyhow::Result<Self> {
+        self.test_worker_executable
+            .as_mut()
+            .context("protocol control requires an attested worker artifact")?
+            .protocol = Some(control);
         Ok(self)
     }
 
@@ -4871,6 +5132,26 @@ impl SessionsSpawnTool {
                                     };
                                     (status, text, completion.usage, ProcessFinalization::Natural)
                                 }
+                                Ok(ProcessWorkerOutcome::VerifiedStartupFailure(result)) => {
+                                    let error = result.error.context("verified startup failure detail missing");
+                                    let error = match error {
+                                        Ok(error) => error,
+                                        Err(error) => {
+                                            tracing::error!(run_id = %rid, error = %error, "verified startup result invalid");
+                                            return;
+                                        }
+                                    };
+                                    (
+                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
+                                        format!("Sub-agent startup error: {error}"),
+                                        Vec::new(),
+                                        ProcessFinalization::Natural,
+                                    )
+                                }
+                                Ok(ProcessWorkerOutcome::UnverifiedStartupFailure(_)) => {
+                                    tracing::error!(run_id = %rid, "unverified startup failure escaped process owner");
+                                    return;
+                                }
                                 Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
                                     let token_usage_records = result
                                         .tokens_used
@@ -7577,11 +7858,15 @@ async fn terminate_owned_child(
     {
         if let Err(group_error) = process_group.terminate() {
             process_group.disarm();
-            start_kill_and_reap_direct_child(child).await.map_err(|direct_error| {
+            let status = start_kill_and_reap_direct_child(child).await.map_err(|direct_error| {
                 anyhow::anyhow!(
                     "failed to kill session-worker process group: {group_error}; direct-child fallback failed: {direct_error}"
                 )
             })?;
+            #[cfg(not(test))]
+            let _ = status;
+            #[cfg(test)]
+            process_group.observe_reap(status);
             return Err(group_error);
         }
     }
@@ -7592,12 +7877,15 @@ async fn terminate_owned_child(
         return start_kill_and_reap_direct_child(child).await;
     }
 
-    wait_for_reap_after_group_termination(
+    let status = wait_for_reap_after_group_termination(
         child,
         #[cfg(test)]
         false,
     )
-    .await
+    .await?;
+    #[cfg(test)]
+    process_group.observe_reap(status);
+    Ok(status)
 }
 
 async fn wait_for_owned_process(
@@ -7614,7 +7902,11 @@ async fn wait_for_owned_process(
     tokio::select! {
         biased;
         status = child.wait() => match status {
-            Ok(status) => Ok(OwnedChildExit::Exited(status)),
+            Ok(status) => {
+                #[cfg(test)]
+                process_group.observe_reap(status);
+                Ok(OwnedChildExit::Exited(status))
+            },
             Err(error) => {
                 relinquish_process_group_after_leader_exit(process_group);
                 hold_unresolved_child_ownership(child, error).await
@@ -7630,6 +7922,8 @@ async fn wait_for_owned_process(
 }
 
 enum ProcessWorkerOutcome {
+    UnverifiedStartupFailure(crate::session_worker::startup_failure::WorkerOutput),
+    VerifiedStartupFailure(WorkerResult),
     OperatorVerifiedFinished(process_terminal::operator::VerifiedOperatorWorkerCompletion),
     OperatorInterrupted {
         detail: String,
@@ -7687,6 +7981,8 @@ struct OwnedProcessGroup {
     termination_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     skip_signal: bool,
+    #[cfg(test)]
+    protocol_diagnostic: Option<Arc<parking_lot::Mutex<TestWorkerProtocolDiagnostic>>>,
 }
 
 impl OwnedProcessGroup {
@@ -7705,6 +8001,8 @@ impl OwnedProcessGroup {
                 termination_calls: None,
                 #[cfg(test)]
                 skip_signal: false,
+                #[cfg(test)]
+                protocol_diagnostic: None,
             })
         }
         #[cfg(not(unix))]
@@ -7716,6 +8014,8 @@ impl OwnedProcessGroup {
                 termination_calls: None,
                 #[cfg(test)]
                 skip_signal: false,
+                #[cfg(test)]
+                protocol_diagnostic: None,
             })
         }
     }
@@ -7752,6 +8052,20 @@ impl OwnedProcessGroup {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn observe_reap(&self, status: std::process::ExitStatus) {
+        if let Some(diagnostic) = &self.protocol_diagnostic {
+            let mut diagnostic = diagnostic.lock();
+            diagnostic.reap_confirmed = true;
+            diagnostic.exit_code = status.code();
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                diagnostic.exit_signal = status.signal();
+            }
+        }
+    }
+
     const fn disarm(&mut self) {
         self.armed = false;
     }
@@ -7764,6 +8078,7 @@ impl OwnedProcessGroup {
             armed: true,
             termination_calls: Some(termination_calls),
             skip_signal: true,
+            protocol_diagnostic: None,
         }
     }
 
@@ -8006,11 +8321,53 @@ async fn run_spawned_child_lifecycle(
     steer: Option<WorkerSteerPipe>,
     progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
     #[cfg(test)] panic_before_wait: bool,
+    #[cfg(test)] protocol: Option<&TestWorkerProtocolControl>,
 ) -> anyhow::Result<OwnedProcessPhase> {
     use tokio::io::AsyncWriteExt;
 
     // The manifest is line 1 of the worker's stdin. Unlike before, the pipe is
     // then kept open for the life of the run so steer frames can follow it.
+    #[cfg(test)]
+    let mut held_stdin = None;
+    #[cfg(test)]
+    let _steer_pump = if let Some(control) = protocol {
+        assert!(payload.len() < 3072, "fixture manifest line exceeds stdin precondition");
+        let mut pipe = child.stdin.take().context("worker protocol stdin missing")?;
+        pipe.write_all(payload.as_bytes()).await?;
+        pipe.write_all(b"\n").await?;
+        pipe.flush().await?;
+        match control.case {
+            TestWorkerProtocolCase::HoldAfterThreeSteers => {
+                for message in ["first steer", "second steer", "third steer"] {
+                    let frame = serde_json::to_string(&WorkerControlFrame::Steer {
+                        message: message.to_owned(),
+                    })?;
+                    assert!(frame.len() < 256, "fixture steer line exceeds stdin precondition");
+                    pipe.write_all(frame.as_bytes()).await?;
+                    pipe.write_all(b"\n").await?;
+                }
+                pipe.flush().await?;
+                held_stdin = Some(pipe);
+            }
+            TestWorkerProtocolCase::CloseAfterManifest => drop(pipe),
+        }
+        None
+    } else if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        steer.map(|steer| {
+            AbortOnDrop(tokio::spawn(pump_worker_steer_frames(
+                stdin,
+                steer.steer_rx,
+                steer.history,
+                steer.run_id,
+            )))
+        })
+    } else {
+        None
+    };
+    #[cfg(not(test))]
     let _steer_pump = if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(payload.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
@@ -8050,7 +8407,28 @@ async fn run_spawned_child_lifecycle(
     #[cfg(test)]
     assert!(!panic_before_wait, "injected owned-child lifecycle panic");
 
-    run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await
+    #[cfg(not(test))]
+    {
+        run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await
+    }
+    #[cfg(test)]
+    {
+        let phase = run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await?;
+        #[cfg(test)]
+        if let (Some(control), OwnedProcessPhase::Exited { status, stdout, stderr }) = (protocol, &phase) {
+            let mut terminal = control.terminal.lock();
+            anyhow::ensure!(terminal.is_none(), "duplicate worker terminal observation");
+            *terminal = Some(TestWorkerProtocolTerminal {
+                status: *status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                stdin_held_through_reap: held_stdin.is_some(),
+            });
+        }
+        #[cfg(test)]
+        drop(held_stdin);
+        Ok(phase)
+    }
 }
 
 async fn cleanup_owned_child_after_panic(
@@ -8064,7 +8442,11 @@ async fn cleanup_owned_child_after_panic(
         return hold_unresolved_child_ownership(child, "injected panic-cleanup try_wait error").await;
     }
     match child.try_wait() {
-        Ok(Some(_)) => {
+        Ok(Some(status)) => {
+            #[cfg(not(test))]
+            let _ = status;
+            #[cfg(test)]
+            process_group.observe_reap(status);
             relinquish_process_group_after_leader_exit(process_group);
             Ok(())
         }
@@ -8220,6 +8602,33 @@ async fn run_sub_agent_process(
         );
     }
     let worker_workspace = worker_workspace_root.join(run_id);
+    #[cfg(all(test, unix))]
+    {
+        if let Some(artifact) = test_worker_executable.filter(|artifact| artifact.protocol.is_some()) {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            artifact.verify()?;
+            let home = std::fs::canonicalize(&artifact.private_home)?;
+            let root = std::fs::canonicalize(worker_workspace_root)?;
+            anyhow::ensure!(
+                root != home && root.starts_with(&home),
+                "protocol workspace root must be inside owned private HOME"
+            );
+            for path in [&home, &root] {
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(path)?.permissions().mode() & 0o777 == 0o700,
+                    "protocol HOME and workspace root must be private"
+                );
+            }
+            std::fs::DirBuilder::new().mode(0o700).create(&worker_workspace)?;
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&worker_workspace)?.permissions().mode() & 0o777 == 0o700,
+                "protocol worker workspace must be private at creation"
+            );
+        } else {
+            std::fs::create_dir_all(&worker_workspace)?;
+        }
+    }
+    #[cfg(any(not(test), not(unix)))]
     std::fs::create_dir_all(&worker_workspace)?;
     let shared_memory_db_path = shared_worker_memory_db_path(logical_workspace_root);
     let worker_memory_db_path = private_worker_memory_db_path(&worker_workspace);
@@ -8363,8 +8772,39 @@ async fn run_sub_agent_process(
     #[cfg(unix)]
     command.process_group(0);
 
+    #[cfg(unix)]
+    let mut prepared_manifest = crate::session_worker::manifest_reference::PreparedManifest::prepare(
+        &manifest,
+        &source_transport_key.clone().unwrap_or_else(session_worker_signing_key),
+        capability_expiry,
+    )?;
+    #[cfg(unix)]
+    let payload = prepared_manifest.line().to_owned();
+    #[cfg(not(unix))]
     let payload = serde_json::to_string(&manifest)?;
+    #[cfg(test)]
+    let protocol = test_worker_executable.and_then(|artifact| artifact.protocol.as_deref());
+    #[cfg(test)]
+    if let Some(control) = protocol {
+        control.claim()?;
+        control.check_serialized_precondition(&payload)?;
+    }
     let mut child = command.spawn()?;
+    #[cfg(unix)]
+    prepared_manifest.mark_spawned();
+    #[cfg(test)]
+    if let Some(control) = protocol {
+        let mut diagnostic = control.diagnostic.lock();
+        diagnostic.spawned = true;
+        diagnostic.pid = child.id();
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            let (pgid, start, class) = test_worker_process_identity(pid);
+            diagnostic.actual_pgid = pgid;
+            diagnostic.start_identity = start;
+            diagnostic.identity_class = Some(class);
+        }
+    }
     // Ledger row for the worker process itself, carrying the process group so a
     // kill reaches anything the worker forks. Its parent resolves to the
     // sub-agent row, because this future runs inside that row's scope.
@@ -8377,13 +8817,33 @@ async fn run_sub_agent_process(
     let worker_pgid: Option<i32> = None;
     let mut worker_registration =
         crate::runtime::registry::register_process(&format!("session-worker {run_id}"), child.id(), worker_pgid);
+    #[cfg(test)]
+    if let Some(control) = protocol {
+        control.diagnostic.lock().registry_id = Some(worker_registration.id().raw());
+    }
     let mut process_group = match OwnedProcessGroup::from_child(&child) {
         Ok(group) => group,
         Err(error) => {
-            start_kill_and_reap_direct_child(&mut child)
+            let status = start_kill_and_reap_direct_child(&mut child)
                 .await
                 .map_err(|cleanup_error| anyhow::anyhow!("{error}; direct-child cleanup failed: {cleanup_error}"))?;
+            #[cfg(not(test))]
+            let _ = status;
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.observe_reap_status(status);
+            }
             worker_registration.mark_reaped();
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.diagnostic.lock().registration_marked_reaped = true;
+            }
+            #[cfg(unix)]
+            prepared_manifest.close().map_err(|cleanup_error| {
+                anyhow::anyhow!(
+                    "session-worker process group setup failed: {error}; snapshot cleanup failed: {cleanup_error}"
+                )
+            })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -8391,6 +8851,11 @@ async fn run_sub_agent_process(
             return Err(error);
         }
     };
+    #[cfg(test)]
+    if let Some(control) = protocol {
+        process_group.termination_calls = Some(Arc::clone(&control.termination_calls));
+        process_group.protocol_diagnostic = Some(Arc::clone(&control.diagnostic));
+    }
     let owned_phase = std::panic::AssertUnwindSafe(async {
         if let Some(recovery) = recovery {
             recovery
@@ -8422,6 +8887,32 @@ async fn run_sub_agent_process(
             )
             .await?;
         }
+        #[cfg(test)]
+        if let Some(control) = protocol {
+            if operator_generation.is_some() {
+                control.diagnostic.lock().launch_persisted = true;
+            }
+            anyhow::ensure!(
+                operator_generation.is_some()
+                    && manifest.operator_source.is_some()
+                    && manifest.memory_event_recording.enabled
+                    && manifest.memory_event_recording.record_user_messages,
+                "stdin protocol control requires a recorded operator launch"
+            );
+            let artifact = test_worker_executable.context("worker protocol artifact missing")?;
+            let home = std::fs::canonicalize(&artifact.private_home)?;
+            let config_dir = std::fs::canonicalize(&manifest.config_dir)?;
+            anyhow::ensure!(
+                config_dir != home && config_dir.starts_with(&home),
+                "protocol config must be inside owned private HOME"
+            );
+            let config_path = config_dir.join("config.toml");
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&config_path)?.file_type().is_file(),
+                "protocol config must be a regular file"
+            );
+            std::fs::remove_file(config_path)?;
+        }
         run_spawned_child_lifecycle(
             &mut child,
             &mut process_group,
@@ -8435,6 +8926,8 @@ async fn run_sub_agent_process(
             Some(progress),
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            protocol,
         )
         .await
     })
@@ -8453,10 +8946,27 @@ async fn run_sub_agent_process(
                 false,
             )
             .await;
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                let mut diagnostic = control.diagnostic.lock();
+                diagnostic.lifecycle_class = Some("lifecycle_error");
+                diagnostic.panic_cleanup_class = Some(match &cleanup {
+                    Ok(()) => "cleanup_returned_ok",
+                    Err(error) => test_worker_cleanup_error_class(error),
+                });
+            }
             cleanup.map_err(|cleanup_error| {
                 anyhow::anyhow!("session-worker lifecycle failed: {error}; cleanup failed: {cleanup_error}")
             })?;
             worker_registration.mark_reaped();
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.diagnostic.lock().registration_marked_reaped = true;
+            }
+            #[cfg(unix)]
+            prepared_manifest.close().map_err(|cleanup_error| {
+                anyhow::anyhow!("session-worker lifecycle failed: {error}; snapshot cleanup failed: {cleanup_error}")
+            })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -8471,8 +8981,25 @@ async fn run_sub_agent_process(
                 false,
             )
             .await;
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                let mut diagnostic = control.diagnostic.lock();
+                diagnostic.lifecycle_class = Some("monitor_panic");
+                diagnostic.panic_cleanup_class = Some(match &cleanup {
+                    Ok(()) => "cleanup_returned_ok",
+                    Err(error) => test_worker_cleanup_error_class(error),
+                });
+            }
             cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error}"))?;
             worker_registration.mark_reaped();
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.diagnostic.lock().registration_marked_reaped = true;
+            }
+            #[cfg(unix)]
+            prepared_manifest.close().map_err(|cleanup_error| {
+                anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; snapshot cleanup failed: {cleanup_error}")
+            })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -8483,6 +9010,12 @@ async fn run_sub_agent_process(
     let (status, stdout, stderr) = match owned_phase {
         OwnedProcessPhase::Exited { status, stdout, stderr } => {
             worker_registration.mark_reaped();
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.diagnostic.lock().registration_marked_reaped = true;
+            }
+            #[cfg(unix)]
+            prepared_manifest.close()?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -8490,6 +9023,12 @@ async fn run_sub_agent_process(
         }
         OwnedProcessPhase::Terminated(reason) => {
             worker_registration.mark_reaped();
+            #[cfg(test)]
+            if let Some(control) = protocol {
+                control.diagnostic.lock().registration_marked_reaped = true;
+            }
+            #[cfg(unix)]
+            prepared_manifest.close()?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -8607,6 +9146,30 @@ async fn run_sub_agent_process(
             }
         }
         match outcome? {
+            ProcessWorkerOutcome::UnverifiedStartupFailure(envelope) => {
+                anyhow::ensure!(
+                    child_source.is_none() && ordinary_generation.is_none(),
+                    "startup failure requires the original operator launch"
+                );
+                let generation = operator_generation
+                    .as_ref()
+                    .context("operator startup generation missing")?;
+                let key = source_transport_key
+                    .as_ref()
+                    .context("operator startup transport key missing")?;
+                // Authenticate the retained launch snapshot, not mutable post-launch disk state.
+                process_terminal::operator::verify_startup_failure(
+                    source_fabric.context("operator startup source storage missing")?,
+                    &manifest,
+                    generation,
+                    key,
+                    &envelope,
+                )
+                .await?;
+                // This branch is reached only after OwnedProcessPhase::Exited and
+                // mark_reaped above; terminated/unconfirmed owners return earlier.
+                Ok(ProcessWorkerOutcome::VerifiedStartupFailure(envelope.result))
+            }
             ProcessWorkerOutcome::Finished(result) => {
                 if let Some((grant, input, _)) = child_source {
                     anyhow::ensure!(
@@ -8694,13 +9257,19 @@ fn classify_worker_output(
         )));
     }
 
-    let parsed: WorkerResult = serde_json::from_str(stdout_raw).map_err(|error| {
-        anyhow::anyhow!(
-            "Failed to parse session-worker output: {error}; status={:?}; stderr={stderr_raw}",
-            status.code(),
-        )
-    })?;
+    let envelope: crate::session_worker::startup_failure::WorkerOutput =
+        serde_json::from_str(stdout_raw).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to parse session-worker output: {error}; status={:?}; stderr={stderr_raw}",
+                status.code(),
+            )
+        })?;
 
+    if envelope.authenticated_startup_failure.is_some() {
+        anyhow::ensure!(status.success(), "startup failure envelope requires clean owned exit");
+        return Ok(ProcessWorkerOutcome::UnverifiedStartupFailure(envelope));
+    }
+    let parsed = envelope.result;
     if !status.success() && parsed.success {
         return Err(anyhow::anyhow!(
             "session-worker exited with status {:?} despite success result",
@@ -9426,6 +9995,73 @@ mod tests {
         }
     }
 
+    /// Q71: derive only the approved parent metadata from the original fixture.
+    fn preconstruction_parent_config(tool: &SessionsSpawnTool, workspace: &std::path::Path) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.config_path = workspace.join("config.toml");
+        config.default_provider = Some(tool.provider_name.clone());
+        config.default_model = Some(tool.model.clone());
+        config.agents = tool.agents.as_ref().clone();
+        config.providers.models.push(
+            serde_json::from_value(json!({
+                "provider": tool.provider_name, "model": tool.model,
+                "operations": ["chat"], "native_tools": true
+            }))
+            .expect("test: approved parent model metadata"),
+        );
+        config.cost.prices.insert(
+            format!("{}/{}", tool.provider_name, tool.model),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config
+    }
+
+    /// Dispatch through the existing Q68 real Chat/default-Builtin source seam.
+    /// Child arguments, security, provider Arc and per-case configuration remain original.
+    async fn dispatch_preconstruction_parent(
+        tool: SessionsSpawnTool,
+        config: crate::config::Config,
+        memory: Arc<dyn Memory>,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+        cleanup
+            .run(Box::pin(async move {
+                let provider = Arc::clone(&tool.provider);
+                let security = Arc::clone(&tool.security);
+                let workspace = config.workspace_dir.clone();
+                // Q71 hybrid is deliberately invalid for persistence; publish the
+                // original in-memory fixture so only actual dispatch can reject it.
+                assert!(!config.config_path.exists());
+                let generation = crate::config::new_shared(config).pin();
+                let tools_handle = tool.tools_handle();
+                let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
+                assert!(tools_handle.set(&registry));
+                crate::chat::decision_source::admission_failure_tests::dispatch_unknown_agent_fixture(
+                    crate::runtime::turn_publication::TurnDecisionPublication {
+                        generation,
+                        registry,
+                        mcp_tool: None,
+                        security,
+                        observer: Arc::new(NoopObserver),
+                        hooks: Arc::new(HookManager::new(workspace)),
+                        memory,
+                        plugin_generation: 0,
+                    },
+                    provider,
+                    arguments,
+                )
+                .await
+            }))
+            .await
+    }
+
     fn make_tool(channel: Arc<dyn Channel>, provider: Arc<dyn crate::providers::Provider>) -> SessionsSpawnTool {
         make_tool_with_security_and_spawn_config(
             channel,
@@ -9701,7 +10337,7 @@ mod tests {
             "the spawning surface's hidden set has to cross the process boundary"
         );
         let (open, open_seal, _) = build(&[]);
-        assert!(open.channel_excluded_tools.is_empty());
+        assert!(open.channel_excluded_tools.is_empty(), "expected an empty value");
         assert_ne!(
             sealed, open_seal,
             "the exclusions are covered by the capability seal, so they cannot be stripped in transit"
@@ -9759,7 +10395,7 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
         assert_eq!(tool.name(), "sessions_spawn");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
         assert!(tool.description().contains("history"));
         assert!(tool.description().contains("steer"));
     }
@@ -9957,7 +10593,10 @@ mod tests {
         // An omitted action selects 'spawn', so 'task' is still required.
         let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
         assert!(implicit.iter().any(|issue| issue.path == "$.task"));
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"task": "do it"})).is_empty());
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"task": "do it"})).is_empty(),
+            "expected an empty value"
+        );
         assert!(enum_strs.contains(&"steer"));
     }
 
@@ -9998,7 +10637,12 @@ mod tests {
     async fn empty_task_returns_failure() {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-        let result = tool.execute(json!({"task": "   "})).await.unwrap();
+        let workspace = tempfile::tempdir().expect("test: parent workspace");
+        let config = preconstruction_parent_config(&tool, workspace.path());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(tool, config, memory, json!({"task": "   "}))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("must not be empty"));
     }
@@ -11383,53 +12027,246 @@ mod tests {
     /// `Some(parent)` as model-origin (see `SessionOrigin::from_parent_run_id`,
     /// asserted in the chat-side `model.rs` tests, which can reach that module).
     #[tokio::test]
-    async fn model_spawn_within_turn_scope_captures_parent_run_id() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+    async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let result = SPAWN_EXECUTION_CONTEXT
-            .scope(
-                SpawnExecutionContext::seed_turn_context("turn-run-xyz".to_string(), "chat:session-1".to_string()),
-                async { tool.execute(with_spawn_grant(json!({"task": "model child"}))).await },
-            )
-            .await
-            .unwrap();
-        assert!(result.success, "spawn inside a turn scope must succeed");
-
-        let runs = tool.active_runs_snapshot().await;
-        let child = runs.first().expect("the spawned child run must be registered");
-        assert_eq!(
-            child.parent_run_id.as_deref(),
-            Some("turn-run-xyz"),
-            "child captured the per-turn run id as parent before the spawn boundary (=> model origin)"
-        );
+        let workspace = tempfile::tempdir()?;
+        use futures_util::FutureExt as _;
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let parent_calls = Arc::new(AtomicUsize::new(0));
+        let child_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let serving_phase = Arc::clone(&phase);
+        let serving_parent_calls = Arc::clone(&parent_calls);
+        let serving_child_calls = Arc::clone(&child_calls);
+        let app = axum::Router::new().route("/api/chat", axum::routing::post(
+            move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let phase = Arc::clone(&serving_phase);
+                let parent_calls = Arc::clone(&serving_parent_calls);
+                let child_calls = Arc::clone(&serving_child_calls);
+                async move {
+                    if request.get("model").and_then(serde_json::Value::as_str) != Some("prx-parent-spawn-model") {
+                        return Err(axum::http::StatusCode::BAD_REQUEST);
+                    }
+                    let message = match phase.load(Ordering::SeqCst) {
+                        0 => {
+                            let has_spawn = request.get("tools").and_then(serde_json::Value::as_array)
+                                .is_some_and(|tools| tools.iter().any(|tool| tool.get("function").and_then(|f| f.get("name")).and_then(serde_json::Value::as_str) == Some("sessions_spawn")));
+                            let original_input = request.get("messages").and_then(serde_json::Value::as_array)
+                                .and_then(|messages| messages.last()).and_then(|m| m.get("content")).and_then(serde_json::Value::as_str) == Some("spawn model child");
+                            if !has_spawn || !original_input || phase.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                                return Err(axum::http::StatusCode::BAD_REQUEST);
+                            }
+                            parent_calls.fetch_add(1, Ordering::SeqCst);
+                            json!({"role":"assistant", "content":"", "tool_calls":[{"function":{"name":"sessions_spawn", "arguments":{"task":"model child"}}}]})
+                        }
+                        2 => {
+                            child_calls.fetch_add(1, Ordering::SeqCst);
+                            json!({"role":"assistant", "content":"ok"})
+                        }
+                        _ => return Err(axum::http::StatusCode::CONFLICT),
+                    };
+                    Ok(axum::Json(json!({"model":"prx-parent-spawn-model", "done":true, "message":message})))
+                }
+            }
+        ));
+        let mut server = TaskTraceServer(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let work = async {
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+            cleanup.run(Box::pin(async {
+                let mut config = crate::config::Config::default();
+                config.workspace_dir = workspace.path().to_path_buf();
+                config.config_path = workspace.path().join("config.toml");
+                config.default_provider = Some("ollama".to_owned());
+                config.default_model = Some("prx-parent-spawn-model".to_owned());
+                config.api_url = Some(endpoint);
+                config.reliability.provider_retries = 0;
+                config.cost.prices.insert("ollama/prx-parent-spawn-model".to_owned(), crate::config::schema::ModelPricing {
+                    input:1.0, output:1.0, cache_write:1.0, cache_read:1.0,
+                });
+                config.providers.models.push(serde_json::from_value(json!({
+                    "provider": "ollama", "model": "prx-parent-spawn-model", "operations": ["chat"], "native_tools": true
+                }))?);
+                config.save().await?;
+                let generation = crate::config::new_shared(config).pin();
+                let config = &generation.effective;
+                let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+                let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+                let model_catalog = crate::providers::selection::catalog_for(config);
+                let resolved = crate::providers::selection::check(config, "ollama", "prx-parent-spawn-model",
+                    &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+                    crate::providers::catalog::UnknownPolicy::Invocation)?;
+                let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
+                    &resolved, &model_catalog, &config.reliability, &crate::providers::provider_runtime_options_from_config(config),
+                )?);
+                let (channel, _) = NamedRecordingChannel::new("terminal");
+                let tool = SessionsSpawnTool::new(
+                    channel,
+                    Arc::clone(&provider),
+                    "ollama",
+                    "prx-parent-spawn-model",
+                    0.7,
+                    Arc::clone(&security),
+                    workspace.path().to_path_buf(),
+                    config.multimodal.clone(),
+                    config.agent.compaction.clone(),
+                    config.agents_with_references().into_owned(),
+                    None,
+                    crate::providers::provider_runtime_options_from_config(config),
+                    config.sessions_spawn.clone(),
+                )
+                .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
+                .with_model_catalog(crate::providers::selection::catalog_for(config))
+                .with_hint_config(config)
+                .with_shared_memory(Arc::clone(&memory))
+                .with_event_recording(config.memory.event_recording_config());
+                tool.set_default_recipient(Some("test-recipient".to_string())).await;
+                let runs = tool.active_runs_arc();
+                let tools_handle = tool.tools_handle();
+                let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
+                assert!(tools_handle.set(&registry));
+                let result = SPAWN_EXECUTION_CONTEXT
+                    .scope(
+                        SpawnExecutionContext::seed_turn_context(
+                            "turn-run-xyz".to_string(),
+                            "chat:session-1".to_string(),
+                        ),
+                        crate::chat::decision_source::admission_failure_tests::dispatch_recorded_model_spawn(
+                            crate::runtime::turn_publication::TurnDecisionPublication {
+                                generation: Arc::clone(&generation),
+                                registry: Arc::clone(&registry),
+                                mcp_tool: None,
+                                security,
+                                observer: Arc::new(NoopObserver),
+                                hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
+                                memory,
+                                plugin_generation: 0,
+                            },
+                            provider,
+                            with_spawn_grant(json!({"task": "model child"})),
+                            Arc::clone(&phase),
+                        ),
+                    )
+                    .await?;
+                assert!(result.success, "spawn inside a turn scope must succeed");
+                assert_eq!(parent_calls.load(Ordering::SeqCst), 1);
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    loop {
+                        if runs.read().await.first().is_some_and(|run| matches!(&run.status, SubAgentStatus::Completed(_) | SubAgentStatus::Failed(_))) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await?;
+                assert!(child_calls.load(Ordering::SeqCst) > 0, "actual child provider request required");
+                let runs = runs.read().await;
+                let child = runs.first().expect("the spawned child run must be registered");
+                assert_eq!(
+                    child.parent_run_id.as_deref(),
+                    Some("turn-run-xyz"),
+                    "child captured the per-turn run id as parent before the spawn boundary (=> model origin)"
+                );
+                Ok::<_, anyhow::Error>(())
+            })).await
+        };
+        let result = std::panic::AssertUnwindSafe(work).catch_unwind().await;
+        server.0.abort();
+        let _ = (&mut server.0).await;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
-    /// Bug-V5-1 complement: a `sessions_spawn` call made with **no**
-    /// `SPAWN_EXECUTION_CONTEXT` in scope (the operator `/bg` slash-command path,
-    /// dispatched outside the turn tool-loop scope) carries no `parent_run_id`,
-    /// which the chat projection reads as user-origin.
+    /// Local operator spawns inherit their authenticated source run even without
+    /// an ambient model-turn spawn context.
     #[tokio::test]
-    async fn user_spawn_without_scope_has_no_parent_run_id() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+    async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> anyhow::Result<()> {
+        use crate::runtime::turn_source::TurnSourceProof as _;
 
-        // No `.scope(...)` wrapper: the task-local is absent, exactly as on the
-        // operator slash-command path.
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "operator child"})))
+        let workspace = tempfile::tempdir()?;
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+        cleanup
+            .run(Box::pin(async {
+                let mut config = crate::config::Config::default();
+                config.workspace_dir = workspace.path().to_path_buf();
+                config.config_path = workspace.path().join("config.toml");
+                config.default_provider = Some("ollama".to_owned());
+                config.default_model = Some("prx-local-model".to_owned());
+                config.providers.models.push(serde_json::from_value(json!({
+                    "provider": "ollama", "model": "prx-local-model", "operations": ["chat"]
+                }))?);
+                config.save().await?;
+                let generation = crate::config::new_shared(config).pin();
+                let config = &generation.effective;
+                let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+                let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+                let provider: Arc<dyn Provider> = Arc::new(EchoProvider { response: "ok".into() });
+                let (channel, _) = NamedRecordingChannel::new("terminal");
+                let tool = SessionsSpawnTool::new(
+                    channel,
+                    Arc::clone(&provider),
+                    "ollama",
+                    "prx-local-model",
+                    0.7,
+                    Arc::clone(&security),
+                    workspace.path().to_path_buf(),
+                    config.multimodal.clone(),
+                    config.agent.compaction.clone(),
+                    config.agents_with_references().into_owned(),
+                    None,
+                    crate::providers::provider_runtime_options_from_config(config),
+                    config.sessions_spawn.clone(),
+                )
+                .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
+                .with_model_catalog(crate::providers::selection::catalog_for(config))
+                .with_hint_config(config)
+                .with_shared_memory(Arc::clone(&memory))
+                .with_event_recording(config.memory.event_recording_config());
+                tool.set_default_recipient(Some("test-recipient".to_string())).await;
+                let runs = tool.active_runs_arc();
+                let tools_handle = tool.tools_handle();
+                let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
+                assert!(tools_handle.set(&registry));
+                assert!(current_spawn_execution_context().is_none());
+                let (args, source) =
+                    crate::chat::decision_source::admission_failure_tests::recorded_local_operator_spawn(
+                        crate::runtime::turn_publication::TurnDecisionPublication {
+                            generation: Arc::clone(&generation),
+                            registry: Arc::clone(&registry),
+                            mcp_tool: None,
+                            security,
+                            observer: Arc::new(NoopObserver),
+                            hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
+                            memory,
+                            plugin_generation: 0,
+                        },
+                        provider,
+                        "operator child",
+                    )
+                    .await?;
+                let expected_parent = source.proof().run_id().to_owned();
+                source
+                    .scope(async {
+                        assert!(current_spawn_execution_context().is_none());
+                        let result = registry
+                            .first()
+                            .expect("spawn tool is published")
+                            .execute(with_spawn_grant(args))
+                            .await?;
+                        assert!(result.success);
+                        assert!(current_spawn_execution_context().is_none());
+                        let runs = runs.read().await;
+                        let child = runs.first().expect("the spawned child run must be registered");
+                        assert_eq!(child.parent_run_id.as_deref(), Some(expected_parent.as_str()));
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            }))
             .await
-            .unwrap();
-        assert!(result.success);
-
-        let runs = tool.active_runs_snapshot().await;
-        let child = runs.first().expect("the spawned child run must be registered");
-        assert_eq!(
-            child.parent_run_id, None,
-            "no spawn-execution context means no parent_run_id (=> user origin)"
-        );
     }
 
     #[tokio::test]
@@ -12233,31 +13070,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_rejects_unknown_agent() {
-        let (ch, _) = RecordingChannel::new();
-        let mut agents = HashMap::new();
-        agents.insert("alpha".to_string(), make_agent_config(None));
-        let tool = SessionsSpawnTool::new(
-            Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            "test-provider",
-            "test-model",
-            0.7,
-            test_security(),
-            std::path::PathBuf::from("/tmp"),
-            crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
-            agents,
-            None,
-            crate::providers::ProviderRuntimeOptions::default(),
-            crate::config::SessionsSpawnConfig::default(),
-        );
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "hello", "agent": "missing"})))
+    async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+        cleanup
+            .run(Box::pin(async {
+                let (ch, _) = RecordingChannel::new();
+                let mut agents = HashMap::new();
+                agents.insert("alpha".to_string(), make_agent_config(None));
+                let provider: Arc<dyn Provider> = Arc::new(EchoProvider { response: "ok".into() });
+                let mut config = crate::config::Config::default();
+                config.workspace_dir = workspace.path().to_path_buf();
+                config.config_path = workspace.path().join("config.toml");
+                config.default_provider = Some("test-provider".to_owned());
+                config.default_model = Some("test-model".to_owned());
+                config.agents = agents.clone();
+                config.providers.models.push(serde_json::from_value(json!({
+                    "provider": "test-provider", "model": "test-model", "operations": ["chat"],
+                    "native_tools": true
+                }))?);
+                config.cost.prices.insert(
+                    "test-provider/test-model".to_owned(),
+                    crate::config::schema::ModelPricing {
+                        input: 1.0,
+                        output: 1.0,
+                        cache_write: 1.0,
+                        cache_read: 1.0,
+                    },
+                );
+                config.save().await?;
+                let generation = crate::config::new_shared(config).pin();
+                let security = test_security();
+                let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+                let tool = SessionsSpawnTool::new(
+                    Arc::new(ch),
+                    Arc::clone(&provider),
+                    "test-provider",
+                    "test-model",
+                    0.7,
+                    Arc::clone(&security),
+                    std::path::PathBuf::from("/tmp"),
+                    crate::config::MultimodalConfig::default(),
+                    crate::config::AgentCompactionConfig::default(),
+                    agents,
+                    None,
+                    crate::providers::ProviderRuntimeOptions::default(),
+                    crate::config::SessionsSpawnConfig::default(),
+                );
+                let tools_handle = tool.tools_handle();
+                let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
+                assert!(tools_handle.set(&registry));
+                assert_eq!(generation.effective.agents.len(), 1);
+                assert!(generation.effective.agents.contains_key("alpha"));
+                assert!(!generation.effective.agents.contains_key("missing"));
+                let result = crate::chat::decision_source::admission_failure_tests::dispatch_unknown_agent_fixture(
+                    crate::runtime::turn_publication::TurnDecisionPublication {
+                        generation,
+                        registry,
+                        mcp_tool: None,
+                        security,
+                        observer: Arc::new(NoopObserver),
+                        hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
+                        memory,
+                        plugin_generation: 0,
+                    },
+                    provider,
+                    with_spawn_grant(json!({"task": "hello", "agent": "missing"})),
+                )
+                .await?;
+                assert!(!result.success);
+                assert!(result.error.unwrap_or_default().contains("Unknown agent"));
+                Ok(())
+            }))
             .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Unknown agent"));
     }
 
     #[tokio::test]
@@ -12282,10 +13167,17 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "hello", "agent": "alpha"})))
-            .await
-            .unwrap();
+        let workspace = tempfile::tempdir().expect("test: parent workspace");
+        let config = preconstruction_parent_config(&tool, workspace.path());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "hello", "agent": "alpha"})),
+        )
+        .await
+        .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("spawn_enabled=false"));
     }
@@ -12447,14 +13339,22 @@ mod tests {
         )
         .with_shared_memory(memory.clone());
 
-        let error = tool
-            .execute(json!({"task": "must not start", "mode": "process"}))
-            .await
-            .unwrap_err()
-            .to_string();
+        let mut config = preconstruction_parent_config(&tool, tmp.path());
+        config.sessions_spawn.process_memory_strategy = "hybrid".to_string();
+        let runs = tool.active_runs_arc();
+        let error = dispatch_preconstruction_parent(
+            tool,
+            config,
+            Arc::clone(&memory),
+            json!({"task": "must not start", "mode": "process"}),
+        )
+        .await
+        .unwrap_err()
+        .root_cause()
+        .to_string();
 
         assert_eq!(error, crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE);
-        assert!(tool.active_runs_snapshot().await.is_empty());
+        assert!(runs.read().await.is_empty());
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
@@ -12609,6 +13509,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         ))
         .catch_unwind()
         .await;
@@ -13358,6 +14259,7 @@ mod tests {
             None,
             Some(progress),
             false,
+            None,
         )
         .await
         .expect("the lifecycle observes the child's death");
@@ -16137,10 +17039,22 @@ mod tests {
         }]);
         let tool = containment_tool(&temp, agents, "test-provider", None).with_model_catalog(catalog);
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "agent": "a"})))
-            .await
-            .expect("test: spawn returns a tool result");
+        let mut config = preconstruction_parent_config(&tool, temp.path());
+        config.providers.models.push(
+            serde_json::from_value(json!({
+                "provider": own.custom_provider(), "model": "jev-decision-test", "operations": ["decision_endpoint"]
+            }))
+            .expect("test: original decision-only child catalog"),
+        );
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "a"})),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
         if result.success {
             own.wait_for_requests(1, std::time::Duration::from_secs(5)).await;
         }
@@ -16164,12 +17078,16 @@ mod tests {
         )]);
         let tool = containment_tool(&temp, agents, "test-provider", None);
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
-                "task": "probe", "agent": "a", "provider": foreign.custom_provider()
-            })))
-            .await
-            .expect("test: spawn returns a tool result");
+        let config = preconstruction_parent_config(&tool, temp.path());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "a", "provider": foreign.custom_provider()})),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
         if result.success {
             foreign.wait_for_requests(1, std::time::Duration::from_secs(5)).await;
         }

@@ -420,7 +420,7 @@ async fn build_agent_context_returns_structured_bundle() {
     );
     assert!(bundle.recent_shared_context.contains("gateway shared status"));
     assert!(bundle.semantic_memory_context.contains("user_msg_pref"));
-    assert!(!bundle.recalled_memory_ids.is_empty());
+    assert!(!bundle.recalled_memory_ids.is_empty(), "expected a non-empty value");
     assert!(bundle.preamble().contains("[Recent shared workspace events]"));
     assert!(bundle.preamble().contains("[Memory context]"));
 }

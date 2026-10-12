@@ -269,9 +269,18 @@ mod tests {
         let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
         let schema = tool.parameters_schema();
 
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunk_id": "id"})).is_empty());
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunkId": "id"})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunk_id": "id"})).is_empty(),
+            "expected an empty value"
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunkId": "id"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[tokio::test]

@@ -2213,9 +2213,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 .and_then(|variable| std::env::var(variable).ok())
                 .is_some_and(|value| !value.trim().is_empty())
             || (provider_name == "minimax"
-                && std::env::var("MINIMAX_OAUTH_TOKEN")
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()));
+                && std::env::var("MINIMAX_OAUTH_TOKEN").is_ok_and(|value| !value.trim().is_empty()));
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) = load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)? {
@@ -3312,7 +3310,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         return Ok::<_, reqwest::Error>((false, None, None));
                     }
 
-                    let payload: Value = resp.json().map_or(Value::Null, |payload| payload);
+                    let payload: Value = resp.json().unwrap_or(Value::Null);
                     let user_id = payload
                         .get("user_id")
                         .and_then(|value| value.as_str())
@@ -4780,10 +4778,10 @@ mod tests {
     #[test]
     fn project_context_default_is_empty() {
         let ctx = ProjectContext::default();
-        assert!(ctx.user_name.is_empty());
-        assert!(ctx.timezone.is_empty());
-        assert!(ctx.agent_name.is_empty());
-        assert!(ctx.communication_style.is_empty());
+        assert!(ctx.user_name.is_empty(), "expected an empty value");
+        assert!(ctx.timezone.is_empty(), "expected an empty value");
+        assert!(ctx.agent_name.is_empty(), "expected an empty value");
+        assert!(ctx.communication_style.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

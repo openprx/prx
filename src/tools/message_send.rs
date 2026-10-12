@@ -1339,7 +1339,7 @@ mod tests {
         let (ch, _) = DummyChannel::new();
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
         assert_eq!(tool.name(), "message_send");
-        assert!(!tool.description().is_empty());
+        assert!(!tool.description().is_empty(), "expected a non-empty value");
     }
 
     #[test]
@@ -1353,13 +1353,23 @@ mod tests {
         let required = schema["required"].as_array().unwrap();
         assert!(!required.iter().any(|v| v.as_str() == Some("action")));
         assert_eq!(schema["properties"]["action"]["default"], "send");
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send"})).is_empty());
-        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send"})).is_empty(),
+            "expected a non-empty value"
+        );
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            "expected a non-empty value"
+        );
         assert!(
             crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send", "message": "hello"}))
-                .is_empty()
+                .is_empty(),
+            "expected an empty value"
         );
-        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"message": "hello"})).is_empty());
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"message": "hello"})).is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// Both message_send schemas owe the model the same thing `cron` and
@@ -1388,21 +1398,24 @@ mod tests {
                 &schema,
                 &json!({"action": "send", "channel": "wacli", "target": "owner"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
         assert!(
             crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"action": "send", "channel": "wacli", "target": "owner", "message": "hello"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected an empty value"
         );
         assert!(
             !crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"action": "react", "channel": "wacli", "target": "owner", "message": "hello"})
             )
-            .is_empty()
+            .is_empty(),
+            "expected a non-empty value"
         );
     }
 

@@ -3427,7 +3427,7 @@ pub fn create_routed_provider_with_options(
     default_model: &str,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    create_routed_provider_with_pinned_root(
+    ProviderConnection::create_routed_provider_with_options(
         primary_name,
         &ProviderConnection {
             api_key,
@@ -3442,90 +3442,92 @@ pub fn create_routed_provider_with_options(
     )
 }
 
-pub(crate) fn create_routed_provider_with_pinned_root(
-    primary_name: &str,
-    connection: &ProviderConnection<'_>,
-    reliability: &crate::config::ReliabilityConfig,
-    model_routes: &[crate::config::ModelRouteConfig],
-    default_model: &str,
-    options: &ProviderRuntimeOptions,
-    pinned: Option<KeylessRoot<'_>>,
-) -> anyhow::Result<Box<dyn Provider>> {
-    let (api_key, api_url) = (connection.api_key, connection.api_url);
-    if model_routes.is_empty() {
-        return create_resilient_provider_with_pinned_root(
-            primary_name,
-            api_key,
-            api_url,
-            reliability,
-            options,
-            pinned,
-        );
-    }
-
-    // Collect unique provider names needed
-    let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
-        if !needed.iter().any(|n| n == &route.provider) {
-            needed.push(route.provider.clone());
+impl ProviderConnection<'_> {
+    pub(crate) fn create_routed_provider_with_options(
+        primary_name: &str,
+        connection: &Self,
+        reliability: &crate::config::ReliabilityConfig,
+        model_routes: &[crate::config::ModelRouteConfig],
+        default_model: &str,
+        options: &ProviderRuntimeOptions,
+        pinned: Option<KeylessRoot<'_>>,
+    ) -> anyhow::Result<Box<dyn Provider>> {
+        let (api_key, api_url) = (connection.api_key, connection.api_url);
+        if model_routes.is_empty() {
+            return create_resilient_provider_with_pinned_root(
+                primary_name,
+                api_key,
+                api_url,
+                reliability,
+                options,
+                pinned,
+            );
         }
-    }
 
-    // Rotation keys are extra credentials for the primary's root key. A route
-    // to a different provider identity gets the same retry settings without
-    // them, so one vendor's keys are never replayed against another.
-    // Create each provider (with its own resilience wrapper)
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-    for name in &needed {
-        let routed_credential = model_routes.iter().find(|r| &r.provider == name).and_then(|r| {
-            r.api_key.as_ref().and_then(|raw_key| {
-                let trimmed_key = raw_key.trim();
-                (!trimmed_key.is_empty()).then_some(trimmed_key)
-            })
-        });
-        let (connection, chain_reliability) =
-            routed_connection(name, primary_name, routed_credential, api_key, api_url, reliability);
-        let (key, url) = (connection.api_key, connection.api_url);
-        match create_resilient_provider_with_pinned_root(
-            name,
-            key,
-            url,
-            &chain_reliability,
-            options,
-            if name == primary_name { pinned } else { None },
-        ) {
-            Ok(provider) => providers.push((name.clone(), provider)),
-            Err(e) => {
-                if name == primary_name {
-                    return Err(e);
-                }
-                tracing::warn!(
-                    provider = %redact_endpoint_userinfo(name),
-                    "Ignoring routed provider that failed to initialize"
-                );
+        // Collect unique provider names needed
+        let mut needed: Vec<String> = vec![primary_name.to_string()];
+        for route in model_routes {
+            if !needed.iter().any(|n| n == &route.provider) {
+                needed.push(route.provider.clone());
             }
         }
+
+        // Rotation keys are extra credentials for the primary's root key. A route
+        // to a different provider identity gets the same retry settings without
+        // them, so one vendor's keys are never replayed against another.
+        // Create each provider (with its own resilience wrapper)
+        let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+        for name in &needed {
+            let routed_credential = model_routes.iter().find(|r| &r.provider == name).and_then(|r| {
+                r.api_key.as_ref().and_then(|raw_key| {
+                    let trimmed_key = raw_key.trim();
+                    (!trimmed_key.is_empty()).then_some(trimmed_key)
+                })
+            });
+            let (connection, chain_reliability) =
+                routed_connection(name, primary_name, routed_credential, api_key, api_url, reliability);
+            let (key, url) = (connection.api_key, connection.api_url);
+            match create_resilient_provider_with_pinned_root(
+                name,
+                key,
+                url,
+                &chain_reliability,
+                options,
+                if name == primary_name { pinned } else { None },
+            ) {
+                Ok(provider) => providers.push((name.clone(), provider)),
+                Err(e) => {
+                    if name == primary_name {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        provider = %redact_endpoint_userinfo(name),
+                        "Ignoring routed provider that failed to initialize"
+                    );
+                }
+            }
+        }
+
+        // Build route table
+        let routes: Vec<(String, router::Route)> = model_routes
+            .iter()
+            .map(|r| {
+                (
+                    r.hint.clone(),
+                    router::Route {
+                        provider_name: r.provider.clone(),
+                        model: r.model.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Box::new(router::RouterProvider::new(
+            providers,
+            routes,
+            default_model.to_string(),
+        )))
     }
-
-    // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
-        .iter()
-        .map(|r| {
-            (
-                r.hint.clone(),
-                router::Route {
-                    provider_name: r.provider.clone(),
-                    model: r.model.clone(),
-                },
-            )
-        })
-        .collect();
-
-    Ok(Box::new(router::RouterProvider::new(
-        providers,
-        routes,
-        default_model.to_string(),
-    )))
 }
 
 /// The connection and reliability a routed provider's chain is built with.
@@ -4206,6 +4208,21 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[test]
+    fn routed_factory_retains_public_function_pointer_signature() {
+        type OriginalFactory = for<'a, 'b, 'c, 'd, 'e, 'f, 'g> fn(
+            &'a str,
+            Option<&'b str>,
+            Option<&'c str>,
+            &'d crate::config::ReliabilityConfig,
+            &'e [crate::config::ModelRouteConfig],
+            &'f str,
+            &'g ProviderRuntimeOptions,
+        ) -> anyhow::Result<Box<dyn Provider>>;
+        fn assert_original_signature(_: OriginalFactory) {}
+        assert_original_signature(create_routed_provider_with_options);
+    }
 
     // ── Retry-After capture on the non-streaming error path ──────
 
@@ -6304,7 +6321,10 @@ Connection: close\r\n\
     #[test]
     fn extra_api_keys_empty_when_unset() {
         let reliability = crate::config::ReliabilityConfig::default();
-        assert!(extra_api_keys(&reliability, Some("sk-primary")).is_empty());
+        assert!(
+            extra_api_keys(&reliability, Some("sk-primary")).is_empty(),
+            "expected an empty value"
+        );
     }
 
     #[test]
@@ -7395,7 +7415,7 @@ mod credential_containment_tests {
             &reliability,
         );
         assert_eq!((foreign.api_key, foreign.api_url), (None, None));
-        assert!(chain.api_keys.is_empty());
+        assert!(chain.api_keys.is_empty(), "expected an empty value");
     }
 
     /// On the wire: a route spelling the primary endpoint differently is

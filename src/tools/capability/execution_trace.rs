@@ -1,5 +1,5 @@
 //! Bounded content-free observations from the actual execution service.
-use crate::causal_tree::store::{RecordedOutcomeAttempt, RecordedToolCall};
+use crate::causal_tree::store::{MAX_RECORDED_PROVIDER_ATTEMPTS, RecordedOutcomeAttempt, RecordedToolCall};
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
 use crate::tools::execution::ToolExecutionStatus;
 use parking_lot::Mutex;
@@ -10,7 +10,6 @@ mod exact_calls;
 use crate::causal_tree::state::exact_calls::ExactCallObservations;
 
 const MAX_CALLS: usize = 64;
-const MAX_PROVIDER_ATTEMPTS: usize = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -259,7 +258,7 @@ impl PendingProvider {
             return;
         };
         for attempt in attempts {
-            if state.provider_attempts.len() >= MAX_PROVIDER_ATTEMPTS {
+            if state.provider_attempts.len() >= MAX_RECORDED_PROVIDER_ATTEMPTS {
                 state.provider_attempts_incomplete = true;
                 break;
             }
@@ -355,7 +354,7 @@ impl ExecutionTraceSnapshot {
             || self.pending_attempts != 0
             || self.unbound_attempts != 0
             || recorded.is_empty()
-            || recorded.len() > MAX_PROVIDER_ATTEMPTS
+            || recorded.len() > MAX_RECORDED_PROVIDER_ATTEMPTS
             || self.provider_requests > recorded.len() as u64
             || outcome.attempts.is_empty()
             || outcome.attempts.len() > recorded.len()
@@ -469,7 +468,7 @@ mod silent_tests {
         }
         assert_eq!(snapshot.started_attempts, 0);
         assert_eq!(snapshot.successful_attempts, 0);
-        assert!(snapshot.calls.is_empty());
+        assert!(snapshot.calls.is_empty(), "expected an empty value");
         assert!(trace.record_authorized_silence().is_err());
         let mut changed = outcome.clone();
         changed.final_model = "prx_other_model".into();
@@ -488,6 +487,43 @@ mod silent_tests {
         forged = snapshot;
         forged.provider_pending = 1;
         assert!(!forged.confirms_silent(&outcome));
+    }
+
+    #[test]
+    fn provider_retention_preserves_counts_and_marks_overflow_without_authorizing_silence() {
+        let final_outcome = outcome();
+        let attempt = final_outcome
+            .attempts
+            .last()
+            .expect("actual successful fixture attempt");
+        for count in [128_u64, 129, 1001] {
+            let trace = ExecutionTrace::default();
+            for _ in 0..count {
+                trace
+                    .begin_provider()
+                    .expect("provider admission")
+                    .finish(Some(std::slice::from_ref(attempt)));
+            }
+            if count > 128 {
+                assert!(trace.record_authorized_silence().is_err());
+            }
+            let snapshot = trace.seal();
+            assert_eq!(snapshot.provider_requests, count);
+            assert_eq!(snapshot.provider_pending, 0);
+            assert_eq!(snapshot.provider_attempts_incomplete, count > 128);
+            let retained = snapshot.provider_attempts.as_ref().expect("actual observations");
+            assert_eq!(retained.len(), 128);
+            assert!(
+                retained
+                    .iter()
+                    .enumerate()
+                    .all(|(index, item)| item.seq == index as u32 + 1 && item.status == "success")
+            );
+            assert!(!snapshot.authorized_silent);
+            if count > 128 {
+                assert!(!snapshot.confirms_silent(&final_outcome));
+            }
+        }
     }
 
     #[test]

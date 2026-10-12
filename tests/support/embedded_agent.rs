@@ -42,6 +42,8 @@ impl std::ops::DerefMut for EmbeddedAgentFixture {
     }
 }
 
+// Integration crates may use only EmbeddedAgentFixture with a case-owned builder.
+#[allow(dead_code)]
 pub fn prepare(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,

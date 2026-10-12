@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(config.password, "");
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
-        assert!(config.allowed_senders.is_empty());
+        assert!(config.allowed_senders.is_empty(), "expected an empty value");
     }
 
     #[test]

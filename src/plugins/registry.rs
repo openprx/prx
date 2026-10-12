@@ -345,7 +345,7 @@ mod tests {
         manifest.permissions.required = vec!["shell".to_string()];
         let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
         assert!(matches!(plugin.status, PluginStatus::Error(_)));
-        assert!(plugin.granted_permissions.is_empty());
+        assert!(plugin.granted_permissions.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]
