@@ -377,7 +377,14 @@ pub(crate) fn compute_config_revision_gated(config_path: &Path) -> Result<(Vec<u
 }
 
 fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> {
-    let main_str = std::fs::read_to_string(config_path)
+    // The process worker resolves its sealed config directory before launch.
+    // Hash the same filesystem identity here so platform aliases such as
+    // macOS `/var` and `/private/var` cannot make an unchanged source look
+    // like a different generation.
+    let config_path = config_path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve config layer: {}", config_path.display()))?;
+    let main_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config layer: {}", config_path.display()))?;
     let _: Value =
         toml::from_str(&main_str).with_context(|| format!("Failed to parse TOML: {}", config_path.display()))?;
@@ -390,7 +397,7 @@ fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> 
     hasher.update(main_bytes);
 
     // Include every managed fragment file.
-    for fragment in list_config_fragment_paths(config_path)? {
+    for fragment in list_config_fragment_paths(&config_path)? {
         let file_name = match fragment.file_name().and_then(|n| n.to_str()) {
             Some(name) => name,
             None => {

@@ -5,6 +5,7 @@
 //! `Arc<Config>` payload) for the lifetime of one operation.
 
 use super::{files::compute_config_revision_gated, schema::Config};
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -12,12 +13,48 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+/// Resolve the existing part of a process-bound path and retain any missing
+/// tail. This gives aliases one filesystem identity while keeping a pinned
+/// binding verifiable if its config file is removed after launch.
+fn process_path_identity(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let mut cursor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut resolved) => {
+                for segment in missing.iter().rev() {
+                    resolved.push(segment);
+                }
+                return Ok(resolved);
+            }
+            Err(error) => {
+                let Some(segment) = cursor.file_name().map(ToOwned::to_owned) else {
+                    return Err(error)
+                        .with_context(|| format!("failed to resolve process-bound path {}", path.display()));
+                };
+                missing.push(segment);
+                if !cursor.pop() {
+                    return Err(error)
+                        .with_context(|| format!("failed to resolve process-bound path {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn process_paths_match(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    Ok(process_path_identity(left)? == process_path_identity(right)?)
+}
 
 /// Stable revision of the desired configuration source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,14 +136,16 @@ impl ProcessGenerationBinding {
     fn signing_payload(&self, config: &Config) -> anyhow::Result<Vec<u8>> {
         // Config excludes both paths from serde; bind them explicitly. Sort
         // nested maps so process-specific HashMap iteration cannot change a tag.
+        let workspace = process_path_identity(&config.workspace_dir)?;
+        let config_path = process_path_identity(&config.config_path)?;
         let mut value = serde_json::to_value((
             self.id,
             &self.source_revision,
             self.applied_at,
             self.trigger,
             &self.deferred_changes,
-            &config.workspace_dir,
-            &config.config_path,
+            workspace,
+            config_path,
             config,
         ))?;
         value.sort_all_objects();
@@ -1948,6 +1987,26 @@ mod pinned_parent_process_binding_tests {
         std::fs::write(&generation.effective.config_path, "default_temperature = 0.25\n")?;
         generation.verify_pinned_process_binding(&binding, &key)?;
         assert!(ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_binding_accepts_a_filesystem_alias_for_the_same_source() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (home, generation, key) = fixture()?;
+        std::fs::create_dir_all(&generation.effective.workspace_dir)?;
+        let binding = generation.bind_process(&key)?;
+        let alias = home.path().join("source-alias");
+        symlink(home.path(), &alias)?;
+        let mut child = generation.effective.as_ref().clone();
+        child.config_path = alias.join("config.toml");
+        child.workspace_dir = alias.join("workspace");
+
+        let restored = ConfigGeneration::restore_process(child, &binding, &key)?;
+        assert_eq!(restored.id, generation.id);
+        assert_eq!(restored.source_revision, generation.source_revision);
         Ok(())
     }
 

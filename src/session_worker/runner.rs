@@ -1151,6 +1151,19 @@ struct PreparedWorkerResult {
     ordinary_completion: Option<Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>>,
 }
 
+fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
+    match (
+        &manifest.child_source,
+        &manifest.ordinary_source,
+        &manifest.operator_source,
+    ) {
+        (Some(source), None, None) => Ok(source.parent_constraints.workspace.as_str()),
+        (None, Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
+        (None, None, Some(source)) => Ok(source.publication.workspace.as_str()),
+        _ => anyhow::bail!("worker source storage requires one authenticated source"),
+    }
+}
+
 /// Decision source and settlement storage belong to the logical parent
 /// workspace, independently of the worker's private execution memory.
 fn worker_decision_fabric(
@@ -1158,20 +1171,10 @@ fn worker_decision_fabric(
     generation: &crate::config::ConfigGeneration,
     execution_fabric: &MemoryFabric,
 ) -> Result<MemoryFabric> {
-    let parent_workspace = match (
-        &manifest.child_source,
-        &manifest.ordinary_source,
-        &manifest.operator_source,
-    ) {
-        (Some(source), None, None) => source.parent_constraints.workspace.as_str(),
-        (None, Some(source), None) => source.parent_constraints.workspace.as_str(),
-        (None, None, Some(source)) => source.publication.workspace.as_str(),
-        _ => anyhow::bail!("worker source storage requires one authenticated source"),
-    };
+    let parent_workspace = worker_source_workspace(manifest)?;
     let config = &generation.effective;
-    let workspace = config.workspace_dir.to_string_lossy();
     anyhow::ensure!(
-        workspace == parent_workspace
+        config.workspace_dir.to_string_lossy() == parent_workspace
             && manifest.runtime_config_generation_id == Some(generation.id.0)
             && manifest.runtime_config_source_revision.as_deref()
                 == Some(generation.source_revision.fingerprint_sha256.as_str()),
@@ -1179,7 +1182,7 @@ fn worker_decision_fabric(
     );
     if normalized_worker_memory_strategy(manifest)? == "shared_fabric" {
         anyhow::ensure!(
-            execution_fabric.workspace_id() == workspace,
+            execution_fabric.workspace_id() == parent_workspace,
             "shared worker memory differs from parent workspace"
         );
         return Ok(execution_fabric.clone());
@@ -1195,7 +1198,7 @@ fn worker_decision_fabric(
         &config.identity_bindings,
         &config.user_policies,
     )?);
-    Ok(MemoryFabric::new(memory, workspace.as_ref()).with_event_recording(manifest.memory_event_recording))
+    Ok(MemoryFabric::new(memory, parent_workspace).with_event_recording(manifest.memory_event_recording))
 }
 
 enum WorkerSegmentSource {
@@ -1300,7 +1303,11 @@ fn verify_worker_parent_authority(
         _ => anyhow::bail!("session-worker child authority and source must be supplied together"),
     };
     anyhow::ensure!(
-        wire.workspace == logical_workspace.to_string_lossy() && wire.workspace == source.parent_constraints.workspace,
+        wire.workspace == source.parent_constraints.workspace,
+        "session-worker parent workspace differs from configuration"
+    );
+    anyhow::ensure!(
+        wire.workspace == logical_workspace.to_string_lossy(),
         "session-worker parent workspace differs from configuration"
     );
     let key = crate::decision::key::DecisionKey::load_existing(logical_workspace)?;
@@ -1411,6 +1418,16 @@ async fn run_owned_manifest(
             generation_after
         );
     }
+    // Config loading resolves relative paths from the worker's physical
+    // config directory. Restore the authenticated parent's spelling before
+    // checking signed parent snapshots, while requiring the same filesystem
+    // identity as the loaded configuration.
+    let source_workspace = worker_source_workspace(&manifest)?;
+    anyhow::ensure!(
+        crate::config::generation::process_paths_match(&config.workspace_dir, Path::new(source_workspace))?,
+        "session-worker parent workspace differs from configuration"
+    );
+    config.workspace_dir = PathBuf::from(source_workspace);
     let operator_snapshots = if manifest.operator_source.is_some() {
         Some(operator_source::restore(
             &manifest,
