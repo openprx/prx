@@ -788,9 +788,15 @@ async fn execute_one_unrecorded(
     } else {
         None
     };
-    let outcome = service
-        .execute(command, adapter.tool_execution_context.clone(), cancellation.cloned())
-        .await;
+    let execution_context = adapter.tool_execution_context.clone();
+    let cancellation = cancellation.cloned();
+    let outcome = if matches!(call.name.as_str(), "delegate" | "sessions_spawn") {
+        spawn_delegation_tool(service.clone(), command, execution_context, cancellation)
+            .join()
+            .await?
+    } else {
+        service.execute(command, execution_context, cancellation).await
+    };
     if outcome.status == crate::tools::ToolExecutionStatus::Cancelled {
         return Err(ToolLoopCancelled.into());
     }
@@ -812,6 +818,80 @@ async fn execute_one_unrecorded(
         return Err(super::turn_contracts::ToolLoopAwaitingApproval { reply: result }.into());
     }
     Ok(result)
+}
+
+/// Delegation backends contain another complete agent loop. Start their fixed
+/// execution pipeline in a separate task so the backend gets a fresh worker
+/// stack instead of extending the caller's already-deep turn stack. The
+/// service-owned pipeline still installs the child grant and call receipt; the
+/// explicit scopes below carry the parent turn's cleanup, lineage and liveness.
+fn spawn_delegation_tool(
+    service: Arc<crate::tools::ToolExecutionService>,
+    command: crate::tools::ToolExecutionCommand,
+    context: crate::tools::ToolExecutionContext,
+    cancellation: Option<CancellationToken>,
+) -> DelegationExecutionTask {
+    let cleanup = crate::runtime::turn_cleanup::current_tracker();
+    let parent_work = crate::runtime::registry::current_work_id();
+    let progress = crate::agent::idle::current_beat();
+    let spawn_context = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+        .try_with(Clone::clone)
+        .ok();
+    let work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>> =
+        Box::pin(async move {
+            let execute = async move { service.execute(command, context, cancellation).await };
+            let execute = async move {
+                match spawn_context {
+                    Some(spawn_context) => {
+                        crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                            .scope(spawn_context, execute)
+                            .await
+                    }
+                    None => execute.await,
+                }
+            };
+            let execute = async move {
+                match cleanup {
+                    Some(cleanup) => cleanup.scope(execute).await,
+                    None => execute.await,
+                }
+            };
+            let execute = async move {
+                match parent_work {
+                    Some(parent_work) => crate::runtime::registry::scope_current(parent_work, execute).await,
+                    None => execute.await,
+                }
+            };
+            crate::agent::idle::scope_beat(progress, execute).await
+        });
+    DelegationExecutionTask::spawn(work)
+}
+
+/// Aborts delegated execution if its parent turn is dropped or cancelled.
+struct DelegationExecutionTask(Option<tokio::task::JoinHandle<crate::tools::ToolExecutionOutcome>>);
+
+impl DelegationExecutionTask {
+    fn spawn(
+        work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>>,
+    ) -> Self {
+        Self(Some(tokio::spawn(work)))
+    }
+
+    async fn join(mut self) -> Result<crate::tools::ToolExecutionOutcome> {
+        self.0
+            .take()
+            .expect("delegation execution task is present")
+            .await
+            .map_err(anyhow::Error::new)
+    }
+}
+
+impl Drop for DelegationExecutionTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 #[allow(clippy::indexing_slicing)]

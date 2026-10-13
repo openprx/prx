@@ -2228,7 +2228,13 @@ impl ToolExecutionService {
                 binding.is_some_and(|binding| binding.is_selected()),
             )
         });
-        let outcome = self.execute_inner(command, context, cancellation).await;
+        // `execute_inner` owns the whole descriptor, policy, approval,
+        // preparation and backend pipeline. Its state machine is large enough
+        // that embedding it in each caller's async frame can exhaust a default
+        // tokio worker stack when a tool starts another agent loop. Keep the
+        // canonical pipeline on the heap so every caller carries only a pointer
+        // while it is pending.
+        let outcome = Box::pin(self.execute_inner(command, context, cancellation)).await;
         if let Some(pending) = pending {
             pending.finish(outcome.status);
         }
