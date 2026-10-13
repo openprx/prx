@@ -462,113 +462,124 @@ impl Provider for RetryPrefixProvider {
 #[tokio::test]
 async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
     // Q45: Corrective retry preserves system prefix and canonical message-role ordering.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let workspace = tempfile::TempDir::new().expect("fixture workspace");
-        let provider = RetryPrefixProvider::new();
-        let tools: Vec<Box<dyn Tool>> = Vec::new();
-        let mut history = vec![
-            ChatMessage::system("You are a helpful assistant.\n\n## Identity\n\nPRX."),
-            ChatMessage::user("what changed in rustls lately"),
-        ];
+    q115_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q115_boxed_fixture_work(async {
+            let workspace = tempfile::TempDir::new().expect("fixture workspace");
+            let provider = RetryPrefixProvider::new();
+            let tools: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![
+                ChatMessage::system("You are a helpful assistant.\n\n## Identity\n\nPRX."),
+                ChatMessage::user("what changed in rustls lately"),
+            ];
 
-        let admission =
-            crate::agent::turn_tests::admission::AdmittedTurn::empty(workspace.path(), "what changed in rustls lately")
-                .await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "terminal",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+                workspace.path(),
+                "what changed in rustls lately",
+            )
+            .await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(tools),
-                observer: &crate::observability::NoopObserver,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("the corrective retry must complete the turn");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(tools),
+                    observer: &crate::observability::NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("the corrective retry must complete the turn");
 
-        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
 
-        let digests = provider.system_digests.lock().clone();
-        assert_eq!(digests.len(), 2, "the fixture must actually retry once");
-        assert_eq!(
-            digests[0], digests[1],
-            "the retry round must send a byte-identical system prefix"
-        );
-        assert!(
-            !*provider.saw_late_system.lock(),
-            "no request may carry a system message outside index 0"
-        );
+            let digests = provider.system_digests.lock().clone();
+            assert_eq!(digests.len(), 2, "the fixture must actually retry once");
+            assert_eq!(
+                digests[0], digests[1],
+                "the retry round must send a byte-identical system prefix"
+            );
+            assert!(
+                !*provider.saw_late_system.lock(),
+                "no request may carry a system message outside index 0"
+            );
 
-        // Fixture proof: the corrective instruction really did reach the retry, at
-        // the tail, so the assertion above is not passing because nothing was added.
-        let tails = provider.tail_roles.lock().clone();
-        assert!(
-            tails[1].starts_with("user:") && tails[1].contains("The previous assistant response was empty."),
-            "the retry instruction must ride at the tail of the request: {}",
-            tails[1]
-        );
-        assert!(
-            history
-                .iter()
-                .all(|message| !message.content.contains("The previous assistant response was empty.")),
-            "the corrective instruction must stay request-local"
-        );
+            // Fixture proof: the corrective instruction really did reach the retry, at
+            // the tail, so the assertion above is not passing because nothing was added.
+            let tails = provider.tail_roles.lock().clone();
+            assert!(
+                tails[1].starts_with("user:") && tails[1].contains("The previous assistant response was empty."),
+                "the retry instruction must ride at the tail of the request: {}",
+                tails[1]
+            );
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains("The previous assistant response was empty.")),
+                "the corrective instruction must stay request-local"
+            );
 
-        // The retry must not change the *shape* of the request either. Pushing the
-        // instruction as its own turn produced `[system, user, user]`, which no
-        // provider in this crate coalesces and strict chat templates reject.
-        let shapes = provider.role_shapes.lock().clone();
-        assert!(
-            !*provider.saw_adjacent_user.lock(),
-            "a corrective retry must not produce two adjacent user turns: {shapes:?}"
-        );
-        assert_eq!(
-            shapes[0], shapes[1],
-            "the retry round must send the same role sequence as the first round: {shapes:?}"
-        );
+            // The retry must not change the *shape* of the request either. Pushing the
+            // instruction as its own turn produced `[system, user, user]`, which no
+            // provider in this crate coalesces and strict chat templates reject.
+            let shapes = provider.role_shapes.lock().clone();
+            assert!(
+                !*provider.saw_adjacent_user.lock(),
+                "a corrective retry must not produce two adjacent user turns: {shapes:?}"
+            );
+            assert_eq!(
+                shapes[0], shapes[1],
+                "the retry round must send the same role sequence as the first round: {shapes:?}"
+            );
 
-        // The instruction is the runtime's words, not the operator's, so it is
-        // labelled and therefore separable from the turn it rides on.
-        let (operator_text, aside) = tails[1]
-            .trim_start_matches("user:")
-            .split_once(crate::agent::response_guard::CORRECTIVE_ASIDE_PREFIX)
-            .expect("the corrective aside must carry its marker");
-        assert_eq!(
-            operator_text.trim(),
-            "what changed in rustls lately",
-            "everything before the marker must be exactly what the operator wrote"
-        );
-        assert!(
-            aside.contains("The previous assistant response was empty."),
-            "everything after the marker must be the runtime's instruction: {aside}"
-        );
-    })
+            // The instruction is the runtime's words, not the operator's, so it is
+            // labelled and therefore separable from the turn it rides on.
+            let (operator_text, aside) = tails[1]
+                .trim_start_matches("user:")
+                .split_once(crate::agent::response_guard::CORRECTIVE_ASIDE_PREFIX)
+                .expect("the corrective aside must carry its marker");
+            assert_eq!(
+                operator_text.trim(),
+                "what changed in rustls lately",
+                "everything before the marker must be exactly what the operator wrote"
+            );
+            assert!(
+                aside.contains("The previous assistant response was empty."),
+                "everything after the marker must be the runtime's instruction: {aside}"
+            );
+        })),
+    )
     .await;
+}
+
+#[inline(never)]
+fn q115_boxed_fixture_work<'a, F: std::future::Future + 'a>(
+    work: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + 'a>> {
+    Box::pin(work)
 }

@@ -360,9 +360,7 @@ fn new_harness_guard() -> std::io::Result<HarnessGuard> {
 fn add_owned_chat_fixture_tariff(guard: &HarnessGuard, provider: &str, model: &str) {
     let path = guard.config_dir.join("config.toml");
     let mut document = if path.exists() {
-        std::fs::read_to_string(&path)
-            .expect("read owned chat config")
-            .parse::<toml::Value>()
+        toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).expect("read owned chat config"))
             .expect("parse owned chat config")
     } else {
         // The normal missing-file loader serializes this same default. Its
@@ -416,6 +414,58 @@ fn add_owned_chat_fixture_tariff(guard: &HarnessGuard, provider: &str, model: &s
         .expect("open owned chat config")
         .write_all(encoded.as_bytes())
         .expect("write fixture tariff");
+}
+
+#[test]
+fn owned_chat_fixture_tariff_preserves_preexisting_config_keys() {
+    let guard = new_harness_guard().expect("create owned chat config harness");
+    let path = guard.config_dir.join("config.toml");
+    let original_text = r#"
+default_provider = "mock"
+default_model = "mock"
+
+[autonomy]
+level = "read_only"
+workspace_only = true
+
+[chat.daemon]
+url = "http://127.0.0.1:1"
+token = ""
+
+[fixture_metadata]
+label = "prx_fixture"
+values = [1, 2, 3]
+"#;
+    std::fs::write(&path, original_text).expect("write preexisting chat config");
+    let original = original_text.parse::<toml::Table>().expect("parse original document");
+    add_owned_chat_fixture_tariff(&guard, "mock", "mock");
+    let encoded = std::fs::read_to_string(&path).expect("read priced document");
+    let round_trip = encoded.parse::<toml::Table>().expect("parse priced document");
+    for (key, value) in &original {
+        assert_eq!(round_trip.get(key), Some(value), "preexisting config key changed");
+    }
+    let price = round_trip
+        .get("cost")
+        .and_then(|cost| cost.get("prices"))
+        .and_then(|prices| prices.get("mock/mock"))
+        .and_then(toml::Value::as_table)
+        .expect("qualified mock fixture price");
+    for field in ["input", "output", "cache_write", "cache_read"] {
+        assert_eq!(price.get(field).and_then(toml::Value::as_float), Some(0.0));
+    }
+    let modified = std::fs::metadata(&path)
+        .expect("priced config metadata")
+        .modified()
+        .expect("priced config mtime");
+    add_owned_chat_fixture_tariff(&guard, "mock", "mock");
+    assert_eq!(std::fs::read_to_string(&path).expect("reread priced config"), encoded);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("unchanged config metadata")
+            .modified()
+            .expect("unchanged config mtime"),
+        modified
+    );
 }
 
 fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {

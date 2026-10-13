@@ -4516,9 +4516,13 @@ mod tests {
             );
             let generation = crate::config::new_shared(config.clone()).pin();
             let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
-            let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(PerfCatalogTool::new("file_read".to_string()))];
+            // Q106: N counts extra inventory beyond one fixed searchable seed (N + 2 tools total).
+            let mut tools: Vec<Box<dyn Tool>> = vec![
+                Box::new(PerfCatalogTool::new("file_read".to_string())),
+                Box::new(PerfCatalogTool::new("prx_perf_0000".to_string())),
+            ];
             tools.extend(
-                (0..catalog_size)
+                (1..=catalog_size)
                     .map(|index| Box::new(PerfCatalogTool::new(format!("prx_perf_{index:04}"))) as Box<dyn Tool>),
             );
             let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools);
@@ -4561,6 +4565,30 @@ mod tests {
             )
             .await;
             let context = result.expect("builtin service decision");
+            let seed = service
+                .catalog
+                .view(&CatalogScope::default())
+                .entries()
+                .iter()
+                .find(|entry| entry.public_name == "prx_perf_0000")
+                .map(|entry| CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                })
+                .expect("fixed searchable discovery seed");
+            assert!(
+                context.audit_hops().any(|hop| matches!(
+                    &hop.candidates,
+                    crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. }
+                        if candidates.iter().any(|candidate| {
+                            candidate.action() == crate::causal_tree::branch::CausalActionKind::Discover
+                                && candidate.target() == crate::causal_tree::branch::CapabilityTarget::NativeTool
+                                && candidate.required_capabilities() == std::slice::from_ref(&seed)
+                        })
+                )),
+                "each measured context must contain its genuine fixed seed Discover reference"
+            );
             let expected = service
                 .catalog
                 .view(&CatalogScope::default())

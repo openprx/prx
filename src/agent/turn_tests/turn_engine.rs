@@ -2043,71 +2043,73 @@ async fn run_tool_call_loop_rejects_oversized_image_payload() {
 #[tokio::test]
 async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
     // Q45: Valid image payload reaches the original vision provider once.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-            expected_user_text: None,
-        };
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = VisionProvider {
+                calls: Arc::clone(&calls),
+                expected_user_text: None,
+            };
 
-        let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
+            let mut history = vec![ChatMessage::user(
+                "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            )];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = NoopObserver;
 
-        let workspace = TempDir::new().expect("multimodal fixture workspace");
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-            workspace.path(),
-            &history.last().expect("source input").content,
-        )
-        .await;
-        let result = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                // no document ingest
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+            let workspace = TempDir::new().expect("multimodal fixture workspace");
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+                workspace.path(),
+                &history.last().expect("source input").content,
+            )
+            .await;
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    // no document ingest
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(tools_registry),
-                observer: &observer,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                // no tool tiering
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                // no scope context
-                on_tool_call: None,
-            },
-        )
-        .await
-        .map(|(outcome, _trace)| outcome.into_text())
-        .expect("valid multimodal payload should pass");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(tools_registry),
+                    observer: &observer,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    // no tool tiering
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    // no scope context
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text())
+            .expect("valid multimodal payload should pass");
 
-        assert_eq!(result, "vision-ok");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    })
+            assert_eq!(result, "vision-ok");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })),
+    )
     .await;
 }
 
@@ -2120,152 +2122,156 @@ async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
 #[tokio::test]
 async fn quoted_image_marker_fossil_still_completes_the_turn() {
     // Q45: Quoted historical image marker does not alter current payload completion.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let provider = PayloadCapturingProvider {
-            captured: Arc::clone(&captured),
-        };
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let provider = PayloadCapturingProvider {
+                captured: Arc::clone(&captured),
+            };
 
-        let live_question = "N: does wacli support sending files?";
-        let mut history = vec![ChatMessage::user(format!(
-            "[Current session context]\n\
+            let live_question = "N: does wacli support sending files?";
+            let mut history = vec![ChatMessage::user(format!(
+                "[Current session context]\n\
                  - [assistant:prx] Media markers (`[IMAGE:...]` etc.) are not mapped to `wacli send file`.\n\n\
                  {live_question}"
-        ))];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
+            ))];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = NoopObserver;
 
-        let workspace = TempDir::new().expect("multimodal fixture workspace");
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-            workspace.path(),
-            &history.last().expect("source input").content,
-        )
-        .await;
-        let result = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+            let workspace = TempDir::new().expect("multimodal fixture workspace");
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+                workspace.path(),
+                &history.last().expect("source input").content,
+            )
+            .await;
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(tools_registry),
-                observer: &observer,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .map(|(outcome, _trace)| outcome.into_text())
-        .expect("a quoted marker fossil must not abort the turn");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(tools_registry),
+                    observer: &observer,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text())
+            .expect("a quoted marker fossil must not abort the turn");
 
-        assert_eq!(result, "answered");
-        let payload = captured.lock().expect("captured payload").clone();
-        let user_text: String = payload
-            .iter()
-            .filter(|message| message.role == "user")
-            .map(|message| message.content.clone())
-            .collect();
-        assert!(
-            user_text.contains(live_question),
-            "the live question must reach the model: {user_text}"
-        );
-    })
+            assert_eq!(result, "answered");
+            let payload = captured.lock().expect("captured payload").clone();
+            let user_text: String = payload
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .collect();
+            assert!(
+                user_text.contains(live_question),
+                "the live question must reach the model: {user_text}"
+            );
+        })),
+    )
     .await;
 }
 
 #[tokio::test]
 async fn run_tool_call_loop_forwards_audio_transcript_with_image_payload() {
     // Q45: Audio transcript and image reach the original vision provider together.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-            expected_user_text: Some("Audio transcript: the package label says fragile"),
-        };
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = VisionProvider {
+                calls: Arc::clone(&calls),
+                expected_user_text: Some("Audio transcript: the package label says fragile"),
+            };
 
-        let mut history = vec![ChatMessage::user(
-            "Audio transcript: the package label says fragile\nAnalyze the attached image too \
+            let mut history = vec![ChatMessage::user(
+                "Audio transcript: the package label says fragile\nAnalyze the attached image too \
                  [IMAGE:data:image/png;base64,iVBORw0KGgo=]"
-                .to_string(),
-        )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
+                    .to_string(),
+            )];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = NoopObserver;
 
-        let workspace = TempDir::new().expect("multimodal fixture workspace");
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-            workspace.path(),
-            &history.last().expect("source input").content,
-        )
-        .await;
-        let result = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                // no document ingest
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+            let workspace = TempDir::new().expect("multimodal fixture workspace");
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+                workspace.path(),
+                &history.last().expect("source input").content,
+            )
+            .await;
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    // no document ingest
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(tools_registry),
-                observer: &observer,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                // no tool tiering
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                // no scope context
-                on_tool_call: None,
-            },
-        )
-        .await
-        .map(|(outcome, _trace)| outcome.into_text())
-        .expect("image plus audio transcript should reach the vision provider");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(tools_registry),
+                    observer: &observer,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    // no tool tiering
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    // no scope context
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text())
+            .expect("image plus audio transcript should reach the vision provider");
 
-        assert_eq!(result, "vision-ok");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    })
+            assert_eq!(result, "vision-ok");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })),
+    )
     .await;
 }
 
@@ -2340,67 +2346,69 @@ impl Tool for SteadyTool {
 #[tokio::test]
 async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history() {
     // Q45: Wasm middleware transforms delivered text and persisted history consistently.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let temp = TempDir::new().unwrap();
-        let plugin_dir = temp.path().join("plugins/pipeline-middleware");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
-        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
-        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let temp = TempDir::new().unwrap();
+            let plugin_dir = temp.path().join("plugins/pipeline-middleware");
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
+            std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
+            std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
 
-        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
-        let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
-        hooks.set_plugin_runtime(runtime).await;
-        let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(temp.path(), "hello").await;
-        let (outcome, _) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "whatsapp",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+            let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
+            let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
+            hooks.set_plugin_runtime(runtime).await;
+            let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(temp.path(), "hello").await;
+            let (outcome, _) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "whatsapp",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &hooks,
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            outcome,
-            ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] plain response"
-        ));
-        assert_eq!(
-            history.last().map(|message| message.content.as_str()),
-            Some("[wasm-middleware] plain response")
-        );
-    })
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &hooks,
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] plain response"
+            ));
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("[wasm-middleware] plain response")
+            );
+        })),
+    )
     .await;
 }
 
@@ -2649,7 +2657,7 @@ mod outbound_middleware_lifecycle {
     #[tokio::test]
     async fn outbound_middleware_skips_corrective_retry_responses() {
         // Q52: evidence prerequisite only; preserve fabricated-marker retry must not reach outbound middleware.
-        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        q79_boxed_fixture_work(crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
             reset_outbound_middleware_calls();
             let temp = TempDir::new().expect("test: temporary workspace");
             let hooks = hooks_with_middleware(temp.path()).await;
@@ -2722,7 +2730,7 @@ mod outbound_middleware_lifecycle {
                 history.last().map(|message| message.content.as_str()),
                 Some("[wasm-middleware] The report is ready.")
             );
-        })
+        })))
         .await;
     }
 

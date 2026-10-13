@@ -418,6 +418,8 @@ async fn configured_small_native_schema_fixture() {
         narrow_total <= main_input_limit,
         "scaled small request must fit after the unchanged decision reservation"
     );
+    // Preserve the original registered-wide construction premise; it is not
+    // proof that an actual business-only wide request would exceed this window.
     assert!(
         budgeted_tokens(estimate_history_tokens_with_source(&history)).saturating_add(wide_tool_tokens) > usable_window,
         "paired wide request must still exceed the same original window"
@@ -508,7 +510,30 @@ async fn configured_small_native_schema_fixture() {
                         "actual_small_native_admission={}",
                         serde_json::to_string(&diagnostic).unwrap()
                     );
-                    admission.assert_core_specs(&tool_specs);
+                    let business_specs: Vec<_> = tool_specs
+                        .iter()
+                        .filter(|spec| spec.name == "file_read")
+                        .cloned()
+                        .collect();
+                    assert_eq!(business_specs.len(), 1, "one exact file_read business definition");
+                    admission.assert_core_specs(&business_specs);
+                    assert!(
+                        decision
+                            .service
+                            .agent_capability_search_spec(decision.proof, decision.context)
+                            .expect("optional search publication")
+                            .is_none(),
+                        "this fixture has no discoverable family"
+                    );
+                    let actual_narrow_total = budgeted_tokens(estimate_history_tokens_with_source(&history))
+                        .saturating_add(budgeted_tokens(
+                            crate::agent::turn_context::measure_native_tool_payload(&business_specs).measurement,
+                        ))
+                        .saturating_add(compiled_instruction_tokens(&business_specs));
+                    assert!(
+                        actual_narrow_total <= main_input_limit,
+                        "actual file_read-only request must fit the unchanged main window"
+                    );
                 }
                 let runtime = admission.memory_runtime();
 

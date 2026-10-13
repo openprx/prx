@@ -219,62 +219,64 @@ async fn empty_assistant_response_retries_and_returns_real_answer() {
 #[tokio::test]
 async fn empty_response_retry_keeps_one_leading_system_message_unchanged() {
     // Q45: Empty-response retry preserves one leading system message.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let provider = StrictSystemPositionRetryProvider {
-            calls: AtomicUsize::new(0),
-            first_system: Mutex::new(None),
-        };
-        let tmp = TempDir::new().expect("admission workspace");
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "hi").await;
-        let result = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "cli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let provider = StrictSystemPositionRetryProvider {
+                calls: AtomicUsize::new(0),
+                first_system: Mutex::new(None),
+            };
+            let tmp = TempDir::new().expect("admission workspace");
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "hi").await;
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &HookManager::new(tmp.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("strict provider should accept the canonical retry transcript");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("strict provider should accept the canonical retry transcript");
 
-        assert!(matches!(result.0, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-        assert!(
-            history
-                .iter()
-                .all(|message| !message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)),
-            "the corrective instruction must remain request-local: {history:?}"
-        );
-    })
+            assert!(matches!(result.0, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)),
+                "the corrective instruction must remain request-local: {history:?}"
+            );
+        })),
+    )
     .await;
 }
 
@@ -390,90 +392,95 @@ fn strip_fabricated_tool_markers_borrows_when_there_is_nothing_to_strip() {
 #[tokio::test]
 async fn fabricated_tool_marker_without_tool_execution_retries_once() {
     // Q52: evidence prerequisite only; preserve retry unsupported tool-use claim.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            "The disk check is clean.\n[Used tools: shell]",
-            "The disk check is clean.",
-        ]);
-        let remaining = Arc::clone(&provider.responses);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the disk")];
-        let tmp = TempDir::new().unwrap();
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the disk").await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "terminal",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "The disk check is clean.\n[Used tools: shell]",
+                "The disk check is clean.",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the disk")];
+            let tmp = TempDir::new().unwrap();
+            let admission =
+                crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the disk").await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("the corrective retry should produce a deliverable answer");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("the corrective retry should produce a deliverable answer");
 
-        assert_eq!(
-            remaining.lock().expect("responses lock should be valid").len(),
-            0,
-            "a fabricated marker with no tool execution must cost exactly one corrective retry \
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a fabricated marker with no tool execution must cost exactly one corrective retry \
                      (both scripted responses consumed = two provider calls)"
-        );
-        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The disk check is clean."));
-        assert!(
-            history
-                .iter()
-                .all(|message| !contains_fabricated_tool_marker(&message.content)),
-            "no fabricated marker may reach history: {history:?}"
-        );
-    })
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The disk check is clean."));
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !contains_fabricated_tool_marker(&message.content)),
+                "no fabricated marker may reach history: {history:?}"
+            );
+        })),
+    )
     .await;
 }
 
 #[tokio::test]
 async fn repeated_fabricated_tool_marker_is_stripped_and_still_delivered() {
     // Q52: evidence prerequisite only; preserve strip repeated unsupported claim after bounded retry.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let (result, history) = run_without_tools(vec![
-            "Everything is green.\n[Used tools: shell, gateway]",
-            "Everything is green.\n[Used tools: shell]",
-        ])
-        .await;
-        let (outcome, _trace) = result.expect("a marker beside real text must not fail the turn");
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let (result, history) = run_without_tools(vec![
+                "Everything is green.\n[Used tools: shell, gateway]",
+                "Everything is green.\n[Used tools: shell]",
+            ])
+            .await;
+            let (outcome, _trace) = result.expect("a marker beside real text must not fail the turn");
 
-        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Everything is green."));
-        assert_eq!(history.len(), 3);
-        assert_eq!(
-            history.last().map(|message| message.content.as_str()),
-            Some("Everything is green."),
-            "the second fabrication must be stripped, not bailed on: {history:?}"
-        );
-    })
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Everything is green."));
+            assert_eq!(history.len(), 3);
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("Everything is green."),
+                "the second fabrication must be stripped, not bailed on: {history:?}"
+            );
+        })),
+    )
     .await;
 }
 
@@ -507,70 +514,106 @@ async fn marker_after_a_real_tool_batch_is_stripped_without_a_retry() {
     ];
     let tmp = TempDir::new().unwrap();
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        tmp.path(),
-        "run file_read to check the fixture",
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    let (outcome, _trace) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("a turn that really used a tool must complete");
+    let mut mechanics_config = crate::config::Config::default();
+    mechanics_config.workspace_dir = tmp.path().to_path_buf();
+    let mechanics_memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("mechanics memory"));
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                            mechanics_config,
+                            "run file_read to check the fixture",
+                            Arc::clone(&tools_registry),
+                            mechanics_memory,
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let (outcome, _trace) = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: ToolLoopMemory::none(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .expect("a turn that really used a tool must complete");
 
-    assert!(
-        history.iter().any(|message| message.role == "tool"),
-        "the turn must really have dispatched a tool batch: {history:?}"
-    );
-    assert_eq!(
-        execution_order
-            .lock()
-            .expect("execution order lock should be valid")
-            .as_slice(),
-        ["file_read".to_string()],
-        "the premise is a tool that really ran: a batch that was only dispatched and then \
+                        assert!(
+                            history.iter().any(|message| message.role == "tool"),
+                            "the turn must really have dispatched a tool batch: {history:?}"
+                        );
+                        assert_eq!(
+                            execution_order
+                                .lock()
+                                .expect("execution order lock should be valid")
+                                .as_slice(),
+                            ["file_read".to_string()],
+                            "the premise is a tool that really ran: a batch that was only dispatched and then \
                  refused is not tool use, and must not buy the model a free marker"
-    );
-    assert_eq!(
-        remaining.lock().expect("responses lock should be valid").len(),
-        0,
-        "a marker backed by a real tool run must not spend a corrective retry"
-    );
-    assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+                        );
+                        assert_eq!(
+                            remaining.lock().expect("responses lock should be valid").len(),
+                            0,
+                            "a marker backed by a real tool run must not spend a corrective retry"
+                        );
+                        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 /// A model can write the marker in the *same* response that carries real
@@ -609,64 +652,100 @@ async fn a_marker_written_beside_real_tool_calls_never_reaches_history() {
     ];
     let tmp = TempDir::new().unwrap();
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        tmp.path(),
-        "run file_read to check the fixture",
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    let (outcome, _trace) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("a turn that really used a tool must complete");
+    let mut mechanics_config = crate::config::Config::default();
+    mechanics_config.workspace_dir = tmp.path().to_path_buf();
+    let mechanics_memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("mechanics memory"));
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                            mechanics_config,
+                            "run file_read to check the fixture",
+                            Arc::clone(&tools_registry),
+                            mechanics_memory,
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let (outcome, _trace) = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: ToolLoopMemory::none(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .expect("a turn that really used a tool must complete");
 
-    assert!(
-        history.iter().any(|message| message.role == "tool"),
-        "the turn must really have dispatched a tool batch: {history:?}"
-    );
-    assert!(
-        history.iter().all(|message| !message.content.contains("[Used tools:")),
-        "the marker written alongside the tool calls must not be stored: {history:?}"
-    );
-    assert!(
-        history.iter().any(|message| message.content.contains("Checking now.")),
-        "only the marker is dropped; the model's own words stay: {history:?}"
-    );
-    assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+                        assert!(
+                            history.iter().any(|message| message.role == "tool"),
+                            "the turn must really have dispatched a tool batch: {history:?}"
+                        );
+                        assert!(
+                            history.iter().all(|message| !message.content.contains("[Used tools:")),
+                            "the marker written alongside the tool calls must not be stored: {history:?}"
+                        );
+                        assert!(
+                            history.iter().any(|message| message.content.contains("Checking now.")),
+                            "only the marker is dropped; the model's own words stay: {history:?}"
+                        );
+                        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 /// Dispatching a batch is not using a tool. When every call in it came
@@ -712,59 +791,95 @@ async fn a_batch_whose_calls_all_failed_still_buys_the_corrective_retry() {
     ];
     let tmp = TempDir::new().unwrap();
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        tmp.path(),
-        "run file_read to check the fixture",
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    let (outcome, _trace) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 3,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("the corrective retry should produce a deliverable answer");
+    let mut mechanics_config = crate::config::Config::default();
+    mechanics_config.workspace_dir = tmp.path().to_path_buf();
+    let mechanics_memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("mechanics memory"));
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                            mechanics_config,
+                            "run file_read to check the fixture",
+                            Arc::clone(&tools_registry),
+                            mechanics_memory,
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let (outcome, _trace) = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 3,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: ToolLoopMemory::none(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .expect("the corrective retry should produce a deliverable answer");
 
-    assert_eq!(
-        remaining.lock().expect("responses lock should be valid").len(),
-        0,
-        "a batch that produced nothing but refusals must not count as tool use, \
+                        assert_eq!(
+                            remaining.lock().expect("responses lock should be valid").len(),
+                            0,
+                            "a batch that produced nothing but refusals must not count as tool use, \
                  so the fabricated marker still costs one corrective retry"
-    );
-    assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check is clean."));
-    assert_eq!(executions.load(Ordering::SeqCst), 1);
+                        );
+                        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check is clean."));
+                        assert_eq!(executions.load(Ordering::SeqCst), 1);
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 /// The gap the whole-line guard left: `Fixture checked. [Used tools:
@@ -779,7 +894,7 @@ async fn a_batch_whose_calls_all_failed_still_buys_the_corrective_retry() {
 #[tokio::test]
 async fn an_inline_fabricated_marker_without_tool_execution_retries_once_then_is_stripped() {
     // Q52: evidence prerequisite only; preserve reject fabricated inline tool claim without dispatch.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    q79_boxed_fixture_work(crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
         let provider = ScriptedProvider::from_text_responses(vec![
             "Fixture checked. [Used tools: shell]",
             "Fixture checked. [Used tools: shell] Nothing else to report.",
@@ -841,7 +956,7 @@ async fn an_inline_fabricated_marker_without_tool_execution_retries_once_then_is
             history.iter().all(|message| !message.content.contains("[Used tools:")),
             "no fabricated marker may reach history in either grain: {history:?}"
         );
-    })
+    })))
     .await;
 }
 
@@ -855,70 +970,73 @@ async fn an_inline_fabricated_marker_without_tool_execution_retries_once_then_is
 #[tokio::test]
 async fn an_inline_marker_is_stripped_before_it_can_be_streamed() {
     // Q52: evidence prerequisite only; preserve suppress fabricated marker before delivery.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            "Fixture checked. [Used tools: shell]",
-            "Fixture checked. [Used tools: shell] Nothing else to report.",
-        ]);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
-        let tmp = TempDir::new().unwrap();
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the fixture").await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "terminal",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "Fixture checked. [Used tools: shell]",
+                "Fixture checked. [Used tools: shell] Nothing else to report.",
+            ]);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
+            let tmp = TempDir::new().unwrap();
+            let admission =
+                crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the fixture").await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: Some(tx),
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("a marker beside real text must not fail the turn");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: Some(tx),
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("a marker beside real text must not fail the turn");
 
-        let mut streamed = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            streamed.push_str(&chunk);
-        }
-        assert!(
-            !streamed.contains("[Used tools:"),
-            "the streamed draft must never paint a fabricated marker: {streamed:?}"
-        );
-        assert!(
-            streamed.contains("Fixture checked."),
-            "the model's own words must still stream: {streamed:?}"
-        );
-        assert!(
-            matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked. Nothing else to report.")
-        );
-    })
+            let mut streamed = String::new();
+            while let Ok(chunk) = rx.try_recv() {
+                streamed.push_str(&chunk);
+            }
+            assert!(
+                !streamed.contains("[Used tools:"),
+                "the streamed draft must never paint a fabricated marker: {streamed:?}"
+            );
+            assert!(
+                streamed.contains("Fixture checked."),
+                "the model's own words must still stream: {streamed:?}"
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked. Nothing else to report.")
+            );
+        })),
+    )
     .await;
 }
 
@@ -1058,75 +1176,111 @@ async fn an_inline_marker_beside_real_tool_calls_is_stripped_without_a_retry() {
     ];
     let tmp = TempDir::new().unwrap();
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        tmp.path(),
-        "run file_read to check the fixture",
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    let (outcome, _trace) = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("a turn that really used a tool must complete");
+    let mut mechanics_config = crate::config::Config::default();
+    mechanics_config.workspace_dir = tmp.path().to_path_buf();
+    let mechanics_memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("mechanics memory"));
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                            mechanics_config,
+                            "run file_read to check the fixture",
+                            Arc::clone(&tools_registry),
+                            mechanics_memory,
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let (outcome, _trace) = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: ToolLoopMemory::none(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .expect("a turn that really used a tool must complete");
 
-    assert_eq!(
-        execution_order
-            .lock()
-            .expect("execution order lock should be valid")
-            .as_slice(),
-        ["file_read".to_string()],
-        "the premise is a tool that really ran"
-    );
-    assert_eq!(
-        remaining.lock().expect("responses lock should be valid").len(),
-        0,
-        "a marker backed by a real tool run must not spend a corrective retry"
-    );
-    assert!(
-        history.iter().all(|message| !message.content.contains("[Used tools:")),
-        "neither grain of the marker may be stored: {history:?}"
-    );
-    assert!(
-        history
-            .iter()
-            .any(|message| message.content.contains("Checking now. One moment.")),
-        "only the marker is cut out; the model's own words stay: {history:?}"
-    );
-    assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked."));
+                        assert_eq!(
+                            execution_order
+                                .lock()
+                                .expect("execution order lock should be valid")
+                                .as_slice(),
+                            ["file_read".to_string()],
+                            "the premise is a tool that really ran"
+                        );
+                        assert_eq!(
+                            remaining.lock().expect("responses lock should be valid").len(),
+                            0,
+                            "a marker backed by a real tool run must not spend a corrective retry"
+                        );
+                        assert!(
+                            history.iter().all(|message| !message.content.contains("[Used tools:")),
+                            "neither grain of the marker may be stored: {history:?}"
+                        );
+                        assert!(
+                            history
+                                .iter()
+                                .any(|message| message.content.contains("Checking now. One moment.")),
+                            "only the marker is cut out; the model's own words stay: {history:?}"
+                        );
+                        assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked."));
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
 }
 
 /// The summarizer reads the turns it is compacting and is explicitly
@@ -1205,77 +1359,80 @@ async fn a_compaction_summary_carrying_a_marker_is_stripped_in_both_grains() {
 #[tokio::test]
 async fn a_marker_after_a_mixed_fence_block_retries_once_then_is_stripped() {
     // Q52: evidence prerequisite only; preserve reject fabricated marker outside mixed fenced content.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell]",
-            "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell] Nothing else to report.",
-        ]);
-        let remaining = Arc::clone(&provider.responses);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
-        let tmp = TempDir::new().unwrap();
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the fixture").await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "terminal",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell]",
+                "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell] Nothing else to report.",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
+            let tmp = TempDir::new().unwrap();
+            let admission =
+                crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "check the fixture").await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("a marker beside real text must not fail the turn");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("a marker beside real text must not fail the turn");
 
-        assert_eq!(
-            remaining.lock().expect("responses lock should be valid").len(),
-            0,
-            "prose after a mixed-fence block is not code, so the fabricated marker must \
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "prose after a mixed-fence block is not code, so the fabricated marker must \
                      cost exactly one corrective retry (both scripted responses consumed)"
-        );
-        assert!(
-            matches!(
-                outcome,
-                ToolLoopOutcome::Text(ref text)
-                    if text == "~~~text\n```example\n~~~\nFixture checked. Nothing else to report."
-            ),
-            "the fenced example must survive byte-for-byte and only the prose marker is cut: {outcome:?}"
-        );
-        assert!(
-            history.iter().all(|message| !message.content.contains("[Used tools:")),
-            "no fabricated marker may reach history: {history:?}"
-        );
-        assert!(
-            history.iter().any(|message| message.content.contains("```example")),
-            "the model's own fenced example must still be stored: {history:?}"
-        );
-    })
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    ToolLoopOutcome::Text(ref text)
+                        if text == "~~~text\n```example\n~~~\nFixture checked. Nothing else to report."
+                ),
+                "the fenced example must survive byte-for-byte and only the prose marker is cut: {outcome:?}"
+            );
+            assert!(
+                history.iter().all(|message| !message.content.contains("[Used tools:")),
+                "no fabricated marker may reach history: {history:?}"
+            );
+            assert!(
+                history.iter().any(|message| message.content.contains("```example")),
+                "the model's own fenced example must still be stored: {history:?}"
+            );
+        })),
+    )
     .await;
 }
 
@@ -1291,75 +1448,77 @@ async fn a_marker_after_a_mixed_fence_block_retries_once_then_is_stripped() {
 #[tokio::test]
 async fn a_marker_inside_a_long_fence_block_is_neither_retried_nor_edited() {
     // Q45: Literal fenced marker content is preserved without spurious retry.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        const ANSWER: &str = "````text\n```\nDocumented [Used tools: shell]\n````";
-        let provider = ScriptedProvider::from_text_responses(vec![
-            ANSWER,
-            "a genuine code example must not spend the corrective retry",
-        ]);
-        let remaining = Arc::clone(&provider.responses);
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("show me the marker syntax"),
-        ];
-        let tmp = TempDir::new().unwrap();
-        let admission =
-            crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "show me the marker syntax").await;
-        let (outcome, _trace) = run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                channel_name: "terminal",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 2,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            const ANSWER: &str = "````text\n```\nDocumented [Used tools: shell]\n````";
+            let provider = ScriptedProvider::from_text_responses(vec![
+                ANSWER,
+                "a genuine code example must not spend the corrective retry",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("show me the marker syntax"),
+            ];
+            let tmp = TempDir::new().unwrap();
+            let admission =
+                crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "show me the marker syntax").await;
+            let (outcome, _trace) = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admission.decision(),
                 },
-                compaction: None,
-                decision: admission.decision(),
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::new(Vec::new()),
-                observer: &NoopObserver,
-                hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admission.adapter()),
-                memory: ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await
-        .expect("a fenced code example must not fail the turn");
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(Vec::new()),
+                    observer: &NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .expect("a fenced code example must not fail the turn");
 
-        assert_eq!(
-            remaining.lock().expect("responses lock should be valid").len(),
-            1,
-            "a marker inside a genuine fenced block is code, not a claim about work: \
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                1,
+                "a marker inside a genuine fenced block is code, not a claim about work: \
                      the second scripted response must stay unconsumed"
-        );
-        assert!(
-            matches!(outcome, ToolLoopOutcome::Text(ref text) if text == ANSWER),
-            "a fenced code example must be delivered byte-for-byte: {outcome:?}"
-        );
-        assert_eq!(
-            history.last().map(|message| message.content.as_str()),
-            Some(ANSWER),
-            "the history copy of a fenced code example must not be edited either: {history:?}"
-        );
-    })
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == ANSWER),
+                "a fenced code example must be delivered byte-for-byte: {outcome:?}"
+            );
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some(ANSWER),
+                "the history copy of a fenced code example must not be edited either: {history:?}"
+            );
+        })),
+    )
     .await;
 }
 
@@ -1419,37 +1578,42 @@ async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Ve
 #[tokio::test]
 async fn stay_silent_call_produces_silent_outcome() {
     // Q45: Exposed stay_silent tool produces the original silent outcome.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let resp =
-            "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>";
-        let (outcome, _history) = run_with_response(resp, true).await;
-        match outcome {
-            ToolLoopOutcome::Silent { reason } => assert_eq!(reason, "off-topic banter"),
-            other => panic!("expected Silent, got {other:?}"),
-        }
-    })
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let resp =
+                "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>";
+            let (outcome, _history) = run_with_response(resp, true).await;
+            match outcome {
+                ToolLoopOutcome::Silent { reason } => assert_eq!(reason, "off-topic banter"),
+                other => panic!("expected Silent, got {other:?}"),
+            }
+        })),
+    )
     .await;
 }
 
 #[tokio::test]
 async fn silent_outcome_writes_no_assistant_turn() {
     // Q45: Intentional silence adds no assistant history entry.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        let resp = "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"not relevant\"}}\n</tool_call>";
-        let before = 2; // system + user
-        let (outcome, history) = run_with_response(resp, true).await;
-        assert!(matches!(outcome, ToolLoopOutcome::Silent { .. }));
-        // No assistant / tool turn appended: silent leaves zero history trace.
-        assert_eq!(
-            history.len(),
-            before,
-            "silent turn must not append assistant/tool history, got: {history:?}"
-        );
-        assert!(
-            history.iter().all(|m| m.role != "assistant"),
-            "no assistant turn should be written on a silent decision"
-        );
-    })
+    q79_boxed_fixture_work(
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
+            let resp =
+                "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"not relevant\"}}\n</tool_call>";
+            let before = 2; // system + user
+            let (outcome, history) = run_with_response(resp, true).await;
+            assert!(matches!(outcome, ToolLoopOutcome::Silent { .. }));
+            // No assistant / tool turn appended: silent leaves zero history trace.
+            assert_eq!(
+                history.len(),
+                before,
+                "silent turn must not append assistant/tool history, got: {history:?}"
+            );
+            assert!(
+                history.iter().all(|m| m.role != "assistant"),
+                "no assistant turn should be written on a silent decision"
+            );
+        })),
+    )
     .await;
 }
 

@@ -1211,28 +1211,37 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_all_aborts_agent_and_kills_shell() {
+        use futures_util::FutureExt as _;
         let task = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        let abort_handle = task.abort_handle();
-        let mut run = make_run("live-agent", "agent", SubAgentStatus::Running);
-        run.abort_handle = Some(abort_handle);
-        let runs = Arc::new(RwLock::new(vec![run]));
-        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let task = crate::tools::sessions_spawn::TaskRunControl::observe_fixture_task(task);
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let abort_handle = task.abort_handle();
+            let mut run = make_run("live-agent", "agent", SubAgentStatus::Running);
+            run.abort_handle = Some(abort_handle);
+            run.task_control = Some(task.control());
+            let runs = Arc::new(RwLock::new(vec![run]));
+            let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
 
-        let (sink, _rx) = super::super::event::SessionEventSink::channel();
-        let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
-        handle.add_shell(shell.clone());
+            let (sink, _rx) = super::super::event::SessionEventSink::channel();
+            let sec = permissive_security();
+            let shell =
+                super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
+            handle.add_shell(shell.clone());
 
-        let report = handle.shutdown_all("test-shutdown").await;
+            let report = handle.shutdown_all("test-shutdown").await;
 
-        assert_eq!(report.aborted_agents, 1);
-        assert_eq!(report.killed_shells, 1);
-        assert!(task.is_finished(), "agent task was aborted");
-        assert!(runs.read().await.is_empty(), "agent registry cleared");
-        assert!(handle.shell_registry().lock().is_empty(), "shell registry cleared");
-        assert!(shell.is_terminal(), "shell process group was killed");
+            assert_eq!(report.aborted_agents, 1);
+            assert_eq!(report.killed_shells, 1);
+            assert!(task.is_finished(), "agent task was aborted");
+            assert!(runs.read().await.is_empty(), "agent registry cleared");
+            assert!(handle.shell_registry().lock().is_empty(), "shell registry cleared");
+            assert!(shell.is_terminal(), "shell process group was killed");
+        })
+        .catch_unwind()
+        .await;
+        task.finish(outcome).await;
     }
 
     #[tokio::test]
@@ -1477,26 +1486,34 @@ mod tests {
 
     #[tokio::test]
     async fn detach_for_chat_session_switch_clears_registry_and_returns_ignored_ids() {
-        let runs = Arc::new(RwLock::new(vec![make_run(
-            "old-agent",
-            "agent a",
-            SubAgentStatus::Running,
-        )]));
-        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
-        assert_eq!(handle.snapshot().await.len(), 1);
+        use futures_util::FutureExt as _;
+        let task = crate::tools::sessions_spawn::TaskRunControl::observe_fixture_task(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let mut run = make_run("old-agent", "agent a", SubAgentStatus::Running);
+            run.abort_handle = Some(task.abort_handle());
+            run.task_control = Some(task.control());
+            let runs = Arc::new(RwLock::new(vec![run]));
+            let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+            assert_eq!(handle.snapshot().await.len(), 1);
 
-        let (summaries, ignored_ids) = handle.detach_for_chat_session_switch().await;
+            let (summaries, ignored_ids) = handle.detach_for_chat_session_switch().await;
 
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].id, "old-agent");
-        assert_eq!(summaries[0].status, super::super::model::STATUS_INTERRUPTED);
-        assert_eq!(ignored_ids.len(), 1);
-        assert_eq!(ignored_ids[0].as_str(), "old-agent");
-        assert!(runs.read().await.is_empty(), "agent registry must be cleared");
-        assert!(
-            handle.snapshot().await.is_empty(),
-            "new chat session must start with an empty child-session registry"
-        );
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].id, "old-agent");
+            assert_eq!(summaries[0].status, super::super::model::STATUS_INTERRUPTED);
+            assert_eq!(ignored_ids.len(), 1);
+            assert_eq!(ignored_ids[0].as_str(), "old-agent");
+            assert!(runs.read().await.is_empty(), "agent registry must be cleared");
+            assert!(
+                handle.snapshot().await.is_empty(),
+                "new chat session must start with an empty child-session registry"
+            );
+        })
+        .catch_unwind()
+        .await;
+        task.finish(outcome).await;
     }
 
     // ── Interactive PTY sessions in the unified list (v3a) ───────────────────

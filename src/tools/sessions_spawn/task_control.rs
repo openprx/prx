@@ -141,3 +141,73 @@ impl TaskRunControl {
             .ok()
     }
 }
+
+// The fixture observer owns the real task join; no terminal-state injection API.
+#[cfg(test)]
+impl TaskRunControl {
+    pub(crate) fn observe_fixture_task(task: tokio::task::JoinHandle<()>) -> OwnedFixtureTask {
+        let control = Self::new();
+        let abort = task.abort_handle();
+        control.attach(abort.clone());
+        let observed = Arc::clone(&control);
+        let observer = tokio::spawn(async move {
+            let result = match task.await {
+                Ok(()) => TaskFinalization::Natural,
+                Err(error) if error.is_cancelled() => TaskFinalization::Terminated,
+                Err(_) => TaskFinalization::Unconfirmed,
+            };
+            observed.publish(result);
+        });
+        OwnedFixtureTask {
+            control,
+            abort,
+            observer,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct OwnedFixtureTask {
+    control: Arc<TaskRunControl>,
+    abort: tokio::task::AbortHandle,
+    observer: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl OwnedFixtureTask {
+    pub(crate) fn control(&self) -> Arc<TaskRunControl> {
+        Arc::clone(&self.control)
+    }
+
+    pub(crate) fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.abort.clone()
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.abort.is_finished()
+    }
+
+    pub(crate) async fn finish(mut self, outcome: std::thread::Result<()>) {
+        self.abort.abort();
+        let cleanup = tokio::time::timeout(std::time::Duration::from_secs(15), &mut self.observer).await;
+        // On timeout the observer retains the original task JoinHandle and
+        // remains responsible for its real join. This is UNKNOWN, never success.
+        let joined = matches!(cleanup, Ok(Ok(())));
+        if !joined {
+            tracing::error!("PRX fixture task observer cleanup UNKNOWN");
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(joined, "fixture observer did not join within owner deadline");
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnedFixtureTask {
+    fn drop(&mut self) {
+        // External cancellation requests abort; the observer still owns join.
+        // Neither this request nor dropping its handle claims finalization.
+        self.abort.abort();
+    }
+}

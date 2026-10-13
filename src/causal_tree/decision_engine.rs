@@ -2266,7 +2266,15 @@ mod tests {
             }
         }
         let tools: Vec<Box<dyn crate::tools::traits::Tool>> = vec![Box::new(PrxSearchableTool), Box::new(PrxPeerTool)];
-        let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let catalog = CapabilityCatalog::build(
+            &tools,
+            &CatalogSources::default(),
+            &SurfacePolicy {
+                channel_allowed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let view = catalog.view(&CatalogScope::default());
         let entry = view
             .entries()

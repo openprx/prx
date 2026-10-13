@@ -1386,9 +1386,6 @@ mod tests {
                     && distribution_valid(&predicted.distributions.capability_target)
                     && distribution_valid(&predicted.distributions.features)
                     && *projection
-                    && predicted.attempts.iter().any(|attempt| {
-                        attempt.backend == "builtin" && attempt.outcome == "served" && attempt.error_class.is_none()
-                    })
                     && terminal.prior_decision_id.as_ref() == Some(&predicted.decision_id)
                     && terminal.directive_kind == "answer"
                     && terminal.abstention_reason.as_deref() == Some("hop_stopped")
@@ -1483,10 +1480,10 @@ mod tests {
                 "different catalog generation must fail"
             );
             let mut altered = builtin.clone();
-            altered.0.attempts.clear();
+            altered.0.backend_locality = "remote".into();
             assert!(
                 !valid_receipts(&[altered, terminal.clone()]),
-                "missing served Builtin attempt must fail"
+                "predicted Builtin with non-Builtin locality must fail"
             );
         }
         assert_eq!(

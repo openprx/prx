@@ -1663,49 +1663,58 @@ mod session_cleanup_tests {
 
     #[tokio::test]
     async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary() {
-        let run = crate::tools::sessions_spawn::SubAgentRun {
-            progress: crate::agent::idle::child_beat(),
-            batch_id: None,
-            id: "quit-live-agent".to_string(),
-            task: "still running".to_string(),
-            owner_id: None,
-            topic_id: None,
-            source_message_event_id: None,
-            started_at: chrono::Utc::now(),
-            finished_at: None,
-            status: crate::tools::sessions_spawn::SubAgentStatus::Running,
-            recipient: None,
-            channel_name: None,
-            abort_handle: None,
-            process_control: None,
-            task_control: None,
-            history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            steer_tx: None,
-            parent_run_id: None,
-            session_scope_key: String::new(),
-            spawn_depth: 0,
-            token_usage_records: Vec::new(),
-        };
-        let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));
-        let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::clone(&runs));
-        let mut chat_session = session::ChatSession::new("provider", "model");
-        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        use futures_util::FutureExt as _;
+        let task = crate::tools::sessions_spawn::TaskRunControl::observe_fixture_task(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let run = crate::tools::sessions_spawn::SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
+                batch_id: None,
+                id: "quit-live-agent".to_string(),
+                task: "still running".to_string(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                status: crate::tools::sessions_spawn::SubAgentStatus::Running,
+                recipient: None,
+                channel_name: None,
+                abort_handle: Some(task.abort_handle()),
+                process_control: None,
+                task_control: Some(task.control()),
+                history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: String::new(),
+                spawn_depth: 0,
+                token_usage_records: Vec::new(),
+            };
+            let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));
+            let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::clone(&runs));
+            let mut chat_session = session::ChatSession::new("provider", "model");
+            let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
 
-        let report = shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &dispatcher).await;
+            let report = shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &dispatcher).await;
 
-        assert_eq!(report.summaries.len(), 1);
-        assert!(
-            runs.read().await.is_empty(),
-            "/quit exit helper must clear live agent registry"
-        );
-        assert_eq!(chat_session.background_sessions.len(), 1);
-        assert_eq!(
-            chat_session
-                .background_sessions
-                .first()
-                .map(|summary| summary.status.as_str()),
-            Some(crate::chat::sessions::model::STATUS_INTERRUPTED)
-        );
+            assert_eq!(report.summaries.len(), 1);
+            assert!(
+                runs.read().await.is_empty(),
+                "/quit exit helper must clear live agent registry"
+            );
+            assert_eq!(chat_session.background_sessions.len(), 1);
+            assert_eq!(
+                chat_session
+                    .background_sessions
+                    .first()
+                    .map(|summary| summary.status.as_str()),
+                Some(crate::chat::sessions::model::STATUS_INTERRUPTED)
+            );
+        })
+        .catch_unwind()
+        .await;
+        task.finish(outcome).await;
     }
 }
 
