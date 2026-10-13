@@ -295,7 +295,7 @@ impl PreparedReplay {
             anyhow::ensure!(
                 store_workspace == recorded.store_workspace_id.as_ref()
                     && row.digest == expected_digest
-                    && row.decision.directive_kind == "delegate"
+                    && row.decision.admits_issued_child()
                     && row.decision.run_id.as_deref() == Some(proof.run_id())
                     && row.decision.session_key.as_deref() == Some(proof.session_key())
                     && row.source_event_id.as_deref() == proof.source_event_id()
@@ -728,7 +728,7 @@ async fn verify_terminal_replay_inner(
         verify_event_mac(key, SOURCE_DOMAIN, &parent_source, &parent.source.mac)?;
         anyhow::ensure!(
             row.digest == parent.digest
-                && row.decision.directive_kind == "delegate"
+                && row.decision.admits_issued_child()
                 && row.decision.enabled_snapshot
                 && !row.decision.legacy_v1
                 && row.source_event_id.as_deref() == Some(parent_source.event_id.as_str())

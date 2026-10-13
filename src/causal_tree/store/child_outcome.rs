@@ -70,7 +70,7 @@ fn facts_match(conn: &Connection, scope: &DecisionScope, record: &ChildOutcomeLi
     };
     Ok(parent.digest == record.parent_digest
         && child.digest == record.child_digest
-        && parent.decision.directive_kind == "delegate"
+        && parent.decision.admits_issued_child()
         && parent.decision.enabled_snapshot
         && child.decision.enabled_snapshot
         && !parent.decision.legacy_v1
@@ -232,7 +232,7 @@ impl DecisionStoreReader {
             };
             if parent.digest != record.parent_digest
                 || child.digest != record.child_digest
-                || parent.decision.directive_kind != "delegate"
+                || !parent.decision.admits_issued_child()
                 || !parent.decision.enabled_snapshot
                 || !child.decision.enabled_snapshot
                 || parent.decision.legacy_v1

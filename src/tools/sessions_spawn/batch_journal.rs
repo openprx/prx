@@ -292,7 +292,7 @@ pub(super) async fn read(
             parent.digest == plan_fields.parent_digest
                 && parent.decision.enabled_snapshot
                 && !parent.decision.legacy_v1
-                && parent.decision.directive_kind == "delegate",
+                && parent.decision.admits_issued_child(),
             "batch parent differs from signed plan"
         );
     }

@@ -421,7 +421,7 @@ impl ParentSource {
             .context("worker parent decision is unavailable")?;
         anyhow::ensure!(
             row.digest == source.parent_decision_digest
-                && row.decision.directive_kind == "delegate"
+                && row.decision.admits_issued_child()
                 && row.decision.enabled_snapshot
                 && !row.decision.legacy_v1
                 && row.source_event_id.as_deref() == Some(source_id)

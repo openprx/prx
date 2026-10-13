@@ -288,7 +288,7 @@ pub(super) async fn read(
         parent.digest == fields.parent_decision_digest
             && parent.decision.enabled_snapshot
             && !parent.decision.legacy_v1
-            && parent.decision.directive_kind == "delegate"
+            && parent.decision.admits_issued_child()
             && parent.decision.run_id.is_some()
             && parent.decision.run_id == input.parent_run_id
             && parent.decision.session_key.is_some()

@@ -1333,7 +1333,7 @@ fn verify_worker_parent_authority(
             && record.catalog_generation == parent.catalog_generation.to_hex()
             && record.decision.enabled_snapshot
             && !record.decision.legacy_v1
-            && record.decision.directive_kind == "delegate"
+            && record.decision.admits_issued_child()
             && record.decision.run_id == manifest.parent_run_id
             && manifest.owner_id.as_deref() == Some(parent.authority.owner.as_str()),
         "session-worker parent decision differs from issued authority"

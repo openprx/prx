@@ -1317,6 +1317,14 @@ impl DecisionView {
         let selected = self.selected_candidate_id.as_deref()?;
         self.candidates.iter().find(|candidate| candidate.id == selected)
     }
+
+    /// Whether an already-verified child grant may name this decision as its
+    /// parent. Direct Answer turns can publish a bounded delegator and issue
+    /// the same sealed child grant as a selected Delegate turn; callers must
+    /// still verify that grant, its digest and all source lineage separately.
+    pub(crate) fn admits_issued_child(&self) -> bool {
+        matches!(self.directive_kind.as_str(), "delegate" | "answer")
+    }
 }
 
 /// The rows evaluation reads (CDP-10): the non-legacy decisions of a window
