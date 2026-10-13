@@ -185,6 +185,10 @@ struct ProviderTurnCompletionContext {
 struct PerTurnContext {
     cancellation: CancellationToken,
     turn_binding: Option<Arc<decision_source::ChatTurnBinding>>,
+    /// The disposition captured before provider execution can seal the
+    /// decision context. `Some` identifies the fixed-terminal path; `None`
+    /// identifies a provider-backed completion.
+    fixed_reply: Option<String>,
     task_id: crate::chat::turn_scheduler::TurnTaskId,
     draft_id: String,
     delta_tx: Option<mpsc::Sender<String>>,
@@ -8209,6 +8213,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         PerTurnContext {
                             cancellation: cancellation.clone(),
                             turn_binding: chat_turn_binding.clone(),
+                            fixed_reply: fixed_reply.clone(),
                             task_id,
                             draft_id: d_id.clone(),
                             delta_tx: Some(delta_tx),
@@ -10821,18 +10826,11 @@ async fn commit_completed_provider_turn(
     };
 
     let provider_turn_task_id = Some(pending.task_id);
-    let fixed_reply = match pending
-        .turn_binding
-        .as_ref()
-        .map(|binding| binding.fixed_reply())
-        .transpose()
-    {
-        Ok(reply) => reply.flatten(),
-        Err(error) => {
-            tracing::error!(error = %error, "Chat directive is unavailable");
-            return false;
-        }
-    };
+    // Provider trace capture seals execution authority before this ordered
+    // finalizer runs. Re-reading the live disposition here would therefore
+    // reject every successful provider-backed turn. Use the immutable
+    // pre-execution classification carried with the turn instead.
+    let fixed_reply = pending.fixed_reply.take();
     let (provider_outcome, terminal_usage) = if let Some(reply) = fixed_reply {
         if empty_response || final_text != reply || recorded_response != reply || !reasoning.is_empty() {
             tracing::error!("Chat fixed reply differs from its decision");
@@ -21071,6 +21069,7 @@ mod p3_directional_switch_tests {
                 context: PerTurnContext {
                     cancellation: CancellationToken::new(),
                     turn_binding: None,
+                    fixed_reply: None,
                     task_id,
                     draft_id: draft_id.to_string(),
                     delta_tx: None,
