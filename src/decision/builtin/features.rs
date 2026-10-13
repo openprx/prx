@@ -494,6 +494,10 @@ pub struct StateFeatures<'s> {
     pub stale_artifacts: u64,
     /// Any query/tool step completed or any user-evidence artifact exists.
     pub has_history: bool,
+    /// The admitted source belongs to a conversation with an earlier turn.
+    pub has_conversation_history: bool,
+    /// User-evidence artifacts present at any age.
+    pub artifact_count: u64,
     /// The offered candidates, in state order.
     pub candidates: Vec<CandidateFeatures<'s>>,
 }
@@ -570,6 +574,11 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
         fresh_artifacts,
         stale_artifacts,
         has_history: steps.iter().any(|step| str_at(step, "kind") != "router_history") || !artifacts.is_empty(),
+        has_conversation_history: state
+            .get("has_conversation_history")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        artifact_count: artifacts.len() as u64,
         candidates,
     }
 }

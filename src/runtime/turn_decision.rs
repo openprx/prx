@@ -2230,6 +2230,7 @@ impl TurnDecisionService {
             observed: segment_observation::initial_observations(segment_observation, deadline, cancellation)?,
             predicted: None,
             derived: DerivedState::default(),
+            has_conversation_history: proof.has_conversation_history(),
             routing_input: RawRoutingInput::new(proof.routing_input().to_string()),
             goal: RawRoutingInput::new(proof.routing_input().to_string()),
             lineage: HopLineage::First,

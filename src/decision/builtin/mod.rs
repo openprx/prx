@@ -136,6 +136,13 @@ fn plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
         && !state.approval_pending
 }
 
+fn continued_plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
+    plain_conversation_turn(state)
+        && state.has_conversation_history
+        && state.successful_lookups == 0
+        && state.artifact_count == 0
+}
+
 /// The log-score of one candidate.
 fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>) -> f64 {
     let Some(action) = candidate.action else {
@@ -187,7 +194,7 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
         }
     }
     if plain_conversation_turn(state)
-        && text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT
+        && (text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT || continued_plain_conversation_turn(state))
         && action == Action::Answer
     {
         score += weights::BRIEF_PLAIN_TURN_TO_ANSWER;
@@ -1971,6 +1978,20 @@ mod tests {
             noul_probability(&continued, GlobalQuestion::EvidenceSufficient) >= 0.5,
             "ordinary conversation history must not force a clarification or external lookup"
         );
+
+        let mut longer_continued = state("p4a second visible turn", typical_candidates());
+        longer_continued["has_conversation_history"] = json!(true);
+        let longer_continued = answer(longer_continued);
+        assert_eq!(chosen(&longer_continued, GlobalQuestion::NextAction), "answer");
+
+        let mut retrieved = state("p4a second visible turn", typical_candidates());
+        retrieved["has_conversation_history"] = json!(true);
+        retrieved["completed_steps"] = json!([
+            {"kind": "provider", "status": "ok"},
+            {"kind": "retrieve", "status": "ok"}
+        ]);
+        let retrieved = answer(retrieved);
+        assert_ne!(chosen(&retrieved, GlobalQuestion::NextAction), "answer");
 
         let empty = answer(state("  ", terminal_candidates()));
         assert_eq!(chosen(&empty, GlobalQuestion::NextAction), "clarify");

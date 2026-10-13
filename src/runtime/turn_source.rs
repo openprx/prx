@@ -123,6 +123,10 @@ pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
     fn intercepts_writes(&self) -> bool {
         false
     }
+    /// Whether this source belongs to a conversation with an earlier turn.
+    fn has_conversation_history(&self) -> bool {
+        false
+    }
     fn child_scope(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>> {
         None
     }
@@ -229,6 +233,7 @@ pub(crate) struct OwnedTurnSourceProof {
     ordinary_process_authority_id: Option<uuid::Uuid>,
     tool_calls_allowed: bool,
     intercepts_writes: bool,
+    has_conversation_history: bool,
     child_scope: Option<std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>>,
     workspace_id: String,
     owner_id: String,
@@ -322,6 +327,7 @@ impl OwnedTurnSourceProof {
             ordinary_process_authority_id: Some(authority.id()),
             tool_calls_allowed: true,
             intercepts_writes: false,
+            has_conversation_history: false,
             child_scope: Some(snapshots.scope.clone()),
             workspace_id: parent.workspace_id().to_owned(),
             owner_id: parent.owner_id().to_owned(),
@@ -369,6 +375,7 @@ impl OwnedTurnSourceProof {
             ordinary_process_authority_id: None,
             tool_calls_allowed: true,
             intercepts_writes: false,
+            has_conversation_history: false,
             child_scope: None,
             workspace_id: parent.workspace_id().to_owned(),
             owner_id: parent.owner_id().to_owned(),
@@ -443,6 +450,7 @@ impl OwnedTurnSourceProof {
             ordinary_process_authority_id: None,
             tool_calls_allowed,
             intercepts_writes: false,
+            has_conversation_history: false,
             child_scope: Some(grant.scope().clone()),
             workspace_id: event.workspace_id.clone(),
             owner_id: parent.owner_id().to_owned(),
@@ -542,6 +550,7 @@ impl OwnedTurnSourceProof {
                 .ordinary_child_publication
                 .as_ref()
                 .is_some_and(|publication| publication.intercepts_writes()),
+            has_conversation_history: false,
             child_scope: actor
                 .ordinary_child_publication
                 .as_ref()
@@ -753,6 +762,7 @@ impl OwnedTurnSourceProof {
             ordinary_process_authority_id: proof.ordinary_process_authority_id(),
             tool_calls_allowed: proof.tool_calls_allowed(),
             intercepts_writes: proof.intercepts_writes(),
+            has_conversation_history: proof.has_conversation_history(),
             child_scope: proof.child_scope().cloned(),
             workspace_id: proof.workspace_id().to_owned(),
             owner_id: proof.owner_id().to_owned(),
@@ -804,6 +814,9 @@ impl TurnSourceProof for OwnedTurnSourceProof {
     }
     fn intercepts_writes(&self) -> bool {
         self.intercepts_writes
+    }
+    fn has_conversation_history(&self) -> bool {
+        self.has_conversation_history
     }
     fn child_scope(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>> {
         self.child_scope.as_ref()

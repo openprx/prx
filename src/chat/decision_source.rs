@@ -20,7 +20,7 @@ impl ChatProviderBinding {
     pub(super) async fn record_guarded(
         &self,
         fabric: crate::memory::MemoryFabric,
-        source: (crate::memory::MessageEventScope, &str, ChatAdmissionMode),
+        source: (crate::memory::MessageEventScope, &str, ChatAdmissionMode, bool),
         input: &str,
         key: String,
         ticket: crate::runtime::turn_cleanup::CleanupTicket,
@@ -28,7 +28,7 @@ impl ChatProviderBinding {
         let fabric = fabric
             .with_ingress_recovery(&self.generation.effective, &ticket)
             .await?;
-        let (scope, session, admission_mode) = source;
+        let (scope, session, admission_mode, has_conversation_history) = source;
         let run = scope.run_id.clone().context("chat input run is missing")?;
         let session = session.to_owned();
         let binding = self.clone();
@@ -70,7 +70,10 @@ impl ChatProviderBinding {
                         event.as_ref(),
                     )
                     .await?;
-                    Ok::<_, anyhow::Error>((event, receipt.bind_provider(binding, admission_mode)?))
+                    Ok::<_, anyhow::Error>((
+                        event,
+                        receipt.bind_provider_with_history(binding, admission_mode, has_conversation_history)?,
+                    ))
                 }
             };
             let operation = async {
@@ -338,7 +341,12 @@ impl ChatOperatorSpawn {
                 .binding
                 .record_guarded(
                     fabric.clone(),
-                    (envelope.message_scope(), session, ChatAdmissionMode::OperatorCommand),
+                    (
+                        envelope.message_scope(),
+                        session,
+                        ChatAdmissionMode::OperatorCommand,
+                        false,
+                    ),
                     &self.command,
                     format!("operator:{run}:input"),
                     owner.register(tokio_util::sync::CancellationToken::new())?,
@@ -409,6 +417,7 @@ pub struct ChatTurnBinding {
     model: String,
     envelope: RuntimeEnvelope,
     routing_input: Arc<str>,
+    has_conversation_history: bool,
 }
 
 #[cfg(not(feature = "terminal-tui"))]
@@ -931,6 +940,15 @@ impl ChatSourceReceipt {
         binding: &ChatProviderBinding,
         admission_mode: ChatAdmissionMode,
     ) -> anyhow::Result<Arc<ChatTurnBinding>> {
+        self.bind_provider_with_history(binding, admission_mode, false)
+    }
+
+    fn bind_provider_with_history(
+        &self,
+        binding: &ChatProviderBinding,
+        admission_mode: ChatAdmissionMode,
+        has_conversation_history: bool,
+    ) -> anyhow::Result<Arc<ChatTurnBinding>> {
         anyhow::ensure!(
             self.envelope.config_generation_id == Some(binding.generation.id.0)
                 && self.envelope.config_source_revision.as_deref()
@@ -951,6 +969,7 @@ impl ChatSourceReceipt {
             model: binding.choice.model_name().to_owned(),
             envelope: self.envelope.clone(),
             routing_input: Arc::clone(&self.routing_input),
+            has_conversation_history,
         }))
     }
     /// Disabled mode can bind local input without claiming it was persisted.
@@ -1072,6 +1091,9 @@ impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
     }
     fn routing_input(&self) -> &str {
         &self.routing_input
+    }
+    fn has_conversation_history(&self) -> bool {
+        self.has_conversation_history
     }
     fn provider_name(&self) -> &str {
         self.choice.provider_name()
@@ -1693,6 +1715,7 @@ pub(crate) mod admission_failure_tests {
                         envelope.message_scope(),
                         "prx_plan_session",
                         ChatAdmissionMode::Model(ChatMode::Plan),
+                        false,
                     ),
                     "prx plan input",
                     "prx_plan_input".to_owned(),

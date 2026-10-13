@@ -247,7 +247,7 @@ fn canonical_empty_state_matches_independent_lexical_golden() {
     state.goal = RawRoutingInput::new("prx_goal".to_owned());
     state.built_at_ms = 0;
     let material = concat!(
-        "{\"derived\":[],\"goal\":\"prx_goal\",\"observed\":{\"artifacts\":[],\"completed_steps\":[],\"retry_count\":0},",
+        "{\"derived\":[],\"goal\":\"prx_goal\",\"has_conversation_history\":false,\"observed\":{\"artifacts\":[],\"completed_steps\":[],\"retry_count\":0},",
         "\"routing_input\":\"prx_input\",\"trusted\":{\"approval_grants\":[],\"approval_pending\":false,\"budgets\":[0,0,0],",
         "\"catalog_generation\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"channel\":null,",
         "\"constraints\":[],\"delivery\":[false,false,false],\"exclusions\":[],\"owner_id\":null,\"policy_version\":\"prx_policy\",",
@@ -430,6 +430,7 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
         }).collect::<Vec<_>>(),
         "routing_input": state.routing_input.as_str(),
         "goal": state.goal.as_str(),
+        "has_conversation_history": state.has_conversation_history,
     });
     if let (true, Some(object)) = (record, value.as_object_mut()) {
         let record = json!({

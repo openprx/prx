@@ -9,6 +9,7 @@ use super::{ApprovalRequirement, CandidateId, CausalState, OpId, SideEffectMode,
 struct CanonicalState<'a> {
     derived: Vec<CanonicalCandidate<'a>>,
     goal: &'a str,
+    has_conversation_history: bool,
     observed: CanonicalObserved<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     record: Option<CanonicalRecord<'a>>,
@@ -131,6 +132,7 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
             })
             .collect(),
         goal: state.goal.as_str(),
+        has_conversation_history: state.has_conversation_history,
         observed: CanonicalObserved {
             artifacts: state
                 .observed

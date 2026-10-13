@@ -7556,8 +7556,9 @@ Retry with a compatible model: /provider {shown} <model>",
         let admitted_chat_mode = chat_mirror.lock().chat_mode;
         #[cfg(not(feature = "terminal-tui"))]
         let admitted_chat_mode = chat_session.mode;
+        let has_conversation_history = history.iter().any(|message| message.role != "system");
         let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded(
-            memory_fabric.clone(), (input_scope, &chat_session_key, decision_source::ChatAdmissionMode::Model(admitted_chat_mode)), &user_input,
+            memory_fabric.clone(), (input_scope, &chat_session_key, decision_source::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
             child_cleanup.register(cancellation.clone())?,
         ).await?;

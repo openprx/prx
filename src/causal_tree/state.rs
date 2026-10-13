@@ -647,6 +647,8 @@ pub(crate) struct CausalState {
     pub(crate) observed: ObservedState,
     pub(crate) predicted: Option<PredictedState>,
     pub(crate) derived: DerivedState,
+    /// Whether the admitted source belongs to a conversation with an earlier turn.
+    pub(crate) has_conversation_history: bool,
     /// The latest user turn, exactly as received.
     pub(crate) routing_input: RawRoutingInput,
     /// The current goal.
@@ -888,6 +890,7 @@ pub(crate) mod fixtures {
             observed: observed(),
             predicted: None,
             derived: derived(candidates(key)),
+            has_conversation_history: false,
             routing_input: RawRoutingInput::new(turn.to_string()),
             goal: RawRoutingInput::new("Answer the question.".to_string()),
             lineage: HopLineage::First,

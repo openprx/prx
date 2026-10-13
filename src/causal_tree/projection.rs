@@ -212,6 +212,7 @@ pub(crate) fn redacted_projection(
         "prior_decision_id": state.lineage.prior_decision_id().map(|id| id.to_string()),
         "latest_user_turn": latest_user_turn,
         "goal": goal,
+        "has_conversation_history": state.has_conversation_history,
         "completed_steps": completed_steps,
         "artifacts": artifacts,
         "failed_tool_fingerprints": failed_namespaces,
