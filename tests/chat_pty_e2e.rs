@@ -147,6 +147,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                 }
                 Err(error) => panic!("loopback accept: {error}"),
             };
+            stream.set_nonblocking(false).expect("blocking loopback connection");
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .expect("read timeout");
