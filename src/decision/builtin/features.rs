@@ -27,6 +27,11 @@ use crate::util::is_combining_mark;
 pub struct TextSignals {
     /// The text carries at least one letter or digit, in any script.
     pub has_text: bool,
+    /// Language-neutral request weight: one per alphanumeric character in a
+    /// spaced script and three per character in a script that normally omits
+    /// spaces. This separates a brief conversational turn from a substantive
+    /// unrouted request without inspecting words.
+    pub request_weight: usize,
     /// A `scheme://` URL shape.
     pub url: bool,
     /// A file-path shape: `/seg/seg` or `/seg.ext`; `~/`, `./`, `../`, `.\`
@@ -345,6 +350,10 @@ pub fn text_signals(text: &str) -> TextSignals {
         let in_word = previous.is_some_and(is_word_character);
         if character.is_alphanumeric() {
             signals.has_text = true;
+            signals.request_weight =
+                signals
+                    .request_weight
+                    .saturating_add(if is_no_space_script(character) { 3 } else { 1 });
         }
         match character {
             '`' => signals.code = true,

@@ -59,7 +59,13 @@ impl TurnDecisionService {
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Option<ToolSpec>> {
-        if !matches!(context.directive(), TurnExecutionDirective::Execute { .. }) {
+        if !matches!(
+            context.directive(),
+            TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
+        ) || context.execution_closed.load(Ordering::Acquire)
+            || !proof.tool_calls_allowed()
+            || !self.model_can_call_tools(proof)
+        {
             return Ok(None);
         }
         if self.discovery_families(proof, context)?.is_empty() {
@@ -113,7 +119,10 @@ impl TurnDecisionService {
     ) -> anyhow::Result<Vec<CapabilityTarget>> {
         anyhow::ensure!(
             !context.execution_closed.load(Ordering::Acquire)
-                && matches!(context.directive(), TurnExecutionDirective::Execute { .. })
+                && matches!(
+                    context.directive(),
+                    TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
+                )
                 && proof.tool_calls_allowed()
                 && self.model_can_call_tools(proof),
             "turn does not permit capability discovery"

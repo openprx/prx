@@ -131,7 +131,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         toml::to_string_pretty(&config).expect("serialize chat config"),
     )
     .expect("write chat config");
-    add_owned_chat_fixture_tariff(&guard, &override_provider, "probe-model");
+    prepare_owned_chat_fixture(&guard, &override_provider, "probe-model");
 
     let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -355,9 +355,10 @@ fn new_harness_guard() -> std::io::Result<HarnessGuard> {
     })
 }
 
-/// Every owned PTY config supplies zero tariffs for its exact fixture providers.
-/// Existing configuration values (including daemon and security settings) survive.
-fn add_owned_chat_fixture_tariff(guard: &HarnessGuard, provider: &str, model: &str) {
+/// Every owned PTY config supplies zero tariffs and an exact native-tools
+/// declaration for its fixture models. Existing configuration values
+/// (including daemon and security settings) survive.
+fn prepare_owned_chat_fixture(guard: &HarnessGuard, provider: &str, model: &str) {
     let path = guard.config_dir.join("config.toml");
     let mut document = if path.exists() {
         toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).expect("read owned chat config"))
@@ -396,6 +397,35 @@ fn add_owned_chat_fixture_tariff(guard: &HarnessGuard, provider: &str, model: &s
             prices.insert(key, price.clone());
             changed = true;
         }
+    }
+    let declaration = toml::Value::try_from(openprx::config::schema::ProviderModelConfig {
+        provider: provider.to_string(),
+        model: Some(model.to_string()),
+        operations: Some(vec![openprx::config::schema::ModelOperationSetting::Chat]),
+        native_tools: Some(true),
+        vision_input: None,
+        streaming: None,
+        structured_output: None,
+        tool_schema_dialect: None,
+        tool_call_dialect: None,
+        context_window: None,
+    })
+    .expect("serialize fixture model declaration");
+    let providers = document
+        .as_table_mut()
+        .expect("chat config table")
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .expect("providers table");
+    let models = providers
+        .entry("models")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("provider model array");
+    if !models.iter().any(|entry| entry == &declaration) {
+        models.push(declaration);
+        changed = true;
     }
     // Repeated commands on one harness must not rewrite a live daemon's config.
     if !changed {
@@ -438,7 +468,7 @@ values = [1, 2, 3]
 "#;
     std::fs::write(&path, original_text).expect("write preexisting chat config");
     let original = original_text.parse::<toml::Table>().expect("parse original document");
-    add_owned_chat_fixture_tariff(&guard, "mock", "mock");
+    prepare_owned_chat_fixture(&guard, "mock", "mock");
     let encoded = std::fs::read_to_string(&path).expect("read priced document");
     let round_trip = encoded.parse::<toml::Table>().expect("parse priced document");
     for (key, value) in &original {
@@ -457,7 +487,7 @@ values = [1, 2, 3]
         .expect("priced config metadata")
         .modified()
         .expect("priced config mtime");
-    add_owned_chat_fixture_tariff(&guard, "mock", "mock");
+    prepare_owned_chat_fixture(&guard, "mock", "mock");
     assert_eq!(std::fs::read_to_string(&path).expect("reread priced config"), encoded);
     assert_eq!(
         std::fs::metadata(&path)
@@ -469,7 +499,7 @@ values = [1, 2, 3]
 }
 
 fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
-    add_owned_chat_fixture_tariff(guard, "mock", "mock");
+    prepare_owned_chat_fixture(guard, "mock", "mock");
     let mut cmd = Command::new(prx_binary());
     cmd.arg("chat");
     cmd.arg("-p").arg("mock");
@@ -1614,6 +1644,39 @@ fn p4a_event_pump_two_sequential_turns_complete_and_exit() {
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
         "P4a sequential turn session should exit"
+    );
+}
+
+/// A later ordinary conversation turn has provider history but no external
+/// target or failed work. The real Chat path must serve it through the model
+/// instead of turning the presence of history into a Clarify terminal.
+#[test]
+#[serial(prx_chat_pty)]
+fn ordinary_plain_second_turn_reaches_the_serving_model() {
+    let sentinel = "[MOCK-PLAIN-CONVERSATION]";
+    let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session.send("hello\r").expect("send first plain turn");
+    let first = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        first.contains(sentinel),
+        "first plain turn should reach the model: {first}"
+    );
+
+    session.send("thanks\r").expect("send second plain turn");
+    let second = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        second.contains(sentinel),
+        "second plain turn with conversation history should reach the model: {second}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "plain conversation should exit cleanly"
     );
 }
 

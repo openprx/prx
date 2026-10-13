@@ -89,8 +89,25 @@ impl TurnDecisionService {
                 && context.catalog_generation() == *self.catalog.generation(),
             "delegation scope is closed or belongs to another catalog"
         );
-        let TurnExecutionDirective::Delegate { manifest } = &context.directive else {
-            anyhow::bail!("selected decision is not delegation");
+        let manifest = match &context.directive {
+            TurnExecutionDirective::Delegate { manifest } => manifest,
+            TurnExecutionDirective::AnswerDirectly => {
+                let direct_delegator = context.execution_refs.iter().any(|reference| {
+                    self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
+                        entry.fingerprint == reference.fingerprint
+                            && entry.generation == reference.generation
+                            && matches!(entry.exposure, Exposure::Direct)
+                            && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                    })
+                });
+                anyhow::ensure!(direct_delegator, "answer surface has no admitted delegator");
+                context
+                    .engine
+                    .outgoing_child
+                    .as_ref()
+                    .context("answer surface has no sealed child manifest")?
+            }
+            _ => anyhow::bail!("selected decision is not delegation-capable"),
         };
         // derive_strict_subset preserves owner/level/cost and decrements depth
         // exactly once. Rebuild its original parent from the engine's retained
@@ -176,26 +193,6 @@ impl TurnDecisionService {
         if self.generation.effective.causal_tree.enabled && (!self.durable_key || !self.recordable) {
             return None;
         }
-        let direct = if discovered.iter().next().is_none() {
-            let input = state.routing_input.as_str();
-            // This proposal comes from the pinned configuration of a sealed
-            // embedded source, not from synthetic text or operator identity.
-            let configured = self.configured_delegation_target(proof).is_some();
-            let names_delegator = configured
-                || input
-                    .split(|character: char| !character.is_alphanumeric() && character != '_')
-                    .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
-            if !names_delegator {
-                return None;
-            }
-            crate::tools::capability::search::CatalogSearch::exact_mentions(
-                catalog,
-                input,
-                usize::from(self.generation.effective.causal_tree.policy.max_candidates),
-            )?
-        } else {
-            Vec::new()
-        };
         let trusted = state.trusted.parts();
         let permitted = |entry: &crate::tools::capability::catalog::CapabilityEntry| {
             catalog.contains(&entry.id)
@@ -211,6 +208,35 @@ impl TurnDecisionService {
                     proof.policy_channel(),
                     proof.policy_chat_type(),
                 ) != crate::tools::execution::ToolExecutionDecision::Deny
+        };
+        let direct_delegator = ["delegate", "sessions_spawn"].into_iter().any(|name| {
+            self.catalog
+                .entry_for_public_name(name)
+                .is_some_and(|entry| matches!(entry.exposure, Exposure::Direct) && permitted(entry))
+        });
+        let direct = if discovered.iter().next().is_none() {
+            let input = state.routing_input.as_str();
+            // This proposal comes from the pinned configuration of a sealed
+            // embedded source, not from synthetic text or operator identity.
+            let configured = self.configured_delegation_target(proof).is_some();
+            let names_delegator = configured
+                || input
+                    .split(|character: char| !character.is_alphanumeric() && character != '_')
+                    .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
+            if !names_delegator && !direct_delegator {
+                return None;
+            }
+            if names_delegator {
+                crate::tools::capability::search::CatalogSearch::exact_mentions(
+                    catalog,
+                    input,
+                    usize::from(self.generation.effective.causal_tree.policy.max_candidates),
+                )?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
         let inherited = proof.child_scope().map(|scope| scope.gate_inputs().0);
         let mut allowed = BTreeSet::new();

@@ -128,6 +128,14 @@ impl BuiltinDecisionBackend {
 // Scores
 // ---------------------------------------------------------------------------
 
+fn plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
+    state.text.has_text
+        && state.undecided()
+        && state.unsuccessful_steps == 0
+        && state.retry_count == 0
+        && !state.approval_pending
+}
+
 /// The log-score of one candidate.
 fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>) -> f64 {
     let Some(action) = candidate.action else {
@@ -177,6 +185,12 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
             Action::Answer => score += weights::UNDECIDED_TO_ANSWER,
             _ => {}
         }
+    }
+    if plain_conversation_turn(state)
+        && text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT
+        && action == Action::Answer
+    {
+        score += weights::BRIEF_PLAIN_TURN_TO_ANSWER;
     }
     score
 }
@@ -287,7 +301,14 @@ fn choice(
 fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
     match meaning {
         Meaning::Global(GlobalQuestion::EvidenceSufficient) => {
-            let decisive = if state.text.has_text && !state.undecided() {
+            // A plain conversational turn may have ordinary provider history
+            // without external evidence. Treating that history as insufficient
+            // forces a read/discovery hop before an admitted model answer can
+            // run. Structurally or exactly targeted turns retain the existing
+            // retrieve-first evidence path.
+            let decisive = if plain_conversation_turn(state) {
+                1.0
+            } else if state.text.has_text && !state.undecided() {
                 0.5
             } else {
                 0.0
@@ -1159,6 +1180,13 @@ mod tests {
         }
     }
 
+    fn noul_probability(response: &DecisionResponse, question: GlobalQuestion) -> f64 {
+        match &response.answers[&QuestionId::global(question)] {
+            DecisionAnswer::Noul(noul) => noul.probability_true.get(),
+            other => panic!("expected a noul, got {other:?}"),
+        }
+    }
+
     /// Candidates of a typical turn: direct answer, memory, skill discovery,
     /// web, filesystem and shell tools, delegation, clarification, refusal.
     fn typical_candidates() -> Vec<Value> {
@@ -1904,6 +1932,102 @@ mod tests {
             ));
         });
         assert_ne!(pending.0, "use_tool");
+    }
+
+    #[test]
+    fn a_plain_conversation_turn_can_reach_the_model_while_undecidable_input_still_clarifies() {
+        let key = key();
+        let terminal_candidates = || {
+            vec![
+                candidate_json("answer", "none", "answer-none"),
+                candidate_json("clarify", "none", "clarify-none"),
+                candidate_json("refuse", "none", "refuse-none"),
+            ]
+        };
+        let answer = |value: Value| {
+            let request = seal(&key, value.clone(), compiler_questions(&value));
+            answer_and_validate(&request)
+        };
+
+        let plain = answer(state("Explain the current result", terminal_candidates()));
+        assert_eq!(chosen(&plain, GlobalQuestion::NextAction), "answer");
+        assert!(
+            noul_probability(&plain, GlobalQuestion::EvidenceSufficient) >= 0.5,
+            "a direct answer must pass the selector's evidence threshold"
+        );
+
+        let greeting = answer(state("hello", typical_candidates()));
+        assert_eq!(chosen(&greeting, GlobalQuestion::NextAction), "answer");
+        assert!(
+            noul_probability(&greeting, GlobalQuestion::EvidenceSufficient) >= 0.5,
+            "a brief greeting must reach the serving model even when generic capabilities are available"
+        );
+
+        let mut continued = state("thanks", typical_candidates());
+        continued["completed_steps"] = json!([{"kind": "provider", "status": "ok"}]);
+        let continued = answer(continued);
+        assert_eq!(chosen(&continued, GlobalQuestion::NextAction), "answer");
+        assert!(
+            noul_probability(&continued, GlobalQuestion::EvidenceSufficient) >= 0.5,
+            "ordinary conversation history must not force a clarification or external lookup"
+        );
+
+        let empty = answer(state("  ", terminal_candidates()));
+        assert_eq!(chosen(&empty, GlobalQuestion::NextAction), "clarify");
+        assert!(noul_probability(&empty, GlobalQuestion::EvidenceSufficient) < 0.5);
+
+        let structured = answer(state("inspect /tmp/prx_fixture", terminal_candidates()));
+        assert!(
+            noul_probability(&structured, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "a structurally external request still needs external evidence"
+        );
+
+        let admitted_structured = answer(state("inspect /tmp/prx_fixture", typical_candidates()));
+        assert_eq!(chosen(&admitted_structured, GlobalQuestion::NextAction), "use_tool");
+        assert_eq!(
+            chosen(&admitted_structured, GlobalQuestion::CapabilityTarget),
+            "filesystem"
+        );
+        assert!(
+            noul_probability(&admitted_structured, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "a matching external candidate must not bypass retrieve-first evidence"
+        );
+
+        let external = answer(state("please find the relevant capability", typical_candidates()));
+        assert_eq!(chosen(&external, GlobalQuestion::NextAction), "discover");
+        assert!(
+            noul_probability(&external, GlobalQuestion::EvidenceSufficient) >= 0.5,
+            "a plain first turn must not be forced into recovery before its ranked discovery can run"
+        );
+
+        let mut pending = state("ok", terminal_candidates());
+        pending["approval_pending"] = json!(true);
+        pending["candidates"].as_array_mut().unwrap().push(candidate_json(
+            "request_approval",
+            "shell",
+            "request_approval-shell",
+        ));
+        let pending = answer(pending);
+        assert!(
+            noul_probability(&pending, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "pending approval must retain its existing evidence gate"
+        );
+
+        let mut failed = state("Explain the current result", terminal_candidates());
+        failed["completed_steps"] = json!([{"kind": "tool", "status": "failed"}]);
+        let failed = answer(failed);
+        assert!(
+            noul_probability(&failed, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "a failed step still requires recovery evidence"
+        );
+
+        let mut retried = state("Explain the current result", terminal_candidates());
+        retried["retry_count"] = json!(weights::RETRY_THRESHOLD);
+        let retried = answer(retried);
+        assert!(
+            noul_probability(&retried, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "an exhausted retry budget still requires clarification"
+        );
     }
 
     /// D-061 amendment N-1..N-4: a localized path, an internationalized

@@ -536,18 +536,21 @@ impl TurnDecisionService {
                 .any(|name| matches!(name.as_str(), "delegate" | "sessions_spawn")))
         .then(|| OrdinaryChildPublication::capture(self, context, proof))
         .transpose()?;
-        execution_context.child_grant = match &context.directive {
-            TurnExecutionDirective::Delegate { .. } if self.generation.effective.causal_tree.enabled => {
-                Some(self.issue_child_grant(proof, context)?)
-            }
-            TurnExecutionDirective::Delegate { .. } => {
+        let delegation_bound = bindings
+            .keys()
+            .any(|name| matches!(name.as_str(), "delegate" | "sessions_spawn"));
+        execution_context.child_grant = if delegation_bound && self.generation.effective.causal_tree.enabled {
+            Some(self.issue_child_grant(proof, context)?)
+        } else if delegation_bound {
+            {
                 anyhow::ensure!(
                     execution_context.ordinary_child_publication.is_some(),
                     "ordinary delegation execution lacks its parent publication"
                 );
-                None
             }
-            _ => None,
+            None
+        } else {
+            None
         };
         execution_context.decision_resume = None;
         execution_context.execution_bindings = Some(Arc::new(bindings));
@@ -832,43 +835,6 @@ impl TurnDecisionService {
         // The decision deadline bounds prediction/rehearsal/hops. Once the
         // service has issued a context, later execution rechecks live gates;
         // it must not reuse that short deadline as the tool runtime timeout.
-        let references: BTreeSet<_> = selected.required_capabilities().iter().cloned().collect();
-        match &context.directive {
-            TurnExecutionDirective::AnswerDirectly => anyhow::ensure!(
-                selected.action() == crate::causal_tree::branch::CausalActionKind::Answer && references.is_empty(),
-                "answer directive carries executable capabilities"
-            ),
-            TurnExecutionDirective::Execute { allowed_capability_ids } => {
-                let ids: BTreeSet<_> = references.iter().map(|reference| &reference.id).collect();
-                anyhow::ensure!(
-                    selected.action() == crate::causal_tree::branch::CausalActionKind::UseTool
-                        && !references.is_empty()
-                        && references.len() == selected.required_capabilities().len()
-                        && ids.len() == allowed_capability_ids.len()
-                        && allowed_capability_ids.iter().all(|id| ids.contains(id))
-                        && references == context.execution_refs,
-                    "issued execution directive differs from its selected candidate"
-                );
-            }
-            TurnExecutionDirective::Delegate { manifest } => {
-                let checked = directive_from_selection(
-                    &context.engine,
-                    &DirectiveContext {
-                        current_generation: catalog.generation(),
-                        approval_expires_at: chrono::Utc::now(),
-                        discovery_limit: 1,
-                    },
-                )?;
-                anyhow::ensure!(
-                    matches!(checked, TurnExecutionDirective::Delegate { manifest: checked } if checked == *manifest)
-                        && !references.is_empty()
-                        && references == context.execution_refs
-                        && references.len() == selected.required_capabilities().len(),
-                    "issued delegation differs from its selected candidate"
-                );
-            }
-            _ => anyhow::bail!("terminal or intermediate directive cannot enter the tool loop"),
-        }
         let resume_evidence = context
             .resume
             .as_ref()
@@ -896,6 +862,54 @@ impl TurnDecisionService {
             failed_call_counts: BTreeMap::new(),
             replayed_non_idempotent: &replayed_non_idempotent,
             retry_limit: None,
+        };
+        let selected_references: BTreeSet<_> = selected.required_capabilities().iter().cloned().collect();
+        let references = match &context.directive {
+            TurnExecutionDirective::AnswerDirectly => {
+                anyhow::ensure!(
+                    selected.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                        && selected_references.is_empty(),
+                    "answer directive differs from its selected candidate"
+                );
+                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates);
+                anyhow::ensure!(
+                    direct == context.execution_refs,
+                    "answer direct surface changed after admission"
+                );
+                direct
+            }
+            TurnExecutionDirective::Execute { allowed_capability_ids } => {
+                let ids: BTreeSet<_> = selected_references.iter().map(|reference| &reference.id).collect();
+                anyhow::ensure!(
+                    selected.action() == crate::causal_tree::branch::CausalActionKind::UseTool
+                        && !selected_references.is_empty()
+                        && selected_references.len() == selected.required_capabilities().len()
+                        && ids.len() == allowed_capability_ids.len()
+                        && allowed_capability_ids.iter().all(|id| ids.contains(id))
+                        && selected_references == context.execution_refs,
+                    "issued execution directive differs from its selected candidate"
+                );
+                selected_references
+            }
+            TurnExecutionDirective::Delegate { manifest } => {
+                let checked = directive_from_selection(
+                    &context.engine,
+                    &DirectiveContext {
+                        current_generation: catalog.generation(),
+                        approval_expires_at: chrono::Utc::now(),
+                        discovery_limit: 1,
+                    },
+                )?;
+                anyhow::ensure!(
+                    matches!(checked, TurnExecutionDirective::Delegate { manifest: checked } if checked == *manifest)
+                        && !selected_references.is_empty()
+                        && selected_references == context.execution_refs
+                        && selected_references.len() == selected.required_capabilities().len(),
+                    "issued delegation differs from its selected candidate"
+                );
+                selected_references
+            }
+            _ => anyhow::bail!("terminal or intermediate directive cannot enter the tool loop"),
         };
         anyhow::ensure!(
             HardGates::check_one(GatePass::PreCommit, &context.engine.state, &catalog, selected, &gates)

@@ -83,12 +83,22 @@ impl TurnDecisionPublication {
             std::borrow::Cow::Borrowed(&config.tool_tiering)
         };
         let excluded_names = tiering.always_exclude.iter().cloned().collect();
-        let direct_names = tiering
+        let mut direct_names: std::collections::BTreeSet<_> = tiering
             .always_include
             .iter()
             .filter(|name| !tiering.always_exclude.contains(name))
             .cloned()
             .collect();
+        // Interactive Chat is itself the local session-orchestration
+        // entrypoint: `/sessions` observes work started by the model-facing
+        // `sessions_spawn` tool. Keep that one bounded orchestration schema in
+        // its direct core when policy permits it. Other surfaces must opt in
+        // through `always_include`, and `always_exclude` still wins here.
+        if surface == crate::causal_tree::state::TurnSurfaceKind::Interactive
+            && !tiering.always_exclude.iter().any(|name| name == "sessions_spawn")
+        {
+            direct_names.insert("sessions_spawn".to_owned());
+        }
         let surface_policy = crate::tools::capability::catalog::SurfacePolicy {
             allowed_tools: None,
             excluded_names,

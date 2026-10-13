@@ -57,6 +57,20 @@ execution binding and the final authority checks. A terminal outcome joins the
 decision after terminal persistence. A delegation launch acknowledgement is not
 proof that its child completed.
 
+With the default builtin backend, a nonempty conversational turn with no
+structural or exact capability target can proceed to the serving model when its
+best admitted candidate is a direct answer, without requiring a retrieval
+artifact. This applies to the first message and later ordinary conversation.
+Empty input and turns made undecidable by failed or repeated work still Clarify.
+Requests that target retrieval, files or tools retain their external-evidence
+path. Freshness, approval and authority checks retain their existing gates. A
+direct-answer turn publishes only the bounded direct core and capability search
+that pass the active surface policy; it does not execute a capability by
+admission alone. Local interactive Chat includes `sessions_spawn` in that core
+because Chat owns the session-orchestration surface. Channel and other
+entrypoints still require their own direct-surface configuration, and an actual
+call is rechecked against source, schema, approval and execution policy.
+
 Use `prx causal backends` to inspect the computed backend order and exclusion
 reasons; `prx causal status` also reports health and circuit state. Availability
 or configuration alone does not authorize a physical send. The builtin is the

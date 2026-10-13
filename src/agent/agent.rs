@@ -1300,12 +1300,16 @@ mod tests {
         }
         let mut agent = builder.build().unwrap();
         // Q56: durable Builtin covers selected retrieval from the original scoped seed.
-        // The first-hello negative control remains only in the Q54 selected-loader Mock fixture.
-        if !record_decisions {
-            assert_eq!(
-                agent.turn("hello").await.unwrap(),
-                "Could you clarify the result you want?"
-            );
+        // The default Builtin must admit a plain first message without invoking
+        // the custom Memory loader. The Q54 Mock's explicit `other` choice is
+        // retained only for an empty, genuinely undecidable negative control.
+        if record_decisions {
+            assert_eq!(agent.turn("hello").await.unwrap(), "done");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
+            models.lock().unwrap().clear();
+        } else {
+            assert_eq!(agent.turn("").await.unwrap(), "Could you clarify the result you want?");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(models.lock().unwrap().is_empty());
         }

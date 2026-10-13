@@ -63,7 +63,9 @@ use super::turn_source::TurnSourceProof;
 #[cfg(test)]
 use crate::agent::entry::AgentTurnProof;
 use crate::capability::CapabilityAvailabilityLevel;
-use crate::causal_tree::branch::{CapabilityRef, CapabilityTarget, CatalogGeneration};
+use crate::causal_tree::branch::{
+    CandidateSpec, CapabilityRef, CapabilityTarget, CatalogGeneration, CausalActionKind, CausalCandidate,
+};
 use crate::causal_tree::candidate_generator::DiscoveredRefs;
 use crate::causal_tree::decision_engine::{
     CausalDecisionEngine, DiscoveryIssueError, EngineDecision, EngineError, EngineInputs, RetrievalIssueError,
@@ -73,7 +75,7 @@ use crate::causal_tree::decision_rehearsal::{CatalogProbe, MemoryProbe, PinnedCo
 use crate::causal_tree::directive::{
     DirectiveContext, DirectiveError, TurnExecutionDirective, directive_from_selection, render_terminal_directive,
 };
-use crate::causal_tree::gates::GateInputs;
+use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::outcome::{DecisionRecordBuilder, OutcomeCorrelator, RecordBuildError, TerminalFacts};
 use crate::causal_tree::state::{
@@ -883,6 +885,54 @@ fn selected_execute_refs(
         return Err(DirectiveError::NotAdmitted);
     }
     Ok(references)
+}
+
+/// The bounded direct core available while the serving model decides whether
+/// to answer or call a tool. These references are publication authority only:
+/// binding and dispatch recheck the live catalog, source, schema, security and
+/// approval policy. Delegators additionally require the sealed child manifest
+/// retained by this exact decision.
+fn direct_answer_refs(
+    decision: &EngineDecision,
+    catalog: &CatalogView<'_>,
+    gates: &GateInputs<'_>,
+) -> BTreeSet<CapabilityRef> {
+    catalog
+        .iter_entries()
+        .filter(|entry| matches!(entry.exposure, Exposure::Direct))
+        .filter_map(|entry| {
+            let delegation = matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn");
+            if delegation && decision.outgoing_child.is_none() {
+                return None;
+            }
+            let reference = CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            };
+            let candidate = CausalCandidate::new(
+                if delegation {
+                    CausalActionKind::Delegate
+                } else {
+                    CausalActionKind::UseTool
+                },
+                entry.family,
+                CandidateSpec {
+                    namespace: None,
+                    required_capabilities: vec![reference.clone()],
+                    side_effect: entry.effect,
+                    approval: entry.approval.clone(),
+                    estimated_cost: None,
+                    estimated_latency_ms: None,
+                },
+            );
+            (!matches!(
+                HardGates::check_capability_publication(&decision.state, catalog, &candidate, gates),
+                GateOutcome::Blocked { .. }
+            ))
+            .then_some(reference)
+        })
+        .collect()
 }
 
 impl TurnDecisionContext {
@@ -2041,7 +2091,15 @@ impl TurnDecisionService {
                 context.record_admitted.store(true, Ordering::Release);
             }
         }
-        if matches!(context.directive, TurnExecutionDirective::Delegate { .. }) {
+        let admits_delegation = matches!(context.directive, TurnExecutionDirective::Delegate { .. })
+            || context.execution_refs.iter().any(|reference| {
+                self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
+                    entry.fingerprint == reference.fingerprint
+                        && entry.generation == reference.generation
+                        && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                })
+            });
+        if admits_delegation {
             if self.generation.effective.causal_tree.enabled {
                 tokio::select! {
                     biased;
@@ -2447,6 +2505,11 @@ impl TurnDecisionService {
                         discovery_limit: 1,
                     },
                 )?;
+                let execution_refs = if matches!(directive, TurnExecutionDirective::AnswerDirectly) {
+                    direct_answer_refs(&decision, &catalog, &gates)
+                } else {
+                    BTreeSet::new()
+                };
                 return Ok(Arc::new(TurnDecisionContext {
                     resume: None,
                     accounting: accounting.retained_scope(),
@@ -2466,7 +2529,7 @@ impl TurnDecisionService {
                     directive,
                     main_compaction: budget.main_compaction,
                     hop_ids,
-                    execution_refs: BTreeSet::new(),
+                    execution_refs,
                     selected_retrieved: Vec::new(),
                     selected_custom_memory_context: None,
                     router_transition: None,
@@ -2677,8 +2740,41 @@ impl TurnDecisionService {
                     };
                     state.built_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
                 }
+                TurnExecutionDirective::AnswerDirectly => {
+                    let execution_refs = direct_answer_refs(&decision, &catalog, &gates);
+                    if cancellation.is_cancelled() {
+                        if has_router_transition {
+                            return terminal_after_catalog_drift(&state, prior_hops);
+                        }
+                        return Err(AgentDecisionError::Cancelled);
+                    }
+                    return Ok(Arc::new(TurnDecisionContext {
+                        resume: None,
+                        accounting: accounting.retained_scope(),
+                        owner_filesystem: owner_filesystem.clone(),
+                        source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
+                        service_id: self.service_id,
+                        record_admitted: AtomicBool::new(false),
+                        execution_trace: std::sync::OnceLock::new(),
+                        served_auxiliary: std::sync::OnceLock::new(),
+                        execution_closed: AtomicBool::new(false),
+                        approval_collection_started: AtomicBool::new(false),
+                        collected_pending: std::sync::OnceLock::new(),
+                        discovery_offers: std::sync::OnceLock::new(),
+                        discovery_admissions: std::sync::OnceLock::new(),
+                        engine: decision,
+                        prior_hops,
+                        directive,
+                        main_compaction: budget.main_compaction,
+                        hop_ids,
+                        execution_refs,
+                        selected_retrieved,
+                        selected_custom_memory_context,
+                        #[cfg(feature = "llm-router")]
+                        router_transition: router_transition.clone(),
+                    }));
+                }
                 TurnExecutionDirective::CollectApprovalArguments(_)
-                | TurnExecutionDirective::AnswerDirectly
                 | TurnExecutionDirective::Clarify { .. }
                 | TurnExecutionDirective::RequestApproval { .. }
                 | TurnExecutionDirective::Refuse { .. } => {
