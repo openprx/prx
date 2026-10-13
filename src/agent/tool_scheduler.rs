@@ -878,11 +878,10 @@ impl DelegationExecutionTask {
     }
 
     async fn join(mut self) -> Result<crate::tools::ToolExecutionOutcome> {
-        self.0
-            .take()
-            .expect("delegation execution task is present")
-            .await
-            .map_err(anyhow::Error::new)
+        let Some(task) = self.0.take() else {
+            anyhow::bail!("delegation execution task is missing");
+        };
+        task.await.map_err(anyhow::Error::new)
     }
 }
 
