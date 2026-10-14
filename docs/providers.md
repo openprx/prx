@@ -627,6 +627,10 @@ prices are included. Kimi Code is subscription/quota billed, so PRX deliberately
 does not invent a per-token cost for `k3` or the `kimi-for-coding*` aliases.
 OpenRouter and proxy pricing remains dynamic.
 
+When a selected model has no matching `cost.prices` entry, only `ollama` is
+treated as zero-cost. LM Studio, llama.cpp, vLLM, and custom loopback endpoints
+need an explicit `cost.prices` entry before PRX can produce a cost estimate.
+
 The canonical routing, usage, and cost settlement boundary is described in
 [provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).
 The 2026-10-04 local candidate adds source-bound Router ranking and bounded KNN
