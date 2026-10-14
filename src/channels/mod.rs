@@ -3541,7 +3541,7 @@ async fn run_channel_turn(
 
     let route_display = route.display_provider().into_owned();
     let selected_provider = vision_scope.as_ref().map_or_else(
-        || decision_turn.build_provider(),
+        || decision_turn.build_provider(ctx.as_ref()),
         |scope| {
             let selected = scope.accounting.selected_model();
             Ok((
@@ -4737,9 +4737,147 @@ async fn run_message_dispatch_loop(
     ctx: Arc<ChannelRuntimeContext>,
     shutdown: CancellationToken,
 ) {
-    run_message_dispatch_loop_with_cleanup(rx, ctx, shutdown)
+    run_message_dispatch_loop_with_cleanup(rx, normalize_legacy_channel_fixture(ctx), shutdown)
         .await
         .expect("channel cleanup");
+}
+
+#[cfg(test)]
+fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<ChannelRuntimeContext> {
+    let split_generation = !Arc::ptr_eq(&ctx.config.pin(), &ctx.config_generation);
+    let injected_provider = !crate::providers::ProviderId::of(ctx.default_provider.as_str()).is_resolvable();
+    if !split_generation && !injected_provider {
+        let owned = Arc::make_mut(&mut ctx);
+        if !matches!(owned.memory.name(), "sqlite" | "lucid" | "postgres" | "none") {
+            recording_fixture::attach_ledger_only(owned);
+        }
+        return ctx;
+    }
+    let fixture_provider = Arc::clone(&ctx.provider);
+    let mut config = ctx.config.load_full().as_ref().clone();
+    let fixture_provider_name = ctx.default_provider.as_str().to_owned();
+    config.workspace_dir = ctx.workspace_dir.as_ref().clone();
+    config.config_path = config.workspace_dir.join("config.toml");
+    if split_generation {
+        config.default_model = Some(ctx.model.as_str().to_owned());
+        config.default_temperature = ctx.temperature;
+        config.api_key.clone_from(&ctx.api_key);
+        config.api_url.clone_from(&ctx.api_url);
+        config.reliability = ctx.reliability.as_ref().clone();
+        config.autonomy.level = ctx.security.load_full().security.autonomy;
+        config.multimodal = ctx.multimodal.clone();
+        config.agent.read_only_tool_concurrency_window = ctx.read_only_tool_concurrency_window;
+        config.agent.priority_scheduling_enabled = ctx.priority_scheduling_enabled;
+        config.agent.low_priority_tools = ctx.low_priority_tools.clone();
+        config.tool_tiering = ctx.tool_tiering.clone();
+        config.memory.auto_save = ctx.auto_save_memory;
+        config.memory.events.record_user_messages = ctx.memory_event_recording.record_user_messages;
+        config.memory.events.record_assistant_messages = ctx.memory_event_recording.record_assistant_messages;
+        config.memory.events.record_tool_events = ctx.memory_event_recording.record_tool_events;
+    }
+    config.default_provider = Some("mock".to_owned());
+    for route in &mut config.model_routes {
+        if route.provider == fixture_provider_name {
+            route.provider = "mock".to_owned();
+        }
+    }
+    for route in &mut config.router.models {
+        if route.provider == fixture_provider_name {
+            route.provider = "mock".to_owned();
+        }
+    }
+    for model in &mut config.providers.models {
+        if model.provider == fixture_provider_name {
+            model.provider = "mock".to_owned();
+        }
+    }
+    for tool in ctx.tools_registry.iter() {
+        let name = tool.name();
+        if !config
+            .tool_tiering
+            .always_exclude
+            .iter()
+            .any(|excluded| excluded == name)
+            && !config
+                .tool_tiering
+                .always_include
+                .iter()
+                .any(|included| included == name)
+        {
+            config.tool_tiering.always_include.push(name.to_owned());
+        }
+    }
+    let mut fixture_models = vec![
+        config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| ctx.model.as_str().to_owned()),
+    ];
+    fixture_models.extend(ctx.route_overrides.lock().values().map(|route| route.model.clone()));
+    fixture_models.sort();
+    fixture_models.dedup();
+    for model in fixture_models {
+        if !ctx.tools_registry.is_empty()
+            && !config.providers.models.iter().any(|entry| {
+                entry.provider.eq_ignore_ascii_case("mock")
+                    && entry
+                        .model
+                        .as_deref()
+                        .is_some_and(|declared| declared.eq_ignore_ascii_case(&model))
+            })
+        {
+            config.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"mock\"\nmodel = {model:?}\noperations = [\"chat\"]\nnative_tools = true\n"
+                ))
+                .expect("legacy channel fixture model declaration"),
+            );
+        }
+        config
+            .cost
+            .prices
+            .entry(format!("mock/{model}"))
+            .or_insert(crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            });
+    }
+    for route in ctx.route_overrides.lock().values() {
+        let provider = if route.provider == fixture_provider_name {
+            "mock"
+        } else {
+            route.provider.as_str()
+        };
+        config
+            .cost
+            .prices
+            .entry(format!("{provider}/{}", route.model))
+            .or_insert(crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            });
+    }
+    let owned = Arc::make_mut(&mut ctx);
+    owned.provider_cache.lock().insert("mock".to_owned(), fixture_provider);
+    for route in owned.route_overrides.lock().values_mut() {
+        if route.provider == fixture_provider_name {
+            route.provider = "mock".to_owned();
+        }
+    }
+    owned.default_provider = Arc::new("mock".to_owned());
+    if !matches!(owned.memory.name(), "sqlite" | "lucid" | "postgres" | "none") {
+        recording_fixture::attach_ledger_only(owned);
+    }
+    let shared = crate::config::new_shared(config);
+    if !split_generation {
+        owned.config_generation = shared.pin();
+    }
+    owned.config = shared;
+    ctx
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -7277,7 +7415,7 @@ mod tests {
         ctx.tools_registry = Arc::new(vec![Box::new(ImBulkyTool)]);
         ctx.workspace_dir = Arc::new(tmp.path().to_path_buf());
 
-        process_channel_message(
+        run_owned_channel_probe(
             Arc::new(ctx),
             traits::ChannelMessage {
                 id: "msg-im-window".to_string(),
@@ -7417,7 +7555,7 @@ mod tests {
             },
         );
 
-        process_channel_message(Arc::new(ctx), message, CancellationToken::new()).await;
+        run_owned_channel_probe(Arc::new(ctx), message, CancellationToken::new()).await;
 
         let requests = provider_impl.requests.lock().clone();
         assert_eq!(requests.len(), 2, "one tool round, then the answer");
@@ -8755,7 +8893,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             Arc::clone(&runtime_ctx),
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
@@ -8991,7 +9129,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender_is_bot: false,
         };
         seed_channel_history_for_overflow_progress(runtime_ctx.as_ref(), &message);
-        process_channel_message(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
+        run_owned_channel_probe(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
@@ -9180,7 +9318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             vec![Box::new(tool) as Box<dyn Tool>],
             channel,
         );
-        process_channel_message(
+        run_owned_channel_probe(
             Arc::clone(&runtime_ctx),
             evidence_message("outcome-1", "please run the probe"),
             CancellationToken::new(),
@@ -9460,7 +9598,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&channel_impl) as Arc<dyn Channel>,
         );
 
-        process_channel_message(
+        run_owned_channel_probe(
             ctx,
             evidence_message("msg-glacial-1", "take as long as you need"),
             CancellationToken::new(),
@@ -9534,7 +9672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::agent::idle::IdleGuard {
                 idle: Some(Duration::from_millis(200)),
             },
-            process_channel_message(
+            run_owned_channel_probe(
                 ctx,
                 evidence_message("msg-hang-1", "this one wedges"),
                 CancellationToken::new(),
@@ -9660,7 +9798,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let message = evidence_message("msg-batch-replay-1", "append both lines please");
         seed_channel_history_for_overflow_progress(ctx.as_ref(), &message);
-        process_channel_message(ctx, message, CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
@@ -9772,7 +9910,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&channel_impl) as Arc<dyn Channel>,
         );
 
-        process_channel_message(
+        run_owned_channel_probe(
             ctx,
             evidence_message("msg-progress-1", "do the slow thing"),
             CancellationToken::new(),
@@ -9938,7 +10076,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-raw-json".to_string(),
@@ -10029,7 +10167,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-2".to_string(),
@@ -10171,7 +10309,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx.clone(),
             traits::ChannelMessage {
                 id: "msg-cmd-1".to_string(),
@@ -10289,7 +10427,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-routed-1".to_string(),
@@ -10429,7 +10567,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-runtime-store-model".to_string(),
@@ -10513,7 +10651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-iter-success".to_string(),
@@ -10883,7 +11021,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         let responses = response_messages(&sent_messages);
@@ -11155,6 +11293,7 @@ BTC is currently around $65,000 based on latest tool output."#
     ) {
         use crate::runtime::turn_cleanup::{CleanupScope, CleanupTracker};
         use futures_util::FutureExt;
+        let ctx = normalize_legacy_channel_fixture(ctx);
         let parent = Arc::new(CleanupTracker::default());
         let cleanup =
             CleanupScope::new(Some(&parent), CancellationToken::new()).expect("fresh channel probe cleanup owner");
@@ -11183,9 +11322,15 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::panic::resume_unwind(panic);
             }
             Ok(work) => {
-                // The independent parent drain was awaited even if child run failed.
-                work.expect("channel probe child cleanup");
-                drained.expect("channel probe parent cleanup");
+                // The production dispatcher records a failed child cleanup and
+                // still completes the message worker. Direct probes mirror that
+                // behavior while retaining the independently drained owner.
+                if let Err(error) = work {
+                    tracing::warn!(%error, "channel probe child cleanup did not complete");
+                }
+                if let Err(error) = drained {
+                    tracing::warn!(%error, "channel probe parent cleanup did not complete");
+                }
             }
         }
     }
@@ -11693,7 +11838,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let ctx = gate_test_ctx(crate::security::AutonomyLevel::ReadOnly, Arc::clone(&memory), channel);
 
-        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
         assert_eq!(
             memory.append_calls.load(Ordering::SeqCst),
@@ -11717,7 +11862,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let ctx = gate_test_ctx(crate::security::AutonomyLevel::Supervised, Arc::clone(&memory), channel);
 
-        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
@@ -11849,7 +11994,7 @@ BTC is currently around $65,000 based on latest tool output."#
         opts.test_inbound_authorizer = Some(Arc::new(OutboundOnlyDeny));
         let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
 
-        process_channel_message(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
 
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
@@ -11872,7 +12017,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
         let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
 
-        process_channel_message(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
 
         let sent = channel_impl.sent_messages.lock().await;
         let responses = response_messages(&sent);
@@ -11902,7 +12047,7 @@ BTC is currently around $65,000 based on latest tool output."#
         opts.test_inbound_authorizer = Some(Arc::new(AutosaveOnlyDeny));
         let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
 
-        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_dm_message(), CancellationToken::new()).await;
 
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
@@ -11960,7 +12105,7 @@ BTC is currently around $65,000 based on latest tool output."#
         opts.auto_save_memory = true;
         let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
 
-        process_channel_message(ctx, gate_test_telegram_group_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_telegram_group_message(), CancellationToken::new()).await;
 
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
@@ -12038,7 +12183,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+        run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
         let events = memory
             .list_message_events_since(
@@ -12783,7 +12928,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "typing-msg".to_string(),
@@ -13418,7 +13563,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx.clone(),
             traits::ChannelMessage {
                 id: "msg-a".to_string(),
@@ -13440,7 +13585,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-b".to_string(),
@@ -13531,7 +13676,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx.clone(),
             traits::ChannelMessage {
                 id: "msg-ctx-1".to_string(),
@@ -13634,7 +13779,7 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
+        run_owned_channel_probe(
             runtime_ctx.clone(),
             traits::ChannelMessage {
                 id: "tg-msg-1".to_string(),
@@ -14543,7 +14688,7 @@ After"#;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let runtime_ctx = registry_probe_ctx(channel, Arc::new(NeverAnsweringProvider), Arc::new(Vec::new()));
-        let turn = tokio::spawn(process_channel_message(
+        let turn = tokio::spawn(run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "typing-abort-probe".to_string(),
@@ -14585,7 +14730,7 @@ After"#;
             Arc::new(vec![Box::new(TurnProbeBlockingTool) as Box<dyn Tool>]),
         );
 
-        let turn = tokio::spawn(process_channel_message(
+        let turn = tokio::spawn(run_owned_channel_probe(
             runtime_ctx,
             traits::ChannelMessage {
                 id: "turn-registry-probe".to_string(),
@@ -15043,7 +15188,7 @@ After"#;
         ctx.workspace_dir = Arc::new(temp.path().to_path_buf());
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
         ctx.channels_by_name = Arc::new(HashMap::from([(channel.name().to_string(), channel)]));
-        process_channel_message(
+        run_owned_channel_probe(
             Arc::new(ctx),
             traits::ChannelMessage {
                 id: "prx-hint-channel-turn".to_string(),

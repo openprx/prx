@@ -76,7 +76,7 @@ pub(super) fn channel_turn(
     message: traits::ChannelMessage,
     cancellation: CancellationToken,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
-    Box::pin(process_channel_message(ctx, message, cancellation))
+    Box::pin(run_owned_channel_probe(ctx, message, cancellation))
 }
 
 enum ReportScenario {
@@ -175,14 +175,13 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         assert_eq!(resolved.verification(), &crate::providers::catalog::Verification::Verified);
         // PMM declaration and transport capabilities are separate contracts.
         // Construct through the same production factory, without issuing a send.
-        let prepared_provider = crate::providers::create_provider_for(
+        let prepared_provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
             &resolved, &crate::providers::selection::catalog_for(&config),
             &config.reliability, &crate::providers::provider_runtime_options_from_config(&config),
-        ).expect("actual PMM loopback provider factory");
+        ).expect("actual PMM loopback provider factory"));
         assert!(prepared_provider.capabilities_for(
             MODEL, crate::providers::traits::ProviderRequestMode::NonStreaming,
         ).vision, "actual selected transport must support vision");
-        drop(prepared_provider);
         let price = crate::llm::route_decision::usage_cost_resolution(
             PROVIDER, MODEL, 1, 0, 0, 0, &config.cost,
         );
@@ -203,6 +202,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         context.config = Arc::clone(&shared);
         context.config_generation = shared.pin();
         context.default_provider = Arc::new(PROVIDER.to_owned());
+        context.provider = prepared_provider;
         context.api_url = Some(endpoint);
         context.api_key = Some("prx-loopback-fixture-key".to_owned());
         context.model = Arc::new(MODEL.to_owned());

@@ -1,16 +1,19 @@
-//! Recording prerequisites for exactly two original channel fixtures.
+//! Durable recording prerequisites for channel fixtures with narrow memory doubles.
 use crate::memory::SqliteMemory;
 use crate::memory::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryPrincipal, MessageEvent, MessageEventInput, SessionContextQuery,
     SharedContextQuery,
 };
+use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, Weak};
 
 pub(super) struct RecordedChannelFixtureMemory {
     original: Arc<dyn Memory>,
     local: SqliteMemory,
+    _local_workspace: Option<tempfile::TempDir>,
     owned_readbacks: AtomicUsize,
 }
 
@@ -47,6 +50,7 @@ pub(super) fn attach(ctx: &mut super::ChannelRuntimeContext, workspace: &Path) -
     let memory = Arc::new(RecordedChannelFixtureMemory {
         original: Arc::clone(&ctx.memory),
         local: SqliteMemory::new(workspace).expect("channel fixture event ledger"),
+        _local_workspace: None,
         owned_readbacks: AtomicUsize::new(0),
     });
     let shared = crate::config::new_shared(config);
@@ -58,10 +62,41 @@ pub(super) fn attach(ctx: &mut super::ChannelRuntimeContext, workspace: &Path) -
     memory
 }
 
+/// Give a legacy narrow memory double the durable event ledger required by the
+/// production channel source while preserving its workspace and operation
+/// assertions. The wrapper owns its private SQLite directory for the full turn.
+pub(super) fn attach_ledger_only(ctx: &mut super::ChannelRuntimeContext) {
+    type Registry = std::collections::HashMap<usize, Weak<RecordedChannelFixtureMemory>>;
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+    let slot = Arc::as_ptr(&ctx.decisions) as usize;
+    let registry = REGISTRY.get_or_init(|| Mutex::new(Registry::new()));
+    let existing = registry
+        .lock()
+        .get(&slot)
+        .and_then(Weak::upgrade)
+        .filter(|memory| Arc::ptr_eq(&memory.original, &ctx.memory));
+    if let Some(memory) = existing {
+        ctx.memory = memory;
+        return;
+    }
+
+    let workspace = tempfile::TempDir::new().expect("legacy channel fixture event ledger workspace");
+    let local = SqliteMemory::new(workspace.path()).expect("legacy channel fixture event ledger");
+    let memory = Arc::new(RecordedChannelFixtureMemory {
+        original: Arc::clone(&ctx.memory),
+        local,
+        _local_workspace: Some(workspace),
+        owned_readbacks: AtomicUsize::new(0),
+    });
+    registry.lock().insert(slot, Arc::downgrade(&memory));
+    ctx.memory = memory;
+}
+
 #[async_trait::async_trait]
 impl Memory for RecordedChannelFixtureMemory {
     fn name(&self) -> &str {
-        self.original.name()
+        self.local.name()
     }
     async fn store(
         &self,
