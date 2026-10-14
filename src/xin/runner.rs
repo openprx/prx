@@ -2021,6 +2021,69 @@ mod tests {
             .expect("test: the manual run completes");
     }
 
+    #[tokio::test]
+    async fn xin_plain_message_reaches_provider_with_default_causal_config() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL, PROBE_REPLY};
+
+        let tmp = TempDir::new().unwrap();
+        let probe = CredentialProbe::start().await;
+        let provider = probe.custom_provider();
+        let mut config = test_config(&tmp);
+        assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        config.default_provider = Some(provider.clone());
+        config.default_model = Some(PROBE_MODEL.to_string());
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = {provider:?}\nmodel = {PROBE_MODEL:?}\noperations = [\"chat\"]\nnative_tools = true\n"
+            ))
+            .expect("test: controlled Xin model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let created = execute_as(
+            Box::new(crate::tools::XinTool::new(
+                crate::config::new_shared(config.clone()),
+                Arc::clone(&security),
+            )),
+            surface_context(&config, Surface::AgentCli),
+            serde_json::json!({
+                "action": "add",
+                "name": "plain-xin-turn",
+                "payload": "hello",
+                "execution_mode": "agent_session",
+            }),
+        )
+        .await;
+        assert!(created.success, "test: the plain Xin task was created: {created:?}");
+        let task = store::list_tasks(&config)
+            .expect("test: list Xin tasks")
+            .into_iter()
+            .find(|task| task.name == "plain-xin-turn")
+            .expect("test: the plain Xin task");
+
+        let run = run_task_now(&config, &security, &task.id)
+            .await
+            .expect("test: the plain Xin task completes");
+
+        assert!(run.success, "test: plain Xin turn failed: {}", run.output);
+        assert_eq!(run.output, PROBE_REPLY);
+        assert!(
+            probe
+                .requests()
+                .iter()
+                .any(|request| request.path.contains("chat/completions")),
+            "test: the Xin turn reached the serving provider"
+        );
+    }
+
     /// R-MCPBh M-1 for xin: an agent-session task ran every tool call with the
     /// `prx agent` CLI tuple whoever created it, so a webhook caller's task could
     /// write into `MEMORY.md` and so into every surface's system prompt. The run
