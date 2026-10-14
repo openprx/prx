@@ -250,7 +250,7 @@ async fn run_tool_call_loop_persists_large_tool_output_documents() {
                             &provider,
                         )
                         .await;
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
 
                         let result = run_turn(
                             &mut history,
@@ -1123,7 +1123,7 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                         )
                         .await;
                         tokio::time::pause();
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
                         let guard = crate::agent::idle::IdleGuard {
@@ -1273,7 +1273,7 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                         )
                         .await;
                         tokio::time::pause();
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
                         let guard = crate::agent::idle::IdleGuard {

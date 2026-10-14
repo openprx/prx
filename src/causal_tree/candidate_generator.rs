@@ -461,9 +461,11 @@ impl CausalCandidateGenerator {
                 if !exact_capability_requires_close {
                     let mut discovery_anchor = None;
                     for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
-                        let searchable = catalog
-                            .iter_entries()
-                            .filter(|entry| entry.family == family && matches!(entry.exposure, Exposure::Searchable));
+                        let searchable = catalog.iter_entries().filter(|entry| {
+                            entry.family == family
+                                && matches!(entry.exposure, Exposure::Searchable)
+                                && !available_for_fallback(entry, policy)
+                        });
                         if let Some(candidate) = select_family_candidate(
                             CausalActionKind::Discover,
                             family,
@@ -721,7 +723,23 @@ fn from_entry(
         fingerprint: entry.fingerprint,
         generation: entry.generation,
     };
-    let estimate = policy.cost_model.estimate_entry(entry);
+    // Discover runs one bounded in-memory catalog search. The referenced
+    // entry supplies the target's effect, approval and availability gates,
+    // but its provider-token and execution-latency estimate belongs to a
+    // later tool call. Charging that estimate to this control hop can make a
+    // perfectly available search expire before selection and turn an
+    // ordinary request into Clarify.
+    let estimate = (action != CausalActionKind::Discover)
+        .then(|| policy.cost_model.estimate_entry(entry))
+        .flatten();
+    let discovery_estimate = (action == CausalActionKind::Discover).then_some((
+        CostEstimate {
+            tokens: 0,
+            micro_usd: 0,
+        },
+        0,
+    ));
+    let estimate = discovery_estimate.or(estimate);
     CausalCandidate::new(
         action,
         family,

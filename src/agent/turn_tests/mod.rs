@@ -440,6 +440,16 @@ pub(super) fn tool_specs_of(tools: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSp
     crate::tools::ToolCatalog::from_tools(tools.iter().map(|tool| tool.as_ref())).tool_specs()
 }
 
+/// Business schemas registered by a fixture. `capability_search` is a
+/// separately gated control and is absent after exact discovery selects the
+/// executable tool.
+pub(super) fn business_tool_specs_of(tools: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSpec> {
+    tool_specs_of(tools)
+        .into_iter()
+        .filter(|spec| spec.name != "capability_search")
+        .collect()
+}
+
 /// Deterministic history that measures at least `target_tokens`, built from
 /// repeated fixed text so the size follows whichever estimator is compiled
 /// in.
