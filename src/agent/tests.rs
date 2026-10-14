@@ -324,6 +324,21 @@ fn fixture_runtime_config(workspace: &std::path::Path) -> crate::config::Config 
         },
     );
     runtime
+        .providers
+        .models
+        .push(crate::config::schema::ProviderModelConfig {
+            provider: "ollama".to_owned(),
+            model: Some("prx-local-model".to_owned()),
+            operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+            native_tools: Some(true),
+            vision_input: None,
+            streaming: None,
+            structured_output: None,
+            tool_schema_dialect: None,
+            tool_call_dialect: None,
+            context_window: None,
+        });
+    runtime
 }
 
 fn build_agent_with(
@@ -479,7 +494,11 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
 
     let response = agent.turn("please fix this bug for me").await.unwrap();
 
-    assert!(response.contains("task run-123"));
+    assert!(
+        response.contains("task run-123"),
+        "configured delegation response: {response:?}; history: {:?}",
+        agent.history()
+    );
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["action"], "spawn");
@@ -540,6 +559,7 @@ async fn turn_handles_multi_step_tool_chain() {
         let (memory, workspace) = make_sqlite_memory();
         let mut config = fixture_runtime_config(workspace.path());
         config.autonomy.level = crate::security::AutonomyLevel::Full;
+        config.tool_tiering.always_include.push("counter".to_owned());
         let agent = Agent::builder()
             .runtime_config(config, "ollama")
             .provider(provider)
@@ -556,7 +576,7 @@ async fn turn_handles_multi_step_tool_chain() {
             !response.is_empty(),
             "Expected non-empty response after multi-step chain"
         );
-        assert_eq!(*count.lock().unwrap(), 3);
+        assert_eq!(*count.lock().unwrap(), 3, "multi-step history: {:?}", agent.history());
     })
     .await;
 }
@@ -962,6 +982,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
         let (memory, workspace) = make_sqlite_memory();
         let mut config = fixture_runtime_config(workspace.path());
         config.autonomy.level = crate::security::AutonomyLevel::Full;
+        config.tool_tiering.always_include.push("counter".to_owned());
         let agent = Agent::builder()
             .runtime_config(config, "ollama")
             .provider(provider)
@@ -978,7 +999,12 @@ async fn turn_handles_multiple_tools_in_one_response() {
             !response.is_empty(),
             "Expected non-empty response after multi-tool batch"
         );
-        assert_eq!(*count.lock().unwrap(), 3, "All 3 tools should have been called");
+        assert_eq!(
+            *count.lock().unwrap(),
+            3,
+            "All 3 tools should have been called; history: {:?}",
+            agent.history()
+        );
     })
     .await;
 }
