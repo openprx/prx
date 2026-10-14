@@ -13,7 +13,7 @@ use crate::runtime::turn_decision::{
     AgentTurnKind, TurnDecisionContext, TurnDecisionService, TurnServiceBuild, build_turn_decision_service,
 };
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::tools::capability::catalog::{CatalogSources, SurfacePolicy};
+use crate::tools::capability::catalog::CatalogSources;
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
     TracingToolExecutionAudit,
@@ -440,6 +440,11 @@ impl AdmittedTurn {
             &origin,
             FixtureOrigin::Channel(_) | FixtureOrigin::OrdinaryControlledChannel(_)
         );
+        let surface = if channel_surface {
+            TurnSurfaceKind::Channel
+        } else {
+            TurnSurfaceKind::AgentLoop
+        };
         if channel_surface {
             config.tool_tiering = config.tool_tiering.for_channel_surface();
         }
@@ -472,11 +477,7 @@ impl AdmittedTurn {
         };
         let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
         let mut service = build_turn_decision_service(
-            if channel_surface {
-                TurnSurfaceKind::Channel
-            } else {
-                TurnSurfaceKind::AgentLoop
-            },
+            surface,
             TurnServiceBuild {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
@@ -489,18 +490,7 @@ impl AdmittedTurn {
                     &hooks,
                     0,
                 ),
-                surface_policy: SurfacePolicy {
-                    channel_allowed: channel_surface,
-                    excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
-                    direct_names: config
-                        .tool_tiering
-                        .always_include
-                        .iter()
-                        .filter(|name| !config.tool_tiering.always_exclude.contains(name))
-                        .cloned()
-                        .collect(),
-                    ..Default::default()
-                },
+                surface_policy: crate::runtime::turn_publication::surface_policy(surface, &config.tool_tiering),
                 provider_catalog: &provider_catalog,
                 transports: if configured_native_tools.is_some() {
                     &crate::decision::compatible_http::HttpDecisionTransports
