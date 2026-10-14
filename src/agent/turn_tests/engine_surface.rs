@@ -1109,6 +1109,10 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
             let drained = cleanup
                 .run(q79_boxed_fixture_work(async {
                     let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        // The compatible decision endpoint is real loopback I/O. Let that
+                        // admission run on wall time, then restore the paused clock before
+                        // the idle guard starts measuring the production tool loop.
+                        tokio::time::resume();
                         let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
                             mechanics_config,
                             input,
@@ -1118,6 +1122,7 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                             &provider,
                         )
                         .await;
+                        tokio::time::pause();
                         admission.assert_core_specs(&tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
@@ -1255,6 +1260,9 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
             let drained = cleanup
                 .run(q79_boxed_fixture_work(async {
                     let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        // Admission uses a real compatible loopback endpoint; restore the
+                        // virtual clock only after that I/O, before the watchdog is armed.
+                        tokio::time::resume();
                         let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
                             mechanics_config,
                             input,
@@ -1264,6 +1272,7 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                             &provider,
                         )
                         .await;
+                        tokio::time::pause();
                         admission.assert_core_specs(&tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
