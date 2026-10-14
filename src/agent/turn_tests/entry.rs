@@ -304,6 +304,38 @@ fn cli_agent_probe_saw_a_chat_request(probe: &crate::providers::credential_probe
         .any(|request| request.path.contains("chat/completions"))
 }
 
+/// A plain single-shot `prx agent` turn must enter through the production
+/// bootstrap and reach its serving model with the default built-in decision
+/// plane. This is the CLI entrypoint acceptance proof for ordinary text.
+#[tokio::test]
+async fn cli_single_shot_plain_message_reaches_provider_with_default_causal_config() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_REPLY};
+
+    let tmp = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start().await;
+    let config = cli_agent_probe_config(tmp.path(), &probe);
+    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+
+    let reply = run_with_runtime_envelope(
+        config,
+        Some("hello".to_string()),
+        None,
+        None,
+        0.0,
+        CancellationToken::new(),
+        None,
+        None,
+    )
+    .await
+    .expect("test: the plain single-shot agent turn completes");
+
+    assert_eq!(reply, PROBE_REPLY);
+    assert!(
+        cli_agent_probe_saw_a_chat_request(&probe),
+        "test: the turn reached the serving provider"
+    );
+}
+
 /// The CLI entrypoint must carry the configured deny policy into the real
 /// provider -> parser -> tool-service path. A default policy would write this
 /// file, so the absent file is the negative wire assertion.
