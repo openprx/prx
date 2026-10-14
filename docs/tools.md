@@ -13,7 +13,7 @@ only `mcp_call`. Its schema does not enumerate configured servers or tools.
 
 | Category | Tools |
 |----------|-------|
-| **Capability discovery** | `capability_search` (source-authorized Execute turns only) |
+| **Capability discovery** | `capability_search` (source-authorized AnswerDirectly and Execute turns) |
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
 | **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
@@ -49,18 +49,19 @@ for storage, path and platform restrictions.
 `capability_search` accepts a nonempty `query` of at most 1024 UTF-8 bytes
 and an optional `limit` from 1 to 5 (default 5). Each hit carries its canonical
 tool schema, capability ID, schema fingerprint and catalog generation. The
-shared turn engine exposes this control tool only for an Execute decision
-with a legal discoverable family, subject to source exclusions and policy.
+shared turn engine exposes this control tool for AnswerDirectly and Execute
+decisions with a legal discoverable family, subject to source exclusions and
+policy.
 Discovery eligibility is retained independently of the prediction candidate
 limit and the original input's length. An oversized original input cannot be
 used directly for an initial search hop; a later model-supplied search query
-must independently meet the 1024-byte limit.
-Answer and delegation directives do not acquire discovery merely because the
-tool is registered. Search uses the indexed, source-filtered catalog and does
-not refresh external backends. Returned references are retained only in that
-live turn and cleared when it closes. A search result alone grants no execution
-authority; the tool requires an execution-service-issued invocation port and
-rejects direct calls without it.
+must independently meet the 1024-byte limit. Registration by itself does not
+expose search: the current source/model must permit tool calls and at least one
+eligible family must survive the surface gates. Search uses the indexed,
+source-filtered catalog and does not refresh external backends. Returned
+references are retained only in that live turn and cleared when it closes. A
+search result alone grants no execution authority; the tool requires an
+execution-service-issued invocation port and rejects direct calls without it.
 When the model subsequently calls an offered public name or exact capability
 ID, the engine rechecks that specific reference before dispatch. Passed
 definitions are appended after the stable core for later iterations of the
@@ -117,12 +118,13 @@ published aliases, while explicit exclusions still apply. Each admission and
 execution provenance check reevaluates the current backend support.
 
 A request in another language does not expose the full registry. The decision
-may select discovery, or an admitted Execute turn may expose `capability_search`
-as described above. Search returns bounded offers from eligible families. An
-offered capability must pass its own admission before it can execute or join
-the appended surface. The old keyword selector and cumulative session union
-are absent from the production path. Tools offered on an earlier turn do not
-become authority for a later turn.
+may select discovery, and admitted AnswerDirectly or Execute turns may expose
+`capability_search` when the source/model may call tools and an eligible family
+exists. Search returns bounded offers from eligible families. An offered
+capability must pass its own admission before it can execute or join the
+appended surface. The old keyword selector and cumulative session union are
+absent from the production path. Tools offered on an earlier turn do not become
+authority for a later turn.
 
 Within one turn, the selected core is stable and newly admitted discoveries
 are appended after it. Both segments use canonical ordering and exact schema

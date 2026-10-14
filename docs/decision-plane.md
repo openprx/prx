@@ -61,15 +61,50 @@ With the default builtin backend, a nonempty conversational turn with no
 structural or exact capability target can proceed to the serving model when its
 best admitted candidate is a direct answer, without requiring a retrieval
 artifact. This applies to the first message and later ordinary conversation.
-Empty input and turns made undecidable by failed or repeated work still Clarify.
-Requests that target retrieval, files or tools retain their external-evidence
-path. Freshness, approval and authority checks retain their existing gates. A
-direct-answer turn publishes only the bounded direct core and capability search
-that pass the active surface policy; it does not execute a capability by
-admission alone. Local interactive Chat includes `sessions_spawn` in that core
-because Chat owns the session-orchestration surface. Channel and other
-entrypoints still require their own direct-surface configuration, and an actual
+An earlier failed provider attempt is not an unsuccessful action step, so it
+does not make a later ordinary message require external evidence. Empty input
+and turns made undecidable by failed or repeated tool work still Clarify. Brief
+ordinary requests (builtin request weight at most two), continued conversation,
+and turns with no viable read/recovery candidate receive the direct-answer
+preference. Longer unrouted text may take one bounded discovery hop and then
+answer when discovery adds no capability.
+
+An exactly named, current Searchable tool uses a narrower selection path: it may
+commit without an external artifact, the evidence-sufficiency abstention, the
+choice-confidence check, or the side-effect-scaled commit threshold. It still
+must be a single exact reference in the current catalog generation and pass
+surface visibility, exclusions, model allowlists, readiness, freshness, margin,
+source and side-effect-mode gates. An approval-required tool remains pending in
+Supervised mode, and execution still requires its exact approval/grant and
+idempotency authority.
+
+An Answer turn may publish the bounded Direct core plus `capability_search` when
+the source/model may call tools and an eligible discovery family exists. It may
+also publish an exactly named `delegate` or `sessions_spawn` on any surface that
+admits delegation, even when that delegator is Searchable rather than configured
+as Direct, but only when the same decision carries a sealed child manifest.
+Interactive Chat additionally places `sessions_spawn` in its Direct core.
+Exclusions, tools-off, read-only and plan interception still remove entries, and
+publication alone never executes one. Channel and gateway turns use these shared
+rules; they do not need a separate direct-surface configuration. Every actual
 call is rechecked against source, schema, approval and execution policy.
+
+Conversation history used by the provider and the boolean used by admission are
+separate contracts. The admission input is currently populated as follows:
+
+| Entrypoint | Admission history input |
+| --- | --- |
+| Interactive Chat | True after the in-process transcript contains a non-system turn |
+| Gateway webhook and authenticated Console | True when the owner/session-scoped durable history contains an earlier user or assistant turn |
+| Single-shot/REPL Agent CLI, channels, cron, Xin, delegate and session workers | False; these sources admit the raw current input even when their provider request or worker state carries earlier context |
+
+The effective model window is pinned before decision dispatch. After the
+configured response reserve, the runtime reserves one sixteenth of the remaining
+window for the sealed decision request (capped at 4,096 tokens) and requires a
+positive main-turn input slice. A smaller effective window fails closed with
+`resolved Agent context window has no safe decision reserve` before provider
+execution. Published tool schemas and their prompt instructions are then
+reserved from the main-turn slice as part of each provider preflight.
 
 Use `prx causal backends` to inspect the computed backend order and exclusion
 reasons; `prx causal status` also reports health and circuit state. Availability
