@@ -1024,10 +1024,10 @@ enum WriterMessage {
     /// A v1 file's progress, saved only when every listed decision is
     /// stored (a record the writer failed to store is never marked done).
     Imported(ImportProgress, Vec<DecisionId>),
-    Drain(tokio::sync::oneshot::Sender<()>),
+    Drain(std::sync::mpsc::Sender<()>),
     /// Checkpoint the WAL, close the connection and stop the writer; the
     /// sender is answered once the connection is closed.
-    Close(tokio::sync::oneshot::Sender<()>),
+    Close(std::sync::mpsc::Sender<()>),
 }
 
 /// The writer's queue. Cloning shares the one writer thread.
@@ -1138,10 +1138,10 @@ impl DecisionStoreWriter {
 
     async fn send_and_wait(
         &self,
-        message: fn(tokio::sync::oneshot::Sender<()>) -> WriterMessage,
+        message: fn(std::sync::mpsc::Sender<()>) -> WriterMessage,
         deadline: Instant,
     ) -> bool {
-        let (done, finished) = tokio::sync::oneshot::channel();
+        let (done, finished) = std::sync::mpsc::channel();
         let mut command = message(done);
         loop {
             match self.queue.try_send(command) {
@@ -1156,7 +1156,10 @@ impl DecisionStoreWriter {
                 Err(TrySendError::Disconnected(_)) => return false,
             }
         }
-        matches!(tokio::time::timeout_at(deadline.into(), finished).await, Ok(Ok(())))
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::task::spawn_blocking(move || finished.recv_timeout(remaining).is_ok())
+            .await
+            .unwrap_or(false)
     }
 }
 

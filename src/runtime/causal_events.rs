@@ -129,8 +129,8 @@ impl DurableCausalEventSink {
     /// Ordinary decisions never wait on telemetry.
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
         let (reply, received) = oneshot::channel();
-        let deadline = tokio::time::Instant::from_std(deadline);
-        tokio::time::timeout_at(deadline, async {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, async {
             self.queue.send(QueueItem::Drain(reply)).await.is_ok() && received.await.is_ok()
         })
         .await
@@ -208,7 +208,8 @@ impl DurableCausalEventSink {
     pub(super) async fn repair_applied(&self, application: VerifiedDirectiveApplication, deadline: Instant) -> bool {
         let (event, idempotency_key, original_generation) = application.into_parts();
         let (reply, received) = oneshot::channel();
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, async {
             if self
                 .queue
                 .send(QueueItem::Applied {
