@@ -7151,6 +7151,20 @@ struct SubAgentTaskResult {
     history_commit_len: usize,
 }
 
+fn settle_sub_agent_task_result(
+    mut settled_segment_usage: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    result: anyhow::Result<SubAgentTaskResult>,
+) -> anyhow::Result<SubAgentTaskResult> {
+    result.map(|mut result| {
+        settled_segment_usage.append(&mut result.segment_usage);
+        result.segment_usage = settled_segment_usage;
+        if result.output.trim().is_empty() {
+            result.output = "[Sub-agent produced no output]".to_string();
+        }
+        result
+    })
+}
+
 async fn run_sub_agent_task(
     task: &str,
     provider: Arc<dyn Provider>,
@@ -7580,34 +7594,14 @@ async fn run_sub_agent_task(
                 let (returned_history, result) = loop_result?;
                 history = returned_history;
                 *history_out.write().await = chat_messages_to_history(&history);
-                return match result {
-                    Ok(mut result) => {
-                        settled_segment_usage.append(&mut result.segment_usage);
-                        result.segment_usage = settled_segment_usage;
-                        if result.output.trim().is_empty() {
-                            result.output = "[Sub-agent produced no output]".to_string();
-                        }
-                        Ok(result)
-                    }
-                    Err(error) => Err(error),
-                };
+                return settle_sub_agent_task_result(settled_segment_usage, result);
             }
             admitted = &mut segment_admission => {
                 if admitted.is_err() {
                     let (returned_history, result) = loop_handle.await?;
                     history = returned_history;
                     *history_out.write().await = chat_messages_to_history(&history);
-                    return match result {
-                        Ok(mut result) => {
-                            settled_segment_usage.append(&mut result.segment_usage);
-                            result.segment_usage = settled_segment_usage;
-                            if result.output.trim().is_empty() {
-                                result.output = "[Sub-agent produced no output]".to_string();
-                            }
-                            Ok(result)
-                        }
-                        Err(error) => Err(error),
-                    };
+                    return settle_sub_agent_task_result(settled_segment_usage, result);
                 }
             }
         }
@@ -7620,17 +7614,7 @@ async fn run_sub_agent_task(
                 history = returned_history;
                 // Write final history to shared store
                 *history_out.write().await = chat_messages_to_history(&history);
-                return match result {
-                    Ok(mut result) => {
-                        settled_segment_usage.append(&mut result.segment_usage);
-                        result.segment_usage = settled_segment_usage;
-                        if result.output.trim().is_empty() {
-                            result.output = "[Sub-agent produced no output]".to_string();
-                        }
-                        Ok(result)
-                    }
-                    Err(error) => Err(error),
-                };
+                return settle_sub_agent_task_result(settled_segment_usage, result);
             },
             steer_opt = steer_rx.recv() => {
                 match steer_opt {
@@ -7683,17 +7667,7 @@ async fn run_sub_agent_task(
                         let (returned_history, result) = loop_handle.await?;
                         history = returned_history;
                         *history_out.write().await = chat_messages_to_history(&history);
-                        return match result {
-                            Ok(mut result) => {
-                                settled_segment_usage.append(&mut result.segment_usage);
-                                result.segment_usage = settled_segment_usage;
-                                if result.output.trim().is_empty() {
-                                    result.output = "[Sub-agent produced no output]".to_string();
-                                }
-                                Ok(result)
-                            }
-                            Err(error) => Err(error),
-                        };
+                        return settle_sub_agent_task_result(settled_segment_usage, result);
                     }
                 }
             }
