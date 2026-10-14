@@ -19,7 +19,7 @@ use crate::memory::{Memory, SqliteMemory};
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::tools::{Tool, ToolCategory};
+use crate::tools::ToolCategory;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
@@ -71,7 +71,7 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
     let tmp = TempDir::new().unwrap();
     let skill_refreshes = Arc::new(AtomicUsize::new(0));
     let mcp_refreshes = Arc::new(AtomicUsize::new(0));
-    let tools_registry: Vec<Box<dyn Tool>> = vec![
+    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(vec![
         Box::new(RefreshCountingTool {
             name: "skill_read",
             category: ToolCategory::System,
@@ -82,7 +82,7 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
             category: ToolCategory::Automation,
             refreshes: Arc::clone(&mcp_refreshes),
         }),
-    ];
+    ]);
 
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
     let provider = ScriptedProvider::from_text_responses(vec!["done"]);
@@ -98,7 +98,6 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
         .map(|tool| tool.spec())
         .collect::<Vec<_>>();
     assert_eq!(expected_specs.len(), 1);
-    let tools_registry = Arc::new(tools_registry);
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
         config,
         raw_turn_text,
