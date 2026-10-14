@@ -1878,6 +1878,50 @@ mod tests {
         assert!(output.contains("agent job failed:"));
     }
 
+    #[tokio::test]
+    async fn cron_plain_message_reaches_provider_with_default_causal_config() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL, PROBE_REPLY};
+
+        let tmp = TempDir::new().unwrap();
+        let probe = CredentialProbe::start().await;
+        let provider = probe.custom_provider();
+        let mut config = test_config(&tmp).await;
+        assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        config.default_provider = Some(provider.clone());
+        config.default_model = Some(PROBE_MODEL.to_string());
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = {provider:?}\nmodel = {PROBE_MODEL:?}\noperations = [\"chat\"]\nnative_tools = true\n"
+            ))
+            .expect("test: controlled Cron model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("hello".to_string());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
+
+        assert!(success, "test: plain Cron turn failed: {output}");
+        assert_eq!(output, PROBE_REPLY);
+        assert!(
+            probe
+                .requests()
+                .iter()
+                .any(|request| request.path.contains("chat/completions")),
+            "test: the Cron turn reached the serving provider"
+        );
+    }
+
     /// PMM-C: a cron agent job whose model cannot chat fails before the
     /// agent starts, and nothing is sent to the provider.
     #[tokio::test]
