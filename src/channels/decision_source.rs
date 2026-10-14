@@ -361,6 +361,14 @@ impl ChannelSourceReceipt {
         )
         .with_run_id(run_id)
         .with_config_generation(generation);
+        if let Some(topic_id) = message
+            .thread_ts
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            envelope = envelope.with_topic_id(topic_id);
+        }
         if let Some(recorded) = recorded.filter(|event| event.id > 0 && !event.event_id.is_empty()) {
             let scope = envelope.message_scope();
             anyhow::ensure!(

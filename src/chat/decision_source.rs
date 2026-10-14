@@ -1352,9 +1352,14 @@ pub(crate) mod admission_failure_tests {
                 Some(cancellation),
             )
             .await;
-        outcome
-            .result
-            .context("genuine model dispatch did not return a tool result")
+        match (outcome.result, outcome.error) {
+            (Some(result), _) => Ok(result),
+            (None, Some(error)) => Err(anyhow::anyhow!(error)),
+            (None, None) => Err(anyhow::anyhow!(
+                "genuine model dispatch ended with status {:?} and no tool result",
+                outcome.status
+            )),
+        }
     }
 
     /// Record and admit a model-origin turn before dispatching its spawn call.
@@ -1441,9 +1446,14 @@ pub(crate) mod admission_failure_tests {
                 Some(cancellation),
             )
             .await;
-        outcome
-            .result
-            .context("genuine model dispatch did not return a tool result")
+        match (outcome.result, outcome.error) {
+            (Some(result), _) => Ok(result),
+            (None, Some(error)) => Err(anyhow::anyhow!(error)),
+            (None, None) => Err(anyhow::anyhow!(
+                "genuine model dispatch ended with status {:?} and no tool result",
+                outcome.status
+            )),
+        }
     }
 
     async fn fixture(record_input: bool) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {

@@ -3737,7 +3737,11 @@ impl SessionsSpawnTool {
                     }
                     None => batch_journal::DispatchState::Rejected,
                 },
-                Err(_) => batch_journal::DispatchState::Unknown,
+                // `execute_spawn_with_id` registers the run immediately before
+                // its infallible driver launch. Every returned error therefore
+                // means no member was dispatched and can be recorded as a
+                // visible rejection instead of an unresolvable unknown.
+                Err(_) => batch_journal::DispatchState::Rejected,
             });
         }
         let journal_required = prepared.is_some();
@@ -3747,9 +3751,8 @@ impl SessionsSpawnTool {
             false
         };
         let mut spawned = Vec::new();
-        let mut uncertain_dispatch = Vec::new();
         let mut roster = Vec::new();
-        for ((reserved_run_id, member), outcome) in member_args.iter().zip(outcomes) {
+        for ((_, member), outcome) in member_args.iter().zip(outcomes) {
             let task = member.get("task").cloned().unwrap_or(serde_json::Value::Null);
             match outcome {
                 Ok(outcome) => match outcome.run_id {
@@ -3768,8 +3771,7 @@ impl SessionsSpawnTool {
                         "error": outcome.result.error.unwrap_or_else(|| "sub-agent was not started".to_string()),
                     })),
                 },
-                Err(error) => uncertain_dispatch
-                    .push(json!({"run_id": reserved_run_id, "task": task, "error": error.to_string()})),
+                Err(error) => rejected.push(json!({"task": task, "error": error.to_string()})),
             }
         }
         if !roster.is_empty() {
@@ -3792,12 +3794,6 @@ impl SessionsSpawnTool {
             "spawned": spawned,
             "rejected": rejected,
         });
-        if !uncertain_dispatch.is_empty() {
-            payload
-                .as_object_mut()
-                .context("batch result must be an object")?
-                .insert("dispatch_unconfirmed".to_owned(), json!(uncertain_dispatch));
-        }
         if journal_required {
             payload
                 .as_object_mut()
@@ -4387,7 +4383,12 @@ impl SessionsSpawnTool {
         // A-channel + B-recipient cross-wiring (cross-channel privacy leak).
         let recipient = match explicit_recipient {
             Some(r) => Some(r),
-            None => match spawn_scope.as_ref().map(|scope| scope.chat_id.clone()) {
+            None => match spawn_scope
+                .as_ref()
+                .map(|scope| scope.chat_id.trim())
+                .filter(|chat_id| !chat_id.is_empty())
+                .map(str::to_owned)
+            {
                 Some(chat_id) => Some(chat_id),
                 None => self.default_recipient.read().await.clone(),
             },
@@ -4497,7 +4498,7 @@ impl SessionsSpawnTool {
         });
         // Retain the request spelling: a resolved hint alone cannot prove which
         // route and credential source selected the actual child provider.
-        let child_requested_model = (child_grant.is_some() || ordinary_publication.is_some())
+        let mut child_requested_model = (child_grant.is_some() || ordinary_publication.is_some())
             .then(|| (resolved_provider_name.clone(), resolved_model.clone()));
         let selected_route_hint = resolved_model.trim().strip_prefix("hint:").map(str::to_string);
         let route_source_provider = selected_route_hint.as_ref().map(|_| resolved_provider_name.clone());
@@ -4679,6 +4680,17 @@ impl SessionsSpawnTool {
         );
         let task_provider_plan =
             self.child_provider_plan(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
+        // A spelling alias of the already-configured gateway is the same
+        // connection, credential, and catalog identity. Issue its ordinary
+        // child proof under the configured spelling so the decision service
+        // sees the catalog row it actually published. Route hints retain their
+        // requested source spelling because that spelling selects the route.
+        if matches!(&task_provider_plan, ChildProvider::Gateway)
+            && selected_route_hint.is_none()
+            && let Some((provider, _)) = child_requested_model.as_mut()
+        {
+            provider.clone_from(&self.provider_name);
+        }
         // Bind ordinary input to the pinned selection before recording.
         // Tasks retain this provider instance; processes export its verified
         // selection and construct their own instance from signed snapshots.
@@ -6444,8 +6456,8 @@ fn format_announce_message(rid: &str, status: &SubAgentStatus, result_text: &str
     match status {
         SubAgentStatus::Completed(_) if summary.is_empty() => format!("🤖 Sub-agent `{rid}` completed"),
         SubAgentStatus::Completed(_) => format!("🤖 Sub-agent `{rid}` completed: {summary}"),
-        _ if summary.is_empty() => format!("🤖 Sub-agent `{rid}` FAILED"),
-        _ => format!("🤖 Sub-agent `{rid}` FAILED: {summary}"),
+        _ if summary.is_empty() => format!("🤖 Sub-agent `{rid}` FAILED with an error"),
+        _ => format!("🤖 Sub-agent `{rid}` FAILED with error: {summary}"),
     }
 }
 
@@ -9685,7 +9697,7 @@ mod tests {
                 },
                 attempts: vec![crate::llm::route_decision::ProviderAttempt {
                     seq: 1,
-                    provider: "echo".to_string(),
+                    provider: "ollama".to_string(),
                     model: model.to_string(),
                     started_at,
                     finished_at,
@@ -9693,7 +9705,7 @@ mod tests {
                     error_class: None,
                     error_message: None,
                 }],
-                final_provider: "echo".to_string(),
+                final_provider: "ollama".to_string(),
                 final_model: model.to_string(),
                 served_member: None,
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
@@ -9980,8 +9992,8 @@ mod tests {
 
     fn make_agent_config(identity_dir: Option<String>) -> DelegateAgentConfig {
         DelegateAgentConfig {
-            provider: "test-provider".to_string(),
-            model: "agent-model".to_string(),
+            provider: "ollama".to_string(),
+            model: "prx-local-model".to_string(),
             system_prompt: None,
             api_key: None,
             credential_ref: None,
@@ -10088,8 +10100,8 @@ mod tests {
         SessionsSpawnTool::new(
             channel,
             provider,
-            "test-provider",
-            "test-model",
+            "ollama",
+            "prx-local-model",
             0.7,
             security,
             std::path::PathBuf::from("/tmp"),
@@ -10121,8 +10133,9 @@ mod tests {
         );
 
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
-        let outcome = tool
-            .execute(json!({
+        let outcome = execute_admitted_spawn(
+            &tool,
+            json!({
                 "task": "a task for a replaced configuration",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -10131,8 +10144,9 @@ mod tests {
                     "chat_type": "direct",
                     "chat_id": "chat-1"
                 }
-            }))
-            .await;
+            }),
+        )
+        .await;
         let text = match outcome {
             Ok(result) => {
                 assert!(!result.success, "the spawn was accepted: {:?}", result.output);
@@ -10390,6 +10404,229 @@ mod tests {
         args
     }
 
+    /// Clone the immutable tool definition while sharing every live runtime
+    /// handle. The admission service owns this copy for one dispatch; assertions
+    /// keep using the original handle to observe the same runs, recipients,
+    /// channels, batch rosters, and child registry.
+    fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
+        SessionsSpawnTool {
+            channel: Arc::clone(&tool.channel),
+            test_worker_executable: tool.test_worker_executable.clone(),
+            channels: Arc::clone(&tool.channels),
+            provider: Arc::clone(&tool.provider),
+            provider_name: tool.provider_name.clone(),
+            model: tool.model.clone(),
+            security: Arc::clone(&tool.security),
+            default_recipient: Arc::clone(&tool.default_recipient),
+            active_runs: Arc::clone(&tool.active_runs),
+            tools: Arc::clone(&tool.tools),
+            workspace_dir: tool.workspace_dir.clone(),
+            compaction_resolver: tool.compaction_resolver.clone(),
+            agents: Arc::clone(&tool.agents),
+            fallback_api_key: tool.fallback_api_key.clone(),
+            configured_providers: tool.configured_providers.clone(),
+            model_catalog: Arc::clone(&tool.model_catalog),
+            hint_config: tool.hint_config.clone(),
+            default_route_source: tool.default_route_source.clone(),
+            fallback_api_key_owner: tool.fallback_api_key_owner.clone(),
+            fallback_uses_root_connection: tool.fallback_uses_root_connection,
+            reliability: tool.reliability.clone(),
+            cost_config: tool.cost_config.clone(),
+            memory: tool.memory.clone(),
+            source_fabric: tool.source_fabric.clone(),
+            // Recovery is owned by the original production-like fixture. A
+            // dispatch copy must not create a second recovery owner.
+            restart_recovery: None,
+            event_recording: tool.event_recording.clone(),
+            event_sink: tool.event_sink.clone(),
+            approval_resolver_factory: tool.approval_resolver_factory.clone(),
+            batch_rosters: Arc::clone(&tool.batch_rosters),
+        }
+    }
+
+    /// Admit a recorded parent and invoke `sessions_spawn` through the
+    /// production decision/execution binding. Every real model caller reaches
+    /// the tool this way; a raw unit call has neither a parent grant nor an
+    /// ordinary publication and must fail closed.
+    async fn execute_admitted_spawn(
+        tool: &SessionsSpawnTool,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        static WORKSPACES: std::sync::OnceLock<parking_lot::Mutex<Vec<tempfile::TempDir>>> = std::sync::OnceLock::new();
+        let trusted_scope = arguments
+            .get("_zc_scope_trusted")
+            .and_then(serde_json::Value::as_bool)
+            .filter(|trusted| *trusted)
+            .and_then(|_| arguments.get("_zc_scope"))
+            .and_then(serde_json::Value::as_object);
+        let field = |key: &str| {
+            trusted_scope
+                .and_then(|scope| scope.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let workspace = field("workspace_id")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| tool.workspace_dir.clone());
+        let admission_memory: Arc<dyn Memory> = match &tool.memory {
+            Some(memory) => Arc::clone(memory),
+            None => {
+                let admission_workspace = tempfile::tempdir()?;
+                let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(admission_workspace.path())?);
+                WORKSPACES
+                    .get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+                    .lock()
+                    .push(admission_workspace);
+                memory
+            }
+        };
+        let mut config = tool
+            .hint_config
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(crate::config::Config::default);
+        config.workspace_dir = workspace.clone();
+        config.config_path = workspace.join("config.toml");
+        config.default_provider = Some(tool.provider_name.clone());
+        config.default_model = Some(tool.model.clone());
+        config.causal_tree.enabled = false;
+        config.autonomy.level = tool.security.autonomy;
+        config.autonomy.workspace_only = tool.security.workspace_only;
+        config
+            .autonomy
+            .forbidden_paths
+            .clone_from(&tool.security.forbidden_paths);
+        config.autonomy.max_cost_per_day_cents = tool.security.max_cost_per_day_cents;
+        config.autonomy.scopes.rules.clone_from(&tool.security.scope_rules);
+        config.autonomy.scopes.default = if tool.security.scope_default_allow {
+            crate::config::ScopeDefault::Allow
+        } else {
+            crate::config::ScopeDefault::Deny
+        };
+        config
+            .autonomy
+            .scopes
+            .assign_owners
+            .clone_from(&tool.security.assign_owners);
+        config.security.audit = tool.security.audit_config.clone();
+        config.agents = tool.agents.as_ref().clone();
+        config.reliability = tool.reliability.clone();
+        config.cost = tool.cost_config.clone();
+        if !config
+            .providers
+            .models
+            .iter()
+            .any(|model| model.provider == tool.provider_name && model.model.as_deref() == Some(tool.model.as_str()))
+        {
+            config.providers.models.push(serde_json::from_value(json!({
+                "provider": tool.provider_name,
+                "model": tool.model,
+                "operations": ["chat"],
+                "native_tools": true
+            }))?);
+        }
+        for route in config.model_routes.clone() {
+            if !config
+                .providers
+                .models
+                .iter()
+                .any(|model| model.provider == route.provider && model.model.as_deref() == Some(route.model.as_str()))
+            {
+                config.providers.models.push(serde_json::from_value(json!({
+                    "provider": route.provider,
+                    "model": route.model,
+                    "operations": ["chat"],
+                    "native_tools": true
+                }))?);
+            }
+        }
+        for agent in config.agents.values() {
+            if !config
+                .providers
+                .models
+                .iter()
+                .any(|model| model.provider == agent.provider && model.model.as_deref() == Some(agent.model.as_str()))
+            {
+                config.providers.models.push(serde_json::from_value(json!({
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "operations": ["chat"],
+                    "native_tools": true
+                }))?);
+            }
+        }
+        config
+            .cost
+            .prices
+            .entry(format!("{}/{}", tool.provider_name, tool.model))
+            .or_insert(crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            });
+        config
+            .cost
+            .prices
+            .entry("ollama/prx-local-model".to_owned())
+            .or_insert(crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            });
+        let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
+        let provider = Arc::clone(&tool.provider);
+        let provider_name = tool.provider_name.clone();
+        let model_name = tool.model.clone();
+        let registry =
+            crate::agent::test_admission::registry_with_search(vec![crate::tools::ArcDelegatingTool::boxed(shared)]);
+        let chat_kind = match field("chat_type") {
+            Some("group") => crate::channels::traits::ChatKind::Group,
+            Some("thread") => crate::channels::traits::ChatKind::Thread,
+            _ => crate::channels::traits::ChatKind::Dm,
+        };
+        let message = ChannelMessage {
+            id: field("source_message_event_id")
+                .unwrap_or("prx-sessions-spawn-parent")
+                .to_owned(),
+            sender: field("sender").unwrap_or("prx_user").to_owned(),
+            reply_target: field("chat_id").unwrap_or_default().to_owned(),
+            content: "sessions_spawn admitted fixture".to_owned(),
+            channel: field("channel").unwrap_or("wacli").to_owned(),
+            timestamp: 0,
+            chat_kind,
+            chat_title: None,
+            sender_display: None,
+            thread_ts: field("topic_id").map(str::to_owned),
+            mentioned_uuids: Vec::new(),
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        };
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+        cleanup
+            .run(Box::pin(async move {
+                let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                    config,
+                    message,
+                    registry,
+                    admission_memory,
+                    (&provider_name, &model_name),
+                )
+                .await;
+                crate::runtime::child_source::scope_ordinary_provider_fixture(
+                    provider,
+                    provider_name.clone(),
+                    model_name.clone(),
+                    admitted.execute_tool("sessions_spawn", arguments),
+                )
+                .await
+            }))
+            .await
+    }
+
     #[test]
     fn name_and_description() {
         let (ch, _) = RecordingChannel::new();
@@ -10554,8 +10791,9 @@ mod tests {
             "usage must carry its terminal settlement identity"
         );
         let history = history_out.read().await;
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].content, "metered task output");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[2].content, "metered task output");
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
@@ -10603,19 +10841,21 @@ mod tests {
     /// BUG-12: an inline `provider` override (no named agent) must drive a
     /// provider rebuild. Using an invalid provider name proves the override is
     /// consumed: provider creation fails naming the inline override, not the
-    /// gateway provider ("test-provider").
+    /// gateway provider (`ollama`).
     #[tokio::test]
     async fn inline_provider_override_drives_provider_rebuild() {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "do work",
                 "provider": "totally-invalid-provider"
-            })))
-            .await
-            .unwrap();
+            })),
+        )
+        .await
+        .unwrap();
 
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or("");
@@ -10658,8 +10898,7 @@ mod tests {
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "Tell me a joke"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "Tell me a joke"})))
             .await
             .unwrap();
 
@@ -10667,13 +10906,20 @@ mod tests {
         assert!(result.output.contains("run_id:"));
         assert!(result.output.contains("Will announce"));
 
-        // Wait briefly for the spawned task to complete
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait for the admitted child to complete and announce rather than
+        // assuming admission, accounting, and provider work fit in 200 ms.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sent.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("admitted child announcement");
 
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Sub-agent"));
-        assert!(messages[0].contains("chicken"));
+        assert!(messages[0].contains("chicken"), "{messages:?}");
     }
 
     /// A channel that records both its name and the messages it sent, so a test
@@ -10736,8 +10982,7 @@ mod tests {
         tool.set_active_channel(wacli_ch as Arc<dyn Channel>).await;
         tool.set_active_recipient("120363000000000000@g.us").await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "do the thing"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "do the thing"})))
             .await
             .unwrap();
         assert!(result.success, "spawn should succeed: {:?}", result.error);
@@ -10829,14 +11074,12 @@ mod tests {
 
         // A's spawn now executes, carrying A's own per-turn scope (wacli + A's
         // recipient). No explicit `recipient` arg, so it must come from the scope.
-        let result = tool
-            .execute(with_spawn_grant(with_scope(
-                json!({"task": "do A's work"}),
-                "wacli",
-                "A-wacli-recipient",
-            )))
-            .await
-            .unwrap();
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(json!({"task": "do A's work"}), "wacli", "A-wacli-recipient")),
+        )
+        .await
+        .unwrap();
         assert!(result.success, "spawn should succeed: {:?}", result.error);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -10933,14 +11176,12 @@ mod tests {
             announce_policy(vec![announce_scope_rule(&[], &["wacli:+15550001111"])]),
         );
 
-        let result = tool
-            .execute(with_spawn_grant(with_scope(
-                json!({"task": "do the thing"}),
-                "wacli",
-                "+15550001111",
-            )))
-            .await
-            .unwrap();
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(json!({"task": "do the thing"}), "wacli", "+15550001111")),
+        )
+        .await
+        .unwrap();
         assert!(
             result.success,
             "the ACL gates delivery, not the spawn itself: {:?}",
@@ -10980,14 +11221,12 @@ mod tests {
             vec![wacli_ch],
         );
 
-        let result = tool
-            .execute(with_spawn_grant(with_scope(
-                json!({"task": "do the thing"}),
-                "wacli",
-                "+15550001111",
-            )))
-            .await
-            .unwrap();
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(json!({"task": "do the thing"}), "wacli", "+15550001111")),
+        )
+        .await
+        .unwrap();
         assert!(result.success, "spawn should succeed: {:?}", result.error);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11023,14 +11262,12 @@ mod tests {
             }),
         );
 
-        let result = tool
-            .execute(with_spawn_grant(with_scope(
-                json!({"task": "do the thing"}),
-                "wacli",
-                "+15550001111",
-            )))
-            .await
-            .unwrap();
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(json!({"task": "do the thing"}), "wacli", "+15550001111")),
+        )
+        .await
+        .unwrap();
         assert!(result.success, "spawn should succeed: {:?}", result.error);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11062,14 +11299,16 @@ mod tests {
 
         // The turn is anchored to an allowed chat, and the model overrides the
         // announcement's destination with the denied one.
-        let denied = tool
-            .execute(with_spawn_grant(with_scope(
+        let denied = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(
                 json!({"task": "reach the denied recipient", "recipient": "+15559999999"}),
                 "wacli",
                 "+15550002222",
-            )))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .unwrap();
         assert!(denied.success, "spawn should succeed: {:?}", denied.error);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11080,14 +11319,16 @@ mod tests {
 
         // Control: the very same override to a recipient outside the deny list
         // is delivered, so the gate is not simply refusing everything.
-        let allowed = tool
-            .execute(with_spawn_grant(with_scope(
+        let allowed = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(
                 json!({"task": "reach an allowed recipient", "recipient": "+15550003333"}),
                 "wacli",
                 "+15550002222",
-            )))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .unwrap();
         assert!(allowed.success, "spawn should succeed: {:?}", allowed.error);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11140,8 +11381,7 @@ mod tests {
 
     /// Spawn one task-mode run under `tool` and return its run id.
     async fn spawn_long_run(tool: &SessionsSpawnTool, args: serde_json::Value, channel: &str, chat_id: &str) -> String {
-        let spawned = tool
-            .execute(with_spawn_grant(with_scope(args, channel, chat_id)))
+        let spawned = execute_admitted_spawn(&tool, with_spawn_grant(with_scope(args, channel, chat_id)))
             .await
             .expect("spawn executes");
         assert!(spawned.success, "spawn should succeed: {:?}", spawned.error);
@@ -11347,14 +11587,16 @@ mod tests {
         );
 
         // Spawn A on wacli (its scope), in task mode so the abort handle exists.
-        let result = tool
-            .execute(with_spawn_grant(with_scope(
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(with_scope(
                 json!({"task": "long A work", "mode": "task"}),
                 "wacli",
                 "A-wacli-recipient",
-            )))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .unwrap();
         assert!(result.success, "spawn should succeed: {:?}", result.error);
         let run_id = {
             let runs = tool.active_runs_snapshot().await;
@@ -11419,11 +11661,12 @@ mod tests {
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         // No grant injected → Medium-risk gate denies under supervised autonomy.
-        let denied = tool.execute(json!({"task": "Tell me a joke"})).await.unwrap();
-        assert!(!denied.success, "spawn must be denied without an approval grant");
+        let denied = execute_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
+            .await
+            .expect_err("an unapproved side-effect tool must not be offered for execution");
         assert!(
-            denied.error.unwrap_or_default().contains("runtime approval grant"),
-            "denial reason should reference the missing approval grant"
+            denied.to_string().contains("did not select tool 'sessions_spawn'"),
+            "the admitted surface must exclude the unapproved tool: {denied}"
         );
 
         // No run should have been registered.
@@ -11447,8 +11690,9 @@ mod tests {
         )
         .with_shared_memory(memory.clone());
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "write through fabric",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -11459,9 +11703,10 @@ mod tests {
                     "topic_id": "topic-1",
                     "source_message_event_id": "msg-1"
                 }
-            })))
-            .await
-            .unwrap();
+            })),
+        )
+        .await
+        .unwrap();
         assert!(result.success);
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -11485,9 +11730,13 @@ mod tests {
             .await
             .unwrap();
 
+        let parent_event = events
+            .iter()
+            .find(|event| event.role == "user" && event.source == "channel")
+            .expect("admitted parent message event");
         let request_event = events
             .iter()
-            .find(|event| event.role == "user")
+            .find(|event| event.role == "user" && event.source == "sessions_spawn")
             .expect("spawn request event");
         let result_event = events
             .iter()
@@ -11506,10 +11755,17 @@ mod tests {
                 .count(),
             1
         );
+        let logical_terminal_key = format!(
+            "turn:{}:final",
+            request_event.run_id.as_deref().expect("spawn request run id")
+        );
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.event_type == "turn.finalized")
+                .filter(|event| {
+                    event.event_type == "turn.finalized"
+                        && event.idempotency_key.as_deref() == Some(logical_terminal_key.as_str())
+                })
                 .count(),
             1
         );
@@ -11517,7 +11773,10 @@ mod tests {
             serde_json::from_str(request_event.raw_payload_json.as_deref().unwrap())
                 .expect("request payload should be json");
         assert_eq!(request_payload["topic_id"].as_str(), Some("topic-1"));
-        assert_eq!(request_payload["source_message_event_id"].as_str(), Some("msg-1"));
+        assert_eq!(
+            request_payload["source_message_event_id"].as_str(),
+            Some(parent_event.event_id.as_str())
+        );
 
         let memory_events = memory
             .list_memory_events_since(
@@ -11556,7 +11815,10 @@ mod tests {
         let task_payload: serde_json::Value =
             serde_json::from_str(task_events[0].payload_json.as_deref().unwrap()).unwrap();
         assert_eq!(task_payload["topic_id"].as_str(), Some("topic-1"));
-        assert_eq!(task_payload["source_message_event_id"].as_str(), Some("msg-1"));
+        assert_eq!(
+            task_payload["source_message_event_id"].as_str(),
+            Some(parent_event.event_id.as_str())
+        );
     }
 
     /// A provider whose every call fails with an error carrying the D-053 probe
@@ -11604,8 +11866,9 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), provider).with_shared_memory(memory.clone());
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "probe the persisted terminal",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -11616,9 +11879,10 @@ mod tests {
                     "topic_id": "topic-1",
                     "source_message_event_id": "msg-1"
                 }
-            })))
-            .await
-            .expect("test: spawn tool call");
+            })),
+        )
+        .await
+        .expect("test: spawn tool call");
         assert!(result.success, "{result:?}");
         let run_id = {
             let runs = tool.active_runs_snapshot().await;
@@ -11651,9 +11915,13 @@ mod tests {
             )
             .await
             .expect("test: list message events");
+        let logical_terminal_key = format!("turn:{run_id}:final");
         let finalized = events
             .iter()
-            .filter(|event| event.event_type == "turn.finalized")
+            .filter(|event| {
+                event.event_type == "turn.finalized"
+                    && event.idempotency_key.as_deref() == Some(logical_terminal_key.as_str())
+            })
             .count();
         (status, finalized)
     }
@@ -11713,8 +11981,7 @@ mod tests {
         );
         // No default_recipient set, no recipient in args
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "Do something"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "Do something"})))
             .await
             .unwrap();
         assert!(result.success);
@@ -11736,13 +12003,15 @@ mod tests {
         );
         tool.set_default_recipient(Some("default-recipient".to_string())).await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "Test task",
                 "recipient": "explicit-recipient"
-            })))
-            .await
-            .unwrap();
+            })),
+        )
+        .await
+        .unwrap();
         assert!(result.success);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11777,8 +12046,9 @@ mod tests {
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         for index in 0..FAN_OUT {
-            let result = tool
-                .execute(with_spawn_grant(json!({
+            let result = execute_admitted_spawn(
+                &tool,
+                with_spawn_grant(json!({
                     "task": format!("fan-out child {index}"),
                     "_zc_scope_trusted": true,
                     "_zc_scope": {
@@ -11787,9 +12057,10 @@ mod tests {
                         "chat_type": "direct",
                         "chat_id": "+15551234567"
                     }
-                })))
-                .await
-                .unwrap();
+                })),
+            )
+            .await
+            .unwrap();
             assert!(
                 result.success,
                 "spawn {index} of {FAN_OUT} must be accepted, got error: {:?}",
@@ -11856,7 +12127,7 @@ mod tests {
                         is_turn_root: false,
                         channel_excluded_tools: Vec::new(),
                     },
-                    async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
+                    async { execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "nested"}))).await },
                 )
                 .await
                 .unwrap();
@@ -11899,7 +12170,7 @@ mod tests {
                     "turn-root-run".to_string(),
                     "signal:+15551234567:openprx_user".to_string(),
                 ),
-                async { tool.execute(with_spawn_grant(json!({"task": "child of a turn"}))).await },
+                async { execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "child of a turn"}))).await },
             )
             .await
             .unwrap();
@@ -11944,7 +12215,7 @@ mod tests {
                     is_turn_root: false,
                     channel_excluded_tools: Vec::new(),
                 },
-                async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
+                async { execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "nested"}))).await },
             )
             .await
             .unwrap();
@@ -11962,8 +12233,7 @@ mod tests {
         let tool = make_tool(Arc::new(ch), Arc::new(FailingProvider));
         tool.set_default_recipient(Some("user".to_string())).await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "This will fail"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "This will fail"})))
             .await
             .unwrap();
         assert!(result.success); // spawn succeeds; failure is in the sub-agent
@@ -11993,7 +12263,7 @@ mod tests {
         let status = SubAgentStatus::Failed("provider failure\nstack trace".to_string());
         let message = format_announce_message("run-abc", &status, "provider failure\nstack trace");
 
-        assert_eq!(message, "🤖 Sub-agent `run-abc` FAILED: provider failure");
+        assert_eq!(message, "🤖 Sub-agent `run-abc` FAILED with error: provider failure");
         assert!(!message.contains("stack trace"));
     }
 
@@ -12008,8 +12278,7 @@ mod tests {
         );
 
         // Spawn a run
-        let _ = tool
-            .execute(with_spawn_grant(json!({"task": "Some task"})))
+        let _ = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "Some task"})))
             .await
             .unwrap();
 
@@ -12281,8 +12550,8 @@ mod tests {
             Arc::new(EchoProvider {
                 response: "done".into(),
             }),
-            "test-provider",
-            "test-model",
+            "ollama",
+            "prx-local-model",
             0.7,
             readonly_security,
             std::path::PathBuf::from("/tmp"),
@@ -12294,9 +12563,11 @@ mod tests {
             crate::config::SessionsSpawnConfig::default(),
         );
 
-        let result = tool.execute(json!({"task": "blocked"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only mode"));
+        let error = execute_admitted_spawn(&tool, json!({"task": "blocked"}))
+            .await
+            .expect_err("a side-effect tool must not be offered on a read-only surface");
+        assert!(error.to_string().contains("did not select tool 'sessions_spawn'"));
+        assert!(tool.active_runs_snapshot().await.is_empty());
     }
 
     #[tokio::test]
@@ -12316,6 +12587,23 @@ mod tests {
             crate::config::SessionsSpawnConfig::default(),
         )
         .with_shared_memory(memory.clone());
+        let owned_task = TaskRunControl::observe_fixture_task(tokio::spawn(std::future::pending::<()>()));
+        let with_owner_scope = |mut arguments: serde_json::Value| {
+            let object = arguments.as_object_mut().expect("kill arguments object");
+            object.insert("_zc_scope_trusted".to_owned(), json!(true));
+            object.insert(
+                "_zc_scope".to_owned(),
+                json!({
+                    "workspace_id": "/tmp",
+                    "channel": "telegram",
+                    "sender": "alice",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1",
+                    "owner_id": "owner-a"
+                }),
+            );
+            arguments
+        };
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
@@ -12331,9 +12619,9 @@ mod tests {
                 status: SubAgentStatus::Running,
                 recipient: None,
                 channel_name: None,
-                abort_handle: None,
+                abort_handle: Some(owned_task.abort_handle()),
                 process_control: None,
-                task_control: None,
+                task_control: Some(owned_task.control()),
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: None,
                 parent_run_id: None,
@@ -12344,14 +12632,14 @@ mod tests {
         }
 
         let denied = tool
-            .execute(json!({"action": "kill", "run_id": "run-1"}))
+            .execute(with_owner_scope(json!({"action": "kill", "run_id": "run-1"})))
             .await
             .unwrap();
         assert!(!denied.success);
         assert!(denied.error.unwrap_or_default().contains("runtime approval grant"));
 
         let allowed = tool
-            .execute(json!({
+            .execute(with_owner_scope(json!({
                 "action": "kill",
                 "run_id": "run-1",
                 crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
@@ -12361,7 +12649,7 @@ mod tests {
                         "test",
                         None
                     )).unwrap()
-            }))
+            })))
             .await
             .unwrap();
         assert!(allowed.success);
@@ -12483,16 +12771,20 @@ mod tests {
 
     #[tokio::test]
     async fn active_runs_store_owner_topic_lineage() {
+        let memory_dir = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(memory_dir.path()).unwrap());
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(
             Arc::new(ch),
             Arc::new(EchoProvider {
                 response: "done".into(),
             }),
-        );
+        )
+        .with_shared_memory(Arc::clone(&memory));
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "lineage task",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -12504,9 +12796,10 @@ mod tests {
                     "task_id": "parent-task",
                     "message_event_id": "msg-a"
                 }
-            })))
-            .await
-            .unwrap();
+            })),
+        )
+        .await
+        .unwrap();
         assert!(result.success);
 
         let runs = tool.active_runs_snapshot().await;
@@ -12514,7 +12807,33 @@ mod tests {
         assert_eq!(runs[0].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
         assert_eq!(runs[0].topic_id.as_deref(), Some("topic-a"));
         assert_eq!(runs[0].parent_run_id.as_deref(), None);
-        assert_eq!(runs[0].source_message_event_id.as_deref(), Some("msg-a"));
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    require_owner_match: false,
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let parent_event = events
+            .iter()
+            .find(|event| event.role == "user" && event.source == "channel")
+            .expect("admitted parent event");
+        assert_eq!(
+            runs[0].source_message_event_id.as_deref(),
+            Some(parent_event.event_id.as_str())
+        );
+        assert_ne!(runs[0].source_message_event_id.as_deref(), Some("msg-a"));
     }
 
     #[tokio::test]
@@ -12963,8 +13282,7 @@ mod tests {
         );
 
         // Spawn without tool registry (no tools set)
-        let spawn_result = tool
-            .execute(with_spawn_grant(json!({"task": "Do a thing"})))
+        let spawn_result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "Do a thing"})))
             .await
             .unwrap();
         assert!(spawn_result.success);
@@ -13082,15 +13400,15 @@ mod tests {
                 let mut config = crate::config::Config::default();
                 config.workspace_dir = workspace.path().to_path_buf();
                 config.config_path = workspace.path().join("config.toml");
-                config.default_provider = Some("test-provider".to_owned());
-                config.default_model = Some("test-model".to_owned());
+                config.default_provider = Some("ollama".to_owned());
+                config.default_model = Some("prx-local-model".to_owned());
                 config.agents = agents.clone();
                 config.providers.models.push(serde_json::from_value(json!({
-                    "provider": "test-provider", "model": "test-model", "operations": ["chat"],
+                    "provider": "ollama", "model": "prx-local-model", "operations": ["chat"],
                     "native_tools": true
                 }))?);
                 config.cost.prices.insert(
-                    "test-provider/test-model".to_owned(),
+                    "ollama/prx-local-model".to_owned(),
                     crate::config::schema::ModelPricing {
                         input: 1.0,
                         output: 1.0,
@@ -13105,8 +13423,8 @@ mod tests {
                 let tool = SessionsSpawnTool::new(
                     Arc::new(ch),
                     Arc::clone(&provider),
-                    "test-provider",
-                    "test-model",
+                    "ollama",
+                    "prx-local-model",
                     0.7,
                     Arc::clone(&security),
                     std::path::PathBuf::from("/tmp"),
@@ -13155,8 +13473,8 @@ mod tests {
         let tool = SessionsSpawnTool::new(
             Arc::new(ch),
             Arc::new(EchoProvider { response: "ok".into() }),
-            "test-provider",
-            "test-model",
+            "ollama",
+            "prx-local-model",
             0.7,
             test_security(),
             std::path::PathBuf::from("/tmp"),
@@ -13199,8 +13517,8 @@ mod tests {
         let tool = SessionsSpawnTool::new(
             Arc::new(ch),
             Arc::new(EchoSystemProvider),
-            "test-provider",
-            "test-model",
+            "ollama",
+            "prx-local-model",
             0.7,
             test_security(),
             ws.path().to_path_buf(),
@@ -13213,8 +13531,7 @@ mod tests {
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "t", "agent": "alpha"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "t", "agent": "alpha"})))
             .await
             .unwrap();
         assert!(result.success);
@@ -14318,12 +14635,12 @@ mod tests {
             }),
         );
 
-        let spawned = tool
-            .execute(with_spawn_grant(
-                json!({"task": "about to be killed from the registry"}),
-            ))
-            .await
-            .expect("spawn tool call");
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "about to be killed from the registry"})),
+        )
+        .await
+        .expect("spawn tool call");
         assert!(spawned.success, "{spawned:?}");
         let run_id = {
             let runs = tool.active_runs_snapshot().await;
@@ -14420,8 +14737,7 @@ mod tests {
             }),
         );
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({"task": "watch me work"})))
+        let spawned = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "watch me work"})))
             .await
             .expect("spawn tool call");
         assert!(spawned.success, "{spawned:?}");
@@ -14435,7 +14751,10 @@ mod tests {
             assert!(matches!(run.status, SubAgentStatus::Running));
             (run.progress.events(), run.idle_for(), run.last_progress_at())
         };
-        assert_eq!(events_before, 0, "a parked run has produced nothing");
+        assert_eq!(
+            events_before, 1,
+            "only the admitted turn start may precede provider output"
+        );
         assert!(
             idle_before >= std::time::Duration::from_millis(150),
             "silence must accumulate, got {idle_before:?}"
@@ -14549,13 +14868,15 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": ["survey the crate", "check the tests", {"task": "read the config"}],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         assert!(spawned.success, "{spawned:?}");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
@@ -14611,13 +14932,15 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": ["the member that survives", "the member that gets reaped"],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
         let run_ids = batch_run_ids(&payload);
@@ -14676,13 +14999,15 @@ mod tests {
             }),
         );
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": ["member one", "member two", "member three"],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
         let run_ids = batch_run_ids(&payload);
@@ -14730,8 +15055,8 @@ mod tests {
         SessionsSpawnTool::new(
             Arc::new(ch),
             Arc::new(EchoProvider { response: "ok".into() }),
-            "test-provider",
-            "test-model",
+            "ollama",
+            "prx-local-model",
             0.7,
             test_security(),
             std::path::PathBuf::from("/tmp"),
@@ -14760,8 +15085,7 @@ mod tests {
     async fn a_spawn_that_fails_while_preparing_the_agent_registers_no_run() {
         let tool = tool_with_broken_agent("alpha");
 
-        let error = tool
-            .execute(with_spawn_grant(json!({"task": "hello", "agent": "alpha"})))
+        let error = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "hello", "agent": "alpha"})))
             .await
             .expect_err("an unparseable memory_scope must fail the spawn");
         assert!(error.to_string().contains("memory_scope"), "{error}");
@@ -14790,13 +15114,15 @@ mod tests {
     async fn a_batch_member_that_fails_preparation_does_not_park_the_join_forever() {
         let tool = tool_with_broken_agent("broken");
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": ["a member that starts", {"task": "a member that cannot", "agent": "broken"}],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
         assert_eq!(payload["started"], 1, "{payload}");
@@ -15121,10 +15447,13 @@ mod tests {
             let call = crate::runtime::registry::register_tool_call("sessions_spawn", None, None);
             let spawned = crate::runtime::registry::scoped(
                 call,
-                tool.execute(with_spawn_grant(json!({
-                    "action": "spawn_batch",
-                    "tasks": ["one", "two", "three"],
-                }))),
+                execute_admitted_spawn(
+                    &tool,
+                    with_spawn_grant(json!({
+                        "action": "spawn_batch",
+                        "tasks": ["one", "two", "three"],
+                    })),
+                ),
             )
             .await
             .expect("spawn_batch tool call");
@@ -15462,16 +15791,14 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
 
-        let missing = tool
-            .execute(with_spawn_grant(json!({"action": "spawn_batch"})))
+        let missing = execute_admitted_spawn(&tool, with_spawn_grant(json!({"action": "spawn_batch"})))
             .await
-            .expect("tool call");
-        assert!(!missing.success);
-        let empty = tool
-            .execute(with_spawn_grant(json!({"action": "spawn_batch", "tasks": []})))
+            .expect_err("the service contract must reject a missing tasks array");
+        assert!(missing.to_string().contains("$.tasks"), "{missing}");
+        let empty = execute_admitted_spawn(&tool, with_spawn_grant(json!({"action": "spawn_batch", "tasks": []})))
             .await
-            .expect("tool call");
-        assert!(!empty.success);
+            .expect_err("the service contract must reject an empty tasks array");
+        assert!(empty.to_string().contains("$.tasks"), "{empty}");
 
         let no_batch = tool.execute(json!({"action": "join"})).await;
         assert!(no_batch.is_err(), "join without a batch_id is a caller error");
@@ -15664,8 +15991,9 @@ mod tests {
             }),
         );
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": [
                     "this one just works",
@@ -15673,9 +16001,10 @@ mod tests {
                     format!("this one {} until it is killed", TaskRoutingProvider::PARKS),
                     format!("this one {} until its worker dies", TaskRoutingProvider::PARKS),
                 ],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         assert!(spawned.success, "{spawned:?}");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
@@ -15766,16 +16095,18 @@ mod tests {
             }),
         );
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": [
                     format!("verdict member {}", TaskRoutingProvider::FAILS),
                     format!("silent member {}", TaskRoutingProvider::PARKS),
                 ],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
         let run_ids = batch_run_ids(&payload);
@@ -16095,13 +16426,15 @@ mod tests {
         // uninteresting reason that they have nowhere to send.
         tool.set_active_recipient("120363000000000000@g.us").await;
 
-        let spawned = tool
-            .execute(with_spawn_grant(json!({
+        let spawned = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": ["check the weather", "check the calendar", "check the inbox"],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         assert!(spawned.success, "{spawned:?}");
         let payload = parse_json(&spawned.output);
         let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
@@ -16170,8 +16503,7 @@ mod tests {
         );
         tool.set_active_recipient("120363000000000000@g.us").await;
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "do the one thing"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "do the one thing"})))
             .await
             .expect("spawn tool call");
         assert!(result.success, "{result:?}");
@@ -16206,10 +16538,12 @@ mod tests {
         );
         tool.set_active_recipient("120363000000000000@g.us").await;
 
-        let silenced = tool
-            .execute(with_spawn_grant(json!({"task": "do it quietly", "announce": false})))
-            .await
-            .expect("spawn tool call");
+        let silenced = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "do it quietly", "announce": false})),
+        )
+        .await
+        .expect("spawn tool call");
         assert!(silenced.success, "{silenced:?}");
         assert!(
             silenced.output.contains("collect it with the 'join' action"),
@@ -16251,35 +16585,32 @@ mod tests {
         tool.set_active_recipient("120363000000000000@g.us").await;
 
         // Route 1: the per-member entry.
-        let refused = tool
-            .execute(with_spawn_grant(json!({
+        let refused = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": [{"task": "report for myself", "announce": true}],
-            })))
-            .await
-            .expect("spawn_batch tool call");
-        let payload = parse_json(&refused.output);
-        assert_eq!(
-            payload["started"], 0,
-            "nothing may start from a refused entry: {payload}"
-        );
-        let error = payload["rejected"][0]["error"]
-            .as_str()
-            .expect("a refused entry says why");
+            })),
+        )
+        .await
+        .expect_err("the published member schema must reject an announce override");
         assert!(
-            error.contains("announce"),
-            "the refusal must name the offending key so the caller can see it: {error}"
+            refused.to_string().contains("$.tasks[0]"),
+            "the refusal must identify the offending member: {refused}"
         );
+        assert!(tool.active_runs_snapshot().await.is_empty());
 
         // Route 2: the batch-level argument, inherited by every member.
-        let batch = tool
-            .execute(with_spawn_grant(json!({
+        let batch = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "announce": true,
                 "tasks": ["check the weather", "check the calendar"],
-            })))
-            .await
-            .expect("spawn_batch tool call");
+            })),
+        )
+        .await
+        .expect("spawn_batch tool call");
         assert!(batch.success, "{batch:?}");
         let payload = parse_json(&batch.output);
         assert_eq!(payload["started"], 2, "{payload}");
@@ -16999,15 +17330,14 @@ mod tests {
                 Some(SPAWN_AGENT_SENTINEL),
             ),
         )]);
-        let tool = containment_tool(&temp, agents, "test-provider", None);
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "agent": "broken"})))
+        let tool = containment_tool(&temp, agents, "ollama", None);
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "broken"})))
             .await
             .expect("test: spawn returns a tool result");
 
         assert!(!result.success, "the provider cannot be built");
         let error = result.error.unwrap_or_default();
-        assert!(error.contains("Failed to create provider"), "{error}");
+        assert!(error.contains("[redacted]"), "{error}");
         assert!(!error.contains("SPAWN-SECRET-pw"), "{error}");
         let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
         // The value the compaction line prints, checked directly
@@ -17037,7 +17367,7 @@ mod tests {
                 Some("jev-decision-test"),
             )
         }]);
-        let tool = containment_tool(&temp, agents, "test-provider", None).with_model_catalog(catalog);
+        let tool = containment_tool(&temp, agents, "ollama", None).with_model_catalog(catalog);
 
         let mut config = preconstruction_parent_config(&tool, temp.path());
         config.providers.models.push(
@@ -17076,7 +17406,7 @@ mod tests {
             "a".to_string(),
             containment_agent(&own.custom_provider(), Some(SPAWN_AGENT_SENTINEL)),
         )]);
-        let tool = containment_tool(&temp, agents, "test-provider", None);
+        let tool = containment_tool(&temp, agents, "ollama", None);
 
         let config = preconstruction_parent_config(&tool, temp.path());
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
@@ -17115,14 +17445,16 @@ mod tests {
             ),
             ("b".to_string(), containment_agent(&other.custom_provider(), None)),
         ]);
-        let tool = containment_tool(&temp, agents, "test-provider", None);
+        let tool = containment_tool(&temp, agents, "ollama", None);
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "probe", "agent": "a", "provider": other.custom_provider()
-            })))
-            .await
-            .expect("test: spawn returns a tool result");
+            })),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
         assert!(result.success, "a configured endpoint is spawnable: {:?}", result.error);
         let seen = other.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
 
@@ -17160,12 +17492,14 @@ mod tests {
             .expect("test: gateway chain builds"),
         );
 
-        let result = tool
-            .execute(with_spawn_grant(json!({
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({
                 "task": "probe", "provider": format!("{}/", gateway.custom_provider())
-            })))
-            .await
-            .expect("test: spawn returns a tool result");
+            })),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
         assert!(result.success, "{:?}", result.error);
         gateway.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
 
@@ -17262,8 +17596,7 @@ mod tests {
         tool.model = "hint:fast".to_string();
         tool.provider = Arc::from(routed_provider);
 
-        let inherited = tool
-            .execute(with_spawn_grant(json!({"task": "probe"})))
+        let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
             .await
             .expect("test: inherited spawn result");
         assert!(inherited.success, "{:?}", inherited.error);
@@ -17272,8 +17605,7 @@ mod tests {
         assert!(!route.saw("PRX-HINT-ROOT-WIRE"));
         assert!(root.requests().is_empty());
 
-        let direct = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "model": PROBE_MODEL})))
+        let direct = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "model": PROBE_MODEL})))
             .await
             .expect("test: direct override spawn result");
         assert!(direct.success, "{:?}", direct.error);
@@ -17344,8 +17676,7 @@ mod tests {
         tool.model = "hint:fast".to_string();
         tool.provider = Arc::from(routed_provider);
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
+        let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
             .await
             .expect("test: direct agent child result");
         assert!(result.success, "{:?}", result.error);
@@ -17355,10 +17686,12 @@ mod tests {
         assert!(!root.saw("PRX-HINT-ROUTE-WIRE"));
         assert!(route.requests().is_empty());
 
-        let profile_result = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})))
-            .await
-            .expect("test: profile agent child result");
+        let profile_result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})),
+        )
+        .await
+        .expect("test: profile agent child result");
         assert!(profile_result.success, "{:?}", profile_result.error);
         assert_eq!(root.wait_for_requests(2, std::time::Duration::from_secs(10)).await, 2);
         let requests = root.requests();
@@ -17371,10 +17704,12 @@ mod tests {
             .expect("isolated credential store")
             .remove(&profile.id)
             .expect("remove isolated credential");
-        let missing = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})))
-            .await
-            .expect("test: missing profile spawn result");
+        let missing = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_profile"})),
+        )
+        .await
+        .expect("test: missing profile spawn result");
         assert!(!missing.success, "missing profile must be refused");
         assert_eq!(root.requests().len(), 2, "missing profile caused outbound I/O");
     }
@@ -17406,13 +17741,17 @@ mod tests {
         let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
         tool.provider = Arc::from(gateway);
 
-        let result = tool
-            .execute(with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})))
-            .await
-            .expect("test: spawn returns a tool result");
+        let result = execute_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
         assert!(result.success, "{:?}", result.error);
 
-        assert_eq!(root.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
+        let seen = root.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
+        let runs = tool.active_runs_snapshot().await;
+        assert_eq!(seen, 1, "gateway child did not reach root endpoint: {runs:?}");
         assert!(root.saw(F1_SPAWN_ROOT_SENTINEL));
     }
 }

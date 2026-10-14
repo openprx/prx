@@ -154,6 +154,27 @@ impl AdmittedTurn {
         .await
     }
 
+    /// Q67 ordinary-child admission with a caller-owned durable backend.
+    pub(crate) async fn ordinary_controlled_channel_with_memory(
+        config: crate::config::Config,
+        message: crate::channels::traits::ChannelMessage,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+    ) -> Self {
+        assert!(!config.causal_tree.enabled, "ordinary child fixture starts disabled");
+        let input = message.content.clone();
+        Self::build(
+            config,
+            &input,
+            registry,
+            memory,
+            FixtureOrigin::OrdinaryControlledChannel(Box::new(message)),
+            selection,
+        )
+        .await
+    }
+
     pub(crate) async fn with_channel_memory(
         config: crate::config::Config,
         message: crate::channels::traits::ChannelMessage,
@@ -506,6 +527,12 @@ impl AdmittedTurn {
                 .expect("Answer fixture must have an actual cleanup owner")
                 .retain_service(Arc::clone(&service));
         }
+        let channel_chat_id = match &origin {
+            FixtureOrigin::Channel(message) | FixtureOrigin::OrdinaryControlledChannel(message) => {
+                Some(message.reply_target.clone())
+            }
+            FixtureOrigin::Cli { .. } => None,
+        };
         let (proof, envelope): (Box<dyn TurnSourceProof>, _) = match origin {
             FixtureOrigin::Channel(message) | FixtureOrigin::OrdinaryControlledChannel(message) => {
                 let (proof, envelope) = crate::channels::decision_source::recorded_fixture_source(
@@ -557,7 +584,10 @@ impl AdmittedTurn {
         let chat_type = proof.policy_chat_type().to_owned();
         let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy())
             .with_event_recording(config.memory.event_recording_config());
-        let execution_context = crate::tools::ToolExecutionContext::new(envelope, chat_type);
+        let execution_context = match channel_chat_id {
+            Some(chat_id) => crate::tools::ToolExecutionContext::new(envelope, chat_type).with_chat_id(chat_id),
+            None => crate::tools::ToolExecutionContext::new(envelope, chat_type),
+        };
         Self {
             service,
             context,
@@ -643,6 +673,43 @@ impl AdmittedTurn {
             service: &self.service,
             context: &self.context,
             proof: self.proof.as_ref(),
+        }
+    }
+
+    /// Execute one selected tool through the same sealed service binding used by
+    /// the production turn engine. Tool tests use this when the behavior under
+    /// test requires an admitted parent source; calling `Tool::execute` directly
+    /// cannot manufacture that authority.
+    pub(crate) async fn execute_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolResult> {
+        let selected = self.service.agent_execution_specs(self.proof.as_ref(), &self.context)?;
+        anyhow::ensure!(
+            selected.specs.iter().any(|spec| spec.name == name),
+            "admitted fixture did not select tool '{name}'"
+        );
+        let (execution, context) = self.service.bind_agent_execution(
+            self.proof.as_ref(),
+            &self.context,
+            &self.execution_context,
+            &selected.specs,
+        )?;
+        let outcome = execution
+            .execute(
+                crate::tools::ToolExecutionCommand::new(name, arguments),
+                context,
+                Some(tokio_util::sync::CancellationToken::new()),
+            )
+            .await;
+        match (outcome.result, outcome.error) {
+            (Some(result), _) => Ok(result),
+            (None, Some(error)) => Err(anyhow::anyhow!(error)),
+            (None, None) => Err(anyhow::anyhow!(
+                "admitted fixture tool '{name}' ended with status {:?} and no result",
+                outcome.status
+            )),
         }
     }
 }

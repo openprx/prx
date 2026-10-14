@@ -911,6 +911,41 @@ tokio::task_local! {
     static OUTGOING_GRANT: Option<Arc<IssuedChildGrant>>;
 }
 
+#[cfg(test)]
+struct OrdinaryProviderFixture {
+    provider: Arc<dyn crate::providers::Provider>,
+    provider_name: String,
+    model_name: String,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static ORDINARY_PROVIDER_FIXTURE: OrdinaryProviderFixture;
+}
+
+/// Keep ordinary-child tests on the production admission and binding path
+/// while supplying their in-memory provider implementation. Production never
+/// enters this scope and always constructs the provider from the pinned model
+/// selection below.
+#[cfg(test)]
+pub(crate) async fn scope_ordinary_provider_fixture<F: std::future::Future>(
+    provider: Arc<dyn crate::providers::Provider>,
+    provider_name: String,
+    model_name: String,
+    work: F,
+) -> F::Output {
+    ORDINARY_PROVIDER_FIXTURE
+        .scope(
+            OrdinaryProviderFixture {
+                provider,
+                provider_name,
+                model_name,
+            },
+            work,
+        )
+        .await
+}
+
 pub(crate) async fn scope_outgoing_grant<F: std::future::Future>(
     grant: Option<Arc<IssuedChildGrant>>,
     work: F,
@@ -1102,6 +1137,25 @@ impl ChildProviderBinding {
             &crate::providers::catalog::Requirement::chat(),
             crate::providers::catalog::UnknownPolicy::Invocation,
         )?;
+        #[cfg(test)]
+        if let Ok(Some(provider)) = ORDINARY_PROVIDER_FIXTURE.try_with(|fixture| {
+            ((crate::providers::ProviderId::of(&fixture.provider_name)
+                == crate::providers::ProviderId::of(provider_name)
+                || crate::providers::canonical_provider_key(&fixture.provider_name)
+                    == crate::providers::canonical_provider_key(provider_name))
+                && fixture.model_name == model_name)
+                .then(|| Arc::clone(&fixture.provider))
+        }) {
+            return Ok(Self {
+                grant: None,
+                generation,
+                provider,
+                requested_provider: provider_name.to_owned(),
+                requested_model: model_name.to_owned(),
+                resolved,
+                route,
+            });
+        }
         Self::from_selection(None, generation, catalog, provider_name, model_name, resolved, route)
     }
 
