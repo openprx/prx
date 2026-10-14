@@ -5661,6 +5661,7 @@ impl Memory for PostgresMemory {
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
+                                  OR (event_type = 'document.ingested' AND agent_id IS NULL AND persona_id IS NULL)
                               ){owner_required_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
@@ -5738,6 +5739,7 @@ impl Memory for PostgresMemory {
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                                  OR (event_type = 'document.ingested' AND agent_id IS NULL AND persona_id IS NULL)
                               ){owner_required_fragment})
                               OR (visibility = 'system' AND $5::BOOLEAN)
                           )
@@ -9757,6 +9759,56 @@ mod tests {
             vec!["doc-b".to_string()],
             "an isolated owner must not read another owner's ingest event: {seen:?}"
         );
+
+        drop(mem);
+        r5_drop_schema(db_url, schema).await;
+    }
+
+    /// V02-R6 live twin: a private tool-ingest event has no agent or persona,
+    /// so the exact owner is the author identity admitted by both event-list
+    /// APIs. A different owner remains excluded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live PostgreSQL: set OPENPRX_TEST_POSTGRES_URL and run with --ignored"]
+    async fn postgres_private_visibility_ingest_event_is_readable_by_its_author() {
+        let db_url = live_postgres_url();
+        let schema = format!("prx_c03_ingest_private_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).expect("test: postgres memory");
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        mem.ingest_document(postgres_c03_ingest_input(
+            "doc-private",
+            &owner_a,
+            Some(C03_SESSION_KEY),
+            MemoryVisibility::Private,
+        ))
+        .await
+        .expect("test: ingest private-visibility document");
+
+        for isolated in [false, true] {
+            let principal = c03_principal(Some(&owner_a), isolated);
+            let recent = postgres_c03_ingest_subjects(&mem, &principal).await;
+            assert_eq!(
+                recent,
+                vec!["doc-private".to_string()],
+                "the author reads its private ingest event (isolated={isolated}): {recent:?}"
+            );
+            let since = mem
+                .list_memory_events_since(&principal, 0, 200)
+                .await
+                .expect("test: memory events since")
+                .into_iter()
+                .filter(|event| event.event_type == "document.ingested")
+                .map(|event| event.subject_id)
+                .collect::<Vec<_>>();
+            assert_eq!(since, recent, "both event-list APIs enforce the same author rule");
+
+            let foreign = postgres_c03_ingest_subjects(&mem, &c03_principal(Some(&owner_b), isolated)).await;
+            assert!(
+                foreign.is_empty(),
+                "another owner cannot read the private ingest event (isolated={isolated}): {foreign:?}"
+            );
+        }
 
         drop(mem);
         r5_drop_schema(db_url, schema).await;

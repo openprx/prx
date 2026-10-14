@@ -927,17 +927,19 @@ document, its chunks, their owner and the visibility the caller asked for are
 unchanged; only the event row gains the keys, so nothing becomes visible to a
 principal that could not already read a row of that visibility.
 
-A `private` or `agent` ingest event is still unreadable to a principal that
-carries no agent or persona. That is the pre-existing property of those arms for
-every event type, not an ingest-specific rule, and it is unchanged here. A test
-pins the `private` case specifically; no ingest path produces `agent` visibility
-today, so there is nothing to pin for that arm.
+A `private` `document.ingested` event whose stored agent and persona are both
+empty is readable by its exact owner. This is the tool-ingest author case. The
+owner-author arm applies only to those rows; an ingest event that carries an
+agent or persona still requires that identity in addition to the owner, as do
+other private events. Another owner cannot read the event. No ingest path
+produces `agent` visibility today.
 
 The `private` arm requires the owner for **every** reader (OQ-1, closed): a
 `private` event is readable only when its `owner_id` equals the reader's own,
-in addition to the `agent_id` / `persona_id` / `sender` match, for an
-owner-isolated caller and an in-process turn alike, on both adapters. Before
-this a principal that was not owner-isolated matched `private` rows on
+for an owner-isolated caller and an in-process turn alike, on both adapters.
+Except for the owner-authored tool-ingest row described above, it also requires
+the `agent_id` / `persona_id` / `sender` match. Before this a principal that was
+not owner-isolated matched `private` rows on
 `agent_id` or `persona_id` alone, so an in-process turn of another owner running
 under the same configured sub-agent name read the first owner's `private`
 events — a private document's `document.ingested` event among them. A reader

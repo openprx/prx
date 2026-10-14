@@ -6304,6 +6304,7 @@ impl Memory for SqliteMemory {
                                 OR (visibility = 'private' AND (
                                     (?3 IS NOT NULL AND agent_id = ?3)
                                     OR (?4 IS NOT NULL AND persona_id = ?4)
+                                    OR (event_type = 'document.ingested' AND agent_id IS NULL AND persona_id IS NULL)
                                 ){owner_required_fragment})
                                 OR (visibility = 'system' AND ?6)
                             )
@@ -6381,6 +6382,7 @@ impl Memory for SqliteMemory {
                                 OR (visibility = 'private' AND (
                                     (?2 IS NOT NULL AND agent_id = ?2)
                                     OR (?3 IS NOT NULL AND persona_id = ?3)
+                                    OR (event_type = 'document.ingested' AND agent_id IS NULL AND persona_id IS NULL)
                                 ){owner_required_fragment})
                                 OR (visibility = 'system' AND ?5)
                             )
@@ -12831,16 +12833,14 @@ source: tool_output\n\
         assert_eq!(event.persona_id, None);
     }
 
-    /// Option (C) documented as behavior: the keys are written verbatim, and a
-    /// `private` ingest event stays unreadable for a principal that carries no
-    /// agent or persona. That is the pre-existing property of the `private` arm
-    /// (`src/memory/sqlite.rs`, `agent_id = ?2 OR persona_id = ?3`) for every
-    /// event type, not something the ingest path special-cases. A00 section 8
-    /// items 1-2 track whether that arm should admit on `owner_id` instead.
+    /// V02-R6: a tool-ingest event carries no agent or persona, so its exact
+    /// owner is its author identity. The author can read the private event
+    /// through either event-list API, while another owner cannot.
     #[tokio::test]
-    async fn private_visibility_ingest_event_records_its_keys_even_when_unreadable() {
+    async fn private_visibility_ingest_event_is_readable_by_its_author() {
         let (tmp, mem) = temp_sqlite();
         let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
 
         mem.ingest_document(c03_ingest_input(
             "doc-private",
@@ -12873,10 +12873,27 @@ source: tool_output\n\
         drop(conn);
 
         for isolated in [false, true] {
-            let seen = c03_ingest_subjects(&mem, &c03_principal(C03_WORKSPACE, Some(&owner_a), isolated)).await;
+            let principal = c03_principal(C03_WORKSPACE, Some(&owner_a), isolated);
+            let recent = c03_ingest_subjects(&mem, &principal).await;
+            assert_eq!(
+                recent,
+                vec!["doc-private".to_string()],
+                "the author reads its private ingest event (isolated={isolated}): {recent:?}"
+            );
+            let since = mem
+                .list_memory_events_since(&principal, 0, 200)
+                .await
+                .expect("test: memory events since")
+                .into_iter()
+                .filter(|event| event.event_type == "document.ingested")
+                .map(|event| event.subject_id)
+                .collect::<Vec<_>>();
+            assert_eq!(since, recent, "both event-list APIs enforce the same author rule");
+
+            let foreign = c03_ingest_subjects(&mem, &c03_principal(C03_WORKSPACE, Some(&owner_b), isolated)).await;
             assert!(
-                seen.is_empty(),
-                "the `private` arm still needs an agent or persona (isolated={isolated}): {seen:?}"
+                foreign.is_empty(),
+                "another owner cannot read the private ingest event (isolated={isolated}): {foreign:?}"
             );
         }
     }
