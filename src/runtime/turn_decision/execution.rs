@@ -470,6 +470,10 @@ impl TurnDecisionService {
             !context.execution_closed.load(Ordering::Acquire),
             "decision execution is already closed"
         );
+        anyhow::ensure!(
+            specs.is_empty() || proof.tool_calls_allowed() && self.model_can_call_tools(proof),
+            "source configuration forbids tool calls"
+        );
         let selected = self.agent_execution_specs(proof, context)?;
         let envelope = &execution_context.envelope;
         anyhow::ensure!(

@@ -6,7 +6,7 @@ use crate::runtime::child_source::{ChildProviderBinding, ChildSegmentSequence};
 use crate::runtime::child_turn::ChildSegmentTurn;
 use crate::runtime::turn_cleanup::CleanupTracker;
 use crate::runtime::turn_terminal::TerminalUsageCollector;
-use crate::tools::ToolExecutionStatus;
+use crate::tools::{ToolExecutionStatus, ToolSpec};
 
 struct CountedRead {
     inner: crate::tools::file_read::FileReadTool,
@@ -70,14 +70,22 @@ impl DecisionBackend for ReadBackend {
         // Only model answers change. The factory still binds the real compiled
         // request, validates every answer, and runs the ordinary hard gates.
         let mut response = BuiltinDecisionBackend::answer(request)?;
+        let has_tool_candidate = crate::decision::builtin::features::extract(request.state().as_json())
+            .candidates
+            .iter()
+            .any(|candidate| candidate.action == Some(crate::decision::builtin::features::Action::UseTool));
         response.backend = "mock".into();
         response.resolved_model = self.identity.configured_model.to_string();
         for (id, answer) in &mut response.answers {
-            let work = id.as_str().starts_with("candidate.use_tool-filesystem-");
+            let work = if has_tool_candidate {
+                id.as_str().starts_with("candidate.use_tool-filesystem-")
+            } else {
+                id.as_str().starts_with("candidate.answer-none.")
+            };
             match answer {
                 DecisionAnswer::Choice(choice) => {
                     let code = if id == &QuestionId::global(GlobalQuestion::NextAction) {
-                        "use_tool"
+                        if has_tool_candidate { "use_tool" } else { "answer" }
                     } else {
                         "filesystem"
                     };
@@ -119,6 +127,15 @@ impl DecisionBackend for ReadBackend {
 
 #[tokio::test]
 async fn actual_failed_ledger_terminal_replay_preserves_facts_into_next_segment() -> anyhow::Result<()> {
+    child_source_gate_and_ledger_case().await
+}
+
+#[tokio::test]
+async fn non_agentic_delegate_child_does_not_publish_or_bind_an_always_include_tool() -> anyhow::Result<()> {
+    child_source_gate_and_ledger_case().await
+}
+
+async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let owned_runs = Arc::new(tokio::sync::RwLock::new(Vec::<SubAgentRun>::new()));
     let workspace = scratch.path().join("logical");
@@ -140,6 +157,24 @@ async fn actual_failed_ledger_terminal_replay_preserves_facts_into_next_segment(
     config.sessions_spawn.process_memory_strategy = "isolated_private".into();
     config.sessions_spawn.worker_workspace_root = Some(workers.to_string_lossy().into_owned());
     config.sessions_spawn.cleanup_on_complete = false;
+    config.tool_tiering.always_include.push("file_read".to_owned());
+    config.agents.insert(
+        "prx_reader".to_owned(),
+        crate::config::DelegateAgentConfig {
+            provider: "ollama".to_owned(),
+            model: "prx-local-model".to_owned(),
+            system_prompt: None,
+            api_key: None,
+            credential_ref: None,
+            temperature: None,
+            max_depth: 1,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        },
+    );
     config.providers.models.push(toml::from_str(
         "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
     )?);
@@ -328,6 +363,61 @@ async fn actual_failed_ledger_terminal_replay_preserves_facts_into_next_segment(
         OutboundSecrets::default(),
         SlotLimits::default(),
     );
+    let mut restricted_scope =
+        crate::memory::MessageEventScope::new("delegate", crate::memory::MemoryVisibility::Workspace)
+            .with_session_key("prx_non_agentic_session")
+            .with_run_id("prx_non_agentic_run")
+            .with_agent_id("prx_reader");
+    grant.bind_event_scope(&mut restricted_scope)?;
+    let restricted_input = crate::runtime::child_source::record_child_input(
+        &fabric,
+        restricted_scope,
+        "Hello",
+        Some("prx_non_agentic_run:input".into()),
+        None,
+        Some(&grant),
+    )
+    .await?
+    .expect("real non-agentic delegate input receipt");
+    let restricted_proof = binding.source_proof(&grant, &restricted_input, &child_provider)?;
+    assert!(
+        !crate::runtime::turn_source::TurnSourceProof::tool_calls_allowed(&restricted_proof),
+        "the configured non-agentic Delegate source must disable tool calls"
+    );
+    let restricted_context = child_service
+        .decide_agent_initial(&restricted_proof, AgentTurnKind::Repl, &cancellation)
+        .await?;
+    assert!(
+        matches!(restricted_context.directive(), TurnExecutionDirective::AnswerDirectly),
+        "non-agentic plain turn did not answer: directive={:?}; selection={:?}; fallback={:?}; candidates={:?}",
+        restricted_context.directive(),
+        restricted_context.engine.selection,
+        restricted_context.engine.fallback_cause,
+        restricted_context.engine.candidates,
+    );
+    assert!(
+        restricted_context.execution_refs().is_empty(),
+        "a source without tool-call authority must publish no direct references"
+    );
+    let restricted_specs = child_service.agent_execution_specs(&restricted_proof, &restricted_context)?;
+    assert!(restricted_specs.specs.is_empty());
+    let restricted_execution = restricted_input.execution_context(&restricted_proof)?;
+    let forged_spec = ToolSpec {
+        name: "file_read".to_owned(),
+        description: "must be rejected before schema binding".to_owned(),
+        parameters: serde_json::json!({"type":"object"}),
+    };
+    let bind_error = match child_service.bind_agent_execution(
+        &restricted_proof,
+        &restricted_context,
+        &restricted_execution,
+        &[forged_spec],
+    ) {
+        Ok(_) => anyhow::bail!("a caller re-added a tool excluded by source authority"),
+        Err(error) => error,
+    };
+    assert_eq!(bind_error.to_string(), "source configuration forbids tool calls");
+    restricted_context.terminal_execution_trace();
     let owner = Arc::new(CleanupTracker::default());
     // Catch only the fixture work. Its future drops terminal guards before
     // cleanup starts; errors and panics cannot delete SQLite under owned writes.

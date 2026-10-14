@@ -913,6 +913,10 @@ fn direct_answer_refs(
     catalog: &CatalogView<'_>,
     gates: &GateInputs<'_>,
 ) -> BTreeSet<CapabilityRef> {
+    if !gates.model_can_call_tools {
+        return BTreeSet::new();
+    }
+    let trusted = decision.state.trusted.parts();
     catalog
         .iter_entries()
         .filter_map(|entry| {
@@ -925,6 +929,14 @@ fn direct_answer_refs(
             let directly_exposed = matches!(entry.exposure, Exposure::Direct);
             let exact_delegation = delegation && exact_delegator_ref(decision, &reference);
             if (!directly_exposed && !exact_delegation) || (delegation && decision.outgoing_child.is_none()) {
+                return None;
+            }
+            if trusted.constraints.iter().any(|code| {
+                matches!(code.as_str(), "resume_exact_call" | "tools_off")
+                    || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
+            }) || trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
+                && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly
+            {
                 return None;
             }
             let candidate = CausalCandidate::new(
