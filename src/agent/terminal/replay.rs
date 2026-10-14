@@ -180,7 +180,7 @@ impl PreparedReplay {
                     .source_actor_matches(source.channel.as_deref(), source.sender.as_deref())
                 && source.role == "user"
                 && source.event_type == "message.created"
-                && crate::runtime::turn_source::recorded_input_matches(
+                && crate::runtime::turn_source::recorded_projected_input_matches(
                     trusted.surface,
                     &source,
                     root.state.routing_input.as_str()

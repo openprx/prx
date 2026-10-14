@@ -49,14 +49,7 @@ pub(crate) fn recorded_input_matches(
     event: &crate::memory::MessageEvent,
     raw_input: &str,
 ) -> bool {
-    if ingress_event_surface(&event.source, event.channel.as_deref(), &event.visibility) != Some(surface)
-        || (surface == TurnSurfaceKind::AgentLoop
-            && !matches!(
-                (event.channel.as_deref(), event.sender.as_deref()),
-                (Some("cli"), Some("local-user")) | (Some("agent_api"), Some("embedded-caller"))
-            ))
-        || (surface == TurnSurfaceKind::Interactive && event.sender.as_deref() != Some("local-user"))
-    {
+    if !recorded_surface_matches(surface, event) {
         return false;
     }
     match surface {
@@ -70,6 +63,42 @@ pub(crate) fn recorded_input_matches(
         }
         TurnSurfaceKind::Interactive => event.content == crate::chat::sanitize::sanitize_for_persistence(raw_input),
     }
+}
+
+/// Match a durable ingress row to the bounded image-marker projection stored
+/// in a decision hop. The event identity and every source field are checked by
+/// the caller; this applies the ingress persistence transform before comparing
+/// the same projection used at decision admission.
+pub(crate) fn recorded_projected_input_matches(
+    surface: TurnSurfaceKind,
+    event: &crate::memory::MessageEvent,
+    projected_input: &str,
+) -> bool {
+    if !recorded_surface_matches(surface, event) {
+        return false;
+    }
+    let recorded = crate::multimodal::project_image_markers_for_routing(&event.content);
+    match surface {
+        TurnSurfaceKind::AgentLoop
+        | TurnSurfaceKind::Server
+        | TurnSurfaceKind::Cron
+        | TurnSurfaceKind::Xin
+        | TurnSurfaceKind::Worker => recorded == projected_input,
+        TurnSurfaceKind::Channel => {
+            recorded == crate::agent::turn_contracts::inbound_user_message(projected_input).content
+        }
+        TurnSurfaceKind::Interactive => recorded == crate::chat::sanitize::sanitize_for_persistence(projected_input),
+    }
+}
+
+fn recorded_surface_matches(surface: TurnSurfaceKind, event: &crate::memory::MessageEvent) -> bool {
+    ingress_event_surface(&event.source, event.channel.as_deref(), &event.visibility) == Some(surface)
+        && (surface != TurnSurfaceKind::AgentLoop
+            || matches!(
+                (event.channel.as_deref(), event.sender.as_deref()),
+                (Some("cli"), Some("local-user")) | (Some("agent_api"), Some("embedded-caller"))
+            ))
+        && (surface != TurnSurfaceKind::Interactive || event.sender.as_deref() == Some("local-user"))
 }
 
 /// A task subject is distinct from a topic or goal. Do not infer it from a

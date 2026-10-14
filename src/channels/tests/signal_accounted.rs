@@ -413,8 +413,10 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         assert!(rows.iter().any(|row| row.0 == "retrieve"));
         assert!(rows.iter().any(|row| row.0 == "answer"));
     } else {
-        assert_eq!(rows.len(), 1, "unpriced admission must close before retrieval");
-        let (directive, candidates, gates) = rows.first().expect("one refusal decision");
+        assert_eq!(rows.len(), 2, "bounded discovery then refusal, without retrieval");
+        assert_eq!(rows[0].0, "discover");
+        assert!(rows.iter().all(|row| row.0 != "retrieve"));
+        let (directive, candidates, gates) = rows.get(1).expect("terminal refusal decision");
         assert_eq!(directive, "refuse");
         let candidates: Vec<crate::causal_tree::store::RecordedCandidate> =
             serde_json::from_str(candidates).expect("actual typed kept candidate records");
