@@ -2449,6 +2449,85 @@ mod tests {
             .await;
     }
 
+    /// A plain Console message uses the default enabled builtin decision plane
+    /// and reaches the serving provider through the same admitted runtime as a
+    /// production Console request.
+    #[tokio::test]
+    async fn console_plain_message_reaches_the_provider_with_default_causal_config() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("test: Console cleanup owner");
+        cleanup
+            .run(Box::pin(async {
+                let mut config = Config::default();
+                config.workspace_dir = tmp.path().to_owned();
+                config.config_path = tmp.path().join("config.toml");
+                config.default_provider = Some("ollama".to_owned());
+                config.default_model = Some("test-model".to_owned());
+                config.providers.models.push(
+                    toml::from_str(
+                        "provider = \"ollama\"\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = false\n",
+                    )
+                    .expect("test: Console model declaration"),
+                );
+                config.cost.prices.insert(
+                    "ollama/test-model".to_owned(),
+                    crate::config::schema::ModelPricing {
+                        input: 1.0,
+                        output: 1.0,
+                        cache_write: 1.0,
+                        cache_read: 1.0,
+                    },
+                );
+                assert_eq!(
+                    config.causal_tree,
+                    crate::causal_tree::CausalTreeConfig::default(),
+                    "the Console proof must retain the default causal configuration"
+                );
+
+                let provider_impl = Arc::new(CapturingProvider::default());
+                let mut state = test_app_state_with_config(config, provider_impl.clone());
+                let envelope = console_runtime_envelope_for_workspace(
+                    tmp.path().to_string_lossy().to_string(),
+                    "console-plain-session",
+                    "console",
+                    "prx_user",
+                );
+                let input = "hello";
+                let (runtime, _, _, proof) = console_test_source(&mut state, envelope, input).await;
+                let service = runtime.decision_slot.publish(&runtime, &state).await?.clone();
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let context = service
+                    .decide_agent_initial(
+                        &proof,
+                        crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                        &cancellation,
+                    )
+                    .await?;
+                assert!(matches!(
+                    context.directive(),
+                    crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+                ));
+                let decision = ConsoleDecisionTurn {
+                    service: Arc::clone(&service),
+                    context,
+                    proof: &proof,
+                    cancellation,
+                    provider_trace: None,
+                };
+                let turn = run_console_runtime_turn(runtime, &state, input, Vec::new(), &decision).await?;
+                service
+                    .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                    .await;
+
+                assert_eq!(turn.reply, "console-runtime-ok");
+                assert_eq!(provider_impl.requests.lock().len(), 1);
+                Ok::<(), anyhow::Error>(())
+            }))
+            .await
+            .expect("test: default Console turn and cleanup complete");
+    }
+
     // ── R5 / OQ-23: the Console turn budgets on the model's effective window ──
 
     const CONSOLE_BULKY_TOOL: &str = "file_read";
