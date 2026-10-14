@@ -2,6 +2,7 @@
   "schema": "prx.causal.state.v1",
   "hop": 0,
   "prior_decision_id": "01936c4e-7d2a-7c3b-9f10-4b5e6a7d8c9e",
+  "has_conversation_history": false,
   "latest_user_turn": "What is the difference between a mutex and a semaphore?",
   "goal": "Explain the difference between a mutex and a semaphore.",
   "completed_steps": [],

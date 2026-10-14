@@ -31,6 +31,7 @@
   "fingerprint_repeated.json": "$.failed_tool_fingerprints[1]: repeated",
   "fingerprints_too_many.json": "$.failed_tool_fingerprints: length outside 0..=16",
   "goal_too_long.json": "$.goal: longer than 1024",
+  "history_not_boolean.json": "$.has_conversation_history: not a boolean",
   "hop_negative.json": "$.hop: not an integer in 0..=255",
   "hop_without_prior.json": "$.prior_decision_id: null exactly on hop 0, else a canonical UUID",
   "no_candidates.json": "$.candidates: length outside 1..=64",

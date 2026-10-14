@@ -38,6 +38,7 @@ capability-name list, CDP-PLAN M16).
 | `prior_decision_id` | string or null | null when `hop` is 0; otherwise the canonical lowercase UUID of the previous decision |
 | `latest_user_turn` | string | the redacted latest user turn, at most 4096 bytes |
 | `goal` | string | the redacted current goal, at most 1024 bytes |
+| `has_conversation_history` | boolean | whether this source turn follows an earlier ordinary conversation turn; it carries no transcript text or identity |
 | `completed_steps` | array | at most 32 entries of `{"kind", "status"}` |
 | `artifacts` | array | at most 16 entries of `{"kind", "age_ms", "summary"}` |
 | `failed_tool_fingerprints` | array | at most 16 distinct `hex8` strings (`^[0-9a-f]{8}$`); diagnostic only, no candidate is matched against it (the per-candidate `failed_before` carries the failure) |

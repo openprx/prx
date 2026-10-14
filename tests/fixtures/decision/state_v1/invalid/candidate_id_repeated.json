@@ -2,6 +2,7 @@
   "schema": "prx.causal.state.v1",
   "hop": 0,
   "prior_decision_id": null,
+  "has_conversation_history": false,
   "latest_user_turn": "Open the issue tracker, file the crash report and tell the team channel.",
   "goal": "File the crash report and notify the team.",
   "completed_steps": [

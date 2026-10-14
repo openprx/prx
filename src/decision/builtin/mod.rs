@@ -1038,7 +1038,8 @@ mod tests {
     fn state(turn: &str, candidates: Vec<Value>) -> Value {
         json!({
             "schema": "prx.causal.state.v1", "hop": 0, "prior_decision_id": null,
-            "latest_user_turn": turn, "goal": "g", "completed_steps": [], "artifacts": [],
+            "latest_user_turn": turn, "goal": "g", "has_conversation_history": false,
+            "completed_steps": [], "artifacts": [],
             "failed_tool_fingerprints": [], "retry_count": 0, "approval_pending": false,
             "constraints": [], "budgets": {"tokens": "b2", "latency": "b2", "cost": "b1"},
             "candidates": candidates

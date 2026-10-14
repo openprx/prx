@@ -8,12 +8,13 @@
 fn state_v1_violations(state: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
 
-    const TOP_KEYS: [&str; 13] = [
+    const TOP_KEYS: [&str; 14] = [
         "schema",
         "hop",
         "prior_decision_id",
         "latest_user_turn",
         "goal",
+        "has_conversation_history",
         "completed_steps",
         "artifacts",
         "failed_tool_fingerprints",
@@ -207,6 +208,11 @@ fn state_v1_violations(state: &serde_json::Value) -> Vec<String> {
         &mut errors,
     );
     bounded_text(top.get("goal"), "$.goal", 1024, false, &mut errors);
+    boolean(
+        top.get("has_conversation_history"),
+        "$.has_conversation_history",
+        &mut errors,
+    );
 
     for (index, step) in bounded_array(top.get("completed_steps"), "$.completed_steps", 0..=32, &mut errors)
         .iter()
