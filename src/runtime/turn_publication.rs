@@ -3,6 +3,21 @@ use crate::tools;
 use anyhow::Result;
 use std::sync::Arc;
 
+/// The bounded native schemas kept on ordinary model turns. These are the
+/// common file and shell operations from the standard progressive-disclosure
+/// contract; publication still applies source, model, surface, security and
+/// approval gates before any one of them can execute.
+const DEFAULT_DIRECT_TOOLS: [&str; 4] = ["file_edit", "file_read", "file_write", "shell"];
+
+fn direct_tool_names(configured: &crate::config::ToolTieringConfig) -> std::collections::BTreeSet<String> {
+    DEFAULT_DIRECT_TOOLS
+        .into_iter()
+        .map(str::to_owned)
+        .chain(configured.always_include.iter().cloned())
+        .filter(|name| !configured.always_exclude.contains(name))
+        .collect()
+}
+
 pub(crate) fn surface_policy(
     surface: crate::causal_tree::state::TurnSurfaceKind,
     configured: &crate::config::ToolTieringConfig,
@@ -14,12 +29,7 @@ pub(crate) fn surface_policy(
         std::borrow::Cow::Borrowed(configured)
     };
     let excluded_names = tiering.always_exclude.iter().cloned().collect();
-    let mut direct_names: std::collections::BTreeSet<_> = tiering
-        .always_include
-        .iter()
-        .filter(|name| !tiering.always_exclude.contains(name))
-        .cloned()
-        .collect();
+    let mut direct_names = direct_tool_names(&tiering);
     // Interactive Chat is itself the local session-orchestration
     // entrypoint: `/sessions` observes work started by the model-facing
     // `sessions_spawn` tool. Keep that one bounded orchestration schema in
@@ -199,13 +209,7 @@ impl ChildDecisionPublication {
         let surface_policy = crate::tools::capability::catalog::SurfacePolicy {
             allowed_tools: self.allowed_tools,
             excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
-            direct_names: config
-                .tool_tiering
-                .always_include
-                .iter()
-                .filter(|name| !config.tool_tiering.always_exclude.contains(name))
-                .cloned()
-                .collect(),
+            direct_names: direct_tool_names(&config.tool_tiering),
             channel_allowed: false,
         };
         let events = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(self.observer));

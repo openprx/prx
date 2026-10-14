@@ -141,15 +141,22 @@ pub(crate) struct CandidatePolicy<'a> {
 /// Fixed-size eligibility facts, independent of prediction truncation and of
 /// whether the original source text can itself serve as a bounded hop query.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct DiscoveryFamilies([bool; 5]);
+pub(crate) struct DiscoveryFamilies([bool; 12]);
 
 impl DiscoveryFamilies {
-    const ALL: [CapabilityTarget; 5] = [
+    const ALL: [CapabilityTarget; 12] = [
+        CapabilityTarget::Memory,
         CapabilityTarget::Skill,
         CapabilityTarget::Mcp,
         CapabilityTarget::NativeTool,
         CapabilityTarget::Wasm,
         CapabilityTarget::Hook,
+        CapabilityTarget::Filesystem,
+        CapabilityTarget::Shell,
+        CapabilityTarget::Document,
+        CapabilityTarget::Web,
+        CapabilityTarget::Im,
+        CapabilityTarget::Session,
     ];
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = CapabilityTarget> + '_ {
@@ -160,14 +167,7 @@ impl DiscoveryFamilies {
     }
 
     pub(crate) const fn supports(family: CapabilityTarget) -> bool {
-        matches!(
-            family,
-            CapabilityTarget::Skill
-                | CapabilityTarget::Mcp
-                | CapabilityTarget::NativeTool
-                | CapabilityTarget::Wasm
-                | CapabilityTarget::Hook
-        )
+        !matches!(family, CapabilityTarget::None)
     }
 }
 
@@ -316,6 +316,7 @@ impl CausalCandidateGenerator {
         }
         let mut discoverable_families = DiscoveryFamilies::default();
         let mut exact_mentions = BTreeSet::new();
+        let mut exact_capability_requires_close = false;
         let mut proposed = Vec::new();
         let folded_input = if terminal_only || policy.delegation_target.is_some() {
             String::new()
@@ -373,6 +374,14 @@ impl CausalCandidateGenerator {
                             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
                                 approval_only = Some(candidate);
                             }
+                            GateOutcome::ApprovalDeferred | GateOutcome::Blocked { gate: 4 | 7 | 9, .. } => {
+                                // An exact action that lacks approval scope,
+                                // model authority or structural permission is
+                                // a denied action request. Do not reinterpret
+                                // it as an ordinary answer or substitute a
+                                // same-family capability.
+                                exact_capability_requires_close = true;
+                            }
                             _ => {}
                         }
                     }
@@ -382,43 +391,45 @@ impl CausalCandidateGenerator {
                     }
                 }
 
-                for family in CapabilityTarget::ALL {
-                    let executable = catalog.iter_entries().filter(|entry| {
-                        entry.family == family
-                            && !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
-                            && available_for_fallback(entry, policy)
-                    });
-                    if let Some(candidate) = select_family_candidate(
-                        CausalActionKind::UseTool,
-                        family,
-                        executable,
-                        false,
-                        state,
-                        catalog,
-                        policy,
-                        gates,
-                    )? {
-                        // An admitted exact mention already represents this entry.
-                        // Preserve family fallback for other entries and unmatched input.
-                        let exact_entry_present = proposed.iter().any(|prior: &CausalCandidate| {
-                            exact_mentions.contains(prior.candidate_id())
-                                && prior.required_capabilities().iter().any(|exact| {
-                                    candidate
-                                        .required_capabilities()
-                                        .iter()
-                                        .any(|fallback| exact.id == fallback.id)
-                                })
+                if !exact_capability_requires_close {
+                    for family in CapabilityTarget::ALL {
+                        let executable = catalog.iter_entries().filter(|entry| {
+                            entry.family == family
+                                && !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                                && available_for_fallback(entry, policy)
                         });
-                        if !exact_entry_present
-                            && !proposed
-                                .iter()
-                                .any(|prior: &CausalCandidate| prior.candidate_id() == candidate.candidate_id())
-                        {
-                            proposed.push(candidate);
+                        if let Some(candidate) = select_family_candidate(
+                            CausalActionKind::UseTool,
+                            family,
+                            executable,
+                            false,
+                            state,
+                            catalog,
+                            policy,
+                            gates,
+                        )? {
+                            // An admitted exact mention already represents this entry.
+                            // Preserve family fallback for other entries and unmatched input.
+                            let exact_entry_present = proposed.iter().any(|prior: &CausalCandidate| {
+                                exact_mentions.contains(prior.candidate_id())
+                                    && prior.required_capabilities().iter().any(|exact| {
+                                        candidate
+                                            .required_capabilities()
+                                            .iter()
+                                            .any(|fallback| exact.id == fallback.id)
+                                    })
+                            });
+                            if !exact_entry_present
+                                && !proposed
+                                    .iter()
+                                    .any(|prior: &CausalCandidate| prior.candidate_id() == candidate.candidate_id())
+                            {
+                                proposed.push(candidate);
+                            }
                         }
                     }
                 }
-                if state.routing_input.supports_selected_read_query() {
+                if !exact_capability_requires_close && state.routing_input.supports_selected_read_query() {
                     for family in [
                         CapabilityTarget::Memory,
                         CapabilityTarget::Document,
@@ -447,25 +458,49 @@ impl CausalCandidateGenerator {
                 // A later capability_search call supplies its own bounded query.
                 // Only initial Discover hops require the raw source to fit that
                 // query contract; both paths use the same capability gates.
-                for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
-                    let searchable = catalog
-                        .iter_entries()
-                        .filter(|entry| entry.family == family && matches!(entry.exposure, Exposure::Searchable));
-                    if let Some(candidate) = select_family_candidate(
-                        CausalActionKind::Discover,
-                        family,
-                        searchable,
-                        false,
-                        state,
-                        catalog,
-                        policy,
-                        gates,
-                    )? {
-                        *eligible = HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates)
-                            == GateOutcome::Passed;
-                        if state.routing_input.supports_selected_read_query() {
-                            proposed.push(candidate);
+                if !exact_capability_requires_close {
+                    let mut discovery_anchor = None;
+                    for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
+                        let searchable = catalog
+                            .iter_entries()
+                            .filter(|entry| entry.family == family && matches!(entry.exposure, Exposure::Searchable));
+                        if let Some(candidate) = select_family_candidate(
+                            CausalActionKind::Discover,
+                            family,
+                            searchable,
+                            false,
+                            state,
+                            catalog,
+                            policy,
+                            gates,
+                        )? {
+                            let outcome =
+                                HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+                            *eligible = outcome == GateOutcome::Passed;
+                            if *eligible && discovery_anchor.is_none() {
+                                discovery_anchor = Some(candidate.clone());
+                            } else if !*eligible
+                                && matches!(outcome, GateOutcome::ApprovalOnly { .. })
+                                && state.routing_input.supports_selected_read_query()
+                            {
+                                // Preserve the exact family candidate only as an
+                                // approval diagnostic. It cannot become the
+                                // generic local-search path without a verified
+                                // action scope.
+                                proposed.push(candidate);
+                            }
                         }
+                    }
+                    if policy.can_deliver_text
+                        && state.routing_input.supports_selected_read_query()
+                        && let Some(anchor) = discovery_anchor
+                    {
+                        // Discovery is one local catalog action. The ranked search
+                        // resolves the family from the query after every eligible
+                        // family has passed its own capability gates; separate
+                        // per-family candidates create an artificial zero-margin
+                        // tie for a language-neutral decision backend.
+                        proposed.push(anchor);
                     }
                 }
             }
@@ -498,7 +533,11 @@ impl CausalCandidateGenerator {
                 }
             }
         }
-        if !routing_history && policy.can_deliver_text && policy.delegation_target.is_none() {
+        if !routing_history
+            && policy.can_deliver_text
+            && policy.delegation_target.is_none()
+            && !exact_capability_requires_close
+        {
             proposed.push(terminal(CausalActionKind::Answer, policy));
         }
         if state.trusted.parts().delivery.interactive && state.trusted.parts().delivery.can_ask_question {

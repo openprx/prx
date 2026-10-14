@@ -912,6 +912,7 @@ fn direct_answer_refs(
     decision: &EngineDecision,
     catalog: &CatalogView<'_>,
     gates: &GateInputs<'_>,
+    selected_discovery_refs: &BTreeSet<CapabilityRef>,
 ) -> BTreeSet<CapabilityRef> {
     if !gates.model_can_call_tools {
         return BTreeSet::new();
@@ -928,7 +929,16 @@ fn direct_answer_refs(
             };
             let directly_exposed = matches!(entry.exposure, Exposure::Direct);
             let exact_delegation = delegation && exact_delegator_ref(decision, &reference);
-            if (!directly_exposed && !exact_delegation) || (delegation && decision.outgoing_child.is_none()) {
+            // A selected local search is already a bounded, turn-scoped
+            // relevance decision. Carry that exact schema into the serving
+            // model's final snapshot when the following hop answers, while
+            // retaining the same publication gates as the direct core.
+            let selected_discovery = !delegation
+                && matches!(entry.exposure, Exposure::Searchable)
+                && selected_discovery_refs.contains(&reference);
+            if (!directly_exposed && !exact_delegation && !selected_discovery)
+                || (delegation && decision.outgoing_child.is_none())
+            {
                 return None;
             }
             if trusted.constraints.iter().any(|code| {
@@ -1092,11 +1102,15 @@ impl TurnDecisionContext {
         }
     }
 
-    pub(crate) const fn terminal_outcome_action(&self) -> Option<crate::causal_tree::branch::CausalActionKind> {
+    pub(crate) fn terminal_outcome_action(&self) -> Option<crate::causal_tree::branch::CausalActionKind> {
         use crate::causal_tree::branch::CausalActionKind;
         match &self.directive {
             TurnExecutionDirective::AnswerDirectly => Some(CausalActionKind::Answer),
-            TurnExecutionDirective::Execute { .. } => Some(CausalActionKind::UseTool),
+            TurnExecutionDirective::Execute { .. } => self
+                .execution_trace
+                .get()
+                .is_some_and(crate::tools::capability::execution_trace::ExecutionTrace::is_sealed)
+                .then_some(CausalActionKind::UseTool),
             TurnExecutionDirective::Delegate { .. } => Some(CausalActionKind::Delegate),
             TurnExecutionDirective::Clarify { .. } => Some(CausalActionKind::Clarify),
             TurnExecutionDirective::Refuse { .. } => Some(CausalActionKind::Refuse),
@@ -1161,10 +1175,11 @@ impl TurnDecisionContext {
             | TurnExecutionDirective::Refuse { .. } => Ok(TurnDisposition::Close {
                 reply: render_terminal_directive(&self.directive)?,
             }),
-            TurnExecutionDirective::AnswerDirectly
-            | TurnExecutionDirective::Execute { .. }
-            | TurnExecutionDirective::Delegate { .. }
-                if !self.execution_closed.load(Ordering::Acquire) =>
+            TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
+                Ok(TurnDisposition::Run)
+            }
+            TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
+                if !self.execution_closed.load(Ordering::Acquire) && Instant::now() < self.engine.deadline =>
             {
                 Ok(TurnDisposition::Run)
             }
@@ -2536,7 +2551,7 @@ impl TurnDecisionService {
                     },
                 )?;
                 let execution_refs = if matches!(directive, TurnExecutionDirective::AnswerDirectly) {
-                    direct_answer_refs(&decision, &catalog, &gates)
+                    direct_answer_refs(&decision, &catalog, &gates, &BTreeSet::new())
                 } else {
                     BTreeSet::new()
                 };
@@ -2721,7 +2736,7 @@ impl TurnDecisionService {
                 TurnExecutionDirective::Discover { .. } => {
                     let signals =
                         crate::decision::builtin::features::text_signals(decision.state.routing_input.as_str());
-                    let plain_turn_can_answer_after_empty_discovery = signals.has_text
+                    let plain_turn_can_answer_after_discovery = signals.has_text
                         && !signals.structural()
                         && decision.state.observed.retry_count() == 0
                         && decision.state.observed.artifacts().is_empty()
@@ -2764,7 +2779,7 @@ impl TurnDecisionService {
                     };
                     let previous_refs = discovered_refs.clone();
                     let added_refs = discovered_refs.extend_selected(selected_refs);
-                    if !added_refs && plain_turn_can_answer_after_empty_discovery {
+                    if plain_turn_can_answer_after_discovery {
                         allow_terminal_answer = true;
                     }
                     discovery_change = Some((previous_refs, added_refs));
@@ -2790,7 +2805,8 @@ impl TurnDecisionService {
                     state.built_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
                 }
                 TurnExecutionDirective::AnswerDirectly => {
-                    let execution_refs = direct_answer_refs(&decision, &catalog, &gates);
+                    let selected_discovery_refs = discovered_refs.iter().cloned().collect();
+                    let execution_refs = direct_answer_refs(&decision, &catalog, &gates, &selected_discovery_refs);
                     if cancellation.is_cancelled() {
                         if has_router_transition {
                             return terminal_after_catalog_drift(&state, prior_hops);

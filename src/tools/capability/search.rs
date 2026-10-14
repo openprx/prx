@@ -151,6 +151,7 @@ impl CatalogSearch {
         Some(found)
     }
 
+    #[cfg(test)]
     pub(crate) fn find<'a>(
         view: &CatalogView<'a>,
         query: &str,

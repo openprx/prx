@@ -87,8 +87,8 @@ pub(crate) struct EngineInputs<'a, 'catalog, P: PredictionPort> {
     /// Force a fresh terminal-only gate pass after hop exhaustion or no progress.
     pub terminal_only: bool,
     /// A successful selected read with new fresh evidence, or a safe plain
-    /// request whose discovery found no matching capability, may authorize
-    /// terminal Answer after a stopped hop. The service owns this fact.
+    /// request whose bounded discovery completed, may authorize terminal
+    /// Answer after a stopped hop. The service owns this fact.
     pub allow_terminal_answer: bool,
     /// Set once by the caller for the whole decision, including fallback.
     pub deadline: Instant,
@@ -461,30 +461,55 @@ impl EngineDecision {
             || !self.state.routing_input.supports_selected_read_query()
             || !(1..=64).contains(&limit)
             || families.is_empty()
-            || families.iter().any(|family| {
-                !matches!(
-                    family,
-                    CapabilityTarget::Skill
-                        | CapabilityTarget::Mcp
-                        | CapabilityTarget::NativeTool
-                        | CapabilityTarget::Wasm
-                        | CapabilityTarget::Hook
-                )
-            })
+            || families
+                .iter()
+                .any(|family| !super::candidate_generator::DiscoveryFamilies::supports(*family))
             || Instant::now() >= self.deadline
         {
             return Err(DiscoveryIssueError);
         }
-        let refs = CatalogSearch::find(catalog, &query, &families, limit)
+        let exact_refs = match &self.candidates {
+            CandidateSet::Legal {
+                candidates,
+                exact_mentions,
+                ..
+            } => candidates
+                .iter()
+                .filter(|candidate| {
+                    exact_mentions.contains(candidate.candidate_id())
+                        && candidate.action() == CausalActionKind::UseTool
+                        && families.contains(&candidate.target())
+                })
+                .flat_map(CausalCandidate::required_capabilities)
+                .filter(|reference| {
+                    catalog.entry_any(&reference.id).is_some_and(|entry| {
+                        matches!(entry.exposure, Exposure::Searchable)
+                            && !trusted.excludes_entry(catalog.model_admission_entry(entry))
+                    })
+                })
+                .take(limit)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            CandidateSet::NoLegalPath { .. } => BTreeSet::new(),
+        };
+        let refs = if exact_refs.is_empty() {
+            CatalogSearch::find_filtered(catalog, &query, &families, limit, |entry| {
+                !matches!(
+                    entry.public_name.as_str(),
+                    "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
+                ) && matches!(entry.exposure, Exposure::Searchable)
+                    && !trusted.excludes_entry(catalog.model_admission_entry(entry))
+            })
             .into_iter()
-            .filter(|hit| matches!(hit.entry.exposure, Exposure::Searchable))
-            .filter(|hit| !trusted.excludes_entry(catalog.model_admission_entry(hit.entry)))
             .map(|hit| CapabilityRef {
                 id: hit.entry.id.clone(),
                 fingerprint: hit.entry.fingerprint,
                 generation: hit.entry.generation,
             })
-            .collect();
+            .collect()
+        } else {
+            exact_refs
+        };
         if Instant::now() >= self.deadline {
             return Err(DiscoveryIssueError);
         }

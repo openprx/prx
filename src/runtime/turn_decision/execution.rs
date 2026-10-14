@@ -893,7 +893,7 @@ impl TurnDecisionService {
                         && selected_references.is_empty(),
                     "answer directive differs from its selected candidate"
                 );
-                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates);
+                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates, &context.execution_refs);
                 anyhow::ensure!(
                     direct == context.execution_refs,
                     "answer direct surface changed after admission"

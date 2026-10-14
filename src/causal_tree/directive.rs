@@ -138,7 +138,12 @@ pub(crate) fn directive_from_selection(
             Ok(TurnExecutionDirective::CollectApprovalArguments(proof.clone()))
         }
         Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => {
-            let CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+            let CandidateSet::Legal {
+                candidates,
+                discoverable_families,
+                ..
+            } = &decision.candidates
+            else {
                 return Err(DirectiveError::NotAdmitted);
             };
             let candidate = candidates
@@ -157,7 +162,13 @@ pub(crate) fn directive_from_selection(
                     },
                 }),
                 CausalActionKind::Discover => Ok(TurnExecutionDirective::Discover {
-                    families: vec![candidate.target()],
+                    // The builtin's language-neutral candidate searches all
+                    // eligible families. A concrete selected family remains
+                    // valid for exact recovery and issuer revalidation.
+                    families: match discoverable_families.iter().collect::<Vec<_>>() {
+                        families if !families.is_empty() => families,
+                        _ => vec![candidate.target()],
+                    },
                     query: decision.state.routing_input.as_str().to_string(),
                     limit: match context.discovery_limit {
                         1..=64 => context.discovery_limit,

@@ -201,6 +201,7 @@ impl CausalSelector {
         let CandidateSet::Legal {
             candidates,
             exact_mentions,
+            discoverable_families,
             approval_scopes,
             ..
         } = admitted
@@ -339,22 +340,22 @@ impl CausalSelector {
             .iter()
             .find(|(candidate, _, _)| {
                 candidate.action() == CausalActionKind::Discover
-                    && candidate.target() == top.target()
-                    && matches!(
-                        top.target(),
-                        CapabilityTarget::Skill
-                            | CapabilityTarget::Mcp
-                            | CapabilityTarget::NativeTool
-                            | CapabilityTarget::Wasm
-                            | CapabilityTarget::Hook
-                    )
+                    && (discoverable_families.iter().next().is_some()
+                        || candidate.target() == top.target()
+                            && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(top.target()))
             })
             .map(|(candidate, _, _)| *candidate);
         let evidence_discover = if exact_selected_tool { target_discover } else { discover };
         if insufficient && !exact_current_tool && retrieve.is_none() && evidence_discover.is_none() {
             return terminal_abstain(candidates, pre_commit, context, "insufficient_evidence");
         }
-        let recovery = if insufficient && !exact_current_tool {
+        let recovery = if top.action() == CausalActionKind::Discover && discoverable_families.iter().next().is_some() {
+            // A family-neutral catalog lookup is the bounded recovery step,
+            // not a business action. Once it is the model's top legal action,
+            // run the local search without using the business-action commit
+            // margin to force a non-interactive refusal.
+            Some(top)
+        } else if insufficient && !exact_current_tool {
             evidence_discover
         } else if target_missing {
             target_discover

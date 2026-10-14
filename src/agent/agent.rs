@@ -3006,6 +3006,21 @@ mod tests {
                 cache_read: 1.0,
             },
         );
+        runtime_config
+            .providers
+            .models
+            .push(crate::config::schema::ProviderModelConfig {
+                provider: "ollama".to_owned(),
+                model: Some("prx-local-model".to_owned()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
 
         let mut agent = Agent::builder()
             .runtime_config(runtime_config, "ollama")
@@ -3033,7 +3048,7 @@ mod tests {
             .expect("test: agent builder should succeed with valid config");
 
         let response = agent
-            .turn("use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
+            .turn("use skill_probe to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
             .await
             .unwrap();
 
