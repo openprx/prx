@@ -27,7 +27,7 @@ pub(super) struct RuntimeCostModel<'a> {
     pricing: &'a CostConfig,
     observed_latency_ms: &'a BTreeMap<String, u32>,
     prices_valid: bool,
-    local_transport: bool,
+    zero_price_exempt: bool,
 }
 
 impl<'a> RuntimeCostModel<'a> {
@@ -36,19 +36,12 @@ impl<'a> RuntimeCostModel<'a> {
         config: &'a Config,
         observed_latency_ms: &'a BTreeMap<String, u32>,
     ) -> Self {
-        let configured_root = config
-            .default_provider
-            .as_deref()
-            .unwrap_or(crate::providers::DEFAULT_PROVIDER_FOR_UNSET);
-        let root_endpoint = (crate::providers::ProviderId::of(configured_root) == *model.provider())
-            .then(|| config.api_url.as_deref())
-            .flatten();
         Self {
             model,
             pricing: &config.cost,
             observed_latency_ms,
             prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
-            local_transport: model.provider().is_local_runtime_at(root_endpoint),
+            zero_price_exempt: zero_price_exempt(model),
         }
     }
 }
@@ -60,7 +53,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
             self.pricing,
             entry.schema_bytes,
             self.prices_valid,
-            self.local_transport,
+            self.zero_price_exempt,
         )?;
         let latency = self
             .observed_latency_ms
@@ -71,7 +64,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
     }
 
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)> {
-        let cost = estimate_cost_with_validity(self.model, self.pricing, 0, self.prices_valid, self.local_transport)?;
+        let cost = estimate_cost_with_validity(self.model, self.pricing, 0, self.prices_valid, self.zero_price_exempt)?;
         Some((cost, default_latency_ms(CapabilityTarget::None)))
     }
 }
@@ -132,13 +125,11 @@ pub(super) fn build_cost_model(
 #[cfg(test)]
 fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usize) -> Option<CostEstimate> {
     let prices_valid = pricing.prices.values().all(|price| price.is_finite_nonnegative());
-    estimate_cost_with_validity(
-        model,
-        pricing,
-        schema_bytes,
-        prices_valid,
-        model.provider().is_local_runtime(),
-    )
+    estimate_cost_with_validity(model, pricing, schema_bytes, prices_valid, zero_price_exempt(model))
+}
+
+fn zero_price_exempt(model: &ResolvedModel) -> bool {
+    model.provider().catalog_name() == Some("ollama") || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
 }
 
 fn estimate_cost_with_validity(
@@ -146,7 +137,7 @@ fn estimate_cost_with_validity(
     pricing: &CostConfig,
     schema_bytes: usize,
     prices_valid: bool,
-    local_transport: bool,
+    zero_price_exempt: bool,
 ) -> Option<CostEstimate> {
     // Even a local model cannot turn a configured but invalid tariff into a
     // zero-cost fallback. Normal config loading rejects these values; this
@@ -169,7 +160,7 @@ fn estimate_cost_with_validity(
     );
     let usd = match price {
         crate::llm::route_decision::UsagePrice::Priced(cost) => cost,
-        crate::llm::route_decision::UsagePrice::Missing if local_transport => 0.0,
+        crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => 0.0,
         crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid => {
             return None;
         }

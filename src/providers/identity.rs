@@ -184,6 +184,7 @@ impl ProviderId {
     /// host. Local catalog adapters carry that fact in the compiled provider
     /// table; a bring-your-own endpoint is local only when its normalized URL
     /// has a loopback host.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_local_runtime(&self) -> bool {
         if let Some(name) = self.catalog_name() {
@@ -197,6 +198,7 @@ impl ProviderId {
 
     /// Apply a root connection override after the caller has verified that
     /// this identity owns that configured endpoint.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_local_runtime_at(&self, root_endpoint: Option<&str>) -> bool {
         self.is_local_runtime() || root_endpoint.is_some_and(endpoint_is_loopback)
@@ -209,6 +211,7 @@ impl ProviderId {
     }
 }
 
+#[cfg(test)]
 fn endpoint_is_loopback(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
