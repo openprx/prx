@@ -2295,6 +2295,7 @@ impl FakeDaemon {
             while !server_stop.load(std::sync::atomic::Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking fake daemon connection");
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .expect("daemon read timeout");
