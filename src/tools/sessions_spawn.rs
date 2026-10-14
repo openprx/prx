@@ -10546,6 +10546,15 @@ mod tests {
         tool: &SessionsSpawnTool,
         arguments: serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
+        fn fixture_price() -> crate::config::schema::ModelPricing {
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            }
+        }
+
         static WORKSPACES: std::sync::OnceLock<parking_lot::Mutex<Vec<tempfile::TempDir>>> = std::sync::OnceLock::new();
         let trusted_scope = arguments
             .get("_zc_scope_trusted")
@@ -10634,6 +10643,11 @@ mod tests {
                     "native_tools": true
                 }))?);
             }
+            config
+                .cost
+                .prices
+                .entry(format!("{}/{}", route.provider, route.model))
+                .or_insert_with(fixture_price);
         }
         for agent in config.agents.values() {
             if !config
@@ -10649,27 +10663,22 @@ mod tests {
                     "native_tools": true
                 }))?);
             }
+            config
+                .cost
+                .prices
+                .entry(format!("{}/{}", agent.provider, agent.model))
+                .or_insert_with(fixture_price);
         }
         config
             .cost
             .prices
             .entry(format!("{}/{}", tool.provider_name, tool.model))
-            .or_insert(crate::config::schema::ModelPricing {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 1.0,
-                cache_read: 1.0,
-            });
+            .or_insert_with(fixture_price);
         config
             .cost
             .prices
             .entry("ollama/prx-local-model".to_owned())
-            .or_insert(crate::config::schema::ModelPricing {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 1.0,
-                cache_read: 1.0,
-            });
+            .or_insert_with(fixture_price);
         let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
         let provider = Arc::clone(&tool.provider);
         let provider_name = tool.provider_name.clone();
@@ -17673,6 +17682,15 @@ mod tests {
             api_key: Some("PRX-HINT-ROUTE-WIRE".to_string()),
             credential_ref: None,
         });
+        config.cost.prices.insert(
+            format!("{root_provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         let catalog = providers::selection::catalog_for(&config);
         let selected = providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
             .expect("test: default hint resolves");
@@ -17686,7 +17704,8 @@ mod tests {
         let mut tool = containment_tool(&temp, HashMap::new(), &root_provider, Some("PRX-HINT-ROOT-WIRE"))
             .with_hint_config(&config)
             .with_model_catalog(catalog)
-            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
+            .with_cost_config(config.cost.clone());
         tool.model = "hint:fast".to_string();
         tool.provider = Arc::from(routed_provider);
 
