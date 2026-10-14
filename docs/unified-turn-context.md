@@ -4,6 +4,11 @@ PRX compiles one immutable capability snapshot for every model request. That
 snapshot is the authority for what the model sees and what the runtime may
 execute during that iteration.
 
+The former monolithic Agent loop has been removed. Maintainers and internal
+Rust callers should use the current owners and typed entry described in the
+[Agent turn engine source migration](agent-turn-engine-migration.md); that note
+also records the current repository-wide large-file inventory.
+
 ## Contract
 
 The turn pipeline runs in this order:

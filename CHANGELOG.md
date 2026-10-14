@@ -15,6 +15,14 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- The former internal `agent::loop_` module and its positional turn helpers are
+  removed. Internal entrypoints now admit their source through their owning
+  adapter and invoke the typed `agent::turn_engine::run_turn` API with
+  `TurnRequest`, `TurnServices`, and `TurnDelivery`. There is no old-path
+  compatibility facade. This is a Rust source-layout break only; it requires no
+  stored-data or configuration migration. See the
+  [source migration and module ownership notes](docs/agent-turn-engine-migration.md).
+
 - `[causal_tree]` has a new schema (the decision plane). A configuration
   written by an earlier release is mapped on load and written in the new form
   on the next save, with `schema_version = 1`. Keys left at their old default
