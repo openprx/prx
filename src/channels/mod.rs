@@ -13543,7 +13543,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
+    async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal_config() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -13551,11 +13551,19 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let mut runtime_config = Config::default();
+        assert_eq!(
+            runtime_config.causal_tree,
+            crate::causal_tree::CausalTreeConfig::default()
+        );
+        runtime_config.default_provider = Some("test-provider".to_string());
+        runtime_config.default_model = Some("test-model".to_string());
+        let config_manager = crate::config::new_shared(runtime_config);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config: Arc::clone(&config_manager),
+            config_generation: config_manager.pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
