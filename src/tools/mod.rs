@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn static_public_tool_inventory_is_complete_unique_and_documented() {
-        assert_eq!(STATIC_PUBLIC_TOOL_NAMES.len(), 54);
+        assert_eq!(STATIC_PUBLIC_TOOL_NAMES.len(), 55);
         let unique = STATIC_PUBLIC_TOOL_NAMES.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), STATIC_PUBLIC_TOOL_NAMES.len());
 
@@ -1331,15 +1331,36 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
         let mut root = test_config(&tmp);
+        std::fs::create_dir_all(&root.workspace_dir).expect("test: create delegate workspace");
+        root.causal_tree.enabled = false;
+        root.autonomy.level = crate::security::AutonomyLevel::Full;
         root.default_provider = Some("litellm".to_string());
         root.api_key = Some(ROOT_SENTINEL.to_string());
         root.api_url = Some(probe.base_url());
         root.auth.codex_auth_json_path = tmp.path().join("no-codex-auth.json");
+        root.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": "litellm",
+                "model": PROBE_MODEL,
+                "operations": ["chat"],
+                "native_tools": false
+            }))
+            .expect("test: child model metadata"),
+        );
+        root.cost.prices.insert(
+            format!("litellm/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         let agents = HashMap::from([(
             "a".to_string(),
             DelegateAgentConfig {
@@ -1357,11 +1378,12 @@ mod tests {
                 spawn_enabled: None,
             },
         )]);
+        root.agents = agents.clone();
 
         let tools = all_tools(
             Arc::new(root.clone()),
             &security,
-            mem,
+            Arc::clone(&mem),
             None,
             None,
             &BrowserConfig::default(),
@@ -1371,18 +1393,53 @@ mod tests {
             Some(ROOT_SENTINEL),
             &root,
         );
-        let delegate = tools
-            .iter()
-            .find(|tool| tool.name() == "delegate")
-            .expect("test: the delegate is registered");
-        let result = delegate
-            .execute(serde_json::json!({"agent": "a", "prompt": "hi"}))
+        let registry = crate::agent::test_admission::registry_with_search(tools);
+        let message = crate::channels::traits::ChannelMessage {
+            id: "prx-tools-delegate-parent".to_owned(),
+            sender: "prx_user".to_owned(),
+            reply_target: "prx_channel".to_owned(),
+            content: "delegate hi".to_owned(),
+            channel: "tools-test".to_owned(),
+            timestamp: 0,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            thread_ts: None,
+            mentioned_uuids: Vec::new(),
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        };
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("test: delegate cleanup owner");
+        let result = cleanup
+            .scope_admission(async {
+                let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                    root,
+                    message,
+                    registry,
+                    mem,
+                    ("ollama", "prx-local-model"),
+                )
+                .await;
+                admitted
+                    .execute_tool("delegate", serde_json::json!({"agent": "a", "prompt": "hi"}))
+                    .await
+            })
             .await
             .expect("test: delegate returns a tool result");
 
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(probe.requests().len(), 1, "the child reached the root api_url");
+        assert_eq!(
+            probe.requests().len(),
+            1,
+            "the child reached the root api_url: {result:?}"
+        );
         assert!(probe.saw(ROOT_SENTINEL), "with the root key");
+        cleanup
+            .run(async { Ok(()) })
+            .await
+            .expect("test: delegate cleanup is confirmed");
     }
 
     #[test]
