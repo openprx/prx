@@ -678,14 +678,13 @@ impl CausalDecisionEngine {
                 ObservedArtifactKind::Memory | ObservedArtifactKind::Document | ObservedArtifactKind::Session
             ) && artifact.age_ms <= crate::decision::builtin::weights::STALE_ARTIFACT_MS
         });
-        let exhausted_discovery_without_match = inputs.discovered_refs.iter().next().is_none()
-            && state
-                .observed
-                .completed_steps()
-                .iter()
-                .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok);
+        let exhausted_discovery = state
+            .observed
+            .completed_steps()
+            .iter()
+            .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok);
         let selection = if inputs.allow_terminal_answer
-            && (has_retrieved_evidence || exhausted_discovery_without_match)
+            && (has_retrieved_evidence || exhausted_discovery)
             && Instant::now() < inputs.deadline
         {
             passed(CausalActionKind::Answer).map(|answer| Selection::Commit {

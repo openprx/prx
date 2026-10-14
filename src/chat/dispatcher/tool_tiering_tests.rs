@@ -252,6 +252,10 @@ async fn offered_tools_for(
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
     config.causal_tree.enabled = false;
+    // Publication is the subject of these fixtures. Leave room for decision
+    // work plus the unchanged 500 ms Web family estimate so G6 measures a
+    // genuine admitted capability instead of closing on fixture latency.
+    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
     config.tool_tiering = tiering;
     let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
         provider.clone(),
@@ -263,6 +267,22 @@ async fn offered_tools_for(
         cancellation.clone(),
     )
     .await;
+    let routing = admitted.binding.decision_routing().expect("tiering routing");
+    let audit = routing
+        .context
+        .audit_hops()
+        .map(|hop| {
+            format!(
+                "candidates={:?} selection={:?} prediction={:?} trace={:?} scores={:?} gates={:?}",
+                hop.candidates, hop.selection, hop.prediction, hop.audit_trace, hop.scores, hop.pre_commit.outcomes
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        admitted.binding.fixed_reply().expect("tiering decision").is_none(),
+        "tiering fixture closed before provider execution: {:?}; {audit:?}",
+        routing.context.directive()
+    );
     let history = vec![
         ChatMessage::system("tiering system"),
         ChatMessage::user(history_user_message),
@@ -577,10 +597,10 @@ async fn chat_driver_publishes_selected_capability_instead_of_registry_tiers() {
     )
     .await;
     assert_eq!(offers.len(), 1);
-    assert!(contains(
-        offers.first().expect("test: expected provider offer"),
-        WEB_TOOL
-    ));
+    assert!(
+        contains(offers.first().expect("test: expected provider offer"), WEB_TOOL),
+        "selected web publication missing: {offers:?}"
+    );
     assert!(contains(
         offers.first().expect("test: expected provider offer"),
         "capability_search"
@@ -688,7 +708,7 @@ async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
     .await;
     assert!(
         contains(control.first().expect("test: expected provider offer"), WEB_TOOL),
-        "positive control must reach the injected capability when explicitly requested"
+        "positive control must reach the injected capability when explicitly requested: {control:?}"
     );
 }
 
