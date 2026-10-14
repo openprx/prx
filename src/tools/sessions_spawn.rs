@@ -60,6 +60,18 @@ const PROCESS_MEMORY_STRATEGY_HYBRID: &str = "hybrid";
 const DEFAULT_HISTORY_LAST_N: usize = 20;
 const DEFAULT_HISTORY_ENTRY_MAX_CHARS: usize = 800;
 
+// Keep the large spawn state machine off the execution service's poll frame.
+// Construct it inside this synchronous boundary and erase its concrete type.
+#[inline(never)]
+fn boxed_spawn_field<'a, F>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>>
+where
+    F: std::future::Future + Send + 'a,
+{
+    Box::pin(make())
+}
+
 /// Status of a spawned sub-agent run.
 #[derive(Debug, Clone)]
 pub enum SubAgentStatus {
@@ -3761,11 +3773,9 @@ impl SessionsSpawnTool {
         // returns, and a caller that asked for a fan-out should not pay for
         // those serially. All of these futures are polled on *this* task, which
         // is what keeps `child_beat`'s task-local parent link intact.
-        let outcomes = futures_util::future::join_all(
-            member_args
-                .iter()
-                .map(|(run_id, member)| self.execute_spawn_with_id(member, Some(&batch_id), Some(run_id))),
-        )
+        let outcomes = futures_util::future::join_all(member_args.iter().map(|(run_id, member)| {
+            boxed_spawn_field(|| self.execute_spawn_with_id(member, Some(&batch_id), Some(run_id)))
+        }))
         .await;
 
         let mut dispatched = Vec::with_capacity(outcomes.len());
@@ -4179,7 +4189,7 @@ impl SessionsSpawnTool {
     /// `batch_id` stamps the run's registry row so `join`, `sessions_list`, and
     /// the control plane can address the whole fan-out as one unit.
     async fn execute_spawn(&self, args: &serde_json::Value, batch_id: Option<&str>) -> anyhow::Result<SpawnOutcome> {
-        self.execute_spawn_with_id(args, batch_id, None).await
+        boxed_spawn_field(|| self.execute_spawn_with_id(args, batch_id, None)).await
     }
 
     async fn execute_spawn_with_id(

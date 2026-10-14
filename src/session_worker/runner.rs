@@ -3562,13 +3562,8 @@ mod tests {
         );
     }
 
-    /// R-C0 F-5: a worker's `sessions_spawn` accepts every provider the
-    /// operator configured, here a keyless fallback provider, like every other
-    /// surface; it previously refused anything but its own and its agents'.
-    #[tokio::test]
-    async fn a_worker_spawn_accepts_an_operator_configured_fallback_provider() {
+    async fn admitted_worker_fallback_spawn() {
         use crate::providers::credential_probe::CredentialProbe;
-        use crate::tools::Tool as _;
         let temp = tempfile::tempdir().expect("test: temp dir");
         let own = CredentialProbe::start().await;
         let fallback = CredentialProbe::start().await;
@@ -3578,6 +3573,34 @@ mod tests {
         manifest.provider_name = own.custom_provider();
         manifest.api_key = None;
         manifest.workspace_dir = temp.path().to_path_buf();
+        config.causal_tree.enabled = false;
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": manifest.provider_name,
+                "model": manifest.model,
+                "operations": ["chat"],
+                "native_tools": true
+            }))
+            .expect("test: worker model metadata"),
+        );
+        config.cost.prices.insert(
+            format!("{}/{}", manifest.provider_name, manifest.model),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config.cost.prices.insert(
+            format!("{}/{}", fallback.custom_provider(), manifest.model),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         let options = crate::providers::provider_runtime_options_from_config(&config);
         let credentials = worker_credentials(&manifest, &config);
         let provider: Arc<dyn Provider> = Arc::from(
@@ -3587,42 +3610,101 @@ mod tests {
             workspace_dir: temp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
+        let memory: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: worker spawn memory"));
+        let source_fabric = MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy().into_owned())
+            .with_event_recording(config.memory.event_recording_config());
+        let active_runs = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let tool = worker_spawn_tool(
             &manifest,
             &config,
             &credentials,
-            provider,
+            Arc::clone(&provider),
             security,
             &options,
-            Arc::new(tokio::sync::RwLock::new(Vec::new())),
-        );
+            Arc::clone(&active_runs),
+        )
+        .with_shared_memory(Arc::clone(&memory))
+        .with_source_fabric(source_fabric);
+        let tools_handle = tool.tools_handle();
+        let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(tool)]);
+        assert!(tools_handle.set(&registry), "test: worker tool registry is set once");
+        let mut admission_config = config.clone();
+        admission_config.default_provider = Some(manifest.provider_name.clone());
+        admission_config.default_model = Some(manifest.model.clone());
         let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
             "sessions_spawn",
             "sessions_spawn:spawn",
             "test",
             None,
         );
-
-        let result = tool
-            .execute(serde_json::json!({
-                "task": "probe",
-                "provider": fallback.custom_provider(),
-                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(grant)
-                    .expect("test: grant serializes"),
-            }))
+        let message = ChannelMessage {
+            id: "prx-worker-spawn-parent".to_owned(),
+            sender: "prx_user".to_owned(),
+            reply_target: "prx_worker".to_owned(),
+            content: "sessions_spawn admitted worker fixture".to_owned(),
+            channel: "session-worker".to_owned(),
+            timestamp: 0,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            thread_ts: None,
+            mentioned_uuids: Vec::new(),
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        };
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+            .expect("test: worker spawn cleanup owner");
+        let result = cleanup
+            .scope_admission(async {
+                let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                    admission_config,
+                    message,
+                    registry,
+                    memory,
+                    (&manifest.provider_name, &manifest.model),
+                )
+                .await;
+                crate::runtime::child_source::scope_ordinary_provider_fixture(
+                    provider,
+                    manifest.provider_name.clone(),
+                    manifest.model.clone(),
+                    admitted.execute_tool(
+                        "sessions_spawn",
+                        serde_json::json!({
+                            "task": "probe",
+                            "provider": fallback.custom_provider(),
+                            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(grant)
+                                .expect("test: grant serializes"),
+                        }),
+                    ),
+                )
+                .await
+            })
             .await
-            .expect("test: spawn returns a tool result");
+            .expect("test: admitted spawn returns a tool result");
 
         assert!(
             result.success,
             "an operator-configured provider is spawnable: {:?}",
             result.error
         );
-        assert_eq!(
-            fallback.wait_for_requests(1, std::time::Duration::from_secs(10)).await,
-            1
-        );
+        let request_count = fallback.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
+        assert_eq!(request_count, 1, "spawned worker state: {:?}", active_runs.read().await);
         assert!(!fallback.saw(WORKER_ROOT_SENTINEL) && !fallback.saw(WORKER_ROTATION_SENTINEL));
+        cleanup
+            .run(async { Ok(()) })
+            .await
+            .expect("test: worker spawn cleanup is confirmed");
+    }
+
+    /// R-C0 F-5: a worker's `sessions_spawn` accepts every provider the
+    /// operator configured, here a keyless fallback provider, like every other
+    /// surface; it previously refused anything but its own and its agents'.
+    #[tokio::test]
+    async fn a_worker_spawn_accepts_an_operator_configured_fallback_provider() {
+        boxed_worker_segments(admitted_worker_fallback_spawn).await;
     }
 
     /// PMM-C: a worker whose manifest names a model that cannot chat builds
