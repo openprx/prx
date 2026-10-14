@@ -144,6 +144,38 @@ pub fn neutralize_media_markers(content: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Keep live image attachments visible to routing without putting their
+/// path, URL, or base64 payload into the decision request. The original turn
+/// remains authoritative for provider preparation and validation; this is
+/// only the bounded semantic projection used to choose the turn path.
+pub fn project_image_markers_for_routing(content: &str) -> Cow<'_, str> {
+    let mut search_from = 0usize;
+    let mut copied_through = 0usize;
+    let mut projected = None::<String>;
+
+    while let Some(span) = find_media_marker(content, search_from) {
+        search_from = span.end;
+        let kind = content.get(span.kind_start..span.kind_end).unwrap_or_default();
+        let payload = content
+            .get(span.payload_start..span.payload_end)
+            .unwrap_or_default()
+            .trim();
+        if kind != "IMAGE" || payload.is_empty() || is_placeholder_reference(payload) {
+            continue;
+        }
+
+        let output = projected.get_or_insert_with(|| String::with_capacity(content.len().min(4096)));
+        output.push_str(content.get(copied_through..span.start).unwrap_or_default());
+        output.push_str("(IMAGE attachment)");
+        copied_through = span.end;
+    }
+
+    projected.map_or(Cow::Borrowed(content), |mut output| {
+        output.push_str(content.get(copied_through..).unwrap_or_default());
+        Cow::Owned(output)
+    })
+}
+
 /// Truncate to `max_chars` characters without ever emitting half a marker.
 ///
 /// Compacted channel history is replayed to the provider verbatim, so a plain
@@ -707,6 +739,22 @@ mod tests {
     fn neutralize_media_markers_leaves_unterminated_prefix_alone() {
         let content = "truncated tail [IMAGE:/tmp/half";
         assert_eq!(neutralize_media_markers(content), content);
+    }
+
+    #[test]
+    fn routing_projection_bounds_live_image_payload_without_changing_other_media() {
+        let content = format!(
+            "Analyze [IMAGE:data:image/png;base64,{}] and keep [DOCUMENT:/tmp/report.pdf]",
+            "A".repeat(1024 * 1024)
+        );
+
+        let projected = project_image_markers_for_routing(&content);
+
+        assert_eq!(
+            projected,
+            "Analyze (IMAGE attachment) and keep [DOCUMENT:/tmp/report.pdf]"
+        );
+        assert!(projected.len() < 100, "routing projection must not retain image bytes");
     }
 
     #[test]

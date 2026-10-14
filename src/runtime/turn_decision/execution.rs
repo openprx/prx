@@ -770,7 +770,8 @@ impl TurnDecisionService {
             exclusions.model_admission.as_deref(),
         )?;
         anyhow::ensure!(
-            context.engine.state.routing_input.as_str() == proof.routing_input(),
+            context.engine.state.routing_input.as_str()
+                == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref(),
             "decision input changed"
         );
         anyhow::ensure!(
@@ -835,7 +836,8 @@ impl TurnDecisionService {
             exclusions.model_admission.as_deref(),
         )?;
         anyhow::ensure!(
-            context.engine.state.routing_input.as_str() == proof.routing_input(),
+            context.engine.state.routing_input.as_str()
+                == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref(),
             "decision input changed"
         );
         anyhow::ensure!(

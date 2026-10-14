@@ -1735,6 +1735,28 @@ impl Tool for ChildSurfaceProbe {
                 child.routing().context.ordinary_fixture_prediction_verified(),
                 "actual child Mock prediction required"
             );
+            let child_routing = child.routing();
+            let child_selection = child_routing
+                .service
+                .agent_execution_specs(child_routing.proof, child_routing.context)
+                .unwrap_or_else(|error| {
+                    let hops = child_routing
+                        .context
+                        .audit_hops()
+                        .map(|hop| {
+                            format!(
+                                "selection={:?} candidates={:?} prediction={:?} pre_commit={:?}",
+                                hop.selection, hop.candidates, hop.prediction, hop.pre_commit
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    panic!("actual child tool selection required: {error:#}; {hops:?}")
+                });
+            assert!(
+                child_selection.specs.iter().any(|spec| spec.name == input),
+                "child must select its requested allowed capability: {:?}",
+                child_selection.specs
+            );
             let registry = self
                 .registry
                 .get()
@@ -1758,7 +1780,7 @@ impl Tool for ChildSurfaceProbe {
                         low_priority_tool_names: Vec::new(),
                     },
                     compaction: None,
-                    decision: child.routing(),
+                    decision: child_routing,
                 },
                 crate::agent::turn_request::TurnServices {
                     provider: provider.as_ref(),
@@ -1831,9 +1853,12 @@ async fn published_child_tools(tiering: crate::config::ToolTieringConfig, input:
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_owned();
     config.causal_tree.enabled = false;
+    config.default_provider = Some("ollama".to_owned());
     config.api_url = Some(endpoint);
     config.tool_tiering = tiering;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.agent.compaction.max_context_tokens_explicit = true;
+    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
         crate::config::schema::ModelPricing {
@@ -1960,9 +1985,11 @@ async fn published_child_tools(tiering: crate::config::ToolTieringConfig, input:
                     server_joined = true;
                     result.expect("bounded local fixture").expect("parent turn");
                     assert!(
-                        history
-                            .iter()
-                            .any(|message| message.role == "tool" && message.content.contains("child completed")),
+                        history.iter().any(|message| {
+                            message.role == "user"
+                                && message.content.starts_with("[Tool results]")
+                                && message.content.contains("child completed")
+                        }),
                         "the child must finish through its actual dispatch and terminal path: {history:?}"
                     );
                     let captured = captured.lock().unwrap();

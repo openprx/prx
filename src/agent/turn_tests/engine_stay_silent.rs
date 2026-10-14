@@ -1525,12 +1525,12 @@ async fn a_marker_inside_a_long_fence_block_is_neither_retried_nor_edited() {
 async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {
     let provider = ScriptedProvider::from_text_responses(vec![response]);
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("some group chatter")];
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("banter")];
     let tmp = TempDir::new().unwrap();
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
         tmp.path(),
-        "some group chatter",
+        "banter",
         Arc::clone(&tools_registry),
     )
     .await;

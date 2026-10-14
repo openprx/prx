@@ -987,7 +987,11 @@ async fn run_tool_call_loop_aggregates_intermediate_turn_fallback() {
         Arc::clone(&tools_registry),
     )
     .await;
-    let expected_specs = tools_registry.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
+    let expected_specs = tools_registry
+        .iter()
+        .filter(|tool| tool.name() != "capability_search")
+        .map(|tool| tool.spec())
+        .collect::<Vec<_>>();
     admission.assert_selected_specs(&expected_specs);
     let (text, trace) = run_turn(
         &mut history,
@@ -1261,10 +1265,10 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
     crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("wide_schema_probe"))];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("file_read"))];
         let mut history = vec![
             ChatMessage::system("compact system instructions"),
-            ChatMessage::user("Use wide_schema_probe."),
+            ChatMessage::user("Use file_read."),
         ];
 
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
@@ -1277,7 +1281,11 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             Arc::clone(&memory),
         )
         .await;
-        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name != "capability_search")
+            .collect::<Vec<_>>();
+        admission.assert_core_specs(&expected_specs);
         let runtime = admission.memory_runtime();
 
         let result = run_turn(
@@ -1330,8 +1338,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
         let raw = event.raw_payload_json.as_deref().expect("request context payload");
         let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
 
-        // The admitted business tool and the search control both enter the request.
-        assert_eq!(payload["tool_snapshot"]["count"], 2);
+        // The exact business tool is the only discoverable family, so the
+        // request contains its schema without a redundant search control.
+        assert_eq!(payload["tool_snapshot"]["count"], 1);
         assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
 
         let estimate = &payload["request_estimate"];
@@ -1968,76 +1977,82 @@ async fn the_vision_refusal_names_the_provider_without_url_userinfo() {
 
 #[tokio::test]
 async fn run_tool_call_loop_rejects_oversized_image_payload() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let provider = VisionProvider {
-        calls: Arc::clone(&calls),
-        expected_user_text: None,
-    };
+    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+            expected_user_text: None,
+        };
 
-    let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
-    let mut history = vec![ChatMessage::user(format!(
-        "[IMAGE:data:image/png;base64,{oversized_payload}]"
-    ))];
+        let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
+        let mut history = vec![ChatMessage::user(format!(
+            "Analyze this [IMAGE:data:image/png;base64,{oversized_payload}]"
+        ))];
 
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-    let observer = NoopObserver;
-    let multimodal = crate::config::MultimodalConfig {
-        max_images: 4,
-        max_image_size_mb: 1,
-        allow_remote_fetch: false,
-    };
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let multimodal = crate::config::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 1,
+            allow_remote_fetch: false,
+        };
 
-    let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
-        &history.last().expect("source input").content,
-    )
-    .await;
-    let err = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            // no document ingest
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &multimodal,
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let workspace = TempDir::new().expect("multimodal fixture workspace");
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
+            workspace.path(),
+            &history.last().expect("source input").content,
+        )
+        .await;
+        let err = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                // no document ingest
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &multimodal,
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(tools_registry),
-            observer: &observer,
-            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            // no tool tiering
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            // no scope context
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect_err("oversized payload must fail");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(tools_registry),
+                observer: &observer,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                // no tool tiering
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                // no scope context
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect_err("oversized payload must fail");
 
-    assert!(err.to_string().contains("multimodal image size limit exceeded"));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            err.to_string().contains("multimodal image size limit exceeded"),
+            "unexpected oversized image refusal: {err:#}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2745,7 +2760,7 @@ mod outbound_middleware_lifecycle {
                 "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>",
             ]);
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::StaySilentTool::new())];
-            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("some group chatter")];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("banter")];
             let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
             let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
                 temp.path(),
@@ -3026,7 +3041,11 @@ async fn tool_arguments_are_validated_in_the_serving_models_dialect() {
         (PER_MODEL_LABEL, GEMINI_SERVED_MODEL),
     )
     .await;
-    admission.assert_core_specs(&tool_specs_of(&tools_registry));
+    let expected_specs = tool_specs_of(&tools_registry)
+        .into_iter()
+        .filter(|spec| spec.name != "capability_search")
+        .collect::<Vec<_>>();
+    admission.assert_core_specs(&expected_specs);
 
     run_turn(
         &mut history,
@@ -3200,7 +3219,11 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
         (PRIMARY, MODEL),
     )
     .await;
-    admission.assert_core_specs(&tool_specs_of(&tools_registry));
+    let expected_specs = tool_specs_of(&tools_registry)
+        .into_iter()
+        .filter(|spec| spec.name != "capability_search")
+        .collect::<Vec<_>>();
+    admission.assert_core_specs(&expected_specs);
 
     let (_, trace) = run_turn(
         &mut history,

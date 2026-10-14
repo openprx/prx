@@ -742,7 +742,8 @@ impl TurnDecisionService {
                 && trusted.run_id.as_deref() == Some(proof.run_id())
                 && trusted.task_id.as_deref() == proof.task_id()
                 && trusted.source_event_id.as_deref() == proof.source_event_id()
-                && hop.state.routing_input.as_str() == proof.routing_input()
+                && hop.state.routing_input.as_str()
+                    == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref()
                 && trusted.catalog_generation == *self.catalog.generation()
                 && trusted.policy_version == self.policy_version
                 && context.hop_ids().last().copied() == Some(context.decision_id()),
@@ -1856,6 +1857,7 @@ impl TurnDecisionService {
             &exclusions.names,
             exclusions.model_admission.as_deref(),
         )?;
+        let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input());
         let refs = decision.issue_selected_discovery(
             catalog,
             &DirectiveContext {
@@ -1863,7 +1865,7 @@ impl TurnDecisionService {
                 approval_expires_at: chrono::Utc::now(),
                 discovery_limit: 1,
             },
-            proof.routing_input(),
+            projected_input.as_ref(),
         )?;
         self.check_live_parity()?;
         Ok(refs)
@@ -1894,6 +1896,7 @@ impl TurnDecisionService {
             &exclusions.names,
             exclusions.model_admission.as_deref(),
         )?;
+        let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input());
         let selected_family = decision.validate_selected_retrieval(
             &catalog,
             &DirectiveContext {
@@ -1901,7 +1904,7 @@ impl TurnDecisionService {
                 approval_expires_at: chrono::Utc::now(),
                 discovery_limit: 1,
             },
-            proof.routing_input(),
+            projected_input.as_ref(),
         )?;
         if Instant::now() >= decision.deadline {
             return Err(AgentRetrievalError::Deadline);
@@ -1922,7 +1925,7 @@ impl TurnDecisionService {
                         let loaded = crate::agent::memory_loader::load_selected_memory(
                             loader.as_ref(),
                             self.memory.as_ref(),
-                            proof.routing_input(),
+                            projected_input.as_ref(),
                             &scope,
                             proof.session_key(),
                             decision.deadline,
@@ -1938,7 +1941,7 @@ impl TurnDecisionService {
                         let hits = self
                             .memory
                             .retrieve_decision_memory(
-                                proof.routing_input(),
+                                projected_input.as_ref(),
                                 5,
                                 proof.memory_scope(),
                                 None,
@@ -1961,7 +1964,7 @@ impl TurnDecisionService {
                     if selected_family == crate::causal_tree::branch::CapabilityTarget::Document {
                         let hits = self
                             .memory
-                            .retrieve_decision_documents(proof.routing_input(), 5, &principal, decision.deadline)
+                            .retrieve_decision_documents(projected_input.as_ref(), 5, &principal, decision.deadline)
                             .await?;
                         Ok((document_artifacts_from_selected_read(&hits, chrono::Utc::now()), None))
                     } else {
@@ -2269,14 +2272,15 @@ impl TurnDecisionService {
             policy_version: Arc::clone(&self.policy_version),
             resolved_model: Arc::clone(&model_ref),
         });
+        let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
         let mut state = CausalState {
             trusted,
             observed: segment_observation::initial_observations(segment_observation, deadline, cancellation)?,
             predicted: None,
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),
-            routing_input: RawRoutingInput::new(proof.routing_input().to_string()),
-            goal: RawRoutingInput::new(proof.routing_input().to_string()),
+            routing_input: RawRoutingInput::new(projected_input.clone()),
+            goal: RawRoutingInput::new(projected_input),
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
@@ -2376,10 +2380,11 @@ impl TurnDecisionService {
         };
 
         let pinned_rehearsal = PinnedCatalogRehearsal { catalog: &catalog };
+        let rehearsal_query = state.routing_input.as_str().to_owned();
         let memory_rehearsal = matches!(self.memory.name(), "sqlite" | "lucid").then_some(ScopedMemoryRehearsal {
             memory: self.memory.as_ref(),
             scope: proof.memory_scope(),
-            query: proof.routing_input(),
+            query: &rehearsal_query,
             principal: proof.owner_id(),
             key: &self.state_key,
         });

@@ -326,10 +326,11 @@ impl TurnDecisionService {
         self.resolve_agent_model(proof)?;
         self.check_live_parity()?;
         let domain = continuation.router.history_domain(proof)?;
+        let routing_input = state.routing_input.as_str();
         let domain_sha256: [u8; 32] = hex::decode(domain.key()?)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("Router domain digest has invalid length"))?;
-        let query_sha256: [u8; 32] = Sha256::digest(proof.routing_input().as_bytes()).into();
+        let query_sha256: [u8; 32] = Sha256::digest(routing_input.as_bytes()).into();
         let binding = RouterHistoryReadBinding {
             domain_sha256,
             query_sha256,
@@ -477,7 +478,7 @@ impl TurnDecisionService {
                     cancellation,
                 ));
             }
-            let grant = decision.issue_selected_router_read(&catalog, &directive_context, proof.routing_input())?;
+            let grant = decision.issue_selected_router_read(&catalog, &directive_context, routing_input)?;
             let evidence = RouterHistoryReadEvidence::from_selected(
                 grant,
                 proof,
@@ -561,7 +562,7 @@ impl TurnDecisionService {
             }
             let vector = if let Some(local) = history.local_embedder_if_present() {
                 local
-                    .embed_router_until(proof.routing_input(), history_deadline, cancellation)
+                    .embed_router_until(routing_input, history_deadline, cancellation)
                     .await?
             } else {
                 let configured = crate::memory::configured_paid_embedder(config, &self.provider_catalog)?;
@@ -576,7 +577,7 @@ impl TurnDecisionService {
                     Arc::clone(&self.state_key),
                     domain_sha256,
                     query_sha256,
-                    proof.routing_input(),
+                    routing_input,
                     history_deadline,
                     cancellation,
                 )
@@ -594,7 +595,7 @@ impl TurnDecisionService {
             let scores = history
                 .scoped_similarity(&read, &domain, &vector, history_deadline, cancellation)
                 .await?;
-            let task = crate::agent::classifier::classify_intent(&config.task_routing, proof.routing_input());
+            let task = crate::agent::classifier::classify_intent(&config.task_routing, routing_input);
             let ranked = continuation.router.rank_scoped_history(proof, task.intent, &scores)?;
             ensure!(
                 !cancellation.is_cancelled() && Instant::now() < history_deadline,

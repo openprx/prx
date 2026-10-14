@@ -32,6 +32,16 @@ fn compiled_instruction_tokens(tool_specs: &[crate::tools::ToolSpec]) -> usize {
     budgeted_tokens(estimate_history_tokens_with_source(&probe))
 }
 
+/// Business schemas registered by the fixture. `capability_search` is a
+/// separately gated control and is absent once the only discoverable family
+/// has already been selected exactly.
+fn business_tool_specs_of(tools: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSpec> {
+    tool_specs_of(tools)
+        .into_iter()
+        .filter(|spec| spec.name != "capability_search")
+        .collect()
+}
+
 // Q58 fixture sizing preserves the intended main-request window while
 // retaining the production decision reservation and original response reserve.
 fn decision_sized_fixture_config(
@@ -68,7 +78,7 @@ async fn context_budget_counts_native_tool_schemas_before_provider_call() {
     crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::with_fields("file_read", 16))];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let tool_specs = tool_specs_of(&tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
         let tool_payload = crate::agent::turn_context::measure_native_tool_payload(&tool_specs);
         let tool_tokens = budgeted_tokens(tool_payload.measurement);
 
@@ -199,13 +209,13 @@ async fn small_native_schema_fixture(excluded: bool) {
     let wide_registry = crate::agent::turn_tests::admission::registry_with_search(vec![Box::new(
         WideSchemaTool::with_fields("file_read", 1),
     )]);
-    let wide_specs = tool_specs_of(&wide_registry);
+    let wide_specs = business_tool_specs_of(&wide_registry);
     let wide_tool_tokens =
         budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&wide_specs).measurement);
 
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "file_read" })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_tokens = budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
 
     let mut history = context_budget_fixture_history(wide_tool_tokens.saturating_mul(4));
@@ -213,7 +223,7 @@ async fn small_native_schema_fixture(excluded: bool) {
         .last_mut()
         .expect("current fixture input")
         .content
-        .push_str(" Use file_read.");
+        .push_str(" Use file_read on /prx/missing.");
     let original_len = history.len();
     let config = context_budget_fixture_config(&history, wide_tool_tokens / 2);
     let usable_window = config.max_context_tokens.saturating_sub(config.reserve_tokens);
@@ -383,13 +393,13 @@ async fn configured_small_native_schema_fixture() {
     let wide_registry = crate::agent::turn_tests::admission::registry_with_search(vec![Box::new(
         WideSchemaTool::with_fields("file_read", 16),
     )]);
-    let wide_specs = tool_specs_of(&wide_registry);
+    let wide_specs = business_tool_specs_of(&wide_registry);
     let wide_tool_tokens =
         budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&wide_specs).measurement);
 
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::with_fields("file_read", 1))];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_tokens = budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
 
     let mut history = context_budget_fixture_history(wide_tool_tokens.saturating_mul(4));
@@ -634,7 +644,7 @@ async fn configured_small_native_schema_fixture() {
 async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals() {
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "file_read" })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
     let native_tokens = budgeted_tokens(tool_surface.native_payload.measurement);
     let instruction_tokens = budgeted_tokens(tool_surface.instructions);
@@ -895,7 +905,7 @@ async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
             WideSchemaTool::with_fields("file_read", 1).with_output("mid turn tool output ".repeat(100)),
         )];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let tool_specs = tool_specs_of(&tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
         let payload_tokens =
             budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
         let appended_tokens = compiled_instruction_tokens(&tool_specs);
@@ -918,7 +928,10 @@ async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
             // and the mark it leaves in history is what makes the difference
             // observable from outside the loop.
             mode: crate::config::AgentCompactionMode::Aggressive,
-            ..context_budget_fixture_config(&history, payload_tokens.saturating_add(appended_tokens))
+            ..decision_sized_fixture_config(context_budget_fixture_config(
+                &history,
+                payload_tokens.saturating_add(appended_tokens),
+            ))
         };
         assert!(
             !plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
@@ -1030,7 +1043,7 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
 
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("file_read"))];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let tool_specs = tool_specs_of(&tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
         let payload_tokens =
             budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
 
@@ -1139,7 +1152,7 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
             WideSchemaTool::with_fields("file_read", 1).with_output(output.clone()),
         )];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let tool_specs = tool_specs_of(&tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
         let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
         let surface_tokens = budgeted_request_tool_tokens(tool_surface);
 
@@ -1405,7 +1418,7 @@ async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration(
         output: "mid turn tool output ".repeat(8),
     })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
 
     let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
@@ -1546,7 +1559,7 @@ async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
         output: "mid turn tool output ".repeat(8),
     })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
 
     let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
@@ -1695,7 +1708,7 @@ async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
             output: "mid turn tool output ".repeat(8),
         })];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let tool_specs = tool_specs_of(&tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
         let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
 
         let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(200));
@@ -1842,7 +1855,7 @@ async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_que
         output: "mid turn tool output ".repeat(8),
     })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
 
     let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
@@ -1967,7 +1980,7 @@ async fn a_trim_only_preflight_opens_the_native_second_request_on_the_question()
         output: "mid turn tool output ".repeat(8),
     })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = tool_specs_of(&tools_registry);
+    let tool_specs = business_tool_specs_of(&tools_registry);
     let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
 
     let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));

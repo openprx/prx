@@ -23,7 +23,8 @@ impl TurnDecisionService {
         {
             return None;
         }
-        (crate::agent::classifier::classify_intent(task, proof.routing_input()).intent
+        let projected = crate::multimodal::project_image_markers_for_routing(proof.routing_input());
+        (crate::agent::classifier::classify_intent(task, projected.as_ref()).intent
             == crate::agent::classifier::TaskIntent::Delegate)
             .then_some("sessions_spawn")
     }
