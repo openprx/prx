@@ -487,6 +487,10 @@ pub struct StateFeatures<'s> {
     /// Query/tool steps that failed, were denied or were cancelled; Router
     /// training-history observations do not predict user-answer evidence.
     pub unsuccessful_steps: u64,
+    /// Failed, denied or cancelled non-provider work. A prior provider attempt
+    /// belongs to the earlier conversation segment and does not make a new
+    /// plain user message structurally undecidable.
+    pub unsuccessful_action_steps: u64,
     /// Completed retrievals or discoveries that succeeded.
     pub successful_lookups: u64,
     /// Artifacts younger than [`super::weights::FRESH_ARTIFACT_MS`].
@@ -539,6 +543,13 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
                 && matches!(str_at(step, "status"), "failed" | "denied" | "cancelled")
         })
         .count() as u64;
+    let unsuccessful_action_steps = steps
+        .iter()
+        .filter(|step| {
+            !matches!(str_at(step, "kind"), "provider" | "router_history")
+                && matches!(str_at(step, "status"), "failed" | "denied" | "cancelled")
+        })
+        .count() as u64;
     let successful_lookups = steps
         .iter()
         .filter(|step| str_at(step, "status") == "ok" && matches!(str_at(step, "kind"), "retrieve" | "discover"))
@@ -571,6 +582,7 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
         retry_count: state.get("retry_count").and_then(Value::as_u64).unwrap_or(0),
         approval_pending: state.get("approval_pending").and_then(Value::as_bool).unwrap_or(false),
         unsuccessful_steps,
+        unsuccessful_action_steps,
         successful_lookups,
         fresh_artifacts,
         stale_artifacts,

@@ -1140,7 +1140,15 @@ async fn run_turn_unguarded(
             );
             if let Some(token) = cancellation_token.as_ref() {
                 tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    () = token.cancelled() => {
+                        if let Some(observation) = provider_observation {
+                            observation.cancelled();
+                        }
+                        if let Some(retained) = &runtime_adapter.provider_trace {
+                            retained.failed();
+                        }
+                        return Err(ToolLoopCancelled.into());
+                    },
                     result = chat_future => result,
                 }
             } else {

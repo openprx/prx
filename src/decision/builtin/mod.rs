@@ -131,7 +131,7 @@ impl BuiltinDecisionBackend {
 fn plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
     state.text.has_text
         && state.undecided()
-        && state.unsuccessful_steps == 0
+        && state.unsuccessful_action_steps == 0
         && state.retry_count == 0
         && !state.approval_pending
 }

@@ -245,6 +245,28 @@ impl PendingProvider {
         self.active = false;
     }
 
+    /// A runtime cancellation proves this request did not return a usable
+    /// response, even though provider-side usage can remain unknown. Record a
+    /// bounded failed observation so a serial successor can inherit the
+    /// completed control-flow fact without claiming a successful response.
+    pub(crate) fn cancelled(mut self) {
+        let mut state = self.trace.0.lock();
+        if state.sealed.is_none() {
+            state.provider_pending = state.provider_pending.saturating_sub(1);
+            if state.provider_attempts.len() >= MAX_RECORDED_PROVIDER_ATTEMPTS {
+                state.provider_attempts_incomplete = true;
+            } else {
+                let seq = state.provider_attempts.len() as u32 + 1;
+                state.provider_attempts.push(RecordedOutcomeAttempt {
+                    seq,
+                    status: "failed".to_owned(),
+                    error_class: None,
+                });
+            }
+        }
+        self.active = false;
+    }
+
     fn record(&self, attempts: Option<&[ProviderAttempt]>) {
         let mut state = self.trace.0.lock();
         if state.sealed.is_some() {

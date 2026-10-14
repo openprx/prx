@@ -653,6 +653,8 @@ mod tests {
                     config.default_provider = Some("ollama".to_owned());
                     config.default_model = Some("prx-gateway-parent".to_owned());
                     config.api_url = Some(endpoint);
+                    config.autonomy.level = AutonomyLevel::Full;
+                    config.tool_tiering.always_include.push("sessions_spawn".to_owned());
                     config.reliability.provider_retries = 0;
                     for (model, native) in [("prx-gateway-parent", true), ("prx-gateway-child", false)] {
                         config.providers.models.push(serde_json::from_value(serde_json::json!({
@@ -698,44 +700,33 @@ mod tests {
                         config_generation:Arc::clone(&generation), provider:Arc::clone(&provider),
                         model:"prx-gateway-parent".to_owned(), temperature:0.0, tools_registry:Arc::clone(&registry), mcp_tool:None,
                     };
-                    // The principal comes only from the real API authentication middleware.
-                    let token = "prx-gateway-steering-fixture-token";
-                    let mut auth_state = test_app_state(AutonomyLevel::Full, workspace);
-                    auth_state.pairing = Arc::new(PairingGuard::new(true, &[token.to_owned()]));
-                    let (input_sender, input_receiver) = tokio::sync::oneshot::channel();
-                    let sender = Arc::new(tokio::sync::Mutex::new(Some(input_sender)));
-                    let ingress = axum::Router::new().route("/fixture-input", axum::routing::post(
-                        move |axum::Extension(principal): axum::Extension<super::super::ApiPrincipal>, body:String| {
-                            let sender = Arc::clone(&sender);
-                            async move {
-                                let Some(sender) = sender.lock().await.take() else { return axum::http::StatusCode::CONFLICT; };
-                                if sender.send((principal, body)).is_err() { return axum::http::StatusCode::GONE; }
-                                axum::http::StatusCode::ACCEPTED
-                            }
-                        }
-                    )).route_layer(axum::middleware::from_fn_with_state(auth_state, super::super::auth_middleware))
-                        .layer(axum::extract::DefaultBodyLimit::max(4096));
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                    let ingress_endpoint = format!("http://{}/fixture-input", listener.local_addr()?);
-                    let stop = cancellation.clone();
-                    owned.servers.push(tokio::spawn(async move {
-                        let _ = axum::serve(listener, ingress).with_graceful_shutdown(stop.cancelled_owned()).await;
-                    }));
                     let input = "sessions_spawn a long task the operator will interrupt";
-                    let response = reqwest::Client::new().post(ingress_endpoint).bearer_auth(token).body(input).send().await?;
-                    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
-                    let (principal, received) = input_receiver.await?;
-                    assert_eq!(received, input);
-                    let envelope = crate::runtime::envelope::RuntimeEnvelope::console(workspace.to_string_lossy(), "prx_gateway_steering")
-                        .with_channel("web-console").with_sender("prx_user")
-                        .with_owner_id(principal.owner_id.clone()).with_owner_isolation()
+                    let fabric_context = crate::gateway::GatewayFabricContext::generic_webhook(
+                        Some("prx_gateway_steering"),
+                        "bearer:prx_fixture",
+                        None,
+                    );
+                    let workspace_id = workspace.to_string_lossy().to_string();
+                    let owner_id = fabric_context
+                        .webhook_owner_id(&workspace_id)
+                        .context("credential-scoped webhook owner missing")?;
+                    let envelope = crate::runtime::envelope::RuntimeEnvelope::gateway(
+                        workspace_id,
+                        fabric_context.session_key.clone(),
+                        fabric_context.channel.clone(),
+                        fabric_context.sender.clone(),
+                        fabric_context.recipient.clone(),
+                        crate::memory::MemoryVisibility::Session,
+                    )
+                        .with_owner_id(owner_id)
                         .with_run_id("prx_gateway_parent").with_config_generation(&generation);
                     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy())
                         .with_event_recording(config.memory.event_recording_config());
                     let event = fabric.record_inbound_user_message(envelope.message_scope(), input, None, None).await?;
-                    let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
-                        memory.as_ref(), &runtime, &principal, &envelope, input, &event.event_id,
+                    let receipt = crate::gateway::decision_source::GatewaySourceReceipt::issue(
+                        memory.as_ref(), &generation, &envelope, input, &event,
                     ).await?;
+                    let proof = receipt.bind(&runtime, &fabric_context)?;
                     let service = crate::runtime::turn_publication::TurnDecisionPublication {
                         generation:Arc::clone(&generation), registry:Arc::clone(&registry), mcp_tool:None,
                         security, observer:Arc::new(NoopObserver), hooks:Arc::new(HookManager::new(workspace.to_path_buf())),
@@ -743,16 +734,56 @@ mod tests {
                     }.publish(crate::causal_tree::state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
                     let context = service.decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
-                    let crate::causal_tree::directive::TurnExecutionDirective::Delegate { manifest } = context.directive() else {
+                    let crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly = context.directive()
+                    else {
                         let (directive, reason) = match context.directive() {
-                        crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
-                        crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.as_str()),
-                        _ => ("Other", "not_applicable"),
+                            crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code } => {
+                                ("Clarify", reason_code.as_str())
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code } => {
+                                ("Refuse", policy_code.as_str())
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly => {
+                                ("AnswerDirectly", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::Execute { .. } => {
+                                ("Execute", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::Retrieve { .. } => {
+                                ("Retrieve", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::Discover { .. } => {
+                                ("Discover", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::RequestApproval { .. } => {
+                                ("RequestApproval", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_) => {
+                                ("CollectApprovalArguments", "not_applicable")
+                            }
+                            crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. } => {
+                                ("Delegate", "not_applicable")
+                            }
+                        };
+                        let reason = match reason {
+                            "insufficient_evidence"
+                            | "commit_threshold_or_margin"
+                            | "no_legal_path"
+                            | "retrieve_evidence"
+                            | "hop_stopped"
+                            | "not_applicable" => reason,
+                            _ => "unclassified",
+                        };
+                        anyhow::bail!("gateway fixture parent directive={directive} reason_code={reason}");
                     };
-                    let reason = match reason { "insufficient_evidence" | "commit_threshold_or_margin" | "no_legal_path" | "retrieve_evidence" | "hop_stopped" | "not_applicable" => reason, _ => "unclassified" };
-                    anyhow::bail!("gateway fixture parent directive={directive} reason_code={reason}");
-                    };
-                    assert!(manifest.allowed.is_empty(), "the actual selected child grant must be model-only");
+                    assert!(
+                        context
+                            .engine()
+                            .outgoing_child
+                            .as_ref()
+                            .is_some_and(|manifest| manifest.allowed.is_empty()),
+                        "the answer surface must retain the actual model-only child grant"
+                    );
                     assert_eq!(context.audit_hops().count(), 1, "fixture must not discover additional work");
                     let specs = service.agent_execution_specs(&proof, &context)?;
                     assert_eq!(specs.specs.len(), 1);
@@ -841,60 +872,150 @@ mod tests {
         }
     }
 
-    /// Spawn a genuinely long-running sub-agent and return `(tool, run_id)`.
-    async fn spawn_long_running_sub_agent(
-        workspace: &std::path::Path,
-        gate: &Arc<tokio::sync::Semaphore>,
-    ) -> (SessionsSpawnTool, String) {
-        let tool = SessionsSpawnTool::new(
-            Arc::new(SilentChannel) as Arc<dyn Channel>,
-            Arc::new(GatedProvider { gate: Arc::clone(gate) }),
-            "test-provider",
-            "test-model",
-            0.0,
-            Arc::new(crate::security::SecurityPolicy {
-                workspace_dir: workspace.to_path_buf(),
-                ..crate::security::SecurityPolicy::default()
-            }),
-            workspace.to_path_buf(),
-            crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
-            std::collections::HashMap::new(),
-            None,
-            crate::providers::ProviderRuntimeOptions::default(),
-            crate::config::SessionsSpawnConfig::default(),
-        );
-        // A run only enters the steerable agent loop when it has a tools
-        // registry: `run_sub_agent_task` short-circuits a registry-less spawn
-        // into a single provider call that never reads its steer channel. An
-        // empty registry is enough to take the real path.
-        // The tool holds its registry weakly; the test keeps it alive.
-        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(Vec::new());
-        assert!(
-            tool.tools_handle().set(&registry),
-            "test: tools registry must be injectable once"
-        );
-        tool.set_default_recipient(Some("test-recipient".to_string())).await;
-        let result = tool
-            .execute(serde_json::json!({
-                "task": "a long task the operator will interrupt",
-                "_zc_scope_trusted": true,
-                "_zc_scope": {
-                    "sender": "operator",
-                    "channel": "silent",
-                    "chat_type": "direct",
-                    "chat_id": "chat-1"
-                }
-            }))
-            .await
-            .expect("test: spawn must be accepted");
-        assert!(result.success, "test: spawn failed: {:?}", result.error);
-        let runs = tool.active_runs_snapshot().await;
-        let run_id = runs
-            .first()
-            .map(|run| run.id.clone())
-            .expect("test: the spawn must have registered a run");
-        (tool, run_id)
+    /// Own the admitted parent turn for a control-plane fixture until its child
+    /// has either completed or been terminated by the test.
+    struct AdmittedSpawnFixture {
+        cleanup: crate::runtime::turn_cleanup::CleanupScope,
+        config: Config,
+        memory: Arc<dyn crate::memory::Memory>,
+        registry: Arc<Vec<Box<dyn Tool>>>,
+        provider: Arc<dyn Provider>,
+        runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
+    }
+
+    impl AdmittedSpawnFixture {
+        async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            let message = ChannelMessage {
+                id: format!("prx-gateway-runtime-{}", uuid::Uuid::new_v4()),
+                sender: "prx_user".to_owned(),
+                reply_target: "prx_gateway_runtime".to_owned(),
+                content: "sessions_spawn admitted runtime fixture".to_owned(),
+                channel: "web-console".to_owned(),
+                timestamp: 0,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
+                thread_ts: None,
+                mentioned_uuids: Vec::new(),
+                mentioned: false,
+                is_group_hint: false,
+                sender_is_bot: false,
+            };
+            self.cleanup
+                .scope_admission(Box::pin(async {
+                    let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                        self.config.clone(),
+                        message,
+                        Arc::clone(&self.registry),
+                        Arc::clone(&self.memory),
+                        ("custom:http://127.0.0.1:1/v1", "test-model"),
+                    )
+                    .await;
+                    crate::runtime::child_source::scope_ordinary_provider_fixture(
+                        Arc::clone(&self.provider),
+                        "custom:http://127.0.0.1:1/v1".to_owned(),
+                        "test-model".to_owned(),
+                        admitted.execute_tool("sessions_spawn", arguments),
+                    )
+                    .await
+                }))
+                .await
+        }
+
+        async fn finish(self) {
+            self.cleanup
+                .run(async { Ok(()) })
+                .await
+                .expect("test: admitted parent and child cleanup must be confirmed");
+        }
+    }
+
+    /// Spawn a genuinely long-running sub-agent and return its admitted parent
+    /// owner together with the portable run id.
+    fn spawn_long_running_sub_agent<'a>(
+        workspace: &'a std::path::Path,
+        gate: &'a Arc<tokio::sync::Semaphore>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (AdmittedSpawnFixture, String)> + 'a>> {
+        Box::pin(async move {
+            let provider: Arc<dyn Provider> = Arc::new(GatedProvider { gate: Arc::clone(gate) });
+            let memory: Arc<dyn crate::memory::Memory> =
+                Arc::new(SqliteMemory::new(workspace).expect("test: admitted spawn memory"));
+            let mut config = Config::default();
+            config.workspace_dir = workspace.to_path_buf();
+            config.config_path = workspace.join("config.toml");
+            config.default_provider = Some("custom:http://127.0.0.1:1/v1".to_owned());
+            config.default_model = Some("test-model".to_owned());
+            config.causal_tree.enabled = false;
+            config.providers.models.push(
+                serde_json::from_value(serde_json::json!({
+                    "provider": "custom:http://127.0.0.1:1/v1",
+                    "model": "test-model",
+                    "operations": ["chat"],
+                    "native_tools": true
+                }))
+                .expect("test: admitted model metadata"),
+            );
+            config.cost.prices.insert(
+                "custom:http://127.0.0.1:1/v1/test-model".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+            let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                &config.autonomy,
+                workspace,
+            ));
+            let tool = SessionsSpawnTool::new(
+                Arc::new(SilentChannel) as Arc<dyn Channel>,
+                Arc::clone(&provider),
+                "custom:http://127.0.0.1:1/v1",
+                "test-model",
+                0.0,
+                security,
+                workspace.to_path_buf(),
+                crate::config::MultimodalConfig::default(),
+                crate::config::AgentCompactionConfig::default(),
+                std::collections::HashMap::new(),
+                None,
+                crate::providers::ProviderRuntimeOptions::default(),
+                crate::config::SessionsSpawnConfig::default(),
+            );
+            let runs = tool.active_runs_arc();
+            let tools_handle = tool.tools_handle();
+            let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(tool)]);
+            assert!(
+                tools_handle.set(&registry),
+                "test: tools registry must be injectable once"
+            );
+            let fixture = AdmittedSpawnFixture {
+                cleanup: crate::runtime::turn_cleanup::CleanupScope::new(
+                    None,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .expect("test: admitted spawn cleanup owner"),
+                config,
+                memory,
+                registry,
+                provider,
+                runs,
+            };
+            let result = fixture
+                .execute(serde_json::json!({"task": "a long task the operator will interrupt"}))
+                .await
+                .expect("test: spawn must be accepted");
+            assert!(result.success, "test: spawn failed: {:?}", result.error);
+            let run_id = fixture
+                .runs
+                .read()
+                .await
+                .first()
+                .map(|run| run.id.clone())
+                .expect("test: the spawn must have registered a run");
+            (fixture, run_id)
+        })
     }
 
     /// Wait until the run's row (and therefore its address) exists.
@@ -946,7 +1067,7 @@ mod tests {
     async fn run_id_and_work_id_address_the_same_run() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (tool, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
         let work_id = await_addressable(&run_id).await;
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
@@ -954,22 +1075,49 @@ mod tests {
         let by_run_id = tasks_cli::request_message(&endpoint, &run_id, "first, by run id")
             .await
             .expect("test: run id must be a valid address");
-        let by_work_id = tasks_cli::request_message(&endpoint, &work_id.to_string(), "second, by work id")
-            .await
-            .expect("test: work id must stay a valid address");
+        let by_work_id = match tasks_cli::request_message(&endpoint, &work_id.to_string(), "second, by work id").await {
+            Ok(report) => report,
+            Err(error) => {
+                let mut states = Vec::new();
+                for _ in 0..100 {
+                    states = fixture
+                        .runs
+                        .read()
+                        .await
+                        .iter()
+                        .map(|run| format!("{}={:?}", run.id, run.status))
+                        .collect::<Vec<_>>();
+                    if states.iter().all(|state| !state.ends_with("=Running")) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("test: work id must stay a valid address: {error:#}; runs={states:?}");
+            }
+        };
 
         assert_eq!(by_run_id.id, by_work_id.id, "both addresses must denote one run");
         assert_eq!(by_run_id.run_id, by_work_id.run_id);
         assert_eq!(by_work_id.run_id.as_deref(), Some(run_id.as_str()));
 
-        let runs = tool.active_runs_arc();
-        assert!(
-            await_history_containing(&runs, &run_id, &steering_instruction("second, by work id")).await,
-            "the message sent by work id must reach the same run"
-        );
+        let runs = Arc::clone(&fixture.runs);
+        if !await_history_containing(&runs, &run_id, &steering_instruction("second, by work id")).await {
+            let observed = runs
+                .read()
+                .await
+                .iter()
+                .find(|run| run.id == run_id)
+                .map(|run| (run.status.clone(), Arc::clone(&run.history)));
+            let observed = match observed {
+                Some((status, history)) => (Some(status), history.read().await.clone()),
+                None => (None, Vec::new()),
+            };
+            panic!("the message sent by work id must reach the same run: {observed:?}");
+        }
 
         gate.add_permits(64);
         server.abort();
+        fixture.finish().await;
     }
 
     /// Evidence 3: `kill` learned the portable address without losing the local
@@ -978,7 +1126,7 @@ mod tests {
     async fn kill_accepts_a_run_id_and_still_accepts_a_work_id() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (_tool, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
         let work_id = await_addressable(&run_id).await;
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
@@ -993,7 +1141,7 @@ mod tests {
 
         // And the legacy address space still works: a second, unrelated run
         // killed by `w<n>` behaves exactly as before.
-        let (_tool2, run_id2) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture2, run_id2) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
         let work_id2 = await_addressable(&run_id2).await;
         let report2 = tasks_cli::request_kill(&endpoint, &work_id2.to_string(), false)
             .await
@@ -1002,6 +1150,8 @@ mod tests {
 
         gate.add_permits(64);
         server.abort();
+        fixture.finish().await;
+        fixture2.finish().await;
     }
 
     /// Evidence 4: the gate is real. Under `read_only` the control plane refuses
@@ -1010,7 +1160,7 @@ mod tests {
     async fn message_is_refused_when_the_policy_forbids_acting() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (tool, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
         await_addressable(&run_id).await;
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::ReadOnly, workspace.path())).await;
@@ -1023,7 +1173,7 @@ mod tests {
             "the refusal must be an authorization failure, got: {rendered}"
         );
 
-        let runs = tool.active_runs_arc();
+        let runs = Arc::clone(&fixture.runs);
         let run_history = {
             let guard = runs.read().await;
             guard
@@ -1044,6 +1194,7 @@ mod tests {
 
         gate.add_permits(64);
         server.abort();
+        fixture.finish().await;
     }
 
     /// Evidence 5: an address that denotes nothing is an explicit error, never a
@@ -1082,7 +1233,7 @@ mod tests {
     async fn blank_messages_are_rejected() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (_tool, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture, run_id) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
         await_addressable(&run_id).await;
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
@@ -1093,6 +1244,7 @@ mod tests {
 
         gate.add_permits(64);
         server.abort();
+        fixture.finish().await;
     }
 
     /// A live item with no steering channel — an agent turn, a tool call — is a
@@ -1451,19 +1603,12 @@ mod tests {
     async fn a_batch_is_listed_as_one_unit_and_killable_by_its_batch_id() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (tool, _) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+        let (fixture, _) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
 
-        let spawned = tool
+        let spawned = fixture
             .execute(serde_json::json!({
                 "action": "spawn_batch",
-                "tasks": ["alpha", "beta", "gamma"],
-                "_zc_scope_trusted": true,
-                "_zc_scope": {
-                    "sender": "operator",
-                    "channel": "silent",
-                    "chat_type": "direct",
-                    "chat_id": "chat-1"
-                }
+                "tasks": ["alpha", "beta", "gamma"]
             }))
             .await
             .expect("test: spawn_batch must be accepted");
@@ -1528,5 +1673,6 @@ mod tests {
 
         gate.add_permits(64);
         server.abort();
+        fixture.finish().await;
     }
 }

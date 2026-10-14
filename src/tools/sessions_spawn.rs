@@ -7356,6 +7356,7 @@ async fn run_sub_agent_task(
         let run_beat = Arc::clone(&progress);
         let cleanup_parent = crate::runtime::turn_cleanup::current_tracker();
         let (cleanup_ack, cleanup_confirmed) = tokio::sync::oneshot::channel();
+        let (segment_admitted, mut segment_admission) = tokio::sync::oneshot::channel();
         let loop_cleanup =
             crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
                 .with_acknowledgement(Some(cleanup_ack));
@@ -7408,6 +7409,7 @@ async fn run_sub_agent_task(
                 )
                 .await?
                 .with_child_cleanup(cleanup_confirmed);
+                let _ = segment_admitted.send(());
                 if child_turn.is_close()? {
                     loop_cleanup.run(async { Ok(()) }).await?;
                     let reply = child_turn
@@ -7517,6 +7519,47 @@ async fn run_sub_agent_task(
             (task_history, result)
         }));
         let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
+
+        // A queued steer may arrive immediately after the run is published.
+        // Do not let it cancel this segment until terminal ownership exists:
+        // otherwise admission can be dropped before a terminal guard is built,
+        // and the next segment correctly refuses the unconfirmed predecessor.
+        tokio::select! {
+            loop_result = &mut loop_handle => {
+                let (returned_history, result) = loop_result?;
+                history = returned_history;
+                *history_out.write().await = chat_messages_to_history(&history);
+                return match result {
+                    Ok(mut result) => {
+                        settled_segment_usage.append(&mut result.segment_usage);
+                        result.segment_usage = settled_segment_usage;
+                        if result.output.trim().is_empty() {
+                            result.output = "[Sub-agent produced no output]".to_string();
+                        }
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            admitted = &mut segment_admission => {
+                if admitted.is_err() {
+                    let (returned_history, result) = loop_handle.await?;
+                    history = returned_history;
+                    *history_out.write().await = chat_messages_to_history(&history);
+                    return match result {
+                        Ok(mut result) => {
+                            settled_segment_usage.append(&mut result.segment_usage);
+                            result.segment_usage = settled_segment_usage;
+                            if result.output.trim().is_empty() {
+                                result.output = "[Sub-agent produced no output]".to_string();
+                            }
+                            Ok(result)
+                        }
+                        Err(error) => Err(error),
+                    };
+                }
+            }
+        }
 
         // Race: loop completion vs steering message
         tokio::select! {
