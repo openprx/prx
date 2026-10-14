@@ -92,15 +92,16 @@ impl TurnDecisionService {
         let manifest = match &context.directive {
             TurnExecutionDirective::Delegate { manifest } => manifest,
             TurnExecutionDirective::AnswerDirectly => {
-                let direct_delegator = context.execution_refs.iter().any(|reference| {
+                let admitted_delegator = context.execution_refs.iter().any(|reference| {
                     self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
                         entry.fingerprint == reference.fingerprint
                             && entry.generation == reference.generation
-                            && matches!(entry.exposure, Exposure::Direct)
                             && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                            && (matches!(entry.exposure, Exposure::Direct)
+                                || super::exact_delegator_ref(&context.engine, reference))
                     })
                 });
-                anyhow::ensure!(direct_delegator, "answer surface has no admitted delegator");
+                anyhow::ensure!(admitted_delegator, "answer surface has no admitted delegator");
                 context
                     .engine
                     .outgoing_child

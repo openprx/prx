@@ -143,6 +143,13 @@ fn continued_plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
         && state.artifact_count == 0
 }
 
+fn explicit_delegation_turn(state: &StateFeatures<'_>) -> bool {
+    state
+        .candidates
+        .iter()
+        .any(|candidate| candidate.exact_mention && matches!(candidate.action, Some(Action::Delegate)))
+}
+
 /// The log-score of one candidate.
 fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>) -> f64 {
     let Some(action) = candidate.action else {
@@ -193,8 +200,9 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
             _ => {}
         }
     }
-    if plain_conversation_turn(state)
+    if (plain_conversation_turn(state)
         && (text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT || continued_plain_conversation_turn(state))
+        || explicit_delegation_turn(state))
         && action == Action::Answer
     {
         score += weights::BRIEF_PLAIN_TURN_TO_ANSWER;
@@ -311,9 +319,10 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             // A plain conversational turn may have ordinary provider history
             // without external evidence. Treating that history as insufficient
             // forces a read/discovery hop before an admitted model answer can
-            // run. Structurally or exactly targeted turns retain the existing
-            // retrieve-first evidence path.
-            let decisive = if plain_conversation_turn(state) {
+            // run. Structurally or exactly targeted tool turns retain the
+            // existing retrieve-first evidence path. Exact delegation instead
+            // serves the model with only the sealed delegator publication.
+            let decisive = if plain_conversation_turn(state) || explicit_delegation_turn(state) {
                 1.0
             } else if state.text.has_text && !state.undecided() {
                 0.5

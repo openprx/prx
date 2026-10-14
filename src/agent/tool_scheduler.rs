@@ -739,10 +739,17 @@ async fn execute_one_unrecorded(
                 .begin(&tool_call_id, None, false)
                 .finish(crate::tools::ToolExecutionStatus::Denied);
         }
-        let result = format!(
-            "Error: tool '{}' was not exposed for this turn and was not executed",
-            call.name
-        );
+        let result = service
+            .unexposed_policy_denial(&call.name, &adapter.tool_execution_context)
+            .map_or_else(
+                || {
+                    format!(
+                        "Error: tool '{}' was not exposed for this turn and was not executed",
+                        call.name
+                    )
+                },
+                |denial| format!("Error: {denial}"),
+            );
         emit_tool_loop_event(
             adapter,
             ToolLoopEvent::ToolFinished {

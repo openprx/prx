@@ -180,11 +180,47 @@ impl ProviderId {
         Some(rest.split_once('@').map_or(rest, |(name, _)| name))
     }
 
+    /// Whether this identity names a runtime whose transport remains on this
+    /// host. Local catalog adapters carry that fact in the compiled provider
+    /// table; a bring-your-own endpoint is local only when its normalized URL
+    /// has a loopback host.
+    #[must_use]
+    pub(crate) fn is_local_runtime(&self) -> bool {
+        if let Some(name) = self.catalog_name() {
+            return canonical_provider_info(name).is_some_and(|info| info.local);
+        }
+        let Some(endpoint) = self.0.strip_prefix(ProviderNamespace::Custom.prefix()) else {
+            return false;
+        };
+        endpoint_is_loopback(endpoint)
+    }
+
+    /// Apply a root connection override after the caller has verified that
+    /// this identity owns that configured endpoint.
+    #[must_use]
+    pub(crate) fn is_local_runtime_at(&self, root_endpoint: Option<&str>) -> bool {
+        self.is_local_runtime() || root_endpoint.is_some_and(endpoint_is_loopback)
+    }
+
     /// Whether this build can construct the provider this id names.
     #[must_use]
     pub fn is_resolvable(&self) -> bool {
         self.namespace() != ProviderNamespace::Unknown
     }
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 impl std::fmt::Display for ProviderId {
@@ -616,6 +652,17 @@ mod tests {
         assert_eq!(ProviderId::of("kimi").catalog_name(), Some("moonshot"));
         assert_eq!(ProviderId::of("custom:http://h.invalid/v1").catalog_name(), None);
         assert_eq!(ProviderId::of("nope").catalog_name(), None);
+    }
+
+    #[test]
+    fn local_runtime_identity_is_compiled_or_loopback_evidence() {
+        assert!(ProviderId::of("ollama").is_local_runtime());
+        assert!(ProviderId::of("mock").is_local_runtime());
+        assert!(ProviderId::of("custom:http://127.0.0.1:9/v1").is_local_runtime());
+        assert!(ProviderId::of("custom:http://localhost:9/v1").is_local_runtime());
+        assert!(ProviderId::of("litellm").is_local_runtime_at(Some("http://127.0.0.1:9/v1")));
+        assert!(!ProviderId::of("openai").is_local_runtime());
+        assert!(!ProviderId::of("custom:https://example.com/v1").is_local_runtime());
     }
 
     #[test]

@@ -66,7 +66,7 @@ use crate::capability::CapabilityAvailabilityLevel;
 use crate::causal_tree::branch::{
     CandidateSpec, CapabilityRef, CapabilityTarget, CatalogGeneration, CausalActionKind, CausalCandidate,
 };
-use crate::causal_tree::candidate_generator::DiscoveredRefs;
+use crate::causal_tree::candidate_generator::{CandidateSet, DiscoveredRefs};
 use crate::causal_tree::decision_engine::{
     CausalDecisionEngine, DiscoveryIssueError, EngineDecision, EngineError, EngineInputs, RetrievalIssueError,
 };
@@ -892,6 +892,22 @@ fn selected_execute_refs(
 /// binding and dispatch recheck the live catalog, source, schema, security and
 /// approval policy. Delegators additionally require the sealed child manifest
 /// retained by this exact decision.
+fn exact_delegator_ref(decision: &EngineDecision, reference: &CapabilityRef) -> bool {
+    let CandidateSet::Legal {
+        candidates,
+        exact_mentions,
+        ..
+    } = &decision.candidates
+    else {
+        return false;
+    };
+    candidates.iter().any(|candidate| {
+        candidate.action() == CausalActionKind::Delegate
+            && exact_mentions.contains(candidate.candidate_id())
+            && candidate.required_capabilities() == std::slice::from_ref(reference)
+    })
+}
+
 fn direct_answer_refs(
     decision: &EngineDecision,
     catalog: &CatalogView<'_>,
@@ -899,17 +915,18 @@ fn direct_answer_refs(
 ) -> BTreeSet<CapabilityRef> {
     catalog
         .iter_entries()
-        .filter(|entry| matches!(entry.exposure, Exposure::Direct))
         .filter_map(|entry| {
             let delegation = matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn");
-            if delegation && decision.outgoing_child.is_none() {
-                return None;
-            }
             let reference = CapabilityRef {
                 id: entry.id.clone(),
                 fingerprint: entry.fingerprint,
                 generation: entry.generation,
             };
+            let directly_exposed = matches!(entry.exposure, Exposure::Direct);
+            let exact_delegation = delegation && exact_delegator_ref(decision, &reference);
+            if (!directly_exposed && !exact_delegation) || (delegation && decision.outgoing_child.is_none()) {
+                return None;
+            }
             let candidate = CausalCandidate::new(
                 if delegation {
                     CausalActionKind::Delegate
@@ -2305,7 +2322,7 @@ impl TurnDecisionService {
         };
         let decision_request_model = self.factory.request_model().or_else(|| Some(model.model()));
         let observed_latency = self.observed_capability_latency(proof.owner_id(), catalog.generation());
-        let cost_model = super::turn_cost::RuntimeCostModel::new(&model, &config.cost, &observed_latency);
+        let cost_model = super::turn_cost::RuntimeCostModel::new(&model, config, &observed_latency);
         let mut discovered_refs = DiscoveredRefs::empty();
         let call_fingerprints = resume_evidence
             .as_ref()

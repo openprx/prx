@@ -168,11 +168,8 @@ impl TurnDecisionService {
         );
         let model = self.resolve_agent_model(proof)?;
         let observed_latency = BTreeMap::new();
-        let costs = crate::runtime::turn_cost::RuntimeCostModel::new(
-            &model,
-            &self.generation.effective.cost,
-            &observed_latency,
-        );
+        let costs =
+            crate::runtime::turn_cost::RuntimeCostModel::new(&model, &self.generation.effective, &observed_latency);
         let estimate = costs.estimate_entry(entry);
         let candidate = CausalCandidate::new(
             CausalActionKind::UseTool,

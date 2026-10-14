@@ -1748,6 +1748,20 @@ impl ToolExecutionService {
         self.resolve(public_name).is_some()
     }
 
+    /// Return the normal execution-policy denial for a known capability that
+    /// was withheld from this turn. This performs no binding, approval,
+    /// preparation, reservation, or backend work.
+    #[must_use]
+    pub fn unexposed_policy_denial(&self, public_name: &str, context: &ToolExecutionContext) -> Option<String> {
+        let descriptor = self.resolve(public_name)?.descriptor;
+        (self.policy.decide(&descriptor, context) == ToolExecutionDecision::Deny).then(|| {
+            format!(
+                "tool '{}' is not permitted under the current execution policy",
+                descriptor.public_name
+            )
+        })
+    }
+
     #[must_use]
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.catalog.descriptors().to_vec()
@@ -2109,7 +2123,10 @@ impl ToolExecutionService {
             reservation: lease.reservation.clone(),
             outcome: outcome.clone(),
         };
-        let payload = match serde_json::to_string(&terminal) {
+        let payload = match serde_json::to_value(&terminal)
+            .map(crate::agent::terminal::redact_persisted_json)
+            .and_then(|value| serde_json::to_string(&value))
+        {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::error!(error = %error, "failed to encode idempotent tool terminal outcome");

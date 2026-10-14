@@ -455,11 +455,16 @@ impl CausalCandidateGenerator {
                 }
             }
             if policy.may_delegate {
+                let exact_delegator = catalog.iter_entries().find(|entry| {
+                    matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                        && exact_mention(&folded_input, entry)
+                });
                 let delegates = catalog.iter_entries().filter(|entry| {
                     (entry.public_name == "delegate" || entry.public_name == "sessions_spawn")
                         && policy
                             .delegation_target
                             .is_none_or(|target| entry.public_name == target)
+                        && exact_delegator.is_none_or(|exact| entry.id == exact.id)
                 });
                 if let Some(candidate) = select_family_candidate(
                     CausalActionKind::Delegate,
@@ -470,6 +475,9 @@ impl CausalCandidateGenerator {
                     policy,
                     gates,
                 )? {
+                    if policy.delegation_target.is_some() || exact_delegator.is_some() {
+                        exact_mentions.insert(candidate.candidate_id().clone());
+                    }
                     proposed.push(candidate);
                 }
             }
@@ -1321,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_delegator_selects_only_requested_entrypoint_and_keeps_hard_gates() {
+    fn explicit_delegator_selects_only_requested_entrypoint_and_keeps_hard_gates() {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "review project without a tool-name mention");
         let registry: Vec<Box<dyn Tool>> = vec![
@@ -1395,7 +1403,12 @@ mod tests {
         };
         let view = catalog.view(&CatalogScope::default());
         let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-        let CandidateSet::Legal { candidates, .. } = generated else {
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } = generated
+        else {
             panic!("configured delegator must have a legal candidate");
         };
         let delegate = candidates
@@ -1407,6 +1420,7 @@ mod tests {
             .entry_any(&delegate.required_capabilities().first().unwrap().id)
             .unwrap();
         assert_eq!(entry.public_name, "sessions_spawn");
+        assert!(exact_mentions.contains(delegate.candidate_id()));
         assert!(candidates.iter().all(|candidate| matches!(
             candidate.action(),
             CausalActionKind::Delegate
@@ -1433,6 +1447,28 @@ mod tests {
                 ))
             );
         }
+
+        gates.model_can_call_tools = true;
+        policy.delegation_target = None;
+        state.routing_input = RawRoutingInput::new("use sessions_spawn for this task".into());
+        let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } = generated
+        else {
+            panic!("named delegator must have a legal candidate");
+        };
+        let delegate = candidates
+            .iter()
+            .find(|candidate| candidate.action() == CausalActionKind::Delegate)
+            .unwrap();
+        let entry = view
+            .entry_any(&delegate.required_capabilities().first().unwrap().id)
+            .unwrap();
+        assert_eq!(entry.public_name, "sessions_spawn");
+        assert!(exact_mentions.contains(delegate.candidate_id()));
     }
 
     #[test]

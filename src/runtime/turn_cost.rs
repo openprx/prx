@@ -8,6 +8,7 @@ use crate::causal_tree::branch::{CapabilityTarget, CostEstimate};
 #[cfg(test)]
 use crate::causal_tree::candidate_generator::CapabilityCostModel;
 use crate::causal_tree::candidate_generator::CostEstimateSource;
+use crate::config::Config;
 use crate::config::schema::CostConfig;
 use crate::providers::catalog::ResolvedModel;
 use crate::tools::capability::catalog::CapabilityEntry;
@@ -26,26 +27,41 @@ pub(super) struct RuntimeCostModel<'a> {
     pricing: &'a CostConfig,
     observed_latency_ms: &'a BTreeMap<String, u32>,
     prices_valid: bool,
+    local_transport: bool,
 }
 
 impl<'a> RuntimeCostModel<'a> {
     pub(super) fn new(
         model: &'a ResolvedModel,
-        pricing: &'a CostConfig,
+        config: &'a Config,
         observed_latency_ms: &'a BTreeMap<String, u32>,
     ) -> Self {
+        let configured_root = config
+            .default_provider
+            .as_deref()
+            .unwrap_or(crate::providers::DEFAULT_PROVIDER_FOR_UNSET);
+        let root_endpoint = (crate::providers::ProviderId::of(configured_root) == *model.provider())
+            .then(|| config.api_url.as_deref())
+            .flatten();
         Self {
             model,
-            pricing,
+            pricing: &config.cost,
             observed_latency_ms,
-            prices_valid: pricing.prices.values().all(|price| price.is_finite_nonnegative()),
+            prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
+            local_transport: model.provider().is_local_runtime_at(root_endpoint),
         }
     }
 }
 
 impl CostEstimateSource for RuntimeCostModel<'_> {
     fn estimate_entry(&self, entry: &CapabilityEntry) -> Option<(CostEstimate, u32)> {
-        let cost = estimate_cost_with_validity(self.model, self.pricing, entry.schema_bytes, self.prices_valid)?;
+        let cost = estimate_cost_with_validity(
+            self.model,
+            self.pricing,
+            entry.schema_bytes,
+            self.prices_valid,
+            self.local_transport,
+        )?;
         let latency = self
             .observed_latency_ms
             .get(entry.id.as_str())
@@ -55,7 +71,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
     }
 
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)> {
-        let cost = estimate_cost_with_validity(self.model, self.pricing, 0, self.prices_valid)?;
+        let cost = estimate_cost_with_validity(self.model, self.pricing, 0, self.prices_valid, self.local_transport)?;
         Some((cost, default_latency_ms(CapabilityTarget::None)))
     }
 }
@@ -116,7 +132,13 @@ pub(super) fn build_cost_model(
 #[cfg(test)]
 fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usize) -> Option<CostEstimate> {
     let prices_valid = pricing.prices.values().all(|price| price.is_finite_nonnegative());
-    estimate_cost_with_validity(model, pricing, schema_bytes, prices_valid)
+    estimate_cost_with_validity(
+        model,
+        pricing,
+        schema_bytes,
+        prices_valid,
+        model.provider().is_local_runtime(),
+    )
 }
 
 fn estimate_cost_with_validity(
@@ -124,6 +146,7 @@ fn estimate_cost_with_validity(
     pricing: &CostConfig,
     schema_bytes: usize,
     prices_valid: bool,
+    local_transport: bool,
 ) -> Option<CostEstimate> {
     // Even a local model cannot turn a configured but invalid tariff into a
     // zero-cost fallback. Normal config loading rejects these values; this
@@ -146,7 +169,7 @@ fn estimate_cost_with_validity(
     );
     let usd = match price {
         crate::llm::route_decision::UsagePrice::Priced(cost) => cost,
-        crate::llm::route_decision::UsagePrice::Missing if model.provider().catalog_name() == Some("ollama") => 0.0,
+        crate::llm::route_decision::UsagePrice::Missing if local_transport => 0.0,
         crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid => {
             return None;
         }
@@ -238,7 +261,7 @@ mod tests {
         let observed_id = view.entries().first().expect("first capability").id.as_str().to_owned();
         let latencies = BTreeMap::from([(observed_id, 37)]);
         let observed = build_cost_model(&view, &model, &config.cost, &latencies);
-        let lazy = RuntimeCostModel::new(&model, &config.cost, &latencies);
+        let lazy = RuntimeCostModel::new(&model, &config, &latencies);
         assert_eq!(lazy.estimate_terminal(), observed.estimate_terminal());
         for entry in view.entries() {
             assert_eq!(
@@ -297,9 +320,9 @@ mod tests {
         assert!(cost.micro_usd > 0);
         assert_eq!(latency, default_latency_ms(CapabilityTarget::None));
 
-        let mut unknown = config.cost;
-        unknown.prices.clear();
-        let unpriced = build_cost_model(&view, &model, &unknown, &BTreeMap::new());
+        let mut unknown = config;
+        unknown.cost.prices.clear();
+        let unpriced = build_cost_model(&view, &model, &unknown.cost, &BTreeMap::new());
         assert!(
             unpriced.estimates.is_empty(),
             "an unknown price cannot become a free candidate"
@@ -340,8 +363,8 @@ mod tests {
         assert_eq!(zero.tokens, 128);
         assert_eq!(zero.micro_usd, 0);
 
-        let mut priced = config.cost;
-        priced.prices.insert(
+        let mut priced = config;
+        priced.cost.prices.insert(
             "ollama/prx-local-model".to_string(),
             crate::config::schema::ModelPricing {
                 input: 1.0,
@@ -351,18 +374,19 @@ mod tests {
             },
         );
         assert!(
-            estimate_cost(&model, &priced, 0)
+            estimate_cost(&model, &priced.cost, 0)
                 .expect("explicit local price")
                 .micro_usd
                 > 0
         );
         priced
+            .cost
             .prices
             .get_mut("ollama/prx-local-model")
             .expect("local price")
             .input = -1.0;
         assert!(
-            estimate_cost(&model, &priced, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0).is_none(),
             "invalid tariff must not become local free pricing"
         );
         assert!(
@@ -371,28 +395,40 @@ mod tests {
                 .is_none()
         );
         priced
+            .cost
             .prices
             .get_mut("ollama/prx-local-model")
             .expect("local price")
             .input = f64::MAX;
         assert!(
-            estimate_cost(&model, &priced, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0).is_none(),
             "overflowed tariff must not become local free pricing"
         );
         priced
+            .cost
             .prices
             .get_mut("ollama/prx-local-model")
             .expect("local price")
             .input = f64::from_bits(1);
         priced
+            .cost
             .prices
             .get_mut("ollama/prx-local-model")
             .expect("local price")
             .output = f64::from_bits(1);
         assert!(
-            estimate_cost(&model, &priced, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0).is_none(),
             "positive subnormal tariff must not become local free pricing"
         );
+    }
+
+    #[test]
+    fn mock_is_zero_money_without_an_external_tariff() {
+        let config = crate::config::Config::default();
+        let model = model(&config, "mock", "prx-local-model");
+        let estimate = estimate_cost(&model, &config.cost, 0).expect("local mock estimate");
+        assert_eq!(estimate.tokens, 128);
+        assert_eq!(estimate.micro_usd, 0);
     }
 
     #[test]

@@ -2281,7 +2281,7 @@ mod tests {
         let tool = DelegateTool::new(agents, test_security());
         let result = dispatch_configured_delegate(tool, json!({"agent":"broken", "prompt":"test"})).await;
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Failed to create provider"));
+        assert!(result.error.unwrap().contains("is not one PRX can construct"));
     }
 
     #[tokio::test]
@@ -2432,14 +2432,14 @@ mod tests {
                     legacy_session_key: None,
                 },
                 0,
-                10,
+                100,
             )
             .await
             .unwrap();
 
         let request_event = events
             .iter()
-            .find(|event| event.role == "user")
+            .find(|event| event.role == "user" && event.source == "delegate")
             .expect("delegate request event");
         let result_event = events
             .iter()
@@ -2508,7 +2508,7 @@ mod tests {
                     legacy_session_key: None,
                 },
                 0,
-                10,
+                100,
             )
             .await
             .unwrap()
@@ -2682,9 +2682,20 @@ mod tests {
             let make = || self.inner.execute(args);
             #[cfg(unix)]
             super::delegate_diagnostic::future_layout("delegate-trait-future-layout.json", &make);
-            let result = make().await?;
-            *self.result.lock() = Some(result.clone());
-            Ok(result)
+            match make().await {
+                Ok(result) => {
+                    *self.result.lock() = Some(result.clone());
+                    Ok(result)
+                }
+                Err(error) => {
+                    *self.result.lock() = Some(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error.to_string()),
+                    });
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -3091,52 +3102,63 @@ mod tests {
             let mut history = vec![crate::providers::ChatMessage::user(input)];
             let hooks = HookManager::new(workspace);
             let multimodal = crate::config::MultimodalConfig::default();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                crate::agent::turn_engine::run_turn(
-                    &mut history,
-                    crate::agent::turn_request::TurnRequest {
-                        channel_name: "agent",
-                        scope: None,
-                        mode: Default::default(),
-                        silent: true,
-                        expose_stay_silent: false,
-                        multimodal: &multimodal,
-                        schedule: crate::agent::turn_request::TurnSchedule {
-                            read_only_tool_concurrency_window: 2,
-                            priority_scheduling_enabled: false,
-                            low_priority_tool_names: Vec::new(),
-                        },
-                        compaction: Some(admitted.compaction()),
-                        decision: admitted.decision(),
-                    },
-                    crate::agent::turn_request::TurnServices {
-                        provider: parent_provider.as_ref(),
-                        provider_name: "ollama",
-                        model: "prx-local-model",
-                        temperature: 0.0,
-                        tools_registry: registry,
-                        observer: &NoopObserver,
-                        hooks: &hooks,
-                        approval: None,
-                        approval_resolver: None,
-                        runtime_adapter: Some(admitted.adapter()),
-                        memory: admitted.memory_runtime(),
-                    },
-                    crate::agent::turn_request::TurnDelivery {
-                        cancellation: None,
-                        on_delta: None,
-                        on_tool_call: None,
-                    },
-                ),
+            let parent_cleanup = crate::runtime::turn_cleanup::current_tracker();
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
+                parent_cleanup.as_ref(),
+                tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .expect("delegate fixture cleanup owner");
+            let result = cleanup
+                .run(async {
+                    Ok(tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        crate::agent::turn_engine::run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "agent",
+                                scope: None,
+                                mode: Default::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &multimodal,
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: Some(admitted.compaction()),
+                                decision: admitted.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: parent_provider.as_ref(),
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry: registry,
+                                observer: &NoopObserver,
+                                hooks: &hooks,
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admitted.adapter()),
+                                memory: admitted.memory_runtime(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        ),
+                    )
+                    .await)
+                })
+                .await;
             #[cfg(unix)]
             if super::delegate_diagnostic::active() {
                 let kind = match &result {
-                    Err(_) => "timeout",
-                    Ok(Err(_)) => "engine_error",
-                    Ok(Ok(_)) => "engine_success",
+                    Err(_) => "cleanup_error",
+                    Ok(Err(_)) => "timeout",
+                    Ok(Ok(Err(_))) => "engine_error",
+                    Ok(Ok(Ok(_))) => "engine_success",
                 };
                 super::delegate_diagnostic::outcome(
                     kind,
@@ -3150,6 +3172,7 @@ mod tests {
                 let _ = admitted.decision().context.terminal_execution_trace();
             }
             result
+                .expect("delegate fixture cleanup")
                 .expect("bounded local delegate fixture")
                 .expect("parent execution");
             let result = captured.lock().take();
@@ -4028,7 +4051,7 @@ mod credential_containment_tests {
         .await;
         assert!(!failed.success, "invalid provider must fail");
         let error = failed.error.unwrap_or_default();
-        assert!(error.contains("Failed to create provider"), "{error}");
+        assert!(error.contains("is not one PRX can construct"), "{error}");
         assert!(!error.contains("SECRET-fixture-pw"), "{error}");
 
         let events = memory

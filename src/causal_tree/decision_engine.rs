@@ -1442,9 +1442,20 @@ fn selector_context(
     discovered_refs: &DiscoveredRefs,
 ) -> SelectorContext {
     let direct_candidates = match set {
-        CandidateSet::Legal { candidates, .. } => candidates
+        CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } => candidates
             .iter()
-            .filter(|candidate| candidate_is_direct(candidate, catalog, resume_target, discovered_refs))
+            .filter(|candidate| {
+                // An exact or source-configured delegator already has a
+                // derived, sealed child manifest. It does not need a catalog
+                // discovery hop to become ready, while an unmentioned Direct
+                // delegator retains the ordinary prediction path.
+                (candidate.action() == CausalActionKind::Delegate && exact_mentions.contains(candidate.candidate_id()))
+                    || candidate_is_direct(candidate, catalog, resume_target, discovered_refs)
+            })
             .map(|candidate| candidate.candidate_id().clone())
             .collect(),
         CandidateSet::NoLegalPath { .. } => BTreeSet::new(),

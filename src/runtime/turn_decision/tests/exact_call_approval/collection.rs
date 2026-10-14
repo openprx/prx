@@ -296,7 +296,7 @@ async fn exact_file_collection(edit: bool) {
         let model = service.resolve_agent_model(plan.as_ref()).unwrap();
         let model_ref = format!("{}:{}", model.provider_label(), model.model());
         let latency = BTreeMap::new();
-        let costs = crate::runtime::turn_cost::RuntimeCostModel::new(&model, &config.cost, &latency);
+        let costs = crate::runtime::turn_cost::RuntimeCostModel::new(&model, &config, &latency);
         let estimate = crate::causal_tree::candidate_generator::CostEstimateSource::estimate_entry(&costs, entry);
         let candidate = crate::causal_tree::branch::CausalCandidate::new(
             crate::causal_tree::branch::CausalActionKind::UseTool,
