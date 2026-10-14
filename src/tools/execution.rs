@@ -1134,8 +1134,8 @@ impl ToolExecutionOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolExecutionReservation {
     operation_id: String,
-    #[serde(default)]
-    owner_token: String,
+    #[serde(default, alias = "owner_token")]
+    reservation_id: String,
     #[serde(default)]
     attempt: u32,
     capability: String,
@@ -1965,7 +1965,7 @@ impl ToolExecutionService {
                         .as_deref()
                         .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
                     if abandoned.as_ref().is_none_or(|abandoned| {
-                        abandoned.owner_token != existing.owner_token
+                        abandoned.reservation_id != existing.reservation_id
                             || abandoned.attempt != existing.attempt
                             || abandoned.capability != existing.capability
                             || abandoned.input_sha256 != existing.input_sha256
@@ -2006,7 +2006,7 @@ impl ToolExecutionService {
                 Ok(None) => {
                     let reservation = ToolExecutionReservation {
                         operation_id: command.operation_id.clone(),
-                        owner_token: Uuid::now_v7().to_string(),
+                        reservation_id: Uuid::now_v7().to_string(),
                         attempt,
                         capability: command.name.clone(),
                         input_sha256: input_sha256.to_string(),
@@ -2067,7 +2067,7 @@ impl ToolExecutionService {
                         .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
                     if recorded
                         .as_ref()
-                        .is_none_or(|recorded| recorded.owner_token != reservation.owner_token)
+                        .is_none_or(|recorded| recorded.reservation_id != reservation.reservation_id)
                     {
                         return Err(Box::new(self.finish(
                             command,
@@ -2185,7 +2185,7 @@ impl ToolExecutionService {
             .as_deref()
             .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
         if recorded.as_ref().is_none_or(|recorded| {
-            recorded.owner_token != lease.reservation.owner_token
+            recorded.reservation_id != lease.reservation.reservation_id
                 || recorded.attempt != lease.reservation.attempt
                 || recorded.capability != lease.reservation.capability
                 || recorded.input_sha256 != lease.reservation.input_sha256
@@ -4492,7 +4492,7 @@ mod tests {
         let (reservation_key, _) = tool_execution_ledger_keys(&execution_context, "recovery-key");
         let reservation = ToolExecutionReservation {
             operation_id: "crashed-owner".to_string(),
-            owner_token: "crashed-owner-token".to_string(),
+            reservation_id: "crashed-owner-token".to_string(),
             attempt: 0,
             capability: command.name.clone(),
             input_sha256,

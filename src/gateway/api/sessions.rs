@@ -2456,10 +2456,10 @@ mod tests {
     const CONSOLE_BULKY_MARKER: &str = "CONSOLE-BULKY";
     const CONSOLE_WINDOW_MODEL: &str = "narrow-window-model";
     const CONSOLE_WINDOW_PROVIDER: &str = "ollama";
-    const CONSOLE_ROUTER_WINDOW: usize = 6_000;
+    const CONSOLE_ROUTER_WINDOW: usize = 33_200;
 
-    /// A read-only tool whose output overruns a 6,000-token window but fits the
-    /// 128,000-token base window and the unbudgeted inline cap.
+    /// A read-only tool whose output overruns the narrow fixture window but
+    /// fits the 128,000-token base window and the unbudgeted inline cap.
     struct ConsoleBulkyTool {
         inner: crate::tools::file_read::FileReadTool,
         executions: Arc<std::sync::atomic::AtomicUsize>,
@@ -2493,7 +2493,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             self.executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let result = self.inner.execute_with_cancellation(args, cancellation).await?;
-            assert!(result.success, "actual private FileRead must succeed");
+            assert!(result.success, "actual private FileRead must succeed: {result:?}");
             assert_eq!(
                 result.output, self.expected,
                 "the full physical file must reach budgeting"
@@ -2560,8 +2560,10 @@ mod tests {
     }
 
     /// Base config: the default 128,000-token window (not set explicitly), and
-    /// a `[[router.models]]` entry that gives the served model a 6,000-token
-    /// window. Only the effective resolution sees the router entry.
+    /// a `[[router.models]]` entry that gives the served model a narrow window.
+    /// Only the effective resolution sees the router entry. The fixture window
+    /// is large enough for the sealed decision request's existing reservation;
+    /// the paired payload remains larger than the main-turn share.
     fn narrow_router_window_config(workspace: &std::path::Path) -> Config {
         let mut config = Config::default();
         config.workspace_dir = workspace.to_path_buf();
@@ -2589,9 +2591,9 @@ mod tests {
     /// the CLI, TUI and webhook budget on (OQ-23 / R5).
     ///
     /// The base config keeps the 128,000-token default, so a turn budgeted on
-    /// the base window forwards the whole 40,000-character tool payload to the
-    /// follow-up request. The router entry gives the served model a
-    /// 6,000-token window; budgeted on that, the follow-up must fit it.
+    /// the base window forwards the whole token-dense tool payload to the
+    /// follow-up request. The router entry gives the served model a narrower
+    /// window; budgeted on that, the follow-up must fit it.
     ///
     /// MUTATION GUARD: pass `Some(&config_snapshot.agent.compaction)` to the
     /// loop again and the follow-up request carries the whole payload.
@@ -2622,21 +2624,31 @@ mod tests {
                 let mut state = test_app_state_with_config(config, provider_impl.clone());
                 state.model = CONSOLE_WINDOW_MODEL.into();
                 let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let mut payload = String::with_capacity(40_000);
+                let mut payload = String::with_capacity(47_000);
                 let mut index = 0usize;
-                while payload.len() < 40_000 {
+                while payload.len() < 47_000 {
                     use std::fmt::Write as _;
-                    let _ = write!(payload, "{CONSOLE_BULKY_MARKER}-{index} ");
+                    let _ = write!(
+                        payload,
+                        "{CONSOLE_BULKY_MARKER}-{index}-龘齉靐齾爩鱻麤灪爨籱癵驫麣纞虋讟钃鸜麷韽饢顟顠顡 "
+                    );
                     index += 1;
                 }
+                assert!(payload.len() < 48_000, "fixture must remain below the native inline cap");
+                assert!(
+                    payload.matches(CONSOLE_BULKY_MARKER).count() > 500,
+                    "the base-window mutation must retain enough payload segments to fail"
+                );
+                assert!(
+                    crate::agent::context_budget::count_tokens(&payload) > 31_000,
+                    "the paired payload must overrun the narrow main-turn window"
+                );
                 let principal = super::super::ApiPrincipal::of_token("prx-test-token");
                 let filesystem = crate::tools::owner_filesystem::OwnerFilesystem::open(
                     &private, workspace.to_string_lossy().as_ref(), &principal.owner_id, &workspace,
                 ).unwrap();
                 let target = filesystem.resolve(CONSOLE_BULKY_FILE).unwrap();
-                let physical = std::path::PathBuf::from(target.operation_target());
-                std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
-                std::fs::write(&physical, &payload).unwrap();
+                filesystem.write_authorized(&target, payload.as_bytes()).unwrap();
                 let security = Arc::new(crate::security::SecurityPolicy::from_config(
                     &state.config.pin().effective.autonomy, &workspace,
                 ));
