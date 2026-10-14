@@ -4692,7 +4692,9 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         // Restore explicit historical metadata, including a legacy unowned row
         // predating owner enforcement. This is not a source-less spawn and gives
         // neither row a driver or an authority token. Both persist in SQLite and
-        // occupy the production registrar's actual shared runtime registry.
+        // occupy the same shared runtime-registry shape used by the production
+        // session read tools. The test owns that fixture directly; production
+        // registration contains no test-only seeding hook.
         let mut rows = Vec::new();
         for (run_id, task, row_owner) in [
             ("prx-legacy-unowned", UNOWNED_RUN_TASK, None),
@@ -4741,9 +4743,18 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
                 batch_id: None,
             });
         }
-        let registry = super::super::legacy_session_fixture::with_rows(workspace.path(), rows, || {
-            production_sessions_registry(&config, &memory)
-        });
+        let active_runs = Arc::new(tokio::sync::RwLock::new(rows));
+        let shared_memory: Arc<dyn crate::memory::Memory> = memory.clone();
+        let workspace_id = workspace.path().to_string_lossy().into_owned();
+        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
+            Box::new(
+                crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
+                    .with_shared_memory(Arc::clone(&shared_memory), workspace_id.clone()),
+            ),
+            Box::new(
+                crate::tools::SessionsHistoryTool::new(active_runs).with_shared_memory(shared_memory, workspace_id),
+            ),
+        ]);
 
         let listed = run_sessions_tool_on(
             Arc::clone(&registry),

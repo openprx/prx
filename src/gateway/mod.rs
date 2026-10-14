@@ -29,8 +29,6 @@ mod decision_cleanup;
 mod decision_runtime;
 pub(crate) mod decision_source;
 mod jobs;
-#[cfg(test)]
-mod legacy_session_fixture;
 
 /// The reserved issuer component of every built-in (non-bearer) MCP origin.
 ///
@@ -1408,8 +1406,6 @@ fn register_gateway_turn_tools(
         // `GET /mcp/v1/tools/list` advertises (V02-R7). Pushed before
         // `spawn_tool` is moved into the list below.
         let active_runs = spawn_tool.active_runs_arc();
-        #[cfg(test)]
-        legacy_session_fixture::seed_registered_runs(&config.workspace_dir, &active_runs);
         let workspace_id = config.workspace_dir.to_string_lossy().to_string();
         tools_list.push(Box::new(
             tools::SessionsListTool::new(active_runs.clone())
