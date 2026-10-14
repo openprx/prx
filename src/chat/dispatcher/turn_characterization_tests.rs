@@ -412,11 +412,12 @@ async fn admit_chat_fixture_with_mode(
     );
     let generation = crate::config::new_shared(config.clone()).pin();
     let policy = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace));
+    let approval_router = Arc::new(ApprovalRouter::new());
     let service = Arc::new(chat_tool_execution_service(
         Arc::clone(&registry),
         Some(Arc::clone(&ledger)),
         Arc::clone(&policy),
-        Arc::new(ApprovalRouter::new()),
+        Arc::clone(&approval_router),
         action_tx.clone(),
         cancellation.clone(),
         None,
@@ -448,17 +449,10 @@ async fn admit_chat_fixture_with_mode(
                 &diagnostics,
                 0,
             ),
-            surface_policy: crate::tools::capability::catalog::SurfacePolicy {
-                excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
-                direct_names: config
-                    .tool_tiering
-                    .always_include
-                    .iter()
-                    .filter(|name| !config.tool_tiering.always_exclude.contains(name))
-                    .cloned()
-                    .collect(),
-                ..Default::default()
-            },
+            surface_policy: crate::runtime::turn_publication::surface_policy(
+                crate::causal_tree::state::TurnSurfaceKind::Interactive,
+                &config.tool_tiering,
+            ),
             provider_catalog: &provider_catalog,
             transports: &crate::agent::test_admission::NoExternalTransport,
             events: Arc::new(crate::agent::test_admission::SilentEvents),
@@ -466,7 +460,12 @@ async fn admit_chat_fixture_with_mode(
             security: policy,
         },
     )
-    .expect("actual chat decision service");
+    .expect("actual chat decision service")
+    .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
+        hooks: Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+        observer: Arc::new(crate::observability::noop::NoopObserver),
+    })
+    .expect("actual chat loop runtime");
     let envelope = crate::chat::chat_runtime_envelope(&workspace.to_string_lossy(), "chat:characterization")
         .with_config_generation(&generation)
         .with_run_id(source_input.0.to_owned());

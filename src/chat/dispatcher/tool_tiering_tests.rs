@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 const TIERING_DRAFT: &str = "tool-tiering-draft";
 const CORE_TOOL: &str = "tiering_core_probe";
@@ -21,18 +22,22 @@ const EXTENDED_TOOL: &str = "tiering_extended_probe";
 const WEB_TOOL: &str = "tiering_web_probe";
 /// A permitted discovery control distinct from the excluded web probe.
 const MEDIA_TOOL: &str = "tiering_media_probe";
+const APPROVAL_TOOL: &str = "config_reload";
+const SESSIONS_SPAWN_TOOL: &str = "sessions_spawn";
 
 /// Records the tool catalog the provider was offered for the turn.
 struct CatalogRecordingProvider {
     offered: Mutex<Vec<Vec<String>>>,
     discover: Option<&'static str>,
+    call: Option<&'static str>,
 }
 
 impl CatalogRecordingProvider {
-    fn new(discover: Option<&'static str>) -> Self {
+    fn new(discover: Option<&'static str>, call: Option<&'static str>) -> Self {
         Self {
             offered: Mutex::new(Vec::new()),
             discover,
+            call,
         }
     }
 }
@@ -76,15 +81,30 @@ impl Provider for CatalogRecordingProvider {
         _temperature: f64,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        self.offered.lock().push(
-            options
-                .tools
-                .unwrap_or_default()
-                .into_iter()
-                .map(|spec| spec.name)
-                .collect(),
-        );
-        let round = self.offered.lock().len();
+        let round = {
+            let mut offered = self.offered.lock();
+            offered.push(
+                options
+                    .tools
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect(),
+            );
+            offered.len()
+        };
+        if let Some(target) = self.call.filter(|_| round == 1) {
+            return stream::iter(vec![
+                Ok(StreamChunk::tool_call_chunk(vec![ToolCallChunk::new(
+                    "tiering-direct-call",
+                    target,
+                    "{}",
+                    0,
+                )])),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed();
+        }
         if let Some(target) = self.discover {
             let call = match round {
                 1 => Some((
@@ -108,6 +128,34 @@ impl Provider for CatalogRecordingProvider {
             }
         }
         stream::iter(vec![Ok(StreamChunk::delta("ok")), Ok(StreamChunk::final_chunk())]).boxed()
+    }
+}
+
+struct ApprovalProbeTool {
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for ApprovalProbeTool {
+    fn name(&self) -> &str {
+        APPROVAL_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "approval boundary probe"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(&self, _arguments: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.executions.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            success: true,
+            output: "approved".to_owned(),
+            error: None,
+        })
     }
 }
 
@@ -148,8 +196,8 @@ impl Tool for TierProbeTool {
     }
 }
 
-fn probe_registry() -> Arc<Vec<Box<dyn Tool>>> {
-    crate::agent::test_admission::registry_with_search(vec![
+fn probe_tools(include_sessions_spawn: bool) -> Vec<Box<dyn Tool>> {
+    let mut tools = vec![
         Box::new(TierProbeTool {
             name: CORE_TOOL,
             tier: ToolTier::Core,
@@ -170,7 +218,23 @@ fn probe_registry() -> Arc<Vec<Box<dyn Tool>>> {
             tier: ToolTier::Extended,
             categories: &[ToolCategory::Media],
         }) as Box<dyn Tool>,
-    ])
+    ];
+    if include_sessions_spawn {
+        tools.push(Box::new(TierProbeTool {
+            name: SESSIONS_SPAWN_TOOL,
+            tier: ToolTier::Core,
+            categories: &[ToolCategory::Automation],
+        }) as Box<dyn Tool>);
+    }
+    tools
+}
+
+fn probe_registry() -> Arc<Vec<Box<dyn Tool>>> {
+    crate::agent::test_admission::registry_with_search(probe_tools(false))
+}
+
+fn spawn_probe_registry() -> Arc<Vec<Box<dyn Tool>>> {
+    crate::agent::test_admission::registry_with_search(probe_tools(true))
 }
 
 /// Each call records a new original input under the same fixture session. The
@@ -182,7 +246,7 @@ async fn offered_tools_for(
     tiering: crate::config::ToolTieringConfig,
     discover: Option<&'static str>,
 ) -> Vec<Vec<String>> {
-    let provider = Arc::new(CatalogRecordingProvider::new(discover));
+    let provider = Arc::new(CatalogRecordingProvider::new(discover, None));
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
     let cancellation = CancellationToken::new();
     let mut config = crate::config::Config::default();
@@ -240,8 +304,265 @@ async fn offered_tools_for(
     offers
 }
 
+struct PlainAnswerObservation {
+    offers: Vec<Vec<String>>,
+    has_child_manifest: bool,
+}
+
+async fn plain_answer_offers_for(
+    workspace: &std::path::Path,
+    draft: &str,
+    tiering: crate::config::ToolTieringConfig,
+    autonomy: crate::security::AutonomyLevel,
+) -> PlainAnswerObservation {
+    let provider = Arc::new(CatalogRecordingProvider::new(None, None));
+    let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
+    let cancellation = CancellationToken::new();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.causal_tree.enabled = false;
+    config.tool_tiering = tiering;
+    config.autonomy.level = autonomy;
+    let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
+        provider.clone(),
+        Some(spawn_probe_registry()),
+        config,
+        ("ollama", "tiering-model", None),
+        (draft, "hello"),
+        action_tx.clone(),
+        cancellation.clone(),
+    )
+    .await;
+    let decision = admitted.binding.decision_routing().expect("plain turn decision");
+    assert!(matches!(
+        decision.context.directive(),
+        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+    ));
+    let has_child_manifest = decision.context.engine().outgoing_child.is_some();
+    let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
+    drive_start_turn_stream(
+        Some(admitted.binding),
+        None,
+        provider.clone(),
+        history.clone(),
+        history,
+        "tiering-model".to_owned(),
+        0.0,
+        None,
+        cancellation,
+        draft.to_owned(),
+        action_tx.clone(),
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
+        None,
+        crate::agent::turn_contracts::ChatMode::Edit,
+        Arc::new(crate::observability::noop::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+    )
+    .await;
+    drop(action_tx);
+    let mut completed = false;
+    while let Some(action) = action_rx.recv().await {
+        match action {
+            Action::StreamFailed { err, .. } => panic!("plain direct-answer turn failed: {err}"),
+            Action::StreamCompleted { .. } => completed = true,
+            _ => {}
+        }
+    }
+    assert!(completed, "plain direct-answer fixture must complete");
+    PlainAnswerObservation {
+        offers: provider.offered.lock().clone(),
+        has_child_manifest,
+    }
+}
+
 fn contains(offer: &[String], name: &str) -> bool {
     offer.iter().any(|offered| offered == name)
+}
+
+#[tokio::test]
+async fn plain_direct_answer_only_offers_unexcluded_direct_tools() {
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = crate::config::ToolTieringConfig {
+        always_include: vec![CORE_TOOL.to_owned(), WEB_TOOL.to_owned()],
+        always_exclude: vec![WEB_TOOL.to_owned(), SESSIONS_SPAWN_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let observation = plain_answer_offers_for(
+        workspace.path(),
+        "plain-protective-surface",
+        policy,
+        crate::security::AutonomyLevel::Full,
+    )
+    .await;
+    assert_eq!(observation.offers.len(), 1);
+    let first = observation.offers.first().expect("plain answer provider offer");
+    assert!(contains(first, CORE_TOOL), "configured Direct tool must be offered");
+    assert!(
+        !contains(first, WEB_TOOL),
+        "always_exclude must outrank Direct publication"
+    );
+    for searchable in [EXTENDED_TOOL, MEDIA_TOOL] {
+        assert!(
+            !contains(first, searchable),
+            "Searchable tool must not be offered: {searchable}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plain_direct_answer_exclusion_hides_sessions_spawn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = crate::config::ToolTieringConfig {
+        always_exclude: vec![SESSIONS_SPAWN_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let observation = plain_answer_offers_for(
+        workspace.path(),
+        "plain-excluded-spawn",
+        policy,
+        crate::security::AutonomyLevel::Full,
+    )
+    .await;
+    assert!(
+        observation
+            .offers
+            .iter()
+            .all(|offer| !contains(offer, SESSIONS_SPAWN_TOOL)),
+        "interactive publication must honor the sessions_spawn exclusion"
+    );
+}
+
+#[tokio::test]
+async fn plain_direct_answer_without_a_child_manifest_hides_sessions_spawn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let observation = plain_answer_offers_for(
+        workspace.path(),
+        "plain-unsealed-spawn",
+        Default::default(),
+        crate::security::AutonomyLevel::ReadOnly,
+    )
+    .await;
+    assert!(
+        !observation.has_child_manifest,
+        "read-only admission must not seal a child manifest"
+    );
+    assert!(
+        observation
+            .offers
+            .iter()
+            .all(|offer| !contains(offer, SESSIONS_SPAWN_TOOL)),
+        "sessions_spawn must not be offered without this decision's sealed child manifest"
+    );
+}
+
+#[tokio::test]
+async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
+    let workspace = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(ApprovalProbeTool {
+        executions: Arc::clone(&executions),
+    }) as Box<dyn Tool>]);
+    let provider = Arc::new(CatalogRecordingProvider::new(None, Some(APPROVAL_TOOL)));
+    let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
+    let cancellation = CancellationToken::new();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+    config.tool_tiering.always_include.push(APPROVAL_TOOL.to_owned());
+    let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
+        provider.clone(),
+        Some(registry),
+        config,
+        ("ollama", "tiering-model", None),
+        ("plain-approval", "hello"),
+        action_tx.clone(),
+        cancellation.clone(),
+    )
+    .await;
+    assert!(matches!(
+        admitted
+            .binding
+            .decision_routing()
+            .expect("plain approval decision")
+            .context
+            .directive(),
+        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+    ));
+    let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
+    let driver = tokio::spawn(drive_start_turn_stream(
+        Some(admitted.binding),
+        None,
+        provider.clone(),
+        history.clone(),
+        history,
+        "tiering-model".to_owned(),
+        0.0,
+        None,
+        cancellation,
+        "plain-approval".to_owned(),
+        action_tx.clone(),
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
+        None,
+        crate::agent::turn_contracts::ChatMode::Edit,
+        Arc::new(crate::observability::noop::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+    ));
+
+    let mut saw_approval_required = false;
+    let mut saw_finished = false;
+    let mut saw_completed = false;
+    for _ in 0..64 {
+        let action = tokio::time::timeout(std::time::Duration::from_secs(3), action_rx.recv())
+            .await
+            .expect("approval action within timeout")
+            .expect("approval action channel remains open");
+        match action {
+            Action::ToolStarted { name, .. } if name == APPROVAL_TOOL => {
+                panic!("unapproved tool reached execution preparation")
+            }
+            Action::ToolFinished {
+                name, success, result, ..
+            } if name == APPROVAL_TOOL => {
+                assert!(!success, "unapproved probe must be rejected");
+                let result = result.expect("approval-required result");
+                assert!(
+                    result.contains("Approval is required") && result.contains("has not run"),
+                    "unexpected approval result: {result}"
+                );
+                assert_eq!(
+                    executions.load(AtomicOrdering::SeqCst),
+                    0,
+                    "the backend must remain untouched while approval is pending"
+                );
+                saw_approval_required = true;
+                saw_finished = true;
+            }
+            Action::StreamCompleted { .. } => {
+                saw_completed = true;
+                break;
+            }
+            Action::StreamFailed { err, .. } => panic!("plain approval turn failed: {err}"),
+            _ => {}
+        }
+    }
+    driver.await.expect("plain approval driver task");
+    drop(action_tx);
+    assert!(
+        saw_approval_required && saw_finished && saw_completed,
+        "approval_required={saw_approval_required} finished={saw_finished} completed={saw_completed}"
+    );
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 0);
+    let offers = provider.offered.lock();
+    assert!(contains(
+        offers.first().expect("plain approval provider offer"),
+        APPROVAL_TOOL
+    ));
 }
 
 #[tokio::test]

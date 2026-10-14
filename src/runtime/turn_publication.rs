@@ -3,6 +3,41 @@ use crate::tools;
 use anyhow::Result;
 use std::sync::Arc;
 
+pub(crate) fn surface_policy(
+    surface: crate::causal_tree::state::TurnSurfaceKind,
+    configured: &crate::config::ToolTieringConfig,
+) -> crate::tools::capability::catalog::SurfacePolicy {
+    let channel_surface = surface == crate::causal_tree::state::TurnSurfaceKind::Channel;
+    let tiering = if channel_surface {
+        std::borrow::Cow::Owned(configured.for_channel_surface())
+    } else {
+        std::borrow::Cow::Borrowed(configured)
+    };
+    let excluded_names = tiering.always_exclude.iter().cloned().collect();
+    let mut direct_names: std::collections::BTreeSet<_> = tiering
+        .always_include
+        .iter()
+        .filter(|name| !tiering.always_exclude.contains(name))
+        .cloned()
+        .collect();
+    // Interactive Chat is itself the local session-orchestration
+    // entrypoint: `/sessions` observes work started by the model-facing
+    // `sessions_spawn` tool. Keep that one bounded orchestration schema in
+    // its direct core when policy permits it. Other surfaces must opt in
+    // through `always_include`, and `always_exclude` still wins here.
+    if surface == crate::causal_tree::state::TurnSurfaceKind::Interactive
+        && !tiering.always_exclude.iter().any(|name| name == "sessions_spawn")
+    {
+        direct_names.insert("sessions_spawn".to_owned());
+    }
+    crate::tools::capability::catalog::SurfacePolicy {
+        allowed_tools: None,
+        excluded_names,
+        direct_names,
+        channel_allowed: channel_surface,
+    }
+}
+
 pub(crate) struct TurnDecisionPublication {
     pub(crate) generation: Arc<crate::config::ConfigGeneration>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
@@ -76,35 +111,7 @@ impl TurnDecisionPublication {
             &hooks.diagnostics(),
             self.plugin_generation,
         );
-        let channel_surface = surface == crate::causal_tree::state::TurnSurfaceKind::Channel;
-        let tiering = if channel_surface {
-            std::borrow::Cow::Owned(config.tool_tiering.for_channel_surface())
-        } else {
-            std::borrow::Cow::Borrowed(&config.tool_tiering)
-        };
-        let excluded_names = tiering.always_exclude.iter().cloned().collect();
-        let mut direct_names: std::collections::BTreeSet<_> = tiering
-            .always_include
-            .iter()
-            .filter(|name| !tiering.always_exclude.contains(name))
-            .cloned()
-            .collect();
-        // Interactive Chat is itself the local session-orchestration
-        // entrypoint: `/sessions` observes work started by the model-facing
-        // `sessions_spawn` tool. Keep that one bounded orchestration schema in
-        // its direct core when policy permits it. Other surfaces must opt in
-        // through `always_include`, and `always_exclude` still wins here.
-        if surface == crate::causal_tree::state::TurnSurfaceKind::Interactive
-            && !tiering.always_exclude.iter().any(|name| name == "sessions_spawn")
-        {
-            direct_names.insert("sessions_spawn".to_owned());
-        }
-        let surface_policy = crate::tools::capability::catalog::SurfacePolicy {
-            allowed_tools: None,
-            excluded_names,
-            direct_names,
-            channel_allowed: channel_surface,
-        };
+        let surface_policy = surface_policy(surface, &config.tool_tiering);
         let execution = Arc::new(
             tools::ToolExecutionService::from_shared_boxed_registry(
                 Arc::clone(registry),
