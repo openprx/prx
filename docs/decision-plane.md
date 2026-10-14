@@ -69,14 +69,17 @@ and turns with no viable read/recovery candidate receive the direct-answer
 preference. Longer unrouted text may take one bounded discovery hop and then
 answer when discovery adds no capability.
 
-An exactly named, current Searchable tool uses a narrower selection path: it may
+An exactly named, current Searchable tool, or an exactly named source-configured
+Delegate with a sealed child manifest, uses a narrower selection path. It may
 commit without an external artifact, the evidence-sufficiency abstention, the
-choice-confidence check, or the side-effect-scaled commit threshold. It still
-must be a single exact reference in the current catalog generation and pass
-surface visibility, exclusions, model allowlists, readiness, freshness, margin,
-source and side-effect-mode gates. An approval-required tool remains pending in
-Supervised mode, and execution still requires its exact approval/grant and
-idempotency authority.
+choice-confidence check, the side-effect-scaled commit threshold, or the
+minimum top-candidate margin. It still must be a single exact current reference
+in the catalog generation and pass surface visibility, exclusions, model
+allowlists, readiness, freshness, source authority, and side-effect-mode gates.
+An approval-required tool remains pending in Supervised mode, and execution
+still requires its exact approval/grant and idempotency authority. Delegation
+also retains the source's delegation authority and sealed child-capability
+boundary.
 
 An Answer turn may publish the bounded Direct core plus `capability_search` when
 the source/model may call tools and an eligible discovery family exists. It may
