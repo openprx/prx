@@ -287,15 +287,16 @@ impl CausalSelector {
         let Some(&(top, top_score, top_mass)) = passed.first() else {
             return Err(SelectError::CandidateMismatch);
         };
-        // A uniquely scored exact tool remains model-selected even when the
-        // distribution across generic action/target options has low entropy
-        // confidence. It still needs an authenticated current direct ref and
-        // every hard gate before this can authorize provider publication.
-        let exact_selected_tool = top.action() == CausalActionKind::UseTool
+        // A uniquely selected exact action remains model-selected even when
+        // the distribution across generic action/target options has low
+        // entropy confidence. It still needs an authenticated current direct
+        // ref and every hard gate before this can authorize tool publication
+        // or a sealed delegation.
+        let exact_selected_action = matches!(top.action(), CausalActionKind::UseTool | CausalActionKind::Delegate)
             && exact_mentions.contains(top.candidate_id())
             && prediction.chosen_action == top.action().as_str()
             && prediction.chosen_target == top.target().as_str();
-        let exact_current_tool = exact_selected_tool && context.direct_candidates.contains(top.candidate_id());
+        let exact_current_action = exact_selected_action && context.direct_candidates.contains(top.candidate_id());
         let retrieve = passed
             .iter()
             .find(|(candidate, _, _)| {
@@ -333,7 +334,7 @@ impl CausalSelector {
             .copied()
             .unwrap_or(0.0);
         let target_missing = top.target() != CapabilityTarget::None
-            && !exact_current_tool
+            && !exact_current_action
             && (!context.direct_candidates.contains(top.candidate_id())
                 || target_probability < policy.minimum_choice_confidence);
         let target_discover = passed
@@ -345,8 +346,12 @@ impl CausalSelector {
                             && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(top.target()))
             })
             .map(|(candidate, _, _)| *candidate);
-        let evidence_discover = if exact_selected_tool { target_discover } else { discover };
-        if insufficient && !exact_current_tool && retrieve.is_none() && evidence_discover.is_none() {
+        let evidence_discover = if exact_selected_action {
+            target_discover
+        } else {
+            discover
+        };
+        if insufficient && !exact_current_action && retrieve.is_none() && evidence_discover.is_none() {
             return terminal_abstain(candidates, pre_commit, context, "insufficient_evidence");
         }
         let recovery = if top.action() == CausalActionKind::Discover && discoverable_families.iter().next().is_some() {
@@ -355,7 +360,7 @@ impl CausalSelector {
             // run the local search without using the business-action commit
             // margin to force a non-interactive refusal.
             Some(top)
-        } else if insufficient && !exact_current_tool {
+        } else if insufficient && !exact_current_action {
             evidence_discover
         } else if target_missing {
             target_discover
@@ -373,15 +378,15 @@ impl CausalSelector {
             .map_or(f64::NEG_INFINITY, |(_, score, _)| score.execution_utility);
         let margin = top_score.execution_utility - runner_up;
         let threshold = effective_threshold(f64::from(policy.commit_threshold), top.side_effect());
-        let enough_choice_confidence = exact_current_tool
+        let enough_choice_confidence = exact_current_action
             || (prediction.action_confidence >= policy.minimum_choice_confidence
                 && prediction.target_confidence >= policy.minimum_choice_confidence);
         let evidence_ok = top.action() != CausalActionKind::Answer || !insufficient;
         let fresh_ok = top.action() == CausalActionKind::Retrieve || !stale;
         if top_mass > 0.0
-            && (top_score.execution_utility >= threshold || exact_current_tool)
+            && (top_score.execution_utility >= threshold || exact_current_action)
             && enough_choice_confidence
-            && margin >= policy.minimum_top_margin
+            && (margin >= policy.minimum_top_margin || exact_current_action)
             && evidence_ok
             && fresh_ok
             && !target_missing
@@ -1001,7 +1006,7 @@ mod tests {
 
     #[test]
     fn exact_current_tool_can_publish_below_the_execution_threshold() {
-        let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+        let (mut set, mut scores, mut evidence, mut report, mut policy, mut context) = fixture(0.5);
         let tool = CausalCandidate::new(
             CausalActionKind::UseTool,
             CapabilityTarget::NativeTool,
@@ -1021,6 +1026,8 @@ mod tests {
         for score in scores.values_mut() {
             score.execution_utility = 0.1;
         }
+        policy.minimum_top_margin = 0.1;
+        scores.values_mut().next().unwrap().execution_utility = 0.59;
         scores.insert(
             tool_id.clone(),
             CandidateScore {
@@ -1057,6 +1064,71 @@ mod tests {
         );
 
         context.direct_candidates.remove(&tool_id);
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+            Selection::Abstain { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_source_configured_delegate_can_publish_below_threshold_and_margin() {
+        let (mut set, mut scores, mut evidence, mut report, mut policy, mut context) = fixture(0.5);
+        let delegate = CausalCandidate::new(
+            CausalActionKind::Delegate,
+            CapabilityTarget::Session,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: SideEffectClass::LocalWrite,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(CostEstimate {
+                    tokens: 1,
+                    micro_usd: 1,
+                }),
+                estimated_latency_ms: Some(1),
+            },
+        );
+        let delegate_id = delegate.candidate_id().clone();
+        for score in scores.values_mut() {
+            score.execution_utility = 0.59;
+        }
+        policy.minimum_top_margin = 0.1;
+        scores.insert(
+            delegate_id.clone(),
+            CandidateScore {
+                semantic_utility: 0.6,
+                execution_utility: 0.6,
+            },
+        );
+        let prediction = evidence.candidates.values().next().unwrap().clone();
+        evidence.candidates.insert(delegate_id.clone(), prediction);
+        evidence.chosen_action = "delegate".to_owned();
+        evidence.chosen_target = "session".to_owned();
+        evidence.action_confidence = 0.01;
+        evidence.target_confidence = 0.01;
+        evidence.target_probabilities.insert(CapabilityTarget::Session, 0.1);
+        report.outcomes.insert(delegate_id.clone(), GateOutcome::Passed);
+        context.direct_candidates.insert(delegate_id.clone());
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } = &mut set
+        else {
+            panic!("expected legal candidates");
+        };
+        candidates.push(delegate);
+        exact_mentions.insert(delegate_id.clone());
+
+        assert_eq!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+            Selection::Commit {
+                candidate_id: delegate_id.clone(),
+                propensity: 1.0,
+            }
+        );
+
+        context.direct_candidates.remove(&delegate_id);
         assert!(matches!(
             CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
             Selection::Abstain { .. }
