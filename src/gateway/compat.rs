@@ -4179,6 +4179,44 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         config
     }
 
+    fn production_spawn_test_config(workspace: &Path) -> crate::config::Config {
+        let mut config = production_mcp_test_config(workspace);
+        config.causal_tree.enabled = false;
+        config.tool_tiering.always_include.push("sessions_spawn".to_owned());
+        config.default_model = Some("prx-gateway-owner-vis".to_owned());
+        let provider_name = crate::providers::selection::default_provider(&config).to_owned();
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": provider_name,
+                "model": "prx-gateway-owner-vis",
+                "operations": ["chat"],
+                "native_tools": true
+            }))
+            .expect("test: gateway owner-visibility model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider_name}/prx-gateway-owner-vis"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let catalog = crate::providers::selection::catalog_for(&config);
+        crate::providers::selection::check_with(
+            &config,
+            &catalog,
+            &provider_name,
+            "prx-gateway-owner-vis",
+            crate::providers::selection::credential_for(&config, &provider_name),
+            &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .unwrap_or_else(|error| panic!("test: gateway fixture model must verify native tools: {error:#}"));
+        config
+    }
+
     /// The MCP identity an owner-isolated caller presents against the
     /// production registry.
     ///
@@ -4197,10 +4235,17 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         config: &crate::config::Config,
         memory: &Arc<crate::memory::SqliteMemory>,
     ) -> Arc<Vec<Box<dyn crate::tools::Tool>>> {
+        production_sessions_runtime(config, memory).tools_registry
+    }
+
+    fn production_sessions_runtime(
+        config: &crate::config::Config,
+        memory: &Arc<crate::memory::SqliteMemory>,
+    ) -> crate::gateway::TurnRuntimeGeneration {
         let manager = crate::config::new_shared(config.clone());
         let shared: Arc<dyn crate::memory::Memory> = memory.clone();
         let hooks = Arc::new(crate::hooks::HookManager::new(config.workspace_dir.clone()));
-        let runtime = crate::gateway::build_gateway_turn_runtime(
+        crate::gateway::build_gateway_turn_runtime(
             manager.pin(),
             manager.clone(),
             shared,
@@ -4212,8 +4257,7 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             #[cfg(feature = "wasm-plugins")]
             None,
         )
-        .expect("test: the production gateway turn runtime must build");
-        Arc::clone(&runtime.tools_registry)
+        .expect("test: the production gateway turn runtime must build")
     }
 
     /// Drive one MCP tool call against `registry` and return the wire response,
@@ -6503,6 +6547,103 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         }
     }
 
+    /// Dispatch a webhook-owned spawn through the same admitted execution
+    /// binding used by a production turn. The credential-qualified sender is
+    /// the external subject from `GatewayFabricContext::webhook_owner_id`, so
+    /// the recorded parent and later gateway control calls share one owner.
+    async fn run_admitted_webhook_spawn(
+        runtime: &crate::gateway::TurnRuntimeGeneration,
+        memory: Arc<dyn crate::memory::Memory>,
+        sender: &str,
+        args: Value,
+    ) -> anyhow::Result<crate::tools::ToolResult> {
+        let fabric =
+            super::super::GatewayFabricContext::generic_webhook(Some(sender), &format!("bearer:{sender}-token"), None);
+        let generation = Arc::clone(&runtime.config_generation);
+        let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
+        let owner_id = fabric
+            .webhook_owner_id(&workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("credential-scoped webhook owner missing"))?;
+        let input = "sessions_spawn admitted webhook fixture";
+        let envelope = crate::runtime::envelope::RuntimeEnvelope::gateway(
+            workspace_id.clone(),
+            fabric.session_key.clone(),
+            fabric.channel.clone(),
+            fabric.sender.clone(),
+            fabric.recipient.clone(),
+            crate::memory::MemoryVisibility::Session,
+        )
+        .with_owner_id(owner_id)
+        .with_run_id(format!("prx-gateway-owner-vis-{sender}"))
+        .with_config_generation(&generation);
+        let event_fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace_id)
+            .with_event_recording(generation.effective.memory.event_recording_config());
+        let event = event_fabric
+            .record_inbound_user_message(envelope.message_scope(), input, None, None)
+            .await?;
+        let receipt = crate::gateway::decision_source::GatewaySourceReceipt::issue(
+            memory.as_ref(),
+            &generation,
+            &envelope,
+            input,
+            &event,
+        )
+        .await?;
+        let proof = receipt.bind(runtime, &fabric)?;
+        let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
+        let service = crate::runtime::turn_publication::TurnDecisionPublication {
+            generation,
+            registry: Arc::clone(&runtime.tools_registry),
+            mcp_tool: runtime.mcp_tool.clone(),
+            security,
+            observer: Arc::new(crate::observability::noop::NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(
+                runtime.config_generation.effective.workspace_dir.clone(),
+            )),
+            memory,
+            plugin_generation: 0,
+        }
+        .publish(crate::causal_tree::state::TurnSurfaceKind::Server)
+        .await?;
+        crate::runtime::turn_cleanup::current_tracker()
+            .ok_or_else(|| anyhow::anyhow!("gateway fixture cleanup owner missing"))?
+            .retain_service(Arc::clone(&service));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = service
+            .decide_agent_initial(
+                &proof,
+                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                &cancellation,
+            )
+            .await?;
+        let specs = service.agent_execution_specs(&proof, &context)?;
+        let execution_context = crate::tools::ToolExecutionContext::new(
+            proof.envelope().clone(),
+            crate::runtime::turn_source::TurnSourceProof::policy_chat_type(&proof),
+        );
+        let (execution, execution_context) =
+            service.bind_agent_execution(&proof, &context, &execution_context, &specs.specs)?;
+        let outcome = crate::runtime::child_source::scope_ordinary_provider_fixture(
+            Arc::clone(&runtime.provider),
+            crate::providers::selection::default_provider(&runtime.config_generation.effective).to_owned(),
+            runtime.model.clone(),
+            execution.execute(
+                crate::tools::ToolExecutionCommand::new("sessions_spawn", args),
+                execution_context,
+                Some(cancellation),
+            ),
+        )
+        .await;
+        match (outcome.result, outcome.error) {
+            (Some(result), _) => Ok(result),
+            (None, Some(error)) => Err(anyhow::anyhow!(error)),
+            (None, None) => Err(anyhow::anyhow!(
+                "admitted webhook spawn ended with status {:?} and no result",
+                outcome.status
+            )),
+        }
+    }
+
     /// A run `sessions_spawn` recorded for the webhook client `alice`: the
     /// scope is `RuntimeEnvelope::sessions_spawn` with alice's channel and
     /// sender, so its owner and its `workspace` visibility are production's.
@@ -6625,20 +6766,24 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
     async fn webhook_turn_cannot_list_read_kill_or_steer_another_owners_live_run() {
         const LIVE_TASK: &str = "prx webhook alice live sub-agent task";
         let workspace = TempDir::new().expect("test: temp workspace");
-        let config = production_mcp_test_config(workspace.path());
+        let config = production_spawn_test_config(workspace.path());
         let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
-        let registry = production_sessions_registry(&config, &memory);
-
-        let (spawn_error, spawned) = run_turn_tool(
-            &registry,
-            &config,
-            webhook_turn_context(workspace.path(), "alice"),
-            "sessions_spawn",
-            serde_json::json!({ "task": LIVE_TASK }),
-        )
-        .await;
-        assert!(!spawn_error, "test: alice's spawn must be accepted: {spawned}");
-        let run_id = spawned_run_id(&spawned);
+        let runtime = production_sessions_runtime(&config, &memory);
+        let registry = Arc::clone(&runtime.tools_registry);
+        let shared_memory: Arc<dyn crate::memory::Memory> = memory.clone();
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("test: admitted webhook cleanup owner");
+        let spawned = cleanup
+            .scope_admission(Box::pin(run_admitted_webhook_spawn(
+                &runtime,
+                shared_memory,
+                "alice",
+                serde_json::json!({ "task": LIVE_TASK }),
+            )))
+            .await
+            .expect("test: admitted webhook spawn");
+        assert!(spawned.success, "test: alice's spawn must be accepted: {spawned:?}");
+        let run_id = spawned_run_id(&spawned.output);
         let mallory = || webhook_turn_context(workspace.path(), "mallory");
 
         let (_, listed) = run_turn_tool(
@@ -6705,6 +6850,10 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             !own.contains("killed by user"),
             "mallory's kill must not have landed: {own}"
         );
+        cleanup
+            .run(async { Ok(()) })
+            .await
+            .expect("test: admitted webhook and child cleanup must be confirmed");
     }
 
     /// SP-MCP V02-R9 test 11, end to end through the real handler now that
