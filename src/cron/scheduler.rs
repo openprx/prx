@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_plain_message_reaches_provider_with_default_causal_config() {
+    async fn cron_default_short_instruction_reaches_provider() {
         use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL, PROBE_REPLY};
 
         let tmp = TempDir::new().unwrap();
@@ -1906,7 +1906,7 @@ mod tests {
         );
         let mut job = test_job("");
         job.job_type = JobType::Agent;
-        job.prompt = Some("hello".to_string());
+        job.prompt = Some("Say hello".to_string());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_agent_job(&config, &security, &job, None).await;
@@ -1919,6 +1919,39 @@ mod tests {
                 .iter()
                 .any(|request| request.path.contains("chat/completions")),
             "test: the Cron turn reached the serving provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_default_remember_note_selects_and_executes_memory_store() {
+        const NOTE: &str = "PRX cron default-entry memory note";
+
+        let tmp = TempDir::new().unwrap();
+        let model = ScriptedStoreModel::start("cron-default-entry-note", NOTE).await;
+        let mut config = model.config(tmp.path());
+        assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        config.cost.prices.insert(
+            format!(
+                "{}/cron-origin-model",
+                config.default_provider.as_deref().expect("fixture provider")
+            ),
+            crate::config::schema::ModelPricing {
+                input: 0.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+
+        schedule_and_run_agent_job(&config, Surface::AgentCli, "remember the note for later").await;
+
+        assert!(
+            model.saw_a_successful_store(),
+            "test: the default-entry memory_store call executed"
+        );
+        assert!(
+            shared_prompt_contains(&config, NOTE),
+            "test: the operator-created memory_store reached the shared memory"
         );
     }
 
