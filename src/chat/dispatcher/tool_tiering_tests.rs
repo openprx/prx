@@ -340,7 +340,6 @@ async fn plain_answer_offers_for(
     let cancellation = CancellationToken::new();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
-    config.causal_tree.enabled = false;
     config.tool_tiering = tiering;
     config.autonomy.level = autonomy;
     let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
