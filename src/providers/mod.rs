@@ -42,6 +42,8 @@ pub(crate) mod credential_probe;
 #[cfg(test)]
 pub(crate) mod label_redaction_tests;
 #[cfg(test)]
+pub(crate) mod test_fixture;
+#[cfg(test)]
 mod tool_dialect_config_tests;
 #[cfg(test)]
 pub(crate) mod tool_schema_refusal_tests;
@@ -2691,6 +2693,11 @@ fn create_provider_with_url_and_options(
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
+
+    #[cfg(test)]
+    if let Some(provider) = test_fixture::build(name) {
+        return Ok(provider);
+    }
 
     // ── Bring Your Own Provider (custom URL) ───────────
     // Format: "custom:https://your-api.com", "custom:http://localhost:1234",

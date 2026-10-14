@@ -3541,7 +3541,7 @@ async fn run_channel_turn(
 
     let route_display = route.display_provider().into_owned();
     let selected_provider = vision_scope.as_ref().map_or_else(
-        || decision_turn.build_provider(ctx.as_ref()),
+        || decision_turn.build_provider(),
         |scope| {
             let selected = scope.accounting.selected_model();
             Ok((
@@ -4753,9 +4753,34 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         }
         return ctx;
     }
-    let fixture_provider = Arc::clone(&ctx.provider);
     let mut config = ctx.config.load_full().as_ref().clone();
     let fixture_provider_name = ctx.default_provider.as_str().to_owned();
+    let provider_cache = ctx.provider_cache.lock().clone();
+    let fixture_provider = provider_cache
+        .get(&fixture_provider_name)
+        .cloned()
+        .unwrap_or_else(|| Arc::clone(&ctx.provider));
+    let fixture_label_for = |provider: &Arc<dyn Provider>| {
+        let identity = Arc::as_ptr(provider).cast::<()>() as usize;
+        format!("custom:http://127.0.0.1/prx-channel-fixture-{identity:x}")
+    };
+    let mut fixture_providers = HashMap::new();
+    fixture_providers.insert(
+        fixture_provider_name.clone(),
+        (fixture_label_for(&fixture_provider), Arc::clone(&fixture_provider)),
+    );
+    for (name, provider) in provider_cache {
+        fixture_providers
+            .entry(name)
+            .or_insert_with(|| (fixture_label_for(&provider), provider));
+    }
+    for (label, provider) in fixture_providers.values() {
+        crate::providers::test_fixture::register(label, Arc::clone(provider));
+    }
+    let fixture_label = fixture_providers
+        .get(&fixture_provider_name)
+        .map(|(label, _)| label.clone())
+        .expect("legacy channel fixture default provider");
     config.workspace_dir = ctx.workspace_dir.as_ref().clone();
     config.config_path = config.workspace_dir.join("config.toml");
     if split_generation {
@@ -4775,60 +4800,55 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         config.memory.events.record_assistant_messages = ctx.memory_event_recording.record_assistant_messages;
         config.memory.events.record_tool_events = ctx.memory_event_recording.record_tool_events;
     }
-    config.default_provider = Some("mock".to_owned());
+    config.default_provider = Some(fixture_label.clone());
     for route in &mut config.model_routes {
-        if route.provider == fixture_provider_name {
-            route.provider = "mock".to_owned();
+        if let Some((label, _)) = fixture_providers.get(&route.provider) {
+            route.provider.clone_from(label);
         }
     }
     for route in &mut config.router.models {
-        if route.provider == fixture_provider_name {
-            route.provider = "mock".to_owned();
+        if let Some((label, _)) = fixture_providers.get(&route.provider) {
+            route.provider.clone_from(label);
         }
     }
     for model in &mut config.providers.models {
-        if model.provider == fixture_provider_name {
-            model.provider = "mock".to_owned();
+        if let Some((label, _)) = fixture_providers.get(&model.provider) {
+            model.provider.clone_from(label);
         }
     }
-    for tool in ctx.tools_registry.iter() {
-        let name = tool.name();
-        if !config
-            .tool_tiering
-            .always_exclude
-            .iter()
-            .any(|excluded| excluded == name)
-            && !config
-                .tool_tiering
-                .always_include
-                .iter()
-                .any(|included| included == name)
-        {
-            config.tool_tiering.always_include.push(name.to_owned());
-        }
-    }
-    let mut fixture_models = vec![
+    let mut fixture_routes = vec![(
+        fixture_label.clone(),
         config
             .default_model
             .clone()
             .unwrap_or_else(|| ctx.model.as_str().to_owned()),
-    ];
-    fixture_models.extend(ctx.route_overrides.lock().values().map(|route| route.model.clone()));
-    fixture_models.sort();
-    fixture_models.dedup();
-    for model in fixture_models {
-        if !ctx.tools_registry.is_empty()
-            && !config.providers.models.iter().any(|entry| {
-                entry.provider.eq_ignore_ascii_case("mock")
-                    && entry
-                        .model
-                        .as_deref()
-                        .is_some_and(|declared| declared.eq_ignore_ascii_case(&model))
-            })
-        {
+        Arc::clone(&fixture_provider),
+    )];
+    for route in ctx.route_overrides.lock().values() {
+        if let Some((label, provider)) = fixture_providers.get(&route.provider) {
+            fixture_routes.push((label.clone(), route.model.clone(), Arc::clone(provider)));
+        }
+    }
+    fixture_routes.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    fixture_routes.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+    for (label, model, provider) in fixture_routes {
+        if !config.providers.models.iter().any(|entry| {
+            entry.provider.eq_ignore_ascii_case(&label)
+                && entry
+                    .model
+                    .as_deref()
+                    .is_some_and(|declared| declared.eq_ignore_ascii_case(&model))
+        }) {
             config.providers.models.push(
                 toml::from_str(&format!(
-                    "provider = \"mock\"\nmodel = {model:?}\noperations = [\"chat\"]\nnative_tools = true\n"
+                    "provider = {label:?}\nmodel = {model:?}\noperations = [\"chat\"]\nnative_tools = {}\nvision_input = {}\n",
+                    !config.tool_tiering.always_include.is_empty()
+                        || provider
+                            .capabilities_for(&model, crate::providers::traits::ProviderRequestMode::NonStreaming)
+                            .native_tool_calling,
+                    provider
+                        .capabilities_for(&model, crate::providers::traits::ProviderRequestMode::NonStreaming)
+                        .vision
                 ))
                 .expect("legacy channel fixture model declaration"),
             );
@@ -4836,7 +4856,7 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         config
             .cost
             .prices
-            .entry(format!("mock/{model}"))
+            .entry(format!("{label}/{model}"))
             .or_insert(crate::config::schema::ModelPricing {
                 input: 1.0,
                 output: 1.0,
@@ -4845,11 +4865,9 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
             });
     }
     for route in ctx.route_overrides.lock().values() {
-        let provider = if route.provider == fixture_provider_name {
-            "mock"
-        } else {
-            route.provider.as_str()
-        };
+        let provider = fixture_providers
+            .get(&route.provider)
+            .map_or(route.provider.as_str(), |(label, _)| label.as_str());
         config
             .cost
             .prices
@@ -4862,13 +4880,12 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
             });
     }
     let owned = Arc::make_mut(&mut ctx);
-    owned.provider_cache.lock().insert("mock".to_owned(), fixture_provider);
     for route in owned.route_overrides.lock().values_mut() {
-        if route.provider == fixture_provider_name {
-            route.provider = "mock".to_owned();
+        if let Some((label, _)) = fixture_providers.get(&route.provider) {
+            route.provider.clone_from(label);
         }
     }
-    owned.default_provider = Arc::new("mock".to_owned());
+    owned.default_provider = Arc::new(fixture_label);
     if !matches!(owned.memory.name(), "sqlite" | "lucid" | "postgres" | "none") {
         recording_fixture::attach_ledger_only(owned);
     }
@@ -8401,6 +8418,13 @@ mod tests {
             .collect()
     }
 
+    fn tiering_for_test_tools(tools: &[Box<dyn Tool>]) -> crate::config::ToolTieringConfig {
+        crate::config::ToolTieringConfig {
+            always_include: tools.iter().map(|tool| tool.name().to_owned()).collect(),
+            ..crate::config::ToolTieringConfig::default()
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -8876,7 +8900,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig {
+                always_include: vec!["mock_price".to_string()],
+                ..crate::config::ToolTieringConfig::default()
+            },
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -9095,7 +9122,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig {
+                always_include: vec!["append_line".to_string()],
+                ..crate::config::ToolTieringConfig::default()
+            },
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -9256,6 +9286,7 @@ BTC is currently around $65,000 based on latest tool output."#
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
+        let tool_tiering = tiering_for_test_tools(&tools);
         Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
             config: crate::config::new_shared(Config::default()),
@@ -9284,7 +9315,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(workspace_dir.to_path_buf()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering,
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -9442,6 +9473,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+        let tool_tiering = tiering_for_test_tools(&tools);
         Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
             config: crate::config::new_shared(Config::default()),
@@ -9470,7 +9502,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering,
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -10059,7 +10091,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig {
+                always_include: vec!["mock_price".to_string()],
+                ..crate::config::ToolTieringConfig::default()
+            },
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -10150,7 +10185,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig {
+                always_include: vec!["mock_price".to_string()],
+                ..crate::config::ToolTieringConfig::default()
+            },
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -10634,7 +10672,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig {
+                always_include: vec!["mock_price".to_string()],
+                ..crate::config::ToolTieringConfig::default()
+            },
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -11322,15 +11363,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::panic::resume_unwind(panic);
             }
             Ok(work) => {
-                // The production dispatcher records a failed child cleanup and
-                // still completes the message worker. Direct probes mirror that
-                // behavior while retaining the independently drained owner.
-                if let Err(error) = work {
-                    tracing::warn!(%error, "channel probe child cleanup did not complete");
-                }
-                if let Err(error) = drained {
-                    tracing::warn!(%error, "channel probe parent cleanup did not complete");
-                }
+                work.expect("channel probe child cleanup");
+                drained.expect("channel probe parent cleanup");
             }
         }
     }
@@ -14537,6 +14571,7 @@ After"#;
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
+        let tool_tiering = tiering_for_test_tools(tools_registry.as_ref());
 
         Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
@@ -14566,7 +14601,7 @@ After"#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
 
-            tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_tiering,
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["prx".to_string()],
@@ -15177,6 +15212,15 @@ After"#;
             api_key: Some("PRX-CHANNEL-ROUTE-KEY".to_string()),
             credential_ref: None,
         });
+        config.cost.prices.insert(
+            format!("{}/{PROBE_MODEL}", route.custom_provider()),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         let manager = crate::config::new_shared(config);
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();

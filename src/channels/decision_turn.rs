@@ -102,48 +102,21 @@ impl ChannelDecisionTurn {
 
     pub(super) fn build_provider(
         &self,
-        ctx: &super::ChannelRuntimeContext,
     ) -> anyhow::Result<(super::ChannelRouteSelection, Arc<dyn crate::providers::Provider>)> {
         let resolved = self.service.resolve_agent_model(&self.proof)?;
-        #[cfg(test)]
-        if let Some(provider) = ctx.provider_cache.lock().get(resolved.provider_label()).cloned() {
-            return Ok((
-                super::ChannelRouteSelection {
-                    provider: resolved.provider_label().to_owned(),
-                    model: resolved.model().to_owned(),
-                },
-                provider,
-            ));
-        }
-        #[cfg(test)]
-        if resolved.provider_label() == ctx.default_provider.as_str() {
-            return Ok((
-                super::ChannelRouteSelection {
-                    provider: resolved.provider_label().to_owned(),
-                    model: resolved.model().to_owned(),
-                },
-                Arc::clone(&ctx.provider),
-            ));
-        }
-        #[cfg(not(test))]
-        let _ = ctx;
         let catalog = crate::providers::selection::catalog_for(&self.config);
         let provider = crate::providers::create_provider_for(
             &resolved,
             &catalog,
             &self.config.reliability,
             &crate::providers::provider_runtime_options_from_config(&self.config),
-        );
-        #[cfg(test)]
-        let provider = Arc::from(provider?);
-        #[cfg(not(test))]
-        let provider = Arc::from(provider?);
+        )?;
         Ok((
             super::ChannelRouteSelection {
                 provider: resolved.provider_label().to_owned(),
                 model: resolved.model().to_owned(),
             },
-            provider,
+            Arc::from(provider),
         ))
     }
 
