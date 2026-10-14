@@ -501,6 +501,10 @@ values = [1, 2, 3]
 
 fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
     prepare_owned_chat_fixture(guard, "mock", "mock");
+    build_unprepared_chat_command_in(guard, extra_args, extra_env)
+}
+
+fn build_unprepared_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(prx_binary());
     cmd.arg("chat");
     cmd.arg("-p").arg("mock");
@@ -1678,6 +1682,58 @@ fn ordinary_plain_second_turn_reaches_the_serving_model() {
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
         "plain conversation should exit cleanly"
+    );
+}
+
+/// The default decision policy must serve a plain turn without an operator
+/// capability declaration for the selected model. The mock's zero tariff is
+/// test accounting only; the causal tree and provider capability catalog stay
+/// exactly at their defaults.
+#[test]
+#[serial(prx_chat_pty)]
+fn default_config_plain_turn_reaches_the_model_without_a_model_declaration() {
+    let sentinel = "[MOCK-DEFAULT-CONFIG]";
+    let guard = new_harness_guard().expect("build default-config chat harness");
+    let defaults = openprx::config::Config::default();
+    let mut config = defaults.clone();
+    config.cost.prices.insert(
+        "mock/mock".to_string(),
+        openprx::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    assert_eq!(config.causal_tree, defaults.causal_tree);
+    assert_eq!(config.providers.models, defaults.providers.models);
+    assert!(
+        config.providers.models.is_empty(),
+        "default config has no model declarations"
+    );
+    std::fs::write(
+        guard.config_dir.join("config.toml"),
+        toml::to_string_pretty(&config).expect("serialize default decision fixture"),
+    )
+    .expect("write default decision fixture");
+
+    let command = build_unprepared_chat_command_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let mut session_guard = SessionGuard::new(spawn_chat_command(command));
+    let session = session_guard.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session.send("hello\r").expect("send default-config plain turn");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "a default-config plain turn should reach the model instead of Clarify: {captured}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "default-config plain conversation should exit cleanly"
     );
 }
 
