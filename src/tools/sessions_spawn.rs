@@ -2498,6 +2498,47 @@ fn watch_task_mode_monitor(
     });
 }
 
+/// Install the same externally-owned task monitor as a production task-mode
+/// spawn on a test registry row.
+///
+/// Tests that exercise kill through a public tool must give a `Running` row
+/// the owner production always installs. The watcher, rather than the caller,
+/// remains responsible for joining the aborted task, committing its terminal
+/// status, and publishing finalization to the kill request.
+#[cfg(test)]
+pub(crate) async fn attach_test_task_mode_owner(
+    active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let task_control = TaskRunControl::new();
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let abort_handle = handle.abort_handle();
+    task_control.attach(abort_handle.clone());
+    {
+        let mut runs = active_runs.write().await;
+        let run = runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .ok_or_else(|| anyhow::anyhow!("test task row `{run_id}` is unavailable"))?;
+        anyhow::ensure!(
+            run.task_control.is_none() && run.abort_handle.is_none(),
+            "test task row `{run_id}` already has a termination owner"
+        );
+        run.task_control = Some(Arc::clone(&task_control));
+        run.abort_handle = Some(abort_handle);
+    }
+    watch_task_mode_monitor(
+        handle,
+        active_runs,
+        run_id.to_owned(),
+        None,
+        Some(task_control),
+        None,
+        None,
+    );
+    Ok(())
+}
+
 /// Process-mode counterpart of [`watch_task_mode_monitor`].
 ///
 /// Routes through [`commit_process_owner_failure_if_unfinalized`] so the run's

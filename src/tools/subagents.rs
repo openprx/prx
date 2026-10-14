@@ -543,7 +543,7 @@ mod tests {
     use super::*;
     use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
     use crate::memory::{MemoryPrincipal, SqliteMemory};
-    use crate::tools::sessions_spawn::{ProcessRunControl, SessionsSpawnTool};
+    use crate::tools::sessions_spawn::{ProcessRunControl, SessionsSpawnTool, attach_test_task_mode_owner};
     use chrono::Utc;
 
     /// The shared action contract every action-dispatched tool is held to:
@@ -676,6 +676,9 @@ mod tests {
             run.batch_id = Some("batch-1".to_string());
             guard.push(run);
         }
+        attach_test_task_mode_owner(Arc::clone(&runs), "batch-victim")
+            .await
+            .expect("test: running batch member has a task owner");
 
         let subagents = SubagentsTool::new(runs.clone());
         let killed = subagents
@@ -724,6 +727,9 @@ mod tests {
     async fn kill_running_marks_failed() {
         let run = make_run("run-1", SubAgentStatus::Running);
         let runs = Arc::new(RwLock::new(vec![run]));
+        attach_test_task_mode_owner(Arc::clone(&runs), "run-1")
+            .await
+            .expect("test: running sub-agent has a task owner");
         let tool = SubagentsTool::with_security(
             runs.clone(),
             Arc::new(crate::security::SecurityPolicy {
@@ -833,6 +839,9 @@ mod tests {
         run.source_message_event_id = Some("msg-a".to_string());
         run.parent_run_id = Some("parent-a".to_string());
         let runs = Arc::new(RwLock::new(vec![run]));
+        attach_test_task_mode_owner(Arc::clone(&runs), "run-kill-ledger")
+            .await
+            .expect("test: recorded sub-agent has a task owner");
         let tool = SubagentsTool::with_security(
             runs.clone(),
             Arc::new(crate::security::SecurityPolicy {
@@ -1299,6 +1308,9 @@ mod tests {
         run.owner_id = Some(alice_owner);
         run.steer_tx = Some(steer_tx);
         let runs = Arc::new(RwLock::new(vec![run]));
+        attach_test_task_mode_owner(Arc::clone(&runs), "run-alice")
+            .await
+            .expect("test: owner-scoped sub-agent has a task owner");
 
         let (_, listed) = ov_run(&runs, ov_context("mallory", false), json!({"action": "list"})).await;
         assert!(
