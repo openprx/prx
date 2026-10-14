@@ -21,12 +21,12 @@ pub struct RuntimeEnvelope {
     /// under this envelope (C03 / V02-R4).
     ///
     /// Set only by trusted internal context for an externally authenticated
-    /// origin whose `session_key` and `sender` are derived from a caller-chosen
-    /// identifier alone — today the MCP execution context, whose key is
-    /// `mcp:{external_subject}`. Every in-process origin (chat, channel, agent,
-    /// cron, xin, sub-agent) leaves this `false` and keeps its historical
-    /// semantics. Flows into [`MemoryPrincipal::require_owner_match`] and, via
-    /// the service-authored `_zc_scope`, into tools that rebuild a principal.
+    /// origin whose caller identity must confine memory reads. This includes
+    /// MCP execution, authenticated Console sessions, and owner-bound Xin
+    /// tasks. Ordinary in-process chat, channel, agent, cron, and sub-agent
+    /// turns leave this `false` and keep their historical semantics. Flows into
+    /// [`MemoryPrincipal::require_owner_match`] and every turn-owned document
+    /// or tool principal rebuilt from this envelope.
     pub owner_isolated: bool,
     pub topic_id: Option<String>,
     pub task_id: Option<String>,

@@ -10,6 +10,12 @@ pub(crate) struct DocumentIngestRuntime {
     pub(super) memory: Arc<dyn Memory>,
     pub(super) workspace_id: String,
     pub(super) owner_id: Option<String>,
+    /// Whether document reads for this turn must match `owner_id` exactly.
+    ///
+    /// Authenticated external entrypoints set this on their runtime envelope;
+    /// retaining it here keeps ingest provenance and context-page recall on
+    /// the same owner boundary as the rest of the turn.
+    pub(super) require_owner_match: bool,
     pub(super) topic_id: Option<String>,
     pub(super) task_id: Option<String>,
     pub(super) source_message_event_id: Option<String>,
@@ -44,6 +50,7 @@ impl DocumentIngestRuntime {
             memory,
             workspace_id: envelope.workspace_id.clone(),
             owner_id: Some(envelope.resolved_owner_id()),
+            require_owner_match: envelope.owner_isolated,
             topic_id: envelope.topic_id.clone(),
             task_id: envelope.resolved_task_id().map(ToString::to_string),
             source_message_event_id: envelope.source_message_event_id.clone(),
@@ -80,6 +87,9 @@ impl DocumentIngestRuntime {
             memory,
             workspace_id,
             owner_id,
+            // ScopeContext is used by in-process callers, whose historical
+            // workspace/session sharing semantics are intentionally retained.
+            require_owner_match: false,
             topic_id: scope.topic_id.map(ToString::to_string),
             task_id: scope.task_id.map(ToString::to_string),
             source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
@@ -137,8 +147,7 @@ impl DocumentIngestRuntime {
             channel: self.channel.clone(),
             sender: self.sender.clone(),
             owner_id: self.owner_id.clone(),
-            // In-process agent turn: the historical sender/session semantics apply.
-            require_owner_match: false,
+            require_owner_match: self.require_owner_match,
             legacy_session_key: self.legacy_session_key.clone(),
         }
     }

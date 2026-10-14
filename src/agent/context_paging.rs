@@ -4,7 +4,7 @@ use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::history::drop_orphan_tool_results_at;
 use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
 use crate::agent::turn_contracts::OS_PAGING_RECALL_MARKER;
-use crate::memory::{DocumentIngestInput, MemoryPrincipal};
+use crate::memory::DocumentIngestInput;
 use crate::providers::ChatMessage;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -244,18 +244,7 @@ pub(super) async fn recall_context_pages(
         return None;
     }
     let limit = paging.max_recalled_pages.max(1);
-    let principal = MemoryPrincipal {
-        workspace_id: runtime.workspace_id.clone(),
-        agent_id: runtime.agent_id.clone(),
-        persona_id: runtime.persona_id.clone(),
-        session_key: runtime.session_key.clone(),
-        channel: runtime.channel.clone(),
-        sender: runtime.sender.clone(),
-        owner_id: runtime.owner_id.clone(),
-        // In-process agent turn: the historical sender/session semantics apply.
-        require_owner_match: false,
-        legacy_session_key: None,
-    };
+    let principal = runtime.memory_principal();
     // Over-fetch then filter to context pages, since search spans all docs in
     // the workspace/owner scope (tool outputs, ingested files, etc.).
     let fetch = limit.saturating_mul(4).max(limit);

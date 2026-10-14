@@ -7,9 +7,11 @@ const OWNERS: [(&str, &str, &str); 2] = [
     ("prx-owner-a-token", "prx-owner-a-session", "prx owner a content"),
     ("prx-owner-b-token", "prx-owner-b-session", "prx owner b content"),
 ];
+const CONTEXT_SENTINELS: [&str; 2] = ["PRX_OWNER_A_CONTEXT_SENTINEL", "PRX_OWNER_B_CONTEXT_SENTINEL"];
 
 struct OwnerCollectionProvider {
     calls: AtomicUsize,
+    context_calls: AtomicUsize,
 }
 #[async_trait]
 impl Provider for OwnerCollectionProvider {
@@ -40,7 +42,62 @@ impl Provider for OwnerCollectionProvider {
             matching.len() == 1,
             "collection input must identify exactly one fixture payload"
         );
-        let content = matching.first().context("owner payload")?.2;
+        let current = matching.first().context("owner payload")?;
+        let owner_index = OWNERS
+            .iter()
+            .position(|owner| owner == *current)
+            .context("owner fixture index")?;
+        if input.contains("context isolation probe") {
+            let expected_context = CONTEXT_SENTINELS.get(owner_index).context("owner context sentinel")?;
+            let transcript = request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::ensure!(
+                transcript.contains(expected_context),
+                "authenticated Console turn did not recall its own owner-scoped context page"
+            );
+            for (index, sentinel) in CONTEXT_SENTINELS.iter().enumerate() {
+                if index != owner_index {
+                    anyhow::ensure!(
+                        !transcript.contains(sentinel),
+                        "authenticated Console turn recalled another owner's workspace-visible page"
+                    );
+                }
+            }
+            self.context_calls.fetch_add(1, Ordering::SeqCst);
+            let now = chrono::Utc::now();
+            return Ok(crate::providers::traits::ChatTrace {
+                response: ChatResponse {
+                    text: Some("Owner-isolated context recalled".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "ollama".to_string(),
+                    model: model.to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "ollama".to_string(),
+                final_model: model.to_string(),
+                served_member: None,
+                tokens_used: crate::llm::route_decision::TokenUsage {
+                    prompt_tokens: Some(12),
+                    completion_tokens: Some(8),
+                    total_tokens: Some(20),
+                    source: crate::llm::route_decision::TokenUsageSource::Reported,
+                    ..crate::llm::route_decision::TokenUsage::default()
+                },
+            });
+        }
+        let content = current.2;
         self.calls.fetch_add(1, Ordering::SeqCst);
         // Reuse only the existing controlled main-call trace constructor. Owner
         // payload is selected from the actual raw input, never global ordinal.
@@ -114,6 +171,20 @@ async fn exercise_owners(
         let target = filesystem.resolve(TARGET)?.operation_target().to_path_buf();
         assert!(!target.exists());
         let uri = format!("/sessions/{session}/message");
+        let (status, value) = routed(
+            &app,
+            Method::POST,
+            &uri,
+            Some(token),
+            serde_json::json!({"message":format!("context isolation probe for {content}")}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value.get("reply").and_then(serde_json::Value::as_str),
+            Some("Owner-isolated context recalled")
+        );
+        assert_eq!(provider.context_calls.load(Ordering::SeqCst), index + 1);
         let input = serde_json::json!({"message":format!("file_write: Create {TARGET} containing {content}.")});
         let before = state.mem.list_message_events_since(&scope, 0, 128).await?;
         for unauthorized in [None, Some("prx-unknown-token")] {
@@ -266,8 +337,8 @@ async fn exercise_owners(
             .collect::<Vec<_>>();
         assert_eq!(
             finalized_turns.len(),
-            2,
-            "collection and fresh resume finalize independently"
+            3,
+            "context probe, collection and fresh resume finalize independently"
         );
         let resume_terminal = finalized_turns
             .iter()
@@ -293,7 +364,12 @@ async fn exercise_owners(
             },
             16,
         )?;
-        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions.len(), 3);
+        let direct = decisions
+            .iter()
+            .find(|row| row.directive_kind == "answer")
+            .context("owner-isolated direct-answer decision")?;
+        assert_eq!(direct.session_key.as_deref(), Some(*session));
         let collection = decisions
             .iter()
             .find(|row| row.decision_id.to_string() == id)
@@ -301,7 +377,7 @@ async fn exercise_owners(
         assert_eq!(collection.directive_kind, "collect_approval_arguments");
         let resumed = decisions
             .iter()
-            .find(|row| row.decision_id.to_string() != id)
+            .find(|row| row.directive_kind == "use_tool")
             .context("owner resume decision")?;
         assert_eq!(resumed.backend_kind, "compatible_http");
         assert_eq!(resumed.directive_kind, "use_tool");
@@ -333,6 +409,7 @@ async fn exercise_owners(
         );
     }
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.context_calls.load(Ordering::SeqCst), 2);
     assert_eq!(writes.load(Ordering::SeqCst), 2);
     Ok(())
 }
@@ -346,6 +423,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
     config.config_path = scratch.join("config.toml");
     config.causal_tree.enabled = true;
     config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+    config.agent.compaction.mode = crate::config::AgentCompactionMode::Safeguard;
     config.default_provider = Some("ollama".into());
     config.default_model = Some(MODEL.into());
     config.providers.models.push(toml::from_str(&format!(
@@ -371,6 +449,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     let provider = Arc::new(OwnerCollectionProvider {
         calls: AtomicUsize::new(0),
+        context_calls: AtomicUsize::new(0),
     });
     let writes = Arc::new(AtomicUsize::new(0));
     let mut state = test_app_state(config.clone(), provider.clone());
@@ -391,6 +470,30 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
         ))),
         calls: Arc::clone(&writes),
     })]);
+    for (index, ((token, session, content), sentinel)) in OWNERS.iter().zip(CONTEXT_SENTINELS).enumerate() {
+        let principal = crate::gateway::api::ApiPrincipal::of_token(token);
+        state
+            .mem
+            .ingest_document(crate::memory::DocumentIngestInput {
+                document_id: Some(format!("context-page:console-owner-{index}")),
+                workspace_id: workspace.to_string_lossy().into_owned(),
+                owner_id: Some(principal.owner_id),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "context_page".to_string(),
+                source_uri: None,
+                title: None,
+                content: format!("{content} {sentinel}"),
+                mime_type: Some("text/plain".to_string()),
+                visibility: crate::memory::MemoryVisibility::Workspace,
+                metadata_json: None,
+                session_key: Some((*session).to_string()),
+                agent_id: None,
+                persona_id: None,
+            })
+            .await?;
+    }
     let mut runtime = state.pin_turn_runtime();
     let resolved = crate::providers::selection::check(
         &config,
@@ -469,10 +572,10 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "one actual controlled decision request per fresh approved resume"
+        4,
+        "one controlled decision request per direct probe and fresh approved resume"
     );
-    // All four whole turns remain durable after owned cleanup drains.
+    // All six whole turns remain durable after owned cleanup drains.
     for (token, session, _) in OWNERS {
         let scope = console_runtime_envelope_for_workspace(
             workspace.to_string_lossy().as_ref(),
@@ -489,7 +592,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
                 .iter()
                 .filter(|event| event.event_type == "turn.finalized")
                 .count(),
-            2
+            3
         );
     }
     Ok(())

@@ -29,7 +29,8 @@ fn document_ingest_runtime_inherits_envelope_lineage() {
         .with_task_id("task-a")
         .with_source_message_event_id("msg-a")
         .with_agent_id("agent-a")
-        .with_persona_id("persona-a");
+        .with_persona_id("persona-a")
+        .with_owner_isolation();
 
     let runtime = DocumentIngestRuntime::from_envelope(memory, &envelope);
 
@@ -40,6 +41,8 @@ fn document_ingest_runtime_inherits_envelope_lineage() {
     assert_eq!(runtime.session_key.as_deref(), Some("agent:run-child"));
     assert_eq!(runtime.agent_id.as_deref(), Some("agent-a"));
     assert_eq!(runtime.persona_id.as_deref(), Some("persona-a"));
+    assert!(runtime.require_owner_match);
+    assert!(runtime.memory_principal().require_owner_match);
 }
 
 #[tokio::test]
@@ -76,6 +79,7 @@ fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
         memory,
         workspace_id,
         owner_id: Some(owner_id),
+        require_owner_match: false,
         topic_id: None,
         task_id: None,
         source_message_event_id: None,

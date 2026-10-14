@@ -229,6 +229,56 @@ async fn os_paging_evicts_cold_context_into_document_store_and_recalls() {
     );
 }
 
+/// An externally authenticated turn must retain its owner-isolation bit when
+/// OS paging rebuilds the document-search principal. Workspace visibility does
+/// not override that boundary: only the matching owner's page may be recalled.
+#[tokio::test]
+async fn owner_isolated_context_paging_recall_excludes_another_owners_workspace_page() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().to_string_lossy().to_string();
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    for (owner, document_id, sentinel) in [
+        ("owner-a", "context-page:owner-a", "OWNER_A_CONTEXT_SENTINEL"),
+        ("owner-b", "context-page:owner-b", "OWNER_B_CONTEXT_SENTINEL"),
+    ] {
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some(document_id.to_string()),
+            workspace_id: workspace.clone(),
+            owner_id: Some(owner.to_string()),
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: OS_PAGING_SOURCE_KIND.to_string(),
+            source_uri: None,
+            title: None,
+            content: format!("isolation beacon {sentinel}"),
+            mime_type: Some("text/plain".to_string()),
+            visibility: crate::memory::MemoryVisibility::Workspace,
+            metadata_json: None,
+            session_key: Some("shared-session".to_string()),
+            agent_id: None,
+            persona_id: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let envelope = RuntimeEnvelope::console(workspace, "shared-session")
+        .with_owner_id("owner-a")
+        .with_owner_isolation();
+    let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+    let recalled = recall_context_pages("isolation beacon", &paging_test_config(true), Some(&runtime))
+        .await
+        .expect("the matching owner's page should be recalled");
+
+    assert!(recalled.content.contains("OWNER_A_CONTEXT_SENTINEL"));
+    assert!(
+        !recalled.content.contains("OWNER_B_CONTEXT_SENTINEL"),
+        "owner-isolated recall must not include another owner's workspace page: {}",
+        recalled.content
+    );
+}
+
 /// A recalled page is a verbatim transcript of earlier turns, so it can carry
 /// the very `[Used tools: ...]` lines that were written before 0.8.137
 /// stopped them. Handing one back to the model is the same fabricated claim
