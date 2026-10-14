@@ -2525,9 +2525,23 @@ async fn run_gateway_chat_with_multimodal(
                     .await?;
                 return Ok(reply.into_owned());
             }
+            let selected_context = crate::agent::memory_loader::format_selected_context(None, context.retrieved()?)?;
+            let semantic_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
+                "webhook"
+            } else {
+                "private"
+            });
+            let recalled_context = crate::agent::context_recall::build_context_with_shared_events_and_scope(
+                state.mem.as_ref(),
+                runtime_envelope.memory_principal(),
+                message,
+                config_snapshot.memory.min_relevance_score,
+                Some(&semantic_scope),
+            )
+            .await;
             let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                preamble: crate::agent::memory_loader::format_selected_context(None, context.retrieved()?)?,
-                ids: Vec::new(),
+                preamble: format!("{selected_context}{}", recalled_context.preamble),
+                ids: recalled_context.ids,
             };
             let enriched_message = if mem_context.preamble.is_empty() {
                 message.to_string()
@@ -4045,14 +4059,16 @@ mod tests {
     }
 
     /// Build the production gateway tool registry over `config` through both
-    /// launch paths, and return `(daemon, prx gateway)`.
+    /// launch paths, and return `(daemon, prx gateway, prx gateway MCP owner)`.
     ///
     /// Every claim about "the gateway tool registry" has to hold on both,
     /// because the MCP endpoint resolves against whichever one its own process
     /// sealed (`AppState.tools_registry` for `prx gateway`,
     /// `TurnRuntimeGeneration.tools_registry` under the daemon). Both are the
     /// real builders, not a fixture: nothing here hand-assembles a tool list.
-    fn production_gateway_registries(config: &Config) -> (Arc<Vec<Box<dyn Tool>>>, Vec<Box<dyn Tool>>) {
+    fn production_gateway_registries(
+        config: &Config,
+    ) -> (Arc<Vec<Box<dyn Tool>>>, Vec<Box<dyn Tool>>, Option<Arc<McpTool>>) {
         let manager = crate::config::new_shared(config.clone());
         let memory: Arc<dyn Memory> =
             Arc::new(SqliteMemory::new(&config.workspace_dir).expect("test: sqlite memory must open"));
@@ -4094,7 +4110,7 @@ mod tests {
         let runtime_adapter: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime).expect("test: the runtime adapter must build"));
         let extensions = hooks.control_tool_arcs(Arc::clone(&security));
-        let mut direct_tools = tools::all_tools_with_runtime_ext_and_extensions(
+        let direct_registry = tools::all_tools_with_runtime_ext_and_extensions(
             Arc::new(config.clone()),
             manager.clone(),
             &security,
@@ -4109,8 +4125,9 @@ mod tests {
             config.api_key.as_deref(),
             config,
             extensions,
-        )
-        .tools;
+        );
+        let direct_mcp = direct_registry.mcp_tool;
+        let mut direct_tools = direct_registry.tools;
         let (_channels_registry, _spawn_tools_handle) = register_gateway_turn_tools(
             &mut direct_tools,
             config,
@@ -4127,7 +4144,7 @@ mod tests {
         )
         .expect("gateway tool registration");
 
-        (Arc::clone(&daemon.tools_registry), direct_tools)
+        (Arc::clone(&daemon.tools_registry), direct_tools, direct_mcp)
     }
 
     /// Assert that every name in `exposed` resolves in both production gateway
@@ -4140,7 +4157,7 @@ mod tests {
             !exposed.is_empty(),
             "sanity: the advertised MCP surface must not be empty, or the loop below passes vacuously"
         );
-        let (daemon, direct) = production_gateway_registries(config);
+        let (daemon, direct, _direct_mcp) = production_gateway_registries(config);
         for (path, registry) in [("the daemon gateway", daemon.as_ref()), ("`prx gateway`", &direct)] {
             for name in exposed {
                 // `supports_name`, not `name()`: this is the exact predicate
@@ -4257,7 +4274,6 @@ mod tests {
     /// Nothing here reaches the network: `api_url` points at a closed loopback
     /// port, and the run is registered before the sub-agent ever contacts a
     /// provider (the pattern proven in `gateway::api::runtime`'s spawn tests).
-    /// The poll below has a deterministic ceiling (AGENTS.md 3.7).
     ///
     /// The assertion is on the run's `source=runtime` marker, not merely on the
     /// task string. `sessions_list` falls through to the memory projection when
@@ -4273,57 +4289,35 @@ mod tests {
     /// stays green.
     #[tokio::test]
     async fn the_gateway_sessions_list_sees_a_run_started_by_the_gateway_sessions_spawn() {
-        let workspace = tempfile::tempdir().unwrap();
-        let config = Config {
-            workspace_dir: workspace.path().to_path_buf(),
-            api_key: Some("test-key".to_string()),
-            // A closed loopback port: the sub-agent's provider call is refused
-            // locally, so the test neither reaches nor waits on a network.
-            api_url: Some("http://127.0.0.1:1".to_string()),
-            ..Config::default()
-        };
-        let manager = crate::config::new_shared(config.clone());
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
-        let hooks = Arc::new(HookManager::new(workspace.path().to_path_buf()));
-        let runtime = build_gateway_turn_runtime(
-            manager.pin(),
-            manager.clone(),
-            memory,
-            None,
-            None,
-            None,
-            None,
-            hooks,
-            #[cfg(feature = "wasm-plugins")]
-            None,
+        let workspace = tempfile::tempdir().expect("test: gateway registry workspace");
+        let state = two_token_webhook_state(workspace.path());
+        let spawned = webhook_as(
+            &state,
+            "token-alpha-0001",
+            "Use sessions_spawn for SHARED-REGISTRY-SPAWN",
+            "registry-probe",
         )
-        .expect("test: the gateway turn runtime must build");
+        .await;
+        assert!(spawned.contains("run_id"), "test: the gateway spawn ran: {spawned}");
 
-        let spawn = runtime
-            .tools_registry
-            .iter()
-            .find(|tool| tool.supports_name("sessions_spawn"))
-            .expect("test: the gateway must publish sessions_spawn");
-        let spawned = spawn
-            .execute(serde_json::json!({
-                "task": SHARED_RUN_REGISTRY_PROBE_TASK,
-                "_zc_scope_trusted": true,
-                "_zc_scope": {
-                    "sender": "prx_operator",
-                    "channel": "gateway",
-                    "chat_type": "direct",
-                    "chat_id": "prx_channel",
-                },
-            }))
-            .await
-            .expect("test: the spawn must be accepted");
-        assert!(spawned.success, "test: spawn failed: {:?}", spawned.error);
-
+        let runtime = state.pin_turn_runtime();
         let list = runtime
             .tools_registry
             .iter()
             .find(|tool| tool.supports_name("sessions_list"))
             .expect("test: the gateway must publish sessions_list");
+        let mut output = String::new();
+        for _ in 0..200 {
+            output = list
+                .execute(serde_json::json!({}))
+                .await
+                .expect("test: sessions_list must answer")
+                .output;
+            if output.contains(SHARED_RUN_REGISTRY_PROBE_TASK) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // `sessions_list` joins one run's lines with a blank line, so a run's
         // `source=` marker and its `task:` line live in the same block.
         fn probe_block(output: &str) -> Option<&str> {
@@ -4332,18 +4326,6 @@ mod tests {
                 .find(|block| block.contains(SHARED_RUN_REGISTRY_PROBE_TASK))
         }
 
-        let mut output = String::new();
-        for _ in 0..200 {
-            output = list
-                .execute(serde_json::json!({}))
-                .await
-                .expect("test: sessions_list must answer")
-                .output;
-            if probe_block(&output).is_some_and(|block| block.contains("source=runtime")) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         let block = probe_block(&output).unwrap_or_default();
         assert!(
             !block.is_empty(),
@@ -6206,19 +6188,55 @@ for line in sys.stdin:
         config.default_provider = Some(root.custom_provider());
         config.default_model = Some("hint:fast".to_string());
         config.api_key = Some("PRX-WEBHOOK-ROOT-KEY".to_string());
+        let route_provider = route.custom_provider();
+        config.cost.prices.insert(
+            format!("{route_provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         config.model_routes.push(crate::config::ModelRouteConfig {
             hint: "fast".to_string(),
-            provider: route.custom_provider(),
+            provider: route_provider,
             model: PROBE_MODEL.to_string(),
             api_key: Some("PRX-WEBHOOK-ROUTE-KEY".to_string()),
             credential_ref: None,
         });
         let options = providers::provider_runtime_options_from_config(&config);
-        let (provider, model, _provider_binding) =
+        let (provider, model, provider_binding) =
             build_gateway_turn_provider(&config, &options).expect("route provider builds");
         let mut state = webhook_test_state(provider);
         state.model = model;
         state.config = crate::config::new_shared(config);
+        state.mem = Arc::new(SqliteMemory::new(workspace.path()).expect("route fixture sqlite"));
+        state.hooks = Arc::new(HookManager::new(workspace.path().to_path_buf()));
+        let generation = state.config.pin();
+        let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
+        let runtime = TurnRuntimeGeneration {
+            provider_binding,
+            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+            config_generation: generation,
+            provider: Arc::clone(&state.provider),
+            model: state.model.clone(),
+            temperature: state.temperature,
+            tools_registry: Arc::clone(&state.tools_registry),
+            mcp_tool: state.mcp_tool.clone(),
+        };
+        state.turn_runtime = Some(Arc::new(GatewayTurnRuntimeOwner::new(
+            runtime,
+            Arc::clone(&state.config),
+            Arc::clone(&state.mem),
+            state.signal.clone(),
+            state.whatsapp.clone(),
+            state.linq.clone(),
+            state.nextcloud_talk.clone(),
+            Arc::clone(&state.hooks),
+            #[cfg(feature = "wasm-plugins")]
+            state.plugin_runtime.clone(),
+        )));
         let response = handle_webhook(
             State(state),
             test_connect_info(),
@@ -6235,18 +6253,29 @@ for line in sys.stdin:
         assert!(root.requests().is_empty());
     }
 
+    fn webhook_test_config() -> Config {
+        let mut config = Config::default();
+        config.default_provider = Some("mock".to_owned());
+        config.default_model = Some("test-model".to_owned());
+        config
+    }
+
     fn webhook_test_state(provider: Arc<dyn Provider>) -> AppState {
+        let workspace = tempfile::tempdir().expect("webhook fixture workspace").keep();
+        let mut config = webhook_test_config();
+        config.workspace_dir = workspace.clone();
+        config.config_path = workspace.join("config.toml");
         AppState {
-            config: crate::config::new_shared(Config::default()),
+            config: crate::config::new_shared(config),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
-            mem: Arc::new(MockMemory),
+            mem: Arc::new(SqliteMemory::new(&workspace).expect("webhook fixture sqlite")),
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             turn_runtime: None,
-            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            hooks: Arc::new(HookManager::new(workspace)),
             webhook_token_hash: None,
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -6269,6 +6298,61 @@ for line in sys.stdin:
         }
     }
 
+    /// Attach the same owned generation and decision slot that gateway startup
+    /// gives every webhook turn. Tests may inject a provider implementation,
+    /// but its model binding, config generation, tool registry, memory and
+    /// cleanup lifetime still travel through the production owner.
+    fn install_webhook_turn_runtime(state: &mut AppState) {
+        let mut config = (*state.config.pin().effective).clone();
+        config.default_model.get_or_insert_with(|| state.model.clone());
+        state.config = crate::config::new_shared(config);
+        let generation = state.config.pin();
+        let config = generation.effective.as_ref();
+        let provider_name = crate::providers::selection::default_provider(config);
+        let model = crate::providers::selection::default_model(config).to_owned();
+        let catalog = crate::providers::selection::catalog_for(config);
+        let resolved = crate::providers::selection::check_with(
+            config,
+            &catalog,
+            provider_name,
+            &model,
+            crate::providers::selection::credential_for(config, provider_name),
+            &crate::providers::catalog::Requirement::chat(),
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .expect("webhook fixture model selection");
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let runtime = TurnRuntimeGeneration {
+            provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                Arc::clone(&state.provider),
+                resolved,
+            ))),
+            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+            config_generation: generation,
+            provider: Arc::clone(&state.provider),
+            model: model.clone(),
+            temperature: state.temperature,
+            tools_registry: Arc::clone(&state.tools_registry),
+            mcp_tool: state.mcp_tool.clone(),
+        };
+        state.model = model;
+        state.turn_runtime = Some(Arc::new(GatewayTurnRuntimeOwner::new(
+            runtime,
+            Arc::clone(&state.config),
+            Arc::clone(&state.mem),
+            state.signal.clone(),
+            state.whatsapp.clone(),
+            state.linq.clone(),
+            state.nextcloud_talk.clone(),
+            Arc::clone(&state.hooks),
+            #[cfg(feature = "wasm-plugins")]
+            state.plugin_runtime.clone(),
+        )));
+    }
+
     /// R3: a webhook turn owns no channel of its own, so `message_send` falls
     /// back to whichever handle the daemon registered — a Signal handle in
     /// production. The turn must therefore name its real origin, or every
@@ -6278,7 +6362,8 @@ for line in sys.stdin:
     async fn a_webhook_turn_names_its_origin_channel_for_outbound_scope() {
         let provider_impl = Arc::new(OriginRecordingProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
+        let mut state = webhook_test_state(provider);
+        install_webhook_turn_runtime(&mut state);
 
         let response = handle_webhook(
             State(state),
@@ -6477,7 +6562,8 @@ for line in sys.stdin:
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
+        let mut state = webhook_test_state(provider);
+        install_webhook_turn_runtime(&mut state);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
@@ -6775,7 +6861,8 @@ for line in sys.stdin:
     async fn webhook_idempotency_same_key_different_body_conflicts() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
+        let mut state = webhook_test_state(provider);
+        install_webhook_turn_runtime(&mut state);
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("body-bound-key"));
 
@@ -6832,7 +6919,8 @@ for line in sys.stdin:
     async fn webhook_idempotency_oversize_success_is_not_reexecuted() {
         let provider_impl = Arc::new(OversizeResponseProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
+        let mut state = webhook_test_state(provider);
+        install_webhook_turn_runtime(&mut state);
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("oversize-result"));
 
@@ -6868,13 +6956,13 @@ for line in sys.stdin:
     #[tokio::test]
     async fn webhook_records_gateway_message_events() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = Config::default();
+        let mut config = webhook_test_config();
         config.workspace_dir = tmp.path().to_path_buf();
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
 
-        let state = AppState {
+        let mut state = AppState {
             config: crate::config::new_shared(config),
             provider,
             model: "test-model".into(),
@@ -6905,6 +6993,7 @@ for line in sys.stdin:
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         };
+        install_webhook_turn_runtime(&mut state);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("gateway-event-1"));
@@ -6936,7 +7025,7 @@ for line in sys.stdin:
             legacy_session_key: None,
         };
         let events = memory
-            .list_message_events_since(&canonical_principal, 0, 10)
+            .list_message_events_since(&canonical_principal, 0, 50)
             .await
             .unwrap();
 
@@ -7011,14 +7100,16 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn webhook_autosave_stores_distinct_keys_per_request() {
+        let workspace = tempfile::TempDir::new().expect("test: autosave workspace");
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
+        let sqlite = Arc::new(SqliteMemory::new(workspace.path()).expect("test: autosave sqlite"));
+        let memory: Arc<dyn Memory> = sqlite.clone();
+        let mut config = webhook_test_config();
+        config.workspace_dir = workspace.path().to_path_buf();
 
-        let tracking_impl = Arc::new(TrackingMemory::default());
-        let memory: Arc<dyn Memory> = tracking_impl.clone();
-
-        let state = AppState {
-            config: crate::config::new_shared(Config::default()),
+        let mut state = AppState {
+            config: crate::config::new_shared(config),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -7048,6 +7139,7 @@ for line in sys.stdin:
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         };
+        install_webhook_turn_runtime(&mut state);
 
         let headers = HeaderMap::new();
 
@@ -7073,7 +7165,13 @@ for line in sys.stdin:
         .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
-        let keys = tracking_impl.keys.lock().clone();
+        let keys = sqlite
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await
+            .expect("test: list autosaved messages")
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));
@@ -7083,14 +7181,16 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn webhook_autosave_skips_group_reply_target() {
+        let workspace = tempfile::TempDir::new().expect("test: autosave workspace");
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
+        let sqlite = Arc::new(SqliteMemory::new(workspace.path()).expect("test: autosave sqlite"));
+        let memory: Arc<dyn Memory> = sqlite.clone();
+        let mut config = webhook_test_config();
+        config.workspace_dir = workspace.path().to_path_buf();
 
-        let tracking_impl = Arc::new(TrackingMemory::default());
-        let memory: Arc<dyn Memory> = tracking_impl.clone();
-
-        let state = AppState {
-            config: crate::config::new_shared(Config::default()),
+        let mut state = AppState {
+            config: crate::config::new_shared(config),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -7120,6 +7220,7 @@ for line in sys.stdin:
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         };
+        install_webhook_turn_runtime(&mut state);
 
         let response = handle_webhook(
             State(state),
@@ -7132,7 +7233,13 @@ for line in sys.stdin:
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(tracking_impl.keys.lock().is_empty());
+        assert!(
+            sqlite
+                .list(Some(&MemoryCategory::Conversation), None)
+                .await
+                .expect("test: list autosaved messages")
+                .is_empty()
+        );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -7263,40 +7370,11 @@ for line in sys.stdin:
     async fn webhook_token_hash_accepts_valid_header() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
 
-        let state = AppState {
-            config: crate::config::new_shared(Config::default()),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            tools_registry: Arc::new(vec![]),
-            mcp_tool: None,
-            turn_runtime: None,
-            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_token_hash: Some(Arc::from(hash_webhook_secret(&secret))),
-            webhook_signing_secret: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
-            whatsapp: None,
-            signal: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            start_time: Instant::now(),
-            gateway_port: 0,
-            logs_broadcast_tx: broadcast::channel(16).0,
-            #[cfg(feature = "wasm-plugins")]
-            plugin_runtime: None,
-        };
+        let mut state = webhook_test_state(provider);
+        state.webhook_token_hash = Some(Arc::from(hash_webhook_secret(&secret)));
+        install_webhook_turn_runtime(&mut state);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Webhook-Token", HeaderValue::from_str(&secret).unwrap());
@@ -7372,41 +7450,11 @@ for line in sys.stdin:
     async fn webhook_signature_accepts_valid_hmac() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
         let body = br#"{"message":"hello"}"#;
 
-        let state = AppState {
-            config: crate::config::new_shared(Config::default()),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            tools_registry: Arc::new(vec![]),
-            mcp_tool: None,
-            turn_runtime: None,
-            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_token_hash: None,
-            webhook_signing_secret: Some(Arc::from(secret.clone())),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
-            whatsapp: None,
-            signal: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            start_time: Instant::now(),
-            gateway_port: 0,
-            logs_broadcast_tx: broadcast::channel(16).0,
-            #[cfg(feature = "wasm-plugins")]
-            plugin_runtime: None,
-        };
+        let mut state = webhook_test_state(provider);
+        state.webhook_signing_secret = Some(Arc::from(secret.clone()));
 
         owned_bound_gateway_fixture(state, |state| async move {
             let mut headers = HeaderMap::new();
@@ -8750,15 +8798,18 @@ for line in sys.stdin:
         config: Config,
         provider: Arc<dyn Provider>,
         tools: Vec<Box<dyn Tool>>,
+        mcp_tool: Option<Arc<McpTool>>,
     ) -> (AppState, Arc<dyn Memory>) {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-        let state = AppState {
+        let mut state = AppState {
             config: crate::config::new_shared(config),
             mem: Arc::clone(&memory),
             tools_registry: Arc::new(tools),
+            mcp_tool,
             hooks: Arc::new(HookManager::new(tmp.path().to_path_buf())),
             ..webhook_test_state(provider)
         };
+        install_webhook_turn_runtime(&mut state);
         (state, memory)
     }
 
@@ -8766,13 +8817,14 @@ for line in sys.stdin:
     /// (so the state directory, auth store included) are the temp dir's,
     /// never the real `~/.openprx`.
     fn budget_test_config(tmp: &tempfile::TempDir) -> Config {
-        let mut config = Config::default();
+        let mut config = webhook_test_config();
         config.workspace_dir = tmp.path().to_path_buf();
         config.config_path = tmp.path().join("config.toml");
         config
     }
 
     async fn post_budget_webhook(state: AppState, message: &str) {
+        let diagnostic_state = state.clone();
         let body = serde_json::json!({"message": message, "reply_target": "client-a"}).to_string();
         let response = handle_webhook(
             State(state),
@@ -8783,7 +8835,21 @@ for line in sys.stdin:
         )
         .await
         .into_response();
-        assert_eq!(response.status(), StatusCode::OK, "the webhook turn must complete");
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("test: error response body")
+                .to_bytes();
+            let workspace = diagnostic_state.config.pin().effective.workspace_dir.clone();
+            let events = all_workspace_message_events(&diagnostic_state, &workspace).await;
+            panic!(
+                "the webhook turn must complete; status={status}, body={}, events={events:?}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     /// The durable `llm.request.context.compiled` payloads of the turn, in
@@ -8831,7 +8897,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().unwrap();
         let provider_impl = Arc::new(BudgetSpyProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let (state, memory) = budget_webhook_state(&tmp, budget_test_config(&tmp), provider, Vec::new());
+        let (state, memory) = budget_webhook_state(&tmp, budget_test_config(&tmp), provider, Vec::new(), None);
 
         post_budget_webhook(state, "hello budget").await;
 
@@ -8881,7 +8947,7 @@ for line in sys.stdin:
         config.tool_tiering.always_include = vec![BULKY_PROBE_TOOL.to_string()];
         let provider_impl = Arc::new(BudgetSpyProvider::calling_the_bulky_probe());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let (state, memory) = budget_webhook_state(&tmp, config, provider, vec![Box::new(BulkyProbeTool)]);
+        let (state, memory) = budget_webhook_state(&tmp, config, provider, vec![Box::new(BulkyProbeTool)], None);
 
         post_budget_webhook(state, WEBHOOK_BUDGET_REQUEST).await;
 
@@ -8960,11 +9026,11 @@ for line in sys.stdin:
         // The registry builders construct the configured provider chain, which
         // needs a credential; the turn itself is served by the spy.
         config.api_key = Some("test-key".to_string());
-        let (_daemon, mut tools) = production_gateway_registries(&config);
+        let (_daemon, mut tools, mcp_tool) = production_gateway_registries(&config);
         tools.push(Box::new(BulkyProbeTool));
         let provider_impl = Arc::new(BudgetSpyProvider::calling_the_bulky_probe());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let (state, memory) = budget_webhook_state(&tmp, config, provider, tools);
+        let (state, memory) = budget_webhook_state(&tmp, config, provider, tools, mcp_tool);
 
         post_budget_webhook(state, WEBHOOK_BUDGET_REQUEST).await;
 
@@ -9045,7 +9111,7 @@ for line in sys.stdin:
         config.agent.compact_context = true;
         let provider_impl = Arc::new(BudgetSpyProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let (state, _memory) = budget_webhook_state(&tmp, config, provider, Vec::new());
+        let (state, _memory) = budget_webhook_state(&tmp, config, provider, Vec::new(), None);
 
         post_budget_webhook(state, "hello compact").await;
 
@@ -9137,6 +9203,11 @@ for line in sys.stdin:
             // context that quotes an earlier `SPAWN` turn.
             let (tool, arguments) = if user.contains("OWNER-VIS-LIST") {
                 ("sessions_spawn", serde_json::json!({"action": "list"}))
+            } else if user.contains("SHARED-REGISTRY-SPAWN") {
+                (
+                    "sessions_spawn",
+                    serde_json::json!({"task": SHARED_RUN_REGISTRY_PROBE_TASK}),
+                )
             } else if user.contains("SHARED-PROMPT-STORE") {
                 (
                     "memory_store",
@@ -9174,10 +9245,38 @@ for line in sys.stdin:
         config.api_url = Some("http://127.0.0.1:1".to_string());
         // A run the turn spawns builds its own provider from this default:
         // a closed loopback endpoint, so it never reaches a real host (D-081).
-        config.default_provider = Some("custom:http://127.0.0.1:1/v1".to_string());
+        let fixture_provider = "custom:http://127.0.0.1:1/v1";
+        let fixture_model = "prx-webhook-fixture";
+        config.default_provider = Some(fixture_provider.to_string());
+        config.default_model = Some(fixture_model.to_string());
+        config.cost.prices.insert(
+            format!("{fixture_provider}/{fixture_model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config
+            .providers
+            .models
+            .push(crate::config::schema::ProviderModelConfig {
+                provider: fixture_provider.to_string(),
+                model: Some(fixture_model.to_string()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
         let manager = crate::config::new_shared(config);
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite memory"));
-        let runtime = build_gateway_turn_runtime(
+        let hooks = Arc::new(HookManager::new(workspace.to_path_buf()));
+        let mut runtime = build_gateway_turn_runtime(
             manager.pin(),
             manager.clone(),
             Arc::clone(&memory),
@@ -9185,19 +9284,43 @@ for line in sys.stdin:
             None,
             None,
             None,
-            Arc::new(HookManager::new(workspace.to_path_buf())),
+            Arc::clone(&hooks),
             #[cfg(feature = "wasm-plugins")]
             None,
         )
         .expect("test: the production gateway turn runtime must build");
+        let resolved = providers::selection::check_default(
+            &manager.pin().effective,
+            providers::catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: the configured webhook model must resolve");
+        runtime.provider_binding = Some(Arc::new(decision_source::GatewayProviderBinding::new(
+            Arc::clone(&provider),
+            resolved,
+        )));
+        runtime.provider = Arc::clone(&provider);
         let mut state = webhook_test_state(provider);
-        state.config = manager;
-        state.mem = memory;
+        state.config = Arc::clone(&manager);
+        state.model = runtime.model.clone();
+        state.mem = Arc::clone(&memory);
         state.tools_registry = Arc::clone(&runtime.tools_registry);
+        state.hooks = Arc::clone(&hooks);
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &["token-alpha-0001".to_string(), "token-bravo-0002".to_string()],
         ));
+        state.turn_runtime = Some(Arc::new(GatewayTurnRuntimeOwner::new(
+            runtime,
+            manager,
+            memory,
+            None,
+            None,
+            None,
+            None,
+            hooks,
+            #[cfg(feature = "wasm-plugins")]
+            None,
+        )));
         state
     }
 
@@ -9235,17 +9358,35 @@ for line in sys.stdin:
         let workspace = tempfile::TempDir::new().expect("test: temp workspace");
         let state = two_token_webhook_state(workspace.path());
 
-        let spawned = webhook_as(&state, "token-alpha-0001", "OWNER-VIS-SPAWN", "client-a").await;
+        let spawned = webhook_as(
+            &state,
+            "token-alpha-0001",
+            "Use sessions_spawn for OWNER-VIS-SPAWN",
+            "client-a",
+        )
+        .await;
         assert!(spawned.contains("run_id"), "test: token a's spawn ran: {spawned}");
 
-        let by_b = webhook_as(&state, "token-bravo-0002", "OWNER-VIS-LIST", "client-a").await;
+        let by_b = webhook_as(
+            &state,
+            "token-bravo-0002",
+            "Use sessions_spawn for OWNER-VIS-LIST",
+            "client-a",
+        )
+        .await;
         assert!(by_b.contains("TOOL-RESULT"), "test: token b's list ran: {by_b}");
         assert!(
             !by_b.contains(OWNER_VIS_SECRET_TASK),
             "another token must not see token a's run by naming its reply_target: {by_b}"
         );
 
-        let by_a = webhook_as(&state, "token-alpha-0001", "OWNER-VIS-LIST", "client-a").await;
+        let by_a = webhook_as(
+            &state,
+            "token-alpha-0001",
+            "Use sessions_spawn for OWNER-VIS-LIST",
+            "client-a",
+        )
+        .await;
         assert!(
             by_a.contains(OWNER_VIS_SECRET_TASK),
             "the token that started the run still sees it: {by_a}"
@@ -9305,7 +9446,13 @@ for line in sys.stdin:
         let workspace = tempfile::TempDir::new().expect("test: temp workspace");
         let state = two_token_webhook_state(workspace.path());
 
-        let stored = webhook_as(&state, "token-alpha-0001", "SHARED-PROMPT-STORE", "client-a").await;
+        let stored = webhook_as(
+            &state,
+            "token-alpha-0001",
+            "Use memory_store for SHARED-PROMPT-STORE",
+            "client-a",
+        )
+        .await;
         assert!(
             stored.contains("Stored memory"),
             "test: the webhook turn's store ran: {stored}"
@@ -9463,39 +9610,35 @@ for line in sys.stdin:
         let provider_impl = Arc::new(SecretErrorProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let state = two_token_webhook_state_with(workspace.path(), provider);
-        let workspace = &workspace;
-        owned_bound_gateway_fixture(state, |state| async move {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer token-alpha-0001"),
-            );
-            let body = serde_json::json!({"message": "hello probe", "reply_target": "client-a"}).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-alpha-0001"),
+        );
+        let body = serde_json::json!({"message": "hello probe", "reply_target": "client-a"}).to_string();
 
-            let response = handle_webhook(
-                State(state.clone()),
-                test_connect_info(),
-                test_uri(),
-                headers,
-                Bytes::from(body),
-            )
-            .await
-            .into_response();
-            assert_eq!(
-                response.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "test: the provider failure must end the turn"
-            );
-            assert!(
-                provider_impl.calls.load(Ordering::SeqCst) >= 1,
-                "test: the turn must have reached the provider"
-            );
-            let events = all_workspace_message_events(&state, workspace.path()).await;
-            assert!(!events.is_empty(), "test: the failed turn recorded message events");
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            test_uri(),
+            headers,
+            Bytes::from(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "test: the provider failure must end the turn"
+        );
+        assert!(
+            provider_impl.calls.load(Ordering::SeqCst) >= 1,
+            "test: the turn must have reached the provider"
+        );
+        let events = all_workspace_message_events(&state, workspace.path()).await;
+        assert!(!events.is_empty(), "test: the failed turn recorded message events");
 
-            crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(workspace.path());
-        })
-        .await;
+        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(workspace.path());
     }
 }
 

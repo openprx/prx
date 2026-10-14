@@ -6101,7 +6101,7 @@ impl Memory for SqliteMemory {
             .into_iter()
             .map(|role| role.trim().to_ascii_lowercase())
             .filter(|role| !role.is_empty())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
 
         let legacy_session_keys = Self::legacy_session_key_params(&principal);
         // Canonical key keeps its `?3` binding; legacy key(s) bind at trailing
@@ -6113,9 +6113,10 @@ impl Memory for SqliteMemory {
         }
         let session_fragment =
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_index = Self::owner_index(9, legacy_session_keys.len());
         let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
             SQLITE_DIALECT,
-            Self::owner_index(9, legacy_session_keys.len()),
+            owner_index,
             principal.require_owner_match,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
@@ -6124,10 +6125,22 @@ impl Memory for SqliteMemory {
         // placeholder as `owner_fragment`, so one bound value serves both.
         let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
             SQLITE_DIALECT,
-            Self::owner_index(9, legacy_session_keys.len()),
+            owner_index,
             true,
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
+        let first_role_index = owner_index + usize::from(owner_required_fragment.bound_owner);
+        let role_fragment = if include_roles.is_empty() {
+            "1 = 1".to_string()
+        } else {
+            format!(
+                "role IN ({})",
+                (first_role_index..first_role_index + include_roles.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         // OV-C: `workspace` is owner-qualified for an owner-isolated reader;
         // every other reader's statement is byte-identical.
         let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
@@ -6145,6 +6158,7 @@ impl Memory for SqliteMemory {
                  WHERE id > ?1
                    AND workspace_id = ?2
                    AND {session_fragment}
+                   AND {role_fragment}
                    AND (
                        {shared_tiers_arm}
                        OR (visibility = 'agent' AND (
@@ -6162,6 +6176,7 @@ impl Memory for SqliteMemory {
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
+                role_fragment = role_fragment,
                 owner_fragment = owner_fragment.sql,
                 owner_required_fragment = owner_required_fragment.sql,
             ))?;
@@ -6181,17 +6196,14 @@ impl Memory for SqliteMemory {
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
             }
+            for role in &include_roles {
+                bind.push(role);
+            }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
             let mut events = rows.collect::<Result<Vec<_>, _>>()?;
             events.reverse();
-            if include_roles.is_empty() {
-                return Ok(events);
-            }
-            Ok(events
-                .into_iter()
-                .filter(|event| include_roles.contains(&event.role.to_ascii_lowercase()))
-                .collect())
+            Ok(events)
         })
         .await?
     }

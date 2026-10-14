@@ -1,7 +1,7 @@
 //! Gateway-owned durable input lineage. This receipt does not authenticate a
 //! caller or grant execution authority; transport admission precedes it.
 use crate::config::ConfigGeneration;
-use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventSource};
+use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventSource, SessionContextQuery};
 use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 
@@ -12,6 +12,7 @@ pub(super) use admission::{GatewayAdmissionGuard, GatewayPendingInput};
 pub(super) struct GatewaySourceReceipt {
     input: std::sync::Arc<str>,
     envelope: RuntimeEnvelope,
+    has_conversation_history: bool,
 }
 
 impl GatewaySourceReceipt {
@@ -44,9 +45,21 @@ impl GatewaySourceReceipt {
         );
         let mut envelope = envelope.clone();
         envelope.source_message_event_id = None;
+        let has_conversation_history = memory
+            .load_recent_session_context(SessionContextQuery {
+                principal: envelope.memory_principal(),
+                since_event_id: None,
+                limit: 24,
+                include_roles: vec!["user".to_string(), "assistant".to_string()],
+            })
+            .await?
+            .into_iter()
+            .next()
+            .is_some();
         Ok(Self {
             input: std::sync::Arc::from(raw_input),
             envelope,
+            has_conversation_history,
         })
     }
 
@@ -122,9 +135,20 @@ impl GatewaySourceReceipt {
             serde_json::to_value(&durable)? == serde_json::to_value(recorded)?,
             "gateway source receipt differs from durable input"
         );
+        let has_conversation_history = memory
+            .load_recent_session_context(SessionContextQuery {
+                principal: envelope.memory_principal(),
+                since_event_id: None,
+                limit: 24,
+                include_roles: vec!["user".to_string(), "assistant".to_string()],
+            })
+            .await?
+            .into_iter()
+            .any(|event| event.id != recorded.id);
         Ok(Self {
             input: std::sync::Arc::from(raw_input),
             envelope: envelope.clone().with_source_message_event_id(recorded.event_id.clone()),
+            has_conversation_history,
         })
     }
 
@@ -290,6 +314,7 @@ pub(crate) struct GatewayTurnProof {
     provider_name: String,
     model_name: String,
     model_binding: crate::agent::entry::AgentModelBinding,
+    has_conversation_history: bool,
 }
 
 impl GatewayTurnProof {
@@ -383,9 +408,21 @@ impl GatewaySourceReceipt {
             );
             let mut local_envelope = envelope.clone();
             local_envelope.source_message_event_id = None;
+            let has_conversation_history = memory
+                .load_recent_session_context(SessionContextQuery {
+                    principal: local_envelope.memory_principal(),
+                    since_event_id: None,
+                    limit: 24,
+                    include_roles: vec!["user".to_string(), "assistant".to_string()],
+                })
+                .await?
+                .into_iter()
+                .next()
+                .is_some();
             return Self {
                 input: std::sync::Arc::from(raw_input),
                 envelope: local_envelope,
+                has_conversation_history,
             }
             .bind_model(runtime, "private");
         };
@@ -429,6 +466,7 @@ impl GatewaySourceReceipt {
             provider_name,
             model_name,
             model_binding: crate::agent::entry::AgentModelBinding::from_resolved(&binding.resolved, route),
+            has_conversation_history: self.has_conversation_history,
         })
     }
 }
@@ -497,6 +535,9 @@ impl crate::runtime::turn_source::TurnSourceProof for GatewayTurnProof {
     }
     fn policy_chat_type(&self) -> &str {
         self.scope.chat_type.as_deref().unwrap_or("private")
+    }
+    fn has_conversation_history(&self) -> bool {
+        self.has_conversation_history
     }
 }
 

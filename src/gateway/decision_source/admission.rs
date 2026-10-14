@@ -182,6 +182,7 @@ impl GatewayAdmissionGuard {
             receipt: Some(GatewaySourceReceipt {
                 input: Arc::clone(&proof.input),
                 envelope: proof.envelope.clone(),
+                has_conversation_history: proof.has_conversation_history,
             }),
             generation: Arc::clone(&proof.generation),
             fabric,
