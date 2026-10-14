@@ -901,7 +901,7 @@ async fn run_agent(
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
 
-    let prompt = format!("[xin:task:{}] {}", task.id, task.payload);
+    let prompt = task.payload.clone();
     // The model is resolved once, by the agent entry
     // (`agent_provider_selection`): a model that cannot chat fails the task
     // there, before any provider exists, and nothing is sent.

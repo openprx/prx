@@ -638,9 +638,7 @@ async fn run_agent_job_with_origin(
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
-    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     // The job's model is resolved once, by the agent entry
     // (`agent_provider_selection`): a model that cannot chat fails the job
     // there, before any provider exists, and nothing is sent.
@@ -701,7 +699,7 @@ async fn run_agent_job_with_origin(
                         }
                         _ => config.clone().into(),
                     },
-                    Some(prefixed_prompt),
+                    Some(prompt),
                     None,
                     model_override,
                     config.default_temperature,

@@ -139,8 +139,24 @@ impl ScriptedStoreModel {
         let mut config = Config::default();
         config.workspace_dir = root.join("workspace");
         config.config_path = root.join("config.toml");
-        config.default_provider = Some(format!("custom:{}", self.base_url));
+        let provider = format!("custom:{}", self.base_url);
+        config.default_provider = Some(provider.clone());
         config.default_model = Some("cron-origin-model".to_string());
+        config
+            .providers
+            .models
+            .push(crate::config::schema::ProviderModelConfig {
+                provider,
+                model: Some("cron-origin-model".to_string()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
         config.api_key = Some("CRON-ORIGIN-TEST-SENTINEL".to_string());
         config.api_url = None;
         config.model_routes = Vec::new();
