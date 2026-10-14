@@ -108,7 +108,7 @@ impl TurnDecisionService {
                     .as_ref()
                     .context("answer surface has no sealed child manifest")?
             }
-            _ => anyhow::bail!("selected decision is not delegation-capable"),
+            _ => anyhow::bail!("selected decision is not delegation"),
         };
         // derive_strict_subset preserves owner/level/cost and decrements depth
         // exactly once. Rebuild its original parent from the engine's retained
