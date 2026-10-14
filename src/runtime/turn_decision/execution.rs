@@ -389,6 +389,24 @@ impl TurnDecisionService {
         self.bind_execution(proof, context, execution_context, specs)
     }
 
+    /// Bind the decision-owned capability set and scope while preserving an
+    /// ingress-owned canonical execution service. Chat uses this for its
+    /// approval router and preparation events. Every actual call still passes
+    /// the issued execution binding, whose parity check covers the complete
+    /// live catalog before the backend can run.
+    pub(crate) fn bind_agent_execution_with_runtime(
+        self: &Arc<Self>,
+        proof: &dyn TurnSourceProof,
+        context: &Arc<TurnDecisionContext>,
+        execution_context: &crate::tools::ToolExecutionContext,
+        specs: &[ToolSpec],
+        runtime_execution: Option<Arc<ToolExecutionService>>,
+    ) -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {
+        let (published_execution, execution_context) =
+            self.bind_agent_execution(proof, context, execution_context, specs)?;
+        Ok((runtime_execution.unwrap_or(published_execution), execution_context))
+    }
+
     /// Returns only the original prepared command and exact selected schema;
     /// a resume never asks a model to recreate approved arguments.
     fn bind_resume_execution(

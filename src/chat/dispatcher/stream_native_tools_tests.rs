@@ -515,16 +515,35 @@ mod tests {
         }
         history.push(crate::providers::traits::ChatMessage::user("write x"));
 
-        let admitted = super::super::turn_characterization_tests::admit_chat_fixture(
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = ledger_dir.path().to_path_buf();
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        config.tool_tiering.always_include.push(FIXTURE_TOOL.to_owned());
+        let admitted = super::super::turn_characterization_tests::admit_chat_fixture_with_config(
             Arc::clone(&provider),
             Some(registry),
-            ledger_dir.path(),
+            config,
             (selection.0, FIXTURE_MODEL, selection.1),
             (FIXTURE_DRAFT, &history.last().expect("source input").content),
             action_tx.clone(),
             cancellation.clone(),
         )
         .await;
+        let routing = admitted.binding.decision_routing().expect("stream fixture routing");
+        let audit = routing
+            .context
+            .audit_hops()
+            .map(|hop| format!("candidates={:?} gates={:?}", hop.candidates, hop.pre_commit.outcomes))
+            .collect::<Vec<_>>();
+        assert!(
+            admitted
+                .binding
+                .fixed_reply()
+                .expect("stream fixture decision")
+                .is_none(),
+            "stream fixture closed before provider execution: {:?}; {audit:?}",
+            routing.context.directive()
+        );
         let principal = admitted.context.envelope.memory_principal();
         let ledger = admitted.fabric.memory();
 

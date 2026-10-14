@@ -4392,14 +4392,44 @@ mod real_mode_tests {
         native_tools: bool,
     ) -> anyhow::Result<Arc<crate::chat::decision_source::ChatTurnBinding>> {
         let model = deps.model.current();
+        let registry = deps.tools_registry.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         let mut config = crate::config::Config {
-            workspace_dir: deps.tool_security_policy.workspace_dir.clone(),
+            // Real-mode tests run concurrently. Give every admitted turn its
+            // own decision/event database so WAL setup cannot contend with a
+            // peer fixture using the same security-policy root.
+            workspace_dir: deps
+                .tool_security_policy
+                .workspace_dir
+                .join(format!("turn-fixture-{}", uuid::Uuid::now_v7())),
             default_provider: Some("ollama".to_owned()),
             default_model: Some(model.to_string()),
+            tool_tiering: deps.tool_tiering.clone(),
             ..crate::config::Config::default()
         };
         config.config_path = config.workspace_dir.join("config.toml");
         config.autonomy.level = deps.tool_security_policy.autonomy;
+        // These fixtures characterize provider streaming and tool-loop
+        // behavior. Publish their explicit in-memory registry as the
+        // configured direct surface so the production decision service, not
+        // a raw Tool call, still owns every execution boundary.
+        if native_tools {
+            for tool in registry.iter() {
+                let name = tool.name();
+                if !config
+                    .tool_tiering
+                    .always_include
+                    .iter()
+                    .any(|included| included == name)
+                    && !config
+                        .tool_tiering
+                        .always_exclude
+                        .iter()
+                        .any(|excluded| excluded == name)
+                {
+                    config.tool_tiering.always_include.push(name.to_owned());
+                }
+            }
+        }
         config.providers.models.push(serde_json::from_value(serde_json::json!({
             "provider":"ollama", "model":model.to_string(), "operations":["chat"],
             "native_tools":native_tools, "streaming":deps.provider.supports_streaming()
@@ -4415,7 +4445,6 @@ mod real_mode_tests {
         );
         let generation = crate::config::new_shared(config).pin();
         let ledger: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&generation.effective.workspace_dir)?);
-        let registry = deps.tools_registry.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         let service = crate::runtime::turn_publication::TurnDecisionPublication {
             generation: Arc::clone(&generation),
             registry,
@@ -4480,6 +4509,29 @@ mod real_mode_tests {
             eprintln!("PRX_Q42_ADMISSION directive={directive} reason_code={reason}");
         }
         Ok(binding)
+    }
+
+    async fn admit_owned_start_turn_fixture(
+        deps: &EffectDeps,
+        run: &str,
+        input: &str,
+        native_tools: bool,
+    ) -> anyhow::Result<(
+        Arc<crate::chat::decision_source::ChatTurnBinding>,
+        crate::runtime::turn_cleanup::CleanupScope,
+    )> {
+        let owner = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+        let binding = owner
+            .scope_admission(admit_start_turn_fixture(deps, run, input, native_tools))
+            .await?;
+        Ok((binding, owner))
+    }
+
+    async fn finish_owned_start_turn_fixture(owner: crate::runtime::turn_cleanup::CleanupScope) {
+        owner
+            .run(async { Ok::<_, anyhow::Error>(()) })
+            .await
+            .expect("Q42 fixture cleanup");
     }
 
     fn build_deps(
@@ -4796,6 +4848,10 @@ mod real_mode_tests {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-fixB-B5", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
 
         // ── start the driver ──
@@ -4811,7 +4867,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -4886,6 +4942,7 @@ mod real_mode_tests {
             2,
             "turns.len() must be strictly 2 (user+assistant, zero double write)"
         );
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// T3-3-fixB D1: SaveSession completion (disk write end) must be strictly before RequestRedraw (refresh).
@@ -5680,6 +5737,10 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(EmptyThenAnswerProvider::default());
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-empty", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
 
         executor
@@ -5694,7 +5755,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -5730,6 +5791,7 @@ mod real_mode_tests {
 
         assert!(saw_assistant_record, "the recovered answer must be recorded");
         assert!(saw_completion, "the recovered turn must complete and clear the draft");
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// Step 5a-2 — send StreamFailed when the provider stream yields an Err (including the retryable verdict).
@@ -5788,6 +5850,10 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(FailingStreamProvider);
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-fail", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
 
         executor
@@ -5802,7 +5868,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -5822,6 +5888,7 @@ mod real_mode_tests {
             }
             other => panic!("expected StreamFailed, got {other:?}"),
         }
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// Step 5a-2 — a cancel in mid-stream triggers StreamCancelled.
@@ -5886,6 +5953,10 @@ mod real_mode_tests {
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(SlowStreamProvider);
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-mid-cancel", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
 
         let cancel = CancellationToken::new();
@@ -5901,7 +5972,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -5925,6 +5996,7 @@ mod real_mode_tests {
             found_cancelled,
             "mid-stream cancel must emit StreamCancelled within reasonable time"
         );
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     #[tokio::test]
@@ -6629,6 +6701,10 @@ mod real_mode_tests {
         deps.model.set(Arc::from("gpt-test-99"));
         deps.temperature = 0.42;
 
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-params", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
@@ -6642,7 +6718,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -6661,6 +6737,7 @@ mod real_mode_tests {
             (temp_seen - 0.42).abs() < f64::EPSILON,
             "temperature must be passed through from EffectDeps (got {temp_seen})"
         );
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// P1-1: TurnCompletionSignal failure-path API contract.
@@ -6991,10 +7068,9 @@ mod real_mode_tests {
                 let executor = EffectExecutor::new_with_deps(deps);
 
                 let cancel = CancellationToken::new();
-                let binding =
-                    admit_start_turn_fixture(&fixture_deps, "draft-tool-happy", "stream the fixture reply", true)
-                        .await
-                        .expect("Q42 genuine admission prerequisite");
+                let binding = admit_start_turn_fixture(&fixture_deps, "draft-tool-happy", "stream reply", true)
+                    .await
+                    .expect("Q42 genuine admission prerequisite");
                 executor
                     .execute(Effect::StartTurn {
                         provider_turn_task_id: None,
@@ -7015,6 +7091,7 @@ mod real_mode_tests {
                 let mut saw_tool_finished_success = false;
                 let mut saw_completion = false;
                 let mut final_text_seen = String::new();
+                let mut observed = Vec::new();
                 for _ in 0..16 {
                     let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                         .await
@@ -7022,12 +7099,14 @@ mod real_mode_tests {
                         .expect("action must arrive");
                     match action {
                         Action::ToolStarted { name, .. } => {
+                            observed.push(format!("started:{name}"));
                             assert_eq!(name, "echo-tool");
                             saw_tool_started = true;
                         }
                         Action::ToolFinished {
                             name, success, result, ..
                         } => {
+                            observed.push(format!("finished:{name}:{success}:{result:?}"));
                             assert_eq!(name, "echo-tool");
                             if success {
                                 saw_tool_finished_success = true;
@@ -7041,6 +7120,7 @@ mod real_mode_tests {
                             final_text_seen.push_str(&delta);
                         }
                         Action::StreamCompleted { final_text, .. } => {
+                            observed.push(format!("completed:{final_text}"));
                             saw_completion = true;
                             assert!(
                                 final_text.contains("done"),
@@ -7054,7 +7134,11 @@ mod real_mode_tests {
                         _ => {}
                     }
                 }
-                assert!(saw_tool_started, "must see ToolStarted");
+                assert!(
+                    saw_tool_started,
+                    "must see ToolStarted; actions={observed:?}; offers={:?}",
+                    *captured_tool_counts.lock()
+                );
                 assert!(saw_tool_finished_success, "must see ToolFinished(success=true)");
                 assert!(saw_completion, "must see StreamCompleted");
                 assert!(
@@ -7196,6 +7280,10 @@ mod real_mode_tests {
             executed: Arc::clone(&executed),
             seen_run_id: Arc::clone(&seen_run_id),
         }) as Box<dyn crate::tools::Tool>]));
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-ctx-probe", "stream the fixture reply", true)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
 
         let turn_run_id = "turn-run-id-xyz".to_string();
@@ -7217,7 +7305,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: Some(seed),
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -7243,6 +7331,7 @@ mod real_mode_tests {
             "redux driver must scope SPAWN_EXECUTION_CONTEXT so the in-turn tool sees the turn run_id \
              (None here means model-spawned sub-agents would be mislabeled as user)"
         );
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// BUG-03 round-2: when a tool fails *unrecoverably* (permission denied) and
@@ -10246,6 +10335,186 @@ mod real_mode_tests {
         assert!(!router.resolve("call-1", false), "second resolve must miss");
     }
 
+    /// The default causal plane turns an approval-required model call into a
+    /// durable pending decision. Chat may continue the provider loop with that
+    /// result, but it must not ask the legacy same-turn router for authority or
+    /// start the backend. Review and execution happen later through the
+    /// explicit decision approval and resume commands.
+    #[tokio::test]
+    async fn t31_driver_default_causal_approval_persists_without_backend_execution() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+        struct PendingShell {
+            executed: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl crate::tools::Tool for PendingShell {
+            fn name(&self) -> &str {
+                "shell"
+            }
+
+            fn description(&self) -> &str {
+                "shell"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.executed.store(true, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "unexpected execution".into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct ToolThenText {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Provider for ToolThenText {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(vec![ToolCallChunk::new(
+                            "call-pending-shell",
+                            "shell",
+                            r#"{"command":"echo pending"}"#,
+                            0,
+                        )])),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![
+                        Ok(StreamChunk::delta("approval pending")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                }
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolThenText {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(PendingShell {
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]));
+        deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
+        let (binding, cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-pending-approval", "stream the fixture reply", true)
+                .await
+                .expect("Q42 genuine admission prerequisite");
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
+                draft_id: "draft-pending-approval".into(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+                routing_input: None,
+                turn_binding: Some(binding),
+            })
+            .await;
+
+        let mut saw_pending = false;
+        let mut saw_completion = false;
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_secs(3), action_rx.recv())
+                .await
+                .expect("action within 3s")
+                .expect("must arrive");
+            match action {
+                Action::ToolApprovalRequested { .. } => {
+                    panic!("default causal approval must not use same-turn router authority")
+                }
+                Action::ToolStarted { .. } => panic!("pending approval must not start the backend"),
+                Action::ToolFinished {
+                    success, name, result, ..
+                } => {
+                    assert_eq!(name, "shell");
+                    assert!(!success, "pending approval is not an executed tool success");
+                    let result = result.expect("pending approval result");
+                    assert!(
+                        result.contains("Approval is required for decision"),
+                        "result={result:?}"
+                    );
+                    assert!(result.contains("operation has not run"), "result={result:?}");
+                    saw_pending = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(
+                        final_text.contains("Approval is required for decision")
+                            && final_text.contains("operation has not run"),
+                        "final_text={final_text:?}"
+                    );
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
+            }
+        }
+        assert!(saw_pending, "Chat must publish the durable pending decision result");
+        assert!(
+            saw_completion,
+            "Chat must finish after reporting the pending decision to the provider"
+        );
+        assert!(!executed.load(AtomicOrdering::SeqCst), "unapproved tool backend ran");
+        finish_owned_start_turn_fixture(cleanup).await;
+    }
+
     /// **S3 T3-1 Step 4**: approval path — policy `Ask` waits on the router;
     /// stub EffectExecutor::RequestApproval defaults to auto-approve.
     #[tokio::test]
@@ -10870,6 +11139,10 @@ mod real_mode_tests {
         deps.provider = Arc::new(PartialThenErrorProvider {
             calls: Arc::clone(&calls),
         });
+        let (binding, fixture_cleanup) =
+            admit_owned_start_turn_fixture(&deps, "draft-partial-network-error", "stream the fixture reply", false)
+                .await
+                .expect("Q42 genuine admission prerequisite");
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
@@ -10883,7 +11156,7 @@ mod real_mode_tests {
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
                 routing_input: None,
-                turn_binding: None,
+                turn_binding: Some(binding),
             })
             .await;
 
@@ -10909,6 +11182,7 @@ mod real_mode_tests {
         assert_eq!(retry_attempts, 0, "partial response must not enter the retry loop");
         assert!(!failed.1, "a partial response cannot be retried safely");
         assert!(failed.0.contains("after model output"), "err={}", failed.0);
+        finish_owned_start_turn_fixture(fixture_cleanup).await;
     }
 
     /// **S3 T3-1 Step 5**: persistent io errors → retries exhausted → StreamFailed(retryable=false).

@@ -288,6 +288,10 @@ fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_path_buf();
     config.causal_tree.enabled = false;
+    // The shared success fixture deliberately exercises a model-issued tool
+    // call. Make that one fixture capability part of the configured Direct
+    // surface; an absent registry entry still publishes nothing.
+    config.tool_tiering.always_include.push(FIXTURE_TOOL.to_owned());
     config.cost.prices.insert(
         FIXTURE_MODEL.to_owned(),
         crate::config::schema::ModelPricing {
@@ -394,15 +398,17 @@ async fn admit_chat_fixture_with_mode(
         config.api_url = Some(endpoint.to_owned());
         config.api_key = Some("test-key".to_owned());
     }
-    config.cost.prices.insert(
-        selection.1.to_owned(),
-        crate::config::schema::ModelPricing {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 1.0,
-            cache_read: 1.0,
-        },
-    );
+    let pricing = crate::config::schema::ModelPricing {
+        input: 1.0,
+        output: 1.0,
+        cache_write: 1.0,
+        cache_read: 1.0,
+    };
+    config.cost.prices.insert(selection.1.to_owned(), pricing.clone());
+    config
+        .cost
+        .prices
+        .insert(format!("{}/{}", selection.0, selection.1), pricing);
     config.providers.models.push(
         serde_json::from_value(serde_json::json!({
             "provider": selection.0, "model": selection.1,
@@ -583,7 +589,7 @@ async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed
         None,
         config.clone(),
         (FIXTURE_PROVIDER, FIXTURE_MODEL, None),
-        (FIXTURE_DRAFT, "prx queued plan input", ChatMode::Plan),
+        (FIXTURE_DRAFT, "read ./missing-plan-fixture.txt", ChatMode::Plan),
         action_tx.clone(),
         cancellation.clone(),
     )

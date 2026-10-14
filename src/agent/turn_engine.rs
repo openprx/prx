@@ -906,11 +906,12 @@ async fn run_turn_unguarded(
         let mut execution_adapter = runtime_adapter.clone();
         execution_adapter.allowed_tool_names = Some(compiled_tool_context.allowed_tool_names());
         {
-            let (execution, bound_context) = service.bind_agent_execution(
+            let (execution, bound_context) = service.bind_agent_execution_with_runtime(
                 proof,
                 context,
                 &execution_adapter.tool_execution_context,
                 compiled_tool_context.tool_specs(),
+                execution_adapter.tool_execution_service.clone(),
             )?;
             execution_adapter.tool_execution_service = Some(execution);
             execution_adapter.tool_execution_context = bound_context;
@@ -1723,8 +1724,13 @@ async fn run_turn_unguarded(
             }
         }
         if let Some(specs) = discovery_dispatch_specs {
-            let (execution, bound_context) =
-                service.bind_agent_execution(proof, context, &execution_adapter.tool_execution_context, &specs)?;
+            let (execution, bound_context) = service.bind_agent_execution_with_runtime(
+                proof,
+                context,
+                &execution_adapter.tool_execution_context,
+                &specs,
+                execution_adapter.tool_execution_service.clone(),
+            )?;
             execution_adapter.allowed_tool_names = Some(std::sync::Arc::new(
                 specs.iter().map(|spec| spec.name.clone()).collect(),
             ));
