@@ -200,6 +200,7 @@ impl CausalSelector {
     ) -> Result<Selection, SelectError> {
         let CandidateSet::Legal {
             candidates,
+            exact_mentions,
             approval_scopes,
             ..
         } = admitted
@@ -285,6 +286,15 @@ impl CausalSelector {
         let Some(&(top, top_score, top_mass)) = passed.first() else {
             return Err(SelectError::CandidateMismatch);
         };
+        // A uniquely scored exact tool remains model-selected even when the
+        // distribution across generic action/target options has low entropy
+        // confidence. It still needs an authenticated current direct ref and
+        // every hard gate before this can authorize provider publication.
+        let exact_selected_tool = top.action() == CausalActionKind::UseTool
+            && exact_mentions.contains(top.candidate_id())
+            && prediction.chosen_action == top.action().as_str()
+            && prediction.chosen_target == top.target().as_str();
+        let exact_current_tool = exact_selected_tool && context.direct_candidates.contains(top.candidate_id());
         let retrieve = passed
             .iter()
             .find(|(candidate, _, _)| {
@@ -308,9 +318,6 @@ impl CausalSelector {
         if no_choice_mass || other_action || other_target {
             return terminal_abstain(candidates, pre_commit, context, "choice_outside_legal_set");
         }
-        if insufficient && retrieve.is_none() && discover.is_none() {
-            return terminal_abstain(candidates, pre_commit, context, "insufficient_evidence");
-        }
         if (insufficient || stale)
             && let Some(candidate) = retrieve
         {
@@ -325,6 +332,7 @@ impl CausalSelector {
             .copied()
             .unwrap_or(0.0);
         let target_missing = top.target() != CapabilityTarget::None
+            && !exact_current_tool
             && (!context.direct_candidates.contains(top.candidate_id())
                 || target_probability < policy.minimum_choice_confidence);
         let target_discover = passed
@@ -342,8 +350,12 @@ impl CausalSelector {
                     )
             })
             .map(|(candidate, _, _)| *candidate);
-        let recovery = if insufficient {
-            discover
+        let evidence_discover = if exact_selected_tool { target_discover } else { discover };
+        if insufficient && !exact_current_tool && retrieve.is_none() && evidence_discover.is_none() {
+            return terminal_abstain(candidates, pre_commit, context, "insufficient_evidence");
+        }
+        let recovery = if insufficient && !exact_current_tool {
+            evidence_discover
         } else if target_missing {
             target_discover
         } else {
@@ -360,12 +372,13 @@ impl CausalSelector {
             .map_or(f64::NEG_INFINITY, |(_, score, _)| score.execution_utility);
         let margin = top_score.execution_utility - runner_up;
         let threshold = effective_threshold(f64::from(policy.commit_threshold), top.side_effect());
-        let enough_choice_confidence = prediction.action_confidence >= policy.minimum_choice_confidence
-            && prediction.target_confidence >= policy.minimum_choice_confidence;
+        let enough_choice_confidence = exact_current_tool
+            || (prediction.action_confidence >= policy.minimum_choice_confidence
+                && prediction.target_confidence >= policy.minimum_choice_confidence);
         let evidence_ok = top.action() != CausalActionKind::Answer || !insufficient;
         let fresh_ok = top.action() == CausalActionKind::Retrieve || !stale;
         if top_mass > 0.0
-            && top_score.execution_utility >= threshold
+            && (top_score.execution_utility >= threshold || exact_current_tool)
             && enough_choice_confidence
             && margin >= policy.minimum_top_margin
             && evidence_ok
@@ -983,6 +996,70 @@ mod tests {
         let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context)
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(matches!(selection, Selection::Abstain { .. }));
+    }
+
+    #[test]
+    fn exact_current_tool_can_publish_below_the_execution_threshold() {
+        let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+        let tool = CausalCandidate::new(
+            CausalActionKind::UseTool,
+            CapabilityTarget::NativeTool,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: SideEffectClass::LocalWrite,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(CostEstimate {
+                    tokens: 1,
+                    micro_usd: 1,
+                }),
+                estimated_latency_ms: Some(1),
+            },
+        );
+        let tool_id = tool.candidate_id().clone();
+        for score in scores.values_mut() {
+            score.execution_utility = 0.1;
+        }
+        scores.insert(
+            tool_id.clone(),
+            CandidateScore {
+                semantic_utility: 0.6,
+                execution_utility: 0.6,
+            },
+        );
+        let prediction = evidence.candidates.values().next().unwrap().clone();
+        evidence.candidates.insert(tool_id.clone(), prediction);
+        evidence.chosen_action = "use_tool".to_owned();
+        evidence.chosen_target = "native_tool".to_owned();
+        evidence.action_confidence = 0.01;
+        evidence.target_confidence = 0.01;
+        evidence.target_probabilities.insert(CapabilityTarget::NativeTool, 0.1);
+        report.outcomes.insert(tool_id.clone(), GateOutcome::Passed);
+        context.direct_candidates.insert(tool_id.clone());
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } = &mut set
+        else {
+            panic!("expected legal candidates");
+        };
+        candidates.push(tool);
+        exact_mentions.insert(tool_id.clone());
+
+        assert_eq!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+            Selection::Commit {
+                candidate_id: tool_id.clone(),
+                propensity: 1.0,
+            }
+        );
+
+        context.direct_candidates.remove(&tool_id);
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+            Selection::Abstain { .. }
+        ));
     }
 
     #[test]

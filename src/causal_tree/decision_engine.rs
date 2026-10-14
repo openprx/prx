@@ -28,7 +28,8 @@ use super::gates::{GateError, GateInputs, GateOutcome, GatePass, GateReport, Har
 use super::ids::DecisionId;
 use super::questions::{CompileError, CompiledQuestionRequest, CompilerPolicy, QuestionCompiler};
 use super::state::{
-    CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedArtifactKind, SideEffectMode, TrustedParts,
+    CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedArtifactKind, ObservedStepKind,
+    ObservedStepStatus, SideEffectMode, TrustedParts,
 };
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::decision::DecisionError;
@@ -85,7 +86,8 @@ pub(crate) struct EngineInputs<'a, 'catalog, P: PredictionPort> {
     pub delegation_target: Option<&'a str>,
     /// Force a fresh terminal-only gate pass after hop exhaustion or no progress.
     pub terminal_only: bool,
-    /// Only a successful selected read with new fresh evidence may authorize
+    /// A successful selected read with new fresh evidence, or a safe plain
+    /// request whose discovery found no matching capability, may authorize
     /// terminal Answer after a stopped hop. The service owns this fact.
     pub allow_terminal_answer: bool,
     /// Set once by the caller for the whole decision, including fallback.
@@ -676,7 +678,16 @@ impl CausalDecisionEngine {
                 ObservedArtifactKind::Memory | ObservedArtifactKind::Document | ObservedArtifactKind::Session
             ) && artifact.age_ms <= crate::decision::builtin::weights::STALE_ARTIFACT_MS
         });
-        let selection = if inputs.allow_terminal_answer && has_retrieved_evidence && Instant::now() < inputs.deadline {
+        let exhausted_discovery_without_match = inputs.discovered_refs.iter().next().is_none()
+            && state
+                .observed
+                .completed_steps()
+                .iter()
+                .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok);
+        let selection = if inputs.allow_terminal_answer
+            && (has_retrieved_evidence || exhausted_discovery_without_match)
+            && Instant::now() < inputs.deadline
+        {
             passed(CausalActionKind::Answer).map(|answer| Selection::Commit {
                 candidate_id: answer.candidate_id().clone(),
                 propensity: 1.0,
@@ -1434,6 +1445,22 @@ fn candidate_is_direct(
     })
 }
 
+fn exact_candidate_without_discovery_is_current(candidate: &CausalCandidate, catalog: &CatalogView<'_>) -> bool {
+    candidate.action() == CausalActionKind::UseTool
+        && candidate.required_capabilities().len() == 1
+        && !super::candidate_generator::DiscoveryFamilies::supports(candidate.target())
+        && candidate.required_capabilities().iter().all(|reference| {
+            catalog.entry_any(&reference.id).is_some_and(|entry| {
+                matches!(entry.exposure, Exposure::Searchable)
+                    && catalog.contains(&reference.id)
+                    && entry.family == candidate.target()
+                    && reference.generation == catalog.generation()
+                    && reference.generation == entry.generation
+                    && reference.fingerprint == entry.fingerprint
+            })
+        })
+}
+
 fn selector_context(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
@@ -1454,6 +1481,13 @@ fn selector_context(
                 // discovery hop to become ready, while an unmentioned Direct
                 // delegator retains the ordinary prediction path.
                 (candidate.action() == CausalActionKind::Delegate && exact_mentions.contains(candidate.candidate_id()))
+                    // Some executable catalog families deliberately have no
+                    // capability-search port. An exact source mention can
+                    // select their one current visible ref, but cannot make a
+                    // stale, excluded, compound, or discoverable-family ref
+                    // direct.
+                    || (exact_mentions.contains(candidate.candidate_id())
+                        && exact_candidate_without_discovery_is_current(candidate, catalog))
                     || candidate_is_direct(candidate, catalog, resume_target, discovered_refs)
             })
             .map(|candidate| candidate.candidate_id().clone())

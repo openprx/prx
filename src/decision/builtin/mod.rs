@@ -143,11 +143,22 @@ fn continued_plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
         && state.artifact_count == 0
 }
 
-fn explicit_delegation_turn(state: &StateFeatures<'_>) -> bool {
-    state
-        .candidates
-        .iter()
-        .any(|candidate| candidate.exact_mention && matches!(candidate.action, Some(Action::Delegate)))
+fn plain_turn_has_no_read_recovery(state: &StateFeatures<'_>) -> bool {
+    plain_conversation_turn(state)
+        && !state
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.action, Some(Action::Retrieve | Action::Discover)))
+}
+
+fn model_managed_delegation_turn(state: &StateFeatures<'_>) -> bool {
+    state.candidates.iter().any(|candidate| {
+        candidate.exact_mention
+            && matches!(candidate.action, Some(Action::Delegate))
+            && candidate.id.rsplit_once('-').is_some_and(|(_, namespace)| {
+                namespace.len() == 8 && namespace.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    })
 }
 
 /// The log-score of one candidate.
@@ -201,8 +212,10 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
         }
     }
     if (plain_conversation_turn(state)
-        && (text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT || continued_plain_conversation_turn(state))
-        || explicit_delegation_turn(state))
+        && (text.request_weight <= weights::BRIEF_REQUEST_MAX_WEIGHT
+            || continued_plain_conversation_turn(state)
+            || plain_turn_has_no_read_recovery(state))
+        || model_managed_delegation_turn(state))
         && action == Action::Answer
     {
         score += weights::BRIEF_PLAIN_TURN_TO_ANSWER;
@@ -322,7 +335,7 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             // run. Structurally or exactly targeted tool turns retain the
             // existing retrieve-first evidence path. Exact delegation instead
             // serves the model with only the sealed delegator publication.
-            let decisive = if plain_conversation_turn(state) || explicit_delegation_turn(state) {
+            let decisive = if plain_conversation_turn(state) || model_managed_delegation_turn(state) {
                 1.0
             } else if state.text.has_text && !state.undecided() {
                 0.5
@@ -1978,6 +1991,16 @@ mod tests {
             noul_probability(&greeting, GlobalQuestion::EvidenceSufficient) >= 0.5,
             "a brief greeting must reach the serving model even when generic capabilities are available"
         );
+
+        let mut direct_only = typical_candidates();
+        direct_only.retain(|candidate| {
+            !matches!(
+                candidate.get("action").and_then(Value::as_str),
+                Some("retrieve" | "discover")
+            )
+        });
+        let direct_only = answer(state("stream the fixture reply", direct_only));
+        assert_eq!(chosen(&direct_only, GlobalQuestion::NextAction), "answer");
 
         let mut continued = state("thanks", typical_candidates());
         continued["completed_steps"] = json!([{"kind": "provider", "status": "ok"}]);

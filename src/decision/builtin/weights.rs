@@ -45,9 +45,9 @@ pub const UNDECIDED_TO_DISCOVER: f64 = 0.7;
 /// Log-score bonus for Answer when nothing is decisive.
 pub const UNDECIDED_TO_ANSWER: f64 = 0.3;
 /// Largest language-neutral request weight treated as a brief conversational
-/// first turn. Twenty alphanumeric characters, or seven characters in a
-/// script that normally omits spaces, remain substantive discovery input.
-pub const BRIEF_REQUEST_MAX_WEIGHT: usize = 19;
+/// first turn. One or two contiguous alphanumeric runs are brief; longer
+/// unrouted text may take the bounded discovery path before answering.
+pub const BRIEF_REQUEST_MAX_WEIGHT: usize = 2;
 /// Log-score bonus that makes Answer decisive for a brief first turn. It is
 /// intentionally larger than the combined priors of the generic read and
 /// discovery candidates so their mere availability cannot force Clarify.

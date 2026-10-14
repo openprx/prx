@@ -2707,6 +2707,22 @@ impl TurnDecisionService {
                     state = observed.state;
                 }
                 TurnExecutionDirective::Discover { .. } => {
+                    let signals =
+                        crate::decision::builtin::features::text_signals(decision.state.routing_input.as_str());
+                    let plain_turn_can_answer_after_empty_discovery = signals.has_text
+                        && !signals.structural()
+                        && decision.state.observed.retry_count() == 0
+                        && decision.state.observed.artifacts().is_empty()
+                        && !decision.state.trusted.parts().approval_pending
+                        && decision.state.observed.completed_steps().iter().all(|step| {
+                            step.kind() == ObservedStepKind::RouterHistory || step.status() == ObservedStepStatus::Ok
+                        })
+                        && !decision
+                            .state
+                            .derived
+                            .candidates()
+                            .iter()
+                            .any(|candidate| candidate.exact_mention);
                     let hop = decision
                         .state
                         .lineage
@@ -2736,6 +2752,9 @@ impl TurnDecisionService {
                     };
                     let previous_refs = discovered_refs.clone();
                     let added_refs = discovered_refs.extend_selected(selected_refs);
+                    if !added_refs && plain_turn_can_answer_after_empty_discovery {
+                        allow_terminal_answer = true;
+                    }
                     discovery_change = Some((previous_refs, added_refs));
                     state = decision.state.clone();
                     let mut steps = state.observed.completed_steps().to_vec();

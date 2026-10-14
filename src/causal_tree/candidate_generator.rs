@@ -158,6 +158,17 @@ impl DiscoveryFamilies {
             .zip(self.0)
             .filter_map(|(family, eligible)| eligible.then_some(family))
     }
+
+    pub(crate) const fn supports(family: CapabilityTarget) -> bool {
+        matches!(
+            family,
+            CapabilityTarget::Skill
+                | CapabilityTarget::Mcp
+                | CapabilityTarget::NativeTool
+                | CapabilityTarget::Wasm
+                | CapabilityTarget::Hook
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -318,6 +329,7 @@ impl CausalCandidateGenerator {
                 CausalActionKind::Retrieve,
                 CapabilityTarget::Memory,
                 sources,
+                false,
                 state,
                 catalog,
                 policy,
@@ -380,6 +392,7 @@ impl CausalCandidateGenerator {
                         CausalActionKind::UseTool,
                         family,
                         executable,
+                        false,
                         state,
                         catalog,
                         policy,
@@ -421,6 +434,7 @@ impl CausalCandidateGenerator {
                             CausalActionKind::Retrieve,
                             family,
                             safe_sources,
+                            false,
                             state,
                             catalog,
                             policy,
@@ -441,6 +455,7 @@ impl CausalCandidateGenerator {
                         CausalActionKind::Discover,
                         family,
                         searchable,
+                        false,
                         state,
                         catalog,
                         policy,
@@ -470,6 +485,7 @@ impl CausalCandidateGenerator {
                     CausalActionKind::Delegate,
                     CapabilityTarget::Session,
                     delegates,
+                    policy.delegation_target.is_some() || exact_delegator.is_some(),
                     state,
                     catalog,
                     policy,
@@ -607,6 +623,7 @@ fn select_family_candidate<'a>(
     action: CausalActionKind,
     family: CapabilityTarget,
     entries: impl IntoIterator<Item = &'a CapabilityEntry>,
+    bind_namespace: bool,
     state: &CausalState,
     catalog: &CatalogView<'_>,
     policy: &CandidatePolicy<'_>,
@@ -639,7 +656,8 @@ fn select_family_candidate<'a>(
         {
             continue;
         }
-        let candidate = from_entry(action, family, entry, policy, None);
+        let namespace = bind_namespace.then(|| Ns8::of(policy.key, &entry.namespace));
+        let candidate = from_entry(action, family, entry, policy, namespace);
         let outcome = HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
         match outcome {
             GateOutcome::Passed => return Ok(Some(candidate)),
@@ -2031,6 +2049,7 @@ mod tests {
             CausalActionKind::Discover,
             entry.family,
             [entry],
+            false,
             &state,
             &view,
             &policy,
@@ -2046,6 +2065,7 @@ mod tests {
             CausalActionKind::Discover,
             entry.family,
             [entry],
+            false,
             &state,
             &view,
             &policy,
@@ -2839,6 +2859,7 @@ mod tests {
                 CausalActionKind::Discover,
                 first.family,
                 [first, second, third],
+                false,
                 &state,
                 &view,
                 &policy,
@@ -3008,6 +3029,7 @@ mod tests {
                 CausalActionKind::UseTool,
                 CapabilityTarget::Mcp,
                 [first, second],
+                false,
                 &state,
                 &view,
                 &policy,

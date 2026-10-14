@@ -118,16 +118,12 @@ pub(crate) fn directive_from_selection(
     context: &DirectiveContext,
 ) -> Result<TurnExecutionDirective, DirectiveError> {
     let trusted = decision.state.trusted.parts();
-    if context.current_generation != trusted.catalog_generation
-        || (std::time::Instant::now() >= decision.deadline
-            && !matches!(
-                &decision.selection,
-                Selection::Abstain {
-                    action: CausalActionKind::Clarify | CausalActionKind::Refuse,
-                    ..
-                }
-            ))
-    {
+    // The decision engine replaces an executable selection with its terminal
+    // fallback when the decision deadline has expired before finalization.
+    // Re-reading the clock here makes an already final-gated selection depend
+    // on scheduler delay between those adjacent steps. Execution boundaries
+    // still enforce their own live deadlines and generation parity.
+    if context.current_generation != trusted.catalog_generation {
         return Err(DirectiveError::NotAdmitted);
     }
     match &decision.selection {
