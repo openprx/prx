@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{md, owner};
 use crate::skills::lifecycle::{
     Bundle, MigrationAction, MigrationEntry, SkillId, SkillLifecycleStore, SourceKind, apply_migration, plan_migration,
@@ -142,7 +144,10 @@ fn apply_imports_with_preserved_bytes_markers_and_enable_state() {
     );
 
     let alpha = SkillId::from_legacy_dir("alpha").expect("test: id");
-    let binding = store.read_binding(&alpha).expect("test: binding").expect("test: bound");
+    let binding = store
+        .active_binding(&alpha)
+        .expect("test: binding")
+        .expect("test: bound");
     assert_eq!((binding.generation, binding.enabled), (1, true));
     let verified = store
         .read_revision(&alpha, &binding.revision_id, None)
@@ -154,7 +159,10 @@ fn apply_imports_with_preserved_bytes_markers_and_enable_state() {
     assert_eq!(verified.revision.source_kind, SourceKind::Operator);
 
     let beta = SkillId::from_legacy_dir("beta").expect("test: id");
-    let beta_binding = store.read_binding(&beta).expect("test: binding").expect("test: bound");
+    let beta_binding = store
+        .active_binding(&beta)
+        .expect("test: binding")
+        .expect("test: bound");
     let beta_rev = store
         .read_revision(&beta, &beta_binding.revision_id, None)
         .expect("test: revision");
@@ -164,14 +172,14 @@ fn apply_imports_with_preserved_bytes_markers_and_enable_state() {
     let gamma = SkillId::from_legacy_dir("gamma").expect("test: id");
     assert!(
         !store
-            .read_binding(&gamma)
+            .active_binding(&gamma)
             .expect("test: binding")
             .expect("test: bound")
             .enabled
     );
     assert!(
         store
-            .read_binding(&SkillId::from_legacy_dir("conflict").expect("test: id"))
+            .active_binding(&SkillId::from_legacy_dir("conflict").expect("test: id"))
             .expect("test: binding")
             .is_none()
     );
@@ -220,7 +228,7 @@ fn apply_refuses_a_directory_that_changed_since_the_plan() {
     assert_eq!(report.imported.len(), 2);
     assert!(
         store
-            .read_binding(&SkillId::from_legacy_dir("alpha").expect("test: id"))
+            .active_binding(&SkillId::from_legacy_dir("alpha").expect("test: id"))
             .expect("test: binding")
             .is_none()
     );

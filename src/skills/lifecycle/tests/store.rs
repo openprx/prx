@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{basic_entries, entry, md, owner};
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, LifecycleError, NewRevision, OwnerScope, RevisionId, SkillId, SkillLifecycleStore,

@@ -1,5 +1,6 @@
 //! Legacy import (SL02): turn owner-owned `skills/<directory>` entries into
-//! immutable revisions with an initial active binding.
+//! immutable revisions, each activated through `publish` (first publish is
+//! generation 1; the disabled marker becomes `enabled = false`).
 //!
 //! [`plan_migration`] is the dry run: it classifies every entry and changes
 //! nothing. [`apply_migration`] imports only the entries the plan marked
@@ -9,9 +10,12 @@
 //! and applying a migration is separate from any later cleanup.
 
 use super::bundle::Bundle;
+use super::journal::TransactionId;
 use super::manifest::validate_manifest;
+use super::publish::PublishRequest;
 use super::store::SkillLifecycleStore;
 use super::types::{LifecycleError, NewRevision, RevisionId, SkillId, SourceKind};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -171,7 +175,7 @@ fn classify(
         ));
     }
     let revision_id = bundle.revision_id().clone();
-    let action = match store.map(|s| s.read_binding(&skill_id)).transpose()?.flatten() {
+    let action = match store.map(|s| s.active_binding(&skill_id)).transpose()?.flatten() {
         Some(binding) if binding.revision_id == revision_id => MigrationAction::AlreadyImported { revision_id },
         Some(binding) => MigrationAction::Drifted {
             bound: binding.revision_id,
@@ -194,6 +198,9 @@ fn classify(
 /// and proceeds only if it still hashes to the planned revision; a failure is
 /// reported per entry and does not stop the others. The caller is responsible
 /// for the migration authorization (SL09 gates this with the shared policy).
+/// Each activation goes through `publish`, so it takes the store and skill
+/// locks and writes a journal transaction; the call blocks while waiting for
+/// them (async callers use `spawn_blocking`).
 pub fn apply_migration(store: &SkillLifecycleStore, workspace_dir: &Path, plan: &MigrationPlan) -> MigrationReport {
     let root = crate::skills::skills_dir(workspace_dir);
     let mut report = MigrationReport::default();
@@ -230,7 +237,19 @@ fn import_one(
     } else {
         SourceKind::Operator
     };
-    store.write_revision(&NewRevision::new(skill_id.clone(), source_kind), &bundle)?;
-    store.write_binding(skill_id, planned, enabled, None)?;
+    let written = store.write_revision(&NewRevision::new(skill_id.clone(), source_kind), &bundle)?;
+    let expected_generation = store.active_binding(skill_id)?.map_or(0, |binding| binding.generation);
+    // Deterministic id: a retried migration of the same skill, revision and
+    // enabled state is an idempotent replay, never a second publication.
+    let digest = hex::encode(Sha256::digest(format!("{skill_id}\0{planned}\0{enabled}").as_bytes()));
+    let transaction_id = TransactionId::parse(&format!("mig-{}", digest.get(..32).unwrap_or(&digest)))?;
+    store.publish(&PublishRequest {
+        transaction_id,
+        skill_id: skill_id.clone(),
+        candidate: planned.clone(),
+        candidate_record_digest: written.record_digest,
+        expected_generation,
+        enabled,
+    })?;
     Ok(())
 }

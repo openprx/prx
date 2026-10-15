@@ -26,8 +26,7 @@ const SELF_DIR: &str = "self";
 const STORE_DIR: &str = "skill-lifecycle";
 const SCHEMA_FILE: &str = "schema.json";
 const REVISIONS_DIR: &str = "revisions";
-const ACTIVE_DIR: &str = "active";
-const STAGING_DIR: &str = "staging";
+pub(super) const STAGING_DIR: &str = "staging";
 const REVISION_FILE: &str = "revision.json";
 const BUNDLE_DIR: &str = "bundle";
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
@@ -148,7 +147,6 @@ impl SkillLifecycleStore {
         ensure_real_dir(&root, true)?;
         ensure_real_dir(&root.join(STAGING_DIR), true)?;
         ensure_real_dir(&root.join(REVISIONS_DIR), true)?;
-        ensure_real_dir(&root.join(ACTIVE_DIR), true)?;
         let store = Self { root, owner };
         store.ensure_schema()?;
         Ok(store)
@@ -263,16 +261,31 @@ impl SkillLifecycleStore {
         }
     }
 
-    pub(super) fn active_dir(&self) -> PathBuf {
-        self.root.join(ACTIVE_DIR)
-    }
-
     pub(super) fn bundle_dir(&self, skill: &SkillId, revision: &RevisionId) -> PathBuf {
         self.revision_dir(skill, revision).join(BUNDLE_DIR)
     }
 
-    pub(super) fn staging_dir(&self) -> PathBuf {
-        self.root.join(STAGING_DIR)
+    /// Reads `revision.json` only (no bundle hashing) and accepts it when its
+    /// canonical digest equals `digest`, which an active binding pins. This is
+    /// enough to learn the authentic display name without verifying the whole
+    /// bundle.
+    pub(super) fn pinned_revision_record(
+        &self,
+        skill: &SkillId,
+        revision: &RevisionId,
+        digest: &str,
+    ) -> Result<SkillRevision, LifecycleError> {
+        let path = self.revision_dir(skill, revision).join(REVISION_FILE);
+        check_private(&path)?;
+        let record: SkillRevision = read_record(&path)?;
+        self.check_owner(&record.owner_scope)?;
+        if record.skill_id != *skill || record.revision_id != *revision || record_digest(&record)? != digest {
+            return Err(LifecycleError::Tampered {
+                path,
+                reason: "revision record does not match the digest pinned by the binding".to_string(),
+            });
+        }
+        Ok(record)
     }
 
     pub(super) fn check_owner_scope(&self, found: &OwnerScope) -> Result<(), LifecycleError> {
@@ -309,6 +322,9 @@ impl SkillLifecycleStore {
         ensure_real_dir(&skill_dir, true)?;
         sync_dir(&self.root.join(REVISIONS_DIR))?;
         let staged = self.root.join(STAGING_DIR).join(uuid::Uuid::new_v4().to_string());
+        // Shared store lock: exclusive startup recovery must not sweep a
+        // staging directory while it is being renamed into place.
+        let _store_lock = self.lock_store(true, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
         let result = self.stage_and_publish(new, bundle, &info, &revision_id, &staged, &final_dir);
         if staged.exists()
             && let Err(e) = fs::remove_dir_all(&staged)

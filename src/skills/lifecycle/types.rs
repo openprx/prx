@@ -38,12 +38,8 @@ pub enum LifecycleError {
     OwnerMismatch { expected: String, found: String },
     #[error("unsupported {what} schema version {found}")]
     UnsupportedSchema { what: &'static str, found: u32 },
-    #[error("skill {skill} generation conflict: expected {expected:?}, found {actual:?}")]
-    GenerationConflict {
-        skill: String,
-        expected: Option<u64>,
-        actual: Option<u64>,
-    },
+    #[error("the task skill pin table is full ({0} pins); new pins are refused until tasks release theirs")]
+    PinTableFull(usize),
     #[error("skill name {0:?} is bound to more than one skill id")]
     AmbiguousSkillName(String),
     #[error("skill {0:?} is disabled")]
@@ -58,6 +54,23 @@ pub enum LifecycleError {
     RevisionNotFound(String),
     #[error("record {path} is invalid: {reason}")]
     InvalidRecord { path: PathBuf, reason: String },
+    #[error("stale generation for skill {skill}: expected {expected}, active is {actual}")]
+    StaleGeneration { skill: String, expected: u64, actual: u64 },
+    #[error("transaction {transaction_id} conflicts with an earlier request that used the same id")]
+    TransactionConflict { transaction_id: String },
+    #[error("transaction {transaction_id} did not commit (state {state}); use a new transaction id")]
+    TransactionNotCommitted {
+        transaction_id: String,
+        state: &'static str,
+    },
+    #[error("rollback target {0} was never published for this skill")]
+    RollbackTargetUnknown(String),
+    #[error("revision {0} is already the active revision")]
+    RevisionAlreadyActive(String),
+    #[error("transaction {transaction_id} is committed but needs repair or recovery: {reason}")]
+    CommittedRepairRequired { transaction_id: String, reason: String },
+    #[error("timed out waiting for publication lock {path}")]
+    LockTimeout { path: PathBuf },
     #[error("i/o error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -343,28 +356,8 @@ impl NewRevision {
     }
 }
 
-/// Pointer from a skill to its active revision. `generation` starts at 1 and
-/// increases on every replacement. Cross-process compare-and-swap, the
-/// publication journal and rollback belong to SL08; SL02 only needs the record
-/// and a single-writer, generation-checked write.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActiveSkillBinding {
-    pub schema_version: u32,
-    pub record_id: String,
-    pub owner_scope: OwnerScope,
-    pub skill_id: SkillId,
-    pub revision_id: RevisionId,
-    pub generation: u64,
-    pub enabled: bool,
-    /// Display name of the bound revision, kept here so name lookups do not
-    /// open every revision. It is cross-checked against the revision record.
-    pub display_name: String,
-    pub created_at: DateTime<Utc>,
-}
-
 /// Task-local, immutable reference to one revision issued from the active
-/// binding. Reads through it never follow a newer binding.
+/// binding (generation and pinned record digest included). Reads through it never follow a newer binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinnedSkillRevision {
     pub owner_scope: OwnerScope,

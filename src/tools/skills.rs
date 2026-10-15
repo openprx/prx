@@ -1209,10 +1209,19 @@ mod tests {
             executable: false,
         }])
         .unwrap();
-        store
+        let written = store
             .write_revision(&NewRevision::new(id.clone(), SourceKind::Learned), &bundle)
             .unwrap();
-        store.write_binding(&id, bundle.revision_id(), true, Some(1)).unwrap();
+        store
+            .publish(&crate::skills::lifecycle::PublishRequest {
+                transaction_id: crate::skills::lifecycle::TransactionId::generate(),
+                skill_id: id.clone(),
+                candidate: bundle.revision_id().clone(),
+                candidate_record_digest: written.record_digest,
+                expected_generation: 1,
+                enabled: true,
+            })
+            .unwrap();
 
         let same_task = read(scoped_args(owner, "task-tool-1", json!({"name": "demo"}))).await;
         assert!(
