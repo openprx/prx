@@ -26,7 +26,7 @@ const SELF_DIR: &str = "self";
 const STORE_DIR: &str = "skill-lifecycle";
 const SCHEMA_FILE: &str = "schema.json";
 const REVISIONS_DIR: &str = "revisions";
-const STAGING_DIR: &str = "staging";
+pub(super) const STAGING_DIR: &str = "staging";
 const REVISION_FILE: &str = "revision.json";
 const BUNDLE_DIR: &str = "bundle";
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
@@ -452,7 +452,7 @@ impl SkillLifecycleStore {
     }
 }
 
-fn record_bytes<T: Serialize>(value: &T, path: &Path) -> Result<Vec<u8>, LifecycleError> {
+pub(super) fn record_bytes<T: Serialize>(value: &T, path: &Path) -> Result<Vec<u8>, LifecycleError> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| LifecycleError::InvalidRecord {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -461,7 +461,7 @@ fn record_bytes<T: Serialize>(value: &T, path: &Path) -> Result<Vec<u8>, Lifecyc
     Ok(bytes)
 }
 
-fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, LifecycleError> {
+pub(super) fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, LifecycleError> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -491,7 +491,7 @@ fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Lifecycle
 /// Requires `path` to be a real (non-symlink) directory, creating it with
 /// owner-only permissions when absent. With `enforce_private`, the directory
 /// must already be owner-only.
-fn ensure_real_dir(path: &Path, enforce_private: bool) -> Result<(), LifecycleError> {
+pub(super) fn ensure_real_dir(path: &Path, enforce_private: bool) -> Result<(), LifecycleError> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -552,7 +552,7 @@ fn create_private_dir_all(path: &Path) -> Result<(), LifecycleError> {
     builder.create(path).map_err(|e| LifecycleError::io(path, e))
 }
 
-fn write_private_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), LifecycleError> {
+pub(super) fn write_private_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), LifecycleError> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -586,7 +586,7 @@ fn sync_tree_dirs(path: &Path) -> Result<(), LifecycleError> {
     sync_dir(path)
 }
 
-fn sync_dir(path: &Path) -> Result<(), LifecycleError> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), LifecycleError> {
     fs::File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|e| LifecycleError::io(path, e))
@@ -605,7 +605,7 @@ fn actual_dir_mode(_path: &Path) -> Result<Option<u32>, LifecycleError> {
 
 /// Verifies actual owner-only permissions and ownership of one entry.
 #[cfg(unix)]
-fn check_private(path: &Path) -> Result<(), LifecycleError> {
+pub(super) fn check_private(path: &Path) -> Result<(), LifecycleError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = fs::symlink_metadata(path).map_err(|e| LifecycleError::io(path, e))?;
     if meta.file_type().is_symlink() {
@@ -630,7 +630,7 @@ fn check_private(path: &Path) -> Result<(), LifecycleError> {
     Ok(())
 }
 #[cfg(not(unix))]
-fn check_private(_path: &Path) -> Result<(), LifecycleError> {
+pub(super) fn check_private(_path: &Path) -> Result<(), LifecycleError> {
     Ok(())
 }
 
