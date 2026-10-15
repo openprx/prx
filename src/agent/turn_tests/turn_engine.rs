@@ -798,6 +798,30 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
     .expect("native dedup tool loop should complete");
     assert_eq!(result, "done");
 
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the native tool round must reach its follow-up request"
+    );
+    let follow_up = requests.get(1).expect("test: native follow-up request");
+    let envelope_index = follow_up
+        .iter()
+        .position(|message| message.role == "assistant" && message.content.contains("\"tool_calls\""))
+        .expect("test: assistant tool-call envelope must precede the result");
+    let tool_result = follow_up
+        .get(envelope_index.saturating_add(1))
+        .expect("test: tool result must immediately follow its assistant envelope");
+    assert_eq!(tool_result.role, "tool");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&tool_result.content)
+            .expect("test: native tool result JSON")
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str),
+        Some("call-1"),
+        "the ordered result must answer the call in the preceding envelope"
+    );
+
     // Persistence uses deterministic, content-addressed document ids, so a
     // duplicate write is an idempotent UPSERT — invisible at the document
     // level. The counting decorator records every `ingest_document` call, so

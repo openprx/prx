@@ -139,13 +139,19 @@ impl Provider for ScriptedProvider {
 /// duplicated in native mode.
 pub(super) struct NativeScriptedProvider {
     pub(super) responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+    requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
 }
 
 impl NativeScriptedProvider {
     pub(super) fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses.into())),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(super) fn requests(&self) -> Vec<Vec<ChatMessage>> {
+        self.requests.lock().expect("requests lock should be valid").clone()
     }
 }
 
@@ -168,7 +174,11 @@ impl Provider for NativeScriptedProvider {
         anyhow::bail!("chat_with_system should not be used in native scripted provider tests");
     }
 
-    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        self.requests
+            .lock()
+            .expect("requests lock should be valid")
+            .push(request.messages.to_vec());
         let mut responses = self.responses.lock().expect("responses lock should be valid");
         responses
             .pop_front()
