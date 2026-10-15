@@ -200,9 +200,9 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/cron/postgres.rs::{qualified_memory_events_table}",
     "src/cron/store.rs::cron_event_outbox",
     "src/cron/store.rs::cron_job_events",
-    "src/memory/postgres.rs::{qualified_memory_events_table}",
-    "src/memory/postgres.rs::{qualified_message_events_table}",
-    "src/memory/postgres.rs::{schema_ident}.approval_grant_events",
+    "src/memory/postgres/schema.rs::{qualified_memory_events_table}",
+    "src/memory/postgres/schema.rs::{qualified_message_events_table}",
+    "src/memory/postgres/schema.rs::{schema_ident}.approval_grant_events",
     "src/memory/sqlite.rs::approval_grant_events",
     "src/memory/sqlite.rs::evolution_proposal_events",
     "src/memory/sqlite.rs::memory_events",
@@ -638,9 +638,32 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     assert!(message_scope.contains("scope.config_generation_id = self.config_generation_id"));
     assert!(message_scope.contains("scope.config_source_revision = self.config_source_revision.clone()"));
 
-    for relative in ["src/memory/sqlite.rs", "src/memory/postgres.rs"] {
-        let source = fs::read_to_string(repository_root().join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+    // The PostgreSQL adapter is the root file plus every file under its
+    // directory; the scan must see both and must not come back empty.
+    let mut postgres_files = vec!["src/memory/postgres.rs".to_string()];
+    for entry in
+        fs::read_dir(repository_root().join("src/memory/postgres")).expect("read the PostgreSQL adapter directory")
+    {
+        let path = entry.expect("read directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            postgres_files.push(relative_path(&path));
+        }
+    }
+    assert!(
+        postgres_files.len() > 2,
+        "the PostgreSQL adapter scan found only {postgres_files:?}"
+    );
+    for (relative, files) in [
+        ("src/memory/sqlite.rs", vec!["src/memory/sqlite.rs".to_string()]),
+        ("src/memory/postgres.rs and src/memory/postgres/", postgres_files),
+    ] {
+        let source = files
+            .iter()
+            .map(|file| {
+                fs::read_to_string(repository_root().join(file)).unwrap_or_else(|error| panic!("read {file}: {error}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for required in [
             "config_generation_id",
             "config_source_revision",
@@ -1701,6 +1724,10 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
 /// reason. Every other function that walks the source tree must separate
 /// production from tests through a marker-aware helper.
 const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
+    (
+        "runtime_and_message_events_preserve_typed_config_generation_columns",
+        "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
+    ),
     (
         "brain_db_is_not_opened_outside_the_sqlite_repository",
         "its allowlist names test functions: a test that opens brain.db directly is a reviewed exception too",
@@ -6448,19 +6475,19 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
                  loop's own handle on the approved execution service",
     },
     NonToolCallSite {
-        entry: "src/memory/postgres.rs::acquire_reset",
+        entry: "src/memory/postgres/pool.rs::acquire_reset",
         receiver: "client",
         occurrences: 1,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/pool.rs",
         evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
         reason: "`checkout.client_mut().and_then(|client| client.execute(...))` resets the \
                  PostgreSQL session context on a pooled tokio-postgres client",
     },
     NonToolCallSite {
-        entry: "src/memory/postgres.rs::apply_rls_context_raw",
+        entry: "src/memory/postgres/access.rs::apply_rls_context_raw",
         receiver: "client",
         occurrences: 4,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/access.rs",
         evidence: "fn apply_rls_context_raw<C: GenericClient>",
         reason: "binds the row-level-security context on a generic tokio-postgres client or \
                  transaction; the four calls are the four SET LOCAL statements",
@@ -6488,7 +6515,7 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         entry: "src/webhook/mod.rs::fail_blocking",
         receiver: "client_mut",
         occurrences: 1,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/pool.rs",
         evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
         reason: "`checkout.client_mut()?.execute(...)` marks a webhook ingestion failed on the \
                  pooled tokio-postgres client; the SQLite twin of the same function reaches its \
@@ -7408,9 +7435,9 @@ mod tests {
 ///   deliberately unanchored and is unreachable for an isolated caller, whose
 ///   mode is forced to Enforce before the choice is made.
 const MEMORY_READ_PRINCIPAL_CONSTRUCTIONS: &[&str] = &[
-    "src/memory/postgres.rs::principal_from_context::1",
+    "src/memory/postgres/access.rs::principal_from_context::1",
     "src/memory/postgres/decision_reads.rs::decision_principal::1",
-    "src/memory/postgres.rs::resolve_principal_from_context::2",
+    "src/memory/postgres/access.rs::resolve_principal_from_context::2",
     "src/memory/principal.rs::resolve_principal::4",
     "src/memory/sqlite.rs::sqlite_read_principal::1",
 ];
