@@ -247,8 +247,10 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
         assert!(refusal.contains("prx-unknown-provider"), "{surface}: {refusal}");
         refusals.push((surface, refusal));
     }
-    for (surface, refusal) in &refusals[1..] {
-        assert_eq!(refusal, &refusals[0].1, "{surface} changed the retained route refusal");
+    let expected = refusals.first().map_or("", |(_, refusal)| refusal.as_str());
+    assert!(!expected.is_empty(), "the chat surface did not return a refusal");
+    for (surface, refusal) in refusals.iter().skip(1) {
+        assert_eq!(refusal, expected, "{surface} changed the retained route refusal");
     }
     assert!(
         probe.requests().is_empty(),
