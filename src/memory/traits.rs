@@ -633,10 +633,69 @@ mod message_event_contract_tests {
         );
     }
 
+    /// The PostgreSQL backend's production text: the root file plus the sibling
+    /// files that were split out of it. Listed with `include_str!`, so a file
+    /// that moves or disappears breaks the build instead of blinding the scan.
+    fn postgres_backend_source() -> String {
+        [
+            include_str!("postgres.rs"),
+            include_str!("postgres/pool.rs"),
+            include_str!("postgres/schema.rs"),
+            include_str!("postgres/access.rs"),
+            include_str!("postgres/embedding.rs"),
+            include_str!("postgres/rows.rs"),
+            include_str!("postgres/memory_impl.rs"),
+            include_str!("postgres/events.rs"),
+        ]
+        .join("\n// ---- next source file ----\n")
+    }
+
+    /// A new file under `postgres/` must join the list above or be named here
+    /// as outside the old single-file text.
+    #[test]
+    fn postgres_backend_source_lists_every_backend_file() {
+        let source = postgres_backend_source();
+        let scanned: Vec<&str> = source.split("\n// ---- next source file ----\n").collect();
+        assert_eq!(
+            scanned.len(),
+            8,
+            "the scanned text must hold the root and seven sibling files"
+        );
+        let outside = [
+            "decision_reads.rs",
+            "ingress_recovery.rs",
+            "router_history.rs",
+            "router_learning.rs",
+        ];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/postgres");
+        for entry in std::fs::read_dir(directory).expect("test: read the backend directory") {
+            let path = entry.expect("test: read a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("test: utf-8 file name");
+            if path.is_dir() {
+                assert_eq!(
+                    name, "tests",
+                    "postgres/{name}/ is a subdirectory the scan does not read"
+                );
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("test: read a backend file");
+            assert!(
+                scanned.iter().any(|part| *part == text) || outside.contains(&name),
+                "postgres/{name} is neither scanned nor listed as outside the scan"
+            );
+        }
+    }
+
     #[test]
     fn sqlite_and_postgres_append_paths_share_lineage_and_transaction_boundaries() {
         let sqlite = include_str!("sqlite.rs");
-        let postgres = include_str!("postgres.rs");
+        let postgres = postgres_backend_source();
         let sqlite_append = sqlite
             .split_once("async fn append_message_event")
             .map_or("", |(_, body)| body);
@@ -730,7 +789,7 @@ mod message_event_contract_tests {
     #[test]
     fn sqlite_and_postgres_compaction_paths_persist_ids_and_covered_range() {
         let sqlite = include_str!("sqlite.rs");
-        let postgres = include_str!("postgres.rs");
+        let postgres = postgres_backend_source();
         let sqlite_append = sqlite
             .split_once("async fn append_compaction_run")
             .map_or("", |(_, body)| body);

@@ -1,10 +1,12 @@
 //! Bounded, read-only decision IO. Never leases the ordinary blocking pool.
+use super::super::principal::{ChatType, MemoryWriteContext, Principal, Role};
+use super::super::traits::MemoryPrincipal;
 use super::super::traits::{DecisionDocumentHit, DecisionMemoryHit, DecisionSessionHit};
-use super::{
-    ChatType, Context, DateTime, Instant, MemoryPrincipal, MemoryWriteContext, PG_DIALECT, PostgresMemory, Principal,
-    Result, Role, Utc, scope_params_to_strings,
-};
+use super::{PG_DIALECT, PostgresMemory, scope_params_to_strings};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::future::Future;
+use std::time::Instant;
 
 impl PostgresMemory {
     /// Own both the protocol driver and read future. Dropping this future drops

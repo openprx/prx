@@ -1,6 +1,8 @@
 //! Owned asynchronous runtime-statistics transactions; no ordinary pool lease.
-use super::{Context, Instant, PostgresMemory, Result};
+use super::PostgresMemory;
 use crate::memory::traits::{RouterLearningEvidence, RouterLearningRead, RouterLearningSnapshot};
+use anyhow::{Context, Result};
+use std::time::Instant;
 
 /// Learning state follows the actual configured event relation, just as Router
 /// history does. Old schema-wide tables are intentionally not read or imported:
