@@ -663,8 +663,10 @@ mod message_event_contract_tests {
     fn sqlite_and_postgres_append_paths_share_lineage_and_transaction_boundaries() {
         let sqlite = sqlite_backend_source();
         let postgres = include_str!("postgres.rs");
+        // The SQLite append lives in `append_event_with_recovery`; the trait
+        // method `append_message_event` only delegates to it.
         let sqlite_append = sqlite
-            .split_once("async fn append_message_event")
+            .split_once("async fn append_event_with_recovery")
             .map_or("", |(_, body)| body);
         let postgres_append = postgres
             .split_once("async fn append_message_event")
