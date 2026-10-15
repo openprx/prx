@@ -82,10 +82,13 @@ also retains the source's delegation authority and sealed child-capability
 boundary.
 
 An Answer turn may publish the bounded Direct core plus `capability_search` when
-the source/model may call tools and an eligible discovery family exists. It may
-also publish an exactly named `delegate` or `sessions_spawn` on any surface that
-admits delegation, even when that delegator is Searchable rather than configured
-as Direct, but only when the same decision carries a sealed child manifest.
+the source/model may call tools and an eligible discovery family exists. A brief
+answer with no structural target, such as a greeting, keeps only the Direct core;
+search becomes available when the input has a URL, path or code shape, or exceeds
+the builtin brief-request bound. An Answer turn may also publish an exactly named
+`delegate` or `sessions_spawn` on any surface that admits delegation, even when
+that delegator is Searchable rather than configured as Direct, but only when the
+same decision carries a sealed child manifest.
 Interactive Chat additionally places `sessions_spawn` in its Direct core.
 Exclusions, tools-off, read-only and plan interception still remove entries, and
 publication alone never executes one. Channel and gateway turns use these shared

@@ -68,6 +68,14 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
+        if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly) {
+            let signals = crate::decision::builtin::features::text_signals(context.engine.state.routing_input.as_str());
+            if !signals.structural()
+                && signals.request_weight <= crate::decision::builtin::weights::BRIEF_REQUEST_MAX_WEIGHT
+            {
+                return Ok(None);
+            }
+        }
         if self.discovery_families(proof, context)?.is_empty() {
             return Ok(None);
         }

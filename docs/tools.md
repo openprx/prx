@@ -51,7 +51,8 @@ and an optional `limit` from 1 to 5 (default 5). Each hit carries its canonical
 tool schema, capability ID, schema fingerprint and catalog generation. The
 shared turn engine exposes this control tool for AnswerDirectly and Execute
 decisions with a legal discoverable family, subject to source exclusions and
-policy.
+policy. A brief AnswerDirectly turn with no URL, path or code shape, including a
+greeting, retains the bounded Direct surface without publishing search.
 Discovery eligibility is retained independently of the prediction candidate
 limit and the original input's length. An oversized original input cannot be
 used directly for an initial search hop; a later model-supplied search query

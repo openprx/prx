@@ -28,6 +28,120 @@ impl Tool for DiscoverySurfaceTool {
 }
 
 #[tokio::test]
+async fn default_greeting_keeps_production_discovery_closed() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let mut tools: Vec<Box<dyn Tool>> = ["file_read", "skills_list", "skill_read", "shell"]
+        .into_iter()
+        .map(|name| {
+            Box::new(DiscoverySurfaceTool {
+                name,
+                dispatches: Arc::clone(&dispatches),
+            }) as Box<dyn Tool>
+        })
+        .collect();
+    tools.push(Box::new(CapabilitySearchTool));
+    let registry = Arc::new(tools);
+    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+        Arc::clone(&registry),
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    ));
+    let provider_catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let service = build_turn_decision_service(
+        TurnSurfaceKind::AgentLoop,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry,
+            execution,
+            catalog_sources: sources(&generation, &config),
+            surface_policy: SurfacePolicy {
+                direct_names: BTreeSet::from(["file_read".to_owned()]),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &provider_catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .unwrap();
+    let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+        &generation,
+        Arc::clone(&memory),
+        "hello",
+        "prx_greeting_discovery",
+    )
+    .await;
+
+    let context = service
+        .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
+    let selected = service.agent_execution_specs(&proof, &context).unwrap();
+    assert_eq!(
+        selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+        ["file_read"]
+    );
+    assert!(
+        service
+            .agent_capability_search_spec(&proof, &context)
+            .unwrap()
+            .is_none()
+    );
+    assert!(service.capability_search_port(&proof, &context).is_err());
+    assert!(
+        service
+            .prepare_discovered_tool(&proof, &context, "skills_list")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        service
+            .admit_discovered_tool(&proof, &context, "skills_list")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        service
+            .agent_appended_execution_specs(&proof, &context)
+            .unwrap()
+            .specs
+            .is_empty()
+    );
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+    context.terminal_execution_trace();
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
 async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
     // Preserve the three original F6 inputs, plus an unspaced-script request.
     let unspaced: String = [0x8bf7, 0x7f29, 0x77ed, 0x8fd9, 0x6bb5, 0x6587, 0x5b57]

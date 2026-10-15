@@ -11,7 +11,9 @@
 )]
 
 use super::*;
-use crate::agent::execution_policy::{AgentToolApprovalStrategy, agent_tool_execution_context};
+use crate::agent::execution_policy::{
+    AgentToolApprovalStrategy, AgentToolRuntimeInputs, agent_tool_execution_context, build_agent_tool_runtime_adapter,
+};
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::ToolResultRecorder;
 use crate::agent::tool_result_recording::tool_result_is_success;
@@ -186,10 +188,10 @@ async fn execute_tools_with_policy_prioritizes_foreground_tools() {
 async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
         name: "delegate".to_string(),
         execution_order: Arc::clone(&execution_order),
-    })];
+    })]);
 
     let policy = crate::security::SecurityPolicy {
         autonomy: crate::security::AutonomyLevel::Supervised,
@@ -197,10 +199,10 @@ async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
     };
     let scope_ctx = ScopeContext {
         policy: &policy,
-        sender: "user@example.com",
+        sender: "prx_user",
         channel: "telegram",
         chat_type: "private",
-        chat_id: "chat-1",
+        chat_id: "prx_channel",
         session_key: None,
         owner_id: None,
         owner_isolated: false,
@@ -210,29 +212,42 @@ async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
         config_generation_id: None,
         config_source_revision: None,
     };
-
-    let call = ParsedToolCall {
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let ledger: Arc<dyn crate::memory::Memory> = Arc::new(
+        crate::memory::SqliteMemory::new(ledger_dir.path()).expect("test: sqlite ledger should open in a temp dir"),
+    );
+    let adapter = build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
+        scope: Some(&scope_ctx),
+        channel_name: "telegram",
+        tools_registry,
+        approval: None,
+        approval_resolver: None,
+        cancellation: None,
+        ledger: Some(ledger),
+        unscoped_policy: None,
+    });
+    let calls = vec![ParsedToolCall {
         name: "delegate".to_string(),
         arguments: serde_json::json!({}),
-    };
-
-    let result = execute_tool_call_serial(
-        &call,
-        &tools_registry,
-        &NoopObserver,
-        None, // no ApprovalManager — the fail-closed condition
-        "telegram",
+    }];
+    let recorder = ToolResultRecorder::new(calls.len());
+    let results = execute_tools_with_service(
+        &calls,
+        &[],
+        &adapter,
+        unlimited_schedule(1),
         None,
-        Some(&scope_ctx),
         ChatMode::default(),
-        None,
+        &NoopObserver,
+        &recorder,
     )
     .await
-    .expect("serial execution should return a denial string, not error");
+    .expect("production scheduler should return a failed tool result, not an execution error");
 
     assert!(
-        result.starts_with("Denied:"),
-        "expected fail-closed denial, got: {result}"
+        results[0].contains("approval required but no approval resolver is available"),
+        "expected fail-closed approval denial, got: {}",
+        results[0]
     );
     assert!(
         execution_order
