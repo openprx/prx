@@ -2535,6 +2535,11 @@ mod tests {
     const CONSOLE_BULKY_TOOL: &str = "file_read";
     const CONSOLE_BULKY_FILE: &str = "prx-console-window.txt";
     const CONSOLE_BULKY_MARKER: &str = "CONSOLE-BULKY";
+    /// Wide ideographic code points as numbers: source and tests carry no CJK literals.
+    const BULKY_FIXTURE_CODEPOINTS: [u32; 24] = [
+        0x9f98, 0x9f49, 0x9750, 0x9f7e, 0x7229, 0x9c7b, 0x9ea4, 0x706a, 0x7228, 0x7c71, 0x7675, 0x9a6b, 0x9ea3, 0x7e9e,
+        0x864b, 0x8b9f, 0x9483, 0x9e1c, 0x9eb7, 0x97fd, 0x9962, 0x985f, 0x9860, 0x9861,
+    ];
     const CONSOLE_WINDOW_MODEL: &str = "narrow-window-model";
     const CONSOLE_WINDOW_PROVIDER: &str = "ollama";
     const CONSOLE_ROUTER_WINDOW: usize = 33_200;
@@ -2709,10 +2714,11 @@ mod tests {
                 let mut index = 0usize;
                 while payload.len() < 47_000 {
                     use std::fmt::Write as _;
-                    let _ = write!(
-                        payload,
-                        "{CONSOLE_BULKY_MARKER}-{index}-\u{9f98}\u{9f49}\u{9750}\u{9f7e}\u{7229}\u{9c7b}\u{9ea4}\u{706a}\u{7228}\u{7c71}\u{7675}\u{9a6b}\u{9ea3}\u{7e9e}\u{864b}\u{8b9f}\u{9483}\u{9e1c}\u{9eb7}\u{97fd}\u{9962}\u{985f}\u{9860}\u{9861} "
-                    );
+                    let _ = write!(payload, "{CONSOLE_BULKY_MARKER}-{index}-");
+                    for codepoint in BULKY_FIXTURE_CODEPOINTS {
+                        payload.extend(char::from_u32(codepoint));
+                    }
+                    payload.push(' ');
                     index += 1;
                 }
                 assert!(payload.len() < 48_000, "fixture must remain below the native inline cap");

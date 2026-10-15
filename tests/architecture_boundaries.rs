@@ -6440,6 +6440,15 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         reason: "private Session owns the actual tokio-postgres Client; three SQL executions persist backend identity and acquire or reclaim lifetime fencing",
     },
     NonToolCallSite {
+        entry: "src/agent/tool_scheduler.rs::spawn_delegation_tool",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/agent/tool_scheduler.rs",
+        evidence: "service: Arc<crate::tools::ToolExecutionService>,",
+        reason: "the parameter is the shared approved execution service; the delegation task \
+                 dispatches the already-built command through it on its own spawned task",
+    },
+    NonToolCallSite {
         entry: "src/agent/tool_scheduler.rs::execute_one_unrecorded",
         receiver: "service",
         occurrences: 1,
