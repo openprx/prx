@@ -66,7 +66,13 @@ async fn decide(scenario: Scenario) -> anyhow::Result<(EngineDecision, Candidate
         });
     }
     let surface = SurfacePolicy {
-        direct_names: BTreeSet::from(["file_write".to_owned(), "mcp__prx_server__write".to_owned()]),
+        direct_names: if exact {
+            BTreeSet::from(["file_write".to_owned(), "mcp__prx_server__write".to_owned()])
+        } else {
+            // Not named and not direct: only the local-discovery diagnostic
+            // scope can exist for the tool.
+            BTreeSet::new()
+        },
         ..SurfacePolicy::default()
     };
     let catalog = CapabilityCatalog::build(&registry, &sources, &surface)?;
@@ -111,13 +117,22 @@ async fn decide(scenario: Scenario) -> anyhow::Result<(EngineDecision, Candidate
         },
         estimate,
     );
+    let fingerprinted = if exact {
+        CandidateId::new(
+            CausalActionKind::UseTool,
+            entry.family,
+            Some(Ns8::of(&key, &entry.namespace)),
+        )
+    } else {
+        CandidateId::new(CausalActionKind::Discover, entry.family, None)
+    };
     let exact_id = CandidateId::new(
         CausalActionKind::UseTool,
         entry.family,
         Some(Ns8::of(&key, &entry.namespace)),
     );
     let calls = if with_call_fingerprint {
-        BTreeMap::from([(exact_id.clone(), [7; 32])])
+        BTreeMap::from([(fingerprinted, [7; 32])])
     } else {
         BTreeMap::new()
     };
@@ -225,6 +240,15 @@ async fn approval_only_tool_that_is_not_named_still_answers() -> anyhow::Result<
         ..Scenario::mcp(true)
     })
     .await?;
+    // The scenario does offer an approval scope for the MCP tool, so it is the
+    // exact-mention filter that keeps the answer.
+    let CandidateSet::Legal { approval_scopes, .. } = &decision.candidates else {
+        panic!("expected a legal set with an answer");
+    };
+    assert!(
+        approval_scopes.values().flatten().next().is_some(),
+        "the fixture must offer an approval scope"
+    );
     assert!(is_answer(&decision.selection), "selection={:?}", decision.selection);
     Ok(())
 }
