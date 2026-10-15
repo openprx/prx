@@ -198,19 +198,20 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/postgres.rs::{qualified_memory_events_table}",
     "src/memory/postgres.rs::{qualified_message_events_table}",
     "src/memory/postgres.rs::{schema_ident}.approval_grant_events",
-    "src/memory/sqlite.rs::approval_grant_events",
-    "src/memory/sqlite.rs::evolution_proposal_events",
-    "src/memory/sqlite.rs::memory_events",
-    "src/memory/sqlite.rs::memory_events",
-    "src/memory/sqlite.rs::memory_events",
-    // Fourth occurrence: the pre-v16 `memory_events` fixture in
-    // `legacy_memory_events_gets_owner_id_column_on_init`, which proves the
-    // C03 owner_id migration upgrades a database created before the column
-    // existed. A test fixture, not a second production ledger.
-    "src/memory/sqlite.rs::memory_events",
-    "src/memory/sqlite.rs::message_events",
-    "src/memory/sqlite.rs::message_events",
-    "src/memory/sqlite.rs::message_events",
+    "src/memory/sqlite/mod.rs::approval_grant_events",
+    "src/memory/sqlite/mod.rs::evolution_proposal_events",
+    "src/memory/sqlite/mod.rs::memory_events",
+    "src/memory/sqlite/mod.rs::memory_events",
+    "src/memory/sqlite/mod.rs::message_events",
+    "src/memory/sqlite/mod.rs::message_events",
+    "src/memory/sqlite/tests/schema_and_documents.rs::message_events",
+    // The `memory_events` tables in `tests/visibility_events.rs` are pre-v16
+    // fixtures (`legacy_memory_events_gets_owner_id_column_on_init` and its
+    // siblings) that prove the C03 owner_id migration upgrades a database
+    // created before the column existed. Test fixtures, not a second
+    // production ledger.
+    "src/memory/sqlite/tests/visibility_events.rs::memory_events",
+    "src/memory/sqlite/tests/visibility_events.rs::memory_events",
     "src/xin/evolution.rs::evolution_proposal_events",
     "src/xin/store.rs::xin_event_outbox",
     "src/xin/store.rs::xin_task_events",
@@ -343,9 +344,11 @@ fn assert_inventory(boundary: &str, actual: Vec<String>, expected: &[&str]) {
 #[test]
 fn brain_db_is_not_opened_outside_the_sqlite_repository() {
     let mut actual = Vec::new();
+    let mut sqlite_repository_files = 0usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if relative == "src/memory/sqlite.rs" {
+        if relative.starts_with("src/memory/sqlite/") {
+            sqlite_repository_files += 1;
             continue;
         }
         let source = read_source(&path);
@@ -363,8 +366,12 @@ fn brain_db_is_not_opened_outside_the_sqlite_repository() {
             }
         }
     }
+    assert!(
+        sqlite_repository_files > 0,
+        "the sqlite repository exemption matched no files under src/memory/sqlite/; the guard would be blind"
+    );
     assert_inventory(
-        "direct brain.db opens outside src/memory/sqlite.rs",
+        "direct brain.db opens outside src/memory/sqlite/",
         actual,
         ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY,
     );
@@ -633,9 +640,22 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     assert!(message_scope.contains("scope.config_generation_id = self.config_generation_id"));
     assert!(message_scope.contains("scope.config_source_revision = self.config_source_revision.clone()"));
 
-    for relative in ["src/memory/sqlite.rs", "src/memory/postgres.rs"] {
-        let source = fs::read_to_string(repository_root().join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+    // The sqlite backend's production files, listed so this check reads them
+    // directly instead of walking the tree (a walk would make it a tree
+    // scanner that needs its own planted-violation probe). `include_str!`
+    // fails the build if one of them moves, and a column that moves to a file
+    // missing from this list fails the check below, so neither can go blind.
+    let sqlite_source = [include_str!("../src/memory/sqlite/mod.rs")].join("\n");
+    assert!(
+        !sqlite_source.trim().is_empty(),
+        "the sqlite backend source files under src/memory/sqlite/ must not be empty"
+    );
+    let postgres_source = fs::read_to_string(repository_root().join("src/memory/postgres.rs"))
+        .unwrap_or_else(|error| panic!("read src/memory/postgres.rs: {error}"));
+    for (relative, source) in [
+        ("src/memory/sqlite/", sqlite_source),
+        ("src/memory/postgres.rs", postgres_source),
+    ] {
         for required in [
             "config_generation_id",
             "config_source_revision",
@@ -6951,7 +6971,7 @@ fn a_tool_on_a_non_local_receiver_is_not_excused_by_a_same_named_local() {
              conn.execute(sql, params)?;\n    \
              {call}\n}}\n"
         );
-        let scan = scan_tool_executions("src/memory/sqlite.rs", &source);
+        let scan = scan_tool_executions("src/memory/sqlite/recall.rs", &source);
         assert_eq!(scan.sites.len(), 2, "{label}: {:?}", scan.sites);
         let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
         let receivers: Vec<&str> = direct.iter().map(|site| site.receiver_path.as_str()).collect();
@@ -6991,7 +7011,7 @@ fn a_producer_match_is_anchored_to_the_whole_initialiser() {
         let source = format!(
             "pub fn probe_producer() {{\n    let handle = {initialiser};\n    let _ = handle.execute(args);\n}}\n"
         );
-        let scan = scan_tool_executions("src/memory/sqlite.rs", &source);
+        let scan = scan_tool_executions("src/memory/sqlite/recall.rs", &source);
         assert_eq!(scan.sites.len(), 1, "{label}: {:?}", scan.sites);
         assert_eq!(
             scan.sites[0].non_tool_binding.is_some(),
@@ -7396,7 +7416,7 @@ mod tests {
 ///   identity. Their doc comments state that owner isolation is a property of
 ///   the trusted context, and every caller that *has* a context is listed
 ///   below, so the scan reaches them through their callers.
-/// - `sqlite_owner_read_principal` (`src/memory/sqlite.rs`) is the backend's
+/// - `sqlite_owner_read_principal` (`src/memory/sqlite/mod.rs`) is the backend's
 ///   own unrestricted principal for Observe-mode compatibility reads. It is
 ///   deliberately unanchored and is unreachable for an isolated caller, whose
 ///   mode is forced to Enforce before the choice is made.
@@ -7405,7 +7425,7 @@ const MEMORY_READ_PRINCIPAL_CONSTRUCTIONS: &[&str] = &[
     "src/memory/postgres/decision_reads.rs::decision_principal::1",
     "src/memory/postgres.rs::resolve_principal_from_context::2",
     "src/memory/principal.rs::resolve_principal::4",
-    "src/memory/sqlite.rs::sqlite_read_principal::1",
+    "src/memory/sqlite/mod.rs::sqlite_read_principal::1",
 ];
 
 /// The three ways a read `Principal` is produced in `src/memory/`.

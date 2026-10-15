@@ -613,6 +613,32 @@ impl MessageEvent {
 mod message_event_contract_tests {
     use super::*;
 
+    /// The SQLite backend's production source: the root `sqlite/mod.rs` followed
+    /// by every other source file directly under `src/memory/sqlite/`. Its
+    /// `tests/` directory is excluded so a test fixture cannot satisfy a
+    /// production guard.
+    fn sqlite_backend_source() -> String {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/sqlite");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+            .expect("test: read src/memory/sqlite")
+            .map(|entry| entry.expect("test: read directory entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|extension| extension == "rs")
+                    && path.file_name().is_some_and(|name| name != "mod.rs")
+            })
+            .collect();
+        files.sort();
+        files.insert(0, directory.join("mod.rs"));
+        assert!(files.len() > 1, "test: the sqlite backend source files were not found");
+        let source = files
+            .iter()
+            .map(|path| std::fs::read_to_string(path).expect("test: read sqlite backend source"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!source.is_empty(), "test: the sqlite backend source is empty");
+        source
+    }
+
     #[test]
     fn typed_source_and_subject_keep_stable_json_contracts() {
         let known = MessageEventSource::Chat;
@@ -635,7 +661,7 @@ mod message_event_contract_tests {
 
     #[test]
     fn sqlite_and_postgres_append_paths_share_lineage_and_transaction_boundaries() {
-        let sqlite = include_str!("sqlite.rs");
+        let sqlite = sqlite_backend_source();
         let postgres = include_str!("postgres.rs");
         let sqlite_append = sqlite
             .split_once("async fn append_message_event")
@@ -729,7 +755,7 @@ mod message_event_contract_tests {
 
     #[test]
     fn sqlite_and_postgres_compaction_paths_persist_ids_and_covered_range() {
-        let sqlite = include_str!("sqlite.rs");
+        let sqlite = sqlite_backend_source();
         let postgres = include_str!("postgres.rs");
         let sqlite_append = sqlite
             .split_once("async fn append_compaction_run")
