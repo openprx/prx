@@ -9,7 +9,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **Broad LLM provider catalog** — Anthropic, OpenAI, Google Gemini, GitHub Copilot, Ollama, AWS Bedrock, GLM, OpenAI Codex, local runtimes, and compatible endpoints
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
 - **Causal Tree Engine** — speculative multi-branch prediction with rehearsal, scoring, and circuit breaker; opt-in via `causal_tree.enabled` (disabled by default)
-- **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
+- **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, opt-in Matrix, and more
 - **Built-in tools and integrations** — shell, MCP, memory, scheduling, remote nodes, and an integration catalog
 - **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
@@ -70,6 +70,13 @@ git clone https://github.com/openprx/prx.git
 cd prx
 cargo build --release --locked --bin prx
 ./target/release/prx onboard --interactive
+```
+
+Release binaries and normal source builds leave Matrix support out. To build
+the Matrix channel, opt in explicitly:
+
+```bash
+cargo build --release --locked --bin prx --features channel-matrix
 ```
 
 ## Binaries

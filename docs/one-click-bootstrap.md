@@ -106,6 +106,17 @@ cargo build --release --locked --bin prx
 install -m 0755 target/release/prx "$HOME/.local/bin/prx"
 ```
 
+Matrix is not included in the default or release binary. A source build can
+opt in to the Matrix channel explicitly:
+
+```bash
+cargo build --release --locked --bin prx --features channel-matrix
+```
+
+After installing that binary, `prx onboard --interactive` offers Matrix. A
+default binary reports an existing `[channels_config.matrix]` configuration as
+unavailable through `prx doctor` and at channel startup.
+
 The Unix installer also provides an explicit source mode:
 
 ```bash
