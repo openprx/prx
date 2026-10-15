@@ -12330,6 +12330,23 @@ circuit_breaker_cooldown_secs = 60
         loaded.expect("test: a pinned hosted model loads");
     }
 
+    /// The decision log and metrics switches never had an effect; a versioned
+    /// file that stores them still loads, and a save does not write them back.
+    #[tokio::test]
+    async fn stored_observability_switches_load_and_are_not_written_back() {
+        let (dir, loaded) = load(
+            "default_temperature = 0.7\n\n[causal_tree]\nschema_version = 1\nenabled = true\n\n\
+             [causal_tree.observability]\ndecision_log = false\nmetrics = false\n",
+        );
+        let loaded = loaded.expect("test: a stored observability table still loads");
+        assert!(loaded.causal_tree.enabled);
+        crate::config::files::write_split_config(&loaded, false)
+            .await
+            .expect("test: save");
+        let saved = saved_text(dir.path());
+        assert!(!saved.contains("decision_log") && !saved.contains("metrics"), "{saved}");
+    }
+
     #[tokio::test]
     async fn migration_is_idempotent_and_save_writes_no_legacy_key() {
         let text = SAVED_BY_8A5D160D.replace("max_branches = 3", "max_branches = 5");

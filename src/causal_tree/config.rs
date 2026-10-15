@@ -448,7 +448,9 @@ impl WeightOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ScoringConfig {
-    /// The scorer version the weights were chosen for.
+    /// The scorer version the weights were chosen for. When set, a scorer of
+    /// another version refuses the configuration rather than apply weights
+    /// chosen for different scoring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Weight overrides.
@@ -485,25 +487,6 @@ pub struct EvaluationConfig {
     pub exploration_rate: f64,
 }
 
-/// Observability (`[causal_tree.observability]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct CausalObservabilityConfig {
-    /// Write a decision log line per decision.
-    pub decision_log: bool,
-    /// Record decision metrics.
-    pub metrics: bool,
-}
-
-impl Default for CausalObservabilityConfig {
-    fn default() -> Self {
-        Self {
-            decision_log: true,
-            metrics: true,
-        }
-    }
-}
-
 /// The `[causal_tree]` section.
 ///
 /// File and JSON reloads share the same canonical keys and defaults.
@@ -532,8 +515,6 @@ pub struct CausalTreeConfig {
     pub store: DecisionStoreConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub evaluation: EvaluationConfig,
-    #[serde(skip_serializing_if = "is_default")]
-    pub observability: CausalObservabilityConfig,
 }
 
 impl Default for CausalTreeConfig {
@@ -547,7 +528,6 @@ impl Default for CausalTreeConfig {
             scoring: ScoringConfig::default(),
             store: DecisionStoreConfig::default(),
             evaluation: EvaluationConfig::default(),
-            observability: CausalObservabilityConfig::default(),
         }
     }
 }
@@ -568,7 +548,6 @@ pub struct CausalTreeConfigWire {
     scoring: ScoringConfig,
     store: DecisionStoreConfig,
     evaluation: EvaluationConfig,
-    observability: CausalObservabilityConfig,
 }
 
 impl Default for CausalTreeConfigWire {
@@ -583,7 +562,6 @@ impl Default for CausalTreeConfigWire {
             scoring: defaults.scoring,
             store: defaults.store,
             evaluation: defaults.evaluation,
-            observability: defaults.observability,
         }
     }
 }
@@ -599,7 +577,6 @@ impl From<CausalTreeConfigWire> for CausalTreeConfig {
             scoring: wire.scoring,
             store: wire.store,
             evaluation: wire.evaluation,
-            observability: wire.observability,
         }
     }
 }
@@ -883,6 +860,18 @@ const LEGACY_ONLY_KEYS: [&[&str]; 8] = [
     &["policy", "circuit_breaker_cooldown_secs"],
 ];
 
+/// Keys that were accepted but never read at runtime. They are dropped with
+/// the legacy keys' report in any `[causal_tree]` table, whatever its schema
+/// version, so a stored file keeps loading: the decision log and metrics
+/// switches (`write_decision_log`, `write_metrics` and their
+/// `observability.*` successors).
+const RETIRED_KEYS: [(&[&str], &str); 4] = [
+    (&["write_decision_log"], "write_decision_log"),
+    (&["write_metrics"], "write_metrics"),
+    (&["observability", "decision_log"], "observability.decision_log"),
+    (&["observability", "metrics"], "observability.metrics"),
+];
+
 /// Where a legacy key's operator value goes.
 enum Home {
     /// It kept its name; only its legacy default is reinterpreted, and only
@@ -906,7 +895,7 @@ struct LegacyKey {
     home: Home,
 }
 
-const LEGACY_KEYS: [LegacyKey; 11] = [
+const LEGACY_KEYS: [LegacyKey; 9] = [
     LegacyKey {
         old: &["policy", "max_branches"],
         name: "policy.max_branches",
@@ -987,26 +976,6 @@ const LEGACY_KEYS: [LegacyKey; 11] = [
         home: Home::Moves {
             path: &["scoring", "weights", "w_latency"],
             name: "scoring.weights.w_latency",
-            max: None,
-        },
-    },
-    LegacyKey {
-        old: &["write_decision_log"],
-        name: "write_decision_log",
-        default: |value| value.as_bool() == Some(true),
-        home: Home::Moves {
-            path: &["observability", "decision_log"],
-            name: "observability.decision_log",
-            max: None,
-        },
-    },
-    LegacyKey {
-        old: &["write_metrics"],
-        name: "write_metrics",
-        default: |value| value.as_bool() == Some(true),
-        home: Home::Moves {
-            path: &["observability", "metrics"],
-            name: "observability.metrics",
             max: None,
         },
     },
@@ -1156,6 +1125,11 @@ pub fn migrate_legacy(root: &mut toml::Value, locate: KeyLocator<'_>) -> Result<
             });
         }
         report.moved.push(key.name);
+    }
+    for (path, name) in RETIRED_KEYS {
+        if take(table, path).is_some() {
+            report.dropped.push(name);
+        }
     }
     Ok(report)
 }
@@ -1759,9 +1733,12 @@ circuit_breaker_cooldown_secs = 120
                 "policy.circuit_breaker_threshold",
                 "policy.circuit_breaker_cooldown_secs",
                 "w_cost",
-                "write_decision_log",
-                "write_metrics"
             ]
+        );
+        assert_eq!(
+            report.dropped,
+            ["w_latency", "write_decision_log", "write_metrics"],
+            "the legacy default is dropped, and so are the switches that never had an effect"
         );
         let config: CausalTreeConfig = root["causal_tree"].clone().try_into().expect("test: loads");
         assert!(config.enabled);
@@ -1772,8 +1749,28 @@ circuit_breaker_cooldown_secs = 120
         assert_eq!(config.backend.circuit_breaker.cooldown_secs, 120);
         assert_eq!(config.scoring.weights.w_cost, Some(0.400_000_005_960_464_5));
         assert_eq!(config.scoring.weights.w_latency, None, "the legacy default is dropped");
-        assert!(!config.observability.decision_log && !config.observability.metrics);
         config.validate().expect("test: the moved values are valid");
+    }
+
+    /// The decision log and metrics switches were accepted but never
+    /// read. A stored file keeps loading, in a versioned
+    /// table too, and the report names each dropped key.
+    #[test]
+    fn retired_keys_are_dropped_with_a_report_in_any_schema_version() {
+        for text in [
+            "[causal_tree]\nschema_version = 1\n[causal_tree.observability]\ndecision_log = false\nmetrics = false\n\
+             [causal_tree.scoring.weights]\nw_cost = 0.2\n",
+            "[causal_tree]\nwrite_decision_log = false\nwrite_metrics = false\n[causal_tree.scoring.weights]\nw_cost = 0.2\n",
+        ] {
+            let mut root = causal(text);
+            let report = migrate_legacy(&mut root, &nowhere).expect("test: migrates");
+            assert!(report.found_legacy_keys(), "{text}");
+            assert_eq!(report.dropped.len(), 2, "{text}: {report:?}");
+            prune_empty_migration_tables(&mut root);
+            let config: CausalTreeConfig = root["causal_tree"].clone().try_into().expect("test: loads");
+            assert_eq!(config.scoring.weights.w_cost, Some(0.2), "operator weights are kept");
+            config.validate().expect("test: valid");
+        }
     }
 
     /// Keys with no faithful home, and a legacy key beside its replacement,
@@ -1789,10 +1786,6 @@ circuit_breaker_cooldown_secs = 120
             (
                 "[causal_tree.policy]\nmax_branches = 5\nmax_candidates = 6\n",
                 "policy.max_branches",
-            ),
-            (
-                "[causal_tree]\nwrite_metrics = false\n[causal_tree.observability]\nmetrics = true\n",
-                "write_metrics",
             ),
             ("[causal_tree.policy]\nmax_branches = 300\n", "policy.max_branches"),
             (
