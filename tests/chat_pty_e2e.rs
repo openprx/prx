@@ -274,7 +274,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         .stdin
         .take()
         .expect("chat stdin")
-        .write_all(b"PRX_CHAT_PARENT\n/exit\n")
+        .write_all(b"PRX_CHAT_PARENT use sessions_spawn\n/exit\n")
         .expect("chat script");
     let output = child.wait_with_output().expect("chat output");
     stop.store(true, Ordering::Relaxed);
@@ -2214,7 +2214,9 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
-    session.send("fan this out\r").expect("send prompt");
+    session
+        .send("use sessions_spawn to fan this out\r")
+        .expect("send prompt");
     read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
 
     session.send("/sessions\r").expect("send /sessions");
