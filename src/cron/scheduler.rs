@@ -2002,6 +2002,26 @@ mod tests {
         assert_eq!(tree(tmp.path()), before, "the refused job changed the workspace");
     }
 
+    /// Finding 64: Cron reaches the agent entry with its own source envelope;
+    /// it must retain the same resolved fallback facts as interactive entrypoints.
+    #[tokio::test]
+    async fn cron_agent_entry_refuses_a_cross_dialect_fallback_before_transport() {
+        let tmp = TempDir::new().expect("test: temp workspace");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut config = test_config(&tmp).await;
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &probe.custom_provider());
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
+
+        assert!(!success, "Cron accepted an incompatible fallback: {output}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("cron", &output);
+        assert!(probe.requests().is_empty(), "Cron reached transport: {output}");
+    }
+
     /// R-PMMC F-1: a cron job whose model is a `hint:<route>` runs again.
     #[tokio::test]
     async fn run_agent_job_resolves_a_hint_model_through_its_route() {

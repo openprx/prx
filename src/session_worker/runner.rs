@@ -3792,6 +3792,28 @@ mod tests {
         assert!(probe.requests().is_empty());
     }
 
+    /// Finding 64: exercise the worker's own credential-choice and provider
+    /// construction seam, rather than calling its lower-level typed builder.
+    #[tokio::test]
+    async fn worker_provider_refuses_a_cross_dialect_fallback_before_transport() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut config = root_config(temp.path());
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &probe.custom_provider());
+        let mut manifest = base_manifest(temp.path(), "capability");
+        manifest.provider_name = probe.custom_provider();
+        manifest.model = crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL.to_string();
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+        let credentials = worker_credentials(&manifest, &config);
+
+        let error = worker_provider(&manifest, &config, &credentials, &options)
+            .err()
+            .expect("a worker accepted an incompatible fallback");
+        let shown = format!("{error:#}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("worker", &shown);
+        assert!(probe.requests().is_empty(), "the worker reached transport: {shown}");
+    }
+
     /// The worker's own chain on a non-default provider carries neither the
     /// root key nor a rotation key onto the wire.
     #[tokio::test]

@@ -123,6 +123,15 @@ independently. A refused or unbuildable route is skipped with a warning rather
 than disabling the default or another route; selecting its `hint:` returns the
 retained refusal without sending a provider request.
 
+A root connection may configure an `api_url` or rotation keys without an
+inline `api_key`. That is still an owner-bound Root selection: construction
+asks the configured provider's own credential store for the missing primary
+key, while the root URL and rotation material remain attached to that same
+provider identity. A route with its own key is a separate credential and does
+not inherit the root URL or root rotation keys. Each route is resolved and
+built independently, so a refused route is retained as that hint's refusal and
+does not disable the default provider or another route.
+
 Where the resolver runs. Every surface resolves before it builds a provider,
 so a refusal sends nothing and names the model, the provider (URL userinfo
 redacted), the evidence and the fix:

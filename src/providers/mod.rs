@@ -40,7 +40,7 @@ pub mod utf8_stream;
 #[cfg(test)]
 pub(crate) mod credential_probe;
 #[cfg(test)]
-mod entrypoint_consistency_tests;
+pub(crate) mod entrypoint_consistency_tests;
 #[cfg(test)]
 pub(crate) mod label_redaction_tests;
 #[cfg(test)]

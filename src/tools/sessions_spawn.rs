@@ -17678,7 +17678,7 @@ mod tests {
     /// A routed parent keeps its route key for an inherited child, while a
     /// direct-model child returns to the configured root connection.
     #[tokio::test]
-    async fn default_hint_child_and_direct_override_use_their_own_wire_keys() {
+    async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
         use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
@@ -17725,6 +17725,11 @@ mod tests {
             .with_cost_config(config.cost.clone());
         tool.model = "hint:fast".to_string();
         tool.provider = Arc::from(routed_provider);
+        assert_eq!(
+            tool.child_provider_plan(None, &root_provider),
+            ChildProvider::Root,
+            "a direct child of a hinted parent must rebuild from the resolved Root credential"
+        );
 
         let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
             .await
@@ -17748,7 +17753,7 @@ mod tests {
     /// A named direct agent on the hinted parent's source provider owns a
     /// separate key. Task mode must select it just as process mode does.
     #[tokio::test]
-    async fn hinted_parent_direct_agent_child_uses_agent_key_on_wire() {
+    async fn child_provider_build_branch_uses_named_agent_credential_on_wire() {
         use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
@@ -17786,11 +17791,9 @@ mod tests {
         let mut profile_agent = containment_agent(&root_provider, None);
         profile_agent.credential_ref = Some(profile.id.clone());
         config.agents.insert("prx_profile".to_string(), profile_agent);
+        let inline_agent = containment_agent(&root_provider, Some("PRX-HINT-AGENT-WIRE"));
         let agents = HashMap::from([
-            (
-                "prx_agent".to_string(),
-                containment_agent(&root_provider, Some("PRX-HINT-AGENT-WIRE")),
-            ),
+            ("prx_agent".to_string(), inline_agent.clone()),
             (
                 "prx_profile".to_string(),
                 config
@@ -17806,6 +17809,13 @@ mod tests {
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
         tool.model = "hint:fast".to_string();
         tool.provider = Arc::from(routed_provider);
+        assert_eq!(
+            tool.child_provider_plan(Some(&inline_agent), &root_provider),
+            ChildProvider::Build {
+                api_key: Some("PRX-HINT-AGENT-WIRE".to_string())
+            },
+            "the named agent must take the override build branch"
+        );
 
         let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
             .await

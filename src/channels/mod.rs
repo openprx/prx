@@ -10644,6 +10644,47 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(ctx.provider_cache.lock().len(), 2);
     }
 
+    /// Finding 64: the per-sender `/models` provider getter resolves the
+    /// selected model's fallback contract before caching or warming a chain.
+    #[tokio::test]
+    async fn per_sender_provider_getter_refuses_a_cross_dialect_fallback_before_transport() {
+        let temp = TempDir::new().expect("test: temp state dir");
+        let probe = providers::credential_probe::CredentialProbe::start().await;
+        let selected_provider = probe.custom_provider();
+        let mut effective = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut effective, &selected_provider);
+        effective.default_provider = Some("openai".to_string());
+        let manager = crate::config::new_shared(effective);
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.default_provider = Arc::new("openai".to_string());
+        ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = manager.pin();
+
+        let error = get_or_create_provider_for_generation(
+            &ctx,
+            &selected_provider,
+            crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL,
+            &ctx.config_generation,
+        )
+        .await
+        .err()
+        .expect("the per-sender getter accepted an incompatible fallback");
+        let shown = format!("{error:#}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("channel per-sender", &shown);
+        assert!(
+            probe.requests().is_empty(),
+            "the channel getter reached transport: {shown}"
+        );
+        assert!(
+            ctx.provider_cache.lock().is_empty(),
+            "a refused chain entered the cache"
+        );
+    }
+
     #[tokio::test]
     async fn process_channel_message_builds_selected_provider_without_plain_turn_retrieval() {
         factory_reload_fixture::run().await;

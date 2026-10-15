@@ -2,23 +2,18 @@ use super::{configured_connection_for, provider_runtime_options_from_config, sco
 use crate::config::Config;
 use crate::providers::traits::{ChatMessage, ChatRequest};
 
-const PRIMARY_MODEL: &str = "model-a";
-const FALLBACK_MODEL: &str = "model-b";
+pub(crate) const PRIMARY_MODEL: &str = "model-a";
+pub(crate) const FALLBACK_MODEL: &str = "model-b";
 
-fn cross_dialect_config(temp: &tempfile::TempDir) -> Config {
-    let provider = "custom:http://127.0.0.1:9/v1";
-    let mut config = Config::default();
-    config.workspace_dir = temp.path().to_path_buf();
-    config.config_path = temp.path().join("config.toml");
+pub(crate) fn configure_cross_dialect(config: &mut Config, provider: &str) {
     config.default_provider = Some(provider.to_string());
     config.default_model = Some(PRIMARY_MODEL.to_string());
     config.api_key = None;
     config.api_url = None;
-    config.auth.codex_auth_json_auto_import = false;
-    config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
-    config.secrets.encrypt = false;
     config.reliability.provider_retries = 0;
     config.reliability.provider_backoff_ms = 0;
+    config.reliability.api_keys.clear();
+    config.reliability.fallback_providers.clear();
     config
         .reliability
         .model_fallbacks
@@ -32,6 +27,22 @@ fn cross_dialect_config(temp: &tempfile::TempDir) -> Config {
             tool_schema: Some(crate::config::schema::ToolSchemaDialectSetting::NoRootCombinators),
             tool_call: None,
         });
+}
+
+pub(crate) fn assert_cross_dialect_refusal(surface: &str, refusal: &str) {
+    assert!(refusal.contains(FALLBACK_MODEL), "{surface}: {refusal}");
+    assert!(refusal.contains("speaks tool-schema dialect"), "{surface}: {refusal}");
+}
+
+fn cross_dialect_config(temp: &tempfile::TempDir) -> Config {
+    let provider = "custom:http://127.0.0.1:9/v1";
+    let mut config = Config::default();
+    config.workspace_dir = temp.path().to_path_buf();
+    config.config_path = temp.path().join("config.toml");
+    config.auth.codex_auth_json_auto_import = false;
+    config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+    config.secrets.encrypt = false;
+    configure_cross_dialect(&mut config, provider);
     config
 }
 
@@ -42,10 +53,10 @@ fn refusal<T>(result: anyhow::Result<T>) -> String {
     }
 }
 
-/// Finding 42: chat, the CLI/cron shared entry, channels, gateway and a
-/// session worker must all retain the same resolved model facts through their
-/// real production builders. The fallback differs only in tool-schema dialect;
-/// every surface must refuse it before any loopback transport is attempted.
+/// Finding 42: the shared chat, CLI, channel, gateway and worker builders retain
+/// the same resolved model facts. Finding 64 drives Cron, Xin and the worker's
+/// own selection seam through their real entry modules instead of naming a
+/// second invocation of the CLI builder here.
 #[test]
 fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
@@ -64,10 +75,6 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let cli_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None)
         .expect("test: CLI selection resolves before its fallback chain is built");
     let cli = refusal(crate::agent::entry::agent_provider_selection(&cli_choice).build_provider(&config, &options));
-    let cron_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None)
-        .expect("test: cron selection resolves before its fallback chain is built");
-    let cron = refusal(crate::agent::entry::agent_provider_selection(&cron_choice).build_provider(&config, &options));
-
     let channels = refusal(crate::channels::build_channel_startup_provider(&config, &options));
     let gateway = refusal(crate::gateway::build_gateway_provider_selection(&config, &options));
 
@@ -87,14 +94,12 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let refusals = [
         ("chat", chat),
         ("cli", cli),
-        ("cron", cron),
         ("channels", channels),
         ("gateway", gateway),
         ("worker", worker),
     ];
     let expected = &refusals[0].1;
-    assert!(expected.contains(FALLBACK_MODEL), "{expected}");
-    assert!(expected.contains("speaks tool-schema dialect"), "{expected}");
+    assert_cross_dialect_refusal("chat", expected);
     for (surface, refusal) in &refusals[1..] {
         assert_eq!(refusal, expected, "{surface} changed the resolver/factory refusal");
     }

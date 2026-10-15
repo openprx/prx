@@ -2084,6 +2084,45 @@ mod tests {
         );
     }
 
+    /// Finding 64: a persisted Xin agent task must pass its model through the
+    /// real manual-run entry, retaining the resolver's fallback dialect facts.
+    #[tokio::test]
+    async fn xin_agent_entry_refuses_a_cross_dialect_fallback_before_transport() {
+        let tmp = TempDir::new().expect("test: temp workspace");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut config = test_config(&tmp);
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &probe.custom_provider());
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let created = execute_as(
+            Box::new(crate::tools::XinTool::new(
+                crate::config::new_shared(config.clone()),
+                Arc::clone(&security),
+            )),
+            surface_context(&config, Surface::AgentCli),
+            serde_json::json!({
+                "action": "add",
+                "name": "cross-dialect-xin-turn",
+                "payload": "Say hello",
+                "execution_mode": "agent_session",
+            }),
+        )
+        .await;
+        assert!(created.success, "test: the Xin task was created: {created:?}");
+        let task = store::list_tasks(&config)
+            .expect("test: list Xin tasks")
+            .into_iter()
+            .find(|task| task.name == "cross-dialect-xin-turn")
+            .expect("test: the Xin task");
+
+        let run = run_task_now(&config, &security, &task.id)
+            .await
+            .expect("test: the Xin task records its refusal");
+
+        assert!(!run.success, "Xin accepted an incompatible fallback: {}", run.output);
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("xin", &run.output);
+        assert!(probe.requests().is_empty(), "Xin reached transport: {}", run.output);
+    }
+
     /// R-MCPBh M-1 for xin: an agent-session task ran every tool call with the
     /// `prx agent` CLI tuple whoever created it, so a webhook caller's task could
     /// write into `MEMORY.md` and so into every surface's system prompt. The run

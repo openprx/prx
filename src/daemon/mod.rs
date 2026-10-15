@@ -2995,6 +2995,35 @@ mod tests {
         assert!(!logged.contains("sk-fixture-not-real"), "{logged}");
     }
 
+    /// Finding 64: the daemon's real evolution-judge factory retains model
+    /// fallback dialect facts and degrades before any provider request.
+    #[tokio::test]
+    async fn evolution_judge_refuses_a_cross_dialect_fallback_before_transport() {
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let temp = tempfile::tempdir().expect("test: temp workspace");
+        let mut config = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &probe.custom_provider());
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || JudgeLogCapture(std::sync::Arc::clone(&sink)))
+            .finish();
+        {
+            let _serial = JUDGE_HEALTH_SERIAL.lock();
+            let _judge = tracing::subscriber::with_default(subscriber, || build_evolution_judge_model(&config));
+        }
+        let logged = String::from_utf8_lossy(&captured.lock()).into_owned();
+
+        assert!(logged.contains("DEGRADED"), "the judge did not degrade: {logged}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("evolution judge", &logged);
+        assert!(probe.requests().is_empty(), "the judge reached transport: {logged}");
+    }
+
     /// A loopback chat endpoint that records the `model` of every request
     /// and answers with a judge score.
     async fn judge_stub() -> (
