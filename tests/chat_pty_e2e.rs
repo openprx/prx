@@ -2233,11 +2233,12 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     );
 }
 
-/// S5 P0-1: gemini-flavor cancel-mid-stream — double Ctrl+C after the first chunk appears.
+/// S5 P0-1: gemini-flavor cancel-mid-stream — the partial turn reaches the
+/// cancelled terminal outcome and remains usable for a following command.
 #[test]
 #[serial(prx_chat_pty)]
 fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
-    // 10 chunks * 100ms = 1s total, long enough for the double Ctrl+C to land mid-stream.
+    // 10 chunks * 100ms = 1s total, long enough for Ctrl+C to land mid-stream.
     let script = r#"{"chunks":[{"delta":"g1 "},{"delta":"g2 "},{"delta":"g3 "},{"delta":"g4 "},{"delta":"g5 "},{"delta":"g6 "},{"delta":"g7 "},{"delta":"g8 "},{"delta":"g9 "},{"delta":"g10"},{"is_final":true}]}"#;
     let (mut sg, _guard) = spawn_chat(
         &[],
@@ -2245,25 +2246,34 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
             ("OPENPRX_MOCK_SCRIPT", script),
             ("OPENPRX_MOCK_PROVIDER_FLAVOR", "gemini"),
             ("OPENPRX_MOCK_DELAY_MS_PER_CHUNK", "100"),
+            ("PRX_TUI", "1"),
         ],
     );
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    read_until_with_dsr(session, "g1 ", TURN_TIMEOUT);
+    read_until_with_dsr(session, "g1", TURN_TIMEOUT);
     session
-        .get_process_mut()
-        .signal(expectrl::Signal::SIGINT)
-        .expect("first SIGINT");
-    std::thread::sleep(Duration::from_millis(100));
-    session
-        .get_process_mut()
-        .signal(expectrl::Signal::SIGINT)
-        .expect("second SIGINT");
+        .send(expectrl::ControlCode::EndOfText)
+        .expect("mid-stream Ctrl+C");
+    std::thread::sleep(Duration::from_millis(250));
+
+    session.send("/cost\r").expect("send /cost after cancellation");
+    let cancelled = read_until_with_dsr(session, "Turns:", TURN_TIMEOUT);
+    assert!(
+        cancelled.contains("Turns:        0"),
+        "the cancelled partial turn must not be committed as a completed user/assistant pair; captured:\n{cancelled}"
+    );
+    assert!(
+        !cancelled.contains("g10"),
+        "the provider stream must stop before its final chunk after cancellation; captured:\n{cancelled}"
+    );
+
+    session.send("/exit\r").expect("send /exit after cancellation");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
-        "gemini-flavor cancel-mid-stream must exit within {EXIT_TIMEOUT:?}"
+        "gemini-flavor chat must remain responsive and exit after the cancelled turn"
     );
 }
 
