@@ -34,10 +34,14 @@ fn tx(name: &str) -> TransactionId {
 
 /// Writes a revision whose body differs per `tag`; returns id and record digest.
 fn write(store: &SkillLifecycleStore, tag: &str) -> Rev {
+    write_for(store, &skill(), tag)
+}
+
+fn write_for(store: &SkillLifecycleStore, skill: &SkillId, tag: &str) -> Rev {
     let bundle =
         Bundle::from_entries(vec![entry("SKILL.md", md("Deploy helper", tag).as_bytes())]).expect("test: bundle");
     let outcome = store
-        .write_revision(&NewRevision::new(skill(), SourceKind::Operator), &bundle)
+        .write_revision(&NewRevision::new(skill.clone(), SourceKind::Operator), &bundle)
         .expect("test: write revision");
     (outcome.revision.revision_id, outcome.record_digest)
 }
@@ -83,6 +87,7 @@ fn first_publish_sets_generation_one_and_journals_the_pinned_digest() {
     assert_eq!(outcome.entry.predecessor_revision_id, None);
     let b = binding(&store).expect("test: bound");
     assert_eq!((b.generation, &b.revision_id, &b.record_digest), (1, &a.0, &a.1));
+    assert!(b.enabled);
     assert_eq!(b.transaction_id, tx("t1"));
     let stored = store
         .journal_entry(&tx("t1"))
@@ -236,44 +241,99 @@ fn race_child_entry() {
 
 #[test]
 fn processes_racing_on_one_generation_have_exactly_one_winner() {
+    let exe = std::env::current_exe().expect("test: current exe");
+    for round in 0..3 {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir(&workspace).expect("test: workspace");
+        let store = open(&workspace);
+        let mut children: Vec<_> = (0..2)
+            .map(|i| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "skills::lifecycle::tests::publish::race_child_entry",
+                        "--test-threads=1",
+                    ])
+                    .env(RACE_ENV, tmp.path())
+                    .env(RACE_INDEX_ENV, i.to_string())
+                    // Each child sleeps between its generation check and the
+                    // swap. Without mutual exclusion both would pass the check
+                    // and both would win.
+                    .env("PRX_SL08_HOLD_MS", "300")
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("test: spawn child")
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !(0..2).all(|i| tmp.path().join(format!("ready-{i}")).exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test: children never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(tmp.path().join("go"), b"").expect("test: go");
+        for child in &mut children {
+            assert!(child.wait().expect("test: wait").success(), "round {round}");
+        }
+        let mut results: Vec<String> = (0..2)
+            .map(|i| fs::read_to_string(tmp.path().join(format!("result-{i}"))).expect("test: result"))
+            .collect();
+        results.sort();
+        assert_eq!(results, ["stale", "won"], "round {round}");
+        assert_eq!(binding(&store).expect("test: bound").generation, 1);
+    }
+}
+
+const KILL_ENV: &str = "PRX_SL08_KILL_DIR";
+
+/// Child of the kill -9 test: takes the skill lock and holds it until killed.
+#[test]
+fn lock_holder_child_entry() {
+    let Ok(dir) = std::env::var(KILL_ENV) else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let store = open(&dir.join("workspace"));
+    store.ensure_publication_dirs().expect("test: dirs");
+    let _lock = store.lock_skill(&skill(), Duration::from_secs(5)).expect("test: lock");
+    fs::write(dir.join("locked"), b"").expect("test: marker");
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+#[test]
+fn a_killed_lock_holder_releases_the_lock_and_publication_continues() {
     let tmp = TempDir::new().expect("test: tempdir");
     let workspace = tmp.path().join("workspace");
     fs::create_dir(&workspace).expect("test: workspace");
     let store = open(&workspace);
-    let exe = std::env::current_exe().expect("test: current exe");
-    let mut children: Vec<_> = (0..2)
-        .map(|i| {
-            std::process::Command::new(&exe)
-                .args([
-                    "--exact",
-                    "skills::lifecycle::tests::publish::race_child_entry",
-                    "--test-threads=1",
-                ])
-                .env(RACE_ENV, tmp.path())
-                .env(RACE_INDEX_ENV, i.to_string())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .expect("test: spawn child")
-        })
-        .collect();
+    let rev = write(&store, "a");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test: current exe"))
+        .args([
+            "--exact",
+            "skills::lifecycle::tests::publish::lock_holder_child_entry",
+            "--test-threads=1",
+        ])
+        .env(KILL_ENV, tmp.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("test: spawn child");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !(0..2).all(|i| tmp.path().join(format!("ready-{i}")).exists()) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "test: children never became ready"
-        );
+    while !tmp.path().join("locked").exists() {
+        assert!(std::time::Instant::now() < deadline, "test: child never locked");
         std::thread::sleep(Duration::from_millis(5));
     }
-    fs::write(tmp.path().join("go"), b"").expect("test: go");
-    for child in &mut children {
-        assert!(child.wait().expect("test: wait").success());
-    }
-    let mut results: Vec<String> = (0..2)
-        .map(|i| fs::read_to_string(tmp.path().join(format!("result-{i}"))).expect("test: result"))
-        .collect();
-    results.sort();
-    assert_eq!(results, ["stale", "won"]);
-    assert_eq!(binding(&store).expect("test: bound").generation, 1);
+    let err = store
+        .lock_skill(&skill(), Duration::from_millis(50))
+        .expect_err("test: held by the child");
+    assert!(matches!(err, LifecycleError::LockTimeout { .. }), "{err}");
+    child.kill().expect("test: kill -9");
+    child.wait().expect("test: reap");
+    store
+        .publish(&request("t1", &rev, 0))
+        .expect("test: lock released by process death");
 }
 
 #[test]
@@ -382,6 +442,11 @@ fn crash_during_publish(point: &'static str) -> (TempDir, SkillLifecycleStore, R
     crash_hooks::arm(point);
     let err = store.publish(&request("t2", &b, 1)).expect_err("test: injected crash");
     assert!(err.to_string().contains("injected crash point"), "{err}");
+    assert_eq!(
+        matches!(err, LifecycleError::CommittedRepairRequired { .. }),
+        point == "after_binding",
+        "{err}"
+    );
     drop(store);
     let restarted = open(tmp.path());
     (tmp, restarted, a, b)
@@ -540,4 +605,160 @@ fn transaction_ids_are_validated() {
     }
     assert!(TransactionId::parse("ok-ID_1").is_ok());
     assert!(TransactionId::parse(TransactionId::generate().as_str()).is_ok());
+}
+
+#[test]
+fn a_live_prepared_transaction_survives_a_later_publication_and_stays_rollbackable() {
+    let (_tmp, store, _a, b) = crash_during_publish("after_binding");
+    let c = write(&store, "c");
+    store
+        .publish(&request("t3", &c, 2))
+        .expect("test: publish over a live prepared tx");
+    let t2 = store
+        .journal_entry(&tx("t2"))
+        .expect("test: read")
+        .expect("test: present");
+    assert_eq!(t2.state, TransactionState::Committed);
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    assert_eq!(report.aborted.len(), 0);
+    store
+        .rollback(&rollback_request("t4", &b.0, 3))
+        .expect("test: rollback to the revision t2 published");
+    assert_eq!(binding(&store).expect("test: bound").revision_id, b.0);
+}
+
+#[test]
+fn recovery_uses_the_successor_chain_when_the_binding_has_moved_on() {
+    let (_tmp, store, _a, b) = crash_during_publish("after_binding");
+    let c = write(&store, "c");
+    store.publish(&request("t3", &c, 2)).expect("test: publish t3");
+    // Rebuild the state older code could leave: t2 PREPARED beneath t3.
+    let path = store.root().join("publication").join("t2.json");
+    let text = fs::read_to_string(&path).expect("test: read");
+    fs::write(
+        &path,
+        text.replace("\"state\": \"committed\"", "\"state\": \"prepared\""),
+    )
+    .expect("test: rewrite");
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    assert_eq!(report.committed, [tx("t2")]);
+    store
+        .rollback(&rollback_request("t4", &b.0, 3))
+        .expect("test: rollback target known");
+}
+
+#[test]
+fn a_post_swap_failure_is_reported_as_committed_repair_required_and_repairable() {
+    let (_tmp, store, _a, b) = crash_during_publish("after_binding");
+    // crash_during_publish already asserted the error variant; the binding is
+    // live and a retry completes the journal.
+    assert_eq!(binding(&store).expect("test: bound").revision_id, b.0);
+    let out = store.publish(&request("t2", &b, 1)).expect("test: repair by retry");
+    assert!(out.replayed);
+    assert_eq!(out.entry.state, TransactionState::Committed);
+}
+
+#[test]
+fn a_failure_before_the_swap_is_a_plain_error() {
+    let (_tmp, store) = setup();
+    let a = write(&store, "a");
+    crash_hooks::arm("binding_staged");
+    let err = store.publish(&request("t1", &a, 0)).expect_err("test: crash");
+    assert!(!matches!(err, LifecycleError::CommittedRepairRequired { .. }), "{err}");
+    assert!(binding(&store).is_none());
+}
+
+#[test]
+fn the_same_transaction_id_on_two_skills_never_overwrites_the_first_entry() {
+    let (_tmp, store) = setup();
+    let other = SkillId::parse("other-skill").expect("test: skill id");
+    let a = write(&store, "a");
+    let o = write_for(&store, &other, "o");
+    let first = store.publish(&request("t1", &a, 0)).expect("test: publish");
+    let mut req = request("t1", &o, 0);
+    req.skill_id = other.clone();
+    let err = store.publish(&req).expect_err("test: same id, other skill");
+    assert!(matches!(err, LifecycleError::TransactionConflict { .. }), "{err}");
+    assert_eq!(
+        store.journal_entry(&tx("t1")).expect("test: read"),
+        Some(first.entry.clone())
+    );
+    assert!(store.active_binding(&other).expect("test: binding").is_none());
+    // The no-replace primitive itself, as a race between two skills would use it.
+    let err = store
+        .create_journal(&first.entry)
+        .expect_err("test: create is no-replace");
+    assert!(matches!(err, LifecycleError::TransactionConflict { .. }), "{err}");
+}
+
+#[test]
+fn journal_strays_and_other_skills_malformed_entries_do_not_block_a_skill() {
+    let (_tmp, store) = setup();
+    let (a, b) = (write(&store, "a"), write(&store, "b"));
+    store.publish(&request("t1", &a, 0)).expect("test: publish a");
+    store.publish(&request("t2", &b, 1)).expect("test: publish b");
+    let dir = store.root().join("publication");
+    for (name, body) in [
+        (".DS_Store", "junk".to_string()),
+        ("notes.txt", "junk".to_string()),
+        (
+            "broken-other.json",
+            "{\"skill_id\": \"other-skill\", \"garbage\": true}".to_string(),
+        ),
+        ("unreadable.json", "not json at all".to_string()),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, body).expect("test: plant");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("test: chmod");
+        }
+    }
+    store
+        .rollback(&rollback_request("t3", &a.0, 2))
+        .expect("test: rollback not blocked");
+    store.recover(Duration::ZERO).expect("test: recovery not blocked");
+}
+
+#[test]
+fn sweep_never_removes_a_staged_file_of_a_skill_whose_lock_is_held() {
+    let (_tmp, store) = setup();
+    store.ensure_publication_dirs().expect("test: dirs");
+    let staged = store
+        .root()
+        .join("staging")
+        .join(format!("atomic-deploy-helper-{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&staged, b"x").expect("test: plant");
+    let held = store.lock_skill(&skill(), Duration::from_secs(1)).expect("test: lock");
+    let report = store.recover(Duration::from_nanos(1)).expect("test: recover");
+    assert_eq!(report.swept_staging, 0);
+    assert!(staged.exists());
+    drop(held);
+    let report = store.recover(Duration::from_nanos(1)).expect("test: recover");
+    assert_eq!(report.swept_staging, 1);
+    assert!(!staged.exists());
+    let leftovers: Vec<_> = fs::read_dir(store.root().join("staging"))
+        .expect("test: staging")
+        .collect();
+    assert!(leftovers.is_empty(), "no trash left behind");
+}
+
+#[test]
+fn exclusive_recovery_refuses_to_run_next_to_a_writer() {
+    let (_tmp, store) = setup();
+    store.ensure_publication_dirs().expect("test: dirs");
+    let writer = store
+        .lock_store(true, Duration::from_secs(1))
+        .expect("test: shared lock");
+    let err = store
+        .recover_with_timeout(Duration::ZERO, Duration::from_millis(50))
+        .expect_err("test: exclusive needs no writers");
+    assert!(matches!(err, LifecycleError::LockTimeout { .. }), "{err}");
+    // A non-zero age sweep is allowed next to writers.
+    store
+        .recover_with_timeout(Duration::from_secs(3600), Duration::from_millis(50))
+        .expect("test: age-limited sweep");
+    drop(writer);
+    store.recover(Duration::ZERO).expect("test: exclusive recovery");
 }

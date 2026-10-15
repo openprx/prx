@@ -59,6 +59,8 @@ pub enum LifecycleError {
     RollbackTargetUnknown(String),
     #[error("revision {0} is already the active revision")]
     RevisionAlreadyActive(String),
+    #[error("transaction {transaction_id} is committed but needs repair or recovery: {reason}")]
+    CommittedRepairRequired { transaction_id: String, reason: String },
     #[error("timed out waiting for publication lock {path}")]
     LockTimeout { path: PathBuf },
     #[error("i/o error at {path}: {source}")]

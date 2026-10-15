@@ -10,9 +10,9 @@
 //! recovered or aborted transaction is never re-run: a new transaction id (and,
 //! at the SL07 binding, a fresh authorization) is required.
 
-use super::generation::{ActiveBinding, SkillLock};
+use super::generation::{ATOMIC_PREFIX, ATOMIC_SUFFIX, ActiveBinding, SkillLock};
 use super::journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
-use super::store::{STAGING_DIR, SkillLifecycleStore};
+use super::store::{STAGING_DIR, SkillLifecycleStore, sync_dir};
 use super::types::{LifecycleError, RevisionId, SCHEMA_VERSION, SkillId};
 use chrono::Utc;
 use std::fs;
@@ -82,6 +82,15 @@ pub(super) mod crash_hooks {
 
     /// Simulated process death: returns an error and leaves all state as is.
     pub(in crate::skills::lifecycle) fn check(point: &str) -> Result<(), LifecycleError> {
+        // Widens the window between the generation check and the swap so
+        // process-race tests overlap deterministically.
+        if point == "binding_staged"
+            && let Some(ms) = std::env::var("PRX_SL08_HOLD_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         let hit = ARMED.with(|a| a.borrow().is_some_and(|armed| armed == point));
         if hit {
             disarm();
@@ -114,8 +123,12 @@ impl Fingerprint<'_> {
 impl SkillLifecycleStore {
     /// Publishes `request.candidate` as the active revision if the active
     /// generation still equals `request.expected_generation`.
+    ///
+    /// Blocking: waits for locks and does file I/O; async callers must use
+    /// `spawn_blocking`.
     pub fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
         self.ensure_publication_dirs()?;
+        let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
         let fingerprint = Fingerprint {
             kind: TransactionKind::Publish,
@@ -141,8 +154,11 @@ impl SkillLifecycleStore {
     /// a new generation. History is not rewritten and no revision is deleted,
     /// so tasks pinned to any revision keep reading it. The pinned digest comes
     /// from the journal entry that committed the target, not from the caller.
+    ///
+    /// Blocking, like [`Self::publish`].
     pub fn rollback(&self, request: &RollbackRequest) -> Result<TransactionOutcome, LifecycleError> {
         self.ensure_publication_dirs()?;
+        let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
         let fingerprint = Fingerprint {
             kind: TransactionKind::Rollback,
@@ -155,7 +171,7 @@ impl SkillLifecycleStore {
             return Ok(outcome);
         }
         let anchor = self
-            .journal_entries()?
+            .journal_entries_for(&request.skill_id)?
             .into_iter()
             .filter(|e| {
                 (&e.skill_id, &e.candidate_revision_id, e.state)
@@ -212,6 +228,10 @@ impl SkillLifecycleStore {
         expected_generation: u64,
     ) -> Result<TransactionOutcome, LifecycleError> {
         let skill = lock.skill();
+        // A PREPARED entry of this skill whose swap went live must be settled
+        // before anything else changes the binding; afterwards the binding no
+        // longer shows it.
+        self.reconcile_skill(lock)?;
         let predecessor = self.active_binding(skill)?;
         let actual = predecessor.as_ref().map_or(0, |b| b.generation);
         if actual != expected_generation {
@@ -250,7 +270,7 @@ impl SkillLifecycleStore {
             prepared_at: Utc::now(),
             finished_at: None,
         };
-        self.write_journal(&entry)?;
+        self.create_journal(&entry)?;
         crash_point!("after_prepared");
 
         let binding = ActiveBinding {
@@ -260,21 +280,61 @@ impl SkillLifecycleStore {
             revision_id: candidate.clone(),
             record_digest: candidate_digest.to_string(),
             generation: new_generation,
+            enabled: true,
             transaction_id: transaction.clone(),
             updated_at: Utc::now(),
         };
-        // An error from here on leaves the entry PREPARED on purpose: whether
-        // the swap happened is decided by the binding in recovery, never guessed.
-        self.cas_binding(lock, &binding, expected_generation)?;
-        crash_point!("after_binding");
-
-        entry.state = TransactionState::Committed;
-        entry.finished_at = Some(Utc::now());
-        self.write_journal(&entry)?;
+        // From here on the entry stays PREPARED when anything fails, on
+        // purpose: whether the swap happened is decided from the binding.
+        if let Err(source) = self.finish_transition(lock, &binding, &mut entry, expected_generation) {
+            return Err(self.classify_failure(skill, &entry, source));
+        }
         Ok(TransactionOutcome { entry, replayed: false })
     }
 
-    /// Resolves a PREPARED entry from the binding. Caller holds the skill lock.
+    fn finish_transition(
+        &self,
+        lock: &SkillLock,
+        binding: &ActiveBinding,
+        entry: &mut JournalEntry,
+        expected_generation: u64,
+    ) -> Result<(), LifecycleError> {
+        self.cas_binding(lock, binding, expected_generation)?;
+        crash_point!("after_binding");
+        entry.state = TransactionState::Committed;
+        entry.finished_at = Some(Utc::now());
+        self.write_journal(entry)
+    }
+
+    /// An error after the swap may have started is not a plain failure: when
+    /// the binding carries the transaction, the mutation is live and the
+    /// caller must be told so (spec 8.3 step 8).
+    fn classify_failure(&self, skill: &SkillId, entry: &JournalEntry, source: LifecycleError) -> LifecycleError {
+        match self.active_binding(skill) {
+            Ok(Some(b)) if (&b.transaction_id, b.generation) == (&entry.transaction_id, entry.new_generation) => {
+                LifecycleError::CommittedRepairRequired {
+                    transaction_id: entry.transaction_id.to_string(),
+                    reason: source.to_string(),
+                }
+            }
+            _ => source,
+        }
+    }
+
+    /// Settles every PREPARED entry of the locked skill.
+    fn reconcile_skill(&self, lock: &SkillLock) -> Result<(), LifecycleError> {
+        for mut entry in self.journal_entries_for(lock.skill())? {
+            if entry.state == TransactionState::Prepared {
+                self.reconcile(lock, &mut entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves a PREPARED entry. Caller holds the skill lock. The entry was
+    /// live if the binding carries it, or if a later transaction of the same
+    /// skill recorded it as its predecessor at the generation it created (a
+    /// later transaction can only start from the live binding).
     fn reconcile(&self, lock: &SkillLock, entry: &mut JournalEntry) -> Result<(), LifecycleError> {
         if lock.skill() != &entry.skill_id {
             return Err(LifecycleError::UnsafeStorePath {
@@ -282,7 +342,8 @@ impl SkillLifecycleStore {
                 reason: "publication lock belongs to a different skill".to_string(),
             });
         }
-        let swapped = self.active_binding(&entry.skill_id)?.is_some_and(|b| {
+        sync_dir(&self.root().join(super::generation::ACTIVE_DIR))?;
+        let binding_live = self.active_binding(&entry.skill_id)?.is_some_and(|b| {
             (&b.transaction_id, b.generation, &b.revision_id, &b.record_digest)
                 == (
                     &entry.transaction_id,
@@ -291,6 +352,12 @@ impl SkillLifecycleStore {
                     &entry.candidate_record_digest,
                 )
         });
+        let swapped = binding_live
+            || self.journal_entries_for(&entry.skill_id)?.iter().any(|later| {
+                later.transaction_id != entry.transaction_id
+                    && (later.expected_generation, later.predecessor_revision_id.as_ref())
+                        == (entry.new_generation, Some(&entry.candidate_revision_id))
+            });
         entry.state = if swapped {
             TransactionState::Committed
         } else {
@@ -300,20 +367,36 @@ impl SkillLifecycleStore {
         self.write_journal(entry)
     }
 
-    /// Crash recovery: resolves every PREPARED journal entry (committed when the
-    /// binding carries it, aborted otherwise; an aborted candidate is never
-    /// published) and removes `staging/` leftovers older than
-    /// `staging_min_age`. Pass a non-zero age while other writers may be
-    /// running, because SL01 revision writes stage without the publication lock;
-    /// `Duration::ZERO` is for exclusive startup recovery.
+    /// Crash recovery: resolves every PREPARED journal entry (committed when
+    /// the binding or a later transaction shows it was live, aborted
+    /// otherwise; an aborted candidate is never published) and sweeps
+    /// `staging/` leftovers older than `staging_min_age`.
+    ///
+    /// `Duration::ZERO` means exclusive startup recovery: it takes the
+    /// store-wide lock exclusively, so no publication or revision write is in
+    /// flight, and fails with `LockTimeout` otherwise. A non-zero age is safe
+    /// next to running writers: entries are renamed to a trash name before
+    /// deletion, and files staged for a skill are only removed when that
+    /// skill's lock can be taken.
+    ///
+    /// Blocking; async callers must use `spawn_blocking`.
     pub fn recover(&self, staging_min_age: Duration) -> Result<RecoveryReport, LifecycleError> {
+        self.recover_with_timeout(staging_min_age, PUBLICATION_LOCK_TIMEOUT)
+    }
+
+    pub(super) fn recover_with_timeout(
+        &self,
+        staging_min_age: Duration,
+        lock_timeout: Duration,
+    ) -> Result<RecoveryReport, LifecycleError> {
         self.ensure_publication_dirs()?;
+        let _store_lock = self.lock_store(!staging_min_age.is_zero(), lock_timeout)?;
         let mut report = RecoveryReport::default();
-        for listed in self.journal_entries()? {
+        for listed in self.journal_entries_lenient()? {
             if listed.state != TransactionState::Prepared {
                 continue;
             }
-            let lock = self.lock_skill(&listed.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
+            let lock = self.lock_skill(&listed.skill_id, lock_timeout)?;
             // Re-read under the lock; another process may have finished it.
             let Some(mut entry) = self.journal_entry(&listed.transaction_id)? else {
                 continue;
@@ -337,7 +420,12 @@ impl SkillLifecycleStore {
         for item in fs::read_dir(&dir).map_err(|e| LifecycleError::io(&dir, e))? {
             let item = item.map_err(|e| LifecycleError::io(&dir, e))?;
             let path = item.path();
-            let meta = fs::symlink_metadata(&path).map_err(|e| LifecycleError::io(&path, e))?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(LifecycleError::io(&path, e)),
+            };
             let age = meta
                 .modified()
                 .ok()
@@ -346,17 +434,52 @@ impl SkillLifecycleStore {
             if age < min_age {
                 continue;
             }
+            // A staged binding or journal file belongs to a skill; it may only
+            // go while that skill's lock is free (the lock holder may be
+            // between staging and renaming it).
+            let _skill_lock = match staged_file_skill(&name) {
+                Some(skill) => match self.lock_skill(&skill, Duration::ZERO) {
+                    Ok(lock) => Some(lock),
+                    Err(LifecycleError::LockTimeout { .. }) => continue,
+                    Err(e) => return Err(e),
+                },
+                None => None,
+            };
+            // Rename first: a writer that renames the same entry into place
+            // concurrently either wins (our rename sees NotFound) or loses its
+            // own rename; we never delete files inside a path that can still
+            // become live.
+            let trash = dir.join(format!(".trash-{}", uuid::Uuid::new_v4()));
+            if !name.starts_with(".trash-") {
+                match fs::rename(&path, &trash) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to move skill staging entry to trash");
+                        continue;
+                    }
+                }
+            }
+            let victim = if name.starts_with(".trash-") { &path } else { &trash };
             let result = if meta.is_dir() {
-                fs::remove_dir_all(&path)
+                fs::remove_dir_all(victim)
             } else {
-                fs::remove_file(&path)
+                fs::remove_file(victim)
             };
             match result {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %path.display(), error = %e, "failed to sweep skill staging entry"),
+                Err(e) => tracing::warn!(path = %victim.display(), error = %e, "failed to sweep skill staging entry"),
             }
         }
         Ok(removed)
     }
+}
+
+/// Skill of a staged `atomic-<skill>-<uuid>.tmp` file, `None` for other names.
+fn staged_file_skill(name: &str) -> Option<SkillId> {
+    const UUID_LEN: usize = 36;
+    let middle = name.strip_prefix(ATOMIC_PREFIX)?.strip_suffix(ATOMIC_SUFFIX)?;
+    let skill = middle.get(..middle.len().checked_sub(UUID_LEN + 1)?)?;
+    SkillId::parse(skill).ok()
 }

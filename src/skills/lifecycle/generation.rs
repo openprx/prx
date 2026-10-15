@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 
 pub(super) const ACTIVE_DIR: &str = "active";
 pub(super) const LOCKS_DIR: &str = "locks";
+pub(super) const STORE_LOCK: &str = ".store.lock";
+pub(super) const ATOMIC_PREFIX: &str = "atomic-";
+pub(super) const ATOMIC_SUFFIX: &str = ".tmp";
 const LOCK_POLL: Duration = Duration::from_millis(5);
 
 /// The authoritative active revision of one skill.
@@ -35,8 +38,10 @@ pub struct ActiveBinding {
     pub revision_id: RevisionId,
     /// Pinned `record_digest()` of the active revision.
     pub record_digest: String,
-    /// Increases by one on every publish and rollback; never rewound.
+    /// Increases by one on every publish, rollback and (later) disable; never rewound.
     pub generation: u64,
+    /// `false` once the skill is disabled; publish and rollback set `true`.
+    pub enabled: bool,
     /// Journal transaction that produced this binding.
     pub transaction_id: TransactionId,
     pub updated_at: DateTime<Utc>,
@@ -59,6 +64,52 @@ impl Drop for SkillLock {
     fn drop(&mut self) {
         if let Err(e) = FileExt::unlock(&self.file) {
             tracing::warn!(skill = %self.skill, error = %e, "failed to release skill publication lock");
+        }
+    }
+}
+
+/// Holder of the store-wide lock; released on drop.
+#[derive(Debug)]
+pub(super) struct StoreLock {
+    file: fs::File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        if let Err(e) = FileExt::unlock(&self.file) {
+            tracing::warn!(error = %e, "failed to release skill store lock");
+        }
+    }
+}
+
+fn lock_file(path: &Path, shared: bool, timeout: Duration) -> Result<fs::File, LifecycleError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| LifecycleError::io(path, e))?;
+    check_private(path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let attempt = if shared {
+            FileExt::try_lock_shared(&file)
+        } else {
+            FileExt::try_lock_exclusive(&file)
+        };
+        match attempt {
+            Ok(()) => return Ok(file),
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                if Instant::now() >= deadline {
+                    return Err(LifecycleError::LockTimeout {
+                        path: path.to_path_buf(),
+                    });
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(e) => return Err(LifecycleError::io(path, e)),
         }
     }
 }
@@ -123,51 +174,46 @@ impl SkillLifecycleStore {
     }
 
     /// Takes the exclusive publication lock of `skill`, waiting up to `timeout`.
+    ///
+    /// This call blocks the calling thread (polling every few milliseconds).
+    /// Async callers must run it, and everything that calls it
+    /// (`publish`, `rollback`, `recover`), inside `spawn_blocking`.
     pub(super) fn lock_skill(&self, skill: &SkillId, timeout: Duration) -> Result<SkillLock, LifecycleError> {
         let locks = self.root().join(LOCKS_DIR);
         ensure_dir_synced(self.root(), &locks)?;
         let path = locks.join(format!("{}.lock", skill.as_str()));
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(&path).map_err(|e| LifecycleError::io(&path, e))?;
-        check_private(&path)?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    return Ok(SkillLock {
-                        file,
-                        skill: skill.clone(),
-                    });
-                }
-                Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-                    if Instant::now() >= deadline {
-                        return Err(LifecycleError::LockTimeout { path });
-                    }
-                    std::thread::sleep(LOCK_POLL);
-                }
-                Err(e) => return Err(LifecycleError::io(&path, e)),
-            }
-        }
+        let file = lock_file(&path, false, timeout)?;
+        Ok(SkillLock {
+            file,
+            skill: skill.clone(),
+        })
+    }
+
+    /// Store-wide lock: shared for anything that stages files (publication,
+    /// SL01 revision writes), exclusive for startup recovery that sweeps all
+    /// of `staging/`. Always taken before any skill lock. Blocks like
+    /// [`Self::lock_skill`].
+    pub(super) fn lock_store(&self, shared: bool, timeout: Duration) -> Result<StoreLock, LifecycleError> {
+        let locks = self.root().join(LOCKS_DIR);
+        ensure_dir_synced(self.root(), &locks)?;
+        let file = lock_file(&locks.join(STORE_LOCK), shared, timeout)?;
+        Ok(StoreLock { file })
     }
 
     /// Writes `bytes` to a fresh fsynced temporary file in `staging/`.
-    fn stage_file(&self, bytes: &[u8]) -> Result<PathBuf, LifecycleError> {
-        let tmp = self
-            .root()
-            .join(STAGING_DIR)
-            .join(format!("atomic-{}.tmp", uuid::Uuid::new_v4()));
+    /// The name carries `skill` so the staging sweep can tell whose lock
+    /// protects the file: `atomic-<skill>-<uuid>.tmp`.
+    pub(super) fn stage_file(&self, skill: &SkillId, bytes: &[u8]) -> Result<PathBuf, LifecycleError> {
+        let tmp = self.root().join(STAGING_DIR).join(format!(
+            "{ATOMIC_PREFIX}{skill}-{}{ATOMIC_SUFFIX}",
+            uuid::Uuid::new_v4()
+        ));
         write_private_file(&tmp, bytes, false)?;
         Ok(tmp)
     }
 
     /// Atomically renames a staged file onto `target` and syncs its directory.
-    fn commit_staged(&self, tmp: &Path, target: &Path) -> Result<(), LifecycleError> {
+    pub(super) fn commit_staged(&self, tmp: &Path, target: &Path) -> Result<(), LifecycleError> {
         if let Err(e) = fs::rename(tmp, target) {
             if let Err(rm) = fs::remove_file(tmp) {
                 tracing::warn!(path = %tmp.display(), error = %rm, "failed to remove staged file after rename failure");
@@ -178,8 +224,8 @@ impl SkillLifecycleStore {
     }
 
     /// Durable atomic replacement of `target` with `bytes`.
-    pub(super) fn write_atomic(&self, target: &Path, bytes: &[u8]) -> Result<(), LifecycleError> {
-        let tmp = self.stage_file(bytes)?;
+    pub(super) fn write_atomic(&self, skill: &SkillId, target: &Path, bytes: &[u8]) -> Result<(), LifecycleError> {
+        let tmp = self.stage_file(skill, bytes)?;
         self.commit_staged(&tmp, target)
     }
 
@@ -207,7 +253,7 @@ impl SkillLifecycleStore {
             });
         }
         let path = self.binding_path(&new.skill_id);
-        let tmp = self.stage_file(&record_bytes(new, &path)?)?;
+        let tmp = self.stage_file(&new.skill_id, &record_bytes(new, &path)?)?;
         crash_point!("binding_staged");
         self.commit_staged(&tmp, &path)
     }

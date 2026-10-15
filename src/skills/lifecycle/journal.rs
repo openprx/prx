@@ -12,7 +12,7 @@
 //! present yet because no verifier exists to give it meaning.
 
 use super::generation::ensure_dir_synced;
-use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes};
+use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
 use super::types::{LifecycleError, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -169,9 +169,28 @@ impl SkillLifecycleStore {
         Ok(Some(entry))
     }
 
-    /// All journal entries, ordered by transaction id. A malformed entry fails
-    /// the call: a damaged journal must be noticed, not skipped.
+    /// All journal entries, ordered by transaction id. A malformed `.json`
+    /// entry fails the call: a damaged journal must be noticed. Dotfiles and
+    /// files without the `.json` suffix are not journal entries and are ignored.
     pub fn journal_entries(&self) -> Result<Vec<JournalEntry>, LifecycleError> {
+        self.scan_journal(None, true)
+    }
+
+    /// Entries of one skill. Entries that provably belong to another skill, or
+    /// whose skill cannot be determined, are skipped even if malformed, so one
+    /// damaged entry of another skill cannot block this skill. A malformed
+    /// entry of this skill still fails the call.
+    pub(super) fn journal_entries_for(&self, skill: &SkillId) -> Result<Vec<JournalEntry>, LifecycleError> {
+        self.scan_journal(Some(skill), false)
+    }
+
+    /// Entries of all skills for recovery; malformed entries are skipped with
+    /// a warning so they cannot block recovery of healthy skills.
+    pub(super) fn journal_entries_lenient(&self) -> Result<Vec<JournalEntry>, LifecycleError> {
+        self.scan_journal(None, false)
+    }
+
+    fn scan_journal(&self, skill: Option<&SkillId>, strict: bool) -> Result<Vec<JournalEntry>, LifecycleError> {
         let dir = self.root().join(PUBLICATION_DIR);
         let reader = match fs::read_dir(&dir) {
             Ok(reader) => reader,
@@ -182,28 +201,76 @@ impl SkillLifecycleStore {
         for item in reader {
             let item = item.map_err(|e| LifecycleError::io(&dir, e))?;
             let name = item.file_name().to_string_lossy().into_owned();
-            let transaction = name
-                .strip_suffix(".json")
-                .ok_or_else(|| LifecycleError::InvalidRecord {
-                    path: item.path(),
-                    reason: "unexpected file in the publication journal".to_string(),
-                })
-                .and_then(TransactionId::parse)?;
-            if let Some(entry) = self.journal_entry(&transaction)? {
-                entries.push(entry);
+            if name.starts_with('.') {
+                continue;
+            }
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let transaction = match TransactionId::parse(stem) {
+                Ok(transaction) => transaction,
+                Err(e) if strict => return Err(e),
+                Err(e) => {
+                    tracing::warn!(file = %name, error = %e, "ignoring journal file with an invalid name");
+                    continue;
+                }
+            };
+            if !strict && let Some(wanted) = skill {
+                match self.entry_skill(&item.path()) {
+                    Some(found) if found != wanted.as_str() => continue,
+                    Some(_) => {}
+                    None => {
+                        tracing::warn!(file = %name, "ignoring journal file without a readable skill id");
+                        continue;
+                    }
+                }
+            }
+            match self.journal_entry(&transaction) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => {}
+                Err(e) if strict || skill.is_some() => return Err(e),
+                Err(e) => tracing::warn!(file = %name, error = %e, "skipping malformed journal entry"),
             }
         }
         entries.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id));
         Ok(entries)
     }
 
+    /// Skill id of a journal file without validating the rest of the entry.
+    fn entry_skill(&self, path: &std::path::Path) -> Option<String> {
+        let value: serde_json::Value = read_record(path).ok()?;
+        value.get("skill_id")?.as_str().map(str::to_string)
+    }
+
     /// Durably replaces the entry of its transaction (temp file, fsync,
-    /// rename, directory fsync).
+    /// rename, directory fsync). For state changes of an existing entry.
     pub(super) fn write_journal(&self, entry: &JournalEntry) -> Result<(), LifecycleError> {
         let dir = self.root().join(PUBLICATION_DIR);
         ensure_dir_synced(self.root(), &dir)?;
         let path = self.journal_path(&entry.transaction_id);
         let bytes = record_bytes(entry, &path)?;
-        self.write_atomic(&path, &bytes)
+        self.write_atomic(&entry.skill_id, &path, &bytes)
+    }
+
+    /// Creates the entry of a new transaction with no-replace semantics: the
+    /// file is fully written and fsynced, then hard-linked into place, so an
+    /// entry another skill's transaction already owns is never overwritten
+    /// (the per-skill lock does not cover the global journal path).
+    pub(super) fn create_journal(&self, entry: &JournalEntry) -> Result<(), LifecycleError> {
+        let dir = self.root().join(PUBLICATION_DIR);
+        ensure_dir_synced(self.root(), &dir)?;
+        let path = self.journal_path(&entry.transaction_id);
+        let tmp = self.stage_file(&entry.skill_id, &record_bytes(entry, &path)?)?;
+        let linked = fs::hard_link(&tmp, &path);
+        if let Err(e) = fs::remove_file(&tmp) {
+            tracing::warn!(path = %tmp.display(), error = %e, "failed to remove temporary journal file");
+        }
+        match linked {
+            Ok(()) => sync_dir(&dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(LifecycleError::TransactionConflict {
+                transaction_id: entry.transaction_id.to_string(),
+            }),
+            Err(e) => Err(LifecycleError::io(&path, e)),
+        }
     }
 }

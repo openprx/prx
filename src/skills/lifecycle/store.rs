@@ -240,6 +240,9 @@ impl SkillLifecycleStore {
         ensure_real_dir(&skill_dir, true)?;
         sync_dir(&self.root.join(REVISIONS_DIR))?;
         let staged = self.root.join(STAGING_DIR).join(uuid::Uuid::new_v4().to_string());
+        // Shared store lock: exclusive startup recovery must not sweep a
+        // staging directory while it is being renamed into place.
+        let _store_lock = self.lock_store(true, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
         let result = self.stage_and_publish(new, bundle, &info, &revision_id, &staged, &final_dir);
         if staged.exists()
             && let Err(e) = fs::remove_dir_all(&staged)
