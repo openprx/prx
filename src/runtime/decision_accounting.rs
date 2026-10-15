@@ -155,7 +155,7 @@ impl AccountingScope {
     pub(super) async fn begin_physical(&self, attempt: PhysicalEstimate<'_>) -> Result<OwnedReceipt, DecisionError> {
         let auxiliary = matches!(
             attempt.purpose,
-            "signal_vision" | "automix_premium" | "router_embedding"
+            "signal_vision" | "smart_group_classifier" | "automix_premium" | "router_embedding"
         );
         let owner_deadline = self.deadline;
         let deadline = owner_deadline.min(attempt.deadline);

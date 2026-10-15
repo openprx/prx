@@ -250,6 +250,19 @@ impl PendingProvider {
     /// bounded failed observation so a serial successor can inherit the
     /// completed control-flow fact without claiming a successful response.
     pub(crate) fn cancelled(mut self) {
+        self.record_failed();
+        self.active = false;
+    }
+
+    /// The provider invocation returned an error without a complete attempt
+    /// trace. Record the completed failure without leaving terminal evidence
+    /// pending; no successful response can be claimed from this observation.
+    pub(crate) fn failed(mut self) {
+        self.record_failed();
+        self.active = false;
+    }
+
+    fn record_failed(&self) {
         let mut state = self.trace.0.lock();
         if state.sealed.is_none() {
             state.provider_pending = state.provider_pending.saturating_sub(1);
@@ -264,7 +277,6 @@ impl PendingProvider {
                 });
             }
         }
-        self.active = false;
     }
 
     fn record(&self, attempts: Option<&[ProviderAttempt]>) {

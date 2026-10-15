@@ -16,6 +16,64 @@ pub(super) struct ChannelDecisionTurn {
     pub(super) route: crate::llm::route_decision::RouteDecision,
 }
 
+pub(super) struct SmartGroupClassifierCall {
+    accounting: Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>,
+    observation: Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>,
+    route: crate::llm::route_decision::RouteDecision,
+    context: Arc<TurnDecisionContext>,
+}
+
+impl SmartGroupClassifierCall {
+    pub(super) fn provider(&self) -> Arc<dyn crate::providers::Provider> {
+        self.accounting.provider()
+    }
+    pub(super) fn model(&self) -> &str {
+        self.accounting.selected_model().model()
+    }
+    pub(super) fn accounting(&self) -> Arc<dyn crate::providers::attempt_accounting::AttemptAccounting> {
+        self.accounting.clone()
+    }
+    pub(super) fn begin(&self) -> anyhow::Result<crate::tools::capability::execution_trace::PendingProvider> {
+        self.observation.begin()?;
+        self.accounting.begin_provider_observation()
+    }
+    pub(super) fn complete(
+        &self,
+        pending: crate::tools::capability::execution_trace::PendingProvider,
+        trace: &crate::providers::traits::ChatTrace,
+    ) -> anyhow::Result<()> {
+        pending.finish(Some(&trace.attempts));
+        self.observation.complete(trace)
+    }
+    pub(super) fn fail(&self, pending: crate::tools::capability::execution_trace::PendingProvider, cancelled: bool) {
+        if cancelled {
+            pending.cancelled();
+        } else {
+            pending.failed();
+        }
+    }
+    pub(super) fn authorize_silence(&self) -> anyhow::Result<()> {
+        self.accounting.authorize_silence()?;
+        self.context.terminal_execution_trace();
+        Ok(())
+    }
+    pub(super) fn provider_outcome(
+        &self,
+        trace: &crate::providers::traits::ChatTrace,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::llm::route_decision::ProviderExecutionOutcome {
+        crate::llm::route_decision::ProviderExecutionOutcome::from_trace(
+            &self.route,
+            trace.attempts.clone(),
+            trace.final_provider.clone(),
+            trace.final_model.clone(),
+            started_at,
+            chrono::Utc::now(),
+            false,
+        )
+    }
+}
+
 impl ChannelDecisionTurn {
     pub(super) async fn admit(
         ctx: &super::ChannelRuntimeContext,
@@ -88,6 +146,41 @@ impl ChannelDecisionTurn {
             &self.context,
             crate::runtime::auxiliary_call::AuxiliaryPurpose::SignalVision,
         )
+    }
+
+    pub(super) fn smart_group_classifier(&mut self) -> anyhow::Result<SmartGroupClassifierCall> {
+        let config = &self.generation.effective.smart_group;
+        let accounting = self.service.smart_group_accounting(
+            &self.proof,
+            &self.context,
+            &config.classifier_provider,
+            &config.classifier_model,
+        )?;
+        let selected = accounting.selected_model();
+        let route = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+            selected.provider_label().to_owned(),
+            selected.model().to_owned(),
+            self.proof.owner_id().to_owned(),
+            self.proof.session_key().to_owned(),
+            self.proof.source_event_id().map(str::to_owned),
+            None,
+            "smart_group_classifier",
+            u32::try_from(self.proof.routing_input().chars().count() / 4).unwrap_or(u32::MAX),
+            false,
+            false,
+        );
+        let observation = crate::runtime::auxiliary_call::AuxiliaryProviderCall::new_for(
+            crate::runtime::auxiliary_call::AuxiliaryPurpose::SmartGroupClassifier,
+            route.clone(),
+            accounting.scope_id(),
+        );
+        self.terminal.register_auxiliary_call(Arc::clone(&observation));
+        Ok(SmartGroupClassifierCall {
+            accounting,
+            observation,
+            route,
+            context: Arc::clone(&self.context),
+        })
     }
 
     pub(super) fn with_vision_observation(

@@ -4621,24 +4621,23 @@ const fn default_pre_gate_max_context_messages() -> usize {
 
 /// Token-saving pre-gate for smart group-reply (`[smart_group]`).
 ///
-/// The pre-gate runs *before* the full agent loop for smart-mode group messages
-/// that do NOT explicitly @-mention the bot. It cheaply triages each such
-/// message into one of three buckets via a 0-token heuristic:
-///   - clearly relevant  → enter the loop,
-///   - obvious noise      → stay silent (skip the loop entirely),
-///   - uncertain          → ask a cheap-tier classifier model for a yes/no.
+/// The pre-gate runs after source decision admission and before the full agent
+/// loop for smart-mode group messages that do NOT explicitly @-mention the bot.
+/// A 0-token heuristic sends clearly relevant messages straight to the loop;
+/// obvious noise and uncertain messages require a yes/no confirmation from a
+/// resolver-built, physically accounted classifier before silence is allowed.
 ///
 /// @-mentions, DMs, and non-smart modes NEVER reach the pre-gate. The pre-gate
 /// is fail-open: any classifier error/timeout enters the loop (it must never
 /// silently drop a message that should have been answered).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SmartGroupConfig {
-    /// Provider id/alias for the Tier-2 classifier. When empty, the channel's
-    /// own routed provider is reused (no extra provider construction).
+    /// Provider id/alias for the Tier-2 classifier. When empty, the admitted
+    /// channel route's provider is resolved for this auxiliary call.
     #[serde(default)]
     pub classifier_provider: String,
-    /// Model id for the Tier-2 classifier. When empty, the channel's routed
-    /// model is reused. Set this to a cheap-tier model id (e.g. one listed in
+    /// Model id for the Tier-2 classifier. When empty, the admitted channel
+    /// route's model is resolved. Set this to a cheap-tier model id (e.g. one listed in
     /// `router.automix.cheap_model_tiers`) to minimize cost.
     #[serde(default)]
     pub classifier_model: String,

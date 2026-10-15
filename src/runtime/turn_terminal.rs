@@ -331,6 +331,10 @@ impl TurnTerminalGuard {
         self
     }
 
+    pub(crate) fn register_auxiliary_call(&mut self, call: Arc<super::auxiliary_call::AuxiliaryProviderCall>) {
+        self.auxiliary_call = Some(call);
+    }
+
     /// Persist the existing main aggregate settlement before an additional
     /// paid call. This does not reinterpret the main trace as per-attempt usage.
     #[cfg(feature = "llm-router")]

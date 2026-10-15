@@ -1,8 +1,8 @@
-//! Smart group-reply pre-gate: a cheap, two-tier triage that runs *before* the
-//! full agent loop for smart-mode group messages that do NOT explicitly mention
-//! the bot. Its sole purpose is to cut token cost by keeping obvious group noise
-//! out of the (expensive) agent loop, while never silently dropping a message
-//! that should have been answered.
+//! Smart group-reply pre-gate: a cheap, two-tier triage that runs after source
+//! decision admission but before the full agent loop for smart-mode group
+//! messages that do NOT explicitly mention the bot. Its sole purpose is to cut
+//! token cost by keeping obvious group noise out of the expensive agent loop,
+//! while never silently dropping a message that should have been answered.
 //!
 //! # Tiers
 //!
@@ -12,12 +12,13 @@
 //!       mention of the bot's name, a direct address, or a continuation of a
 //!       thread the bot recently participated in). Enters the loop immediately.
 //!     - [`Heuristic::Skip`] — obvious noise (pure emoji/stickers, ultra-short
-//!       social reactions like "lol"). Stays silent without calling any model.
+//!       social reactions like "lol"). Requires a source-bound classifier
+//!       confirmation before the admitted turn may stay silent.
 //!     - [`Heuristic::Uncertain`] — everything else; escalates to Tier 2.
 //!
-//! - **Tier 2 — cheap-tier classifier** ([`classify_with_model`]): only invoked
-//!   for the `Uncertain` bucket. One short prompt → `{respond: bool}`. This is
-//!   the token-saving sweet spot: a single cheap call instead of a full loop.
+//! - **Tier 2 — cheap-tier classifier** ([`classify_with_model`]): invoked for
+//!   `Uncertain` and heuristic `Skip` buckets. One short prompt → YES/NO through
+//!   the admitted turn's resolver and physical accounting scope.
 //!
 //! # Invariants
 //!
@@ -32,14 +33,14 @@
 use std::time::Duration;
 
 use crate::config::SmartGroupConfig;
-use crate::providers::Provider;
+use crate::providers::{Provider, traits::ChatTrace};
 
 /// Tier-1 (0-token) heuristic classification of a group message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heuristic {
     /// Clearly relevant — enter the agent loop without consulting any model.
     EnterLoop,
-    /// Obvious noise — stay silent without consulting any model.
+    /// Obvious noise — request an admitted classifier confirmation of silence.
     Skip,
     /// Indeterminate — escalate to the Tier-2 cheap-model classifier.
     Uncertain,
@@ -91,6 +92,17 @@ impl PreGatePath {
 pub struct PreGateOutcome {
     pub decision: PreGateDecision,
     pub path: PreGatePath,
+}
+
+pub(super) enum ClassifierCall {
+    Completed(Box<ChatTrace>),
+    Failed,
+    Cancelled,
+}
+
+pub(super) struct ModelClassification {
+    pub(super) outcome: PreGateOutcome,
+    pub(super) call: ClassifierCall,
 }
 
 impl PreGateOutcome {
@@ -334,42 +346,73 @@ fn parse_classifier_answer(answer: &str) -> Option<bool> {
 ///
 /// `provider`/`model` are the resolved classifier provider+model (the caller
 /// resolves these from [`SmartGroupConfig`], falling back to the channel route).
-pub async fn classify_with_model(
+pub(super) async fn classify_with_model(
     provider: &dyn Provider,
     model: &str,
     cfg: &SmartGroupConfig,
     recent_context: &[String],
     latest: &str,
     bot_names: &[String],
-) -> PreGateOutcome {
+    accounting: std::sync::Arc<dyn crate::providers::attempt_accounting::AttemptAccounting>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ModelClassification {
     let prompt = build_classifier_prompt(recent_context, latest, bot_names);
-    let call = provider.chat_with_system(
-        Some(CLASSIFIER_SYSTEM_PROMPT),
-        &prompt,
+    let messages = [
+        crate::providers::ChatMessage::system(CLASSIFIER_SYSTEM_PROMPT),
+        crate::providers::ChatMessage::user(prompt),
+    ];
+    let accounting_deadline = accounting.deadline();
+    let configured_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(cfg.classifier_timeout_secs.max(1)))
+        .unwrap_or(accounting_deadline);
+    let deadline = tokio::time::Instant::from_std(configured_deadline.min(accounting_deadline));
+    let call = crate::providers::attempt_accounting::chat_traced(
+        provider,
+        crate::providers::traits::ChatRequest {
+            messages: &messages,
+            tools: None,
+        },
         model,
         cfg.classifier_temperature,
+        accounting,
     );
-    let timeout = Duration::from_secs(cfg.classifier_timeout_secs.max(1));
 
-    match tokio::time::timeout(timeout, call).await {
-        Ok(Ok(answer)) => match parse_classifier_answer(&answer) {
-            Some(true) => PreGateOutcome::enter(PreGatePath::ClassifierEnter),
-            Some(false) => PreGateOutcome::skip(PreGatePath::ClassifierSkip),
-            None => {
-                tracing::debug!(answer = %answer, "pre-gate classifier returned unparseable answer; failing open");
-                PreGateOutcome::enter(PreGatePath::ClassifierFailOpen)
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = tokio::time::timeout_at(deadline, call) => Some(result),
+    };
+    match result {
+        Some(Ok(Ok(trace))) => {
+            let outcome = match parse_classifier_answer(trace.response.text_or_empty()) {
+                Some(true) => PreGateOutcome::enter(PreGatePath::ClassifierEnter),
+                Some(false) => PreGateOutcome::skip(PreGatePath::ClassifierSkip),
+                None => {
+                    tracing::debug!("pre-gate classifier returned an unparseable answer; failing open");
+                    PreGateOutcome::enter(PreGatePath::ClassifierFailOpen)
+                }
+            };
+            ModelClassification {
+                outcome,
+                call: ClassifierCall::Completed(Box::new(trace)),
             }
-        },
-        Ok(Err(err)) => {
-            tracing::warn!("pre-gate classifier call failed; failing open (enter loop): {err}");
-            PreGateOutcome::enter(PreGatePath::ClassifierFailOpen)
         }
-        Err(_elapsed) => {
+        Some(Ok(Err(err))) => {
+            tracing::warn!("pre-gate classifier call failed; failing open (enter loop): {err}");
+            ModelClassification {
+                outcome: PreGateOutcome::enter(PreGatePath::ClassifierFailOpen),
+                call: ClassifierCall::Failed,
+            }
+        }
+        Some(Err(_)) | None => {
             tracing::warn!(
                 timeout_secs = cfg.classifier_timeout_secs,
-                "pre-gate classifier timed out; failing open (enter loop)"
+                "pre-gate classifier was cancelled or timed out; failing open (enter loop)"
             );
-            PreGateOutcome::enter(PreGatePath::ClassifierFailOpen)
+            ModelClassification {
+                outcome: PreGateOutcome::enter(PreGatePath::ClassifierFailOpen),
+                call: ClassifierCall::Cancelled,
+            }
         }
     }
 }
@@ -556,6 +599,9 @@ mod tests {
     struct FailingProvider;
     #[async_trait]
     impl Provider for FailingProvider {
+        fn supports_attempt_accounting(&self) -> bool {
+            true
+        }
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities::default()
         }
@@ -573,6 +619,9 @@ mod tests {
     struct YesProvider;
     #[async_trait]
     impl Provider for YesProvider {
+        fn supports_attempt_accounting(&self) -> bool {
+            true
+        }
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities::default()
         }
@@ -587,19 +636,60 @@ mod tests {
         }
     }
 
+    struct TestAccounting;
+    impl crate::providers::attempt_accounting::sealed::AccountingOwner for TestAccounting {}
+    #[async_trait]
+    impl crate::providers::attempt_accounting::AttemptAccounting for TestAccounting {
+        fn deadline(&self) -> std::time::Instant {
+            std::time::Instant::now() + Duration::from_secs(5)
+        }
+        async fn begin(
+            &self,
+            _request: crate::providers::attempt_accounting::PhysicalRequest<'_>,
+        ) -> anyhow::Result<Box<dyn crate::providers::attempt_accounting::AttemptReceipt>> {
+            anyhow::bail!("unit provider must not issue a physical request")
+        }
+    }
+
+    fn test_accounting() -> std::sync::Arc<dyn crate::providers::attempt_accounting::AttemptAccounting> {
+        std::sync::Arc::new(TestAccounting)
+    }
+
     #[tokio::test]
     async fn classifier_failure_fails_open_to_enter_loop() {
         let cfg = SmartGroupConfig::default();
-        let outcome = classify_with_model(&FailingProvider, "m", &cfg, &[], "ambiguous statement", &names()).await;
-        assert!(outcome.should_enter_loop(), "classifier failure must fail open");
-        assert_eq!(outcome.path, PreGatePath::ClassifierFailOpen);
+        let result = classify_with_model(
+            &FailingProvider,
+            "m",
+            &cfg,
+            &[],
+            "ambiguous statement",
+            &names(),
+            test_accounting(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(result.outcome.should_enter_loop(), "classifier failure must fail open");
+        assert_eq!(result.outcome.path, PreGatePath::ClassifierFailOpen);
+        assert!(matches!(result.call, ClassifierCall::Failed));
     }
 
     #[tokio::test]
     async fn classifier_no_answer_skips() {
         let cfg = SmartGroupConfig::default();
-        let outcome = classify_with_model(&YesProvider, "m", &cfg, &[], "casual banter", &names()).await;
-        assert!(!outcome.should_enter_loop(), "explicit NO should skip");
-        assert_eq!(outcome.path, PreGatePath::ClassifierSkip);
+        let result = classify_with_model(
+            &YesProvider,
+            "m",
+            &cfg,
+            &[],
+            "casual banter",
+            &names(),
+            test_accounting(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(!result.outcome.should_enter_loop(), "explicit NO should skip");
+        assert_eq!(result.outcome.path, PreGatePath::ClassifierSkip);
+        assert!(matches!(result.call, ClassifierCall::Completed(_)));
     }
 }

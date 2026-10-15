@@ -513,14 +513,21 @@ pub(super) async fn run() {
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
         initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
         assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());
-        let config = crate::config::new_shared(initial);
+        let mut initial_ctx = context(
+            &tmp,
+            crate::config::new_shared(initial),
+            memory.clone(),
+            channel.clone(),
+            Arc::clone(&cache),
+            Arc::clone(&histories),
+        );
+        let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
+        let config = Arc::clone(&initial_ctx.config);
         let g0 = config.pin();
         cache.lock().insert(
             (g0.id.0, "openai".to_owned(), MODEL.to_owned()),
             Arc::clone(&cached_provider),
         );
-        let mut initial_ctx = context(&tmp, Arc::clone(&config), memory.clone(), channel.clone(), Arc::clone(&cache), Arc::clone(&histories));
-        let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
         let committed = Arc::new(Mutex::new(Vec::new()));
         let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadParticipant {
             cache: Arc::clone(&cache),
