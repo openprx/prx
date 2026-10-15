@@ -69,18 +69,27 @@ pub struct VerifiedRevision {
     pub bundle: Bundle,
 }
 
-/// Canonical digest of a revision record: lowercase hex SHA-256 of its compact
-/// `serde_json` serialization (fixed field order, no maps). A digest stored
-/// inside the same directory does not authenticate the record, because whoever
-/// can edit the record can edit the digest too. The digest is meant to be
-/// pinned elsewhere, for example by the SL08 publication journal, and passed
-/// to [`SkillLifecycleStore::read_revision`].
+/// Version of the record digest encoding.
+const RECORD_DIGEST_VERSION: u32 = 1;
+const RECORD_DIGEST_DOMAIN: &[u8] = b"prx-skill-record\0";
+
+/// Canonical digest of a revision record: lowercase hex SHA-256 of
+/// `b"prx-skill-record\0"`, the `u32` big-endian digest version (1) and the
+/// compact `serde_json` serialization of the record (fixed field order, no
+/// maps). A digest stored inside the same directory does not authenticate the
+/// record, because whoever can edit the record can edit the digest too. The
+/// digest is meant to be pinned elsewhere, for example by the SL08 publication
+/// journal, and passed to [`SkillLifecycleStore::read_revision`].
 pub fn record_digest(revision: &SkillRevision) -> Result<String, LifecycleError> {
     let bytes = serde_json::to_vec(revision).map_err(|e| LifecycleError::InvalidRecord {
         path: PathBuf::from(REVISION_FILE),
         reason: e.to_string(),
     })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    let mut hasher = Sha256::new();
+    hasher.update(RECORD_DIGEST_DOMAIN);
+    hasher.update(RECORD_DIGEST_VERSION.to_be_bytes());
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Name of the first provenance field in which `new` differs from `record`.

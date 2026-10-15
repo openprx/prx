@@ -396,6 +396,10 @@ fn collect_dir(
             return Err(BundleError::UnsupportedFileType(display(&child_rel)));
         }
     }
+    // A swap after the listing check above must not go unnoticed either.
+    if dir_identity(dir, rel)? != before {
+        return Err(BundleError::ChangedDuringRead(display(rel)));
+    }
     Ok(())
 }
 
