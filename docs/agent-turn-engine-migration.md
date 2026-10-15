@@ -20,6 +20,7 @@ wire formats.
 | Tool parsing, policy, scheduling, and result recording | `agent::tool_call_parser`, `agent::execution_policy`, `agent::tool_scheduler`, and `agent::tool_result_recording` |
 | Provider rounds and attribution | `agent::provider_round` |
 | Progress and idle cancellation | `agent::idle` |
+| Bounded diagnostic previews and secret redaction | `agent::diagnostics` |
 | Trusted document provenance | `agent::document_ingest` |
 
 Internal callers that used `agent::loop_::agent_turn`,
@@ -52,24 +53,24 @@ why its current contents remain cohesive. Future growth still requires review.
 
 | Lines | File | Recorded ownership and cohesion reason |
 | ---: | --- | --- |
-| 22,582 | `src/chat/mod.rs` | Owns terminal Chat assembly and its private end-to-end fixtures; provider, renderer, state, and dispatcher concerns are already separate modules. |
-| 17,851 | `src/tools/sessions_spawn.rs` | Owns admitted child construction, spawn lifecycle, batch behavior, and the tests that pin grant and cleanup boundaries; splitting the state machine must preserve those shared authority invariants. |
+| 22,584 | `src/chat/mod.rs` | Owns terminal Chat assembly and its private end-to-end fixtures; provider, renderer, state, and dispatcher concerns are already separate modules. |
+| 17,860 | `src/tools/sessions_spawn.rs` | Owns admitted child construction, spawn lifecycle, batch behavior, and the tests that pin grant and cleanup boundaries; splitting the state machine must preserve those shared authority invariants. |
 | 15,613 | `src/memory/sqlite.rs` | Owns the SQLite `Memory` adapter, its schema and migrations, SQL projections, and backend-specific contract tests. |
-| 15,322 | `src/channels/mod.rs` | Owns shared channel construction and admitted message dispatch plus cross-channel fixtures; concrete transports already live in their own modules. |
+| 15,332 | `src/channels/mod.rs` | Owns shared channel construction and admitted message dispatch plus cross-channel fixtures; concrete transports already live in their own modules. |
 | 13,733 | `src/chat/tui.rs` | Owns the feature-gated terminal UI input, layout, rendering, and rendering-state tests as one presentation boundary. |
 | 12,471 | `src/config/schema.rs` | Owns the public Serde schema, defaults, validation, compatibility loading, and their contract tests; keeping these together prevents schema/default drift. |
-| 11,696 | `src/chat/dispatcher.rs` | Owns the reducer effect executor and admitted Chat driver with behavioral tests that pin action/effect ordering. |
+| 11,698 | `src/chat/dispatcher.rs` | Owns the reducer effect executor and admitted Chat driver with behavioral tests that pin action/effect ordering. |
 | 11,033 | `src/chat/state.rs` | Owns the pure Chat reducer, effect vocabulary, state transitions, and exhaustive reducer tests. |
 | 10,755 | `src/memory/postgres.rs` | Owns the PostgreSQL `Memory` adapter, pool, RLS, schema/migrations, SQL projections, and backend-specific tests. |
 | 10,040 | `tests/architecture_boundaries.rs` | Centralizes declarative source scanners, exact allowlists, and mutation probes so architectural exceptions cannot diverge across test binaries. |
-| 9,825 | `src/gateway/mod.rs` | Owns Axum ingress, production registry assembly, gateway runtime lifecycle, and root integration fixtures; API and compatibility handlers are already separate modules. |
+| 9,819 | `src/gateway/mod.rs` | Owns Axum ingress, production registry assembly, gateway runtime lifecycle, and root integration fixtures; API and compatibility handlers are already separate modules. |
 | 8,881 | `src/runtime/turn_decision.rs` | Owns decision-service integration and its policy matrix; routing and supporting decision concerns are already factored into child modules. |
 | 7,493 | `src/providers/mod.rs` | Owns provider factory, route/credential resolution, dialect selection, and factory tests while concrete provider protocols remain separate. |
-| 7,247 | `src/gateway/compat.rs` | Owns compatibility and MCP HTTP surfaces with the cross-boundary authorization tests that pin their route behavior. |
+| 7,470 | `src/gateway/compat.rs` | Owns compatibility and MCP HTTP surfaces with the cross-boundary authorization tests that pin their route behavior. |
 | 6,482 | `src/onboard/wizard.rs` | Owns the interactive onboarding state machine, discovery, configuration writes, fallback/cancellation behavior, and their workflow tests. |
 | 6,239 | `src/providers/reliable.rs` | Owns the resilient provider wrapper, failover, retry, trace/usage attribution, streaming, and the tests for that single policy boundary. |
 | 6,115 | `src/tools/execution.rs` | Owns canonical tool dispatch, approval, idempotency, preparation, reservation, and security-boundary tests. |
-| 5,573 | `src/session_worker/runner.rs` | Owns the worker wire protocol, manifest/source admission, segment runtime, cleanup, and process-boundary tests. |
+| 5,584 | `src/session_worker/runner.rs` | Owns the worker wire protocol, manifest/source admission, segment runtime, cleanup, and process-boundary tests. |
 | 5,060 | `src/causal_tree/store.rs` | Owns the decision store schema, migrations, repositories, and persistence tests as one backend boundary. |
 | 5,058 | `src/providers/compatible.rs` | Owns the OpenAI-compatible HTTP/SSE wire family, dialect normalization, stream parser, and protocol fixtures. |
 
