@@ -3672,16 +3672,13 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
     }
 
     /// The three default-exposed memory tools over one SQLite store.
-    ///
-    /// The `memory_recall` gate mirrors `src/tools/mod.rs`: the daemon does not
-    /// register it while the memory ACL is on (V02-R7b), so neither does this.
     fn memory_registry(
         config: &crate::config::Config,
         memory: &Arc<crate::memory::SqliteMemory>,
     ) -> Arc<Vec<Box<dyn crate::tools::Tool>>> {
         let shared: Arc<dyn crate::memory::Memory> = memory.clone();
         let acl_enabled = config.memory.acl_enabled;
-        let mut tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+        Arc::new(vec![
             Box::new(crate::tools::MemorySearchTool::new(
                 config.workspace_dir.clone(),
                 shared.clone(),
@@ -3692,11 +3689,8 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
                 shared.clone(),
                 acl_enabled,
             )) as Box<dyn crate::tools::Tool>,
-        ];
-        if !acl_enabled {
-            tools.push(Box::new(crate::tools::MemoryRecallTool::new(shared, false)) as Box<dyn crate::tools::Tool>);
-        }
-        Arc::new(tools)
+            Box::new(crate::tools::MemoryRecallTool::new(shared, acl_enabled)) as Box<dyn crate::tools::Tool>,
+        ])
     }
 
     async fn run_memory_tool(
@@ -3809,9 +3803,8 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         );
     }
 
-    /// `memory_recall` is the third default-exposed name. In production it is
-    /// built with a hardcoded `acl_enabled = false`, so before V02-R5 its
-    /// owner-scoped branch was unreachable and every MCP recall was unscoped.
+    /// `memory_recall` is the third default-exposed name. An isolated MCP
+    /// caller always uses owner-scoped recall, independently of ACL mode.
     #[tokio::test]
     async fn mcp_memory_recall_does_not_leak_another_issuers_rows() {
         let workspace = TempDir::new().expect("test: temp workspace");
@@ -3885,11 +3878,7 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
     }
 
     /// The same isolation with the flag on, proving the fix is flag-independent
-    /// in both directions.
-    ///
-    /// `memory_recall` is not registered while the ACL is on (V02-R7b), so this
-    /// covers `memory_search` and `memory_get` only — `memory_registry` mirrors
-    /// that production gate.
+    /// in both directions and every advertised memory reader stays callable.
     #[tokio::test]
     async fn mcp_memory_tools_are_isolated_when_the_acl_flag_is_on() {
         let workspace = TempDir::new().expect("test: temp workspace");
@@ -3904,6 +3893,7 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         for (tool, args) in [
             ("memory_search", serde_json::json!({"query": MEMORY_MARKER_QUERY})),
             ("memory_get", serde_json::json!({"path": MEMORY_MARKER_KEY})),
+            ("memory_recall", serde_json::json!({"query": MEMORY_MARKER_QUERY})),
         ] {
             let seen_by_b = run_memory_tool(&config, &memory, &issuer_b, tool, args).await;
             assert!(
@@ -3912,18 +3902,17 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             );
         }
 
-        let seen_by_a = run_memory_tool(
-            &config,
-            &memory,
-            &issuer_a,
-            "memory_get",
-            serde_json::json!({"path": MEMORY_MARKER_KEY}),
-        )
-        .await;
-        assert!(
-            seen_by_a.contains(MEMORY_MARKER_CONTENT),
-            "issuer A must still read its own row with the ACL flag on: {seen_by_a}"
-        );
+        for (tool, args) in [
+            ("memory_search", serde_json::json!({"query": MEMORY_MARKER_QUERY})),
+            ("memory_get", serde_json::json!({"path": MEMORY_MARKER_KEY})),
+            ("memory_recall", serde_json::json!({"query": MEMORY_MARKER_QUERY})),
+        ] {
+            let seen_by_a = run_memory_tool(&config, &memory, &issuer_a, tool, args).await;
+            assert!(
+                seen_by_a.contains(MEMORY_MARKER_CONTENT),
+                "issuer A must still read its own row through {tool} with the ACL flag on: {seen_by_a}"
+            );
+        }
     }
 
     /// Trusted authorship: forging another issuer's owner id *and* clearing the

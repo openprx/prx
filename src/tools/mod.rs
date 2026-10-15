@@ -574,11 +574,10 @@ pub fn all_tools_with_runtime_ext_and_extensions(
         )));
         tool_arcs.push(Arc::new(MemoryReindexTool::new(memory.clone(), security.clone())));
 
-        if config.memory.acl_enabled {
-            tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
-        } else {
-            tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
-        }
+        tool_arcs.push(Arc::new(MemoryRecallTool::new(
+            memory.clone(),
+            config.memory.acl_enabled,
+        )));
     }
 
     tool_arcs.push(Arc::new(
@@ -1064,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_skips_memory_recall_when_acl_enabled() {
+    fn all_tools_registers_acl_scoped_memory_recall_when_acl_enabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -1095,7 +1094,7 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"memory_recall"));
+        assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"document_search"));
         assert!(names.contains(&"document_get_chunk"));
         assert!(names.contains(&"memory_reindex"));

@@ -127,9 +127,9 @@ impl Tool for MemoryRecallTool {
         // V02-R5: an owner-isolated origin (today an externally authenticated
         // MCP caller) takes the owner-scoped path regardless of the flag —
         // `memory.acl_enabled` is an in-process rollout switch and must not be
-        // able to disable an authenticated caller's owner boundary. That also
-        // makes the FIX-#50 branch reachable in production, which it was not
-        // while `src/tools/mod.rs` built this tool with a hardcoded `false`.
+        // able to disable an authenticated caller's owner boundary. The
+        // production registry also passes the real flag so local ACL-enabled
+        // recalls take the same scoped branch.
         let isolated = crate::tools::execution::scope_requires_owner_match(&args);
         let recall_result = if self.acl_enabled || isolated {
             let mut scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
@@ -264,10 +264,10 @@ mod tests {
         assert!(result.output.contains("No memories found"));
     }
 
-    /// V02-R5: the tool is built with a hardcoded `acl_enabled = false` in
-    /// production, so before this change every recall — MCP included — took the
-    /// unscoped path. An owner-isolated origin now takes the scoped one, which
-    /// is what makes the FIX-#50 branch reachable outside tests.
+    /// V02-R5: an owner-isolated origin takes the scoped path independently of
+    /// the configured ACL mode. The production registry passes that mode to
+    /// this tool, while the external-owner boundary cannot be turned off with
+    /// configuration.
     ///
     /// MUTATION GUARD: drop `|| isolated` and this goes red while
     /// `recall_finds_match` (no isolation marker) stays green.

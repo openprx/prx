@@ -483,10 +483,9 @@ empty registry that would answer every caller with an empty list. An
 executor-side bound applies even when a provider dialect omits JSON Schema
 range keywords: `sessions_list` and `subagents` list return at most 100 runs,
 and `sessions_history` returns at most 500 entries; explicit zero limits clamp
-to one. A conditional exception remains: `memory_recall` is withheld from the
-registry
-whenever `memory.acl_enabled` is true, so with memory ACL on that name is still
-advertised and answers 404.
+to one. `memory_recall` remains registered when `memory.acl_enabled` is true and
+uses the caller's trusted owner scope, so every default-advertised read tool is
+callable in both ACL modes.
 
 ### Owner-isolated reads for external MCP callers
 

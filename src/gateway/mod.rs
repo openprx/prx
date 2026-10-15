@@ -4218,24 +4218,16 @@ mod tests {
     }
 
     /// V02-R7b: the same parity question with `memory.acl_enabled = true`.
-    ///
-    /// `default_mcp_server_exposed_tools` advertises `memory_recall`
-    /// unconditionally, while `all_tools_with_runtime_ext_and_extensions`
-    /// withholds the tool whenever memory ACL is on. The config-load warning
-    /// next to `side_effecting_exposed_tools` only fires for mutating names and
-    /// `memory_recall` is read-only, so an operator who turns memory ACL on
-    /// gets a silently advertised-but-404 name.
-    ///
-    /// That is a second, conditional break with its own remediation decision
-    /// (filter the effective exposure, warn at config load, or withdraw the
-    /// name), and registering the two session read tools does not close it.
-    /// Fixing it here would put two concerns in one change (AGENTS.md 6.2), so
-    /// the guard is landed executable but ignored: run it with `--ignored` to
-    /// observe the break, and un-ignore it when V02-R7b is decided.
+    /// The production registry keeps `memory_recall` callable and constructs
+    /// it in ACL mode, matching the name advertised by MCP discovery.
     #[test]
-    #[ignore = "V02-R7b: memory_recall is advertised unconditionally but withheld when memory.acl_enabled is true; open decision, out of scope for the V02-R7 registration fix"]
     fn every_default_exposed_mcp_tool_resolves_when_memory_acl_is_enabled() {
         let workspace = tempfile::tempdir().unwrap();
+        let test_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: gateway construction runtime");
+        let _test_runtime_guard = test_runtime.enter();
         let mut config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             // The builder constructs a real provider chain, which refuses to
