@@ -1,4 +1,6 @@
 //! Owner isolation over the `memories` table plus source-scan helpers.
+#![cfg(test)]
+
 use super::owner_isolation::{C03_SESSION_KEY, C03_WORKSPACE, c03_owner};
 use crate::memory::postgres::rows::quote_identifier;
 use crate::memory::postgres::{PostgresMemory, live_postgres_url};
@@ -54,9 +56,41 @@ pub(super) fn r5_production_source() -> &'static str {
             include_str!("../memory_impl.rs"),
             include_str!("../events.rs"),
         ]
-        .concat()
+        .join(FILE_SEPARATOR)
     });
     SOURCE.as_str()
+}
+
+/// Joins the production files in [`r5_production_source`], so a scan that
+/// reads "to the end of the method" never runs across a file boundary.
+pub(super) const FILE_SEPARATOR: &str = "\n// ---- next source file ----\n";
+
+/// Files under `postgres/` that were never part of the old single-file text
+/// and are deliberately outside [`r5_production_source`].
+const OUTSIDE_PRODUCTION_SOURCE: [&str; 4] =
+    ["decision_reads.rs", "ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+
+/// A new production file must either join the scanned text or be named in
+/// [`OUTSIDE_PRODUCTION_SOURCE`]; otherwise the text guards would go blind to it.
+#[test]
+fn production_source_lists_every_backend_file() {
+    let scanned: Vec<&str> = r5_production_source().split(FILE_SEPARATOR).collect();
+    assert_eq!(scanned.len(), 8, "the scanned text must hold the root and seven sibling files");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/postgres");
+    let mut unlisted = Vec::new();
+    for entry in std::fs::read_dir(&directory).expect("test: read the backend directory") {
+        let path = entry.expect("test: read a directory entry").path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).expect("test: utf-8 file name");
+        let text = std::fs::read_to_string(&path).expect("test: read a backend file");
+        let covered = scanned.iter().any(|part| *part == text) || OUTSIDE_PRODUCTION_SOURCE.contains(&name);
+        if !covered {
+            unlisted.push(name.to_string());
+        }
+    }
+    assert!(unlisted.is_empty(), "backend files missing from the scanned text: {unlisted:?}");
 }
 
 /// Drop every line comment, so a comment that merely *names* a call is not
@@ -79,6 +113,7 @@ pub(super) fn r5_method_text(production: &'static str, declaration: &str) -> &'s
         .unwrap_or_else(|| panic!("test: production declaration not found: {declaration}"));
     let body_start = start + declaration.len();
     let rest = &production[body_start..];
+    let rest = &rest[..rest.find(FILE_SEPARATOR).unwrap_or(rest.len())];
     let end = [
         "\n    async fn ",
         "\n    fn ",

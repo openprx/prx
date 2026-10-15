@@ -1,4 +1,6 @@
 //! Pure unit tests for identifier validation and small helpers.
+#![cfg(test)]
+
 use crate::memory::postgres::PostgresMemory;
 use crate::memory::postgres::rows::{related_table_name, validate_identifier};
 use crate::memory::traits::MemoryCategory;

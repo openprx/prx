@@ -1,6 +1,8 @@
 //! Row-level-security policy tests, live and offline.
+#![cfg(test)]
+
 use super::CountingEmbedding;
-use super::memory_owner_isolation::{r5_drop_schema, r5_production_source, r5_seed, r5_without_comments};
+use super::memory_owner_isolation::{FILE_SEPARATOR, r5_drop_schema, r5_production_source, r5_seed, r5_without_comments};
 use super::owner_isolation::{C03_WORKSPACE, c03_owner};
 use crate::memory::postgres::pool::{PostgresConnectionPool, PostgresSessionContext};
 use crate::memory::postgres::rows::quote_identifier;
@@ -415,6 +417,7 @@ fn apply_rls_context_raw_sets_the_owner_isolation_flag() {
         .find("fn apply_rls_context_raw<C: GenericClient>(")
         .expect("test: apply_rls_context_raw exists");
     let body = &source[start..];
+    let body = body.split(FILE_SEPARATOR).next().unwrap_or(body);
     let body = &body[..body.find("\n    }\n").expect("test: apply_rls_context_raw ends")];
     let bypass_return = body.find("return Ok(());").expect("test: system early return");
     let flag = body
@@ -546,6 +549,7 @@ fn init_vector_rls_installs_the_public_read_policy_on_memories_only() {
         .find("fn init_vector_rls(")
         .expect("test: init_vector_rls exists");
     let body = &source[start..];
+    let body = body.split(FILE_SEPARATOR).next().unwrap_or(body);
     let body = b2_collapse_whitespace(&body[..body.find("\n    }\n").expect("test: init_vector_rls ends")]);
     assert_eq!(body.matches("memories_public_read_policy_sql(").count(), 1, "{body}");
     assert!(

@@ -647,7 +647,28 @@ mod message_event_contract_tests {
             include_str!("postgres/memory_impl.rs"),
             include_str!("postgres/events.rs"),
         ]
-        .concat()
+        .join("\n// ---- next source file ----\n")
+    }
+
+    /// A new file under `postgres/` must join the list above or be named here
+    /// as outside the old single-file text.
+    #[test]
+    fn postgres_backend_source_lists_every_backend_file() {
+        let scanned = postgres_backend_source();
+        let outside = ["decision_reads.rs", "ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/postgres");
+        for entry in std::fs::read_dir(directory).expect("test: read the backend directory") {
+            let path = entry.expect("test: read a directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str()).expect("test: utf-8 file name");
+            let text = std::fs::read_to_string(&path).expect("test: read a backend file");
+            assert!(
+                scanned.contains(&text) || outside.contains(&name),
+                "postgres/{name} is neither scanned nor listed as outside the scan"
+            );
+        }
     }
 
     #[test]

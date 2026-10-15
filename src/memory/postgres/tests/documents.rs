@@ -1,4 +1,6 @@
 //! Owner isolation over `document_chunks`.
+#![cfg(test)]
+
 use super::owner_isolation::{C03_WORKSPACE, c03_owner, c03_principal};
 use crate::memory::postgres::{PostgresMemory, live_postgres_url};
 use crate::memory::traits::{DocumentIngestInput, Memory, MemoryVisibility};

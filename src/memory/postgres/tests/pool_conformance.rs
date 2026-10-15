@@ -1,4 +1,6 @@
 //! Live pool, migration, conformance and reindex tests plus shared fixtures.
+#![cfg(test)]
+
 use super::CountingEmbedding;
 use crate::memory::embeddings;
 use crate::memory::postgres::rows::quote_identifier;

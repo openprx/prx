@@ -1,4 +1,6 @@
 //! Tests for the PostgreSQL memory backend.
+#![cfg(test)]
+
 
 mod basics;
 mod documents;

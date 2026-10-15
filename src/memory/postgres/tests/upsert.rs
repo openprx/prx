@@ -1,4 +1,6 @@
 //! The owner-isolated `memory_store` upsert.
+#![cfg(test)]
+
 use super::memory_owner_isolation::{r5_context, r5_drop_schema, r5_method_text, r5_production_source};
 use super::owner_isolation::c03_owner;
 use crate::memory::postgres::rows::quote_identifier;

@@ -1,4 +1,6 @@
 //! Owner-isolation matrices for identity, ingest events and drafts.
+#![cfg(test)]
+
 use super::memory_owner_isolation::r5_drop_schema;
 use crate::memory::postgres::{PostgresMemory, live_postgres_url};
 use crate::memory::traits::{

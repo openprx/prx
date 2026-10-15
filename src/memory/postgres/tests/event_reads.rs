@@ -1,4 +1,6 @@
 //! Owner-qualified event reader tests.
+#![cfg(test)]
+
 use super::memory_owner_isolation::{r5_drop_schema, r5_method_text, r5_production_source};
 use super::owner_isolation::{C03_SESSION_KEY, C03_WORKSPACE, c03_message_input, c03_owner, c03_principal};
 use crate::memory::postgres::{PostgresMemory, live_postgres_url};
