@@ -1,5 +1,6 @@
 use super::{configured_connection_for, provider_runtime_options_from_config, scoped_reliability};
 use crate::config::Config;
+use crate::providers::traits::{ChatMessage, ChatRequest};
 
 const PRIMARY_MODEL: &str = "model-a";
 const FALLBACK_MODEL: &str = "model-b";
@@ -99,4 +100,95 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     for (surface, refusal) in &refusals[1..] {
         assert_eq!(refusal, expected, "{surface} changed the resolver/factory refusal");
     }
+}
+
+/// Finding 40's fallback admission must survive the finding-42 entrypoint
+/// factories. Both real builders send the tool-bearing request to the primary,
+/// then refuse an unpriced fallback and a tool-less fallback before transport.
+#[tokio::test]
+async fn chat_and_cli_keep_fallback_admission_after_primary_429() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let primary = CredentialProbe::start_with_statuses(vec![429, 429]).await;
+    let unpriced = CredentialProbe::start().await;
+    let tool_less = CredentialProbe::start().await;
+    let primary_name = primary.custom_provider();
+    let unpriced_name = unpriced.custom_provider();
+    let tool_less_name = tool_less.custom_provider();
+    let mut config = Config::default();
+    config.workspace_dir = temp.path().to_path_buf();
+    config.config_path = temp.path().join("config.toml");
+    config.default_provider = Some(primary_name.clone());
+    config.default_model = Some(PROBE_MODEL.to_string());
+    config.auth.codex_auth_json_auto_import = false;
+    config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+    config.reliability.provider_retries = 0;
+    config.reliability.provider_backoff_ms = 0;
+    config.reliability.fallback_providers = vec![unpriced_name.clone(), tool_less_name.clone()];
+    for (provider, native_tools) in [(&primary_name, true), (&unpriced_name, true), (&tool_less_name, false)] {
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": provider,
+                "model": PROBE_MODEL,
+                "operations": ["chat"],
+                "native_tools": native_tools,
+            }))
+            .expect("test: model declaration"),
+        );
+    }
+    for provider in [&primary_name, &tool_less_name] {
+        config.cost.prices.insert(
+            format!("{provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
+
+    let options = provider_runtime_options_from_config(&config);
+    let (_, chat) = crate::chat::chat_provider_chain(&config, &primary_name, &primary_name, PROBE_MODEL, &options)
+        .expect("test: chat chain builds");
+    let cli_choice =
+        crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("test: CLI selection resolves");
+    let cli = crate::agent::entry::agent_provider_selection(&config, &cli_choice)
+        .build_provider(&config, &options)
+        .expect("test: CLI chain builds");
+    let messages = [ChatMessage::user("Use probe_tool.")];
+    let tools = [crate::tools::ToolSpec {
+        name: "probe_tool".to_string(),
+        description: "Test fallback admission".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    for (surface, provider) in [("chat", chat), ("cli", cli)] {
+        let error = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                PROBE_MODEL,
+                0.0,
+            )
+            .await
+            .expect_err("test: no inadmissible fallback can serve");
+        let shown = format!("{error:#}");
+        assert!(
+            shown.contains("429") || shown.contains("rate limit"),
+            "{surface}: {shown}"
+        );
+    }
+
+    assert_eq!(primary.requests().len(), 2, "chat and CLI each reach the primary once");
+    assert!(
+        unpriced.requests().is_empty(),
+        "the unpriced fallback reached transport"
+    );
+    assert!(
+        tool_less.requests().is_empty(),
+        "the tool-less fallback reached transport"
+    );
 }
