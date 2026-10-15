@@ -5564,9 +5564,10 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     (
         "src/tools/skills.rs::execute_named",
         3,
-        "decorator: `SkillTool` forwards an alias to the skill runner, and `SkillReadTool` \
-         rewrites a catalog alias into its own `name` argument (or forwards the exact name) and \
-         re-enters its own `execute`; both are the already-gated outer call, not a new entry",
+        "decorator, three sites, each inside an already-gated ToolExecutionService call: \
+         `SkillReadTool::execute_named` re-enters its own `self.execute` twice (the exact name, \
+         and a catalog alias rewritten into its `name` argument), and \
+         `SkillExecuteTool::execute_named` forwards to `execute_named_with_cancellation`",
     ),
     (
         "src/tools/skills.rs::execute_resolved",
