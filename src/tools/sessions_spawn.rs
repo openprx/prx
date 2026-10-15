@@ -450,6 +450,7 @@ pub(crate) struct SpawnExecutionContext {
     pub(crate) session_scope_key: String,
     pub(crate) spawn_depth: usize,
     pub(crate) owner_id: Option<String>,
+    pub(crate) owner_isolated: bool,
     pub(crate) topic_id: Option<String>,
     pub(crate) source_message_event_id: Option<String>,
     /// D8-4: distinguishes a *turn root* context (seeded at a top-level
@@ -490,6 +491,7 @@ impl SpawnExecutionContext {
             session_scope_key,
             spawn_depth: 0,
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             source_message_event_id: None,
             is_turn_root: true,
@@ -526,6 +528,7 @@ struct SpawnScope {
     chat_type: String,
     chat_id: String,
     owner_id: Option<String>,
+    owner_isolated: bool,
     topic_id: Option<String>,
     parent_task_id: Option<String>,
     source_message_event_id: Option<String>,
@@ -542,6 +545,7 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
             chat_type: context.chat_type.clone(),
             chat_id: context.chat_id.clone(),
             owner_id: sessions_read_model::effective_run_owner_from_context(context),
+            owner_isolated: context.envelope.owner_isolated,
             topic_id: context.envelope.topic_id.clone(),
             parent_task_id: context.envelope.task_id.clone(),
             source_message_event_id: context.envelope.source_message_event_id.clone(),
@@ -593,6 +597,10 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
         // so a caller whose scope carries no explicit owner (a gateway webhook
         // turn) still finds the runs it started.
         owner_id: sessions_read_model::effective_run_owner(args),
+        // Legacy trusted arguments do not establish an authenticated owner
+        // isolation boundary. Real calls take this bit from their admitted
+        // execution envelope above.
+        owner_isolated: false,
         topic_id: scope
             .get("topic_id")
             .and_then(serde_json::Value::as_str)
@@ -840,6 +848,7 @@ fn spawn_session_scope_key(parent_ctx: Option<&SpawnExecutionContext>, scope: Op
 #[derive(Debug, Clone, Default)]
 struct SpawnLineage {
     owner_id: Option<String>,
+    owner_isolated: bool,
     topic_id: Option<String>,
     parent_task_id: Option<String>,
     source_message_event_id: Option<String>,
@@ -855,6 +864,8 @@ fn spawn_lineage(
             .and_then(|scope| scope.owner_id.clone())
             .or_else(|| parent_ctx.and_then(|ctx| ctx.owner_id.clone()))
             .or_else(|| event_scope.owner_id.clone()),
+        owner_isolated: scope.is_some_and(|scope| scope.owner_isolated)
+            || parent_ctx.is_some_and(|ctx| ctx.owner_isolated),
         topic_id: scope
             .and_then(|scope| scope.topic_id.clone())
             .or_else(|| parent_ctx.and_then(|ctx| ctx.topic_id.clone())),
@@ -4306,6 +4317,7 @@ impl SessionsSpawnTool {
                     .clone()
                     .context("operator spawn recipient missing")?,
                 owner_id: Some(proof.owner_id().to_owned()),
+                owner_isolated: proof.owner_isolated(),
                 topic_id: None,
                 parent_task_id: Some(proof.run_id().to_owned()),
                 source_message_event_id: proof.source_event_id().map(str::to_owned),
@@ -4979,6 +4991,7 @@ impl SessionsSpawnTool {
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
                 owner_id: run_lineage.owner_id.clone(),
+                owner_isolated: run_lineage.owner_isolated,
                 topic_id: run_lineage.topic_id.clone(),
                 source_message_event_id: run_lineage.source_message_event_id.clone(),
                 // A spawn-run context (this run may itself spawn): its children
@@ -5600,6 +5613,7 @@ impl SessionsSpawnTool {
             session_scope_key: session_scope_key.clone(),
             spawn_depth,
             owner_id: run_lineage.owner_id.clone(),
+            owner_isolated: run_lineage.owner_isolated,
             topic_id: run_lineage.topic_id.clone(),
             source_message_event_id: run_lineage.source_message_event_id.clone(),
             // A spawn-run context (this run may itself spawn): its children
@@ -7439,19 +7453,11 @@ async fn run_sub_agent_task(
                 };
             let context = &child_source.1;
             let envelope = &context.envelope;
-            let scope_ctx = ScopeContext {
-                policy: &security,
-                sender: envelope.sender.as_deref().unwrap_or_default(),
-                channel: envelope.channel.as_deref().unwrap_or_default(),
-                chat_type: context.chat_type.as_str(),
-                chat_id: envelope.recipient.as_deref().unwrap_or_default(),
-                owner_id: envelope.owner_id.as_deref(),
-                topic_id: envelope.topic_id.as_deref(),
-                task_id: envelope.task_id.as_deref(),
-                source_message_event_id: envelope.source_message_event_id.as_deref(),
-                config_generation_id: envelope.config_generation_id,
-                config_source_revision: envelope.config_source_revision.as_deref(),
-            };
+            let scope_ctx = ScopeContext::from_execution_context(
+                &security,
+                context,
+                envelope.recipient.as_deref().unwrap_or_default(),
+            );
             let memory_owned = child_fabric_owned.memory();
             // Only build an `ApprovalManager` when a resolver is attached. Under
             // permission-model Phase 1 the unified `SecurityPolicy::decide`
@@ -7817,6 +7823,7 @@ fn build_session_worker_manifest(
         scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
         scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
         owner_id: lineage.owner_id.clone(),
+        owner_isolated: lineage.owner_isolated,
         topic_id: lineage.topic_id.clone(),
         parent_task_id: lineage.parent_task_id.clone(),
         source_message_event_id: lineage.source_message_event_id.clone(),
@@ -10266,7 +10273,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_spawn_process_manifest_carries_resolved_child_compaction() {
+    fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
             compaction_resolver_with_models(vec![
@@ -10278,6 +10285,7 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
+            owner_isolated: true,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -10288,6 +10296,7 @@ mod tests {
             chat_type: "direct".to_string(),
             chat_id: "chat-1".to_string(),
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -10347,6 +10356,7 @@ mod tests {
         assert_ne!(manifest_config.max_context_tokens, 1_000_000);
         assert_eq!(manifest.runtime_config_generation_id, Some(17));
         assert_eq!(manifest.runtime_config_source_revision.as_deref(), Some("revision-17"));
+        assert!(manifest.owner_isolated);
     }
 
     #[test]
@@ -10361,6 +10371,7 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -12199,6 +12210,7 @@ mod tests {
                         session_scope_key: format!("signal:direct:+1555000{parent_depth}"),
                         spawn_depth: parent_depth,
                         owner_id: None,
+                        owner_isolated: false,
                         topic_id: None,
                         source_message_event_id: None,
                         is_turn_root: false,
@@ -12287,6 +12299,7 @@ mod tests {
                     session_scope_key: "signal:+15551234567:openprx_user".to_string(),
                     spawn_depth: 0,
                     owner_id: None,
+                    owner_isolated: false,
                     topic_id: None,
                     source_message_event_id: None,
                     is_turn_root: false,
@@ -13013,6 +13026,7 @@ mod tests {
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
         let lineage = SpawnLineage {
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -13671,6 +13685,7 @@ mod tests {
             scope_chat_type: None,
             scope_chat_id: None,
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -13778,6 +13793,7 @@ mod tests {
             chat_type: "direct".to_string(),
             chat_id: "chat-1".to_string(),
             owner_id: None,
+            owner_isolated: false,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("parent-task".to_string()),
             source_message_event_id: Some("msg-a".to_string()),

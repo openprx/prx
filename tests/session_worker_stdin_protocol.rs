@@ -508,6 +508,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         scope_chat_type: None,
         scope_chat_id: None,
         owner_id: None,
+        owner_isolated: false,
         topic_id: None,
         parent_task_id: None,
         source_message_event_id: None,

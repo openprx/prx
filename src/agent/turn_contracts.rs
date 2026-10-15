@@ -72,12 +72,39 @@ pub(crate) struct ScopeContext<'a> {
     pub channel: &'a str,
     pub chat_type: &'a str,
     pub chat_id: &'a str,
+    pub session_key: Option<&'a str>,
     pub owner_id: Option<&'a str>,
+    pub owner_isolated: bool,
     pub topic_id: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub source_message_event_id: Option<&'a str>,
     pub config_generation_id: Option<u64>,
     pub config_source_revision: Option<&'a str>,
+}
+
+impl<'a> ScopeContext<'a> {
+    pub(crate) fn from_execution_context(
+        policy: &'a SecurityPolicy,
+        context: &'a crate::tools::ToolExecutionContext,
+        chat_id: &'a str,
+    ) -> Self {
+        let envelope = &context.envelope;
+        Self {
+            policy,
+            sender: envelope.sender.as_deref().unwrap_or_default(),
+            channel: envelope.channel.as_deref().unwrap_or_default(),
+            chat_type: context.chat_type.as_str(),
+            chat_id,
+            session_key: Some(envelope.session_key.as_str()),
+            owner_id: envelope.owner_id.as_deref(),
+            owner_isolated: envelope.owner_isolated,
+            topic_id: envelope.topic_id.as_deref(),
+            task_id: envelope.task_id.as_deref(),
+            source_message_event_id: envelope.source_message_event_id.as_deref(),
+            config_generation_id: envelope.config_generation_id,
+            config_source_revision: envelope.config_source_revision.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

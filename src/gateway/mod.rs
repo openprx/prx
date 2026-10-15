@@ -2606,9 +2606,11 @@ async fn run_gateway_chat_with_multimodal(
                 // chat_type so scope rules can target the gateway surface.
                 chat_type: "gateway",
                 chat_id: fabric_ctx.session_key.as_str(),
+                session_key: Some(runtime_envelope.session_key.as_str()),
                 // R-MCPB F-2: the credential-bound owner, so run views and owner-scoped
                 // rows follow the authenticated caller rather than its `reply_target`.
                 owner_id: webhook_owner_id.as_deref(),
+                owner_isolated: runtime_envelope.owner_isolated,
                 topic_id: None,
                 task_id: None,
                 source_message_event_id: None,

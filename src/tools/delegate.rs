@@ -1427,19 +1427,7 @@ impl DelegateLoopResources {
         let child_event_fabric = child_source.fabric.clone();
         let child_memory = child_event_fabric.memory();
         let envelope = &child_execution.envelope;
-        let scope_ctx = ScopeContext {
-            policy: &security,
-            sender: envelope.sender.as_deref().unwrap_or_default(),
-            channel: envelope.channel.as_deref().unwrap_or_default(),
-            chat_type: &child_execution.chat_type,
-            chat_id: &envelope.session_key,
-            owner_id: envelope.owner_id.as_deref(),
-            topic_id: envelope.topic_id.as_deref(),
-            task_id: envelope.task_id.as_deref(),
-            source_message_event_id: envelope.source_message_event_id.as_deref(),
-            config_generation_id: envelope.config_generation_id,
-            config_source_revision: envelope.config_source_revision.as_deref(),
-        };
+        let scope_ctx = ScopeContext::from_execution_context(&security, &child_execution, &envelope.session_key);
         let resolved_compaction = self.resolve_child_compaction(effective_provider, effective_model);
         tracing::debug!(
             agent = agent_name,

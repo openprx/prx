@@ -73,27 +73,27 @@ impl DocumentIngestRuntime {
 
     pub(crate) fn from_scope(memory: Arc<dyn Memory>, scope: &ScopeContext<'_>) -> Self {
         let workspace_id = scope.policy.workspace_dir.to_string_lossy().to_string();
-        let owner_id = Some(
-            crate::memory::principal::OwnerPrincipal::new(
-                workspace_id.clone(),
-                scope.channel,
-                scope.sender,
-                scope.chat_id,
-                vec![crate::memory::principal::Role::Anonymous],
+        let owner_id = scope.owner_id.map(str::to_owned).or_else(|| {
+            Some(
+                crate::memory::principal::OwnerPrincipal::new(
+                    workspace_id.clone(),
+                    scope.channel,
+                    scope.sender,
+                    scope.chat_id,
+                    vec![crate::memory::principal::Role::Anonymous],
+                )
+                .owner_id,
             )
-            .owner_id,
-        );
+        });
         Self {
             memory,
             workspace_id,
             owner_id,
-            // ScopeContext is used by in-process callers, whose historical
-            // workspace/session sharing semantics are intentionally retained.
-            require_owner_match: false,
+            require_owner_match: scope.owner_isolated,
             topic_id: scope.topic_id.map(ToString::to_string),
             task_id: scope.task_id.map(ToString::to_string),
             source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
-            session_key: Some(scope.chat_id.to_string()),
+            session_key: Some(scope.session_key.unwrap_or(scope.chat_id).to_string()),
             legacy_session_key: None,
             turn_key: scope
                 .source_message_event_id

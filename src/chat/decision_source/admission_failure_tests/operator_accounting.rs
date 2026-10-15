@@ -410,6 +410,7 @@ async fn restore_operator_process(
         scope_chat_type: Some(source.proof().policy_chat_type().to_owned()),
         scope_chat_id: scope.recipient.clone(),
         owner_id: scope.owner_id.clone(),
+        owner_isolated: source.proof().owner_isolated(),
         topic_id: None,
         parent_task_id: None,
         source_message_event_id: source.proof().source_event_id().map(str::to_owned),

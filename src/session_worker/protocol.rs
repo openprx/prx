@@ -214,6 +214,8 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
+    pub owner_isolated: bool,
+    #[serde(default)]
     pub topic_id: Option<String>,
     #[serde(default)]
     pub parent_task_id: Option<String>,
@@ -377,7 +379,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_manifest_roundtrip_json() {
+    fn worker_manifest_roundtrip_json_preserves_owner_isolation() {
         let manifest = WorkerManifest {
             parent_capability: Some("capability".into()),
             capability_manifest: None,
@@ -423,6 +425,7 @@ mod tests {
             scope_chat_type: Some("direct".into()),
             scope_chat_id: Some("chat-1".into()),
             owner_id: Some("owner:/tmp/parent-ws:telegram:openprx_user".into()),
+            owner_isolated: true,
             topic_id: Some("topic-1".into()),
             parent_task_id: Some("run-0".into()),
             source_message_event_id: Some("msg-1".into()),
@@ -458,6 +461,7 @@ mod tests {
             parsed.owner_id.as_deref(),
             Some("owner:/tmp/parent-ws:telegram:openprx_user")
         );
+        assert!(parsed.owner_isolated);
         assert_eq!(parsed.topic_id.as_deref(), Some("topic-1"));
         assert_eq!(parsed.parent_task_id.as_deref(), Some("run-0"));
         assert_eq!(parsed.source_message_event_id.as_deref(), Some("msg-1"));

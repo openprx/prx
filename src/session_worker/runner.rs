@@ -2057,7 +2057,9 @@ async fn run_owned_manifest(
                     channel,
                     chat_type,
                     chat_id,
+                    session_key: Some(manifest.session_scope_key.as_str()),
                     owner_id: manifest.owner_id.as_deref(),
+                    owner_isolated: manifest.owner_isolated,
                     topic_id: manifest.topic_id.as_deref(),
                     task_id: manifest.parent_task_id.as_deref(),
                     source_message_event_id: manifest.source_message_event_id.as_deref(),
@@ -2208,19 +2210,11 @@ async fn run_owned_manifest(
                     let child_execution = adapter.as_ref().map(|adapter| adapter.tool_execution_context.clone());
                     let child_scope = child_execution.as_ref().map(|context| {
                         let envelope = &context.envelope;
-                        ScopeContext {
-                            policy: security_ref,
-                            sender: envelope.sender.as_deref().unwrap_or_default(),
-                            channel: envelope.channel.as_deref().unwrap_or_default(),
-                            chat_type: context.chat_type.as_str(),
-                            chat_id: envelope.recipient.as_deref().unwrap_or_default(),
-                            owner_id: envelope.owner_id.as_deref(),
-                            topic_id: envelope.topic_id.as_deref(),
-                            task_id: envelope.task_id.as_deref(),
-                            source_message_event_id: envelope.source_message_event_id.as_deref(),
-                            config_generation_id: envelope.config_generation_id,
-                            config_source_revision: envelope.config_source_revision.as_deref(),
-                        }
+                        ScopeContext::from_execution_context(
+                            security_ref,
+                            context,
+                            envelope.recipient.as_deref().unwrap_or_default(),
+                        )
                     });
                     let loop_scope = child_scope.as_ref().or(scope_ctx_ref);
                     let loop_result = cleanup
@@ -2835,6 +2829,12 @@ fn worker_runtime_envelope_for_workspace(manifest: &WorkerManifest, workspace_id
     if let Some(chat_id) = manifest.scope_chat_id.as_deref() {
         envelope = envelope.with_recipient(chat_id);
     }
+    if let Some(owner_id) = manifest.owner_id.as_deref().filter(|owner_id| !owner_id.is_empty()) {
+        envelope = envelope.with_owner_id(owner_id);
+    }
+    if manifest.owner_isolated {
+        envelope = envelope.with_owner_isolation();
+    }
     envelope.config_generation_id = manifest.runtime_config_generation_id;
     envelope.config_source_revision = manifest.runtime_config_source_revision.clone();
     envelope
@@ -2899,6 +2899,7 @@ where
                     session_scope_key: manifest.session_scope_key.clone(),
                     spawn_depth: manifest.spawn_depth,
                     owner_id: manifest.owner_id.clone(),
+                    owner_isolated: manifest.owner_isolated,
                     topic_id: manifest.topic_id.clone(),
                     source_message_event_id,
                     // A resumed spawn-run process (not a turn root): children
@@ -3269,6 +3270,7 @@ mod tests {
             scope_chat_type: None,
             scope_chat_id: None,
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -4786,6 +4788,7 @@ mod tests {
             scope_chat_type: Some("direct".to_string()),
             scope_chat_id: Some("chat-1".to_string()),
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: false,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("run-parent".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
@@ -4902,6 +4905,7 @@ mod tests {
             scope_chat_type: Some("direct".to_string()),
             scope_chat_id: Some("chat-1".to_string()),
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: false,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("run-parent".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
@@ -4993,6 +4997,7 @@ mod tests {
             scope_chat_type: Some("direct".to_string()),
             scope_chat_id: Some("chat-1".to_string()),
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: false,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("run-parent".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
@@ -5138,6 +5143,7 @@ mod tests {
             scope_chat_type: Some("direct".to_string()),
             scope_chat_id: Some("chat-1".to_string()),
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: false,
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
@@ -5225,6 +5231,7 @@ mod tests {
             scope_chat_type: None,
             scope_chat_id: None,
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: false,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("run-parent".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
@@ -5263,7 +5270,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_event_scope_preserves_spawn_lineage() {
+    fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
         let manifest = WorkerManifest {
             parent_capability: Some("capability".to_string()),
             capability_manifest: None,
@@ -5304,6 +5311,7 @@ mod tests {
             scope_chat_type: Some("direct".to_string()),
             scope_chat_id: Some("chat-1".to_string()),
             owner_id: Some("owner-a".to_string()),
+            owner_isolated: true,
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("run-parent".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
@@ -5333,6 +5341,9 @@ mod tests {
         assert_eq!(principal.session_key.as_deref(), Some("telegram:chat-1:alice"));
         assert_eq!(principal.channel.as_deref(), Some("telegram"));
         assert_eq!(principal.sender.as_deref(), Some("alice"));
+        assert_eq!(principal.owner_id.as_deref(), Some("owner-a"));
+        assert!(principal.require_owner_match);
+        assert!(envelope.owner_isolated);
 
         let write_context = envelope.memory_write_context("direct");
         assert_eq!(write_context.channel.as_deref(), Some("telegram"));

@@ -13,7 +13,7 @@
 use super::*;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::history::build_native_assistant_history;
-use crate::agent::turn_contracts::OS_PAGING_RECALL_MARKER;
+use crate::agent::turn_contracts::{OS_PAGING_RECALL_MARKER, ScopeContext};
 use crate::agent::turn_tests::{first_orphan_tool_index, paging_test_config};
 use crate::memory::{
     DocumentIngestInput, DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryEntry, MemoryPrincipal,
@@ -275,6 +275,70 @@ async fn owner_isolated_context_paging_recall_excludes_another_owners_workspace_
     assert!(
         !recalled.content.contains("OWNER_B_CONTEXT_SENTINEL"),
         "owner-isolated recall must not include another owner's workspace page: {}",
+        recalled.content
+    );
+}
+
+/// A child execution envelope already retains the parent's owner-isolation
+/// bit. Converting that envelope into the scope used by the child tool loop
+/// must keep the same owner, isolation boundary, and canonical session key so
+/// context paging cannot expose another owner's workspace page.
+#[tokio::test]
+async fn owner_isolated_spawn_child_recall_excludes_another_owners_workspace_page() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().to_string_lossy().to_string();
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    for (owner, document_id, sentinel) in [
+        ("owner-a", "context-page:child-owner-a", "CHILD_OWNER_A_CONTEXT"),
+        ("owner-b", "context-page:child-owner-b", "CHILD_OWNER_B_CONTEXT"),
+    ] {
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some(document_id.to_string()),
+            workspace_id: workspace.clone(),
+            owner_id: Some(owner.to_string()),
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: OS_PAGING_SOURCE_KIND.to_string(),
+            source_uri: None,
+            title: None,
+            content: format!("child isolation beacon {sentinel}"),
+            mime_type: Some("text/plain".to_string()),
+            visibility: crate::memory::MemoryVisibility::Workspace,
+            metadata_json: None,
+            session_key: Some("child-session".to_string()),
+            agent_id: None,
+            persona_id: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let envelope = RuntimeEnvelope::sessions_spawn(workspace, "child-session", "child-run")
+        .with_channel("console")
+        .with_sender("prx_user")
+        .with_recipient("child-recipient")
+        .with_owner_id("owner-a")
+        .with_owner_isolation();
+    let context = crate::tools::ToolExecutionContext::new(envelope, "private");
+    let policy = crate::security::SecurityPolicy {
+        workspace_dir: tmp.path().to_path_buf(),
+        ..crate::security::SecurityPolicy::default()
+    };
+    let scope = ScopeContext::from_execution_context(&policy, &context, "child-recipient");
+    let runtime = DocumentIngestRuntime::from_scope(Arc::clone(&mem), &scope).into_nested_turn();
+
+    assert_eq!(runtime.owner_id.as_deref(), Some("owner-a"));
+    assert!(runtime.require_owner_match);
+    assert_eq!(runtime.session_key.as_deref(), Some("child-session"));
+
+    let recalled = recall_context_pages("child isolation beacon", &paging_test_config(true), Some(&runtime))
+        .await
+        .expect("the isolated child's own page should be recalled");
+    assert!(recalled.content.contains("CHILD_OWNER_A_CONTEXT"));
+    assert!(
+        !recalled.content.contains("CHILD_OWNER_B_CONTEXT"),
+        "owner-isolated child recall must not include another owner's page: {}",
         recalled.content
     );
 }
