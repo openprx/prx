@@ -335,14 +335,22 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             // run. Structurally or exactly targeted tool turns retain the
             // existing retrieve-first evidence path. Exact delegation instead
             // serves the model with only the sealed delegator publication.
-            let decisive = if plain_conversation_turn(state) || model_managed_delegation_turn(state) {
+            let plain = plain_conversation_turn(state) || model_managed_delegation_turn(state);
+            let decisive = if plain {
                 1.0
             } else if state.text.has_text && !state.undecided() {
                 0.5
             } else {
                 0.0
             };
-            sigmoid(state.fresh_artifacts as f64 + state.successful_lookups as f64 + decisive - 1.0)
+            let evidence = sigmoid(state.fresh_artifacts as f64 + state.successful_lookups as f64 + decisive - 1.0);
+            if plain {
+                // Explicit floor: never below the plain-turn value, whatever the
+                // logistic rounds to.
+                evidence.max(weights::PLAIN_TURN_EVIDENCE)
+            } else {
+                evidence
+            }
         }
         Meaning::Global(GlobalQuestion::NeedsFreshState) => {
             sigmoid(1.5_f64.mul_add(state.stale_artifacts as f64, -(state.fresh_artifacts as f64)) - 0.5)

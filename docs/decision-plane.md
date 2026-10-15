@@ -441,6 +441,17 @@ weights chosen for other scoring. A calibration applied with
 measured on in `calibration_profile`; validation refuses any configuration
 whose backend kind, endpoint or model no longer matches it.
 
+### Selection thresholds
+
+These values are fixed constants, not configuration:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it is sufficient to answer; below it the selector retrieves, discovers or abstains. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
+| Freshness threshold | 0.5, exclusive | `needs_fresh_state` above it marks observed artifacts stale and prefers a retrieve |
+| Deterministic propensity | 1.0 | recorded for every non-exploratory selection; only read-only exploration replaces it |
+| Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
+
 ## Terminal authority and logical task completion
 
 Enabled and disabled model turns finalize through `TurnTerminalCommit`, whose

@@ -48,6 +48,10 @@ pub(crate) enum TurnExecutionDirective {
     },
 }
 
+/// The longest an approval request may stay open: an approval scope expiring
+/// later than this after issue is refused as mismatched.
+const MAX_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 /// Render only terminal dispositions that need no provider or capability call.
 /// Reason codes are internal diagnostics and never enter the reply text.
 pub(crate) fn render_terminal_directive(
@@ -238,7 +242,7 @@ pub(crate) fn directive_from_selection(
                 return Err(DirectiveError::ApprovalScopeMismatch);
             }
             let now = Utc::now();
-            if context.approval_expires_at <= now || context.approval_expires_at > now + chrono::Duration::minutes(5) {
+            if context.approval_expires_at <= now || context.approval_expires_at > now + MAX_APPROVAL_LIFETIME {
                 return Err(DirectiveError::ApprovalScopeMismatch);
             }
             Ok(TurnExecutionDirective::RequestApproval {
