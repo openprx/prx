@@ -212,7 +212,9 @@ struct ChannelRuntimeContext {
     #[cfg(test)]
     config_generation: Arc<crate::config::ConfigGeneration>,
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    #[cfg(test)]
     provider: Arc<dyn Provider>,
+    #[cfg(test)]
     default_provider: Arc<String>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
@@ -1799,14 +1801,15 @@ async fn get_or_create_provider_for_generation(
     generation: &Arc<crate::config::ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     let cache_key = (generation.id.0, provider_name.to_string(), model_name.to_string());
-    if let Some(existing) = ctx.provider_cache.lock().get(&cache_key).cloned() {
-        return Ok(existing);
-    }
-    if provider_name == ctx.default_provider.as_str()
-        && model_name == resolved_default_model(&generation.effective)
-        && !model_name.trim().starts_with("hint:")
+    let active_generation = ctx.config.pin().id.0;
     {
-        return Ok(Arc::clone(&ctx.provider));
+        let mut cache = ctx.provider_cache.lock();
+        cache.retain(|(generation, _, _), _| *generation == active_generation);
+        if generation.id.0 == active_generation
+            && let Some(existing) = cache.get(&cache_key).cloned()
+        {
+            return Ok(existing);
+        }
     }
     let config = &generation.effective;
     let catalog = providers::selection::catalog_for(config);
@@ -1836,7 +1839,12 @@ async fn get_or_create_provider_for_generation(
         );
     }
 
-    ctx.provider_cache.lock().insert(cache_key, Arc::clone(&provider));
+    let active_generation = ctx.config.pin().id.0;
+    let mut cache = ctx.provider_cache.lock();
+    cache.retain(|(generation, _, _), _| *generation == active_generation);
+    if generation.id.0 == active_generation {
+        cache.insert(cache_key, Arc::clone(&provider));
+    }
     Ok(provider)
 }
 
@@ -5973,7 +5981,9 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         config_generation,
         channels_by_name,
+        #[cfg(test)]
         provider: Arc::clone(&provider),
+        #[cfg(test)]
         default_provider: Arc::new(provider_name),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
@@ -6023,6 +6033,8 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         test_inbound_authorizer: None,
     });
+    #[cfg(not(test))]
+    drop(provider);
 
     let dispatch_result = run_message_dispatch_loop_with_cleanup(rx, runtime_ctx, shutdown.clone()).await;
     if dispatch_result.is_err() {
@@ -6067,6 +6079,36 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::TempDir;
+
+    struct ProviderReloadPermit;
+
+    struct PreparedProviderReloadPermit;
+
+    impl crate::config::ConfigGenerationParticipant for ProviderReloadPermit {
+        fn name(&self) -> &'static str {
+            "channel-provider-reload-proof"
+        }
+
+        fn supports_rebuild_field(&self, field: &str) -> bool {
+            matches!(field, "api_key" | "api_url")
+        }
+
+        fn prepare(
+            &self,
+            _generation: Arc<crate::config::ConfigGeneration>,
+            _changed_fields: &[String],
+        ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+            Ok(Box::new(PreparedProviderReloadPermit))
+        }
+    }
+
+    impl crate::config::PreparedConfigGeneration for PreparedProviderReloadPermit {
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
 
     #[test]
     fn channel_configuration_statuses_include_wacli() {
@@ -10051,6 +10093,99 @@ BTC is currently around $65,000 based on latest tool output."#
             "a provider chain resolved for model-a was reused for model-b"
         );
         assert_eq!(ctx.provider_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generation_provider_cache_rebuilds_the_same_default_after_reload() {
+        const OLD_KEY: &str = "prx-channel-cache-key-old";
+        const NEW_KEY: &str = "prx-channel-cache-key-new";
+
+        let old_endpoint = providers::credential_probe::CredentialProbe::start().await;
+        let new_endpoint = providers::credential_probe::CredentialProbe::start().await;
+        let temp = TempDir::new().expect("test: temp state dir");
+        let mut initial = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        initial.default_provider = Some("openai".to_string());
+        initial.default_model = Some("gpt-4o".to_string());
+        initial.api_key = Some(OLD_KEY.to_string());
+        initial.api_url = Some(old_endpoint.base_url());
+        let manager = crate::config::new_shared(initial);
+        let old_generation = manager.pin();
+
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = Arc::clone(&old_generation);
+        ctx.default_provider = Arc::new("openai".to_string());
+        ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        let stale: Arc<dyn Provider> = Arc::new(ModelCaptureProvider::default());
+        let stale_weak = Arc::downgrade(&stale);
+        ctx.provider_cache
+            .lock()
+            .insert((old_generation.id.0, "openai".to_string(), "gpt-4o".to_string()), stale);
+
+        let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = Arc::new(ProviderReloadPermit);
+        manager.register_participant(&participant);
+        let mut reloaded = old_generation.effective.as_ref().clone();
+        reloaded.api_key = Some(NEW_KEY.to_string());
+        reloaded.api_url = Some(new_endpoint.base_url());
+        let report = manager
+            .apply_runtime_config(reloaded, crate::config::ConfigReloadTrigger::Test)
+            .expect("same-route credential reload");
+        assert_eq!(report.rebuilt, vec!["api_key", "api_url"]);
+        let new_generation = manager.pin();
+        assert_ne!(new_generation.id, old_generation.id);
+        ctx.config_generation = Arc::clone(&new_generation);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let command = traits::ChannelMessage {
+            sender: "prx_user".to_string(),
+            reply_target: "prx_channel".to_string(),
+            channel: "telegram".to_string(),
+            content: "/models openai".to_string(),
+            ..traits::ChannelMessage::default()
+        };
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &new_generation, &command, Some(&channel)).await,
+            "the production /models command did not claim its input"
+        );
+        assert!(
+            channel_impl
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(|message| message.contains("Provider switched to `openai`")),
+            "the production /models command did not report readiness"
+        );
+
+        let selected = get_or_create_provider_for_generation(&ctx, "openai", "gpt-4o", &new_generation)
+            .await
+            .expect("cached reloaded default provider");
+        let response = selected
+            .simple_chat("verify reloaded channel provider", "gpt-4o", 0.0)
+            .await
+            .expect("reloaded provider response");
+
+        assert_eq!(response, providers::credential_probe::PROBE_REPLY);
+        assert!(old_endpoint.requests().is_empty(), "the startup endpoint was reused");
+        let requests = new_endpoint.requests();
+        assert!(!requests.is_empty(), "the reloaded endpoint was not called");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.carries(NEW_KEY) && !request.carries(OLD_KEY)),
+            "the reloaded provider did not keep the new credential owner: {requests:?}"
+        );
+        assert!(
+            stale_weak.upgrade().is_none(),
+            "the stale credential chain remained cached"
+        );
+        let cached = ctx.provider_cache.lock();
+        assert_eq!(cached.len(), 1);
+        assert!(cached.contains_key(&(new_generation.id.0, "openai".to_string(), "gpt-4o".to_string())));
     }
 
     /// Finding 64: the per-sender `/models` provider getter resolves the
