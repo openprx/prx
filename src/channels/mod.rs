@@ -185,9 +185,6 @@ struct ChannelRuntimeDefaults {
     default_provider: String,
     model: String,
     temperature: f64,
-    api_key: Option<String>,
-    api_url: Option<String>,
-    reliability: crate::config::ReliabilityConfig,
 }
 
 #[derive(Clone)]
@@ -1059,9 +1056,6 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
         temperature: config.default_temperature,
-        api_key: config.api_key.clone(),
-        api_url: config.api_url.clone(),
-        reliability: config.reliability.clone(),
     }
 }
 
@@ -1080,9 +1074,6 @@ fn runtime_defaults_for_generation(
             default_provider: ctx.default_provider.as_str().to_string(),
             model: ctx.model.as_str().to_string(),
             temperature: ctx.temperature,
-            api_key: ctx.api_key.clone(),
-            api_url: ctx.api_url.clone(),
-            reliability: ctx.reliability.as_ref().clone(),
         };
     }
     #[cfg(not(test))]
@@ -1965,40 +1956,34 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
 async fn get_or_create_provider_for_generation(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    model_name: &str,
     generation: &Arc<crate::config::ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
         return Ok(existing);
     }
     if provider_name == ctx.default_provider.as_str()
-        && !resolved_default_model(&generation.effective)
-            .trim()
-            .starts_with("hint:")
+        && model_name == resolved_default_model(&generation.effective)
+        && !model_name.trim().starts_with("hint:")
     {
         return Ok(Arc::clone(&ctx.provider));
     }
-    let defaults = runtime_defaults_for_generation(ctx, generation);
-    // The root credential and base URL belong to the configured default
-    // provider. A `/models <other>` switch must not hand them to anyone else,
-    // so they are released only on a provider-identity match — which also
-    // covers the alias spellings a plain string comparison missed. A selection
-    // left without a credential is refused by the availability gate, before
-    // any transport exists, and that error is propagated unchanged.
-    let connection = providers::configured_connection_for(
+    let config = &generation.effective;
+    let catalog = providers::selection::catalog_for(config);
+    let resolved = providers::selection::check_with(
+        config,
+        &catalog,
         provider_name,
-        &defaults.default_provider,
-        defaults.api_key.as_deref(),
-        defaults.api_url.as_deref(),
-    );
-
-    // The rotation keys are extra credentials for that same root key, so they
-    // follow the connection and are cleared when it is withheld.
-    let reliability = providers::scoped_reliability(&defaults.reliability, &connection);
-    let provider = providers::create_resilient_provider_with_options(
-        provider_name,
-        connection.api_key,
-        connection.api_url,
-        &reliability,
+        model_name,
+        providers::selection::credential_for(config, provider_name),
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    let provider = providers::create_provider_for(
+        &resolved,
+        &catalog,
+        &config.reliability,
+        &config.cost,
         &ctx.provider_runtime_options,
     )?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
@@ -2045,6 +2030,29 @@ fn build_channel_hint_provider(
         model: resolved.model().to_string(),
     };
     Ok(Some((route, Arc::from(provider))))
+}
+
+/// Build the default channel provider from the exact resolver release used by
+/// channel turns. The returned names are the wire destination after a route
+/// hint has been resolved.
+pub(crate) fn build_channel_startup_provider(
+    config: &Config,
+    options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<(Arc<dyn Provider>, String, String)> {
+    let catalog = providers::selection::catalog_for(config);
+    let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_provider_for(
+        &resolved,
+        &catalog,
+        &config.reliability,
+        &config.cost,
+        options,
+    )?);
+    Ok((
+        provider,
+        resolved.provider_label().to_string(),
+        resolved.model().to_string(),
+    ))
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -2147,7 +2155,7 @@ async fn handle_runtime_command_if_needed(
                         )
                         .map(|_| ())
                     } else {
-                        get_or_create_provider_for_generation(ctx, &provider_name, config_generation)
+                        get_or_create_provider_for_generation(ctx, &provider_name, &current.model, config_generation)
                             .await
                             .map(|_| ())
                     };
@@ -4497,7 +4505,9 @@ async fn resolve_pre_gate_classifier(
     };
 
     if !cfg.classifier_provider.trim().is_empty() && cfg.classifier_provider.trim() != route_provider {
-        match get_or_create_provider_for_generation(ctx, cfg.classifier_provider.trim(), config_generation).await {
+        match get_or_create_provider_for_generation(ctx, cfg.classifier_provider.trim(), &model, config_generation)
+            .await
+        {
             Ok(provider) => return Ok((provider, model)),
             Err(error) => {
                 tracing::warn!(
@@ -4523,7 +4533,7 @@ async fn resolve_pre_gate_classifier(
         };
         return Ok((provider, model));
     }
-    let provider = get_or_create_provider_for_generation(ctx, route_provider, config_generation).await?;
+    let provider = get_or_create_provider_for_generation(ctx, route_provider, &model, config_generation).await?;
     Ok((provider, model))
 }
 
@@ -4892,9 +4902,7 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         recording_fixture::attach_ledger_only(owned);
     }
     let shared = crate::config::new_shared(config);
-    if !split_generation {
-        owned.config_generation = shared.pin();
-    }
+    owned.config_generation = shared.pin();
     owned.config = shared;
     ctx
 }
@@ -5533,30 +5541,8 @@ pub async fn start_channels_with_config(
     };
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     check_channel_startup_default(&config)?;
-    let selected_hint = build_channel_hint_provider(
-        &config,
-        &provider_name,
-        &resolved_default_model(&config),
-        &provider_runtime_options,
-    )?;
-    let default_is_hint = selected_hint.is_some();
-    let (provider, turn_provider_name, model): (Arc<dyn Provider>, String, String) =
-        if let Some((route, provider)) = selected_hint {
-            (provider, route.provider, route.model)
-        } else {
-            let provider = providers::create_resilient_provider_with_options(
-                &provider_name,
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-                &config.reliability,
-                &provider_runtime_options,
-            )?;
-            (
-                Arc::from(provider),
-                provider_name.clone(),
-                resolved_default_model(&config),
-            )
-        };
+    let default_is_hint = resolved_default_model(&config).trim().starts_with("hint:");
+    let (provider, turn_provider_name, model) = build_channel_startup_provider(&config, &provider_runtime_options)?;
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
     // so the first real message doesn't hit a cold-start timeout.
@@ -7101,7 +7087,13 @@ mod tests {
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
         let generation = Arc::clone(&ctx.config_generation);
 
-        let outcome = get_or_create_provider_for_generation(&ctx, &endpoint.provider_name(), &generation).await;
+        let outcome = get_or_create_provider_for_generation(
+            &ctx,
+            &endpoint.provider_name(),
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
 
         assert!(
             outcome.is_ok(),
@@ -7144,7 +7136,7 @@ mod tests {
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
         let generation = Arc::clone(&ctx.config_generation);
 
-        let provider = get_or_create_provider_for_generation(&ctx, &probe.custom_provider(), &generation)
+        let provider = get_or_create_provider_for_generation(&ctx, &probe.custom_provider(), PROBE_MODEL, &generation)
             .await
             .expect("test: a keyless BYO endpoint is usable on its own");
         let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -7177,14 +7169,28 @@ mod tests {
         let trailing_slash_spelling = format!("{configured}/");
         let selected = format!("CUSTOM:{}", configured.trim_start_matches("custom:"));
         let mut ctx = ctx_with_histories(HashMap::new());
-        ctx.default_provider = Arc::new(configured);
+        ctx.default_provider = Arc::new(configured.clone());
         ctx.api_key = Some(BYO_CONNECTION_SENTINEL.to_string());
         ctx.api_url = None;
         ctx.reliability = Arc::new(channel_reliability_without_fallbacks());
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        let mut effective = Config::default();
+        effective.workspace_dir = temp.path().to_path_buf();
+        effective.default_provider = Some(configured);
+        effective.api_key = Some(BYO_CONNECTION_SENTINEL.to_string());
+        effective.reliability = channel_reliability_without_fallbacks();
+        let manager = crate::config::new_shared(effective);
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = manager.pin();
         let generation = Arc::clone(&ctx.config_generation);
 
-        let outcome = get_or_create_provider_for_generation(&ctx, &selected, &generation).await;
+        let outcome = get_or_create_provider_for_generation(
+            &ctx,
+            &selected,
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
 
         assert!(
             outcome.is_ok(),
@@ -7201,7 +7207,13 @@ mod tests {
         // second is proven only by a request of its own that carries it
         // (SP-INT2 a29): `carried` alone stays true whatever this call sends.
         let requests_before_trailing_slash = endpoint.requests().len();
-        let trailing_slash = get_or_create_provider_for_generation(&ctx, &trailing_slash_spelling, &generation).await;
+        let trailing_slash = get_or_create_provider_for_generation(
+            &ctx,
+            &trailing_slash_spelling,
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
         assert!(
             trailing_slash.is_ok(),
             "one endpoint spelled with a trailing slash is the same endpoint: {:?}",
@@ -9120,7 +9132,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            reliability: Arc::new(crate::config::ReliabilityConfig {
+                provider_retries: 0,
+                ..crate::config::ReliabilityConfig::default()
+            }),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
@@ -9174,7 +9189,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tool");
-        let lines = appended.lines().filter(|line| !line.is_empty()).count();
+        let lines = appended.lines().filter(|line| *line == "appended").count();
         assert_eq!(
             lines, 1,
             "the replay must not run the tool a second time; audit file: {appended:?}"
@@ -10536,9 +10551,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .insert("test-provider".to_string(), Arc::clone(&reloaded_provider));
 
-        let selected = get_or_create_provider_for_generation(&ctx, "test-provider", &ctx.config_generation)
-            .await
-            .expect("cached generation provider");
+        let selected =
+            get_or_create_provider_for_generation(&ctx, "test-provider", "default-model", &ctx.config_generation)
+                .await
+                .expect("cached generation provider");
         assert!(Arc::ptr_eq(&selected, &reloaded_provider));
         let response = selected
             .chat_with_history(
@@ -12705,10 +12721,16 @@ BTC is currently around $65,000 based on latest tool output."#
             calls: parking_lot::Mutex::new(Vec::new()),
         });
 
+        let mut effective = Config::default();
+        effective.default_provider = Some("test-provider".to_string());
+        effective.default_model = Some("test-model".to_string());
+        let config = crate::config::new_shared(effective);
+        let config_generation = config.pin();
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),

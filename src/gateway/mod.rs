@@ -1521,18 +1521,13 @@ fn build_gateway_turn_runtime(
     })
 }
 
-/// Build the pinned generation's default chat connection. An explicit hint
-/// names one route, so its provider, model and credential must be resolved as
-/// one selection; the provider-wide routed factory can reuse another hint's
-/// credential when two hints name the same provider.
-fn build_gateway_turn_provider(
+/// Build the pinned generation's default chat connection. The selected
+/// provider, model and credential are resolved as one value before the exact
+/// connection is constructed, including when the default names a route hint.
+pub(crate) fn build_gateway_provider_selection(
     config: &Config,
     options: &providers::ProviderRuntimeOptions,
-) -> anyhow::Result<(
-    Arc<dyn Provider>,
-    String,
-    Option<Arc<decision_source::GatewayProviderBinding>>,
-)> {
+) -> anyhow::Result<(Arc<dyn Provider>, providers::catalog::ResolvedModel)> {
     let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
     let catalog = providers::selection::catalog_for(config);
     let provider: Arc<dyn Provider> = Arc::from(providers::create_provider_for(
@@ -1542,6 +1537,18 @@ fn build_gateway_turn_provider(
         &config.cost,
         options,
     )?);
+    Ok((provider, resolved))
+}
+
+fn build_gateway_turn_provider(
+    config: &Config,
+    options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<(
+    Arc<dyn Provider>,
+    String,
+    Option<Arc<decision_source::GatewayProviderBinding>>,
+)> {
+    let (provider, resolved) = build_gateway_provider_selection(config, options)?;
     let model = resolved.model().to_owned();
     let binding = Arc::new(decision_source::GatewayProviderBinding::new(
         Arc::clone(&provider),

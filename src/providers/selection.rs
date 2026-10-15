@@ -518,6 +518,23 @@ pub fn check_default(config: &Config, policy: UnknownPolicy) -> Result<ResolvedM
 ///
 /// The first refused route, named by its hint.
 pub fn check_routes(config: &Config, catalog: &CatalogView, policy: UnknownPolicy) -> anyhow::Result<()> {
+    resolve_routes(config, catalog, policy).map(|_| ())
+}
+
+/// Resolve every configured chat route with the credential owned by that
+/// route's destination. The returned selections are ready for the typed
+/// provider factory; callers must not reconstruct their connections from the
+/// raw route fields after this point.
+///
+/// # Errors
+///
+/// The first refused route, named by its hint.
+pub fn resolve_routes(
+    config: &Config,
+    catalog: &CatalogView,
+    policy: UnknownPolicy,
+) -> anyhow::Result<Vec<(String, ResolvedModel)>> {
+    let mut resolved = Vec::with_capacity(config.model_routes.len());
     for route in &config.model_routes {
         if route.model.trim().starts_with("hint:") {
             return Err(anyhow::anyhow!(
@@ -539,7 +556,7 @@ pub fn check_routes(config: &Config, catalog: &CatalogView, policy: UnknownPolic
         } else {
             credential_for(config, &route.provider)
         };
-        check_with(
+        let selection = check_with(
             config,
             catalog,
             &route.provider,
@@ -549,8 +566,9 @@ pub fn check_routes(config: &Config, catalog: &CatalogView, policy: UnknownPolic
             policy,
         )
         .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))?;
+        resolved.push((route.hint.clone(), selection));
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// How the configured default resolves, in one line for `prx doctor` and

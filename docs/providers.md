@@ -171,10 +171,12 @@ model fallback 'model-b' of 'model-a' on provider 'custom:http://127.0.0.1:8080/
 
 Fix: declare the fallback's dialect (`[[providers.models]]` `model =
 "model-b"` `tool_schema_dialect = "no_root_combinators"`), or move it off the
-primary's `model_fallbacks`. In this release the surfaces above resolve and
-then build with their existing credential-scoped chains, so this refusal is
-reached only through `create_provider_for`; it becomes a start-up refusal for
-each surface that switches its construction to it.
+primary's `model_fallbacks`. Chat, CLI/cron/xin, channels, gateway, workers,
+spawned children and the evolution judge all construct through the resolved
+model factory, so the same configuration is refused on every entrypoint before
+transport. Routed providers construct the default and every `hint:` destination
+from separate resolved selections; two hints that name the same provider still
+keep their own credential, model facts and fallback admission.
 
 At failover time, every fallback pair is checked against the primary turn's
 admission facts before a request is sent. A fallback needs a valid cost entry

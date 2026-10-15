@@ -1624,16 +1624,12 @@ fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::e
         crate::providers::selection::check_default(config, crate::providers::catalog::UnknownPolicy::Invocation)
             .map_err(anyhow::Error::from)
             .and_then(|resolved| {
-                let credential = resolved.credential();
-                let reliability = crate::config::ReliabilityConfig {
-                    api_keys: credential.rotation_keys().to_vec(),
-                    ..config.reliability.clone()
-                };
-                crate::providers::create_resilient_provider_with_options(
-                    resolved.provider_label(),
-                    credential.api_key(),
-                    credential.api_url(),
-                    &reliability,
+                let catalog = crate::providers::selection::catalog_for(config);
+                crate::providers::create_provider_for(
+                    &resolved,
+                    &catalog,
+                    &config.reliability,
+                    &config.cost,
                     &provider_runtime_options,
                 )
                 .map(|provider| (provider, resolved.model().to_string()))

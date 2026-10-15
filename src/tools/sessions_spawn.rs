@@ -1796,24 +1796,18 @@ impl SessionsSpawnTool {
     }
 
     /// Build the provider for a sub-agent that overrides the gateway provider.
-    ///
-    /// Goes through `create_resilient_provider_with_options` so the sub-agent
-    /// gets the retry loop, the exponential backoff, `Retry-After` handling, the
-    /// shared rate-limit gate and the aggregated `All providers/models failed`
-    /// diagnostics. The previous `create_provider_with_options` call returned a
-    /// **bare** provider: a single 429 killed the sub-agent in under a second,
-    /// with zero retries and an error message that carried no attempt trail.
+    /// The exact model and owner-bound credential have already been released by
+    /// the resolver; the typed factory adds the retry and fallback policy
+    /// without reopening any credential source.
     fn build_override_provider(
-        provider_name: &str,
-        api_key: Option<&str>,
+        resolved: &providers::catalog::ResolvedModel,
+        catalog: &providers::catalog::CatalogView,
         reliability: &crate::config::ReliabilityConfig,
+        cost: &crate::config::schema::CostConfig,
         options: &providers::ProviderRuntimeOptions,
     ) -> anyhow::Result<Arc<dyn Provider>> {
         let reliability = Self::override_reliability(reliability);
-        // `api_url` stays `None`: the gateway's base URL belongs to the gateway's
-        // provider, and pointing an overridden vendor at it would be wrong.
-        let provider =
-            providers::create_resilient_provider_with_options(provider_name, api_key, None, &reliability, options)?;
+        let provider = providers::create_provider_for(resolved, catalog, &reliability, cost, options)?;
         Ok(Arc::from(provider))
     }
 
@@ -4582,45 +4576,38 @@ impl SessionsSpawnTool {
         }
         let child_credential = operator_source.as_ref().map_or_else(
             || {
-                (child_grant.is_some() || ordinary_publication.is_some() || resolved_model.trim().starts_with("hint:"))
-                    .then_some(child_model_config)
-                    .map(|config| {
-                        let credential = if inherits_default_route {
-                            (providers::ProviderId::of(inherited_model.0)
-                                == providers::ProviderId::of(&resolved_provider_name))
-                            .then(|| inherited_model.2.clone())
-                        } else {
-                            None
-                        };
-                        credential.unwrap_or_else(|| {
-                            selected_agent
-                                .as_ref()
-                                .filter(|(_, agent)| {
-                                    providers::ProviderId::of(&agent.provider)
-                                        == providers::ProviderId::of(&resolved_provider_name)
-                                })
-                                .map_or_else(
-                                    || providers::selection::credential_for(config, &resolved_provider_name),
-                                    |(name, agent)| {
-                                        agent.credential_ref.as_deref().map_or_else(
-                                            || {
-                                                if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-                                                    providers::credentials::CredentialRef::LegacyInline(
-                                                        providers::credentials::LegacySlot::Agent(name.clone()),
-                                                    )
-                                                } else {
-                                                    providers::selection::credential_for(
-                                                        config,
-                                                        &resolved_provider_name,
-                                                    )
-                                                }
-                                            },
-                                            |id| providers::credentials::CredentialRef::Profile { id: id.to_string() },
-                                        )
-                                    },
-                                )
+                let config = child_model_config;
+                let credential = if inherits_default_route {
+                    (providers::ProviderId::of(inherited_model.0) == providers::ProviderId::of(&resolved_provider_name))
+                        .then(|| inherited_model.2.clone())
+                } else {
+                    None
+                };
+                Some(credential.unwrap_or_else(|| {
+                    selected_agent
+                        .as_ref()
+                        .filter(|(_, agent)| {
+                            providers::ProviderId::of(&agent.provider)
+                                == providers::ProviderId::of(&resolved_provider_name)
                         })
-                    })
+                        .map_or_else(
+                            || providers::selection::credential_for(config, &resolved_provider_name),
+                            |(name, agent)| {
+                                agent.credential_ref.as_deref().map_or_else(
+                                    || {
+                                        if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                                            providers::credentials::CredentialRef::LegacyInline(
+                                                providers::credentials::LegacySlot::Agent(name.clone()),
+                                            )
+                                        } else {
+                                            providers::selection::credential_for(config, &resolved_provider_name)
+                                        }
+                                    },
+                                    |id| providers::credentials::CredentialRef::Profile { id: id.to_string() },
+                                )
+                            },
+                        )
+                }))
             },
             |source| Some(source.resolved().credential().reference().clone()),
         );
@@ -5461,7 +5448,7 @@ impl SessionsSpawnTool {
         let mut provider_name = resolved_provider_name;
         let mut model = resolved_model;
         let child_provider_binding = if let Some(grant) = child_grant.as_ref() {
-            let credential = child_credential.context("child credential selection missing")?;
+            let credential = child_credential.clone().context("child credential selection missing")?;
             let (requested_child_provider, requested_child_model) =
                 child_requested_model.as_ref().context("child model request missing")?;
             let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build(
@@ -5519,13 +5506,13 @@ impl SessionsSpawnTool {
         } else {
             match task_provider_plan {
                 ChildProvider::Root => {
-                    let config = child_model_config;
+                    let credential = child_credential.clone().context("child credential selection missing")?;
                     let resolved = match providers::selection::check_with(
-                        config,
+                        child_model_config,
                         child_model_catalog,
                         &provider_name,
                         &model,
-                        providers::selection::credential_for(config, &provider_name),
+                        credential,
                         &providers::catalog::Requirement::chat(),
                         providers::catalog::UnknownPolicy::Invocation,
                     ) {
@@ -5541,12 +5528,36 @@ impl SessionsSpawnTool {
                     )
                     .map(Arc::from)
                 }
-                ChildProvider::Build { api_key } => Self::build_override_provider(
-                    &provider_name,
-                    api_key.as_deref(),
-                    provider_reliability,
-                    provider_options,
-                ),
+                ChildProvider::Build { api_key } => {
+                    let credential = child_credential.clone().context("child credential selection missing")?;
+                    let resolved = match providers::selection::check_with(
+                        child_model_config,
+                        child_model_catalog,
+                        &provider_name,
+                        &model,
+                        credential,
+                        &providers::catalog::Requirement::chat(),
+                        providers::catalog::UnknownPolicy::Invocation,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(refusal) => {
+                            return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}")));
+                        }
+                    };
+                    if let Some(planned_key) = api_key.as_deref() {
+                        anyhow::ensure!(
+                            resolved.credential().api_key() == Some(planned_key),
+                            "resolved child credential differs from the provider plan"
+                        );
+                    }
+                    Self::build_override_provider(
+                        &resolved,
+                        child_model_catalog,
+                        provider_reliability,
+                        &child_model_config.cost,
+                        provider_options,
+                    )
+                }
                 ChildProvider::Gateway => Ok(self.provider.clone()),
             }
         };
@@ -9637,14 +9648,21 @@ mod tests {
         let provider = {
             let _serialized = mock_error_env_lock().lock();
             let _env = MockErrorEnvGuard::set("Mock API error (429 Too Many Requests): rate_limit_error");
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some("mock".to_string());
+            config.default_model = Some("mock-model".to_string());
+            let catalog = providers::selection::catalog_for(&config);
+            let resolved = providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
+                .expect("test: mock selection resolves");
             SessionsSpawnTool::build_override_provider(
-                "mock",
-                None,
+                &resolved,
+                &catalog,
                 &crate::config::ReliabilityConfig {
                     provider_retries: 2,
                     provider_backoff_ms: 200,
                     ..crate::config::ReliabilityConfig::default()
                 },
+                &config.cost,
                 &providers::ProviderRuntimeOptions::default(),
             )
             .expect("test: mock provider must build")

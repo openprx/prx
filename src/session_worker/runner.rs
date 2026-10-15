@@ -303,20 +303,75 @@ fn worker_provider(
     if manifest.model.trim().starts_with("hint:") {
         anyhow::bail!("session-worker received an unresolved model route");
     }
-    crate::providers::selection::check_model(
-        &crate::providers::selection::catalog_for(config),
+    let credential = if manifest.route_hint.is_some() {
+        manifest
+            .route_credential
+            .clone()
+            .context("session-worker manifest route credential provenance is missing")?
+    } else if let Some((name, agent)) = manifest
+        .agent_id
+        .as_deref()
+        .and_then(|name| config.agents.get(name).map(|agent| (name, agent)))
+        .filter(|(_, agent)| {
+            crate::providers::ProviderId::of(&agent.provider)
+                == crate::providers::ProviderId::of(&manifest.provider_name)
+        })
+    {
+        match agent
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+            None if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) => {
+                crate::providers::credentials::CredentialRef::LegacyInline(
+                    crate::providers::credentials::LegacySlot::Agent(name.to_string()),
+                )
+            }
+            None => crate::providers::selection::credential_for(config, &manifest.provider_name),
+        }
+    } else {
+        crate::providers::selection::credential_for(config, &manifest.provider_name)
+    };
+    build_worker_provider_selection(
+        config,
         &manifest.provider_name,
         &manifest.model,
-        &crate::providers::catalog::Requirement::chat(),
-        crate::providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    crate::providers::create_resilient_provider_with_options(
-        &manifest.provider_name,
-        credentials.provider.api_key,
-        credentials.provider.api_url,
+        credential,
+        &credentials.provider,
         &credentials.reliability,
         options,
     )
+}
+
+/// Resolve and construct the exact provider/model connection a worker was
+/// sealed to. This is the worker's sole provider-construction seam.
+pub(crate) fn build_worker_provider_selection(
+    config: &Config,
+    provider_name: &str,
+    model: &str,
+    credential: crate::providers::credentials::CredentialRef,
+    sealed_connection: &crate::providers::ProviderConnection<'_>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &crate::providers::ProviderRuntimeOptions,
+) -> Result<Box<dyn Provider>> {
+    let catalog = crate::providers::selection::catalog_for(config);
+    let resolved = crate::providers::selection::check_with(
+        config,
+        &catalog,
+        provider_name,
+        model,
+        credential,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    anyhow::ensure!(
+        resolved.credential().api_key() == sealed_connection.api_key
+            && resolved.credential().api_url() == sealed_connection.api_url,
+        "session-worker resolved credential differs from its sealed connection"
+    );
+    crate::providers::create_provider_for(&resolved, &catalog, reliability, &config.cost, options)
 }
 
 fn write_worker_result(result: &impl serde::Serialize) -> Result<()> {
@@ -3747,6 +3802,7 @@ mod tests {
         let config = root_config(temp.path());
         let mut manifest = base_manifest(temp.path(), "capability");
         manifest.provider_name = probe.custom_provider();
+        manifest.model = PROBE_MODEL.to_string();
         manifest.api_key = None;
         let options = crate::providers::provider_runtime_options_from_config(&config);
 

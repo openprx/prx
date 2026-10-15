@@ -3900,7 +3900,7 @@ fn chat_model_switch(config: &Config, provider_name: &str, model_name: &str) -> 
 /// it, `providers::configured_connection_for`), and the rotation keys in
 /// `reliability.api_keys` follow them, because they are extra credentials for
 /// that same root key.
-fn chat_provider_chain<'a>(
+pub(crate) fn chat_provider_chain<'a>(
     config: &'a Config,
     provider_name: &str,
     configured_provider_name: &str,
@@ -3908,7 +3908,7 @@ fn chat_provider_chain<'a>(
     options: &providers::ProviderRuntimeOptions,
 ) -> Result<(providers::ProviderConnection<'a>, Box<dyn Provider>)> {
     let catalog = providers::selection::catalog_for(config);
-    providers::selection::check_with(
+    let resolved = providers::selection::check_with(
         config,
         &catalog,
         provider_name,
@@ -3917,23 +3917,13 @@ fn chat_provider_chain<'a>(
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )?;
-    providers::selection::check_routes(config, &catalog, providers::catalog::UnknownPolicy::Invocation)?;
     let connection = providers::configured_connection_for(
         provider_name,
         configured_provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
     );
-    let reliability = providers::scoped_reliability(&config.reliability, &connection);
-    let provider = providers::create_routed_provider_with_options(
-        provider_name,
-        connection.api_key,
-        connection.api_url,
-        &reliability,
-        &config.model_routes_with_references(),
-        model_name,
-        options,
-    )?;
+    let provider = providers::create_routed_provider_for(&resolved, &catalog, config, options)?;
     Ok((connection, provider))
 }
 
@@ -5930,14 +5920,39 @@ pub async fn run(
                 emit_chat_output("Usage: /model <name>");
                 continue;
             }
-            let next_binding = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
-                decision_source::ChatProviderBinding::capture(
-                    &ctx.config_generation, &provider, provider_name, new_model,
+            let rebuilt = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
+                chat_provider_chain(
+                    &config,
+                    provider_name,
+                    configured_provider_name,
+                    new_model,
+                    &provider_runtime_options,
                 )
             });
-            match next_binding {
-                Ok(binding) => {
+            match rebuilt {
+                Ok((_connection, built)) => {
+                    let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
+                    let binding = match decision_source::ChatProviderBinding::capture(
+                        &ctx.config_generation,
+                        &new_provider_arc,
+                        provider_name,
+                        new_model,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            emit_chat_output(&format!(
+                                "Cannot bind model selection: {}",
+                                providers::sanitize_api_error(&error.to_string())
+                            ));
+                            continue;
+                        }
+                    };
                     provider_binding = binding;
+                    provider = Arc::clone(&new_provider_arc);
+                    #[cfg(feature = "terminal-tui")]
+                    if let Some(slot) = provider_slot.as_ref() {
+                        slot.set(Arc::clone(&new_provider_arc));
+                    }
                     current_model_owned = new_model.to_string();
                     #[cfg(feature = "terminal-tui")]
                     if let Some(slot) = model_slot.as_ref() {

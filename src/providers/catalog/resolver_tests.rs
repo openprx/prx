@@ -855,6 +855,17 @@ async fn a_fallback_model_never_inherits_the_primarys_lowered_schema() {
         .reliability
         .model_fallbacks
         .insert("model-a".to_string(), vec!["model-b".to_string()]);
+    for model in ["model-a", "model-b"] {
+        config.cost.prices.insert(
+            format!("{label}/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     let catalog = CatalogView::from_config(&config);
     let resolved = resolve(
         &root(&label, "model-a"),
@@ -1022,11 +1033,28 @@ async fn a_fallback_with_the_same_declared_dialect_is_served_and_a_non_chat_one_
                 tool_schema: Some(crate::config::schema::ToolSchemaDialectSetting::NoRootCombinators),
                 tool_call: None,
             });
+        declare(
+            &mut config,
+            &label,
+            Some(model),
+            "operations = [\"chat\"]\nnative_tools = true\n",
+        );
     }
     config
         .reliability
         .model_fallbacks
         .insert("model-a".to_string(), vec!["model-b".to_string()]);
+    for model in ["model-a", "model-b"] {
+        config.cost.prices.insert(
+            format!("{label}/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     let catalog = CatalogView::from_config(&config);
     let resolved = resolve(
         &root(&label, "model-a"),

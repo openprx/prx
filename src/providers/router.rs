@@ -77,6 +77,31 @@ impl RouterProvider {
         }
     }
 
+    /// Build a router whose default and every route already own their exact
+    /// provider chain. Route destinations deliberately receive distinct
+    /// indices even when their provider labels match: two hints may name the
+    /// same vendor with different credentials, model facts or fallback policy.
+    pub(super) fn from_resolved(
+        default: (String, Box<dyn Provider>),
+        routes: Vec<(String, String, String, Box<dyn Provider>)>,
+        default_model: String,
+    ) -> Self {
+        let mut providers = Vec::with_capacity(routes.len() + 1);
+        providers.push(default);
+        let mut resolved_routes = HashMap::with_capacity(routes.len());
+        for (hint, provider_name, model, provider) in routes {
+            let index = providers.len();
+            providers.push((provider_name, provider));
+            resolved_routes.insert(hint, (index, model));
+        }
+        Self {
+            routes: resolved_routes,
+            providers,
+            default_index: 0,
+            _default_model: default_model,
+        }
+    }
+
     /// Resolve a model parameter to a (provider, actual_model) pair.
     ///
     /// If the model starts with "hint:", look up the hint in the route table.
