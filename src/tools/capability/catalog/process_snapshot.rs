@@ -2,9 +2,11 @@
 use super::{
     ApprovalRequirement, Arc, BTreeSet, CapabilityAvailability, CapabilityCatalog, CapabilityEntry, CapabilityId,
     CapabilityTarget, CatalogGeneration, DecisionKey, ExecutionTarget, Exposure, OpId, SchemaFingerprint,
-    SideEffectClass, Value, insert,
+    SideEffectClass, Value, insert, risk_for_effect,
 };
+use crate::acl::approval_grant::RiskLevel;
 use crate::decision::key::KeyDomain;
+use crate::tools::traits::ToolCategory;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -31,7 +33,9 @@ struct Entry {
     namespace: String,
     summary: String,
     aliases: Vec<String>,
+    categories: Vec<ToolCategory>,
     effect: String,
+    risk: RiskLevel,
     op_ids: Vec<String>,
     // None is no approval; Some(empty) retains required dynamic approval.
     approval_ops: Option<Vec<String>>,
@@ -69,7 +73,9 @@ impl CapabilityCatalog {
                     namespace: entry.namespace.clone(),
                     summary: entry.summary.clone(),
                     aliases: entry.aliases.clone(),
+                    categories: entry.categories.clone(),
                     effect: entry.effect.as_str().to_owned(),
+                    risk: entry.risk,
                     op_ids: entry.op_ids.iter().map(|op| op.as_str().to_owned()).collect(),
                     approval_ops,
                     channel_eligible: entry.channel_eligible,
@@ -145,6 +151,7 @@ impl CapabilityCatalog {
                 .map_or(ApprovalRequirement::None, |ops| ApprovalRequirement::Required {
                     op_ids: ops.iter().map(|op| OpId::new(op)).collect(),
                 });
+            anyhow::ensure!(entry.risk == risk_for_effect(effect), "process catalog risk is invalid");
             if let Some(metadata) = &entry.skill_metadata {
                 anyhow::ensure!(
                     family == CapabilityTarget::Skill
@@ -163,8 +170,10 @@ impl CapabilityCatalog {
                     namespace: entry.namespace,
                     summary: entry.summary,
                     aliases: entry.aliases,
+                    categories: entry.categories,
                     exact_mention_terms: Vec::new(),
                     effect,
+                    risk: entry.risk,
                     op_ids: entry.op_ids.iter().map(|op| OpId::new(op)).collect(),
                     approval,
                     channel_eligible: entry.channel_eligible,

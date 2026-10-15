@@ -16,6 +16,11 @@ use std::sync::Weak;
 #[derive(serde::Serialize)]
 pub(crate) struct CapabilitySearchHit {
     capability: CapabilitySearchReference,
+    categories: Vec<&'static str>,
+    effect: &'static str,
+    risk: &'static str,
+    approval: &'static str,
+    channel_eligible: bool,
     schema: ToolSpec,
 }
 
@@ -222,6 +227,15 @@ impl CapabilitySearchAuthority {
                     fingerprint: hex::encode(entry.fingerprint.0),
                     generation: entry.generation.to_hex(),
                 },
+                categories: entry.categories.iter().map(|category| category.as_str()).collect(),
+                effect: entry.effect.as_str(),
+                risk: match entry.risk {
+                    crate::acl::approval_grant::RiskLevel::Low => "low",
+                    crate::acl::approval_grant::RiskLevel::Medium => "medium",
+                    crate::acl::approval_grant::RiskLevel::High => "high",
+                },
+                approval: entry.approval.code(),
+                channel_eligible: entry.channel_eligible,
                 schema,
             });
         }

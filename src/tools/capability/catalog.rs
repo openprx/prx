@@ -1,6 +1,7 @@
 pub(crate) mod process_snapshot;
 
 use super::fingerprint::tool_spec_fingerprint;
+use crate::acl::approval_grant::RiskLevel;
 use crate::capability::{CapabilityAvailability, CapabilityAvailabilityLevel};
 use crate::causal_tree::branch::{
     ApprovalRequirement, CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, OpId, SchemaFingerprint,
@@ -45,10 +46,12 @@ pub(crate) struct CapabilityEntry {
     pub namespace: String,
     pub summary: String,
     pub aliases: Vec<String>,
+    pub categories: Vec<ToolCategory>,
     /// Lowercased ID, public name and aliases, frozen after all source
     /// metadata is attached and before the entry is published.
     pub exact_mention_terms: Vec<String>,
     pub effect: SideEffectClass,
+    pub risk: RiskLevel,
     pub op_ids: Vec<OpId>,
     pub approval: ApprovalRequirement,
     pub channel_eligible: bool,
@@ -323,6 +326,7 @@ impl CapabilityCatalog {
                 descriptor.backend_name.clone(),
                 namespace,
                 family,
+                descriptor.categories.clone(),
                 effect,
                 descriptor.availability.clone(),
                 ExecutionTarget::Tool(descriptor.public_name.clone()),
@@ -336,6 +340,7 @@ impl CapabilityCatalog {
                 "mcp_call".to_string(),
                 discovered.server.clone(),
                 CapabilityTarget::Mcp,
+                vec![ToolCategory::Automation],
                 SideEffectClass::Destructive,
                 CapabilityAvailability::ready("discovered allowed MCP backend"),
                 ExecutionTarget::Tool(discovered.spec.name.clone()),
@@ -359,6 +364,7 @@ impl CapabilityCatalog {
                 "skill_read".to_string(),
                 "skill".to_string(),
                 CapabilityTarget::Skill,
+                vec![ToolCategory::System],
                 SideEffectClass::ReadOnly,
                 CapabilityAvailability::configured("installed skill metadata"),
                 ExecutionTarget::Skill {
@@ -382,6 +388,7 @@ impl CapabilityCatalog {
                 "hooks".to_string(),
                 "hook".to_string(),
                 CapabilityTarget::Hook,
+                vec![ToolCategory::Automation],
                 hook.effect,
                 CapabilityAvailability::configured("registered lifecycle hook"),
                 ExecutionTarget::Hook,
@@ -413,6 +420,7 @@ impl CapabilityCatalog {
                 "nodes".to_string(),
                 "node".to_string(),
                 CapabilityTarget::Shell,
+                vec![ToolCategory::DevOps],
                 SideEffectClass::ProcessExec,
                 node.availability.clone(),
                 ExecutionTarget::Node {
@@ -802,6 +810,7 @@ fn entry_from_spec(
     root: String,
     namespace: String,
     family: CapabilityTarget,
+    categories: Vec<ToolCategory>,
     effect: SideEffectClass,
     availability: CapabilityAvailability,
     target: ExecutionTarget,
@@ -840,8 +849,10 @@ fn entry_from_spec(
         namespace,
         summary: summary(&spec.description),
         aliases: Vec::new(),
+        categories,
         exact_mention_terms: Vec::new(),
         effect,
+        risk: risk_for_effect(effect),
         op_ids,
         approval,
         channel_eligible: surface.channel_allowed,
@@ -855,6 +866,16 @@ fn entry_from_spec(
         exposure,
         availability,
     })
+}
+
+pub(super) const fn risk_for_effect(effect: SideEffectClass) -> RiskLevel {
+    match effect {
+        SideEffectClass::ReadOnly => RiskLevel::Low,
+        SideEffectClass::LocalWrite | SideEffectClass::ExternalSend | SideEffectClass::CredentialOrConfig => {
+            RiskLevel::Medium
+        }
+        SideEffectClass::ProcessExec | SideEffectClass::Destructive => RiskLevel::High,
+    }
 }
 
 fn summary(description: &str) -> String {
@@ -929,8 +950,10 @@ fn generation_of(sources: &CatalogSources, surface: &SurfacePolicy, entries: &[C
             hasher.update(value);
         }
         let policy = format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            entry.categories,
             entry.effect,
+            entry.risk,
             entry.op_ids,
             entry.approval,
             entry.exposure,

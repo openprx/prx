@@ -48,7 +48,9 @@ for storage, path and platform restrictions.
 
 `capability_search` accepts a nonempty `query` of at most 1024 UTF-8 bytes
 and an optional `limit` from 1 to 5 (default 5). Each hit carries its canonical
-tool schema, capability ID, schema fingerprint and catalog generation. The
+tool schema, capability ID, schema fingerprint, catalog generation, categories,
+effect, static risk, approval requirement and channel eligibility. Exact call
+risk and approval scope are still resolved from the arguments during admission. The
 shared turn engine exposes this control tool for AnswerDirectly and Execute
 decisions with a legal discoverable family, subject to source exclusions and
 policy. A brief AnswerDirectly turn with no URL, path or code shape, including a
@@ -61,7 +63,8 @@ expose search: the current source/model must permit tool calls and at least one
 eligible family must survive the surface gates. Search uses the indexed,
 source-filtered catalog and does not refresh external backends. Returned
 references are retained only in that live turn and cleared when it closes. A
-search result alone grants no execution authority; the tool requires an
+search result alone grants no execution authority; fresh admission must append
+the exact offered schema before it can bind for execution. The tool requires an
 execution-service-issued invocation port and rejects direct calls without it.
 When the model subsequently calls an offered public name or exact capability
 ID, the engine rechecks that specific reference before dispatch. Passed

@@ -545,6 +545,30 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
         schema.get("description").and_then(serde_json::Value::as_str),
         Some("Inspect release metadata")
     );
+    assert_eq!(hit.get("categories"), Some(&serde_json::json!(["system"])));
+    assert_eq!(hit.get("effect").and_then(serde_json::Value::as_str), Some("read_only"));
+    assert_eq!(hit.get("risk").and_then(serde_json::Value::as_str), Some("low"));
+    assert_eq!(hit.get("approval").and_then(serde_json::Value::as_str), Some("none"));
+    assert_eq!(
+        hit.get("channel_eligible").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(proof.workspace_id(), proof.run_id())
+        .with_config_generation(&generation)
+        .with_source_message_event_id(proof.source_event_id().unwrap());
+    let execution_context =
+        crate::tools::ToolExecutionContext::new(envelope, "private").with_chat_id(proof.session_key());
+    let mut offered_but_unadmitted = selected.specs.clone();
+    offered_but_unadmitted.push(serde_json::from_value(schema.clone()).unwrap());
+    let bind_error = match service.bind_agent_execution(&proof, &context, &execution_context, &offered_but_unadmitted) {
+        Ok(_) => panic!("a search offer must not create execution authority"),
+        Err(error) => error,
+    };
+    assert!(
+        bind_error.to_string().contains("unknown runtime dependency"),
+        "unexpected pre-admission binding error: {bind_error:#}"
+    );
 
     let proposal = service
         .admit_discovered_tool(&proof, &context, SKILL_NAME)
@@ -558,11 +582,6 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     );
     let mut published = selected.specs;
     published.extend(appended.specs);
-    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(proof.workspace_id(), proof.run_id())
-        .with_config_generation(&generation)
-        .with_source_message_event_id(proof.source_event_id().unwrap());
-    let execution_context =
-        crate::tools::ToolExecutionContext::new(envelope, "private").with_chat_id(proof.session_key());
     let (executor, bound) = service
         .bind_agent_execution(&proof, &context, &execution_context, &published)
         .unwrap();

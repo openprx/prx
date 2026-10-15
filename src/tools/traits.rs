@@ -58,6 +58,23 @@ pub enum ToolCategory {
     System,
 }
 
+impl ToolCategory {
+    /// Stable model-facing code used by capability discovery metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FileSystem => "file_system",
+            Self::Memory => "memory",
+            Self::WebBrowsing => "web_browsing",
+            Self::Communication => "communication",
+            Self::Scheduling => "scheduling",
+            Self::Automation => "automation",
+            Self::DevOps => "dev_ops",
+            Self::Media => "media",
+            Self::System => "system",
+        }
+    }
+}
+
 /// Core tool trait — implement for any capability
 #[async_trait]
 pub trait Tool: Send + Sync {
