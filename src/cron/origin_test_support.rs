@@ -142,6 +142,15 @@ impl ScriptedStoreModel {
         let provider = format!("custom:{}", self.base_url);
         config.default_provider = Some(provider.clone());
         config.default_model = Some("cron-origin-model".to_string());
+        config.cost.prices.insert(
+            format!("{provider}/cron-origin-model"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
         config
             .providers
             .models
