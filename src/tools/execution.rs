@@ -5337,7 +5337,9 @@ mod tests {
     /// `allOf` with its own item composition, and a scalar `if`/`then`/`else`.
     ///
     /// Composition used to be compiled and then skipped for anything but an
-    /// object, so a contract shaped like this validated nothing at all.
+    /// object, so a contract shaped like this validated nothing at all. The
+    /// same fixture also keeps the document-root conditional and local-ref
+    /// paths on the production executor boundary.
     struct CompositionTool {
         calls: Arc<AtomicUsize>,
     }
@@ -5373,6 +5375,29 @@ mod tests {
                         "then": {"maximum": 20},
                         "else": {"minimum": 0},
                         "description": "Lookback window."
+                    },
+                    "profile": {
+                        "allOf": [{
+                            "type": "object",
+                            "properties": {"name": {"type": "string", "minLength": 2}},
+                            "required": ["name"]
+                        }]
+                    },
+                    "action": {"type": "string", "enum": ["read", "write"]},
+                    "content": {"type": "string"},
+                    "target": {"$ref": "#/$defs/Target"}
+                },
+                "if": {
+                    "properties": {"action": {"const": "write"}},
+                    "required": ["action"]
+                },
+                "then": {"required": ["content"]},
+                "else": {},
+                "$defs": {
+                    "Target": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string", "minLength": 3}},
+                        "required": ["id"]
                     }
                 }
             })
@@ -5489,12 +5514,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_path_rejects_object_root_conditional_and_ref_violations_before_backend() {
+        for (arguments, expected_path) in [
+            (serde_json::json!({"profile": {}}), "$.profile"),
+            (serde_json::json!({"profile": {"name": "x"}}), "$.profile.name"),
+            (serde_json::json!({"action": "write"}), "$"),
+            (serde_json::json!({"target": {}}), "$.target"),
+            (serde_json::json!({"target": {"id": "x"}}), "$.target.id"),
+        ] {
+            let (outcome, calls) = composition_outcome(arguments.clone()).await;
+            assert_eq!(
+                outcome.status,
+                ToolExecutionStatus::InvalidArguments,
+                "{arguments} violates the published composition, got {}",
+                outcome.model_content
+            );
+            assert_eq!(
+                calls, 0,
+                "an object, root-conditional, or local-ref violation must not reach the executor: {arguments}"
+            );
+            assert!(
+                outcome.model_content.contains(expected_path),
+                "expected {expected_path} in {}",
+                outcome.model_content
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn production_path_accepts_composition_respecting_scalars_and_arrays() {
         for arguments in [
             serde_json::json!({"limit": 5}),
             serde_json::json!({"tags": ["ops", "prod"]}),
             serde_json::json!({"window": 15}),
             serde_json::json!({"window": 5}),
+            serde_json::json!({"profile": {"name": "prx"}}),
+            serde_json::json!({"action": "write", "content": "ready"}),
+            serde_json::json!({"target": {"id": "prx"}}),
             serde_json::json!({"limit": 1, "tags": ["ops"], "window": 20}),
         ] {
             let (outcome, calls) = composition_outcome(arguments.clone()).await;
