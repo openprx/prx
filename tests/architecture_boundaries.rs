@@ -3741,13 +3741,15 @@ fn forwarded_compaction_values_are_produced_from_the_effective_window() {
             "{relative}: resolved producer changed"
         );
         assert_eq!(
-            body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config)?;")
+            body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config,extra_token_ratio_limit)?;")
                 .count(),
             1
         );
         assert_eq!(
-            body.matches("letmain_compaction=reservation.reserved_compaction(&effective.config)?;")
-                .count(),
+            body.matches(
+                "letmain_compaction=reservation.reserved_compaction(&effective.config,extra_token_ratio_limit)?;"
+            )
+            .count(),
             1
         );
     }
@@ -10042,7 +10044,7 @@ fn mutation_proof_compaction_producer_guard() {
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
         "src/runtime/turn_decision.rs",
-        "let main_compaction = reservation.reserved_compaction(&effective.config)?;",
+        "let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;",
         "let main_compaction = config.agent.compaction.clone();",
     );
 }
