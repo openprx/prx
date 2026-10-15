@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -42,6 +44,41 @@ PENDING = "pending"
 PENDING_STATUSES = frozenset({"queued", "in_progress", "requested", "waiting", "pending"})
 # Conclusions that are terminal failures wherever they appear in a required run.
 FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "cancelled", "action_required", "stale"})
+RELEASE_TAG_PATTERN = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?")
+COMMIT_SHA_PATTERN = re.compile(r"[0-9A-Fa-f]{40}")
+
+
+class ReleaseTagError(ValueError):
+    """The requested release tag is invalid or does not identify the gated commit."""
+
+
+def verify_release_tag(tag: str, gated_sha: str, repo_root: str = ".") -> str:
+    """Resolve an annotated or lightweight tag and require its commit to be gated."""
+    if RELEASE_TAG_PATTERN.fullmatch(tag) is None:
+        raise ReleaseTagError(f"release tag '{tag}' is not a valid vX.Y.Z tag")
+    if COMMIT_SHA_PATTERN.fullmatch(gated_sha) is None:
+        raise ReleaseTagError(f"gated SHA '{gated_sha}' is not a full commit SHA")
+
+    try:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise ReleaseTagError(f"could not resolve release tag '{tag}': {error}") from error
+    if resolved.returncode != 0:
+        detail = resolved.stderr.strip() or "tag does not resolve to a commit"
+        raise ReleaseTagError(f"could not resolve release tag '{tag}': {detail}")
+
+    tag_sha = resolved.stdout.strip().lower()
+    if tag_sha != gated_sha.lower():
+        raise ReleaseTagError(
+            f"release tag '{tag}' resolves to {tag_sha}, but the gated SHA is {gated_sha.lower()}"
+        )
+    return tag_sha
 
 
 @dataclass(frozen=True)
@@ -342,6 +379,7 @@ def load_bundle(path: str) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Gate release publication on the exact tag SHA.")
     parser.add_argument("--sha", help="Commit SHA behind the release tag.")
+    parser.add_argument("--tag", help="Release tag that must resolve to --sha in the checkout.")
     parser.add_argument(
         "--repo", default=os.environ.get("GITHUB_REPOSITORY", ""), help="OWNER/NAME."
     )
@@ -368,8 +406,16 @@ def main(argv: list[str] | None = None) -> int:
         bundle["sha"] = sha
         result = finalize(evaluate(bundle))
     else:
-        if not args.sha or not args.repo:
-            print("release gate: --sha and --repo are required in online mode", file=sys.stderr)
+        if not args.sha or not args.repo or not args.tag:
+            print(
+                "release gate: --sha, --tag and --repo are required in online mode",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            verify_release_tag(args.tag, args.sha)
+        except ReleaseTagError as error:
+            print(f"release gate: {error}", file=sys.stderr)
             return 2
         token = os.environ.get("GITHUB_TOKEN", "")
         api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")

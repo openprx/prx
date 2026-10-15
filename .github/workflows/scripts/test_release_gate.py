@@ -13,7 +13,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -129,6 +131,56 @@ class ReleaseGateDecisionTest(unittest.TestCase):
         self.assertEqual(
             1, release_gate.main(["--bundle", str(FIXTURE_DIR / "docs_only_green.json")])
         )
+
+
+class ReleaseTagBindingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self.temp_dir.name)
+        self.git("init", "--quiet")
+        self.git("config", "user.name", "PRXAgent")
+        self.git("config", "user.email", "prx@example.com")
+        (self.repo / "release.txt").write_text("release\n", encoding="utf-8")
+        self.git("add", "release.txt")
+        self.git("commit", "--quiet", "-m", "test: release fixture")
+        self.sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("tag", "-a", "v1.2.3", "-m", "prx v1.2.3")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_annotated_tag_resolving_to_gated_sha_passes(self) -> None:
+        self.assertEqual(
+            self.sha,
+            release_gate.verify_release_tag("v1.2.3", self.sha, str(self.repo)),
+        )
+
+    def test_tag_resolving_to_another_commit_is_rejected(self) -> None:
+        (self.repo / "release.txt").write_text("later\n", encoding="utf-8")
+        self.git("commit", "--quiet", "-am", "test: later fixture")
+        other_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        with self.assertRaisesRegex(release_gate.ReleaseTagError, "but the gated SHA is"):
+            release_gate.verify_release_tag("v1.2.3", other_sha, str(self.repo))
+
+    def test_untrusted_tag_syntax_is_rejected_before_git_resolution(self) -> None:
+        with self.assertRaisesRegex(release_gate.ReleaseTagError, "not a valid"):
+            release_gate.verify_release_tag("v1.2.3:refs/heads/main", self.sha, str(self.repo))
+
+    def test_release_workflow_passes_the_tag_to_the_exact_sha_gate(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        gate_job = workflow.split("\n  validate:", 1)[0]
+        self.assertIn("fetch-depth: 0", gate_job)
+        self.assertIn("--sha \"$GITHUB_SHA\"", gate_job)
+        self.assertIn("--tag \"$RELEASE_TAG\"", gate_job)
 
 
 class ReleaseGatePolicyTest(unittest.TestCase):

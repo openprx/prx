@@ -4,6 +4,9 @@ Publishing a PRX release is gated on the **exact commit the tag points at**.
 The `Exact-SHA Release Gate` job in `.github/workflows/release.yml` runs before
 `validate`, `build` and `release`, and every one of those jobs declares it in
 `needs`. If the gate fails, no asset is built and no release is created.
+For a manual dispatch, the requested tag must already exist and resolve to the
+same commit as `github.sha`; selecting a branch or commit while naming a tag at
+another commit fails before the Actions API gate runs.
 
 ## Why the gate exists
 
@@ -25,6 +28,8 @@ job-level conclusions of two workflows.
 
 Additional rules:
 
+- The release tag is resolved to its commit in the checkout and must equal
+  `github.sha`. This also peels annotated tags before comparison.
 - The `Release` workflow is never an input, so the gate cannot wait on the run
   that asks the question.
 - If several runs of one workflow exist for the same SHA, the **newest** run
@@ -39,6 +44,7 @@ Additional rules:
 
 | Observed state on the tag SHA | Gate decision |
 |-------------------------------|---------------|
+| Requested tag resolves to a different commit than `github.sha` | `FAIL` before workflow status is queried |
 | All required jobs `success` in the newest run of both workflows | `PASS` — publication proceeds |
 | Required workflow has no run for this SHA | `PENDING`, then `FAIL` when the wait budget expires |
 | Newest run is `queued` / `in_progress`, or a required job has not finished | `PENDING`, then `FAIL` when the wait budget expires |

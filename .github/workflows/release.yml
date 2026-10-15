@@ -26,15 +26,21 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Manual dispatch can name a tag unrelated to the selected ref. The
+          # gate resolves the tag locally before querying CI for github.sha.
+          fetch-depth: 0
       - name: Self-test the gate decision logic
         run: ./scripts/ci/release_gate_tests.sh
       - name: Require green CI and security on the exact tag SHA
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
         run: |
           python3 .github/workflows/scripts/release_gate.py \
             --repo "$GITHUB_REPOSITORY" \
             --sha "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
             --wait-seconds 2100 \
             --poll-seconds 30 \
             --summary "$GITHUB_STEP_SUMMARY"
