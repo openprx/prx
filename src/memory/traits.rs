@@ -655,14 +655,22 @@ mod message_event_contract_tests {
     #[test]
     fn postgres_backend_source_lists_every_backend_file() {
         let scanned = postgres_backend_source();
-        let outside = ["decision_reads.rs", "ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+        let outside = [
+            "decision_reads.rs",
+            "ingress_recovery.rs",
+            "router_history.rs",
+            "router_learning.rs",
+        ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/postgres");
         for entry in std::fs::read_dir(directory).expect("test: read the backend directory") {
             let path = entry.expect("test: read a directory entry").path();
             if path.extension().is_none_or(|extension| extension != "rs") {
                 continue;
             }
-            let name = path.file_name().and_then(|name| name.to_str()).expect("test: utf-8 file name");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("test: utf-8 file name");
             let text = std::fs::read_to_string(&path).expect("test: read a backend file");
             assert!(
                 scanned.contains(&text) || outside.contains(&name),

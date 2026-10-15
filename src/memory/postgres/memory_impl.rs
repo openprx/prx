@@ -2849,8 +2849,26 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn increment_useful_count(&self, _id: &str) -> Result<()> {
-        Ok(())
+    async fn increment_useful_count(&self, id: &str) -> Result<()> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let id = id.to_string();
+
+        // Same scope as `forget` and `count`, which also take no caller
+        // context: the pooled connection is the trusted system session. As in
+        // SQLite, an unknown id updates nothing and is not an error.
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let stmt = format!(
+                "UPDATE {qualified_table}
+                 SET useful_count = COALESCE(useful_count, 0) + 1,
+                     updated_at = $1
+                 WHERE id = $2"
+            );
+            let now = Utc::now();
+            client.with_client(|client| Ok(client.execute(&stmt, &[&now, &id])?))?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn ingest_document(&self, input: DocumentIngestInput) -> Result<DocumentRecord> {

@@ -67,15 +67,23 @@ pub(super) const FILE_SEPARATOR: &str = "\n// ---- next source file ----\n";
 
 /// Files under `postgres/` that were never part of the old single-file text
 /// and are deliberately outside [`r5_production_source`].
-const OUTSIDE_PRODUCTION_SOURCE: [&str; 4] =
-    ["decision_reads.rs", "ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+const OUTSIDE_PRODUCTION_SOURCE: [&str; 4] = [
+    "decision_reads.rs",
+    "ingress_recovery.rs",
+    "router_history.rs",
+    "router_learning.rs",
+];
 
 /// A new production file must either join the scanned text or be named in
 /// [`OUTSIDE_PRODUCTION_SOURCE`]; otherwise the text guards would go blind to it.
 #[test]
 fn production_source_lists_every_backend_file() {
     let scanned: Vec<&str> = r5_production_source().split(FILE_SEPARATOR).collect();
-    assert_eq!(scanned.len(), 8, "the scanned text must hold the root and seven sibling files");
+    assert_eq!(
+        scanned.len(),
+        8,
+        "the scanned text must hold the root and seven sibling files"
+    );
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/postgres");
     let mut unlisted = Vec::new();
     for entry in std::fs::read_dir(&directory).expect("test: read the backend directory") {
@@ -83,14 +91,20 @@ fn production_source_lists_every_backend_file() {
         if path.extension().is_none_or(|extension| extension != "rs") {
             continue;
         }
-        let name = path.file_name().and_then(|name| name.to_str()).expect("test: utf-8 file name");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test: utf-8 file name");
         let text = std::fs::read_to_string(&path).expect("test: read a backend file");
         let covered = scanned.iter().any(|part| *part == text) || OUTSIDE_PRODUCTION_SOURCE.contains(&name);
         if !covered {
             unlisted.push(name.to_string());
         }
     }
-    assert!(unlisted.is_empty(), "backend files missing from the scanned text: {unlisted:?}");
+    assert!(
+        unlisted.is_empty(),
+        "backend files missing from the scanned text: {unlisted:?}"
+    );
 }
 
 /// Drop every line comment, so a comment that merely *names* a call is not

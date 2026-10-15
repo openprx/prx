@@ -35,7 +35,7 @@ const LIVE_URL_HELPER_CALL: &str = "live_postgres_url()";
 /// 26 in the memory adapter, 4 in the cron
 /// store, 1 in the cron scheduler, 2 in the webhook repository, 1 in schema
 /// migration and 1 in the fitness CLI.
-const EXPECTED_LIVE_POSTGRES_TESTS: usize = 35;
+const EXPECTED_LIVE_POSTGRES_TESTS: usize = 36;
 
 fn line_of(source: &str, offset: usize) -> usize {
     source[..offset].matches('\n').count() + 1

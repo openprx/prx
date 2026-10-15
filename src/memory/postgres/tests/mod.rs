@@ -1,7 +1,6 @@
 //! Tests for the PostgreSQL memory backend.
 #![cfg(test)]
 
-
 mod basics;
 mod documents;
 mod event_reads;
@@ -10,6 +9,7 @@ mod owner_isolation;
 mod pool_conformance;
 mod rls;
 mod upsert;
+mod useful_count;
 
 use crate::memory::embeddings;
 use anyhow::Result;

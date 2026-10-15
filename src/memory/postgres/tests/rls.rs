@@ -2,7 +2,9 @@
 #![cfg(test)]
 
 use super::CountingEmbedding;
-use super::memory_owner_isolation::{FILE_SEPARATOR, r5_drop_schema, r5_production_source, r5_seed, r5_without_comments};
+use super::memory_owner_isolation::{
+    FILE_SEPARATOR, r5_drop_schema, r5_production_source, r5_seed, r5_without_comments,
+};
 use super::owner_isolation::{C03_WORKSPACE, c03_owner};
 use crate::memory::postgres::pool::{PostgresConnectionPool, PostgresSessionContext};
 use crate::memory::postgres::rows::quote_identifier;
