@@ -25,6 +25,7 @@ pub mod connection_test;
 pub mod copilot;
 pub mod credentials;
 pub mod gemini;
+pub(crate) mod generation;
 mod identity;
 pub mod ollama;
 pub mod openai;

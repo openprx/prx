@@ -139,8 +139,8 @@ const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str =
     "I could not identify this image with confidence. Please send a clearer picture or add some context.";
 
-type ProviderCacheKey = (u64, String, String);
-type ProviderCacheMap = Arc<Mutex<HashMap<ProviderCacheKey, Arc<dyn Provider>>>>;
+type ProviderCacheKey = providers::generation::GenerationProviderCacheKey;
+type ProviderCacheMap = providers::generation::GenerationProviderCache;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1800,52 +1800,15 @@ async fn get_or_create_provider_for_generation(
     model_name: &str,
     generation: &Arc<crate::config::ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    let cache_key = (generation.id.0, provider_name.to_string(), model_name.to_string());
-    let active_generation = ctx.config.pin().id.0;
-    {
-        let mut cache = ctx.provider_cache.lock();
-        cache.retain(|(generation, _, _), _| *generation == active_generation);
-        if generation.id.0 == active_generation
-            && let Some(existing) = cache.get(&cache_key).cloned()
-        {
-            return Ok(existing);
-        }
-    }
-    let config = &generation.effective;
-    let catalog = providers::selection::catalog_for(config);
-    let resolved = providers::selection::check_with(
-        config,
-        &catalog,
+    providers::generation::get_or_create_provider_for_generation(
+        &ctx.config,
+        &ctx.provider_cache,
+        &ctx.provider_runtime_options,
         provider_name,
         model_name,
-        providers::selection::credential_for(config, provider_name),
-        &providers::catalog::Requirement::chat(),
-        providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    let provider = providers::create_provider_for(
-        &resolved,
-        &catalog,
-        &config.reliability,
-        &config.cost,
-        &ctx.provider_runtime_options,
-    )?;
-    let provider: Arc<dyn Provider> = Arc::from(provider);
-
-    if let Err(err) = provider.warmup().await {
-        tracing::warn!(
-            provider = %providers::redact_endpoint_userinfo(provider_name),
-            "Provider warmup failed: {}",
-            providers::redact_endpoint_userinfo(&err.to_string())
-        );
-    }
-
-    let active_generation = ctx.config.pin().id.0;
-    let mut cache = ctx.provider_cache.lock();
-    cache.retain(|(generation, _, _), _| *generation == active_generation);
-    if generation.id.0 == active_generation {
-        cache.insert(cache_key, Arc::clone(&provider));
-    }
-    Ok(provider)
+        generation,
+    )
+    .await
 }
 
 /// A hint is one selected route, not a provider-wide chain. Constructing the
@@ -5767,6 +5730,20 @@ pub async fn start_channels_with_config(
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+    if !default_is_hint {
+        provider_cache_seed.insert(
+            (config_generation.id.0, provider_name.clone(), model.clone()),
+            Arc::clone(&provider),
+        );
+    }
+    let provider_cache: ProviderCacheMap = Arc::new(Mutex::new(provider_cache_seed));
+    let pinned_provider_resolver: Arc<dyn providers::generation::PinnedProviderResolver> =
+        Arc::new(providers::generation::ConfigGenerationProviderResolver::with_cache(
+            Arc::clone(&shared_config),
+            provider_runtime_options.clone(),
+            Arc::clone(&provider_cache),
+        ));
     // Publish the same registry process-wide for as long as these channels are
     // running, so the gateway control plane (`POST /api/channels/{name}/send`)
     // can reach the very channel objects that own the live connections. The
@@ -5846,6 +5823,7 @@ pub async fn start_channels_with_config(
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)
+        .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver))
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool
@@ -5890,13 +5868,16 @@ pub async fn start_channels_with_config(
         ));
 
         // image: vision tool backed by the active provider (OpenClaw alignment)
-        tools_list.push(Box::new(tools::ImageTool::new(
-            Arc::clone(&provider),
-            &model,
-            temperature,
-            security.clone(),
-            config.multimodal.clone(),
-        )));
+        tools_list.push(Box::new(
+            tools::ImageTool::new(
+                Arc::clone(&provider),
+                &model,
+                temperature,
+                security.clone(),
+                config.multimodal.clone(),
+            )
+            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver), &turn_provider_name),
+        ));
 
         tools_list.push(Box::new(spawn_tool));
         Some(handle)
@@ -5980,13 +5961,6 @@ pub async fn start_channels_with_config(
     // receiving. `prx tasks list` is where in-flight turns are counted now.
     println!("  🚦 In-flight messages: unbounded (inspect with `prx tasks list`)");
 
-    let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
-    if !default_is_hint {
-        provider_cache_seed.insert(
-            (config_generation.id.0, provider_name.clone(), model.clone()),
-            Arc::clone(&provider),
-        );
-    }
     let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
         let allowed_from = normalize_allowlist(&signal.allowed_from);
         let group_allow_from = normalize_allowlist(&signal.group_allow_from);
@@ -6070,7 +6044,7 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         low_priority_tools: config.agent.low_priority_tools.clone(),
         conversation_histories,
-        provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+        provider_cache,
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         #[cfg(test)]
         api_key: config.api_key.clone(),
@@ -6134,6 +6108,7 @@ mod tests {
         clippy::unreadable_literal
     )]
     mod factory_reload_fixture;
+    mod provider_tool_reload;
     mod signal_accounted;
     mod smart_group_accounted;
 

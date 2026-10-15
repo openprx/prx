@@ -1297,6 +1297,7 @@ pub struct SessionsSpawnTool {
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     /// Provider for sub-agent LLM calls.
     provider: Arc<dyn Provider>,
+    pinned_provider_resolver: Option<Arc<dyn providers::generation::PinnedProviderResolver>>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.
@@ -1608,6 +1609,7 @@ impl SessionsSpawnTool {
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
             provider,
+            pinned_provider_resolver: None,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,
@@ -1683,6 +1685,15 @@ impl SessionsSpawnTool {
         executable.verify()?;
         self.test_worker_executable = Some(executable);
         Ok(self)
+    }
+
+    #[must_use]
+    pub(crate) fn with_pinned_provider_resolver(
+        mut self,
+        resolver: Arc<dyn providers::generation::PinnedProviderResolver>,
+    ) -> Self {
+        self.pinned_provider_resolver = Some(resolver);
+        self
     }
 
     #[cfg(test)]
@@ -5488,7 +5499,20 @@ impl SessionsSpawnTool {
                 "operator child provider differs from captured ingress"
             );
         }
-        let provider_result = if let Some(binding) = child_provider_binding.as_ref() {
+        let pinned_generation_id = || {
+            child_grant
+                .as_ref()
+                .map(|grant| grant.generation().id.0)
+                .or_else(|| ordinary_publication.map(|publication| publication.generation().id.0))
+                .or_else(|| operator_source.as_ref().map(|source| source.generation().id.0))
+                .context("gateway child provider generation missing")
+        };
+        let provider_result = if matches!(&task_provider_plan, ChildProvider::Gateway)
+            && operator_source.is_none()
+            && let Some(resolver) = &self.pinned_provider_resolver
+        {
+            resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
+        } else if let Some(binding) = child_provider_binding.as_ref() {
             Ok(binding.provider())
         } else if let Some(resolved) = selected_hint.as_ref() {
             let reliability = crate::config::ReliabilityConfig {
@@ -5558,7 +5582,13 @@ impl SessionsSpawnTool {
                         provider_options,
                     )
                 }
-                ChildProvider::Gateway => Ok(self.provider.clone()),
+                ChildProvider::Gateway => {
+                    if let Some(resolver) = &self.pinned_provider_resolver {
+                        resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
+                    } else {
+                        Ok(self.provider.clone())
+                    }
+                }
             }
         };
         let provider = match provider_result {
@@ -10519,6 +10549,7 @@ mod tests {
             test_worker_executable: tool.test_worker_executable.clone(),
             channels: Arc::clone(&tool.channels),
             provider: Arc::clone(&tool.provider),
+            pinned_provider_resolver: tool.pinned_provider_resolver.clone(),
             provider_name: tool.provider_name.clone(),
             model: tool.model.clone(),
             security: Arc::clone(&tool.security),

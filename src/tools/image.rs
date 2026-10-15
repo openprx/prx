@@ -18,6 +18,8 @@ use std::sync::Arc;
 /// Tool for vision/image understanding via the active provider.
 pub struct ImageTool {
     provider: Arc<dyn Provider>,
+    pinned_provider_resolver: Option<Arc<dyn crate::providers::generation::PinnedProviderResolver>>,
+    pinned_provider_name: Option<String>,
     model: String,
     temperature: f64,
     security: Arc<SecurityPolicy>,
@@ -36,6 +38,8 @@ impl ImageTool {
         let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&security.workspace_dir);
         Self {
             provider,
+            pinned_provider_resolver: None,
+            pinned_provider_name: None,
             model: model.into(),
             temperature,
             security,
@@ -48,6 +52,17 @@ impl ImageTool {
     /// (This is a snapshot — callers re-construct or re-register the tool for model changes.)
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    #[must_use]
+    pub(crate) fn with_pinned_provider_resolver(
+        mut self,
+        resolver: Arc<dyn crate::providers::generation::PinnedProviderResolver>,
+        provider_name: impl Into<String>,
+    ) -> Self {
+        self.pinned_provider_resolver = Some(resolver);
+        self.pinned_provider_name = Some(provider_name.into());
+        self
     }
 }
 
@@ -92,6 +107,25 @@ impl Tool for ImageTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let provider = if let Some(resolver) = &self.pinned_provider_resolver {
+            let generation_id = crate::tools::execution::current_child_call_context()
+                .and_then(|caller| caller.context().envelope.config_generation_id)
+                .or_else(|| {
+                    args.get("_zc_scope_trusted")
+                        .and_then(serde_json::Value::as_bool)
+                        .filter(|trusted| *trusted)
+                        .and_then(|_| args.pointer("/_zc_scope/config_generation_id"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .ok_or_else(|| anyhow::anyhow!("image execution is missing its pinned configuration generation"))?;
+            let provider_name = self
+                .pinned_provider_name
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image provider resolver has no pinned provider name"))?;
+            resolver.resolve(generation_id, provider_name, &self.model).await?
+        } else {
+            Arc::clone(&self.provider)
+        };
         // Collect image references from 'image' and/or 'images' parameters
         let mut image_refs: Vec<String> = Vec::new();
 
@@ -162,8 +196,7 @@ impl Tool for ImageTool {
         }
 
         // Check that the provider supports vision
-        if !self
-            .provider
+        if !provider
             .capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming)
             .vision
         {
@@ -223,8 +256,7 @@ impl Tool for ImageTool {
             tools: None,
         };
 
-        let response = self
-            .provider
+        let response = provider
             .chat(request, &self.model, self.temperature)
             .await
             .map_err(|e| anyhow::anyhow!("Vision model call failed: {e}"))?;

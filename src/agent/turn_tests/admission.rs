@@ -175,6 +175,36 @@ impl AdmittedTurn {
         .await
     }
 
+    /// Ordinary-channel admission bound to a caller-owned generation. Reload
+    /// tests use this to keep the execution envelope, child publication and
+    /// provider resolver on the same immutable snapshot.
+    pub(crate) async fn ordinary_controlled_channel_with_generation(
+        generation: Arc<crate::config::ConfigGeneration>,
+        message: crate::channels::traits::ChannelMessage,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+    ) -> Self {
+        assert!(
+            !generation.effective.causal_tree.enabled,
+            "ordinary child fixture starts disabled"
+        );
+        let config = generation.effective.as_ref().clone();
+        let input = message.content.clone();
+        Self::build_mode(
+            config,
+            &input,
+            registry,
+            memory,
+            FixtureOrigin::OrdinaryControlledChannel(Box::new(message)),
+            selection,
+            None,
+            None,
+            Some(generation),
+        )
+        .await
+    }
+
     pub(crate) async fn with_channel_memory(
         config: crate::config::Config,
         message: crate::channels::traits::ChannelMessage,
@@ -201,7 +231,7 @@ impl AdmittedTurn {
         origin: FixtureOrigin,
         selection: (&str, &str),
     ) -> Self {
-        Self::build_mode(config, input, registry, memory, origin, selection, None, None).await
+        Self::build_mode(config, input, registry, memory, origin, selection, None, None, None).await
     }
 
     /// Explicit engine-only Answer fixture; existing Off/Builtin helpers are unchanged.
@@ -231,6 +261,7 @@ impl AdmittedTurn {
             ("ollama", "prx-local-model"),
             Some(false),
             None,
+            None,
         )
         .await
     }
@@ -258,6 +289,7 @@ impl AdmittedTurn {
             FixtureOrigin::Cli { recorded: true },
             ("ollama", "prx-local-model"),
             Some(true),
+            None,
             None,
         )
         .await;
@@ -317,6 +349,7 @@ impl AdmittedTurn {
             ("ollama", "prx-local-model"),
             Some(capabilities.native_tool_calling),
             None,
+            None,
         )
         .await;
         if admitted
@@ -375,6 +408,7 @@ impl AdmittedTurn {
             ("ollama", "prx-local-model"),
             Some(capabilities.native_tool_calling),
             None,
+            None,
         )
         .await
     }
@@ -408,6 +442,7 @@ impl AdmittedTurn {
                 ("ollama", "prx-local-model"),
                 Some(capabilities.native_tool_calling),
                 audit,
+                None,
             )
             .await
         })
@@ -422,19 +457,27 @@ impl AdmittedTurn {
         selection: (&str, &str),
         configured_native_tools: Option<bool>,
         audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
+        generation_override: Option<Arc<crate::config::ConfigGeneration>>,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
         if configured_native_tools.is_none() {
             config.causal_tree.enabled = false;
         }
-        config.providers.models.push(
-            serde_json::from_value(serde_json::json!({
-                "provider": selection.0, "model": selection.1,
-                "operations": ["chat"], "native_tools": configured_native_tools.unwrap_or(true),
-            }))
-            .expect("local fixture model descriptor"),
-        );
+        if !config
+            .providers
+            .models
+            .iter()
+            .any(|entry| entry.provider == selection.0 && entry.model.as_deref() == Some(selection.1))
+        {
+            config.providers.models.push(
+                serde_json::from_value(serde_json::json!({
+                    "provider": selection.0, "model": selection.1,
+                    "operations": ["chat"], "native_tools": configured_native_tools.unwrap_or(true),
+                }))
+                .expect("local fixture model descriptor"),
+            );
+        }
         let ordinary_controlled = matches!(&origin, FixtureOrigin::OrdinaryControlledChannel(_));
         let channel_surface = matches!(
             &origin,
@@ -448,7 +491,7 @@ impl AdmittedTurn {
         if channel_surface {
             config.tool_tiering = config.tool_tiering.for_channel_surface();
         }
-        let generation = crate::config::new_shared(config.clone()).pin();
+        let generation = generation_override.unwrap_or_else(|| crate::config::new_shared(config.clone()).pin());
         let security = Arc::new(crate::security::SecurityPolicy::from_config(
             &config.autonomy,
             workspace,
