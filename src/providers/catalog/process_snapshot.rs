@@ -48,6 +48,8 @@ struct Discovered {
 struct Snapshot {
     #[serde(default)]
     release_revision: Option<String>,
+    #[serde(default)]
+    release_content_sha256: Option<String>,
     curated: Vec<Curated>,
     discovered: Vec<Discovered>,
     routes: Vec<RouteTarget>,
@@ -91,6 +93,10 @@ impl CatalogView {
     fn process_payload(&self) -> anyhow::Result<String> {
         let snapshot = Snapshot {
             release_revision: self.release_revision().map(str::to_owned),
+            release_content_sha256: self
+                .release_catalog()
+                .ok()
+                .map(|catalog| catalog.content_sha256().to_owned()),
             curated: self
                 .curated
                 .iter()
@@ -133,6 +139,10 @@ impl CatalogView {
             anyhow::ensure!(
                 embedded.revision == parent_revision,
                 "child model catalog revision does not match its parent"
+            );
+            anyhow::ensure!(
+                snapshot.release_content_sha256.as_deref() == Some(embedded.content_sha256()),
+                "child model catalog content does not match its parent"
             );
             (Some(embedded), None)
         } else {
@@ -329,6 +339,34 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "child model catalog revision does not match its parent"
+        );
+    }
+
+    #[test]
+    fn child_refuses_changed_catalog_content_under_the_same_revision() {
+        let embedded = super::super::ReleaseCatalog::embedded().expect("test: embedded catalog validates");
+        let mut changed = serde_json::to_value(embedded.as_ref()).expect("test: catalog serializes");
+        *changed
+            .pointer_mut("/models/0/display_name")
+            .expect("test: first model display name exists") =
+            serde_json::Value::String("Changed fixture label".to_string());
+        let changed = super::super::ReleaseCatalog::from_json(&changed.to_string())
+            .expect("test: changed catalog remains semantically valid");
+        assert_eq!(changed.revision, embedded.revision);
+        assert_ne!(changed.content_sha256(), embedded.content_sha256());
+
+        let parent_catalog = CatalogView::default().with_release_catalog(changed);
+        let key = DecisionKey::ephemeral();
+        let parent = DecisionId::new_runtime();
+        let snapshot = parent_catalog
+            .bind_process(&key, parent)
+            .expect("test: parent snapshot binds");
+
+        let error = CatalogView::restore_process(&snapshot, &key, parent)
+            .expect_err("a child must reject changed content under the same revision");
+        assert_eq!(
+            error.to_string(),
+            "child model catalog content does not match its parent"
         );
     }
 }

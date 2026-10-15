@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{DescriptorSource, FeatureSet, ModelDescriptor, ModelOperation, Support};
 use crate::providers::ProviderId;
@@ -133,6 +134,7 @@ pub enum ModelLifecycleStatus {
 
 /// Lifecycle and replacement metadata for a catalog model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelLifecycle {
     pub status: ModelLifecycleStatus,
     #[serde(default)]
@@ -145,6 +147,7 @@ pub struct ModelLifecycle {
 
 /// Model feature facts. `None` is unknown rather than false.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogFeatures {
     #[serde(default)]
     pub native_tools: Option<bool>,
@@ -160,6 +163,7 @@ pub struct CatalogFeatures {
 
 /// Token limits supplied by the release catalog.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogLimits {
     #[serde(default)]
     pub context_window: Option<u32>,
@@ -169,6 +173,7 @@ pub struct CatalogLimits {
 
 /// A price tier above an input-token threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogPriceTier {
     pub above_input_tokens: u64,
     pub input: f64,
@@ -177,6 +182,7 @@ pub struct CatalogPriceTier {
 
 /// Per-million-token prices shipped by a release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogPricing {
     pub unit: String,
     pub input: f64,
@@ -191,7 +197,7 @@ pub struct CatalogPricing {
 
 /// A typed request-parameter declaration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CatalogParameter {
     Range {
         min: f64,
@@ -241,6 +247,7 @@ impl CatalogParameter {
 
 /// Router hints associated with one model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogRouterHints {
     pub categories: Vec<String>,
     pub latency_ms: u32,
@@ -249,6 +256,7 @@ pub struct CatalogRouterHints {
 
 /// Hosted transport recommendations supplied by a model entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogTransport {
     #[serde(default)]
     pub recommended_timeout_ms: Option<u64>,
@@ -258,6 +266,7 @@ pub struct CatalogTransport {
 
 /// One model record in `catalog/models.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseModel {
     pub id: String,
     pub provider: String,
@@ -293,7 +302,7 @@ impl ReleaseModel {
     /// Whether this row can be offered for a new selection.
     #[must_use]
     pub fn is_listed(&self) -> bool {
-        self.lifecycle.status != ModelLifecycleStatus::Retired && self.api_model != "*"
+        self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
     }
 
     /// Whether this model performs the requested operation.
@@ -309,6 +318,7 @@ impl ReleaseModel {
 
 /// Provider display and default-selection metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseProvider {
     pub default_model: String,
     pub display_name: String,
@@ -316,6 +326,7 @@ pub struct ReleaseProvider {
 
 /// The consolidated defaults shared by every surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseDefaults {
     pub provider: String,
     pub model: String,
@@ -323,6 +334,7 @@ pub struct ReleaseDefaults {
 
 /// The validated embedded catalog document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseCatalog {
     #[serde(rename = "$schema", default)]
     schema: Option<String>,
@@ -332,6 +344,8 @@ pub struct ReleaseCatalog {
     pub providers: BTreeMap<String, ReleaseProvider>,
     pub defaults: ReleaseDefaults,
     pub models: Vec<ReleaseModel>,
+    #[serde(skip)]
+    content_sha256: String,
     #[serde(skip)]
     warnings: Vec<String>,
 }
@@ -349,6 +363,7 @@ impl ReleaseCatalog {
         validate_secret_free(&raw)?;
         let mut catalog: Self = serde_json::from_value(raw)
             .map_err(|_| ReleaseCatalogError::new("the embedded model catalog does not match schema v1"))?;
+        catalog.content_sha256 = format!("sha256:{:x}", Sha256::digest(input.as_bytes()));
         catalog.validate()?;
         Ok(catalog)
     }
@@ -362,7 +377,14 @@ impl ReleaseCatalog {
     pub fn embedded() -> Result<Arc<Self>, ReleaseCatalogError> {
         static CATALOG: OnceLock<Result<Arc<ReleaseCatalog>, ReleaseCatalogError>> = OnceLock::new();
         CATALOG
-            .get_or_init(|| Self::from_json(EMBEDDED_CATALOG_JSON).map(Arc::new))
+            .get_or_init(|| {
+                Self::from_json(EMBEDDED_CATALOG_JSON).map(|catalog| {
+                    for warning in catalog.warnings() {
+                        tracing::warn!(warning, "embedded model catalog warning");
+                    }
+                    Arc::new(catalog)
+                })
+            })
             .clone()
     }
 
@@ -370,6 +392,12 @@ impl ReleaseCatalog {
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Digest of the exact JSON bytes used to build this catalog.
+    #[must_use]
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
     }
 
     /// Find one model under the canonical provider identity.
@@ -385,16 +413,24 @@ impl ReleaseCatalog {
         })
     }
 
-    /// Models offered for one provider, in catalog order.
+    /// Active chat models offered for one provider, with its release default first.
     #[must_use]
     pub fn listed_models(&self, provider: &str) -> Vec<&ReleaseModel> {
         let Some(provider) = self.provider_name(provider) else {
             return Vec::new();
         };
-        self.models
+        let default = self.providers.get(provider).map(|entry| entry.default_model.as_str());
+        let mut models: Vec<_> = self
+            .models
             .iter()
-            .filter(|model| model.provider.eq_ignore_ascii_case(provider) && model.is_listed())
-            .collect()
+            .filter(|model| {
+                model.provider.eq_ignore_ascii_case(provider)
+                    && model.is_listed()
+                    && model.supports(ModelOperation::Chat)
+            })
+            .collect();
+        models.sort_by_key(|model| !default.is_some_and(|default| model.id.eq_ignore_ascii_case(default)));
+        models
     }
 
     /// The provider's release default, returned in the API-model spelling
@@ -486,7 +522,7 @@ impl ReleaseCatalog {
             ));
         }
 
-        let mut identities = BTreeSet::new();
+        let mut identities_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut canonical_ids = BTreeSet::new();
         for model in &self.models {
             validate_model_shape(model)?;
@@ -498,9 +534,17 @@ impl ReleaseCatalog {
                 )));
             }
             let id = model.id.to_ascii_lowercase();
-            if !canonical_ids.insert(id.clone()) || !identities.insert(id) {
+            if !canonical_ids.insert(id.clone()) {
                 return Err(ReleaseCatalogError::new(
                     "the embedded model catalog has a duplicate model id",
+                ));
+            }
+            let identities = identities_by_provider
+                .entry(model.provider.to_ascii_lowercase())
+                .or_default();
+            if !identities.insert(id) || !identities.insert(model.api_model.to_ascii_lowercase()) {
+                return Err(ReleaseCatalogError::new(
+                    "the embedded model catalog has a colliding model identity",
                 ));
             }
             for alias in &model.aliases {
@@ -525,9 +569,14 @@ impl ReleaseCatalog {
         }
 
         for (name, provider) in &self.providers {
+            let default_model = self
+                .models
+                .iter()
+                .find(|model| model.id.eq_ignore_ascii_case(&provider.default_model));
             if name.trim().is_empty()
                 || provider.display_name.trim().is_empty()
-                || !canonical_ids.contains(&provider.default_model.to_ascii_lowercase())
+                || default_model.is_none()
+                || default_model.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
                 || !provider.default_model.starts_with(&format!("{name}/"))
             {
                 return Err(ReleaseCatalogError::new(
@@ -535,8 +584,13 @@ impl ReleaseCatalog {
                 ));
             }
         }
+        let global_default = self
+            .models
+            .iter()
+            .find(|model| model.id.eq_ignore_ascii_case(&self.defaults.model));
         if !self.providers.contains_key(&self.defaults.provider)
-            || !canonical_ids.contains(&self.defaults.model.to_ascii_lowercase())
+            || global_default.is_none()
+            || global_default.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
             || !self.defaults.model.starts_with(&format!("{}/", self.defaults.provider))
         {
             return Err(ReleaseCatalogError::new(
@@ -813,8 +867,9 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-16.1");
+        assert_eq!(catalog.revision, "2026-10-16.2");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
+        assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
         assert!(
             catalog.warnings().is_empty(),
@@ -864,6 +919,68 @@ mod tests {
             &format!("\"display_name\":\"{secret_value}\""),
         );
         assert!(ReleaseCatalog::from_json(&secret).is_err());
+
+        let unknown_field = minimal_catalog("gpt-fixture").replace(
+            "\"context_window\":8192",
+            "\"context_window\":8192,\"context_windw\":4096",
+        );
+        assert!(
+            ReleaseCatalog::from_json(&unknown_field).is_err(),
+            "a misspelled schema-v1 field must not be silently dropped"
+        );
+
+        let mut alias_collision: Value =
+            serde_json::from_str(&minimal_catalog("gpt-fixture")).expect("test: fixture JSON");
+        let models = alias_collision
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: fixture models array");
+        let first = models
+            .first_mut()
+            .and_then(Value::as_object_mut)
+            .expect("test: fixture first model object");
+        *first.get_mut("aliases").expect("test: aliases field") = serde_json::json!(["gpt-other"]);
+        let mut other = Value::Object(first.clone());
+        let other_fields = other.as_object_mut().expect("test: cloned model object");
+        *other_fields.get_mut("id").expect("test: id field") = Value::String("openai/gpt-other".to_string());
+        *other_fields.get_mut("api_model").expect("test: API model field") = Value::String("gpt-other".to_string());
+        *other_fields.get_mut("aliases").expect("test: aliases field") = serde_json::json!([]);
+        models.push(other);
+        assert!(
+            ReleaseCatalog::from_json(&alias_collision.to_string()).is_err(),
+            "an alias must not collide with another row's API model"
+        );
+    }
+
+    #[test]
+    fn listed_models_are_active_chat_rows_with_the_provider_default_first() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded catalog validates");
+        let anthropic = catalog.listed_models("anthropic");
+        assert_eq!(
+            anthropic.first().map(|model| model.id.as_str()),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(
+            anthropic.len(),
+            3,
+            "retired price/context rows stay out of new selections"
+        );
+        assert!(
+            anthropic
+                .iter()
+                .all(|model| model.lifecycle.status == ModelLifecycleStatus::Active)
+        );
+        assert!(anthropic.iter().all(|model| model.supports(ModelOperation::Chat)));
+
+        let openrouter = catalog.listed_models("openrouter");
+        assert_eq!(
+            openrouter.first().map(|model| model.id.as_str()),
+            Some("openrouter/anthropic/claude-sonnet-5")
+        );
+        assert!(
+            openrouter.iter().all(|model| model.api_model != "typesafe/jev-1.13"),
+            "a decision-only model must not be offered as a chat selection"
+        );
     }
 
     #[test]
@@ -890,9 +1007,20 @@ mod tests {
 
     #[test]
     fn catalog_view_applies_discovery_operator_and_catalog_precedence() {
-        let json =
-            minimal_catalog("gpt-fixture").replace("\"operations\":[\"chat\"]", "\"operations\":[\"embedding\"]");
-        let catalog = ReleaseCatalog::from_json(&json).expect("test: fixture catalog validates");
+        let mut value: Value =
+            serde_json::from_str(&minimal_catalog("gpt-default")).expect("test: fixture catalog is JSON");
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: fixture has models");
+        let mut embedding = models.first().expect("test: fixture has a default model").clone();
+        let embedding_fields = embedding.as_object_mut().expect("test: cloned model object");
+        *embedding_fields.get_mut("id").expect("test: id field") = Value::String("openai/gpt-fixture".to_string());
+        *embedding_fields.get_mut("api_model").expect("test: API model field") =
+            Value::String("gpt-fixture".to_string());
+        *embedding_fields.get_mut("operations").expect("test: operations field") = serde_json::json!(["embedding"]);
+        models.push(embedding);
+        let catalog = ReleaseCatalog::from_json(&value.to_string()).expect("test: fixture catalog validates");
         let provider = ProviderId::of("openai");
 
         let catalog_only = CatalogView::default().with_release_catalog(catalog);

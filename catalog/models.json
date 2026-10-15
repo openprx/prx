@@ -1,7 +1,7 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-16.1",
+  "revision": "2026-10-16.2",
   "published_at": "2026-10-16T00:00:00Z",
   "providers": {
     "anthropic": {
@@ -141,7 +141,10 @@
       "display_name": "claude-3-haiku",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -170,7 +173,10 @@
       "display_name": "claude-3.5-sonnet",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -199,7 +205,10 @@
       "display_name": "claude-fable-5",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -240,7 +249,10 @@
       "display_name": "claude-haiku-3",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -280,7 +292,10 @@
       "display_name": "claude-haiku-4-5",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -360,7 +375,10 @@
       "display_name": "claude-opus-4-20250514",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -389,7 +407,10 @@
       "display_name": "claude-opus-4-6",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -430,7 +451,10 @@
       "display_name": "claude-opus-4-7",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -512,7 +536,10 @@
       "display_name": "claude-sonnet-4-20250514",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -541,7 +568,10 @@
       "display_name": "claude-sonnet-4-6",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -1029,7 +1059,10 @@
       "display_name": "gemini-1.5-pro",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "gemini/gemini-3.5-flash"
       },
       "operations": [
         "chat"
@@ -1058,7 +1091,10 @@
       "display_name": "gemini-2.0-flash",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "gemini/gemini-3.5-flash"
       },
       "operations": [
         "chat"
@@ -1098,7 +1134,10 @@
       "display_name": "gemini-2.5-pro",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "gemini/gemini-3.5-flash"
       },
       "operations": [
         "chat"
@@ -1754,7 +1793,10 @@
       "display_name": "kimi-k2.6",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.5"
       },
       "operations": [
         "chat"
@@ -2042,7 +2084,10 @@
       "display_name": "gpt-code5.3",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openai-codex/gpt-5.2-codex"
       },
       "operations": [
         "chat"
@@ -2105,7 +2150,10 @@
       "display_name": "gpt-4o",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openai/gpt-5.6"
       },
       "operations": [
         "chat"
@@ -2145,7 +2193,10 @@
       "display_name": "gpt-4o-mini",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openai/gpt-5.6"
       },
       "operations": [
         "chat"
@@ -2265,7 +2316,10 @@
       "display_name": "gpt-5.6-sol",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openai/gpt-5.6"
       },
       "operations": [
         "chat"
@@ -2323,7 +2377,10 @@
       "display_name": "o1-preview",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openai/gpt-5.6"
       },
       "operations": [
         "chat"
@@ -2396,7 +2453,10 @@
       "display_name": "google/gemini-3-flash",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openrouter/anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -2480,7 +2540,10 @@
       "display_name": "moonshotai/kimi-k2.5",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openrouter/anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -2564,7 +2627,10 @@
       "display_name": "qwen/qwen3.5-plus",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openrouter/anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -2604,7 +2670,10 @@
       "display_name": "thudm/glm-5",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openrouter/anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -2673,7 +2742,10 @@
       "display_name": "x-ai/grok-4.1-fast",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "openrouter/anthropic/claude-sonnet-5"
       },
       "operations": [
         "chat"
@@ -3131,7 +3203,10 @@
       "display_name": "grok-3",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-10-16T00:00:00Z",
+        "retire_at": "2026-10-16T00:00:00Z",
+        "replacement": "xai/grok-4.20"
       },
       "operations": [
         "chat"
@@ -3310,6 +3385,267 @@
       ],
       "features": {},
       "limits": {},
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/deepseek-v3.1:cloud",
+      "provider": "ollama",
+      "api_model": "deepseek-v3.1:cloud",
+      "display_name": "DeepSeek V3.1 Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/gemini-3-flash-preview:cloud",
+      "provider": "ollama",
+      "api_model": "gemini-3-flash-preview:cloud",
+      "display_name": "Gemini 3 Flash Preview Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/glm-4.7:cloud",
+      "provider": "ollama",
+      "api_model": "glm-4.7:cloud",
+      "display_name": "GLM 4.7 Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/glm-5:cloud",
+      "provider": "ollama",
+      "api_model": "glm-5:cloud",
+      "display_name": "GLM 5 Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/gpt-oss:cloud",
+      "provider": "ollama",
+      "api_model": "gpt-oss:cloud",
+      "display_name": "GPT-OSS Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/minimax-m2.5:cloud",
+      "provider": "ollama",
+      "api_model": "minimax-m2.5:cloud",
+      "display_name": "MiniMax M2.5 Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/qwen2.5-coder:1.5b",
+      "provider": "ollama",
+      "api_model": "qwen2.5-coder:1.5b",
+      "display_name": "Qwen2.5 Coder 1.5B",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/qwen2.5-coder:3b",
+      "provider": "ollama",
+      "api_model": "qwen2.5-coder:3b",
+      "display_name": "Qwen2.5 Coder 3B",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "ollama/qwen2.5:cloud",
+      "provider": "ollama",
+      "api_model": "qwen2.5:cloud",
+      "display_name": "Qwen2.5 Cloud",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.0,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
       "parameters": {},
       "levels": {
         "low": {},

@@ -730,6 +730,16 @@ fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     }
 }
 
+fn prioritize_default_model(provider_name: &str, models: &mut Vec<(String, String)>) {
+    let default = default_model_for_provider(provider_name);
+    if let Some(index) = models.iter().position(|(model, _)| model == &default)
+        && index != 0
+    {
+        let entry = models.remove(index);
+        models.insert(0, entry);
+    }
+}
+
 fn supports_live_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
@@ -974,21 +984,15 @@ fn fetch_live_models_for_provider(
                 // Key is None or empty, assume local Ollama
                 fetch_ollama_models()?
             } else {
-                // Key is present, assume Ollama Cloud and return hardcoded list
-                [
-                    "glm-5:cloud",
-                    "glm-4.7:cloud",
-                    "gpt-oss:cloud",
-                    "gemini-3-flash-preview:cloud",
-                    "qwen2.5-coder:1.5b",
-                    "qwen2.5-coder:3b",
-                    "qwen2.5:cloud",
-                    "minimax-m2.5:cloud",
-                    "deepseek-v3.1:cloud",
-                ]
-                .into_iter()
-                .map(DiscoveredModel::id_only)
-                .collect()
+                // Ollama Cloud does not expose a model-list endpoint. Its
+                // release-owned fallback comes from the same catalog as every
+                // other offline model surface.
+                crate::providers::catalog::ReleaseCatalog::embedded()
+                    .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?
+                    .listed_models("ollama")
+                    .into_iter()
+                    .map(|model| DiscoveredModel::id_only(&model.api_model))
+                    .collect()
             }
         }
         _ => {
@@ -1986,6 +1990,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "Provider default model".to_string(),
         ));
     }
+    prioritize_default_model(provider_name, &mut model_options);
 
     model_options.push((
         CUSTOM_MODEL_SENTINEL.to_string(),
@@ -5446,6 +5451,39 @@ mod tests {
             catalog_models_for_provider("bedrock"),
             catalog_models_for_provider("aws-bedrock")
         );
+    }
+
+    #[test]
+    fn catalog_and_live_options_preselect_the_release_default() {
+        for (provider, expected) in [
+            ("anthropic", "claude-sonnet-5"),
+            ("openai", "gpt-5.6"),
+            ("gemini", "gemini-3.5-flash"),
+            ("xai", "grok-4.20"),
+            ("mistral", "mistral-large-latest"),
+            ("ollama", "llama3.2"),
+        ] {
+            let catalog = catalog_models_for_provider(provider);
+            assert_eq!(catalog.first().map(|(model, _)| model.as_str()), Some(expected));
+
+            let mut live = vec![
+                ("alphabetical-first".to_string(), "First".to_string()),
+                (expected.to_string(), "Provider default".to_string()),
+            ];
+            prioritize_default_model(provider, &mut live);
+            assert_eq!(live.first().map(|(model, _)| model.as_str()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ollama_cloud_fallback_is_served_from_active_release_rows() {
+        let discovered = fetch_live_models_for_provider("ollama", "fixture-key", None)
+            .expect("test: embedded Ollama fallback must load");
+        let ids: Vec<_> = discovered.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids.first().copied(), Some("llama3.2"));
+        assert!(ids.contains(&"glm-5:cloud"));
+        assert!(ids.contains(&"qwen2.5-coder:3b"));
+        assert!(!ids.contains(&"*"));
     }
 
     #[test]

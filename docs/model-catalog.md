@@ -7,10 +7,10 @@ not download or overlay catalog files at runtime. Catalog changes therefore
 arrive with a PRX release and use the normal binary rollback path.
 
 The catalog supplies the offline baseline for provider defaults, onboarding,
-`prx models list`, and provider/model descriptors. A live provider catalog is
-separate discovery evidence. User and operator choices stay in TOML, including
-`[[providers.models]]` declarations; they are never written back into the
-release JSON.
+`prx models list`, Ollama Cloud's offline fallback list, and provider/model
+descriptors. A live provider catalog is separate discovery evidence. User and
+operator choices stay in TOML, including `[[providers.models]]` declarations;
+they are never written back into the release JSON.
 
 ## Format and validation
 
@@ -29,12 +29,20 @@ Every chat model defines all three common model levels, even when a level does
 not change any parameters yet. A level is a bundle of typed parameter values;
 it is distinct from a provider's `reasoning_effort` value.
 
-The loader rejects malformed JSON, unsupported schema majors, invalid model or
-provider defaults, duplicate IDs or aliases, missing lifecycle replacements,
+The loader rejects malformed JSON, unknown schema-v1 fields, unsupported schema
+majors, invalid model or provider defaults, duplicate IDs, aliases that collide
+with an ID or API model for the same provider, missing lifecycle replacements,
 invalid prices and limits, invalid level values, credential fields, secret-like
 strings, and URLs containing user information. Newer schema minors load with a
 warning. Unknown future parameter names are ignored with a warning and never
-reach a provider request.
+reach a provider request. Loader warnings are emitted once when the embedded
+catalog is first opened.
+
+New selections show active chat rows only. Retired rows remain available as
+facts for configurations that already name them but are absent from onboarding
+and the default `models list`; decision-only rows are also absent from those chat
+pickers. Each provider's declared default is the first and preselected entry,
+independent of JSON ordering or a live provider list.
 
 Catalog capability evidence uses the same resolver path as operator and live
 facts. The order is:
@@ -47,15 +55,19 @@ facts. The order is:
 6. unverified model ID.
 
 The effective descriptor records `Catalog { revision }` when the release row
-is its evidence. A child process snapshot records that revision and refuses to
-restore under a binary with a different embedded revision.
+is its evidence. A child process snapshot records both the revision and SHA-256
+digest of the embedded JSON and refuses to restore under a binary with a
+different revision or content.
 
 ## Maintaining the release file
 
 Edit `catalog/models.json`; do not add a second built-in model table in Rust.
-Keep provider defaults pointed at active rows, keep aliases globally unique,
-and keep prices non-negative. Model IDs and model facts belong in this JSON;
-adapter code retains only protocol wire mapping and transport limits.
+Keep provider defaults pointed at active chat rows, keep aliases unambiguous
+within their provider, and keep prices non-negative. Model IDs and model facts,
+including the Ollama Cloud fallback set, belong in this JSON; adapter code
+retains only protocol wire mapping and transport limits. Increment `revision`
+for every content change; process snapshots bind the digest as an independent
+check against a missed revision bump.
 
 Run the semantic and real-path checks through the repository guard:
 

@@ -25,7 +25,7 @@ use crate::decision::model_pin::is_unpinned_model;
 
 /// The model a surface runs when neither the selection nor `default_model`
 /// names one.
-pub const DEFAULT_MODEL_FOR_UNSET: &str = "anthropic/claude-sonnet-4";
+pub const DEFAULT_MODEL_FOR_UNSET: &str = "anthropic/claude-sonnet-5";
 
 /// The configured default provider, or the one an unset `default_provider`
 /// means.
