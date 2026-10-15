@@ -473,7 +473,11 @@ is refused with 404 `exposed tool is not available`. That registry is the one
 of the current configuration generation, pinned once per call exactly as a
 webhook turn pins it, so a hot reload that adds, removes or reconfigures a tool
 takes effect on the next `POST /mcp/v1/tools/call`; before this the call kept
-resolving against the registry built at gateway start. Both gateway launch paths
+resolving against the registry built at gateway start. The handler also binds
+the exact admitted schema, catalog generation and dynamic backend identity
+before submitting its detached job. If any of those facts change before
+execution begins, the response reports a stale capability and the backend does
+not run. Both gateway launch paths
 — the daemon (rebuilt on every hot reload) and `prx gateway` — register their
 tools from one shared body, so the default-exposed set resolves on either.
 `sessions_list` and `sessions_history` on the gateway read the sub-agent run

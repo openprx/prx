@@ -402,6 +402,21 @@ pub async fn mcp_tools_call(
     {
         return Err(json_error(StatusCode::NOT_FOUND, "exposed tool is not available"));
     }
+    let execution_context = bind_mcp_execution_context(
+        Arc::clone(&turn_runtime.tools_registry),
+        turn_runtime.mcp_tool.as_ref(),
+        turn_runtime.config_generation.id.0.to_string(),
+        &config,
+        &request.name,
+        &identity,
+    )
+    .map_err(|error| {
+        tracing::warn!(tool = %request.name, error = %error, "mcp tool call admission binding failed");
+        json_error(
+            StatusCode::CONFLICT,
+            "tool capability changed or became unavailable during admission",
+        )
+    })?;
 
     // An exposed tool can be a shell command, a build, or a sub-agent run —
     // none of which has a bound. Running it inside this handler would tie it to
@@ -418,6 +433,7 @@ pub async fn mcp_tools_call(
             request.arguments,
             identity,
             idempotency,
+            execution_context,
         ),
     );
 
@@ -447,11 +463,12 @@ async fn run_mcp_tool_call_job(
     args: Value,
     identity: ExternalAgentIdentity,
     idempotency: Option<McpIdempotency>,
+    execution_context: crate::tools::ToolExecutionContext,
 ) -> Result<jobs::JobOutput, String> {
     if !tools.iter().any(|tool| tool.supports_name(&tool_name)) {
         return Err("exposed tool is not available".to_string());
     }
-    let outcome = execute_mcp_tool_call(tools, &config, &tool_name, args, &identity, idempotency).await;
+    let outcome = execute_bound_mcp_tool_call(tools, &config, &tool_name, args, idempotency, execution_context).await;
     let body = serde_json::to_value(mcp_tool_call_response(tool_name, identity, outcome))
         .map_err(|error| format!("failed to encode mcp tool result: {error}"))?;
     Ok(jobs::JobOutput::new(StatusCode::OK, body))
@@ -465,6 +482,7 @@ async fn run_mcp_tool_call_job(
 /// outcome. Reusing the key for a different command is refused rather than
 /// silently executed. Without a key nothing is deduplicated: a retry executes
 /// again, which is the contract this route had before the key was accepted.
+#[cfg(test)]
 async fn execute_mcp_tool_call(
     tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
     config: &crate::config::Config,
@@ -473,7 +491,22 @@ async fn execute_mcp_tool_call(
     identity: &ExternalAgentIdentity,
     idempotency: Option<McpIdempotency>,
 ) -> crate::tools::ToolExecutionOutcome {
-    let mut service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+    execute_bound_mcp_tool_call(
+        tools,
+        config,
+        tool_name,
+        args,
+        idempotency,
+        mcp_execution_context(identity),
+    )
+    .await
+}
+
+fn mcp_tool_execution_service(
+    tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    config: &crate::config::Config,
+) -> crate::tools::ToolExecutionService {
+    crate::tools::ToolExecutionService::from_shared_boxed_registry(
         tools,
         Arc::new(crate::tools::SecurityEffectPolicy::new(
             crate::runtime::bootstrap::build_security_policy(config),
@@ -481,7 +514,63 @@ async fn execute_mcp_tool_call(
         Arc::new(crate::tools::DenyApprovalStrategy),
         Arc::new(crate::tools::AdapterOwnedPreparation),
         Arc::new(crate::tools::TracingToolExecutionAudit),
+    )
+}
+
+/// Pin the exact executable capability admitted by the external MCP route.
+///
+/// This binding carries identity only: execution still applies owner
+/// isolation, effect policy, approval, schema and idempotency gates. Capturing
+/// it before the detached job is submitted makes any schema, generation or
+/// dynamic backend change fail closed when the job starts.
+fn bind_mcp_execution_context(
+    tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    mcp_tool: Option<&Arc<crate::tools::McpTool>>,
+    config_generation_id: String,
+    config: &crate::config::Config,
+    tool_name: &str,
+    identity: &ExternalAgentIdentity,
+) -> anyhow::Result<crate::tools::ToolExecutionContext> {
+    let service = mcp_tool_execution_service(Arc::clone(&tools), config);
+    let sources = crate::tools::capability::catalog::CatalogSources {
+        config_generation_id,
+        mcp: mcp_tool.map_or_else(Vec::new, |tool| tool.capability_snapshot()),
+        ..Default::default()
+    };
+    let catalog = Arc::new(crate::tools::capability::catalog::CapabilityCatalog::build(
+        tools.as_ref(),
+        &sources,
+        &crate::tools::capability::catalog::SurfacePolicy::default(),
+    )?);
+    catalog.check_parity(&service)?;
+    let entry = catalog
+        .entry_for_public_name(tool_name)
+        .ok_or_else(|| anyhow::anyhow!("admitted tool has no capability catalog entry"))?;
+    let mut context = mcp_execution_context(identity);
+    let binding = crate::tools::capability::execution_binding::ExecutionBinding::issued(
+        crate::causal_tree::ids::DecisionId::new_runtime(),
+        entry,
+        Arc::clone(&catalog),
+        context.envelope.clone(),
+        true,
     );
+    context.execution_bindings = Some(Arc::new(std::collections::BTreeMap::from([(
+        tool_name.to_string(),
+        binding,
+    )])));
+    context.execution_trace = Some(crate::tools::capability::execution_trace::ExecutionTrace::default());
+    Ok(context)
+}
+
+async fn execute_bound_mcp_tool_call(
+    tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    config: &crate::config::Config,
+    tool_name: &str,
+    args: Value,
+    idempotency: Option<McpIdempotency>,
+    execution_context: crate::tools::ToolExecutionContext,
+) -> crate::tools::ToolExecutionOutcome {
+    let mut service = mcp_tool_execution_service(tools, config);
     // Runtime-only keys in the request body are dropped and re-authored by the
     // service from this context, so a forged `_zc_scope` / `_zc_approval_grant`
     // in the body cannot survive into execution.
@@ -495,7 +584,7 @@ async fn execute_mcp_tool_call(
             service = service.with_idempotency_memory(ledger);
         }
     }
-    service.execute(command, mcp_execution_context(identity), None).await
+    service.execute(command, execution_context, None).await
 }
 
 /// Project a service outcome onto the MCP wire response.
@@ -6020,6 +6109,151 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         );
     }
     // ── MCP-HOTRELOAD: tools/call resolves against the current generation ──
+
+    #[derive(Clone)]
+    struct MutableMcpCompatTool {
+        schema_generation: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MutableMcpCompatTool {
+        fn new() -> Self {
+            Self {
+                schema_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn change_schema(&self) {
+            self.schema_generation.store(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for MutableMcpCompatTool {
+        fn name(&self) -> &str {
+            "memory_search"
+        }
+
+        fn description(&self) -> &str {
+            "mutable MCP compatibility fixture"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            if self.schema_generation.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                })
+            } else {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "revision": {"type": "integer"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                })
+            }
+        }
+
+        async fn execute(&self, _args: Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "mutable-fixture-ran".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// The real asynchronous handler captures a capability binding before it
+    /// submits the detached job. A schema change after the 202 response must be
+    /// rejected by the execution service before the backend is polled.
+    #[tokio::test]
+    async fn mcp_tool_call_rejects_schema_drift_after_async_admission() {
+        use crate::config::PreparedConfigGeneration as _;
+
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = production_mcp_handler_config(workspace.path());
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let (state, owner) = production_mcp_app_state(&config, &memory);
+        let tool = MutableMcpCompatTool::new();
+        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(tool.clone())]);
+
+        let previous = owner.pin();
+        let mut prepared = super::super::PreparedGatewayTurnRuntime {
+            current: Arc::clone(&owner.current),
+            previous: Arc::clone(&previous),
+            generation: super::super::TurnRuntimeGeneration {
+                provider_binding: None,
+                decision_slot: Arc::new(super::super::decision_runtime::GatewayDecisionSlot::default()),
+                config_generation: Arc::clone(&previous.config_generation),
+                provider: Arc::clone(&previous.provider),
+                model: previous.model.clone(),
+                temperature: previous.temperature,
+                tools_registry: registry,
+                mcp_tool: None,
+            },
+        };
+        prepared.commit().expect("test: publish mutable tool generation");
+
+        let result = mcp_tools_call(
+            State(state),
+            axum::http::Uri::from_static("/mcp/v1/tools/call?mode=async"),
+            bearer_headers("schema-drift"),
+            Json(McpToolCallRequest {
+                name: "memory_search".to_string(),
+                arguments: serde_json::json!({"query": "fixture"}),
+            }),
+        )
+        .await;
+        let (status, Json(body)) = match result {
+            Ok(response) | Err(response) => response,
+        };
+        assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+        let job_id = body
+            .get("job_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("test: accepted response carries a job id");
+
+        // `#[tokio::test]` uses a current-thread runtime. The spawned job cannot
+        // be polled until this test yields, so this is deterministically after
+        // admission and before execution starts.
+        tool.change_schema();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = jobs::snapshot(job_id).expect("test: submitted job remains observable");
+                if snapshot.status != "running" {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test: detached MCP job must settle");
+        assert_eq!(snapshot.status, "succeeded", "snapshot: {snapshot:?}");
+        let result = snapshot.result.expect("test: settled job carries a response");
+        assert_eq!(
+            result.pointer("/is_error"),
+            Some(&Value::Bool(true)),
+            "result: {result}"
+        );
+        assert!(
+            body_str(&result, "/content/0/text")
+                .contains("capability scope, generation, schema or backend binding is stale"),
+            "result: {result}"
+        );
+        assert_eq!(
+            tool.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale capability must be rejected before backend execution"
+        );
+    }
 
     /// A hot reload publishes a new tool registry through the turn-runtime
     /// owner, as it does for webhook turns. The boot-time registry here lacks
