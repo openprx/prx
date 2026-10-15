@@ -198,12 +198,12 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/postgres.rs::{qualified_memory_events_table}",
     "src/memory/postgres.rs::{qualified_message_events_table}",
     "src/memory/postgres.rs::{schema_ident}.approval_grant_events",
-    "src/memory/sqlite/mod.rs::approval_grant_events",
-    "src/memory/sqlite/mod.rs::evolution_proposal_events",
-    "src/memory/sqlite/mod.rs::memory_events",
-    "src/memory/sqlite/mod.rs::memory_events",
-    "src/memory/sqlite/mod.rs::message_events",
-    "src/memory/sqlite/mod.rs::message_events",
+    "src/memory/sqlite/approval_grants.rs::approval_grant_events",
+    "src/memory/sqlite/approval_grants.rs::memory_events",
+    "src/memory/sqlite/schema.rs::evolution_proposal_events",
+    "src/memory/sqlite/schema.rs::memory_events",
+    "src/memory/sqlite/schema.rs::message_events",
+    "src/memory/sqlite/schema.rs::message_events",
     "src/memory/sqlite/tests/schema_and_documents.rs::message_events",
     // The `memory_events` tables in `tests/visibility_events.rs` are pre-v16
     // fixtures (`legacy_memory_events_gets_owner_id_column_on_init` and its
@@ -645,7 +645,20 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     // scanner that needs its own planted-violation probe). `include_str!`
     // fails the build if one of them moves, and a column that moves to a file
     // missing from this list fails the check below, so neither can go blind.
-    let sqlite_source = [include_str!("../src/memory/sqlite/mod.rs")].join("\n");
+    let sqlite_source = [
+        include_str!("../src/memory/sqlite/mod.rs"),
+        include_str!("../src/memory/sqlite/approval_grants.rs"),
+        include_str!("../src/memory/sqlite/documents.rs"),
+        include_str!("../src/memory/sqlite/drafts.rs"),
+        include_str!("../src/memory/sqlite/events.rs"),
+        include_str!("../src/memory/sqlite/evolution.rs"),
+        include_str!("../src/memory/sqlite/memory_impl.rs"),
+        include_str!("../src/memory/sqlite/mirror.rs"),
+        include_str!("../src/memory/sqlite/recall.rs"),
+        include_str!("../src/memory/sqlite/rows.rs"),
+        include_str!("../src/memory/sqlite/schema.rs"),
+    ]
+    .join("\n");
     assert!(
         !sqlite_source.trim().is_empty(),
         "the sqlite backend source files under src/memory/sqlite/ must not be empty"

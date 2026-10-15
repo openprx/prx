@@ -17,6 +17,13 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+use super::recall::{VECTOR_CANDIDATE_CAP, vector_candidate_cap, vector_candidate_query};
+use crate::memory::traits::{
+    CompactionRunInput, DocumentIngestInput, Memory, MemoryCategory, MemoryDraftInput, MemoryEvent, MemoryEventInput,
+    MemoryLinkInput, MemoryReadMode, MemoryStoreMetadata, MemoryVisibility, RetrievalTraceInput, SessionContextQuery,
+    SharedContextQuery,
+};
+
 mod message_events;
 mod mirror_and_guards;
 mod owner_isolation;
