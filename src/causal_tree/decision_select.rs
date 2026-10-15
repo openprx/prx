@@ -286,6 +286,16 @@ impl CausalSelector {
         let Some(&(top, top_score, top_mass)) = passed.first() else {
             return Err(SelectError::CandidateMismatch);
         };
+        // An exactly named capability that needs approval, with an available
+        // verified approval scope, asks for approval; a plain Answer must not
+        // silently replace the action the operator named.
+        if top.action() == CausalActionKind::Answer
+            && let Some(approval) = available_approval(candidates, approval_scopes, pre_commit)
+            && matches!(&approval, Selection::RequestApproval { pending_candidate_id, .. }
+                if exact_mentions.contains(pending_candidate_id))
+        {
+            return Ok(approval);
+        }
         // A uniquely selected exact action remains model-selected even when
         // the distribution across generic action/target options has low
         // entropy confidence. It still needs an authenticated current direct

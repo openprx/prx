@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+mod approval_selection_tests;
+#[cfg(test)]
 pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;

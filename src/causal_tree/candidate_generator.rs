@@ -628,7 +628,14 @@ impl CausalCandidateGenerator {
                 truncated.push(candidate.candidate_id().clone());
             }
         }
-        exact_mentions.retain(|id| kept.iter().any(|candidate| candidate.candidate_id() == id));
+        // An exactly named capability that is approval-only stays recorded as an
+        // exact mention: the selector uses it to prefer the approval request.
+        exact_mentions.retain(|id| {
+            kept.iter().any(|candidate| candidate.candidate_id() == id)
+                || approval_only
+                    .iter()
+                    .any(|pending| pending.candidate.candidate_id() == id)
+        });
         approval_scopes.retain(|id, _| kept.iter().any(|candidate| candidate.candidate_id() == id));
         Ok(CandidateSet::Legal {
             discoverable_families,
