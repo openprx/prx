@@ -359,7 +359,7 @@ pub(super) async fn classify_with_model(
     let prompt = build_classifier_prompt(recent_context, latest, bot_names);
     let messages = [
         crate::providers::ChatMessage::system(CLASSIFIER_SYSTEM_PROMPT),
-        crate::providers::ChatMessage::user(prompt),
+        crate::agent::turn_contracts::inbound_user_message_owned(prompt),
     ];
     let accounting_deadline = accounting.deadline();
     let configured_deadline = std::time::Instant::now()
