@@ -2711,7 +2711,7 @@ mod tests {
                     use std::fmt::Write as _;
                     let _ = write!(
                         payload,
-                        "{CONSOLE_BULKY_MARKER}-{index}-龘齉靐齾爩鱻麤灪爨籱癵驫麣纞虋讟钃鸜麷韽饢顟顠顡 "
+                        "{CONSOLE_BULKY_MARKER}-{index}-\u{9f98}\u{9f49}\u{9750}\u{9f7e}\u{7229}\u{9c7b}\u{9ea4}\u{706a}\u{7228}\u{7c71}\u{7675}\u{9a6b}\u{9ea3}\u{7e9e}\u{864b}\u{8b9f}\u{9483}\u{9e1c}\u{9eb7}\u{97fd}\u{9962}\u{985f}\u{9860}\u{9861} "
                     );
                     index += 1;
                 }

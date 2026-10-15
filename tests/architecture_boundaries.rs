@@ -4650,8 +4650,14 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
     let execute = function_body(production, "execute");
     assert!(
-        compact_rust_tokens(&execute).contains("self.execute_inner(command,context,cancellation).await")
-            && execute.matches("execute_inner(").count() == 1
+        {
+            // The canonical pipeline is boxed so callers carry a pointer, not the
+            // whole state machine; the boxed and the bare await are both the one
+            // call into `execute_inner`.
+            let compact = compact_rust_tokens(&execute);
+            compact.contains("self.execute_inner(command,context,cancellation).await")
+                || compact.contains("Box::pin(self.execute_inner(command,context,cancellation)).await")
+        } && execute.matches("execute_inner(").count() == 1
             && function_body(production, "execute_inner")
                 .matches("enforce_command_contract(")
                 .count()
@@ -5557,8 +5563,10 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/tools/skills.rs::execute_named",
-        1,
-        "decorator: skill aliases forward to the skill runner",
+        3,
+        "decorator: `SkillTool` forwards an alias to the skill runner, and `SkillReadTool` \
+         rewrites a catalog alias into its own `name` argument (or forwards the exact name) and \
+         re-enters its own `execute`; both are the already-gated outer call, not a new entry",
     ),
     (
         "src/tools/skills.rs::execute_resolved",
