@@ -8045,7 +8045,10 @@ fn resolver_imports(production: &str) -> Vec<String> {
 /// PMM-C-L / D-065: the agent loop's entries (`prx agent`, cron and xin agent
 /// jobs, `prx go --message`) resolve their provider and model exactly once,
 /// in `agent::entry::resolve_agent_model_choice`, and before the runtime
-/// bootstrap; the callers do not resolve it again under any name.
+/// bootstrap. The only later re-resolution is the explicit credential-source
+/// attestation immediately before construction. Each configured route is then
+/// resolved once, from its own credential, inside the typed routed factory;
+/// callers do not resolve either selection again under any name.
 #[test]
 fn agent_loop_entries_resolve_the_model_once() {
     let entry = production_part(&read_source(&repository_root().join("src/agent/entry.rs")));
@@ -8057,10 +8060,24 @@ fn agent_loop_entries_resolve_the_model_once() {
     );
     assert_eq!(
         resolution.matches("providers::selection::check_routes(").count(),
-        1,
-        "resolve_agent_model_choice resolves the routed destinations once"
+        0,
+        "resolve_agent_model_choice leaves per-route resolution to the typed routed factory"
     );
-    let outside = entry.replacen(&resolution, "", 1);
+
+    let providers = production_part(&read_source(&repository_root().join("src/providers/mod.rs")));
+    let routed_factory = function_body(&providers, "create_routed_provider_for");
+    assert_eq!(
+        routed_factory.matches("selection::resolve_route(").count(),
+        1,
+        "create_routed_provider_for resolves every configured route through the typed resolver"
+    );
+    let attestation = function_body(&entry, "factory_credential_source_matches");
+    assert_eq!(
+        attestation.matches("providers::selection::check_with(").count(),
+        1,
+        "the construction-time credential-source attestation re-resolves exactly once"
+    );
+    let outside = entry.replacen(&resolution, "", 1).replacen(&attestation, "", 1);
     for needle in RESOLVER_NEEDLES {
         assert!(
             !outside.contains(needle),
