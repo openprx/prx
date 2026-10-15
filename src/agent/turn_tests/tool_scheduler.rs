@@ -17,7 +17,7 @@ use crate::agent::execution_policy::{
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::ToolResultRecorder;
 use crate::agent::tool_result_recording::tool_result_is_success;
-use crate::agent::turn_contracts::{ChatMode, ScopeContext};
+use crate::agent::turn_contracts::{ApprovalDecision, ApprovalResolver, ChatMode, ScopeContext};
 use crate::agent::turn_tests::{DelayTool, RecordingTool, scheduler_test_adapter};
 use crate::approval::ApprovalManager;
 #[cfg(test)]
@@ -275,7 +275,7 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
         crate::tools::ToolExecutionDecision::Allow
     );
     let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
-    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, &ledger_dir);
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, None, &ledger_dir);
     let calls = single_call("delegate", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
@@ -289,6 +289,10 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
     );
 }
 
+/// Companion to the fail-closed test: under the SAME conditions (supervised,
+/// scope present, no `ApprovalManager`) a genuinely read-only tool resolves
+/// to `Allow` and still executes through the production executor, so the
+/// fail-closed denial does not over-block observational tools.
 #[tokio::test]
 async fn supervised_read_only_tool_without_approval_manager_still_executes() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
@@ -304,7 +308,7 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
     };
     let scope_ctx = scheduler_scope(&policy, "user@example.com");
     let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
-    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, &ledger_dir);
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, None, &ledger_dir);
     let calls = single_call("file_read", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
@@ -319,6 +323,10 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
     );
 }
 
+/// P2-a: a tool on the session "Always" allowlist executes immediately under
+/// `supervised` without re-prompting, even when an `ApprovalManager` is wired
+/// (production: `AgentToolApprovalStrategy` in `execution_policy.rs`) -- the
+/// "Always" shortcut survived the move to the unified `decide` gate.
 #[tokio::test]
 async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
@@ -341,7 +349,7 @@ async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
 
     // No resolver: a non-allowlisted Act tool would deny on this channel.
     let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
-    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, Some(Arc::clone(&mgr)), &ledger_dir);
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, Some(Arc::clone(&mgr)), None, &ledger_dir);
     let calls = single_call("delegate", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
@@ -380,6 +388,7 @@ fn scoped_scheduler_adapter(
     tools: Vec<Box<dyn Tool>>,
     scope: &ScopeContext<'_>,
     approval: Option<Arc<ApprovalManager>>,
+    approval_resolver: Option<Arc<dyn ApprovalResolver>>,
     ledger_dir: &TempDir,
 ) -> ToolLoopRuntimeAdapter {
     let ledger: Arc<dyn crate::memory::Memory> = Arc::new(
@@ -390,7 +399,7 @@ fn scoped_scheduler_adapter(
         channel_name: scope.channel,
         tools_registry: Arc::new(tools),
         approval,
-        approval_resolver: None,
+        approval_resolver,
         cancellation: None,
         ledger: Some(ledger),
         unscoped_policy: None,
@@ -415,6 +424,98 @@ fn single_call(name: &str, arguments: serde_json::Value) -> Vec<ParsedToolCall> 
         name: name.to_string(),
         arguments,
     }]
+}
+
+/// Resolver double that returns a fixed decision and counts its invocations.
+struct FixedApprovalResolver {
+    decision: ApprovalDecision,
+    calls: AtomicUsize,
+}
+
+impl FixedApprovalResolver {
+    fn new(decision: ApprovalDecision) -> Arc<Self> {
+        Arc::new(Self {
+            decision,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl ApprovalResolver for FixedApprovalResolver {
+    async fn resolve(&self, _request: &crate::approval::ApprovalRequest, _channel: &str) -> ApprovalDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
+    }
+}
+
+/// Runs a supervised, non-allowlisted `delegate` call on the non-CLI `telegram`
+/// channel through the production executor and returns (result, executions).
+async fn run_supervised_act_call_with_approval(resolver: Option<Arc<dyn ApprovalResolver>>) -> (String, Vec<String>) {
+    let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+        name: "delegate".to_string(),
+        execution_order: Arc::clone(&execution_order),
+    })];
+    let policy = crate::security::SecurityPolicy {
+        autonomy: crate::security::AutonomyLevel::Supervised,
+        ..crate::security::SecurityPolicy::default()
+    };
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+    let mgr = Arc::new(ApprovalManager::new());
+    assert!(!mgr.is_session_allowlisted("delegate"));
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, Some(mgr), resolver, &ledger_dir);
+    let calls = single_call("delegate", serde_json::json!({}));
+    let mut results =
+        run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+    let executed = execution_order
+        .lock()
+        .expect("execution order lock should be valid")
+        .clone();
+    (results.remove(0), executed)
+}
+
+#[tokio::test]
+async fn supervised_act_tool_with_granting_resolver_executes_once() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let resolver = FixedApprovalResolver::new(ApprovalDecision::Grant);
+    let (result, executed) = run_supervised_act_call_with_approval(Some(resolver.clone())).await;
+
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "the resolver must be asked once"
+    );
+    assert_eq!(result, "delegate", "a granted call returns the tool output: {result}");
+    assert_eq!(executed, ["delegate"], "a granted Act tool must execute exactly once");
+}
+
+#[tokio::test]
+async fn supervised_act_tool_with_denying_resolver_is_not_executed() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let resolver = FixedApprovalResolver::new(ApprovalDecision::Deny);
+    let (result, executed) = run_supervised_act_call_with_approval(Some(resolver.clone())).await;
+
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "the resolver must be asked once"
+    );
+    assert!(result.contains("Denied by user"), "denial text expected, got: {result}");
+    assert!(executed.is_empty(), "a denied Act tool must NOT execute");
+}
+
+#[tokio::test]
+async fn supervised_act_tool_with_manager_but_no_resolver_on_non_cli_channel_is_denied() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let (result, executed) = run_supervised_act_call_with_approval(None).await;
+
+    assert!(result.contains("Denied by user"), "denial text expected, got: {result}");
+    assert!(
+        executed.is_empty(),
+        "without a resolver a non-CLI channel must deny, not approve"
+    );
 }
 
 fn slow_tool_registry(delay_ms: u64) -> Vec<Box<dyn Tool>> {
