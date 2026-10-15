@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 500;
 
 /// Tool that retrieves the conversation history of a spawned sub-agent run.
 pub struct SessionsHistoryTool {
@@ -91,10 +92,7 @@ impl Tool for SessionsHistoryTool {
             }
         };
 
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
+        let limit = super::limits::bounded_limit(&args, "limit", DEFAULT_LIMIT, MAX_LIMIT);
 
         // C03 / V02-R4: see `sessions_list` — an externally authenticated caller
         // only reaches the registry entries its own owner registered. Anything
@@ -373,6 +371,29 @@ mod tests {
         let result = tool.execute(json!({"run_id": "run-3", "limit": 5})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("showing 5/20"));
+    }
+
+    #[tokio::test]
+    async fn gemini_relaxed_executor_limit_is_clamped_by_sessions_history() {
+        let entries = (0..=MAX_LIMIT)
+            .map(|index| make_entry("user", &format!("entry-{index:03}")))
+            .collect();
+        let run = make_run("bounded-history", SubAgentStatus::Completed("done".into()), entries);
+        let tool = SessionsHistoryTool::new(Arc::new(RwLock::new(vec![run])));
+        let schema = tool.parameters_schema();
+        let wire = crate::tools::ToolSchemaDialect::Gemini
+            .wire_schema(tool.name(), &schema)
+            .expect("Gemini schema lowering");
+        assert!(wire.pointer("/properties/limit/maximum").is_none());
+
+        let result = tool
+            .execute(json!({"run_id": "bounded-history", "limit": u64::MAX}))
+            .await
+            .expect("sessions_history execution");
+
+        assert!(result.output.contains("showing 500/501"), "{}", result.output);
+        assert!(result.output.contains("entry-499"), "{}", result.output);
+        assert!(!result.output.contains("entry-500"), "{}", result.output);
     }
 
     #[tokio::test]

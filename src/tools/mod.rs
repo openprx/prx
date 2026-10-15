@@ -39,6 +39,7 @@ pub mod git_operations;
 pub mod http_request;
 pub mod image;
 pub mod image_info;
+mod limits;
 pub(crate) mod owner_filesystem;
 mod owner_filesystem_dispatch;
 // Historical selectors remain test-only until their positive coverage has

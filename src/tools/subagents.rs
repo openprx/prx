@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const DEFAULT_LIMIT: usize = 20;
+const MAX_LIMIT: usize = 100;
 
 /// Manage running/recent sub-agent sessions created by `sessions_spawn`.
 pub struct SubagentsTool {
@@ -488,10 +489,7 @@ impl Tool for SubagentsTool {
         match action {
             "list" => {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
+                let limit = super::limits::bounded_limit(&args, "limit", DEFAULT_LIMIT, MAX_LIMIT);
                 self.execute_list(status, limit, &owner_scope).await
             }
             "kill" => {
@@ -1096,6 +1094,32 @@ mod tests {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
         let result = tool.execute(json!({"action": "list", "limit": 2})).await.unwrap();
         assert!(result.output.contains("2 shown"));
+    }
+
+    #[tokio::test]
+    async fn gemini_relaxed_executor_limit_is_clamped_by_subagents() {
+        let runs = (0..=MAX_LIMIT)
+            .map(|index| {
+                let mut run = make_run(&format!("run-{index:03}"), SubAgentStatus::Running);
+                run.task = format!("task-{index:03}");
+                run
+            })
+            .collect();
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let schema = tool.parameters_schema();
+        let wire = crate::tools::ToolSchemaDialect::Gemini
+            .wire_schema(tool.name(), &schema)
+            .expect("Gemini schema lowering");
+        assert!(wire.pointer("/properties/limit/maximum").is_none());
+
+        let result = tool
+            .execute(json!({"action": "list", "limit": u64::MAX}))
+            .await
+            .expect("subagents execution");
+
+        assert!(result.output.contains("100 shown"), "{}", result.output);
+        assert!(result.output.contains("run-099"), "{}", result.output);
+        assert!(!result.output.contains("run-100"), "{}", result.output);
     }
 
     // ── default action (no action param) → list ─────────────────

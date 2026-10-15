@@ -479,8 +479,12 @@ tools from one shared body, so the default-exposed set resolves on either.
 `sessions_list` and `sessions_history` on the gateway read the sub-agent run
 registry that this gateway's own `sessions_spawn` writes to, together with the
 owner-qualified memory projection described below; they are not a separate,
-empty registry that would answer every caller with an empty list. One
-conditional exception remains: `memory_recall` is withheld from the registry
+empty registry that would answer every caller with an empty list. An
+executor-side bound applies even when a provider dialect omits JSON Schema
+range keywords: `sessions_list` and `subagents` list return at most 100 runs,
+and `sessions_history` returns at most 500 entries; explicit zero limits clamp
+to one. A conditional exception remains: `memory_recall` is withheld from the
+registry
 whenever `memory.acl_enabled` is true, so with memory ACL on that name is still
 advertised and answers 404.
 

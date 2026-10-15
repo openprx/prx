@@ -14,6 +14,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const DEFAULT_LIMIT: usize = 20;
+const MAX_LIMIT: usize = 100;
+
 /// Tool to list active and recently completed sub-agent sessions.
 pub struct SessionsListTool {
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
@@ -81,7 +84,7 @@ impl Tool for SessionsListTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let status_filter = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let limit = super::limits::bounded_limit(&args, "limit", DEFAULT_LIMIT, MAX_LIMIT);
 
         // C03 / V02-R4: the run registry is shared by every origin in this
         // process. An externally authenticated caller may only see the runs its
@@ -494,6 +497,34 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No sessions"));
+    }
+
+    #[tokio::test]
+    async fn gemini_relaxed_executor_limit_is_clamped_by_sessions_list() {
+        let runs = (0..=MAX_LIMIT)
+            .map(|index| {
+                make_run(
+                    &format!("run-{index:03}"),
+                    SubAgentStatus::Running,
+                    &format!("task-{index:03}"),
+                )
+            })
+            .collect();
+        let tool = SessionsListTool::new(Arc::new(RwLock::new(runs)));
+        let schema = tool.parameters_schema();
+        let wire = crate::tools::ToolSchemaDialect::Gemini
+            .wire_schema(tool.name(), &schema)
+            .expect("Gemini schema lowering");
+        assert!(wire.pointer("/properties/limit/maximum").is_none());
+
+        let result = tool
+            .execute(json!({"limit": u64::MAX}))
+            .await
+            .expect("sessions_list execution");
+
+        assert!(result.output.contains("100 shown"), "{}", result.output);
+        assert!(result.output.contains("run-099"), "{}", result.output);
+        assert!(!result.output.contains("run-100"), "{}", result.output);
     }
 
     #[tokio::test]
