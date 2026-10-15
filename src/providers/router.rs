@@ -28,6 +28,7 @@ pub struct Route {
 /// This wraps multiple pre-created providers and selects the right one per request.
 pub struct RouterProvider {
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
+    refused_routes: HashMap<String, String>,  // hint → construction/refusal reason
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     _default_model: String,
@@ -71,6 +72,7 @@ impl RouterProvider {
 
         Self {
             routes: resolved_routes,
+            refused_routes: HashMap::new(),
             providers,
             default_index: 0,
             _default_model: default_model,
@@ -84,6 +86,7 @@ impl RouterProvider {
     pub(super) fn from_resolved(
         default: (String, Box<dyn Provider>),
         routes: Vec<(String, String, String, Box<dyn Provider>)>,
+        refused_routes: Vec<(String, String)>,
         default_model: String,
     ) -> Self {
         let mut providers = Vec::with_capacity(routes.len() + 1);
@@ -96,6 +99,7 @@ impl RouterProvider {
         }
         Self {
             routes: resolved_routes,
+            refused_routes: refused_routes.into_iter().collect(),
             providers,
             default_index: 0,
             _default_model: default_model,
@@ -112,6 +116,9 @@ impl RouterProvider {
             validate_user_route_hint(model)?;
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
                 return Ok((*idx, resolved_model.clone()));
+            }
+            if let Some(refusal) = self.refused_routes.get(hint) {
+                anyhow::bail!("{refusal}");
             }
             anyhow::bail!("unknown route hint '{hint}'");
         }
@@ -284,13 +291,13 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
         use futures::StreamExt as _;
-        let Ok((provider_idx, resolved_model)) = self.resolve(model) else {
-            return futures::stream::once(async move {
-                Err(super::traits::StreamError::Provider(
-                    "RouterProvider: invalid route hint".to_string(),
-                ))
-            })
-            .boxed();
+        let (provider_idx, resolved_model) = match self.resolve(model) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let message = error.to_string();
+                return futures::stream::once(async move { Err(super::traits::StreamError::Provider(message)) })
+                    .boxed();
+            }
         };
         let Some((_, provider)) = self.providers.get(provider_idx) else {
             // resolve() always returns a valid idx; defensively return an error chunk instead of panicking.

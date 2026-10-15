@@ -1530,12 +1530,8 @@ pub(crate) fn build_gateway_provider_selection(
 ) -> anyhow::Result<(Arc<dyn Provider>, providers::catalog::ResolvedModel)> {
     let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
     let catalog = providers::selection::catalog_for(config);
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_provider_for(
-        &resolved,
-        &catalog,
-        &config.reliability,
-        &config.cost,
-        options,
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_for(
+        &resolved, &catalog, config, options,
     )?);
     Ok((provider, resolved))
 }

@@ -536,39 +536,50 @@ pub fn resolve_routes(
 ) -> anyhow::Result<Vec<(String, ResolvedModel)>> {
     let mut resolved = Vec::with_capacity(config.model_routes.len());
     for route in &config.model_routes {
-        if route.model.trim().starts_with("hint:") {
-            return Err(anyhow::anyhow!(
-                "model route `hint:{}` is refused: its model '{}' is itself a routing hint, which the router sends \
-                 literally; name a model",
-                route.hint,
-                route.model.trim()
-            ));
-        }
-        let credential = if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-            CredentialRef::LegacyInline(LegacySlot::ModelRoute(route.hint.clone()))
-        } else if let Some(id) = route
-            .credential_ref
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            CredentialRef::Profile { id: id.to_string() }
-        } else {
-            credential_for(config, &route.provider)
-        };
-        let selection = check_with(
-            config,
-            catalog,
-            &route.provider,
-            &route.model,
-            credential,
-            &Requirement::chat(),
-            policy,
-        )
-        .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))?;
+        let selection = resolve_route(config, catalog, route, policy)?;
         resolved.push((route.hint.clone(), selection));
     }
     Ok(resolved)
+}
+
+/// Resolve one configured chat route. Routed provider construction uses this
+/// per route so one refused destination cannot disable unrelated surfaces.
+pub(crate) fn resolve_route(
+    config: &Config,
+    catalog: &CatalogView,
+    route: &crate::config::ModelRouteConfig,
+    policy: UnknownPolicy,
+) -> anyhow::Result<ResolvedModel> {
+    if route.model.trim().starts_with("hint:") {
+        anyhow::bail!(
+            "model route `hint:{}` is refused: its model '{}' is itself a routing hint, which the router sends \
+             literally; name a model",
+            route.hint,
+            route.model.trim()
+        );
+    }
+    let credential = if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        CredentialRef::LegacyInline(LegacySlot::ModelRoute(route.hint.clone()))
+    } else if let Some(id) = route
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        CredentialRef::Profile { id: id.to_string() }
+    } else {
+        credential_for(config, &route.provider)
+    };
+    check_with(
+        config,
+        catalog,
+        &route.provider,
+        &route.model,
+        credential,
+        &Requirement::chat(),
+        policy,
+    )
+    .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
 /// How the configured default resolves, in one line for `prx doctor` and

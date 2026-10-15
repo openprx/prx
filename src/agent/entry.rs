@@ -1397,8 +1397,8 @@ impl AgentModelBinding {
 /// This is the one resolution of the entry. An operator's invocation runs an
 /// id-only model with a warning and refuses one the evidence rules out
 /// (D-034). The chain the entry builds is routed, so every `[[model_routes]]`
-/// destination is resolved too, on every run, and a `hint:` model is checked
-/// as the destination it names (D-035).
+/// destination is resolved when the routed provider is built, and a `hint:`
+/// model is checked as the destination it names (D-035).
 pub(crate) fn resolve_agent_model_choice(
     config: &Config,
     provider_override: Option<&str>,
@@ -1416,7 +1416,6 @@ pub(crate) fn resolve_agent_model_choice(
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )?;
-    providers::selection::check_routes(config, &catalog, providers::catalog::UnknownPolicy::Invocation)?;
     let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
     Ok(AgentModelChoice {
         provider_name: provider_name.to_string(),

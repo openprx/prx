@@ -118,6 +118,10 @@ credential together. A process worker checks the sealed route against its
 pinned configuration before it sends a request. A direct-model override under
 a routed parent uses the selected provider's connection: a named agent's own
 credential stays with that agent, while a root child uses the root connection.
+At routed-surface startup, each non-default route is resolved and built
+independently. A refused or unbuildable route is skipped with a warning rather
+than disabling the default or another route; selecting its `hint:` returns the
+retained refusal without sending a provider request.
 
 Where the resolver runs. Every surface resolves before it builds a provider,
 so a refusal sends nothing and names the model, the provider (URL userinfo
@@ -125,11 +129,11 @@ redacted), the evidence and the fix:
 
 | Surface | What is resolved | Policy |
 | --- | --- | --- |
-| `prx chat` startup, `/model`, `/provider`; every `[[model_routes]]` destination | chat | invocation |
+| `prx chat` startup, `/model`, `/provider`; each `[[model_routes]]` destination is retained as either a ready route or a named refusal | chat | invocation |
 | channel runtime start-up, channel `/model` (the route is left unchanged on a refusal); under the daemon, every hot reload that changes the default provider or model, the provider tables or the routes restarts the channel runtime, which resolves again, so a reload to a model that cannot chat is refused and the previous configuration stays active. A standalone `prx channels start` applies such changes only on restart | chat | invocation |
 | gateway start-up and each configuration generation (a refused default rejects the generation; the previous one stays active) | chat | invocation |
 | `delegate`, `sessions_spawn` (task and process workers) | chat | invocation |
-| `prx agent` (`--provider`, `--model`), `prx go --message`, and cron and xin agent jobs, which run through it: the selection and every configured `[[model_routes]]` destination (whether or not the run uses it), once per run, before the runtime starts | chat | invocation |
+| `prx agent` (`--provider`, `--model`), `prx go --message`, and cron and xin agent jobs, which run through it: the selection and every configured `[[model_routes]]` destination, retained as ready or refused once per run | chat | invocation |
 | the evolution judge: judges with the resolved default model (the route destination for a `hint:`). A default that cannot be resolved or built leaves only the deterministic mock scorer, which sends nothing: its verdict is a deferral in every mode — a proposed Auto-mode change is not written — and the `evolution_judge` health component and a warning say so. A model judge whose call fails, whose reply is not a score, or that does not answer within `[self_system] evolution_judge_timeout_secs` (default 180) is deferred the same way (`judge_failed`). Evolution changes are written only after an accepted verdict; a deferred cycle is logged as `deferred` (see [evolution](evolution.md#judge-verdicts)). The memory layer's engine scores with the mock scorer, so it never applies in Auto mode | chat | invocation |
 | `prx go` (resolved by the agent entry with `--message`, by chat start-up otherwise) | chat | invocation |
 | memory embedders and `[[embedding_routes]]` (a refused embedder falls back to keyword recall) | embeddings | invocation |
@@ -176,7 +180,9 @@ spawned children and the evolution judge all construct through the resolved
 model factory, so the same configuration is refused on every entrypoint before
 transport. Routed providers construct the default and every `hint:` destination
 from separate resolved selections; two hints that name the same provider still
-keep their own credential, model facts and fallback admission.
+keep their own credential, model facts and fallback admission. A bad
+non-default destination does not stop startup: its hint retains that exact
+refusal and returns it if selected.
 
 At failover time, every fallback pair is checked against the primary turn's
 admission facts before a request is sent. A fallback needs a valid cost entry
@@ -726,12 +732,11 @@ explicit signal from the upstream.
 - Stream idle timeout is controlled by
   `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default 45 seconds, minimum 5).
 
-A resolved keyless root connection for Ollama (non-cloud models) or an
-OpenAI-compatible `custom:` endpoint keeps its configured endpoint and
-provider-owned rotation keys. Its initial provider is constructed without
-looking up an auth profile. This applies to a PMM-resolved root connection;
-legacy provider-store lookup and explicit profile/OAuth flows keep their existing
-behavior. Key-required providers such as OpenAI still use their configured
-profile fallback when the root has no key, and that fallback cannot attest a
-root credential for CLI decision authority. A connection is never released to a
-different provider identity.
+A Root connection with `api_url` or `reliability.api_keys` but no `api_key`
+keeps that owner-bound endpoint and rotation material, then performs the same
+provider-store lookup as an otherwise unconfigured key: active auth profile,
+environment credential, OAuth cache or subscription login, according to the
+provider. Keyless providers still build when that lookup finds nothing. OpenAI
+Codex is the exception in the other direction: it always uses its own login and
+ignores Root API keys, URL and rotation keys. A Root connection is never
+released to a different provider identity.

@@ -3146,7 +3146,14 @@ pub fn create_provider_for(
         model_fallbacks.insert(primary.to_string(), siblings.clone());
     }
     let reliability = crate::config::ReliabilityConfig {
-        api_keys: resolved.credential().rotation_keys().to_vec(),
+        // OpenAI Codex authenticates from its own login store. Root rotation
+        // keys are configuration for ordinary API-key providers and must not
+        // create duplicate Codex provider instances.
+        api_keys: if is_openai_codex_alias(label) {
+            Vec::new()
+        } else {
+            resolved.credential().rotation_keys().to_vec()
+        },
         model_fallbacks,
         ..reliability.clone()
     };
@@ -3198,10 +3205,13 @@ pub fn create_provider_for(
 /// therefore cannot inherit another route's key, dialect or fallback facts,
 /// including when two hints name the same provider label.
 ///
+/// A refused or unbuildable route is retained as a refusal attached to its
+/// hint. Other routes and the default remain available; selecting that hint
+/// returns the original refusal.
+///
 /// # Errors
 ///
-/// When any configured route is refused or any exact provider chain cannot be
-/// constructed.
+/// When the default provider chain cannot be constructed.
 pub fn create_routed_provider_for(
     resolved: &catalog::ResolvedModel,
     catalog: &catalog::CatalogView,
@@ -3212,21 +3222,36 @@ pub fn create_routed_provider_for(
     if config.model_routes.is_empty() {
         return Ok(default);
     }
-    let route_selections = selection::resolve_routes(config, catalog, catalog::UnknownPolicy::Invocation)?;
-    let mut routes = Vec::with_capacity(route_selections.len());
-    for (hint, route) in route_selections {
-        let provider = create_provider_for(&route, catalog, &config.reliability, &config.cost, options)
-            .map_err(|error| anyhow::anyhow!("model route `hint:{hint}` could not be built: {error}"))?;
-        routes.push((
-            hint,
-            route.provider_label().to_string(),
-            route.model().to_string(),
-            provider,
-        ));
+    let mut routes = Vec::with_capacity(config.model_routes.len());
+    let mut refused_routes = Vec::new();
+    for configured in &config.model_routes {
+        let built = selection::resolve_route(config, catalog, configured, catalog::UnknownPolicy::Invocation).and_then(
+            |route| {
+                create_provider_for(&route, catalog, &config.reliability, &config.cost, options)
+                    .map(|provider| (route, provider))
+                    .map_err(|error| {
+                        anyhow::anyhow!("model route `hint:{}` could not be built: {error}", configured.hint)
+                    })
+            },
+        );
+        match built {
+            Ok((route, provider)) => routes.push((
+                configured.hint.clone(),
+                route.provider_label().to_string(),
+                route.model().to_string(),
+                provider,
+            )),
+            Err(error) => {
+                let refusal = redact_endpoint_userinfo(&error.to_string()).into_owned();
+                tracing::warn!(hint = %configured.hint, "Skipping refused model route: {refusal}");
+                refused_routes.push((configured.hint.clone(), refusal));
+            }
+        }
     }
     Ok(Box::new(router::RouterProvider::from_resolved(
         (resolved.provider_label().to_string(), default),
         routes,
+        refused_routes,
         resolved.model().to_string(),
     )))
 }
@@ -3282,9 +3307,9 @@ impl<'a> From<Option<&'a str>> for ProviderCredentialInput<'a> {
 }
 
 /// A resolver-owned primary connection. Construction may consult a provider's
-/// store only when the resolver selected [`credentials::CredentialRef::ProviderStore`];
-/// every other reference uses exactly the released material, including an
-/// intentionally absent key.
+/// store when the resolver selected [`credentials::CredentialRef::ProviderStore`]
+/// or when the Root owns only URL/rotation material and its key is absent.
+/// Every other reference uses exactly the released material.
 #[derive(Clone, Copy)]
 pub(crate) struct ResolvedPrimary<'a> {
     resolved: &'a catalog::ResolvedModel,
@@ -3296,11 +3321,12 @@ impl<'a> ResolvedPrimary<'a> {
     }
 
     fn matches_connection(self, name: &str, key: Option<&str>, url: Option<&str>, rotation: &[String]) -> bool {
-        name == self.resolved.provider_label()
-            && ProviderId::of(name) == *self.resolved.provider()
-            && key == self.resolved.credential().api_key()
-            && url == self.resolved.credential().api_url()
-            && rotation == self.resolved.credential().rotation_keys()
+        let same_provider = name == self.resolved.provider_label() && ProviderId::of(name) == *self.resolved.provider();
+        same_provider
+            && (is_openai_codex_alias(name)
+                || (key == self.resolved.credential().api_key()
+                    && url == self.resolved.credential().api_url()
+                    && rotation == self.resolved.credential().rotation_keys()))
     }
 
     fn resolve_credentials(
@@ -3316,6 +3342,11 @@ impl<'a> ResolvedPrimary<'a> {
         let resolved = match credential.reference() {
             credentials::CredentialRef::ProviderStore => resolve_provider_credentials(name, None, options),
             credentials::CredentialRef::None => ResolvedProviderCredentials::default(),
+            credentials::CredentialRef::LegacyInline(credentials::LegacySlot::Root)
+                if credential.api_key().is_none() =>
+            {
+                resolve_provider_credentials(name, None, options)
+            }
             credentials::CredentialRef::Profile { .. } | credentials::CredentialRef::LegacyInline(_) => credential
                 .api_key()
                 .map_or_else(ResolvedProviderCredentials::default, |key| {
@@ -3330,12 +3361,8 @@ impl<'a> ResolvedPrimary<'a> {
 
     fn construct(self, options: &ProviderRuntimeOptions) -> anyhow::Result<Box<dyn Provider>> {
         if is_openai_codex_alias(self.resolved.provider_label()) {
-            if !matches!(
-                self.resolved.credential().reference(),
-                credentials::CredentialRef::ProviderStore
-            ) {
-                anyhow::bail!("OpenAI Codex construction requires its resolver-selected provider store");
-            }
+            // Codex owns an OAuth/subscription login. Legacy Root material can
+            // select this provider, but it never becomes Codex wire material.
             return create_provider_with_options(self.resolved.provider_label(), None, options);
         }
         create_provider_with_url_and_options(

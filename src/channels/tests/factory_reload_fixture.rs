@@ -180,7 +180,11 @@ impl ConfigGenerationParticipant for ReloadParticipant {
         Ok(Box::new(PreparedReload {
             cache: Arc::clone(&self.cache),
             provider: Arc::clone(&self.cached_provider),
-            previous: self.cache.lock().get("openai").cloned(),
+            previous: self
+                .cache
+                .lock()
+                .get(&(generation.id.0, "openai".to_owned(), MODEL.to_owned()))
+                .cloned(),
             committed: Arc::clone(&self.committed),
             generation: generation.id.0,
         }))
@@ -188,18 +192,20 @@ impl ConfigGenerationParticipant for ReloadParticipant {
 }
 impl PreparedConfigGeneration for PreparedReload {
     fn commit(&mut self) -> anyhow::Result<()> {
-        self.cache
-            .lock()
-            .insert("openai".to_owned(), Arc::clone(&self.provider));
+        self.cache.lock().insert(
+            (self.generation, "openai".to_owned(), MODEL.to_owned()),
+            Arc::clone(&self.provider),
+        );
         self.committed.lock().push(self.generation);
         Ok(())
     }
     fn rollback(&mut self) {
         let mut cache = self.cache.lock();
+        let key = (self.generation, "openai".to_owned(), MODEL.to_owned());
         if let Some(previous) = self.previous.take() {
-            cache.insert("openai".to_owned(), previous);
+            cache.insert(key, previous);
         } else {
-            cache.remove("openai");
+            cache.remove(&key);
         }
         self.committed.lock().retain(|id| *id != self.generation);
     }
@@ -502,17 +508,19 @@ pub(super) async fn run() {
         let cached_provider: Arc<dyn Provider> = Arc::new(CachedProviderProbe {
             calls: Arc::clone(&cached_calls),
         });
-        cache
-            .lock()
-            .insert("openai".to_owned(), Arc::clone(&cached_provider));
         let histories = Arc::new(Mutex::new(HashMap::new()));
         let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
         initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
         assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());
-        let mut initial_ctx = context(&tmp, crate::config::new_shared(initial), memory.clone(), channel.clone(), Arc::clone(&cache), Arc::clone(&histories));
+        let config = crate::config::new_shared(initial);
+        let g0 = config.pin();
+        cache.lock().insert(
+            (g0.id.0, "openai".to_owned(), MODEL.to_owned()),
+            Arc::clone(&cached_provider),
+        );
+        let mut initial_ctx = context(&tmp, Arc::clone(&config), memory.clone(), channel.clone(), Arc::clone(&cache), Arc::clone(&histories));
         let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
-        let config = Arc::clone(&initial_ctx.config); let g0 = config.pin();
         let committed = Arc::new(Mutex::new(Vec::new()));
         let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadParticipant {
             cache: Arc::clone(&cache),

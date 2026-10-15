@@ -421,7 +421,7 @@ fn raw_provider_whitespace_cannot_hide_a_keyed_factory_route() {
 }
 
 #[tokio::test]
-async fn root_url_without_root_key_is_refused_without_reopening_provider_profile() {
+async fn root_url_without_root_key_uses_the_provider_profile() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start().await;
     let mut config = isolated_config(&temp);
@@ -447,15 +447,37 @@ async fn root_url_without_root_key_is_refused_without_reopening_provider_profile
     let (built, counts) = crate::providers::credential_resolution_observation::observe(|| {
         agent_provider_selection(&config, &choice).build_provider(&config, &options)
     });
-    let error = match built {
-        Ok(_) => panic!("OpenAI must not build without its resolver-released key"),
-        Err(error) => error.to_string(),
-    };
-    assert!(error.contains("missing credential/api key"), "{error}");
-    assert_eq!(counts, [0, 0, 0], "the exact Root must not consult a credential store");
-    assert!(!probe.saw("PRX-PROFILE-KEY"), "factory reopened the provider store");
-    assert!(probe.requests().is_empty(), "a refused exact Root reached transport");
+    let provider = built.expect("URL-only Root falls back to the provider's own credential store");
+    assert_eq!(
+        counts,
+        [1, 1, 0],
+        "construction must perform one provider-profile lookup"
+    );
+    let reply = provider
+        .simple_chat("ping", "gpt-4o", 0.0)
+        .await
+        .expect("the restored credential reaches the configured Root URL");
+    assert_eq!(reply, PROBE_REPLY);
+    assert!(probe.saw("PRX-PROFILE-KEY"), "the provider profile was not used");
     assert!(choice.factory_credential_source_matches(&config));
+}
+
+#[test]
+fn openai_codex_ignores_root_key_url_and_rotation_material() {
+    let temp = tempfile::tempdir().expect("test workspace");
+    let mut config = isolated_config(&temp);
+    config.default_provider = Some("openai-codex".to_string());
+    config.default_model = Some("gpt-5.2-codex".to_string());
+    config.api_key = Some("PRX-IGNORED-CODEX-ROOT".to_string());
+    config.api_url = Some("https://ignored.example.invalid/v1".to_string());
+    config.reliability.api_keys = vec!["PRX-IGNORED-CODEX-ROTATION".to_string()];
+    let choice = resolve_agent_model_choice(&config, None, None).expect("Codex Root selection resolves");
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
+        agent_provider_selection(&config, &choice).build_provider(&config, &options)
+    });
+    provider.expect("Codex builds from its own login despite unrelated Root material");
+    assert_eq!(counts, [0, 0, 0], "Codex must not resolve Root API-key material");
 }
 
 /// Kimi Code accepts any model string and answers anyway, so an id outside
@@ -473,7 +495,7 @@ fn an_unlisted_kimi_code_model_is_still_refused() {
 
 /// Real wire plus actual factory lookup observation: no header-only inference.
 #[tokio::test]
-async fn resolved_keyless_roots_skip_profile_resolution_on_owned_wire() {
+async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire() {
     use futures_util::FutureExt;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -483,7 +505,7 @@ async fn resolved_keyless_roots_skip_profile_resolution_on_owned_wire() {
             self.0.abort();
         }
     }
-    for label in ["ollama", "custom"] {
+    for label in ["openai", "ollama", "custom"] {
         let temp = tempfile::tempdir().expect("owned configuration");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = Arc::clone(&seen);
@@ -561,7 +583,11 @@ async fn resolved_keyless_roots_skip_profile_resolution_on_owned_wire() {
                 built.is_ok(),
                 "an unrelated route cannot invalidate the resolved default"
             );
-            assert_eq!(counts, [1, 0, 0], "only the new route resolves its explicit key");
+            assert_eq!(
+                counts,
+                [2, 1, 0],
+                "the URL-only Root resolves its provider profile and the new route resolves its explicit key"
+            );
             assert!(seen.lock().is_empty());
             let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
                 agent_provider_selection(&config, &choice).build_provider(&config, &options)
@@ -578,8 +604,13 @@ async fn resolved_keyless_roots_skip_profile_resolution_on_owned_wire() {
             {
                 let requests = seen.lock();
                 assert_eq!(requests.len(), 1);
-                assert_eq!(counts, [0, 0, 0]);
-                assert!(requests.first().is_some_and(Option::is_none));
+                assert_eq!(counts, [1, 1, 0]);
+                let expected_authorization = (label != "ollama").then_some("Bearer PRX-CONFLICTING-PROFILE");
+                assert_eq!(
+                    requests.first().and_then(Option::as_deref),
+                    expected_authorization,
+                    "{label} changed how it presents a resolved provider credential"
+                );
             }
             // The typed PMM factory must preserve the same absence independently
             // of the CLI routed entry.
@@ -605,8 +636,14 @@ async fn resolved_keyless_roots_skip_profile_resolution_on_owned_wire() {
             {
                 let requests = seen.lock();
                 assert_eq!(requests.len(), 2);
-                assert_eq!(typed_counts, [0, 0, 0]);
-                assert!(requests.iter().all(Option::is_none));
+                assert_eq!(typed_counts, [1, 1, 0]);
+                let expected_authorization = (label != "ollama").then_some("Bearer PRX-CONFLICTING-PROFILE");
+                assert!(
+                    requests
+                        .iter()
+                        .all(|authorization| authorization.as_deref() == expected_authorization),
+                    "{label} changed how it presents a resolved provider credential"
+                );
             }
             let generation = crate::config::new_shared(config).pin();
             let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")

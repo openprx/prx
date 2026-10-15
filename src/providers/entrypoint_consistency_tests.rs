@@ -192,3 +192,66 @@ async fn chat_and_cli_keep_fallback_admission_after_primary_429() {
         "the tool-less fallback reached transport"
     );
 }
+
+/// Finding 61: every long-lived surface starts when an unrelated route is
+/// refused, and selecting that hint returns the same retained refusal.
+#[tokio::test]
+async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let probe = CredentialProbe::start().await;
+    let primary = probe.custom_provider();
+    let mut config = Config::default();
+    config.workspace_dir = temp.path().to_path_buf();
+    config.config_path = temp.path().join("config.toml");
+    config.default_provider = Some(primary.clone());
+    config.default_model = Some(PROBE_MODEL.to_string());
+    config.auth.codex_auth_json_auto_import = false;
+    config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+    config.reliability.provider_retries = 0;
+    config.model_routes.push(crate::config::ModelRouteConfig {
+        hint: "broken".to_string(),
+        provider: "prx-unknown-provider".to_string(),
+        model: "prx-unknown-model".to_string(),
+        api_key: None,
+        credential_ref: None,
+    });
+    let options = provider_runtime_options_from_config(&config);
+
+    let (_, chat) = crate::chat::chat_provider_chain(&config, &primary, &primary, PROBE_MODEL, &options)
+        .expect("chat starts with the refused route retained");
+    let choice =
+        crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("CLI default selection resolves");
+    let cli = crate::agent::entry::agent_provider_selection(&config, &choice)
+        .build_provider(&config, &options)
+        .expect("CLI starts with the refused route retained");
+    let (channels, _, _) = crate::channels::build_channel_startup_provider(&config, &options)
+        .expect("channels start with the refused route retained");
+    let (gateway, _) = crate::gateway::build_gateway_provider_selection(&config, &options)
+        .expect("gateway starts with the refused route retained");
+
+    let mut refusals = Vec::new();
+    for (surface, provider) in [
+        ("chat", std::sync::Arc::<dyn crate::providers::Provider>::from(chat)),
+        ("cli", std::sync::Arc::<dyn crate::providers::Provider>::from(cli)),
+        ("channels", channels),
+        ("gateway", gateway),
+    ] {
+        let error = provider
+            .simple_chat("ping", "hint:broken", 0.0)
+            .await
+            .expect_err("the refused hint cannot reach transport");
+        let refusal = format!("{error:#}");
+        assert!(refusal.contains("hint:broken"), "{surface}: {refusal}");
+        assert!(refusal.contains("prx-unknown-provider"), "{surface}: {refusal}");
+        refusals.push((surface, refusal));
+    }
+    for (surface, refusal) in &refusals[1..] {
+        assert_eq!(refusal, &refusals[0].1, "{surface} changed the retained route refusal");
+    }
+    assert!(
+        probe.requests().is_empty(),
+        "a refused route reached the default transport"
+    );
+}

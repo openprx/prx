@@ -144,7 +144,8 @@ const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 9_600;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str =
     "I could not identify this image with confidence. Please send a clearer picture or add some context.";
 
-type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
+type ProviderCacheKey = (u64, String, String);
+type ProviderCacheMap = Arc<Mutex<HashMap<ProviderCacheKey, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1959,7 +1960,8 @@ async fn get_or_create_provider_for_generation(
     model_name: &str,
     generation: &Arc<crate::config::ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
+    let cache_key = (generation.id.0, provider_name.to_string(), model_name.to_string());
+    if let Some(existing) = ctx.provider_cache.lock().get(&cache_key).cloned() {
         return Ok(existing);
     }
     if provider_name == ctx.default_provider.as_str()
@@ -1996,9 +1998,7 @@ async fn get_or_create_provider_for_generation(
         );
     }
 
-    ctx.provider_cache
-        .lock()
-        .insert(provider_name.to_string(), Arc::clone(&provider));
+    ctx.provider_cache.lock().insert(cache_key, Arc::clone(&provider));
     Ok(provider)
 }
 
@@ -2041,12 +2041,8 @@ pub(crate) fn build_channel_startup_provider(
 ) -> anyhow::Result<(Arc<dyn Provider>, String, String)> {
     let catalog = providers::selection::catalog_for(config);
     let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_provider_for(
-        &resolved,
-        &catalog,
-        &config.reliability,
-        &config.cost,
-        options,
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_for(
+        &resolved, &catalog, config, options,
     )?);
     Ok((
         provider,
@@ -4769,8 +4765,18 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
     let fixture_provider_name = ctx.default_provider.as_str().to_owned();
     let provider_cache = ctx.provider_cache.lock().clone();
     let fixture_provider = provider_cache
-        .get(&fixture_provider_name)
+        .get(&(
+            ctx.config_generation.id.0,
+            fixture_provider_name.clone(),
+            ctx.model.as_str().to_owned(),
+        ))
         .cloned()
+        .or_else(|| {
+            provider_cache
+                .iter()
+                .find(|((_, provider, _), _)| provider == &fixture_provider_name)
+                .map(|(_, provider)| Arc::clone(provider))
+        })
         .unwrap_or_else(|| Arc::clone(&ctx.provider));
     let fixture_label_for = |provider: &Arc<dyn Provider>| {
         let identity = Arc::as_ptr(provider).cast::<()>() as usize;
@@ -4781,7 +4787,7 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         fixture_provider_name.clone(),
         (fixture_label_for(&fixture_provider), Arc::clone(&fixture_provider)),
     );
-    for (name, provider) in provider_cache {
+    for ((_, name, _), provider) in provider_cache {
         fixture_providers
             .entry(name)
             .or_insert_with(|| (fixture_label_for(&provider), provider));
@@ -6102,9 +6108,12 @@ pub async fn start_channels_with_config(
     // receiving. `prx tasks list` is where in-flight turns are counted now.
     println!("  🚦 In-flight messages: unbounded (inspect with `prx tasks list`)");
 
-    let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+    let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
     if !default_is_hint {
-        provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+        provider_cache_seed.insert(
+            (config_generation.id.0, provider_name.clone(), model.clone()),
+            Arc::clone(&provider),
+        );
     }
     let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
         let allowed_from = normalize_allowlist(&signal.allowed_from);
@@ -10340,14 +10349,30 @@ BTC is currently around $65,000 based on latest tool output."#
         let fallback_provider_impl = Arc::new(ModelCaptureProvider::default());
         let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        let config_manager = crate::config::new_shared(Config::default());
+        let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "openrouter".to_string(),
+                "default-model".to_string(),
+            ),
+            fallback_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config: config_manager,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10448,9 +10473,25 @@ BTC is currently around $65,000 based on latest tool output."#
         let routed_provider_impl = Arc::new(ModelCaptureProvider::default());
         let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+        let config_manager = crate::config::new_shared(Config::default());
+        let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "openrouter".to_string(),
+                "route-model".to_string(),
+            ),
+            routed_provider,
+        );
 
         let route_key = "telegram_alice".to_string();
         let mut route_overrides = HashMap::new();
@@ -10464,8 +10505,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config: config_manager,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10547,9 +10588,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_provider: Arc<dyn Provider> = reloaded_provider_impl.clone();
         let mut ctx = ctx_with_histories(HashMap::new());
         ctx.provider = startup_provider;
-        ctx.provider_cache
-            .lock()
-            .insert("test-provider".to_string(), Arc::clone(&reloaded_provider));
+        ctx.provider_cache.lock().insert(
+            (
+                ctx.config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&reloaded_provider),
+        );
 
         let selected =
             get_or_create_provider_for_generation(&ctx, "test-provider", "default-model", &ctx.config_generation)
@@ -10575,6 +10621,30 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn generation_provider_cache_separates_models_on_the_same_provider() {
+        let ctx = ctx_with_histories(HashMap::new());
+        let selected_provider = "custom:http://127.0.0.1:9/v1";
+
+        let model_a = get_or_create_provider_for_generation(&ctx, selected_provider, "model-a", &ctx.config_generation)
+            .await
+            .expect("first model builds");
+        let model_a_again =
+            get_or_create_provider_for_generation(&ctx, selected_provider, "model-a", &ctx.config_generation)
+                .await
+                .expect("first model is cached");
+        let model_b = get_or_create_provider_for_generation(&ctx, selected_provider, "model-b", &ctx.config_generation)
+            .await
+            .expect("second model builds its own chain");
+
+        assert!(Arc::ptr_eq(&model_a, &model_a_again), "the exact cache key was rebuilt");
+        assert!(
+            !Arc::ptr_eq(&model_a, &model_b),
+            "a provider chain resolved for model-a was reused for model-b"
+        );
+        assert_eq!(ctx.provider_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_builds_selected_provider_without_plain_turn_retrieval() {
         factory_reload_fixture::run().await;
     }
@@ -10589,9 +10659,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(ModelCaptureProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
-
         let temp = tempfile::TempDir::new().expect("temp dir");
         let mut live_config = Config::default();
         live_config.default_provider = Some("test-provider".to_string());
@@ -10599,6 +10666,15 @@ BTC is currently around $65,000 based on latest tool output."#
         live_config.default_temperature = 0.5;
         let config_manager = crate::config::new_shared(live_config);
         let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "hot-reloaded-model".to_string(),
+            ),
+            Arc::clone(&provider),
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
@@ -15187,9 +15263,10 @@ After"#;
         ctx.config = shared.clone();
         ctx.config_generation = Arc::clone(&generation);
         ctx.default_provider = Arc::new("openrouter".to_string());
-        ctx.provider_cache
-            .lock()
-            .insert("openai".to_string(), Arc::new(DummyProvider) as Arc<dyn Provider>);
+        ctx.provider_cache.lock().insert(
+            (generation.id.0, "openai".to_string(), "vendor-model".to_string()),
+            Arc::new(DummyProvider) as Arc<dyn Provider>,
+        );
         let msg = traits::ChannelMessage {
             id: "msg-models".to_string(),
             sender: "alice".to_string(),
