@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{entry, md, owner};
 use crate::skills::lifecycle::publish::crash_hooks;
 use crate::skills::lifecycle::{

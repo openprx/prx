@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 mod bundle;
 mod manifest;
 mod publish;
