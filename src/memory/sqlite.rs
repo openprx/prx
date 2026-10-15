@@ -49,6 +49,55 @@ const fn vector_candidate_cap(limit: usize, configured: usize) -> usize {
     if limit > configured { limit } else { configured }
 }
 
+struct VectorCandidateQuery {
+    sql: String,
+    params: Vec<Box<dyn rusqlite::types::ToSql>>,
+    candidate_cap: usize,
+}
+
+fn vector_candidate_query(
+    provider: &str,
+    model: &str,
+    dimensions: usize,
+    limit: usize,
+    category: Option<&str>,
+    session_id: Option<&str>,
+    configured_candidate_cap: usize,
+) -> VectorCandidateQuery {
+    let mut sql = "SELECT id, embedding FROM memories
+                   WHERE embedding IS NOT NULL
+                     AND embedding_provider = ?1
+                     AND embedding_model = ?2
+                     AND embedding_dimensions = ?3"
+        .to_string();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(provider.to_string()),
+        Box::new(model.to_string()),
+        Box::new(i64::try_from(dimensions).unwrap_or(i64::MAX)),
+    ];
+    let mut idx = 4;
+
+    if let Some(category) = category {
+        let _ = write!(sql, " AND category = ?{idx}");
+        params.push(Box::new(category.to_string()));
+        idx += 1;
+    }
+    if let Some(session_id) = session_id {
+        let _ = write!(sql, " AND session_id = ?{idx}");
+        params.push(Box::new(session_id.to_string()));
+        idx += 1;
+    }
+    let candidate_cap = vector_candidate_cap(limit, configured_candidate_cap);
+    let _ = write!(sql, " ORDER BY update_seq DESC, rowid DESC LIMIT ?{idx}");
+    params.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
+
+    VectorCandidateQuery {
+        sql,
+        params,
+        candidate_cap,
+    }
+}
+
 /// One process says "your memory store has outgrown the candidate cap" once.
 ///
 /// This is a warning, not a debug line: past this point vector recall is
@@ -3381,34 +3430,14 @@ impl SqliteMemory {
         session_id: Option<&str>,
         candidate_cap: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql = "SELECT id, embedding FROM memories
-                       WHERE embedding IS NOT NULL
-                         AND embedding_provider = ?1
-                         AND embedding_model = ?2
-                         AND embedding_dimensions = ?3"
-            .to_string();
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        param_values.push(Box::new(provider.to_string()));
-        param_values.push(Box::new(model.to_string()));
-        param_values.push(Box::new(i64::try_from(dimensions).unwrap_or(i64::MAX)));
-        let mut idx = 4;
-
-        if let Some(cat) = category {
-            let _ = write!(sql, " AND category = ?{idx}");
-            param_values.push(Box::new(cat.to_string()));
-            idx += 1;
-        }
-        if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
-            param_values.push(Box::new(sid.to_string()));
-            idx += 1;
-        }
-        let candidate_cap = vector_candidate_cap(limit, candidate_cap);
-        let _ = write!(sql, " ORDER BY update_seq DESC, rowid DESC LIMIT ?{idx}");
-        param_values.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
+        let VectorCandidateQuery {
+            sql,
+            params,
+            candidate_cap,
+        } = vector_candidate_query(provider, model, dimensions, limit, category, session_id, candidate_cap);
 
         let mut stmt = conn.prepare(&sql)?;
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
         let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -13976,30 +14005,21 @@ source: tool_output\n\
         // Every row of the plan, not just the first: the sort SQLite adds when
         // the index cannot supply the order is reported on its own line, so a
         // single-row read would call an index scan plus a temp B-tree "clean".
-        let plan_of = |sql: &str| -> String {
-            let mut stmt = conn.prepare(sql).expect("test: prepare explain query plan");
+        let plan_of = |category, session_id| -> String {
+            let query = vector_candidate_query("local", "prx-local-hash-v1", 384, 10, category, session_id, 10);
+            let explain_sql = format!("EXPLAIN QUERY PLAN {}", query.sql);
+            let mut stmt = conn
+                .prepare(&explain_sql)
+                .expect("test: prepare production candidate query plan");
+            let params: Vec<&dyn rusqlite::types::ToSql> = query.params.iter().map(AsRef::as_ref).collect();
             let rows = stmt
-                .query_map(params!["local", "prx-local-hash-v1", 384_i64, 10_i64], |row| {
-                    row.get::<_, String>(3)
-                })
+                .query_map(params.as_slice(), |row| row.get::<_, String>(3))
                 .expect("test: explain query plan");
             rows.collect::<Result<Vec<_>, _>>()
                 .expect("test: collect query plan")
                 .join(" | ")
         };
-        let plans = [
-            plan_of(
-                "EXPLAIN QUERY PLAN SELECT id, embedding FROM memories \
-                 WHERE embedding IS NOT NULL AND embedding_provider = ?1 AND embedding_model = ?2 \
-                 AND embedding_dimensions = ?3 ORDER BY update_seq DESC, rowid DESC LIMIT ?4",
-            ),
-            plan_of(
-                "EXPLAIN QUERY PLAN SELECT id, embedding FROM memories \
-                 WHERE embedding IS NOT NULL AND embedding_provider = ?1 AND embedding_model = ?2 \
-                 AND embedding_dimensions = ?3 AND category = 'core' AND session_id = 'session-a' \
-                 ORDER BY update_seq DESC, rowid DESC LIMIT ?4",
-            ),
-        ];
+        let plans = [plan_of(None, None), plan_of(Some("core"), Some("session-a"))];
         for plan in plans {
             assert!(
                 plan.contains("idx_memories_embedding_candidates_seq"),
