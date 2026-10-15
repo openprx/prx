@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
+pub mod lifecycle;
+
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
 
