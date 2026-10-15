@@ -17376,6 +17376,55 @@ mod tests {
         )
     }
 
+    /// Finding 71: a named-agent override must retain the model fallback
+    /// contract when the admitted spawn builds its child provider. The
+    /// incompatible fallback is refused before the run or transport exists.
+    #[tokio::test]
+    async fn admitted_named_agent_spawn_refuses_a_cross_dialect_fallback_before_transport() {
+        use crate::providers::credential_probe::CredentialProbe;
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start().await;
+        let agent_provider = probe.custom_provider();
+        let mut agent = containment_agent(&agent_provider, Some(SPAWN_AGENT_SENTINEL));
+        agent.model = crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL.to_string();
+        let agents = HashMap::from([("prx_agent".to_string(), agent)]);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.auth.codex_auth_json_auto_import = false;
+        config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+        config.secrets.encrypt = false;
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &agent_provider);
+        let catalog = providers::selection::catalog_for(&config);
+        let configured = providers::ConfiguredProviders::from_config(&config);
+        let tool = containment_tool(&temp, agents, "ollama", None)
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&configured)
+            .with_reliability(config.reliability.clone());
+
+        let refusal =
+            match execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"}))).await
+            {
+                Ok(result) => {
+                    assert!(!result.success, "the incompatible agent fallback was spawned");
+                    result.error.unwrap_or_default()
+                }
+                Err(error) => format!("{error:#}"),
+            };
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal(
+            "sessions_spawn named agent",
+            &refusal,
+        );
+        assert!(probe.requests().is_empty(), "a refused fallback reached transport");
+        assert!(
+            tool.active_runs_snapshot().await.is_empty(),
+            "a refused fallback created a run"
+        );
+    }
+
     /// R-PMMC F-5: every production construction of the spawn tool hands it
     /// the model evidence, so operator declarations are consulted on every
     /// surface (chat's `prx chat` registry included).

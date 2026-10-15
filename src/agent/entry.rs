@@ -1391,6 +1391,7 @@ pub(crate) fn resolve_agent_model_choice(
     let provider_name = provider_override.unwrap_or_else(|| providers::selection::default_provider(config));
     let model_name = model_override.unwrap_or_else(|| providers::selection::default_model(config));
     let catalog = providers::selection::catalog_for(config);
+    let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
     let resolved = providers::selection::check_with(
         config,
         &catalog,
@@ -1399,8 +1400,8 @@ pub(crate) fn resolve_agent_model_choice(
         providers::selection::credential_for(config, provider_name),
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
+    )
+    .map_err(|refusal| providers::selection::route_refusal(route.as_ref(), refusal))?;
     Ok(AgentModelChoice {
         provider_name: provider_name.to_string(),
         model_name: model_name.to_string(),

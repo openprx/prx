@@ -1974,13 +1974,20 @@ async fn handle_runtime_command_if_needed(
             Some(provider_name) => {
                 // The new provider is resolved with the sender's current model
                 // before anything is built or switched.
-                let refusal = providers::selection::check(
+                let catalog = providers::selection::catalog_for(&config_generation.effective);
+                let route = providers::selection::route_target(&catalog, &provider_name, &current.model)
+                    .ok()
+                    .flatten();
+                let refusal = providers::selection::check_with(
                     &config_generation.effective,
+                    &catalog,
                     &provider_name,
                     &current.model,
+                    providers::selection::credential_for(&config_generation.effective, &provider_name),
                     &providers::catalog::Requirement::chat(),
                     providers::catalog::UnknownPolicy::Invocation,
                 )
+                .map_err(|refusal| providers::selection::route_refusal(route, refusal))
                 .err();
                 if let Some(refusal) = refusal {
                     format!(
@@ -2067,6 +2074,67 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+/// Exercise the production `/models` handler with a retained route refusal.
+/// Kept test-only because the runtime owns its context and outbound channel.
+#[cfg(test)]
+pub(crate) async fn broken_route_models_command_response(config: &Config) -> String {
+    #[derive(Default)]
+    struct RefusalChannel {
+        sent: tokio::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Channel for RefusalChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.content.clone());
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let shared = crate::config::new_shared(config.clone());
+    let generation = shared.pin();
+    let channel_impl = Arc::new(RefusalChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut ctx = tests::ctx_with_histories(HashMap::new());
+    ctx.config = shared;
+    ctx.config_generation = Arc::clone(&generation);
+
+    let msg = traits::ChannelMessage {
+        id: "prx-broken-route-command".to_string(),
+        sender: "prx_user".to_string(),
+        reply_target: "prx_channel".to_string(),
+        content: "/models openai".to_string(),
+        channel: "telegram".to_string(),
+        ..traits::ChannelMessage::default()
+    };
+    let key = ConversationKey::from_message(&msg);
+    set_route_selection(
+        &ctx,
+        &generation,
+        &key,
+        ChannelRouteSelection {
+            provider: providers::selection::default_provider(config).to_string(),
+            model: "hint:broken".to_string(),
+        },
+    );
+    assert!(
+        handle_runtime_command_if_needed(&ctx, &generation, &msg, Some(&channel)).await,
+        "the production /models handler did not claim the command"
+    );
+    channel_impl
+        .sent
+        .lock()
+        .await
+        .last()
+        .cloned()
+        .expect("the production /models handler did not send a refusal")
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
@@ -6491,7 +6559,7 @@ mod tests {
 
     /// Build a minimal `ChannelRuntimeContext` whose conversation history map is
     /// seeded with `histories`, for exercising compact/clear in isolation.
-    fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
+    pub(super) fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
         ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
             config: crate::config::new_shared(Config::default()),

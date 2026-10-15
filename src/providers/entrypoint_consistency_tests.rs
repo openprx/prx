@@ -60,7 +60,8 @@ fn refusal<T>(result: anyhow::Result<T>) -> String {
 #[test]
 fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
-    let config = cross_dialect_config(&temp);
+    let mut config = cross_dialect_config(&temp);
+    config.causal_tree.enabled = false;
     let provider = config.default_provider.as_deref().expect("test: provider");
     let options = provider_runtime_options_from_config(&config);
 
@@ -90,6 +91,15 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
         &reliability,
         &options,
     ));
+    let catalog = crate::providers::selection::catalog_for(&config);
+    let gateway_child = refusal(crate::runtime::child_source::ChildProviderBinding::build_ordinary(
+        &config,
+        &catalog,
+        provider,
+        PRIMARY_MODEL,
+        crate::providers::selection::credential_for(&config, provider),
+        None,
+    ));
 
     let refusals = [
         ("chat", chat),
@@ -97,6 +107,7 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
         ("channels", channels),
         ("gateway", gateway),
         ("worker", worker),
+        ("gateway child", gateway_child),
     ];
     let expected = &refusals[0].1;
     assert_cross_dialect_refusal("chat", expected);
@@ -255,6 +266,25 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
     for (surface, refusal) in refusals.iter().skip(1) {
         assert_eq!(refusal, expected, "{surface} changed the retained route refusal");
     }
+
+    let cli_override = match crate::agent::entry::resolve_agent_model_choice(&config, None, Some("hint:broken")) {
+        Ok(_) => panic!("the CLI --model override accepted a refused route"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        format!("{cli_override:#}"),
+        expected,
+        "the CLI --model path changed the retained route refusal"
+    );
+
+    let channel_response = crate::channels::broken_route_models_command_response(&config).await;
+    let channel_refusal = channel_response
+        .strip_suffix(". Route unchanged; switch the model first with `/model <model-id>` or pick another provider.")
+        .unwrap_or_else(|| panic!("channel /models changed its refusal envelope: {channel_response}"));
+    assert_eq!(
+        channel_refusal, expected,
+        "the channel /models path changed the retained route refusal"
+    );
     assert!(
         probe.requests().is_empty(),
         "a refused route reached the default transport"

@@ -152,6 +152,16 @@ pub fn check_with(
     Ok(resolved)
 }
 
+/// Add the selected route identity to a resolver refusal without changing its
+/// typed cause. Surfaces that accept `hint:` as user input use this display;
+/// direct provider/model selection retains the original typed error.
+pub(crate) fn route_refusal(route: Option<&catalog::RouteTarget>, refusal: ResolutionError) -> anyhow::Error {
+    match route {
+        Some(route) => anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint),
+        None => anyhow::Error::new(refusal),
+    }
+}
+
 /// Check a decision backend selection (D-036 item 4; D-040 OQ-A2).
 ///
 /// A model is selectable as a decision backend only when its descriptor

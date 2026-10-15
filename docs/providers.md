@@ -191,7 +191,9 @@ transport. Routed providers construct the default and every `hint:` destination
 from separate resolved selections; two hints that name the same provider still
 keep their own credential, model facts and fallback admission. A bad
 non-default destination does not stop startup: its hint retains that exact
-refusal and returns it if selected.
+refusal and returns it if selected. The CLI `--model hint:<name>` path and a
+channel `/models <provider>` switch while that hint is selected preserve the
+same route-named refusal text.
 
 At failover time, every fallback pair is checked against the primary turn's
 admission facts before a request is sent. A fallback needs a valid cost entry
