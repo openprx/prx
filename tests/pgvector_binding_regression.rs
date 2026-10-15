@@ -1,6 +1,7 @@
 //! Offline guards for the `PostgreSQL` memory adapter's pgvector SQL (PG-VECTOR).
 //!
-//! These tests read `src/memory/postgres.rs` as text and need no database.
+//! These tests read `src/memory/postgres.rs` and every file under
+//! `src/memory/postgres/` as text and need no database.
 //!
 //! Why: the adapter binds each embedding as the Rust `String` produced by
 //! `pgvector_literal` (`[0.1,0.2,...]`). The `postgres` client lets the server
@@ -13,11 +14,9 @@
 //! What these guards do NOT prove: that a live server accepts the cast, that
 //! the HNSW index is still chosen, or that the RLS transaction context
 //! survives. Those need a real `PostgreSQL` with pgvector (the ignored,
-//! env-gated tests in `src/memory/postgres.rs`).
+//! env-gated tests in `src/memory/postgres/tests/`).
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
-
-const POSTGRES_MEMORY: &str = include_str!("../src/memory/postgres.rs");
 
 /// Number of `$N::text::vector` parameter casts in the adapter: seven
 /// statements, two of which (the memory and document-chunk ANN searches) use
@@ -33,13 +32,49 @@ const LIVE_URL_HELPER_DEFINITION: &str = "pub(crate) fn live_postgres_url() -> S
 const LIVE_URL_HELPER_CALL: &str = "live_postgres_url()";
 
 /// Tests that need a live `PostgreSQL`, counted by their `#[ignore]` attribute:
-/// 26 in the memory adapter, 4 in the cron
+/// 28 in the memory adapter, 4 in the cron
 /// store, 1 in the cron scheduler, 2 in the webhook repository, 1 in schema
 /// migration and 1 in the fitness CLI.
-const EXPECTED_LIVE_POSTGRES_TESTS: usize = 35;
+const EXPECTED_LIVE_POSTGRES_TESTS: usize = 37;
 
 fn line_of(source: &str, offset: usize) -> usize {
     source[..offset].matches('\n').count() + 1
+}
+
+/// Every file of the PostgreSQL memory adapter with its path relative to the
+/// manifest directory: the root `src/memory/postgres.rs` plus everything
+/// under `src/memory/postgres/`. The adapter used to be one file, so a guard
+/// that read only the root would go blind to every statement that moved out.
+fn postgres_memory_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("test: read the PostgreSQL adapter directory")
+            .map(|entry| entry.expect("test: read a directory entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path.strip_prefix(root).expect("test: path under the root");
+                let text = std::fs::read_to_string(&path).expect("test: read an adapter source file");
+                out.push((relative.display().to_string(), text));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root_file = root.join("src/memory/postgres.rs");
+    let mut out = vec![(
+        "src/memory/postgres.rs".to_string(),
+        std::fs::read_to_string(&root_file).expect("test: read src/memory/postgres.rs"),
+    )];
+    walk(&root.join("src/memory/postgres"), root, &mut out);
+    assert!(
+        out.len() > 2 && out.iter().all(|(_, text)| !text.is_empty()),
+        "the PostgreSQL adapter scan must see the root file and its directory: {:?}",
+        out.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    out
 }
 
 /// Split `text` into (rest, `$N` placeholder) when it ends with one.
@@ -87,10 +122,14 @@ fn vector_casts(source: &str) -> Vec<(usize, VectorCast)> {
 
 #[test]
 fn pgvector_parameters_are_never_typed_as_vector() {
-    let offending: Vec<String> = vector_casts(POSTGRES_MEMORY)
-        .into_iter()
-        .filter(|(_, kind)| *kind != VectorCast::TextParameter)
-        .map(|(line, kind)| format!("src/memory/postgres.rs:{line} ({kind:?})"))
+    let offending: Vec<String> = postgres_memory_sources()
+        .iter()
+        .flat_map(|(path, text)| {
+            vector_casts(text)
+                .into_iter()
+                .filter(|(_, kind)| *kind != VectorCast::TextParameter)
+                .map(move |(line, kind)| format!("{path}:{line} ({kind:?})"))
+        })
         .collect();
     assert!(
         offending.is_empty(),
@@ -102,10 +141,15 @@ fn pgvector_parameters_are_never_typed_as_vector() {
 
 #[test]
 fn pgvector_parameters_still_reach_the_vector_type() {
-    let text_parameters = vector_casts(POSTGRES_MEMORY)
-        .into_iter()
-        .filter(|(_, kind)| *kind == VectorCast::TextParameter)
-        .count();
+    let text_parameters: usize = postgres_memory_sources()
+        .iter()
+        .map(|(_, text)| {
+            vector_casts(text)
+                .into_iter()
+                .filter(|(_, kind)| *kind == VectorCast::TextParameter)
+                .count()
+        })
+        .sum();
     assert_eq!(
         text_parameters, EXPECTED_TEXT_VECTOR_PARAMETERS,
         "expected {EXPECTED_TEXT_VECTOR_PARAMETERS} `$N::text::vector` casts (seven statements: \
@@ -120,13 +164,16 @@ fn pgvector_literal_stays_the_text_form_bound_to_those_parameters() {
     // The `::text` cast is correct only while the bound value is text. If the
     // producer changes to a native vector type (e.g. the `pgvector` crate), the
     // casts above must be revisited together with it.
+    let sources = postgres_memory_sources();
     assert!(
-        POSTGRES_MEMORY.contains("fn pgvector_literal(embedding: &[f32]) -> Option<String> {"),
+        sources
+            .iter()
+            .any(|(_, text)| text.contains("fn pgvector_literal(embedding: &[f32]) -> Option<String> {")),
         "`pgvector_literal` must keep producing the text form (`Option<String>`) that the \
          `$N::text::vector` parameters are typed for"
     );
     assert!(
-        !POSTGRES_MEMORY.contains("pgvector::"),
+        !sources.iter().any(|(_, text)| text.contains("pgvector::")),
         "the adapter binds vectors as text; a native pgvector binding needs the casts revisited"
     );
 }

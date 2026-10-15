@@ -180,6 +180,11 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // ledger; discovery closes immediately and call sessions close on reset.
     "src/tools/mcp.rs::call_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
     "src/tools/mcp.rs::discover_server_tools_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
+    // Test-only: proving the skill publication generation CAS is process-safe
+    // needs real competing processes (the test binary re-executed), and proving
+    // the lock is released when its holder dies needs a child that is SIGKILLed.
+    "src/skills/lifecycle/tests/publish.rs::a_killed_lock_holder_releases_the_lock_and_publication_continues::.spawn()",
+    "src/skills/lifecycle/tests/publish.rs::processes_racing_on_one_generation_have_exactly_one_winner::.spawn()",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",
@@ -217,9 +222,9 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/cron/postgres.rs::{qualified_memory_events_table}",
     "src/cron/store.rs::cron_event_outbox",
     "src/cron/store.rs::cron_job_events",
-    "src/memory/postgres.rs::{qualified_memory_events_table}",
-    "src/memory/postgres.rs::{qualified_message_events_table}",
-    "src/memory/postgres.rs::{schema_ident}.approval_grant_events",
+    "src/memory/postgres/schema.rs::{qualified_memory_events_table}",
+    "src/memory/postgres/schema.rs::{qualified_message_events_table}",
+    "src/memory/postgres/schema.rs::{schema_ident}.approval_grant_events",
     "src/memory/sqlite/approval_grants.rs::approval_grant_events",
     "src/memory/sqlite/approval_grants.rs::memory_events",
     "src/memory/sqlite/schema.rs::evolution_proposal_events",
@@ -721,11 +726,31 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         !sqlite_source.trim().is_empty(),
         "the sqlite backend source files under src/memory/sqlite/ must not be empty"
     );
-    let postgres_source = fs::read_to_string(repository_root().join("src/memory/postgres.rs"))
-        .unwrap_or_else(|error| panic!("read src/memory/postgres.rs: {error}"));
+    // The PostgreSQL adapter is the root file plus every file under its
+    // directory; the scan must see both and must not come back empty.
+    let mut postgres_files = vec!["src/memory/postgres.rs".to_string()];
+    for entry in
+        fs::read_dir(repository_root().join("src/memory/postgres")).expect("read the PostgreSQL adapter directory")
+    {
+        let path = entry.expect("read directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            postgres_files.push(relative_path(&path));
+        }
+    }
+    assert!(
+        postgres_files.len() > 2,
+        "the PostgreSQL adapter scan found only {postgres_files:?}"
+    );
+    let postgres_source = postgres_files
+        .iter()
+        .map(|file| {
+            fs::read_to_string(repository_root().join(file)).unwrap_or_else(|error| panic!("read {file}: {error}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     for (relative, source) in [
         ("src/memory/sqlite/", sqlite_source),
-        ("src/memory/postgres.rs", postgres_source),
+        ("src/memory/postgres.rs and src/memory/postgres/", postgres_source),
     ] {
         for required in [
             "config_generation_id",
@@ -1787,6 +1812,10 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
 /// reason. Every other function that walks the source tree must separate
 /// production from tests through a marker-aware helper.
 const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
+    (
+        "runtime_and_message_events_preserve_typed_config_generation_columns",
+        "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
+    ),
     (
         "brain_db_is_not_opened_outside_the_sqlite_repository",
         "its allowlist names test functions: a test that opens brain.db directly is a reviewed exception too",
@@ -6532,19 +6561,19 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
                  loop's own handle on the approved execution service",
     },
     NonToolCallSite {
-        entry: "src/memory/postgres.rs::acquire_reset",
+        entry: "src/memory/postgres/pool.rs::acquire_reset",
         receiver: "client",
         occurrences: 1,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/pool.rs",
         evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
         reason: "`checkout.client_mut().and_then(|client| client.execute(...))` resets the \
                  PostgreSQL session context on a pooled tokio-postgres client",
     },
     NonToolCallSite {
-        entry: "src/memory/postgres.rs::apply_rls_context_raw",
+        entry: "src/memory/postgres/access.rs::apply_rls_context_raw",
         receiver: "client",
         occurrences: 4,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/access.rs",
         evidence: "fn apply_rls_context_raw<C: GenericClient>",
         reason: "binds the row-level-security context on a generic tokio-postgres client or \
                  transaction; the four calls are the four SET LOCAL statements",
@@ -6572,7 +6601,7 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         entry: "src/webhook/mod.rs::fail_blocking",
         receiver: "client_mut",
         occurrences: 1,
-        evidence_file: "src/memory/postgres.rs",
+        evidence_file: "src/memory/postgres/pool.rs",
         evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
         reason: "`checkout.client_mut()?.execute(...)` marks a webhook ingestion failed on the \
                  pooled tokio-postgres client; the SQLite twin of the same function reaches its \
@@ -7492,9 +7521,9 @@ mod tests {
 ///   deliberately unanchored and is unreachable for an isolated caller, whose
 ///   mode is forced to Enforce before the choice is made.
 const MEMORY_READ_PRINCIPAL_CONSTRUCTIONS: &[&str] = &[
-    "src/memory/postgres.rs::principal_from_context::1",
+    "src/memory/postgres/access.rs::principal_from_context::1",
     "src/memory/postgres/decision_reads.rs::decision_principal::1",
-    "src/memory/postgres.rs::resolve_principal_from_context::2",
+    "src/memory/postgres/access.rs::resolve_principal_from_context::2",
     "src/memory/principal.rs::resolve_principal::4",
     "src/memory/sqlite/mod.rs::sqlite_read_principal::1",
 ];
