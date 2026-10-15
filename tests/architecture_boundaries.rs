@@ -68,15 +68,15 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // refused `memory_store` left the victim row's `owner_id` unchanged and wrote
     // no identity binding, and no memory API returns either. Every write in that
     // test goes through the production MCP handler.
-    "src/gateway/compat.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
-    "src/gateway/compat.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    "src/gateway/compat/tests/handler.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
+    "src/gateway/compat/tests/card_jwt.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     // Test-only (V02-R5): the anti-over-correction lock needs one row at
     // `visibility = 'public'`, and no memory API writes that visibility —
     // `classify_memory` produces `owner`, `group` or `private` only, and
     // `MemoryStoreMetadata` carries no visibility field. The row is published
     // with a single parameterized UPDATE on the seeded test database; every
     // read in that test still goes through the production MCP seam.
-    "src/gateway/compat.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
+    "src/gateway/compat/tests/memory_tools.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",
