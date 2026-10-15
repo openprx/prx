@@ -664,9 +664,11 @@ impl TurnDecisionService {
                 &config.router,
                 &config.model_routes,
             );
-            let reservation = DecisionTokenReservation::from_effective_compaction(&effective.config)?;
+            let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
+            let reservation =
+                DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
             parts.budgets.tokens = parts.budgets.tokens.min(u64::try_from(reservation.decision_tokens)?);
-            let main_compaction = reservation.reserved_compaction(&effective.config)?;
+            let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
             let remaining_budget = parts.budgets;
             let mut next = state.clone();
             next.trusted = TrustedState::from_runtime(parts);

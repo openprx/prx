@@ -1376,16 +1376,28 @@ fn session_artifacts_from_selected_read(
 
 impl DecisionTokenReservation {
     /// Use the selected route's effective compaction window, after its
-    /// response reserve. Very small windows fail closed instead of silently
+    /// response reserve. The fixed marginal slice is also capped by the
+    /// configured ratio to that baseline window. Very small windows and a
+    /// ratio that cannot fund one token fail closed instead of silently
     /// authorizing a zero-token decision budget.
     pub(crate) fn from_effective_compaction(
         config: &crate::config::AgentCompactionConfig,
+        extra_token_ratio_limit: f32,
     ) -> Result<Self, DecisionReserveUnavailable> {
         let available = config
             .max_context_tokens
             .checked_sub(config.reserve_tokens)
             .ok_or(DecisionReserveUnavailable)?;
-        let decision_tokens = (available / 16).min(4096);
+        if !extra_token_ratio_limit.is_finite() || extra_token_ratio_limit < 0.0 {
+            return Err(DecisionReserveUnavailable);
+        }
+        let ratio_limit = ((available as f64) * f64::from(extra_token_ratio_limit)).floor();
+        let ratio_limit = if ratio_limit >= usize::MAX as f64 {
+            usize::MAX
+        } else {
+            ratio_limit as usize
+        };
+        let decision_tokens = (available / 16).min(4096).min(ratio_limit);
         let main_input_limit = available
             .checked_sub(decision_tokens)
             .ok_or(DecisionReserveUnavailable)?;
@@ -1405,8 +1417,9 @@ impl DecisionTokenReservation {
     pub(crate) fn reserved_compaction(
         self,
         effective: &crate::config::AgentCompactionConfig,
+        extra_token_ratio_limit: f32,
     ) -> Result<crate::config::AgentCompactionConfig, DecisionReserveUnavailable> {
-        let expected = Self::from_effective_compaction(effective)?;
+        let expected = Self::from_effective_compaction(effective, extra_token_ratio_limit)?;
         if self != expected {
             return Err(DecisionReserveUnavailable);
         }
@@ -3081,8 +3094,10 @@ impl TurnDecisionService {
             &config.router,
             &config.model_routes,
         );
-        let reservation = DecisionTokenReservation::from_effective_compaction(&effective.config)?;
-        let main_compaction = reservation.reserved_compaction(&effective.config)?;
+        let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
+        let reservation =
+            DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
+        let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
         let remaining = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
             &config.cost,
             &config.workspace_dir,
@@ -5543,15 +5558,24 @@ mod tests {
     }
 
     #[test]
-    fn decision_reservation_uses_effective_input_window_and_rejects_tiny_windows() {
+    fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windows() {
         let mut config = crate::config::AgentCompactionConfig::default();
         config.max_context_tokens = 32_768;
         config.reserve_tokens = 4_096;
-        let reservation = DecisionTokenReservation::from_effective_compaction(&config).unwrap();
+        let reservation = DecisionTokenReservation::from_effective_compaction(
+            &config,
+            crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+        )
+        .unwrap();
         assert_eq!(reservation.decision_tokens, 1_792);
         assert_eq!(reservation.main_input_limit, 26_880);
         assert_eq!(reservation.decision_tokens + reservation.main_input_limit, 28_672);
-        let reserved = reservation.reserved_compaction(&config).unwrap();
+        let reserved = reservation
+            .reserved_compaction(
+                &config,
+                crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+            )
+            .unwrap();
         assert_eq!(reserved.reserve_tokens, 5_888);
         assert_eq!(
             reserved.max_context_tokens - reserved.reserve_tokens,
@@ -5562,7 +5586,10 @@ mod tests {
         changed_route.max_context_tokens = 16_384;
         assert!(
             matches!(
-                reservation.reserved_compaction(&changed_route),
+                reservation.reserved_compaction(
+                    &changed_route,
+                    crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+                ),
                 Err(DecisionReserveUnavailable)
             ),
             "a reservation is bound to its effective input window"
@@ -5570,21 +5597,43 @@ mod tests {
 
         config.max_context_tokens = 100_000;
         config.reserve_tokens = 1;
-        let capped = DecisionTokenReservation::from_effective_compaction(&config).unwrap();
+        let capped = DecisionTokenReservation::from_effective_compaction(
+            &config,
+            crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+        )
+        .unwrap();
         assert_eq!(capped.decision_tokens, 4_096);
         assert_eq!(capped.main_input_limit, 95_903);
 
         config.max_context_tokens = 16;
         config.reserve_tokens = 0;
-        let smallest = DecisionTokenReservation::from_effective_compaction(&config).unwrap();
+        let smallest = DecisionTokenReservation::from_effective_compaction(
+            &config,
+            crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+        )
+        .unwrap();
         assert_eq!(smallest.decision_tokens, 1);
         assert_eq!(smallest.main_input_limit, 15);
+
+        config.max_context_tokens = 32_768;
+        config.reserve_tokens = 4_096;
+        let ratio_limited = DecisionTokenReservation::from_effective_compaction(&config, 0.01).unwrap();
+        assert_eq!(ratio_limited.decision_tokens, 286);
+        assert_eq!(ratio_limited.main_input_limit, 28_386);
+        assert_eq!(
+            DecisionTokenReservation::from_effective_compaction(&config, 0.0),
+            Err(DecisionReserveUnavailable),
+            "a zero ratio cannot admit an unaccounted decision request"
+        );
 
         for (window, response_reserve) in [(0, 0), (4, 5), (15, 0), (4_096, 4_096)] {
             config.max_context_tokens = window;
             config.reserve_tokens = response_reserve;
             assert_eq!(
-                DecisionTokenReservation::from_effective_compaction(&config),
+                DecisionTokenReservation::from_effective_compaction(
+                    &config,
+                    crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
+                ),
                 Err(DecisionReserveUnavailable)
             );
         }

@@ -59,6 +59,36 @@ fn fixture_main_compaction(config: &crate::config::AgentCompactionConfig) -> cra
     main
 }
 
+#[tokio::test]
+async fn configured_extra_token_ratio_caps_real_turn_decision_admission() {
+    let workspace = TempDir::new().expect("budget fixture workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.agent.compaction.max_context_tokens = 32_768;
+    config.agent.compaction.max_context_tokens_explicit = true;
+    config.agent.compaction.reserve_tokens = 4_096;
+    config.causal_tree.policy.extra_token_ratio_limit = 0.01;
+
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
+    let admission =
+        crate::agent::turn_tests::admission::AdmittedTurn::with_config(config, "Explain `2 + 2`.", tools_registry)
+            .await;
+
+    let baseline_tokens = 32_768_usize - 4_096;
+    let ratio_limit = ((baseline_tokens as f64) * f64::from(0.01_f32)).floor() as usize;
+    assert_eq!(ratio_limit, 286, "fixture must exercise the configured ratio cap");
+    assert!(ratio_limit < baseline_tokens / 16, "the ratio must be the active cap");
+    assert_eq!(admission.compaction().reserve_tokens, 4_096 + ratio_limit);
+    assert_eq!(
+        admission
+            .compaction()
+            .max_context_tokens
+            .checked_sub(admission.compaction().reserve_tokens),
+        Some(baseline_tokens - ratio_limit),
+        "the production admission must reserve no more than the configured extra-token ratio"
+    );
+}
+
 /// A history that fits the window on its own can still overrun it once the
 /// native tool schemas are appended to the same request. The budget has to
 /// account for them before the provider is reached, not after.

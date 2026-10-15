@@ -741,8 +741,10 @@ async fn admin_accounting_scope(
             &config.router,
             &config.model_routes,
         );
-        let reservation =
-            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(&effective.config)?;
+        let reservation = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+            &effective.config,
+            config.causal_tree.policy.extra_token_ratio_limit,
+        )?;
         tokens = tokens.min(u64::try_from(reservation.decision_tokens)?);
     }
     anyhow::ensure!(tokens != u64::MAX && tokens > 0, "admin decision allowance unavailable");
@@ -1151,9 +1153,12 @@ mod tests {
             &config.model_routes,
         );
         let expected_tokens = u64::try_from(
-            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(&effective.config)
-                .expect("actual effective decision reservation")
-                .decision_tokens,
+            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+                &effective.config,
+                config.causal_tree.policy.extra_token_ratio_limit,
+            )
+            .expect("actual effective decision reservation")
+            .decision_tokens,
         )
         .expect("bounded decision reservation");
         let expected_cost = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
