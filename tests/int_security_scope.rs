@@ -162,8 +162,8 @@ async fn scope_policy_multi_rule_layered_evaluation() {
 // These tests call the production scrub — `tools::execution::strip_runtime_only_args`,
 // the single source of truth every injection site reuses (`normalize_arguments`
 // in tools/execution.rs, `inject_trusted_scope` in gateway/compat.rs,
-// `Agent::execute_tool_call` in agent/agent.rs, `execute_one_tool` in
-// agent/execution_policy.rs, and the third-party forward in tools/mcp.rs).
+// `Agent::execute_tool_call` in agent/agent.rs, and the third-party forward in
+// tools/mcp.rs).
 //
 // The earlier version of this block re-implemented the removals inside the test
 // and asserted against its own copy, which proved nothing about production code.

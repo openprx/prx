@@ -1,15 +1,7 @@
 use crate::agent::diagnostics::sanitize_tool_parse_log_preview;
 use crate::providers::ToolCall;
-#[cfg(test)]
-use crate::tools::Tool;
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
-
-/// Find a tool by name in the registry.
-#[cfg(test)]
-pub(super) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools.iter().find(|t| t.supports_name(name)).map(|t| t.as_ref())
-}
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {

@@ -11,7 +11,8 @@ use std::sync::Arc;
 /// delegate, sessions_spawn, …) can default it to [`ChatMode::Edit`].
 ///
 /// - [`ChatMode::Plan`] — read-only: write/shell/git-mutating tools are
-///   intercepted by [`execute_one_tool`] before execution and a simulated
+///   intercepted by `execute_one_unrecorded` (`agent/tool_scheduler.rs`, reached via
+///   `execute_tools_with_service`) before execution and a simulated
 ///   "[plan mode] would call <tool>" result is fed back to the model. Read
 ///   tools (file_read, grep, web_search, memory_recall, …) execute normally.
 /// - [`ChatMode::Edit`] — default. No filtering: all tools that pass the
