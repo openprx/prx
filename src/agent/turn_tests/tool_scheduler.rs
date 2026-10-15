@@ -17,7 +17,7 @@ use crate::agent::execution_policy::{
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::ToolResultRecorder;
 use crate::agent::tool_result_recording::tool_result_is_success;
-use crate::agent::turn_contracts::{ChatMode, ScopeContext};
+use crate::agent::turn_contracts::{ApprovalDecision, ApprovalResolver, ChatMode, ScopeContext};
 use crate::agent::turn_tests::{DelayTool, RecordingTool, scheduler_test_adapter};
 use crate::approval::ApprovalManager;
 #[cfg(test)]
@@ -126,7 +126,7 @@ fn tool_barrier_groups_memory_reindex_with_memory_writes() {
 }
 
 #[tokio::test]
-async fn execute_tools_with_policy_prioritizes_foreground_tools() {
+async fn production_scheduler_prioritizes_foreground_tools() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![
@@ -139,6 +139,8 @@ async fn execute_tools_with_policy_prioritizes_foreground_tools() {
             execution_order: Arc::clone(&execution_order),
         }),
     ];
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
 
     let calls = vec![
         ParsedToolCall {
@@ -151,24 +153,17 @@ async fn execute_tools_with_policy_prioritizes_foreground_tools() {
         },
     ];
 
-    let results = execute_tools_with_policy(
+    let results = run_through_production_scheduler(
         &calls,
-        &tools_registry,
-        &NoopObserver,
-        None,
-        "cli",
+        &adapter,
         ReadOnlyToolScheduleConfig {
             concurrency_window: 2,
             priority_enabled: true,
             low_priority_tool_names: std::iter::once("sessions_spawn".to_string()).collect(),
         },
-        None,
-        None,
         ChatMode::default(),
-        None,
     )
-    .await
-    .expect("priority scheduling should execute successfully");
+    .await;
 
     assert_eq!(results, vec!["sessions_spawn", "file_read"]);
     let observed_order = execution_order
@@ -267,45 +262,24 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
         execution_order: Arc::clone(&execution_order),
     })];
     let policy = crate::security::SecurityPolicy::default();
-    let scope_ctx = ScopeContext {
-        policy: &policy,
-        sender: "user@example.com",
-        channel: "telegram",
-        chat_type: "private",
-        chat_id: "chat-1",
-        session_key: None,
-        owner_id: None,
-        owner_isolated: false,
-        topic_id: None,
-        task_id: None,
-        source_message_event_id: None,
-        config_generation_id: None,
-        config_source_revision: None,
-    };
-    let call = ParsedToolCall {
-        name: "delegate".to_string(),
-        arguments: serde_json::json!({}),
-    };
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
 
     assert_eq!(
-        decide_tool_call(&call, Some(&scope_ctx)),
+        crate::tools::decide_tool_execution(
+            scope_ctx.policy,
+            "delegate",
+            scope_ctx.sender,
+            scope_ctx.channel,
+            scope_ctx.chat_type
+        ),
         crate::tools::ToolExecutionDecision::Allow
     );
-    let result = execute_tool_call_serial(
-        &call,
-        &tools_registry,
-        &NoopObserver,
-        None,
-        "telegram",
-        None,
-        Some(&scope_ctx),
-        ChatMode::default(),
-        None,
-    )
-    .await
-    .expect("default autonomous execution");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, None, &ledger_dir);
+    let calls = single_call("delegate", serde_json::json!({}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
-    assert_eq!(result, "delegate");
+    assert_eq!(results, vec!["delegate"]);
     assert_eq!(
         execution_order
             .lock()
@@ -317,8 +291,8 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
 
 /// Companion to the fail-closed test: under the SAME conditions (supervised,
 /// scope present, no `ApprovalManager`) a genuinely read-only tool resolves
-/// to `Allow` and still executes — the fix denies side effects without
-/// over-blocking observational tools.
+/// to `Allow` and still executes through the production executor, so the
+/// fail-closed denial does not over-block observational tools.
 #[tokio::test]
 async fn supervised_read_only_tool_without_approval_manager_still_executes() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
@@ -332,42 +306,13 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
         autonomy: crate::security::AutonomyLevel::Supervised,
         ..crate::security::SecurityPolicy::default()
     };
-    let scope_ctx = ScopeContext {
-        policy: &policy,
-        sender: "user@example.com",
-        channel: "telegram",
-        chat_type: "private",
-        chat_id: "chat-1",
-        session_key: None,
-        owner_id: None,
-        owner_isolated: false,
-        topic_id: None,
-        task_id: None,
-        source_message_event_id: None,
-        config_generation_id: None,
-        config_source_revision: None,
-    };
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, None, None, &ledger_dir);
+    let calls = single_call("file_read", serde_json::json!({}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
-    let call = ParsedToolCall {
-        name: "file_read".to_string(),
-        arguments: serde_json::json!({}),
-    };
-
-    let result = execute_tool_call_serial(
-        &call,
-        &tools_registry,
-        &NoopObserver,
-        None,
-        "telegram",
-        None,
-        Some(&scope_ctx),
-        ChatMode::default(),
-        None,
-    )
-    .await
-    .expect("serial execution of read-only tool should succeed");
-
-    assert_eq!(result, "file_read");
+    assert_eq!(results, vec!["file_read"]);
     assert_eq!(
         execution_order
             .lock()
@@ -380,7 +325,8 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
 
 /// P2-a: a tool on the session "Always" allowlist executes immediately under
 /// `supervised` without re-prompting, even when an `ApprovalManager` is wired
-/// — the "Always" shortcut survived the move to the unified `decide` gate.
+/// (production: `AgentToolApprovalStrategy` in `execution_policy.rs`) -- the
+/// "Always" shortcut survived the move to the unified `decide` gate.
 #[tokio::test]
 async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
@@ -394,9 +340,34 @@ async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
         autonomy: crate::security::AutonomyLevel::Supervised,
         ..crate::security::SecurityPolicy::default()
     };
-    let scope_ctx = ScopeContext {
-        policy: &policy,
-        sender: "user@example.com",
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+
+    // Seed the session "Always" allowlist for `delegate`.
+    let mgr = Arc::new(ApprovalManager::new());
+    mgr.record_decision("delegate", &serde_json::json!({}), ApprovalResponse::Always, "telegram");
+    assert!(mgr.is_session_allowlisted("delegate"));
+
+    // No resolver: a non-allowlisted Act tool would deny on this channel.
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, Some(Arc::clone(&mgr)), None, &ledger_dir);
+    let calls = single_call("delegate", serde_json::json!({}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+
+    assert_eq!(results, vec!["delegate"]);
+    assert_eq!(
+        execution_order
+            .lock()
+            .expect("execution order lock should be valid")
+            .as_slice(),
+        ["delegate"],
+        "session-allowlisted Act tool must execute without a prompt"
+    );
+}
+
+fn scheduler_scope<'a>(policy: &'a crate::security::SecurityPolicy, sender: &'a str) -> ScopeContext<'a> {
+    ScopeContext {
+        policy,
+        sender,
         channel: "telegram",
         chat_type: "private",
         chat_id: "chat-1",
@@ -408,40 +379,142 @@ async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
         source_message_event_id: None,
         config_generation_id: None,
         config_source_revision: None,
-    };
+    }
+}
 
-    // Seed the session "Always" allowlist for `delegate`.
-    let mgr = ApprovalManager::new();
-    mgr.record_decision("delegate", &serde_json::json!({}), ApprovalResponse::Always, "telegram");
-    assert!(mgr.is_session_allowlisted("delegate"));
+/// Production adapter (real `ToolExecutionService` + the agent approval
+/// strategy) for a scoped, non-CLI channel, with an optional approval manager.
+fn scoped_scheduler_adapter(
+    tools: Vec<Box<dyn Tool>>,
+    scope: &ScopeContext<'_>,
+    approval: Option<Arc<ApprovalManager>>,
+    approval_resolver: Option<Arc<dyn ApprovalResolver>>,
+    ledger_dir: &TempDir,
+) -> ToolLoopRuntimeAdapter {
+    let ledger: Arc<dyn crate::memory::Memory> = Arc::new(
+        crate::memory::SqliteMemory::new(ledger_dir.path()).expect("test: sqlite ledger should open in a temp dir"),
+    );
+    build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
+        scope: Some(scope),
+        channel_name: scope.channel,
+        tools_registry: Arc::new(tools),
+        approval,
+        approval_resolver,
+        cancellation: None,
+        ledger: Some(ledger),
+        unscoped_policy: None,
+    })
+}
 
-    let call = ParsedToolCall {
+/// Drives `calls` through the production executor `execute_tools_with_service`.
+async fn run_through_production_scheduler(
+    calls: &[ParsedToolCall],
+    adapter: &ToolLoopRuntimeAdapter,
+    schedule: ReadOnlyToolScheduleConfig,
+    chat_mode: ChatMode,
+) -> Vec<String> {
+    let recorder = ToolResultRecorder::new(calls.len());
+    execute_tools_with_service(calls, &[], adapter, schedule, None, chat_mode, &NoopObserver, &recorder)
+        .await
+        .expect("production scheduler should return tool results, not an execution error")
+}
+
+fn single_call(name: &str, arguments: serde_json::Value) -> Vec<ParsedToolCall> {
+    vec![ParsedToolCall {
+        name: name.to_string(),
+        arguments,
+    }]
+}
+
+/// Resolver double that returns a fixed decision and counts its invocations.
+struct FixedApprovalResolver {
+    decision: ApprovalDecision,
+    calls: AtomicUsize,
+}
+
+impl FixedApprovalResolver {
+    fn new(decision: ApprovalDecision) -> Arc<Self> {
+        Arc::new(Self {
+            decision,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl ApprovalResolver for FixedApprovalResolver {
+    async fn resolve(&self, _request: &crate::approval::ApprovalRequest, _channel: &str) -> ApprovalDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
+    }
+}
+
+/// Runs a supervised, non-allowlisted `delegate` call on the non-CLI `telegram`
+/// channel through the production executor and returns (result, executions).
+async fn run_supervised_act_call_with_approval(resolver: Option<Arc<dyn ApprovalResolver>>) -> (String, Vec<String>) {
+    let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "delegate".to_string(),
-        arguments: serde_json::json!({}),
+        execution_order: Arc::clone(&execution_order),
+    })];
+    let policy = crate::security::SecurityPolicy {
+        autonomy: crate::security::AutonomyLevel::Supervised,
+        ..crate::security::SecurityPolicy::default()
     };
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+    let mgr = Arc::new(ApprovalManager::new());
+    assert!(!mgr.is_session_allowlisted("delegate"));
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(tools_registry, &scope_ctx, Some(mgr), resolver, &ledger_dir);
+    let calls = single_call("delegate", serde_json::json!({}));
+    let mut results =
+        run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+    let executed = execution_order
+        .lock()
+        .expect("execution order lock should be valid")
+        .clone();
+    (results.remove(0), executed)
+}
 
-    let result = execute_tool_call_serial(
-        &call,
-        &tools_registry,
-        &NoopObserver,
-        Some(&mgr),
-        "telegram",
-        None,
-        Some(&scope_ctx),
-        ChatMode::default(),
-        None, // no resolver: a non-allowlisted Act tool would deny on this channel
-    )
-    .await
-    .expect("allowlisted tool should execute");
+#[tokio::test]
+async fn supervised_act_tool_with_granting_resolver_executes_once() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let resolver = FixedApprovalResolver::new(ApprovalDecision::Grant);
+    let (result, executed) = run_supervised_act_call_with_approval(Some(resolver.clone())).await;
 
-    assert_eq!(result, "delegate");
     assert_eq!(
-        execution_order
-            .lock()
-            .expect("execution order lock should be valid")
-            .as_slice(),
-        ["delegate"],
-        "session-allowlisted Act tool must execute without a prompt"
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "the resolver must be asked once"
+    );
+    assert_eq!(result, "delegate", "a granted call returns the tool output: {result}");
+    assert_eq!(executed, ["delegate"], "a granted Act tool must execute exactly once");
+}
+
+#[tokio::test]
+async fn supervised_act_tool_with_denying_resolver_is_not_executed() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let resolver = FixedApprovalResolver::new(ApprovalDecision::Deny);
+    let (result, executed) = run_supervised_act_call_with_approval(Some(resolver.clone())).await;
+
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "the resolver must be asked once"
+    );
+    assert!(result.contains("Denied by user"), "denial text expected, got: {result}");
+    assert!(executed.is_empty(), "a denied Act tool must NOT execute");
+}
+
+#[tokio::test]
+async fn supervised_act_tool_with_manager_but_no_resolver_on_non_cli_channel_is_denied() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let (result, executed) = run_supervised_act_call_with_approval(None).await;
+
+    assert!(result.contains("Denied by user"), "denial text expected, got: {result}");
+    assert!(
+        executed.is_empty(),
+        "without a resolver a non-CLI channel must deny, not approve"
     );
 }
 
@@ -635,7 +708,7 @@ async fn read_only_calls_still_run_concurrently_without_any_rollout_gate() {
 }
 
 #[tokio::test]
-async fn execute_one_tool_applies_barrier_for_shared_resource_tools() {
+async fn production_scheduler_applies_barrier_for_shared_resource_tools() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -645,29 +718,17 @@ async fn execute_one_tool_applies_barrier_for_shared_resource_tools() {
         Arc::clone(&active),
         Arc::clone(&max_active),
     ))];
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let first_calls = single_call("file_write", serde_json::json!({"value":"A"}));
+    let second_calls = single_call("file_write", serde_json::json!({"value":"B"}));
 
-    let first = execute_one_tool(
-        "file_write",
-        serde_json::json!({"value":"A"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::default(),
+    let (first, second) = tokio::join!(
+        run_through_production_scheduler(&first_calls, &adapter, unlimited_schedule(1), ChatMode::default()),
+        run_through_production_scheduler(&second_calls, &adapter, unlimited_schedule(1), ChatMode::default()),
     );
-    let second = execute_one_tool(
-        "file_write",
-        serde_json::json!({"value":"B"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::default(),
-    );
-
-    let (_a, _b) = tokio::join!(first, second);
+    assert_eq!(first, vec!["ok:A"]);
+    assert_eq!(second, vec!["ok:B"]);
     assert_eq!(
         max_active.load(Ordering::SeqCst),
         1,
@@ -739,25 +800,17 @@ async fn production_scheduler_refuses_a_tool_when_its_shared_resource_barrier_ti
 }
 
 #[tokio::test]
-async fn execute_one_tool_rejects_action_specific_schema_errors_before_side_effects() {
+async fn production_scheduler_rejects_action_specific_schema_errors_before_side_effects() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let executions = Arc::new(AtomicUsize::new(0));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ConditionalSchemaTool {
         executions: Arc::clone(&executions),
     })];
-
-    let result = execute_one_tool(
-        "conditional_schema",
-        serde_json::json!({"action": "write"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::default(),
-    )
-    .await
-    .expect("schema preflight should return a retryable tool result");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let calls = single_call("conditional_schema", serde_json::json!({"action": "write"}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+    let result = &results[0];
 
     assert!(result.contains("$.content is required"), "{result}");
     assert!(result.contains("Read the tool schema and retry"), "{result}");
@@ -765,7 +818,7 @@ async fn execute_one_tool_rejects_action_specific_schema_errors_before_side_effe
 }
 
 #[tokio::test]
-async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
+async fn production_scheduler_in_plan_mode_intercepts_write_tools() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     // file_write is registered but plan mode should short-circuit before
     // touching it. We confirm via the DelayTool counter that no execution
@@ -789,21 +842,14 @@ async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
         Arc::clone(&active),
         Arc::clone(&max_active),
     ))];
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let calls = single_call("file_write", serde_json::json!({"value": "x"}));
 
     let started = std::time::Instant::now();
-    let result = execute_one_tool(
-        "file_write",
-        serde_json::json!({"value": "x"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::Plan,
-    )
-    .await
-    .expect("plan-mode interception should succeed");
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Plan).await;
     let elapsed = started.elapsed();
+    let result = &results[0];
 
     assert!(
         result.starts_with("[plan mode] would call file_write"),
@@ -821,7 +867,7 @@ async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
 }
 
 #[tokio::test]
-async fn execute_one_tool_in_plan_mode_allows_read_tools() {
+async fn production_scheduler_in_plan_mode_allows_read_tools() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     // file_read is in the read-only set — plan mode should let it run.
     // We use a fake DelayTool named "file_read" and assert it ran (active
@@ -834,19 +880,11 @@ async fn execute_one_tool_in_plan_mode_allows_read_tools() {
         Arc::clone(&active),
         Arc::clone(&max_active),
     ))];
-
-    let result = execute_one_tool(
-        "file_read",
-        serde_json::json!({"value": "x"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::Plan,
-    )
-    .await
-    .expect("read tool should execute normally in plan mode");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let calls = single_call("file_read", serde_json::json!({"value": "x"}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Plan).await;
+    let result = &results[0];
 
     assert!(
         !result.starts_with("[plan mode]"),
@@ -860,7 +898,7 @@ async fn execute_one_tool_in_plan_mode_allows_read_tools() {
 }
 
 #[tokio::test]
-async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
+async fn production_scheduler_in_edit_mode_runs_write_tools_normally() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -870,19 +908,11 @@ async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
         Arc::clone(&active),
         Arc::clone(&max_active),
     ))];
-
-    let result = execute_one_tool(
-        "file_write",
-        serde_json::json!({"value": "y"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::Edit,
-    )
-    .await
-    .expect("edit mode must allow file_write through");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let calls = single_call("file_write", serde_json::json!({"value": "y"}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Edit).await;
+    let result = &results[0];
 
     assert!(
         !result.starts_with("[plan mode]"),
@@ -896,7 +926,7 @@ async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
 }
 
 #[tokio::test]
-async fn execute_one_tool_in_auto_mode_runs_write_tools_normally() {
+async fn production_scheduler_in_auto_mode_runs_write_tools_normally() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -906,19 +936,11 @@ async fn execute_one_tool_in_auto_mode_runs_write_tools_normally() {
         Arc::clone(&active),
         Arc::clone(&max_active),
     ))];
-
-    let result = execute_one_tool(
-        "shell",
-        serde_json::json!({"value": "echo hi"}),
-        &tools_registry,
-        &NoopObserver,
-        None,
-        None,
-        false,
-        ChatMode::Auto,
-    )
-    .await
-    .expect("auto mode must allow shell through");
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
+    let calls = single_call("shell", serde_json::json!({"value": "echo hi"}));
+    let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Auto).await;
+    let result = &results[0];
 
     assert!(
         !result.starts_with("[plan mode]"),
