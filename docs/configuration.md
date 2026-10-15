@@ -790,6 +790,7 @@ effect) and its response carries the same `warning`.
 |---|---|
 | `agent.max_tool_iterations` | progressing agent work has no arbitrary tool-round ceiling |
 | `agent.parallel_tools` | no concurrency ceiling to switch |
+| `agent.tool_dispatcher` | never read: the tool-call wire form follows the provider's capabilities |
 | `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
 | `agent.concurrency_kill_switch_force_serial` | staged rollout retired |
 | `agent.concurrency_rollout_stage` | staged rollout retired |

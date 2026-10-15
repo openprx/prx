@@ -323,14 +323,6 @@ pub(crate) enum ObservedArtifactKind {
     Memory,
     Document,
     Session,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Canonical artifact kind; live discovery metadata must not become answer evidence"
-        )
-    )]
-    Discovery,
 }
 
 impl ObservedArtifactKind {
@@ -339,7 +331,6 @@ impl ObservedArtifactKind {
             Self::Memory => "memory",
             Self::Document => "document",
             Self::Session => "session",
-            Self::Discovery => "discovery",
         }
     }
 }
@@ -1031,11 +1022,6 @@ mod turn_state_tests {
                 ObservedStepKind::Retrieve,
             ),
             hop(ObservedStepStatus::Failed, None, ObservedStepKind::Retrieve),
-            hop(
-                ObservedStepStatus::Ok,
-                Some((ObservedArtifactKind::Discovery, "A calendar skill.")),
-                ObservedStepKind::Discover,
-            ),
         ] {
             assert_ne!(progress.evidence_fingerprint(&key), evidence, "{progress:?}");
         }

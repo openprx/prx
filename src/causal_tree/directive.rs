@@ -44,13 +44,6 @@ pub(crate) enum TurnExecutionDirective {
         approval_scope: ApprovalScope,
     },
     Refuse {
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "CDP-PLAN retains the internal refusal code; public refusal text must not disclose policy detail"
-            )
-        )]
         policy_code: String,
     },
 }
@@ -72,9 +65,13 @@ pub(crate) fn render_terminal_directive(
             approval_scope.decision_id,
             approval_scope.effect.as_str(),
         ))),
-        TurnExecutionDirective::Refuse { .. } => Ok(std::borrow::Cow::Borrowed(
-            "I can't complete this request under the current policy.",
-        )),
+        TurnExecutionDirective::Refuse { policy_code } => {
+            // The internal code stays in the log; the reply never discloses policy detail.
+            tracing::debug!(policy_code = %policy_code, "rendering terminal refusal");
+            Ok(std::borrow::Cow::Borrowed(
+                "I can't complete this request under the current policy.",
+            ))
+        }
         _ => Err(DirectiveError::ActionMismatch),
     }
 }

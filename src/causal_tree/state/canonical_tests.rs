@@ -16,8 +16,8 @@ fn canonical_fixture(key: &DecisionKey, size: u8) -> CausalState {
             1 => ApprovalRequirement::Required {
                 op_ids: vec![OpId::new("prx_op_b"), OpId::new("prx_op_a"), OpId::new("prx_op_b")],
             },
-            _ => ApprovalRequirement::Satisfied {
-                grant_id: Arc::from("prx_grant"),
+            _ => ApprovalRequirement::Required {
+                op_ids: vec![OpId::new("prx_op_c")],
             },
         };
         let refs = (0..2)
@@ -305,7 +305,6 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
         ObservedArtifactKind::Memory,
         ObservedArtifactKind::Document,
         ObservedArtifactKind::Session,
-        ObservedArtifactKind::Discovery,
     ] {
         let mut artifact = fixtures::artifact("PRX summary\u{0000}\t\r\u{001f}", STALE_ARTIFACT_MS);
         artifact.kind = kind;
@@ -410,7 +409,6 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
                 ApprovalRequirement::Required { op_ids } => {
                     json!(["required", legacy_sorted_set(op_ids.iter().map(OpId::as_str))])
                 }
-                ApprovalRequirement::Satisfied { grant_id } => json!(["satisfied", grant_id.as_ref()]),
             };
             json!({
                 "id": candidate.candidate_id().as_str(),

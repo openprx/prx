@@ -3383,10 +3383,7 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
 
 /// The sub-agent tool types and their constructors (INT-2B a46).
 const SUB_AGENT_TOOL_CONSTRUCTORS: &[(&str, &[&str])] = &[
-    (
-        "DelegateTool",
-        &["new", "new_with_options", "with_depth", "with_depth_and_options"],
-    ),
+    ("DelegateTool", &["new", "with_depth"]),
     ("SessionsSpawnTool", &["new", "new_with_registry"]),
 ];
 
@@ -3620,8 +3617,8 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         "production CompactionResolver::from_base calls",
         from_base,
         &[
-            "src/tools/delegate.rs::new_with_options",
-            "src/tools/delegate.rs::with_depth_and_options",
+            "src/tools/delegate.rs::new",
+            "src/tools/delegate.rs::with_depth",
             "src/tools/sessions_spawn.rs::new_with_registry",
         ],
     );
@@ -4284,7 +4281,6 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // The legacy `Agent` dispatcher's own tool-result block and its conversion of
     // an already-built conversation (the user turns in it came through
     // `inbound_user_message` in `agent.rs`).
-    "src/agent/dispatcher.rs::format_results",
     "src/agent/dispatcher.rs::to_provider_messages",
     // Copies of messages already in a history (content truncated or normalised,
     // role kept): compaction and audit projections, multimodal normalisation.

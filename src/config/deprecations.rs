@@ -76,6 +76,10 @@ const REASON_NEVER_IMPLEMENTED: &str = "audit event signing was never implemente
 const REASON_ROLLOUT_RETIRED: &str = "read-only tool scheduling is no longer staged behind a rollout switch, so there is nothing left to stage or roll \
      back";
 
+/// The key named a choice the runtime makes itself.
+const REASON_NEVER_READ: &str = "this setting was never read: prx picks the tool-call wire form from the provider's \
+                                 capabilities, so the value had no effect";
+
 /// Every configuration path removed by the unbounded-runtime work.
 ///
 /// Ordered by section so a reader can check it against a `config.toml` by eye.
@@ -97,6 +101,11 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         path: &["runtime", "idle_hang_max_total_secs"],
         shape: DeprecatedShape::Field,
         reason: REASON_NO_TIMEOUT,
+    },
+    DeprecatedKey {
+        path: &["agent", "tool_dispatcher"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_NEVER_READ,
     },
     // ── [agent]: tool concurrency governance ──────────────────────────────
     DeprecatedKey {

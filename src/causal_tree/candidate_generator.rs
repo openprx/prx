@@ -9,7 +9,7 @@ use super::branch::{
     ApprovalRequirement, CandidateId, CandidateSpec, CapabilityRef, CapabilityTarget, CausalActionKind,
     CausalCandidate, CostEstimate, Ns8, OpId, SideEffectClass,
 };
-use super::gates::{GateError, GateInputs, GateOutcome, GatePass, GateReport, HardGates};
+use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
 use super::state::{CausalState, SideEffectMode};
 use crate::decision::DecisionKey;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
@@ -177,25 +177,11 @@ pub(crate) enum CandidateSet {
         discoverable_families: DiscoveryFamilies,
         candidates: Vec<CausalCandidate>,
         exact_mentions: BTreeSet<CandidateId>,
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "CDP-PLAN retains bounded truncation diagnostics; production selection consumes the retained candidates"
-            )
-        )]
         truncated: Vec<CandidateId>,
         approval_scopes: BTreeMap<CandidateId, Vec<PendingApproval>>,
         report: GateReport,
     },
     NoLegalPath {
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "Preserve the no-legal-path classification; authorization uses gates and approval scopes"
-            )
-        )]
         reason: NoLegalReason,
         /// Admitted terminal bodies retained for fresh post/pre-commit gates.
         terminals: Vec<CausalCandidate>,
@@ -266,9 +252,7 @@ impl CausalCandidateGenerator {
             policy,
             Some(Ns8::of(policy.key, &entry.namespace)),
         );
-        (HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates)
-            == GateOutcome::ApprovalDeferred)
-            .then_some(candidate)
+        (HardGates::check_one(state, catalog, &candidate, gates) == GateOutcome::ApprovalDeferred).then_some(candidate)
     }
 
     pub(crate) fn generate(
@@ -364,8 +348,7 @@ impl CausalCandidateGenerator {
                             policy,
                             Some(Ns8::of(policy.key, &entry.namespace)),
                         );
-                        let admission =
-                            HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+                        let admission = HardGates::check_one(state, catalog, &candidate, gates);
                         match admission {
                             GateOutcome::Passed => {
                                 selected = Some(candidate);
@@ -476,8 +459,7 @@ impl CausalCandidateGenerator {
                             policy,
                             gates,
                         )? {
-                            let outcome =
-                                HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+                            let outcome = HardGates::check_one(state, catalog, &candidate, gates);
                             *eligible = outcome == GateOutcome::Passed;
                             if *eligible && discovery_anchor.is_none() {
                                 discovery_anchor = Some(candidate.clone());
@@ -548,7 +530,7 @@ impl CausalCandidateGenerator {
         proposed.push(terminal(CausalActionKind::Refuse, policy));
 
         // A duplicate id is a generator bug and is rejected by HardGates.
-        let initial = HardGates::apply(GatePass::PrePrediction, state, catalog, &proposed, gates)?;
+        let initial = HardGates::apply(state, catalog, &proposed, gates)?;
         let mut approval_only = Vec::new();
         let mut approval_scope_missing = false;
         for candidate in proposed.iter().filter(|_| !terminal_only) {
@@ -585,7 +567,7 @@ impl CausalCandidateGenerator {
             }
             proposed.push(refusal);
         }
-        let report = HardGates::apply(GatePass::PrePrediction, state, catalog, &proposed, gates)?;
+        let report = HardGates::apply(state, catalog, &proposed, gates)?;
         let mut legal = Vec::new();
         for candidate in proposed {
             if matches!(report.outcomes.get(candidate.candidate_id()), Some(GateOutcome::Passed)) {
@@ -613,8 +595,7 @@ impl CausalCandidateGenerator {
                             continue;
                         }
                         let candidate = from_entry(CausalActionKind::UseTool, family, entry, policy, None);
-                        let admission =
-                            HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+                        let admission = HardGates::check_one(state, catalog, &candidate, gates);
                         if admission == GateOutcome::ApprovalDeferred {
                             reason = NoLegalReason::ApprovalScopeUnavailable;
                             break;
@@ -699,7 +680,7 @@ fn select_family_candidate<'a>(
         }
         let namespace = bind_namespace.then(|| Ns8::of(policy.key, &entry.namespace));
         let candidate = from_entry(action, family, entry, policy, namespace);
-        let outcome = HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+        let outcome = HardGates::check_one(state, catalog, &candidate, gates);
         match outcome {
             GateOutcome::Passed => return Ok(Some(candidate)),
             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
@@ -1976,14 +1957,8 @@ mod tests {
             &policy,
             None,
         );
-        let old_gate = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&wrongly_labeled),
-            &gates,
-        )
-        .expect("permissive gate");
+        let old_gate =
+            HardGates::apply(&state, &view, std::slice::from_ref(&wrongly_labeled), &gates).expect("permissive gate");
         assert_eq!(
             old_gate.outcomes.get(wrongly_labeled.candidate_id()),
             Some(&GateOutcome::Passed),
@@ -2090,7 +2065,6 @@ mod tests {
         state.trusted = TrustedState::from_runtime(trusted.clone());
         assert_eq!(
             HardGates::check_one(
-                GatePass::PrePrediction,
                 &state,
                 &view,
                 &from_entry(CausalActionKind::Discover, entry.family, entry, &policy, None),
@@ -2769,7 +2743,7 @@ mod tests {
                 continue;
             }
             let candidate = from_entry(action, family, entry, policy, None);
-            let outcome = HardGates::check_one(GatePass::PrePrediction, state, catalog, &candidate, gates);
+            let outcome = HardGates::check_one(state, catalog, &candidate, gates);
             match outcome {
                 GateOutcome::Passed => return Ok(Some(candidate)),
                 GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
@@ -2936,12 +2910,10 @@ mod tests {
             expected_proposed.push(terminal(CausalActionKind::Refuse, &policy));
             let mut actual_proposed = actual.into_iter().collect::<Vec<_>>();
             actual_proposed.push(terminal(CausalActionKind::Refuse, &policy));
-            for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
-                let expected_report = HardGates::apply(pass, &state, &view, &expected_proposed, &gates).unwrap();
-                let actual_report = HardGates::apply(pass, &state, &view, &actual_proposed, &gates).unwrap();
-                assert_eq!(actual_report.outcomes, expected_report.outcomes);
-                assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
-            }
+            let expected_report = HardGates::apply(&state, &view, &expected_proposed, &gates).unwrap();
+            let actual_report = HardGates::apply(&state, &view, &actual_proposed, &gates).unwrap();
+            assert_eq!(actual_report.outcomes, expected_report.outcomes);
+            assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
             if scenario == 3 {
                 assert_eq!(
                     actual_pricing, reference_pricing,
@@ -2949,7 +2921,6 @@ mod tests {
                 );
                 assert_eq!(
                     HardGates::check_one(
-                        GatePass::PrePrediction,
                         &state,
                         &view,
                         &from_entry(CausalActionKind::Discover, first.family, first, &policy, None),
@@ -3062,10 +3033,10 @@ mod tests {
             }
             let first_probe = from_entry(CausalActionKind::UseTool, CapabilityTarget::Mcp, first, &policy, None);
             assert!(
-                matches!(HardGates::check_one(GatePass::PrePrediction, &state, &view, &first_probe, &gates), GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty())
+                matches!(HardGates::check_one(&state, &view, &first_probe, &gates), GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty())
             );
             let second_probe = from_entry(CausalActionKind::UseTool, CapabilityTarget::Mcp, second, &policy, None);
-            let second_outcome = HardGates::check_one(GatePass::PrePrediction, &state, &view, &second_probe, &gates);
+            let second_outcome = HardGates::check_one(&state, &view, &second_probe, &gates);
             if allow_second {
                 assert_eq!(second_outcome, GateOutcome::Passed);
             } else {
@@ -3101,12 +3072,10 @@ mod tests {
             );
             let expected_proposed = [expected, terminal(CausalActionKind::Refuse, &policy)];
             let actual_proposed = [actual, terminal(CausalActionKind::Refuse, &policy)];
-            for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
-                let expected_report = HardGates::apply(pass, &state, &view, &expected_proposed, &gates).unwrap();
-                let actual_report = HardGates::apply(pass, &state, &view, &actual_proposed, &gates).unwrap();
-                assert_eq!(actual_report.outcomes, expected_report.outcomes);
-                assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
-            }
+            let expected_report = HardGates::apply(&state, &view, &expected_proposed, &gates).unwrap();
+            let actual_report = HardGates::apply(&state, &view, &actual_proposed, &gates).unwrap();
+            assert_eq!(actual_report.outcomes, expected_report.outcomes);
+            assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
         }
     }
 }
