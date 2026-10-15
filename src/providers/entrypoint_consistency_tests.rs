@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{configured_connection_for, provider_runtime_options_from_config, scoped_reliability};
 use crate::config::Config;
 use crate::providers::traits::{ChatMessage, ChatRequest};
