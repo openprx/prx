@@ -49,11 +49,25 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Timeout for acquiring a tool barrier lock. If the lock holder panics or
-/// hangs, we proceed without serialisation rather than deadlocking forever.
+/// Timeout for acquiring a tool barrier lock. A timed-out mutation is refused:
+/// running it without the shared-resource barrier would defeat the scheduler's
+/// serialization guarantee.
 const TOOL_BARRIER_TIMEOUT_SECS: u64 = 60;
 
-async fn acquire_tool_barrier(key: &'static str, tool_name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tool '{tool_name}' could not acquire shared-resource barrier '{barrier_key}' within {timeout_secs}s; tool was not executed"
+)]
+struct ToolBarrierTimeout {
+    tool_name: String,
+    barrier_key: &'static str,
+    timeout_secs: u64,
+}
+
+async fn acquire_tool_barrier(
+    key: &'static str,
+    tool_name: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, ToolBarrierTimeout> {
     let barrier = {
         let mut barriers = TOOL_BARRIERS.lock();
         barriers
@@ -62,22 +76,23 @@ async fn acquire_tool_barrier(key: &'static str, tool_name: &str) -> Option<toki
             .clone()
     };
 
-    (tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(TOOL_BARRIER_TIMEOUT_SECS),
         barrier.lock_owned(),
     )
-    .await)
-        .map_or_else(
-            |_| {
-                tracing::warn!(
-                    tool = %tool_name,
-                    barrier_key = key,
-                    "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s, proceeding without barrier",
-                );
-                None
-            },
-            |guard| Some(guard),
-        )
+    .await
+    .map_err(|_| {
+        tracing::warn!(
+            tool = %tool_name,
+            barrier_key = key,
+            "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s; refusing tool execution",
+        );
+        ToolBarrierTimeout {
+            tool_name: tool_name.to_string(),
+            barrier_key: key,
+            timeout_secs: TOOL_BARRIER_TIMEOUT_SECS,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -213,7 +228,7 @@ async fn execute_one_tool(
     }
 
     let _barrier_guard = if let Some(key) = tool_barrier_key(call_name) {
-        acquire_tool_barrier(key, call_name).await
+        Some(acquire_tool_barrier(key, call_name).await?)
     } else {
         None
     };
@@ -790,10 +805,26 @@ async fn execute_one_unrecorded(
         return Ok(result);
     }
 
-    let _barrier = if let Some(key) = tool_barrier_key(&call.name) {
-        acquire_tool_barrier(key, &call.name).await
-    } else {
-        None
+    let _barrier = match tool_barrier_key(&call.name) {
+        Some(key) => match acquire_tool_barrier(key, &call.name).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let result = format!("Error: {error}");
+                emit_tool_loop_event(
+                    adapter,
+                    ToolLoopEvent::ToolFinished {
+                        tool_call_id,
+                        name: call.name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        result: result.clone(),
+                    },
+                )
+                .await?;
+                return Ok(result);
+            }
+        },
+        None => None,
     };
     let execution_context = adapter.tool_execution_context.clone();
     let cancellation = cancellation.cloned();

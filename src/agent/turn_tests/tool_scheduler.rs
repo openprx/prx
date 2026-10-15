@@ -23,10 +23,12 @@ use crate::approval::ApprovalResponse;
 use crate::observability::{NoopObserver, Observer, ObserverEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tempfile::TempDir;
+
+static TOOL_SCHEDULER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct ConditionalSchemaTool {
     executions: Arc<AtomicUsize>,
@@ -123,6 +125,7 @@ fn tool_barrier_groups_memory_reindex_with_memory_writes() {
 
 #[tokio::test]
 async fn execute_tools_with_policy_prioritizes_foreground_tools() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![
         Box::new(RecordingTool {
@@ -181,6 +184,7 @@ async fn execute_tools_with_policy_prioritizes_foreground_tools() {
 /// the fix it fell through to direct execution, bypassing approval entirely.
 #[tokio::test]
 async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "delegate".to_string(),
@@ -241,6 +245,7 @@ async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
 
 #[tokio::test]
 async fn default_full_policy_executes_installed_act_tool_without_approval_manager() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "delegate".to_string(),
@@ -301,6 +306,7 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
 /// over-blocking observational tools.
 #[tokio::test]
 async fn supervised_read_only_tool_without_approval_manager_still_executes() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "file_read".to_string(),
@@ -362,6 +368,7 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
 /// — the "Always" shortcut survived the move to the unified `decide` gate.
 #[tokio::test]
 async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "delegate".to_string(),
@@ -493,6 +500,7 @@ async fn run_single_tool_through_scheduler(
 /// execution in `execute_one_with_service` turns this test red.
 #[tokio::test(start_paused = true)]
 async fn parallel_and_serial_lanes_agree_that_tools_have_no_timeout() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let observer = SchedulerEventObserver::default();
 
     // `file_read` is read-only -> parallel batch lane.
@@ -520,6 +528,7 @@ async fn parallel_and_serial_lanes_agree_that_tools_have_no_timeout() {
 /// must still run both lanes deadline-free and identically.
 #[tokio::test(start_paused = true)]
 async fn no_schedule_config_can_reintroduce_a_timeout_or_a_serial_fallback() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     for window in [0_usize, 1, 2, 64] {
         for priority_enabled in [false, true] {
             let schedule = ReadOnlyToolScheduleConfig {
@@ -566,6 +575,7 @@ async fn no_schedule_config_can_reintroduce_a_timeout_or_a_serial_fallback() {
 /// itself.
 #[tokio::test]
 async fn read_only_calls_still_run_concurrently_without_any_rollout_gate() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
@@ -611,6 +621,7 @@ async fn read_only_calls_still_run_concurrently_without_any_rollout_gate() {
 
 #[tokio::test]
 async fn execute_one_tool_applies_barrier_for_shared_resource_tools() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
@@ -649,8 +660,72 @@ async fn execute_one_tool_applies_barrier_for_shared_resource_tools() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn production_scheduler_refuses_a_tool_when_its_shared_resource_barrier_times_out() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let barrier = {
+        let mut barriers = TOOL_BARRIERS.lock();
+        barriers
+            .entry("runtime_config")
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let held = barrier.lock_owned().await;
+    let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scheduler_test_adapter(
+        vec![Box::new(RecordingTool {
+            name: "proxy_config".to_string(),
+            execution_order: Arc::clone(&execution_order),
+        })],
+        &ledger_dir,
+    );
+    let calls = vec![ParsedToolCall {
+        name: "proxy_config".to_string(),
+        arguments: serde_json::json!({}),
+    }];
+
+    let task = tokio::spawn(async move {
+        let recorder = ToolResultRecorder::new(calls.len());
+        execute_tools_with_service(
+            &calls,
+            &[],
+            &adapter,
+            unlimited_schedule(1),
+            None,
+            ChatMode::default(),
+            &NoopObserver,
+            &recorder,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(TOOL_BARRIER_TIMEOUT_SECS + 1)).await;
+    let results = task
+        .await
+        .expect("test: scheduler task must join")
+        .expect("test: barrier timeout is a failed tool result, not a scheduler failure");
+    drop(held);
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]
+            .contains("could not acquire shared-resource barrier 'runtime_config' within 60s; tool was not executed"),
+        "result: {}",
+        results[0]
+    );
+    assert!(
+        execution_order
+            .lock()
+            .expect("execution order lock should be valid")
+            .is_empty(),
+        "a timed-out shared-resource call must not reach its backend"
+    );
+}
+
 #[tokio::test]
 async fn execute_one_tool_rejects_action_specific_schema_errors_before_side_effects() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let executions = Arc::new(AtomicUsize::new(0));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ConditionalSchemaTool {
         executions: Arc::clone(&executions),
@@ -676,6 +751,7 @@ async fn execute_one_tool_rejects_action_specific_schema_errors_before_side_effe
 
 #[tokio::test]
 async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     // file_write is registered but plan mode should short-circuit before
     // touching it. We confirm via the DelayTool counter that no execution
     // happened.
@@ -731,6 +807,7 @@ async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
 
 #[tokio::test]
 async fn execute_one_tool_in_plan_mode_allows_read_tools() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     // file_read is in the read-only set — plan mode should let it run.
     // We use a fake DelayTool named "file_read" and assert it ran (active
     // counter ≥ 1 at peak).
@@ -769,6 +846,7 @@ async fn execute_one_tool_in_plan_mode_allows_read_tools() {
 
 #[tokio::test]
 async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
@@ -804,6 +882,7 @@ async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
 
 #[tokio::test]
 async fn execute_one_tool_in_auto_mode_runs_write_tools_normally() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
@@ -873,6 +952,7 @@ impl Tool for EmptyOutputFailureTool {
 /// (R-LOOPD5 F-5).
 #[tokio::test]
 async fn a_failed_tool_with_empty_output_reports_its_reason_to_the_model() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let executions = Arc::new(AtomicUsize::new(0));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptyOutputFailureTool {
         executions: Arc::clone(&executions),
@@ -913,6 +993,7 @@ async fn a_failed_tool_with_empty_output_reports_its_reason_to_the_model() {
 /// pinned by `policy_deny_prevents_approval_preparation_and_execution_but_audits`.
 #[tokio::test]
 async fn read_only_autonomy_denies_an_act_tool_before_approval_or_execution() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
         name: "delegate".to_string(),

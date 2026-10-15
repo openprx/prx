@@ -301,6 +301,11 @@ active_hours = [8, 23]
 # no switch that turns that off. Tool execution is never time-bounded either —
 # a long-running tool is normal agent business. Use `prx tasks list|kill` to see
 # and stop work that is actually running away.
+# Stateful tools that mutate the same workspace, runtime configuration, memory
+# or session lifecycle share a serialization barrier. Waiting for that barrier
+# is bounded to 60 seconds; if it cannot be acquired, that call returns an error
+# without running its backend. This contention bound does not limit a tool once
+# its execution has started.
 # Max concurrent read-only tools in one batch (default: 2)
 read_only_tool_concurrency_window = 2
 # Enable priority scheduling so foreground tools run before background batches.
