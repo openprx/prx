@@ -3086,6 +3086,7 @@ pub fn create_provider_for(
     resolved: &catalog::ResolvedModel,
     catalog: &catalog::CatalogView,
     reliability: &crate::config::ReliabilityConfig,
+    cost: &crate::config::schema::CostConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let label = resolved.provider_label();
@@ -3154,6 +3155,7 @@ pub fn create_provider_for(
         model_fallbacks,
         ..reliability.clone()
     };
+    let fallback_admission = fallback_admission_for(resolved, catalog, &reliability, cost);
     let mut scoped = options.clone();
     if accepts_tool_dialect_declarations(label) {
         scoped
@@ -3190,7 +3192,47 @@ pub fn create_provider_for(
         &reliability,
         &scoped,
         KeylessRoot::from_resolved(resolved),
+        Some(fallback_admission),
     )
+}
+
+pub(crate) fn fallback_admission_for(
+    resolved: &catalog::ResolvedModel,
+    catalog: &catalog::CatalogView,
+    reliability: &crate::config::ReliabilityConfig,
+    cost: &crate::config::schema::CostConfig,
+) -> reliable::FallbackAdmission {
+    let primary = resolved.model();
+    let siblings = reliability.model_fallbacks.get(primary).map_or(&[][..], Vec::as_slice);
+    let mut admission = reliable::FallbackAdmission::new(resolved.provider().clone(), primary);
+    for provider in
+        std::iter::once(resolved.provider_label()).chain(reliability.fallback_providers.iter().map(String::as_str))
+    {
+        let provider_id = ProviderId::of(provider);
+        for model in std::iter::once(primary).chain(siblings.iter().map(String::as_str)) {
+            if provider_id == *resolved.provider() && model == primary {
+                continue;
+            }
+            let descriptor = catalog.describe(&provider_id, model);
+            let native_tools = descriptor.operation(catalog::ModelOperation::Chat) == catalog::Support::Supported
+                && *descriptor.features.get(catalog::Feature::NativeTools) == catalog::Support::Supported;
+            let cost_admitted =
+                match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
+                    crate::llm::route_decision::UsagePrice::Priced(_) => true,
+                    crate::llm::route_decision::UsagePrice::Missing => provider_id.catalog_name() == Some("ollama"),
+                    crate::llm::route_decision::UsagePrice::Invalid => false,
+                };
+            admission.insert(
+                provider_id.clone(),
+                model,
+                reliable::FallbackEligibility {
+                    cost_admitted,
+                    native_tools,
+                },
+            );
+        }
+    }
+    admission
 }
 
 enum ProviderCredentialInput<'a> {
@@ -3285,7 +3327,7 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    create_resilient_provider_with_pinned_root(primary_name, api_key, api_url, reliability, options, None)
+    create_resilient_provider_with_pinned_root(primary_name, api_key, api_url, reliability, options, None, None)
 }
 
 fn create_resilient_provider_with_pinned_root(
@@ -3295,6 +3337,7 @@ fn create_resilient_provider_with_pinned_root(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
     pinned: Option<KeylessRoot<'_>>,
+    fallback_admission: Option<reliable::FallbackAdmission>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     #[cfg(feature = "wasm-plugins")]
     if primary_name.starts_with("wasm:") {
@@ -3392,12 +3435,15 @@ fn create_resilient_provider_with_pinned_root(
         anyhow::bail!("No available providers after credential/initialization checks: {reasons}");
     }
 
-    let reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
+    let mut reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
         .with_model_fallbacks(reliability.model_fallbacks.clone())
         .with_unavailable_providers(unavailable)
         // Every chain built through the factory observes the same per-provider
         // cool-down, so one request's 429 defers the others already in flight.
         .with_rate_limit_gate(rate_limit::shared_gate());
+    if let Some(admission) = fallback_admission {
+        reliable = reliable.with_fallback_admission(admission);
+    }
 
     Ok(Box::new(reliable))
 }
@@ -3468,6 +3514,7 @@ impl ProviderConnection<'_> {
                 reliability,
                 options,
                 pinned,
+                None,
             );
         }
 
@@ -3501,6 +3548,7 @@ impl ProviderConnection<'_> {
                 &chain_reliability,
                 options,
                 if name == primary_name { pinned } else { None },
+                None,
             ) {
                 Ok(provider) => providers.push((name.clone(), provider)),
                 Err(e) => {

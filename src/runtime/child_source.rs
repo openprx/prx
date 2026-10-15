@@ -1180,6 +1180,7 @@ impl ChildProviderBinding {
             &resolved,
             catalog,
             &reliability,
+            &config.cost,
             &options,
         )?);
         Ok(Self {

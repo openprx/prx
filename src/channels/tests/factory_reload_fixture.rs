@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-//! Q73B/Q74: real selected retrieval and generation-owned factory wire.
+//! Q73B/Q74: plain-turn direct answer and generation-owned factory wire.
 use super::*;
 use crate::config::{ConfigGeneration, ConfigGenerationParticipant, PreparedConfigGeneration};
 use crate::memory::MemoryWriteContext;
@@ -125,14 +125,33 @@ fn factory(config: &Config) -> Arc<dyn Provider> {
             &selection,
             &providers::selection::catalog_for(config),
             &config.reliability,
+            &config.cost,
             &providers::provider_runtime_options_from_config(config),
         )
         .expect("fixture real provider factory"),
     )
 }
 
+struct CachedProviderProbe {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CachedProviderProbe {
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("admitted message turn used the cached provider")
+    }
+
+    async fn chat_with_history(&self, _: &[ChatMessage], _: &str, _: f64) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("admitted message turn used the cached provider")
+    }
+}
+
 struct ReloadParticipant {
     cache: ProviderCacheMap,
+    cached_provider: Arc<dyn Provider>,
     committed: Arc<Mutex<Vec<u64>>>,
 }
 struct PreparedReload {
@@ -160,7 +179,7 @@ impl ConfigGenerationParticipant for ReloadParticipant {
         );
         Ok(Box::new(PreparedReload {
             cache: Arc::clone(&self.cache),
-            provider: factory(&generation.effective),
+            provider: Arc::clone(&self.cached_provider),
             previous: self.cache.lock().get("openai").cloned(),
             committed: Arc::clone(&self.committed),
             generation: generation.id.0,
@@ -225,7 +244,7 @@ impl Endpoint {
                     if !valid_phase
                         || body.get("model").and_then(serde_json::Value::as_str) != Some(MODEL)
                         || body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
-                        || memory.selected.load(Ordering::SeqCst) == 0
+                        || memory.selected.load(Ordering::SeqCst) != 0
                     {
                         bad.fetch_add(1, Ordering::SeqCst);
                         return axum::http::StatusCode::BAD_REQUEST.into_response();
@@ -479,6 +498,13 @@ pub(super) async fn run() {
     let outcome = std::panic::AssertUnwindSafe(async {
         let channel = Arc::new(TelegramRecordingChannel::default());
         let cache = Arc::new(Mutex::new(HashMap::new()));
+        let cached_calls = Arc::new(AtomicUsize::new(0));
+        let cached_provider: Arc<dyn Provider> = Arc::new(CachedProviderProbe {
+            calls: Arc::clone(&cached_calls),
+        });
+        cache
+            .lock()
+            .insert("openai".to_owned(), Arc::clone(&cached_provider));
         let histories = Arc::new(Mutex::new(HashMap::new()));
         let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
@@ -488,30 +514,57 @@ pub(super) async fn run() {
         let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
         let config = Arc::clone(&initial_ctx.config); let g0 = config.pin();
         let committed = Arc::new(Mutex::new(Vec::new()));
-        let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadParticipant { cache: Arc::clone(&cache), committed: Arc::clone(&committed) });
+        let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadParticipant {
+            cache: Arc::clone(&cache),
+            cached_provider,
+            committed: Arc::clone(&committed),
+        });
         config.register_participant(&participant);
         let release = ReleaseOnDrop(Arc::clone(&a.release));
         let control = std::panic::AssertUnwindSafe(async {
             let _release = release;
-            tokio::time::timeout(Duration::from_secs(20), a.entered.notified()).await.expect("real G0 serving request after selected retrieval");
-            assert_eq!(*a.calls.lock(), vec![0]); assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
+            tokio::time::timeout(Duration::from_secs(20), a.entered.notified())
+                .await
+                .expect("real G0 serving request without retrieval");
+            assert_eq!(*a.calls.lock(), vec![0]);
+            assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
+            assert_eq!(
+                memory.selected.load(Ordering::SeqCst),
+                0,
+                "plain G0 turn must not retrieve memory before the in-flight reload"
+            );
             reload(&config, KEYS[1], &a.url, &["api_key"])
-        }).catch_unwind();
-        let work = std::panic::AssertUnwindSafe(run_owned_channel_probe(initial_ctx, message(0), CancellationToken::new())).catch_unwind();
+        })
+        .catch_unwind();
+        let work = std::panic::AssertUnwindSafe(run_owned_channel_probe(
+            initial_ctx,
+            message(0),
+            CancellationToken::new(),
+        ))
+        .catch_unwind();
         let (first, reloaded) = tokio::join!(work, control);
-        if let Err(panic) = first { std::panic::resume_unwind(panic); }
-        let g1 = match reloaded { Ok(generation) => generation, Err(panic) => std::panic::resume_unwind(panic) };
+        if let Err(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
+        let g1 = match reloaded {
+            Ok(generation) => generation,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert_eq!(
+            memory.selected.load(Ordering::SeqCst),
+            0,
+            "plain G0 turn must finish without memory retrieval"
+        );
         let recorded: Arc<dyn Memory> = recording.clone();
-        let selected_before = memory.selected.load(Ordering::SeqCst);
         run_owned_channel_probe(context(&tmp, Arc::clone(&config), Arc::clone(&recorded), channel.clone(), Arc::clone(&cache), Arc::clone(&histories)), message(1), CancellationToken::new()).await;
-        assert!(memory.selected.load(Ordering::SeqCst) > selected_before, "G1 must obtain genuine selected evidence");
+        assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G1 turn must not retrieve memory");
         assert_eq!(*a.calls.lock(), vec![0, 1]); assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
         let g2 = reload(&config, KEYS[2], &b.url, &["api_key", "api_url"]);
-        let selected_before = memory.selected.load(Ordering::SeqCst);
         run_owned_channel_probe(context(&tmp, Arc::clone(&config), recorded, channel.clone(), Arc::clone(&cache), histories), message(2), CancellationToken::new()).await;
-        assert!(memory.selected.load(Ordering::SeqCst) > selected_before, "G2 must obtain genuine selected evidence");
+        assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G2 turn must not retrieve memory");
         assert_eq!(*a.calls.lock(), vec![0, 1]); assert_eq!(*b.calls.lock(), vec![2]);
         assert_eq!(a.invalid.load(Ordering::SeqCst), 0); assert_eq!(b.invalid.load(Ordering::SeqCst), 0);
+        assert_eq!(cached_calls.load(Ordering::SeqCst), 0, "admitted turns must build the provider from each pinned selection");
         assert_eq!(*committed.lock(), vec![g1.id.0, g2.id.0]);
         let principal = crate::runtime::envelope::RuntimeEnvelope::channel(tmp.path().to_string_lossy().to_string(), "telegram", "prx_user", Some("prx_channel".to_owned())).memory_principal();
         let events = recording.list_message_events_recent(&principal, 100).await.expect("actual generation event history");
@@ -528,8 +581,12 @@ pub(super) async fn run() {
             assert!(rows.iter().all(|(_, _, backend)| backend == "builtin"));
             assert!(rows.iter().any(|(candidates, selected, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
-                candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "retrieve" && candidate.target == "memory")
-            }), "actual input must have a persisted selected Memory retrieval");
+                candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")
+            }), "plain input must persist a selected direct answer");
+            assert!(rows.iter().all(|(candidates, selected, _)| {
+                let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
+                candidates.iter().all(|candidate| Some(candidate.id.as_str()) != selected.as_deref() || candidate.action != "retrieve")
+            }), "plain input must not select memory retrieval");
             let marker = format!("prx-factory-generation-{phase}");
             assert!(events.iter().any(|event| event.role == "assistant" && event.content.contains(&marker) && event.run_id == user.run_id && event.config_generation_id == user.config_generation_id && event.config_source_revision == user.config_source_revision));
             assert!(channel.sent_messages.lock().await.iter().any(|message| message.contains(&marker)));
@@ -537,7 +594,7 @@ pub(super) async fn run() {
         assert!(recording.owned_readbacks() >= 3);
         drop(participant);
     }).catch_unwind().await;
-    // Release response barriers and join both owned servers even on assertion panic.
+    // Join both owned servers even on assertion panic.
     let (closed_a, closed_b) = tokio::join!(a.close(), b.close());
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);

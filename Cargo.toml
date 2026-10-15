@@ -244,7 +244,7 @@ libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "process"] }
 
 [features]
-default = ["channel-matrix", "llm-router", "wasm-plugins", "terminal-tui"]
+default = ["llm-router", "wasm-plugins", "terminal-tui"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)

@@ -1539,6 +1539,7 @@ fn build_gateway_turn_provider(
         &resolved,
         &catalog,
         &config.reliability,
+        &config.cost,
         options,
     )?);
     let model = resolved.model().to_owned();
@@ -9545,20 +9546,18 @@ for line in sys.stdin:
         );
     }
 
-    /// D-026 (R-MCPBfg N-2): with memory ACL off, a webhook turn's
-    /// `memory_store` write used to be mirrored into the workspace `MEMORY.md`,
-    /// which every surface — the terminal UI, `prx agent`, other webhook
-    /// clients, the Console, channels — pastes into its system prompt. Only
-    /// writes from the local operator surfaces are mirrored now; this one stays
-    /// in the owner-scoped table.
+    /// D-026 (R-MCPBfg N-2): a webhook has no approval adapter, so its
+    /// approval-required `memory_store` call is withheld before execution. The
+    /// proposed content must also remain absent from shared prompt material.
     ///
     /// MUTATION GUARD: mirror every successful store again and this goes red.
     #[tokio::test]
     async fn a_webhook_memory_store_never_reaches_another_surfaces_system_prompt() {
         let workspace = tempfile::TempDir::new().expect("test: temp workspace");
-        let state = two_token_webhook_state(workspace.path());
+        let provider = Arc::new(WebhookToolScriptProvider::default());
+        let state = two_token_webhook_state_with(workspace.path(), provider.clone());
 
-        let stored = webhook_as(
+        let withheld = webhook_as(
             &state,
             "token-alpha-0001",
             "Use memory_store for SHARED-PROMPT-STORE",
@@ -9566,8 +9565,21 @@ for line in sys.stdin:
         )
         .await;
         assert!(
-            stored.contains("Stored memory"),
-            "test: the webhook turn's store ran: {stored}"
+            withheld.contains("I can't complete this request under the current policy."),
+            "test: the webhook must report the withheld write: {withheld}"
+        );
+        assert!(
+            provider.seen.lock().is_empty(),
+            "the approval-required webhook write must be withheld before provider execution"
+        );
+        assert!(
+            state
+                .mem
+                .get("webhook-note")
+                .await
+                .expect("test: memory lookup")
+                .is_none(),
+            "the unapproved webhook write must not reach memory storage"
         );
 
         let mirror = std::fs::read_to_string(workspace.path().join("MEMORY.md")).unwrap_or_default();

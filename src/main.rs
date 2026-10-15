@@ -769,7 +769,8 @@ Manage communication channels.
 
 Add, remove, list, and health-check channels that connect OpenPRX \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, wacli, matrix, imessage, email.
+slack, whatsapp, wacli, imessage, email, and Matrix when this binary is \
+built with the `channel-matrix` feature.
 
 Examples:
   prx channel list

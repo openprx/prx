@@ -2039,7 +2039,7 @@ fn build_channel_hint_provider(
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )?;
-    let provider = providers::create_provider_for(&resolved, &catalog, &config.reliability, options)?;
+    let provider = providers::create_provider_for(&resolved, &catalog, &config.reliability, &config.cost, options)?;
     let route = ChannelRouteSelection {
         provider: resolved.provider_label().to_string(),
         model: resolved.model().to_string(),
@@ -9237,6 +9237,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct OutcomeRecordingProvider {
         observed_tool_results: parking_lot::Mutex<Vec<String>>,
+        calls: AtomicU64,
     }
 
     fn outcome_probe_call_payload() -> String {
@@ -9255,6 +9256,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(outcome_probe_call_payload())
         }
 
@@ -9264,6 +9266,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let tool_results = messages
                 .iter()
                 .filter(|message| message.content.contains("[Tool results]"))
@@ -9335,12 +9338,14 @@ BTC is currently around $65,000 based on latest tool output."#
         })
     }
 
-    /// Drive one channel turn and return the `[Tool results]` text the model saw.
+    /// Drive one channel turn and return the provider calls and any
+    /// `[Tool results]` text the model saw.
     async fn run_outcome_turn(
         workspace_dir: &std::path::Path,
         memory: Arc<dyn Memory>,
         tool: OutcomeProbeTool,
-    ) -> Vec<String> {
+        admission_succeeds: bool,
+    ) -> (u64, Vec<String>) {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider = Arc::new(OutcomeRecordingProvider::default());
@@ -9351,13 +9356,28 @@ BTC is currently around $65,000 based on latest tool output."#
             vec![Box::new(tool) as Box<dyn Tool>],
             channel,
         );
-        run_owned_channel_probe(
-            Arc::clone(&runtime_ctx),
-            evidence_message("outcome-1", "please run the probe"),
-            CancellationToken::new(),
+        let message = evidence_message("outcome-1", "please run the probe");
+        if admission_succeeds {
+            run_owned_channel_probe(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
+        } else {
+            let runtime_ctx = normalize_legacy_channel_fixture(runtime_ctx);
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+                .expect("fresh channel probe cleanup owner");
+            let outcome = cleanup
+                .run(async move {
+                    process_channel_message(runtime_ctx, message, CancellationToken::new()).await;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            assert!(
+                outcome.is_err(),
+                "the unadmittable turn must report failed terminal cleanup"
+            );
+        }
+        (
+            provider.calls.load(Ordering::SeqCst),
+            provider.observed_tool_results.lock().clone(),
         )
-        .await;
-        provider.observed_tool_results.lock().clone()
     }
 
     /// The load-bearing assertion: with a ledger reachable, a side-effecting tool
@@ -9372,16 +9392,18 @@ BTC is currently around $65,000 based on latest tool output."#
         let marker = dir.path().join("marker.txt");
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
 
-        let observed = run_outcome_turn(
+        let (provider_calls, observed) = run_outcome_turn(
             dir.path(),
             memory,
             OutcomeProbeTool {
                 path: marker.clone(),
                 fail: false,
             },
+            true,
         )
         .await;
 
+        assert!(provider_calls > 0, "the admitted turn must reach the provider");
         let written = std::fs::read_to_string(&marker)
             .expect("test: the side-effecting tool must actually have written its file");
         assert_eq!(written, "written by the tool");
@@ -9405,16 +9427,18 @@ BTC is currently around $65,000 based on latest tool output."#
         let marker = dir.path().join("marker.txt");
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
 
-        let observed = run_outcome_turn(
+        let (provider_calls, observed) = run_outcome_turn(
             dir.path(),
             memory,
             OutcomeProbeTool {
                 path: marker.clone(),
                 fail: true,
             },
+            true,
         )
         .await;
 
+        assert!(provider_calls > 0, "the admitted turn must reach the provider");
         assert!(!marker.exists(), "a failing tool must not leave the side effect behind");
         assert!(
             observed
@@ -9429,8 +9453,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     /// The fail-closed half of the contract: when no ledger can be opened at all,
-    /// the side-effecting tool is refused, nothing is written, and the model is
-    /// told so in as many words.
+    /// input admission stops before the provider and nothing is written.
     ///
     /// The workspace is a regular file, so the dedicated ledger cannot be created
     /// under it and no ledger is reachable by any route.
@@ -9442,23 +9465,25 @@ BTC is currently around $65,000 based on latest tool output."#
         std::fs::write(&blocked_workspace, "not a directory").expect("test: block the workspace");
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
 
-        let observed = run_outcome_turn(
+        let (provider_calls, observed) = run_outcome_turn(
             &blocked_workspace,
             memory,
             OutcomeProbeTool {
                 path: marker.clone(),
                 fail: false,
             },
+            false,
         )
         .await;
 
-        assert!(
-            !marker.exists(),
-            "a refused tool must not have produced its side effect"
+        assert!(!marker.exists(), "unadmittable input must not produce a side effect");
+        assert_eq!(
+            provider_calls, 0,
+            "unadmittable input must fail closed before provider execution"
         );
         assert!(
-            observed.iter().any(|text| text.contains("refusing side effect")),
-            "the model must be told the side effect was refused: {observed:?}"
+            observed.is_empty(),
+            "a provider that was not called cannot observe tool results"
         );
     }
 
@@ -10534,7 +10559,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_prefers_cached_default_provider_instance() {
+    async fn process_channel_message_builds_selected_provider_without_plain_turn_retrieval() {
         factory_reload_fixture::run().await;
     }
 
@@ -11238,6 +11263,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             &resolved,
                             &catalog,
                             &config.reliability,
+                            &config.cost,
                             &providers::provider_runtime_options_from_config(&config),
                         )
                         .expect("real channel provider factory"),
@@ -12484,7 +12510,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    struct RecallMemory;
+    #[derive(Default)]
+    struct RecallMemory {
+        recalls: AtomicU64,
+    }
 
     #[async_trait::async_trait]
     impl Memory for RecallMemory {
@@ -12508,6 +12537,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _limit: usize,
             _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.recalls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![crate::memory::MemoryEntry {
                 id: "entry-1".to_string(),
                 key: "memory_key_1".to_string(),
@@ -13667,7 +13697,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_enriches_current_turn_without_persisting_context() {
+    async fn process_channel_message_answers_plain_turn_without_retrieval_or_persisted_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -13675,6 +13705,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let memory = Arc::new(RecallMemory::default());
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
             config: crate::config::new_shared(Config::default()),
@@ -13682,7 +13713,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(RecallMemory),
+            memory: memory.clone(),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
@@ -13746,9 +13777,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
-        assert!(calls[0][1].1.contains("Age is 45"));
         assert!(calls[0][1].1.contains("hello"));
+        assert!(!calls[0][1].1.contains("[Memory context]"));
+        assert!(!calls[0][1].1.contains("Age is 45"));
+        assert_eq!(
+            memory.recalls.load(Ordering::SeqCst),
+            0,
+            "a plain direct-answer turn must not retrieve memory"
+        );
 
         let histories = runtime_ctx.conversation_histories.lock();
         let turns = histories

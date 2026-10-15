@@ -87,6 +87,7 @@ fn select_and_build(config: &Config, catalog: &CatalogView) -> anyhow::Result<Bo
         &resolved,
         catalog,
         &config.reliability,
+        &config.cost,
         &provider_runtime_options_from_config(config),
     )
 }
@@ -228,6 +229,7 @@ async fn a_per_model_declaration_on_one_endpoint_does_not_fold_to_the_widest() {
             &resolved,
             &catalog,
             &config.reliability,
+            &config.cost,
             &provider_runtime_options_from_config(&config),
         )
         .expect("test: construct");
@@ -993,6 +995,7 @@ fn build_for(
         resolved,
         catalog,
         &config.reliability,
+        &config.cost,
         &provider_runtime_options_from_config(config),
     )
 }

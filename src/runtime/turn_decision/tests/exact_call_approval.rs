@@ -353,4 +353,4 @@ async fn exact_file_without_intent(edit: bool) {
 mod native_usage;
 
 #[path = "exact_call_approval/collection.rs"]
-mod collection;
+pub(crate) mod collection;

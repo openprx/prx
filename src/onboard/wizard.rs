@@ -1,14 +1,16 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
+#[cfg(feature = "channel-matrix")]
+use crate::config::MatrixConfig;
 use crate::config::init::Spec;
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig, HeartbeatConfig,
-    IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig,
-    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    IMessageConfig, LarkConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig, ObservabilityConfig,
+    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
@@ -68,7 +70,7 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         slack,
         mattermost,
         imessage,
-        matrix,
+        matrix: _,
         signal,
         whatsapp,
         email,
@@ -85,7 +87,7 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || slack.is_some()
         || mattermost.is_some()
         || imessage.is_some()
-        || matrix.is_some()
+        || (cfg!(feature = "channel-matrix") && channels.matrix.is_some())
         || signal.is_some()
         || whatsapp.is_some()
         || email.is_some()
@@ -2822,6 +2824,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         Discord,
         Slack,
         IMessage,
+        #[cfg(feature = "channel-matrix")]
         Matrix,
         WhatsApp,
         Linq,
@@ -2837,6 +2840,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         ChannelMenuChoice::Discord,
         ChannelMenuChoice::Slack,
         ChannelMenuChoice::IMessage,
+        #[cfg(feature = "channel-matrix")]
         ChannelMenuChoice::Matrix,
         ChannelMenuChoice::WhatsApp,
         ChannelMenuChoice::Linq,
@@ -2884,6 +2888,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— macOS only"
                     }
                 ),
+                #[cfg(feature = "channel-matrix")]
                 ChannelMenuChoice::Matrix => format!(
                     "Matrix     {}",
                     if config.matrix.is_some() {
@@ -3295,6 +3300,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&contacts_str).cyan()
                 );
             }
+            #[cfg(feature = "channel-matrix")]
             ChannelMenuChoice::Matrix => {
                 // ── Matrix ──
                 println!();
@@ -4168,6 +4174,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     if config.imessage.is_some() {
         active.push("iMessage");
     }
+    #[cfg(feature = "channel-matrix")]
     if config.matrix.is_some() {
         active.push("Matrix");
     }
@@ -4644,6 +4651,7 @@ fn print_summary(config: &Config) {
     if config.channels_config.imessage.is_some() {
         channels.push("iMessage");
     }
+    #[cfg(feature = "channel-matrix")]
     if config.channels_config.matrix.is_some() {
         channels.push("Matrix");
     }

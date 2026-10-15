@@ -353,55 +353,26 @@ async fn exercise(
     assert_eq!(source.run_id, resumed_row.run_id);
     if case == Case::Builtin {
         assert_eq!(resumed_row.backend_kind, "builtin");
-        assert_eq!(resumed_row.directive_kind, "clarify");
-        assert_eq!(resumed_row.abstention_reason.as_deref(), Some("insufficient_evidence"));
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        assert!(!path.join(TARGET).exists());
-        assert!(!private_target.exists());
-        let events = state.mem.list_message_events_since(&scope, 0, 64).await?;
+        assert_eq!(resumed_row.directive_kind, "use_tool");
+        assert!(resumed_row.abstention_reason.is_none());
         assert!(
-            !events
-                .iter()
-                .any(|event| event.event_type.starts_with("tool.execution."))
+            resumed_row.attempts.is_empty(),
+            "builtin selection makes no decision HTTP call"
         );
-        // Clarify never reaches the before-dispatch grant claim. Verify that
-        // fact, then revoke through the actual owner control before retrying.
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.event_type == "approval.decision.resolved")
-        );
-        let revoked = change_decision_approval(
-            state.clone(),
-            SESSION.into(),
-            id.clone(),
-            super::super::super::ApiPrincipal::of_token("prx-test-token"),
-            DecisionApprovalChange::Revoke,
-        )
-        .await;
-        assert_eq!(revoked.status(), StatusCode::OK);
-        let repeated = post_decision_resume(
-            State(state),
-            Path((SESSION.into(), id)),
-            request(serde_json::json!({}), Some("prx-test-token")),
-        )
-        .await;
-        assert!(!repeated.status().is_success());
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        return Ok(());
+    } else {
+        assert_eq!(resumed_row.backend_kind, "compatible_http");
+        assert_eq!(resumed_row.configured_model, DECISION_MODEL);
+        assert_eq!(resumed_row.directive_kind, "use_tool");
+        assert_eq!(resumed_row.attempts.len(), 1);
+        let attempt = resumed_row.attempts.first().context("real HTTP attempt")?;
+        assert_eq!(attempt.backend, "compatible_http");
+        assert_eq!(attempt.outcome, "served");
+        assert!(attempt.error_class.is_none());
     }
-    assert_eq!(resumed_row.backend_kind, "compatible_http");
-    assert_eq!(resumed_row.configured_model, DECISION_MODEL);
-    assert_eq!(resumed_row.directive_kind, "use_tool");
     assert_eq!(
         value.get("execution_status").and_then(serde_json::Value::as_str),
         Some("succeeded")
     );
-    assert_eq!(resumed_row.attempts.len(), 1);
-    let attempt = resumed_row.attempts.first().context("real HTTP attempt")?;
-    assert_eq!(attempt.backend, "compatible_http");
-    assert_eq!(attempt.outcome, "served");
-    assert!(attempt.error_class.is_none());
     assert_eq!(std::fs::read_to_string(&private_target)?, CONTENT);
     assert!(
         !path.join(TARGET).exists(),
@@ -601,7 +572,7 @@ async fn console_multiple_collection_calls_fail_without_pending_or_file_write() 
 }
 
 #[tokio::test]
-async fn console_builtin_approved_resume_clarifies_without_file_execution() -> anyhow::Result<()> {
+async fn console_builtin_approved_resume_selects_and_executes_file_write() -> anyhow::Result<()> {
     run_case(Case::Builtin).await
 }
 

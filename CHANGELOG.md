@@ -15,6 +15,12 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Matrix channel support is now opt-in with the `channel-matrix` Cargo feature.
+  Default and release binaries omit Matrix; source builds can enable it with
+  `--features channel-matrix`. Onboarding only offers Matrix in an enabled
+  build, while `prx doctor` and channel startup report a configured Matrix
+  channel as unavailable when the running binary lacks the feature.
+
 - The former internal `agent::loop_` module and its positional turn helpers are
   removed. Internal entrypoints now admit their source through their owning
   adapter and invoke the typed `agent::turn_engine::run_turn` API with

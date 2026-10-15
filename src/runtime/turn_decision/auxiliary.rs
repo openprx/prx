@@ -23,6 +23,7 @@ impl TurnDecisionService {
             &selected,
             &self.provider_catalog,
             &self.generation.effective.reliability,
+            &self.generation.effective.cost,
             &crate::providers::provider_runtime_options_from_config(&self.generation.effective),
         )
         .map_err(|_| anyhow::anyhow!("auxiliary provider construction refused"))?;
