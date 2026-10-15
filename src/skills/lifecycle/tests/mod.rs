@@ -1,5 +1,7 @@
+mod binding;
 mod bundle;
 mod manifest;
+mod migrate;
 mod store;
 
 use super::{BundleEntry, OwnerScope};

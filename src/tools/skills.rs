@@ -126,6 +126,27 @@ impl Tool for SkillsListTool {
     }
 }
 
+/// The task a trusted, runtime-authored scope belongs to (`task_id`, else
+/// `run_id`). Absent for untrusted or direct calls, which are never pinned.
+fn trusted_task_id(args: &serde_json::Value) -> Option<String> {
+    if !args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let scope = args.get("_zc_scope")?.as_object()?;
+    ["task_id", "run_id"].into_iter().find_map(|key| {
+        scope
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 pub struct SkillReadTool {
     workspace_dir: PathBuf,
     config: Config,
@@ -152,6 +173,71 @@ impl SkillReadTool {
         crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
             .into_iter()
             .find(|skill| skill.name == name)
+    }
+
+    /// Serves a lifecycle-managed skill from its immutable revision instead of
+    /// the legacy projection. `Ok(None)` keeps the legacy path: the caller has
+    /// no trusted owner, the skill is not in the catalog, or it has no binding
+    /// for that owner. Once a binding exists nothing falls back to another
+    /// revision or to the projection: a disabled, missing or tampered revision
+    /// fails the read.
+    async fn read_lifecycle_managed(
+        &self,
+        name: &str,
+        resource_path: Option<&str>,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        let Some(owner_id) = super::sessions_read_model::effective_run_owner(args) else {
+            return Ok(None);
+        };
+        let owner = match crate::skills::lifecycle::OwnerScope::new(&owner_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                tracing::warn!(%error, "skill_read owner id is not a valid lifecycle owner scope; using the legacy path");
+                return Ok(None);
+            }
+        };
+        let in_catalog = crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
+            .iter()
+            .any(|skill| skill.name.eq_ignore_ascii_case(name));
+        if !in_catalog {
+            return Ok(None);
+        }
+        let task_id = trusted_task_id(args);
+        let workspace = self.workspace_dir.clone();
+        let skill_name = name.to_string();
+        let resource = resource_path.map(str::to_string);
+        let read = tokio::task::spawn_blocking(move || {
+            crate::skills::lifecycle::read_managed_resource(
+                &workspace,
+                &owner,
+                &skill_name,
+                resource.as_deref(),
+                task_id.as_deref(),
+                MAX_SKILL_RESOURCE_BYTES,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("lifecycle skill read task failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("Managed skill '{name}' cannot be read: {error}"))?;
+        let Some(read) = read else {
+            return Ok(None);
+        };
+        Ok(Some(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "skill": name,
+                "resource": read.bundle_dir.join(&read.resource_path),
+                "skill_root": read.bundle_dir,
+                "trust": if read.untrusted_origin { "community_untrusted" } else { "workspace_trusted" },
+                "content": read.content,
+                "managed": true,
+                "revision_id": read.pin.revision_id.as_str(),
+                "generation": read.pin.generation,
+                "pinned": read.pinned,
+            }))?,
+            error: None,
+        }))
     }
 
     fn resolve_target(&self, name: &str, resource_path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf, bool)> {
@@ -272,6 +358,9 @@ impl Tool for SkillReadTool {
             .filter(|name| !name.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'name' parameter"))?;
         let resource_path = args.get("resource_path").and_then(serde_json::Value::as_str);
+        if let Some(result) = self.read_lifecycle_managed(name, resource_path, &args).await? {
+            return Ok(result);
+        }
         let (target, root, trusted) = self.resolve_target(name, resource_path)?;
         let metadata = tokio::fs::metadata(&target).await?;
         if metadata.len() > MAX_SKILL_RESOURCE_BYTES {
@@ -1070,5 +1159,103 @@ mod tests {
             .unwrap();
         assert!(result.success, "{:?}", result.error);
         assert_eq!(result.output, "operational");
+    }
+
+    fn scoped_args(owner: &str, task: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut args = extra;
+        if let Some(object) = args.as_object_mut() {
+            object.insert("_zc_scope_trusted".to_string(), json!(true));
+            object.insert("_zc_scope".to_string(), json!({"owner_id": owner, "task_id": task}));
+        }
+        args
+    }
+
+    fn skill_md(body: &str) -> String {
+        format!("---\nname: demo\ndescription: Demo skill\n---\n\n{body}\n")
+    }
+
+    #[tokio::test]
+    async fn skill_read_serves_lifecycle_revisions_pinned_per_task() {
+        use crate::skills::lifecycle::{
+            Bundle, BundleEntry, NewRevision, OwnerScope, SkillId, SkillLifecycleStore, SourceKind, apply_migration,
+            plan_migration,
+        };
+        let temp = TempDir::new().unwrap();
+        let skill_dir = temp.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md("legacy body")).unwrap();
+        let owner = "owner:ws:cli:alice";
+        let store = SkillLifecycleStore::open(temp.path(), OwnerScope::new(owner).unwrap()).unwrap();
+        let plan = plan_migration(temp.path(), Some(&store)).unwrap();
+        let report = apply_migration(&store, temp.path(), &plan);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
+
+        let read = |args: serde_json::Value| {
+            let tool = &tool;
+            async move { serde_json::from_str::<serde_json::Value>(&tool.execute(args).await.unwrap().output).unwrap() }
+        };
+        let first = read(scoped_args(owner, "task-tool-1", json!({"name": "demo"}))).await;
+        assert!(first.get("content").unwrap().as_str().unwrap().contains("legacy body"));
+        assert_eq!(first.get("managed").unwrap(), &json!(true));
+        assert_eq!(first.get("pinned").unwrap(), &json!(true));
+        let revision_a = first.get("revision_id").unwrap().as_str().unwrap().to_string();
+
+        // Publish revision B for the same skill id and move the binding.
+        let id = SkillId::from_legacy_dir("demo").unwrap();
+        let bundle = Bundle::from_entries(vec![BundleEntry {
+            path: "SKILL.md".into(),
+            bytes: skill_md("revised body").into_bytes(),
+            executable: false,
+        }])
+        .unwrap();
+        store
+            .write_revision(&NewRevision::new(id.clone(), SourceKind::Learned), &bundle)
+            .unwrap();
+        store.write_binding(&id, bundle.revision_id(), true, Some(1)).unwrap();
+
+        let same_task = read(scoped_args(owner, "task-tool-1", json!({"name": "demo"}))).await;
+        assert!(
+            same_task
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("legacy body")
+        );
+        assert_eq!(same_task.get("revision_id").unwrap().as_str().unwrap(), revision_a);
+        let new_task = read(scoped_args(owner, "task-tool-2", json!({"name": "demo"}))).await;
+        assert!(
+            new_task
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("revised body")
+        );
+        assert_eq!(new_task.get("generation").unwrap(), &json!(2));
+
+        // Callers without a trusted owner, and other owners, keep the legacy
+        // projection exactly as before.
+        let legacy = read(json!({"name": "demo"})).await;
+        assert!(legacy.get("content").unwrap().as_str().unwrap().contains("legacy body"));
+        assert!(legacy.get("managed").is_none());
+        let other = read(scoped_args("owner:ws:cli:bob", "task-tool-3", json!({"name": "demo"}))).await;
+        assert!(other.get("managed").is_none());
+
+        // Escapes are still refused for managed skills.
+        let escape = tool
+            .execute(scoped_args(
+                owner,
+                "task-tool-1",
+                json!({"name": "demo", "resource_path": "../../x"}),
+            ))
+            .await
+            .expect_err("managed resource escape must fail");
+        assert!(escape.to_string().contains("cannot be read"));
+        let owner_scope = OwnerScope::new(owner).unwrap();
+        for task in ["task-tool-1", "task-tool-2", "task-tool-3"] {
+            crate::skills::lifecycle::release_task_pins(&owner_scope, task);
+        }
     }
 }

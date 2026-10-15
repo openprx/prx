@@ -143,6 +143,11 @@ fn pinned_record_digest_authenticates_non_derived_fields() {
         crate::skills::lifecycle::record_digest(&ok.revision).expect("test: digest"),
         digest
     );
+    let mut expected = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut expected, b"prx-skill-record\0");
+    sha2::Digest::update(&mut expected, 1u32.to_be_bytes());
+    sha2::Digest::update(&mut expected, serde_json::to_vec(&ok.revision).expect("test: json"));
+    assert_eq!(hex::encode(sha2::Digest::finalize(expected)), digest);
 
     let path = store
         .root()
