@@ -33,12 +33,10 @@ const LIVE_URL_HELPER_DEFINITION: &str = "pub(crate) fn live_postgres_url() -> S
 const LIVE_URL_HELPER_CALL: &str = "live_postgres_url()";
 
 /// Tests that need a live `PostgreSQL`, counted by their `#[ignore]` attribute:
-/// 27 in the memory adapter (the 27th is
-/// `postgres_private_visibility_ingest_event_is_readable_by_its_author`, the live regression test for
-/// 46ee5263 that private ingest events are readable by their author), 4 in the cron
+/// 26 in the memory adapter, 4 in the cron
 /// store, 1 in the cron scheduler, 2 in the webhook repository, 1 in schema
 /// migration and 1 in the fitness CLI.
-const EXPECTED_LIVE_POSTGRES_TESTS: usize = 36;
+const EXPECTED_LIVE_POSTGRES_TESTS: usize = 35;
 
 fn line_of(source: &str, offset: usize) -> usize {
     source[..offset].matches('\n').count() + 1
