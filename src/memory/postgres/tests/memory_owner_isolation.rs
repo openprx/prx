@@ -88,13 +88,20 @@ fn production_source_lists_every_backend_file() {
     let mut unlisted = Vec::new();
     for entry in std::fs::read_dir(&directory).expect("test: read the backend directory") {
         let path = entry.expect("test: read a directory entry").path();
-        if path.extension().is_none_or(|extension| extension != "rs") {
-            continue;
-        }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .expect("test: utf-8 file name");
+        if path.is_dir() {
+            assert_eq!(
+                name, "tests",
+                "postgres/{name}/ is a subdirectory the scan does not read"
+            );
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&path).expect("test: read a backend file");
         let covered = scanned.iter().any(|part| *part == text) || OUTSIDE_PRODUCTION_SOURCE.contains(&name);
         if !covered {

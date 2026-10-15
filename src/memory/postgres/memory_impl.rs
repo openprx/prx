@@ -2851,6 +2851,12 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    /// Adds one to `useful_count` for the row with this id.
+    ///
+    /// Takes no caller context, like `forget` and the SQLite twin, so it runs
+    /// in the pool's system session without an owner scope. The only caller
+    /// passes ids it read from owner-scoped recall results. The id is a bound
+    /// parameter; only the validated table name is formatted into the SQL.
     async fn increment_useful_count(&self, id: &str) -> Result<()> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
