@@ -3619,6 +3619,15 @@ mod credential_containment_tests {
         }
     }
 
+    fn fixture_price() -> crate::config::schema::ModelPricing {
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        }
+    }
+
     fn admitted_config(
         temp: &tempfile::TempDir,
         agents: HashMap<String, DelegateAgentConfig>,
@@ -3631,6 +3640,19 @@ mod credential_containment_tests {
         config.causal_tree.enabled = false;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
         config.reliability.provider_retries = 0;
+        for agent in agents.values() {
+            config
+                .cost
+                .prices
+                .insert(format!("{}/{}", agent.provider, agent.model.trim()), fixture_price());
+        }
+        let default_provider = config.default_provider.as_deref().expect("test: default provider");
+        for model in agents.values().map(|agent| agent.model.trim()) {
+            config
+                .cost
+                .prices
+                .insert(format!("{default_provider}/{model}"), fixture_price());
+        }
         config.agents = agents;
         config
     }
@@ -3748,6 +3770,10 @@ mod credential_containment_tests {
             api_key: Some("PRX-DELEGATE-ROUTE-KEY".to_string()),
             credential_ref: None,
         });
+        config
+            .cost
+            .prices
+            .insert(format!("{}/{}", route.custom_provider(), PROBE_MODEL), fixture_price());
         let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
             .with_hint_config(&config)
             .with_model_catalog(providers::selection::catalog_for(&config))
@@ -3981,6 +4007,10 @@ mod credential_containment_tests {
         config.default_provider = Some("litellm".to_owned());
         config.api_key = Some(F1_ROOT_SENTINEL.to_owned());
         config.api_url = Some(root.base_url());
+        config
+            .cost
+            .prices
+            .insert(format!("lite-llm/{PROBE_MODEL}"), fixture_price());
         let result = super::tests::dispatch_admitted_delegate(
             config,
             tool,
