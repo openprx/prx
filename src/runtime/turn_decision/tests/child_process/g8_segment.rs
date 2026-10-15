@@ -34,6 +34,37 @@ impl Tool for CountedRead {
         self.inner.execute(args).await
     }
 }
+
+const HIDDEN_CHILD_CAPABILITY: &str = "prx_hidden_child_read";
+
+struct HiddenChildCapability {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for HiddenChildCapability {
+    fn name(&self) -> &str {
+        HIDDEN_CHILD_CAPABILITY
+    }
+
+    fn description(&self) -> &str {
+        "Read hidden child fixture data"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{}})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult {
+            success: true,
+            output: "hidden".to_owned(),
+            error: None,
+        })
+    }
+}
+
 struct ReadBackend {
     identity: BackendIdentity,
 }
@@ -218,11 +249,15 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     .with_event_recording(config.memory.event_recording_config());
     let tools_handle = spawn.tools_handle();
     let physical_calls = Arc::new(AtomicUsize::new(0));
+    let hidden_calls = Arc::new(AtomicUsize::new(0));
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
         Box::new(spawn),
         Box::new(CountedRead {
             inner: crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false),
             calls: Arc::clone(&physical_calls),
+        }),
+        Box::new(HiddenChildCapability {
+            calls: Arc::clone(&hidden_calls),
         }),
     ]);
     assert!(tools_handle.set(&registry));
@@ -244,7 +279,11 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             execution,
             catalog_sources: sources(&generation, &config),
             surface_policy: SurfacePolicy {
-                direct_names: BTreeSet::from(["sessions_spawn".into(), "file_read".into()]),
+                direct_names: BTreeSet::from([
+                    "sessions_spawn".into(),
+                    "file_read".into(),
+                    HIDDEN_CHILD_CAPABILITY.into(),
+                ]),
                 ..SurfacePolicy::default()
             },
             provider_catalog: &catalog,
@@ -282,16 +321,24 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
     let grant = service.issue_child_grant(&proof, &context)?;
     // A child can only use work named in the actual admitted parent request.
-    // Merely registering file_read on the parent never grants it to a child.
+    // Registering another capability on both executors never grants it.
     let (issued, _) = grant.scope().gate_inputs();
     let read = grant
         .catalog()
         .entry_for_public_name("file_read")
         .expect("registered read");
+    let hidden = grant
+        .catalog()
+        .entry_for_public_name(HIDDEN_CHILD_CAPABILITY)
+        .expect("registered hidden child capability");
     assert_eq!(issued.allowed.len(), 1, "grant narrows to the requested read");
     assert!(issued.allowed.iter().any(|reference| {
         reference.id == read.id && reference.fingerprint == read.fingerprint && reference.generation == read.generation
     }));
+    assert!(
+        issued.allowed.iter().all(|reference| reference.id != hidden.id),
+        "the sealed manifest must not inherit an unrequested registered capability"
+    );
     let binding = ChildProviderBinding::build(
         Arc::clone(&grant),
         "ollama",
@@ -317,10 +364,15 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     .await?
     .expect("real task input receipt");
     let mut sequence = ChildSegmentSequence::new(Arc::clone(&grant), task_input)?;
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountedRead {
-        inner: crate::tools::file_read::FileReadTool::new(Arc::clone(grant.security()), false),
-        calls: Arc::clone(&physical_calls),
-    })]);
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(CountedRead {
+            inner: crate::tools::file_read::FileReadTool::new(Arc::clone(grant.security()), false),
+            calls: Arc::clone(&physical_calls),
+        }),
+        Box::new(HiddenChildCapability {
+            calls: Arc::clone(&hidden_calls),
+        }),
+    ]);
     let execution = Arc::new(
         ToolExecutionService::from_shared_boxed_registry(
             Arc::clone(&registry),
@@ -340,7 +392,7 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             execution,
             catalog_sources: sources(&generation, &config),
             surface_policy: SurfacePolicy {
-                direct_names: BTreeSet::from(["file_read".into()]),
+                direct_names: BTreeSet::from(["file_read".into(), HIDDEN_CHILD_CAPABILITY.into()]),
                 ..SurfacePolicy::default()
             },
             provider_catalog: &catalog,
@@ -492,6 +544,33 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             specs.specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["file_read"]
         );
+        assert!(
+            routing
+                .context
+                .execution_refs()
+                .iter()
+                .all(|reference| reference.id != hidden.id),
+            "the child engine must not publish the registered capability omitted from its sealed manifest"
+        );
+        let hidden_descriptor = child_service
+            .execution
+            .current_descriptor(HIDDEN_CHILD_CAPABILITY)
+            .expect("the hidden backend remains registered for the negative control");
+        let hidden_spec = ToolSpec {
+            name: hidden_descriptor.public_name,
+            description: hidden_descriptor.description,
+            parameters: hidden_descriptor.parameters,
+        };
+        let bind_error = match child_service.bind_agent_execution(
+            child_proof.as_ref(),
+            routing.context,
+            &execution_context,
+            &[hidden_spec],
+        ) {
+            Ok(_) => anyhow::bail!("the child rebound a capability outside its sealed manifest"),
+            Err(error) => error,
+        };
+        assert_eq!(bind_error.to_string(), "unknown runtime dependency");
         let (executor, bound) = child_service.bind_agent_execution(
             child_proof.as_ref(),
             routing.context,
@@ -644,6 +723,11 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             physical_calls.load(Ordering::SeqCst),
             1,
             "inheritance never executes a tool"
+        );
+        assert_eq!(
+            hidden_calls.load(Ordering::SeqCst),
+            0,
+            "the registered capability outside the sealed child manifest never executes"
         );
         next.fail(&anyhow::anyhow!("fixture closes without another tool dispatch"), false)
             .await?;
