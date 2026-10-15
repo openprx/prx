@@ -31,9 +31,9 @@ pub struct PublishRequest {
     pub candidate_record_digest: String,
     /// Generation the caller observed; 0 when nothing was published yet.
     pub expected_generation: u64,
-    /// Whether the skill is enabled once this revision is active. Not part of
-    /// the journaled fingerprint: a caller that retries a transaction id with
-    /// another value gets the original outcome, so choose ids accordingly.
+    /// Whether the skill is enabled once this revision is active. Journaled
+    /// and part of the request fingerprint: retrying a transaction id with the
+    /// other value is a `TransactionConflict`.
     pub enabled: bool,
 }
 
@@ -110,6 +110,8 @@ struct Fingerprint<'a> {
     candidate: &'a RevisionId,
     digest: Option<&'a str>,
     expected_generation: u64,
+    /// `None` for rollbacks, whose enabled state comes from the target's anchor.
+    enabled: Option<bool>,
 }
 
 impl Fingerprint<'_> {
@@ -121,6 +123,7 @@ impl Fingerprint<'_> {
             entry.expected_generation,
         ) == (self.kind, self.skill, self.candidate, self.expected_generation)
             && self.digest.is_none_or(|d| entry.candidate_record_digest == d)
+            && self.enabled.is_none_or(|e| entry.enabled == e)
     }
 }
 
@@ -140,6 +143,7 @@ impl SkillLifecycleStore {
             candidate: &request.candidate,
             digest: Some(&request.candidate_record_digest),
             expected_generation: request.expected_generation,
+            enabled: Some(request.enabled),
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -156,7 +160,7 @@ impl SkillLifecycleStore {
     }
 
     /// Makes a revision that was committed earlier the active one again, under
-    /// a new generation. History is not rewritten and no revision is deleted,
+    /// a new generation, with the enabled state its committing transaction had. History is not rewritten and no revision is deleted,
     /// so tasks pinned to any revision keep reading it. The pinned digest comes
     /// from the journal entry that committed the target, not from the caller.
     ///
@@ -171,6 +175,7 @@ impl SkillLifecycleStore {
             candidate: &request.target,
             digest: None,
             expected_generation: request.expected_generation,
+            enabled: None,
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -191,7 +196,7 @@ impl SkillLifecycleStore {
             &request.target,
             &anchor.candidate_record_digest,
             request.expected_generation,
-            true,
+            anchor.enabled,
         )
     }
 
@@ -273,6 +278,7 @@ impl SkillLifecycleStore {
             candidate_record_digest: candidate_digest.to_string(),
             expected_generation,
             new_generation,
+            enabled,
             state: TransactionState::Prepared,
             prepared_at: Utc::now(),
             finished_at: None,

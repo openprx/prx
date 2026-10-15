@@ -10,7 +10,7 @@
 //! and applying a migration is separate from any later cleanup.
 
 use super::bundle::Bundle;
-use super::journal::TransactionId;
+use super::journal::{TransactionId, TransactionState};
 use super::manifest::validate_manifest;
 use super::publish::PublishRequest;
 use super::store::SkillLifecycleStore;
@@ -22,6 +22,7 @@ use std::path::Path;
 
 const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
 const MAX_MIGRATION_ENTRIES: usize = 1024;
+const MAX_IMPORT_ATTEMPTS: u32 = 8;
 
 /// What a migration would do (or did not do) for one legacy directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,18 +239,54 @@ fn import_one(
         SourceKind::Operator
     };
     let written = store.write_revision(&NewRevision::new(skill_id.clone(), source_kind), &bundle)?;
-    let expected_generation = store.active_binding(skill_id)?.map_or(0, |binding| binding.generation);
-    // Deterministic id: a retried migration of the same skill, revision and
-    // enabled state is an idempotent replay, never a second publication.
-    let digest = hex::encode(Sha256::digest(format!("{skill_id}\0{planned}\0{enabled}").as_bytes()));
-    let transaction_id = TransactionId::parse(&format!("mig-{}", digest.get(..32).unwrap_or(&digest)))?;
-    store.publish(&PublishRequest {
-        transaction_id,
-        skill_id: skill_id.clone(),
-        candidate: planned.clone(),
-        candidate_record_digest: written.record_digest,
-        expected_generation,
-        enabled,
-    })?;
-    Ok(())
+    // An import is always the skill's first publication: generation 0 is
+    // expected, so a retry after commit replays instead of conflicting, and a
+    // plan that went stale because someone else published meanwhile fails with
+    // `StaleGeneration` instead of overwriting their revision.
+    //
+    // The transaction id is deterministic (skill, revision, enabled, attempt),
+    // so re-applying a plan replays a committed import. An attempt that ended
+    // ABORTED (a crash before the binding swap) can never be re-run, so the
+    // next attempt number derives the next id.
+    for attempt in 0..MAX_IMPORT_ATTEMPTS {
+        let transaction_id = import_transaction_id(skill_id, planned, enabled, attempt)?;
+        if store
+            .journal_entry(&transaction_id)?
+            .is_some_and(|entry| entry.state == TransactionState::Aborted)
+        {
+            continue;
+        }
+        let request = PublishRequest {
+            transaction_id,
+            skill_id: skill_id.clone(),
+            candidate: planned.clone(),
+            candidate_record_digest: written.record_digest.clone(),
+            expected_generation: 0,
+            enabled,
+        };
+        match store.publish(&request) {
+            // A PREPARED entry of a dead writer was just reconciled to ABORTED.
+            Err(LifecycleError::TransactionNotCommitted { .. }) => {}
+            other => return other.map(|_| ()),
+        }
+    }
+    Err(LifecycleError::InvalidRecord {
+        path: store.root().to_path_buf(),
+        reason: format!("{skill_id}: {MAX_IMPORT_ATTEMPTS} import attempts ended aborted"),
+    })
+}
+
+fn import_transaction_id(
+    skill_id: &SkillId,
+    planned: &RevisionId,
+    enabled: bool,
+    attempt: u32,
+) -> Result<TransactionId, LifecycleError> {
+    let seed = format!("{skill_id}\0{planned}\0{enabled}");
+    let digest = if attempt == 0 {
+        hex::encode(Sha256::digest(seed.as_bytes()))
+    } else {
+        hex::encode(Sha256::digest(format!("{seed}\0{attempt}").as_bytes()))
+    };
+    TransactionId::parse(&format!("mig-{}", digest.get(..32).unwrap_or(&digest)))
 }

@@ -150,6 +150,11 @@ fn trusted_task_id(args: &serde_json::Value) -> Option<String> {
 pub struct SkillReadTool {
     workspace_dir: PathBuf,
     config: Config,
+    /// Pin lifecycle-managed skills to the revision a task first read. Off in
+    /// production until the task terminal releases pins (SL03): a pin table
+    /// that is never drained would eventually refuse new pins. Without it,
+    /// every managed read resolves the active binding.
+    pin_tasks: bool,
 }
 
 pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> ToolSpec {
@@ -166,7 +171,19 @@ pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> T
 
 impl SkillReadTool {
     pub const fn new(workspace_dir: PathBuf, config: Config) -> Self {
-        Self { workspace_dir, config }
+        Self {
+            workspace_dir,
+            config,
+            pin_tasks: false,
+        }
+    }
+
+    /// Enables per-task revision pinning for managed skills. The caller must
+    /// release the pins (`lifecycle::release_task_pins`) at the task terminal.
+    #[must_use]
+    pub const fn with_task_pinning(mut self, enabled: bool) -> Self {
+        self.pin_tasks = enabled;
+        self
     }
 
     fn metadata_for_name(&self, name: &str) -> Option<crate::skills::SkillMetadata> {
@@ -203,7 +220,7 @@ impl SkillReadTool {
         if !in_catalog {
             return Ok(None);
         }
-        let task_id = trusted_task_id(args);
+        let task_id = if self.pin_tasks { trusted_task_id(args) } else { None };
         let workspace = self.workspace_dir.clone();
         let skill_name = name.to_string();
         let resource = resource_path.map(str::to_string);
@@ -1189,7 +1206,8 @@ mod tests {
         let plan = plan_migration(temp.path(), Some(&store)).unwrap();
         let report = apply_migration(&store, temp.path(), &plan);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
-        let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
+        let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path())).with_task_pinning(true);
+        let unpinned_tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
 
         let read = |args: serde_json::Value| {
             let tool = &tool;
@@ -1243,6 +1261,25 @@ mod tests {
                 .contains("revised body")
         );
         assert_eq!(new_task.get("generation").unwrap(), &json!(2));
+
+        // Production default: no task pinning, so every read follows the binding.
+        let unpinned: serde_json::Value = serde_json::from_str(
+            &unpinned_tool
+                .execute(scoped_args(owner, "task-tool-1", json!({"name": "demo"})))
+                .await
+                .unwrap()
+                .output,
+        )
+        .unwrap();
+        assert!(
+            unpinned
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("revised body")
+        );
+        assert_eq!(unpinned.get("pinned").unwrap(), &json!(false));
 
         // Callers without a trusted owner, and other owners, keep the legacy
         // projection exactly as before.

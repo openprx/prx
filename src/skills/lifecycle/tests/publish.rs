@@ -765,3 +765,35 @@ fn exclusive_recovery_refuses_to_run_next_to_a_writer() {
     drop(writer);
     store.recover(Duration::ZERO).expect("test: exclusive recovery");
 }
+
+#[test]
+fn retrying_a_transaction_with_another_enabled_value_conflicts() {
+    let (_tmp, store) = setup();
+    let a = write(&store, "A");
+    let mut first = request("tx-enabled", &a, 0);
+    first.enabled = false;
+    store.publish(&first).expect("test: publish disabled");
+    let mut changed = first.clone();
+    changed.enabled = true;
+    let err = store.publish(&changed).expect_err("test: different enabled value");
+    assert!(matches!(err, LifecycleError::TransactionConflict { .. }), "{err}");
+    assert!(store.publish(&first).expect("test: identical retry replays").replayed);
+}
+
+#[test]
+fn rollback_restores_the_enabled_state_of_its_target() {
+    let (_tmp, store) = setup();
+    let a = write(&store, "A");
+    let b = write(&store, "B");
+    let mut disabled = request("tx-a", &a, 0);
+    disabled.enabled = false;
+    store.publish(&disabled).expect("test: publish A disabled");
+    store.publish(&request("tx-b", &b, 1)).expect("test: publish B");
+    assert!(binding(&store).expect("test: binding").enabled);
+
+    store
+        .rollback(&rollback_request("tx-back", &a.0, 2))
+        .expect("test: rollback");
+    let restored = binding(&store).expect("test: binding");
+    assert_eq!((restored.generation, restored.enabled), (3, false));
+}

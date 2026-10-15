@@ -39,13 +39,15 @@ impl SkillLifecycleStore {
         for entry in entries {
             let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            let stem = name
+            let parsed = name
                 .strip_suffix(".json")
-                .ok_or_else(|| LifecycleError::InvalidRecord {
-                    path: entry.path(),
-                    reason: "unexpected entry in the active binding directory".to_string(),
-                })?;
-            ids.push(SkillId::parse(stem)?);
+                .filter(|_| !name.starts_with('.'))
+                .and_then(|stem| SkillId::parse(stem).ok());
+            let Some(id) = parsed else {
+                tracing::warn!(entry = %entry.path().display(), "ignoring unexpected entry in the active binding directory");
+                continue;
+            };
+            ids.push(id);
             if ids.len() > MAX_ACTIVE_BINDINGS {
                 return Err(LifecycleError::InvalidRecord {
                     path: dir,
@@ -85,15 +87,26 @@ impl SkillLifecycleStore {
     /// Pins the revision named by `binding`, verifying it against the pinned
     /// record digest. `display_name` is the authenticated name of that revision.
     pub fn pin_binding(&self, binding: &ActiveBinding) -> Result<PinnedSkillRevision, LifecycleError> {
+        self.verify_binding(binding).map(|(pin, _)| pin)
+    }
+
+    /// Verifies the revision named by `binding` once and returns both the pin
+    /// and the verified revision, so a caller that also reads it does not
+    /// hash the bundle a second time.
+    pub(super) fn verify_binding(
+        &self,
+        binding: &ActiveBinding,
+    ) -> Result<(PinnedSkillRevision, VerifiedRevision), LifecycleError> {
         let verified = self.read_revision(&binding.skill_id, &binding.revision_id, Some(&binding.record_digest))?;
-        Ok(PinnedSkillRevision {
+        let pin = PinnedSkillRevision {
             owner_scope: binding.owner_scope.clone(),
             skill_id: binding.skill_id.clone(),
             revision_id: binding.revision_id.clone(),
             generation: binding.generation,
-            display_name: verified.revision.display_name,
-            record_digest: verified.record_digest,
-        })
+            display_name: verified.revision.display_name.clone(),
+            record_digest: verified.record_digest.clone(),
+        };
+        Ok((pin, verified))
     }
 
     /// Resolves the active binding of `skill` into a pin; `None` when the skill
@@ -178,6 +191,23 @@ impl PinTable {
         Ok(Some(pin))
     }
 
+    /// The pin this task holds for a skill whose display name equals `name`
+    /// (ASCII case-insensitive).
+    pub(super) fn find_by_name(
+        &self,
+        owner: &OwnerScope,
+        task_id: &str,
+        name: &str,
+    ) -> Option<Arc<PinnedSkillRevision>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|(key, pin)| {
+                key.owner == *owner && key.task_id == task_id && pin.display_name.eq_ignore_ascii_case(name)
+            })
+            .map(|(_, pin)| Arc::clone(pin))
+    }
+
     pub(super) fn release(&self, owner: &OwnerScope, task_id: &str) {
         self.entries
             .lock()
@@ -233,26 +263,42 @@ pub fn read_managed_resource(
     task_id: Option<&str>,
     max_bytes: u64,
 ) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+    // A task that already holds a pin for this skill name keeps it, even if
+    // the active binding was renamed, disabled or removed since.
+    let held = task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
     let store = match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
         Ok(Some(store)) => store,
-        Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) => return Ok(None),
+        Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) if held.is_none() => return Ok(None),
+        Ok(None) => return Err(LifecycleError::RevisionNotFound(skill_name.to_string())),
         Err(e) => return Err(e),
     };
-    let Some((binding, _display_name)) = store.find_binding_by_name(skill_name)? else {
-        return Ok(None);
-    };
-    if !binding.enabled {
-        return Err(LifecycleError::SkillDisabled(skill_name.to_string()));
-    }
-    let (pin, pinned) = match task_id {
-        Some(task) => {
-            let pin = task_pin(owner, task, &binding.skill_id, || store.pin_binding(&binding).map(Some))?
-                .ok_or_else(|| LifecycleError::RevisionNotFound(binding.skill_id.to_string()))?;
-            ((*pin).clone(), true)
+    let (pin, pinned, verified) = if let Some(pin) = held {
+        let verified = store.read_pinned(&pin)?;
+        ((*pin).clone(), true, verified)
+    } else {
+        let Some((binding, _display_name)) = store.find_binding_by_name(skill_name)? else {
+            return Ok(None);
+        };
+        if !binding.enabled {
+            return Err(LifecycleError::SkillDisabled(skill_name.to_string()));
         }
-        None => (store.pin_binding(&binding)?, false),
+        // One verification of the bundle serves both the pin and the read.
+        let (issued, verified) = store.verify_binding(&binding)?;
+        match task_id {
+            Some(task) => {
+                let pin = task_pin(owner, task, &binding.skill_id, || Ok(Some(issued)))?
+                    .ok_or_else(|| LifecycleError::RevisionNotFound(binding.skill_id.to_string()))?;
+                // Another thread may have pinned this task first.
+                let verified = if pin.revision_id == verified.revision.revision_id {
+                    verified
+                } else {
+                    store.read_pinned(&pin)?
+                };
+                ((*pin).clone(), true, verified)
+            }
+            None => (issued, false, verified),
+        }
     };
-    let verified = store.read_pinned(&pin)?;
     let file = select_resource(&verified.bundle, resource_path)?;
     let size = u64::try_from(file.bytes().len()).unwrap_or(u64::MAX);
     if size > max_bytes {

@@ -367,3 +367,60 @@ fn untrusted_origin_marker_is_reported() {
         .expect("test: managed");
     assert!(read.untrusted_origin);
 }
+
+#[test]
+fn a_pinned_task_keeps_its_revision_when_the_skill_is_renamed_or_disabled() {
+    let (tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A body"));
+    activate(&store, &skill(), &a, 0, true);
+    let guide = Some("references/guide.md");
+    let first = read(tmp.path(), OWNER_A, "Deploy helper", guide, Some("task-rename-1"))
+        .expect("test: read")
+        .expect("test: managed");
+    assert_eq!(first.content, "A body");
+
+    let renamed = publish_rev(
+        &store,
+        &skill(),
+        vec![
+            entry("SKILL.md", md("Renamed skill", "Now called something else").as_bytes()),
+            entry("references/guide.md", b"B body"),
+        ],
+    );
+    activate(&store, &skill(), &renamed, 1, false);
+
+    // The pinned task still reads A by the name it selected, although the
+    // active binding is now a differently named, disabled revision.
+    let again = read(tmp.path(), OWNER_A, "deploy helper", guide, Some("task-rename-1"))
+        .expect("test: pinned read survives rename and disable")
+        .expect("test: managed");
+    assert_eq!((again.content.as_str(), again.pinned), ("A body", true));
+    // Another task resolves the new binding: the old name is gone, the new one is disabled.
+    assert!(
+        read(tmp.path(), OWNER_A, "deploy helper", guide, Some("task-rename-2"))
+            .expect("test: read")
+            .is_none()
+    );
+    let err = read(tmp.path(), OWNER_A, "renamed skill", guide, Some("task-rename-2")).expect_err("test: disabled");
+    assert!(matches!(err, LifecycleError::SkillDisabled(_)), "{err}");
+    release_task_pins(&owner(OWNER_A), "task-rename-1");
+}
+
+#[test]
+fn stray_files_in_the_active_directory_do_not_break_listing() {
+    let (_tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A"));
+    activate(&store, &skill(), &a, 0, true);
+    let active = store.root().join("active");
+    for stray in [".DS_Store", "notes.txt", "bad name.json", ".hidden.json"] {
+        fs::write(active.join(stray), b"x").expect("test: stray file");
+    }
+    let listed = store.list_active_bindings().expect("test: list");
+    assert_eq!(listed.len(), 1);
+    assert!(
+        store
+            .find_binding_by_name("deploy helper")
+            .expect("test: find")
+            .is_some()
+    );
+}

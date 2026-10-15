@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::{md, owner};
+use crate::skills::lifecycle::NewRevision;
 use crate::skills::lifecycle::{
     Bundle, MigrationAction, MigrationEntry, SkillId, SkillLifecycleStore, SourceKind, apply_migration, plan_migration,
     read_managed_resource,
@@ -250,4 +251,96 @@ fn imported_skills_read_like_the_legacy_directory() {
         let expected = fs::read_to_string(tmp.path().join("skills").join(legacy)).expect("test: legacy");
         assert_eq!(managed.content, expected);
     }
+}
+
+fn import_all(tmp: &TempDir) -> (SkillLifecycleStore, crate::skills::lifecycle::MigrationPlan) {
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let plan = plan_migration(tmp.path(), Some(&store)).expect("test: plan");
+    (store, plan)
+}
+
+#[test]
+fn reapplying_the_same_plan_after_commit_replays() {
+    let tmp = workspace();
+    let (store, plan) = import_all(&tmp);
+    let first = apply_migration(&store, tmp.path(), &plan);
+    assert!(first.failed.is_empty(), "{:?}", first.failed);
+    let again = apply_migration(&store, tmp.path(), &plan);
+    assert!(again.failed.is_empty(), "a replay is not a failure: {:?}", again.failed);
+    assert_eq!(again.imported, first.imported);
+    let alpha = SkillId::from_legacy_dir("alpha").expect("test: id");
+    let binding = store
+        .active_binding(&alpha)
+        .expect("test: binding")
+        .expect("test: bound");
+    assert_eq!(binding.generation, 1, "the replay must not publish a second generation");
+}
+
+#[test]
+fn a_plan_made_before_someone_else_published_is_stale() {
+    let tmp = workspace();
+    let (store, plan) = import_all(&tmp);
+    let alpha = SkillId::from_legacy_dir("alpha").expect("test: id");
+    let other = Bundle::from_entries(vec![super::entry(
+        "SKILL.md",
+        md("Alpha", "Published elsewhere").as_bytes(),
+    )])
+    .expect("test: bundle");
+    let written = store
+        .write_revision(&NewRevision::new(alpha.clone(), SourceKind::Learned), &other)
+        .expect("test: write");
+    super::activate(
+        &store,
+        &alpha,
+        &(written.revision.revision_id.clone(), written.record_digest),
+        0,
+        true,
+    );
+
+    let report = apply_migration(&store, tmp.path(), &plan);
+    assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+    assert_eq!(report.failed.first().map(|f| f.0.as_str()), Some("alpha"));
+    assert!(
+        report.failed.first().is_some_and(|f| f.1.contains("generation")),
+        "{:?}",
+        report.failed
+    );
+    let binding = store
+        .active_binding(&alpha)
+        .expect("test: binding")
+        .expect("test: bound");
+    assert_eq!(
+        binding.revision_id, written.revision.revision_id,
+        "their revision is preserved"
+    );
+    assert_eq!(binding.generation, 1);
+}
+
+#[test]
+fn an_import_aborted_by_a_crash_is_retried_with_a_new_attempt() {
+    use crate::skills::lifecycle::publish::crash_hooks;
+    let tmp = workspace();
+    let (store, plan) = import_all(&tmp);
+    crash_hooks::arm("after_prepared");
+    let crashed = apply_migration(&store, tmp.path(), &plan);
+    crash_hooks::disarm();
+    assert_eq!(crashed.failed.len(), 1, "{:?}", crashed.failed);
+    assert_eq!(crashed.failed.first().map(|f| f.0.as_str()), Some("alpha"));
+    let alpha = SkillId::from_legacy_dir("alpha").expect("test: id");
+    assert!(store.active_binding(&alpha).expect("test: binding").is_none());
+
+    // The first attempt's id is stuck PREPARED/ABORTED; a retry derives the next one.
+    let (store, plan) = import_all(&tmp);
+    assert!(matches!(
+        find(&plan.entries, "alpha").action,
+        MigrationAction::Import { .. }
+    ));
+    let retry = apply_migration(&store, tmp.path(), &plan);
+    assert!(retry.failed.is_empty(), "{:?}", retry.failed);
+    assert_eq!(retry.imported.len(), 1);
+    let binding = store
+        .active_binding(&alpha)
+        .expect("test: binding")
+        .expect("test: bound");
+    assert_eq!(binding.generation, 1);
 }
