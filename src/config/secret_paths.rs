@@ -2490,19 +2490,14 @@ mod tests {
             Some(ROUTE_SECRET)
         );
 
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &loaded.model_routes,
-            "route-model",
-            &isolated_provider_options(dir.path()),
-        )
-        .expect("test: routed provider");
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
+        let provider =
+            crate::providers::create_provider_from_test_config(&runtime_config, &isolated_provider_options(dir.path()))
+                .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(
@@ -2626,19 +2621,15 @@ mod tests {
         assert_eq!(routes[0].api_key.as_deref(), Some(ROUTE_SECRET));
         assert_eq!(routes[1].api_key, None, "another provider's reference was released");
 
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &routes,
-            "route-model",
-            &isolated_provider_options(dir.path()),
-        )
-        .expect("test: routed provider");
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.model_routes = routes.to_vec();
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
+        let provider =
+            crate::providers::create_provider_from_test_config(&runtime_config, &isolated_provider_options(dir.path()))
+                .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(
@@ -2664,20 +2655,14 @@ mod tests {
 
         let loaded = crate::config::Config::load_from_path(&config.config_path, config.workspace_dir.clone())
             .expect("test: load");
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
         let options = isolated_provider_options(dir.path());
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &loaded.model_routes,
-            "route-model",
-            &options,
-        )
-        .expect("test: routed provider");
+        let provider = crate::providers::create_provider_from_test_config(&runtime_config, &options)
+            .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(

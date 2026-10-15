@@ -10,7 +10,7 @@
 
 #![allow(clippy::indexing_slicing)]
 
-use super::create_resilient_provider_with_options;
+use super::create_provider_from_test_config;
 use super::label_redaction_tests::spawn_fixed_status_stub;
 use super::provider_runtime_options_from_config;
 use super::tool_dialect_config_tests::{
@@ -48,17 +48,38 @@ fn config_with(provider: &str, reliability: &str, extra: &str) -> String {
 }
 
 fn build(config: &crate::config::Config) -> Box<dyn super::Provider> {
-    create_resilient_provider_with_options(
+    let mut config = config.clone();
+    let providers = std::iter::once(
         config
             .default_provider
             .as_deref()
             .expect("test: the fixture names a provider"),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &provider_runtime_options_from_config(config),
     )
-    .expect("test: the configured chain constructs")
+    .chain(config.reliability.fallback_providers.iter().map(String::as_str))
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    for provider in providers {
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": provider.clone(),
+                "model": FIXTURE_MODEL,
+                "operations": ["chat"],
+                "native_tools": true
+            }))
+            .expect("test: verified NativeTools declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider}/{FIXTURE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
+    create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+        .expect("test: the configured chain constructs")
 }
 
 async fn chat_with(provider: &dyn super::Provider, tools: &[ToolSpec]) -> anyhow::Result<String> {

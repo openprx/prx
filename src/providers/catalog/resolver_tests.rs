@@ -1130,19 +1130,15 @@ fn a_model_scoped_declaration_does_not_widen_the_endpoints_enforcement() {
         Some("model-a"),
         "tool_schema_dialect = \"no_root_combinators\"\n",
     );
-    let provider = crate::providers::create_resilient_provider_with_options(
-        label,
-        None,
-        None,
-        &config.reliability,
-        &provider_runtime_options_from_config(&config),
-    )
-    .expect("test: construct");
+    let provider =
+        crate::providers::create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+            .expect("test: construct");
     assert_eq!(
         provider.tool_schema_dialect(),
         ToolSchemaDialect::Raw,
         "a model-b turn on this endpoint is enforced against model-a's rewrite"
     );
+    assert_eq!(provider.tool_schema_dialect_for("model-b"), ToolSchemaDialect::Raw);
 
     let mut wide = isolated_config(&temp, label, "model-b");
     declare(
@@ -1151,18 +1147,18 @@ fn a_model_scoped_declaration_does_not_widen_the_endpoints_enforcement() {
         None,
         "tool_schema_dialect = \"no_root_combinators\"\n",
     );
-    let provider = crate::providers::create_resilient_provider_with_options(
-        label,
-        None,
-        None,
-        &wide.reliability,
-        &provider_runtime_options_from_config(&wide),
-    )
-    .expect("test: construct");
+    let provider =
+        crate::providers::create_provider_from_test_config(&wide, &provider_runtime_options_from_config(&wide))
+            .expect("test: construct");
     assert_eq!(
         provider.tool_schema_dialect(),
+        ToolSchemaDialect::Raw,
+        "the typed chain does not claim a provider-wide rewrite without a model"
+    );
+    assert_eq!(
+        provider.tool_schema_dialect_for("model-b"),
         ToolSchemaDialect::NoRootCombinators,
-        "a provider-wide declaration covers every model"
+        "a provider-wide declaration covers the selected model"
     );
 }
 
@@ -1257,7 +1253,7 @@ fn every_chain_member_is_checked_against_the_primarys_requirement() {
 #[test]
 fn a_routed_turn_is_enforced_in_its_destinations_dialect() {
     let temp = tempfile::TempDir::new().expect("test: temp dir");
-    let config = isolated_config(&temp, "openai", "gpt-4o");
+    let mut config = isolated_config(&temp, "openai", "gpt-4o");
     let routes = vec![crate::config::ModelRouteConfig {
         hint: "vision".to_string(),
         provider: "gemini".to_string(),
@@ -1265,16 +1261,11 @@ fn a_routed_turn_is_enforced_in_its_destinations_dialect() {
         api_key: Some("PMMC-ROUTE-SENTINEL".to_string()),
         credential_ref: None,
     }];
-    let router = crate::providers::create_routed_provider_with_options(
-        "openai",
-        Some(ROOT_SENTINEL),
-        None,
-        &config.reliability,
-        &routes,
-        "gpt-4o",
-        &provider_runtime_options_from_config(&config),
-    )
-    .expect("test: construct");
+    config.api_key = Some(ROOT_SENTINEL.to_string());
+    config.model_routes = routes;
+    let router =
+        crate::providers::create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+            .expect("test: construct");
     assert_eq!(router.tool_schema_dialect_for("hint:vision"), ToolSchemaDialect::Gemini);
     assert_eq!(router.tool_schema_dialect_for("gpt-4o"), ToolSchemaDialect::Raw);
     assert_eq!(

@@ -3974,14 +3974,8 @@ mod tests {
         // registrar with the arguments that entry point supplies.
         let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
         let provider: Arc<dyn Provider> = Arc::from(
-            providers::create_resilient_provider_with_options(
-                config.default_provider.as_deref().unwrap_or("openrouter"),
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-                &config.reliability,
-                &provider_runtime_options,
-            )
-            .expect("test: the provider chain must build"),
+            providers::create_provider_from_test_config(&config, &provider_runtime_options)
+                .expect("test: the provider chain must build"),
         );
         let model = config
             .default_model
@@ -4095,14 +4089,8 @@ mod tests {
         // registrar with the arguments that entry point supplies.
         let provider_runtime_options = providers::provider_runtime_options_from_config(config);
         let provider: Arc<dyn Provider> = Arc::from(
-            providers::create_resilient_provider_with_options(
-                config.default_provider.as_deref().unwrap_or("openrouter"),
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-                &config.reliability,
-                &provider_runtime_options,
-            )
-            .expect("test: the provider chain must build"),
+            providers::create_provider_from_test_config(config, &provider_runtime_options)
+                .expect("test: the provider chain must build"),
         );
         let model = config
             .default_model

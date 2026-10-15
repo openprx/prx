@@ -13,8 +13,8 @@
 
 use super::traits::{ChatMessage, ChatRequest};
 use super::{
-    Provider, ProviderRuntimeOptions, ToolSchemaDialectDeclaration, create_provider_with_options,
-    create_resilient_provider_with_options, provider_runtime_options_from_config,
+    Provider, ProviderRuntimeOptions, ToolSchemaDialectDeclaration, create_provider_from_test_config,
+    create_provider_with_options, provider_runtime_options_from_config,
 };
 use crate::tools::{ToolSchemaDialect, ToolSpec};
 use serde_json::{Value, json};
@@ -165,18 +165,8 @@ pub(super) fn load_config(dir: &TempDir, body: &str) -> anyhow::Result<crate::co
 /// The provider chain the gateway and the channels build for the configured
 /// default provider, from nothing but the loaded configuration.
 fn build_default_provider(config: &crate::config::Config) -> Box<dyn Provider> {
-    let name = config
-        .default_provider
-        .as_deref()
-        .expect("test: the fixture config names a default provider");
-    create_resilient_provider_with_options(
-        name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &provider_runtime_options_from_config(config),
-    )
-    .expect("test: the configured provider constructs")
+    create_provider_from_test_config(config, &provider_runtime_options_from_config(config))
+        .expect("test: the configured provider constructs")
 }
 
 fn config_for(provider: &str, extra: &str) -> String {
@@ -374,11 +364,14 @@ async fn a_model_scoped_raw_entry_overrides_a_provider_wide_declaration() {
         no_root_combinators_declaration(&label)
     );
     let config = load_config(&dir, &config_for(&label, &declarations)).expect("test: both entries load");
-    let provider = build_default_provider(&config);
+    let lowered_provider = build_default_provider(&config);
+    let mut published_config = config.clone();
+    published_config.default_model = Some("PUBLISHED-MODEL".to_string());
+    let published_provider = build_default_provider(&published_config);
 
     let tools = [mergeable_tool()];
     let messages = [ChatMessage::user("look it up")];
-    let lowered = provider
+    let lowered = lowered_provider
         .chat(
             ChatRequest {
                 messages: &messages,
@@ -389,7 +382,7 @@ async fn a_model_scoped_raw_entry_overrides_a_provider_wide_declaration() {
         )
         .await;
     assert!(lowered.is_ok(), "the provider-wide entry lowers: {lowered:?}");
-    let published = provider
+    let published = published_provider
         .chat(
             ChatRequest {
                 messages: &messages,

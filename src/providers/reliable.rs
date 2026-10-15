@@ -566,14 +566,14 @@ pub struct ReliableProvider {
     base_backoff_ms: u64,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
-    /// Per-fallback G6/G7 facts for resolver-built chains. Legacy factories
-    /// leave this absent and retain their historical behavior.
+    /// Per-fallback G6/G7 facts for resolver-built chains. Direct unit-test
+    /// construction leaves this absent.
     fallback_admission: Option<FallbackAdmission>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
     unavailable_providers: Vec<(String, String)>,
     /// Per-provider cool-down learned from upstream 429/503 responses.
     ///
-    /// Chains built by [`create_resilient_provider_with_options`](super::create_resilient_provider_with_options)
+    /// Chains built by [`create_provider_for`](super::create_provider_for)
     /// share the process-wide gate, so a 429 on one request defers every other
     /// in-flight request to the same provider. Chains constructed directly get
     /// a private gate, keeping unit tests isolated from one another.

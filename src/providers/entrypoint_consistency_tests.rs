@@ -63,12 +63,10 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
 
     let cli_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None)
         .expect("test: CLI selection resolves before its fallback chain is built");
-    let cli =
-        refusal(crate::agent::entry::agent_provider_selection(&config, &cli_choice).build_provider(&config, &options));
+    let cli = refusal(crate::agent::entry::agent_provider_selection(&cli_choice).build_provider(&config, &options));
     let cron_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None)
         .expect("test: cron selection resolves before its fallback chain is built");
-    let cron =
-        refusal(crate::agent::entry::agent_provider_selection(&config, &cron_choice).build_provider(&config, &options));
+    let cron = refusal(crate::agent::entry::agent_provider_selection(&cron_choice).build_provider(&config, &options));
 
     let channels = refusal(crate::channels::build_channel_startup_provider(&config, &options));
     let gateway = refusal(crate::gateway::build_gateway_provider_selection(&config, &options));
@@ -154,7 +152,7 @@ async fn chat_and_cli_keep_fallback_admission_after_primary_429() {
         .expect("test: chat chain builds");
     let cli_choice =
         crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("test: CLI selection resolves");
-    let cli = crate::agent::entry::agent_provider_selection(&config, &cli_choice)
+    let cli = crate::agent::entry::agent_provider_selection(&cli_choice)
         .build_provider(&config, &options)
         .expect("test: CLI chain builds");
     let messages = [ChatMessage::user("Use probe_tool.")];
@@ -223,7 +221,7 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
         .expect("chat starts with the refused route retained");
     let choice =
         crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("CLI default selection resolves");
-    let cli = crate::agent::entry::agent_provider_selection(&config, &choice)
+    let cli = crate::agent::entry::agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("CLI starts with the refused route retained");
     let (channels, _, _) = crate::channels::build_channel_startup_provider(&config, &options)

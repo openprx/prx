@@ -17600,15 +17600,15 @@ mod tests {
             &gateway.custom_provider(),
             Some(SPAWN_ROOT_SENTINEL),
         );
+        let gateway_config = crate::config::Config {
+            default_provider: Some(gateway.custom_provider()),
+            default_model: Some(crate::providers::credential_probe::PROBE_MODEL.to_string()),
+            api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
+            ..crate::config::Config::default()
+        };
         tool.provider = Arc::from(
-            providers::create_resilient_provider_with_options(
-                &gateway.custom_provider(),
-                Some(SPAWN_ROOT_SENTINEL),
-                None,
-                &crate::config::ReliabilityConfig::default(),
-                &providers::ProviderRuntimeOptions::default(),
-            )
-            .expect("test: gateway chain builds"),
+            providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
+                .expect("test: gateway chain builds"),
         );
 
         let result = execute_admitted_spawn(
@@ -17852,15 +17852,21 @@ mod tests {
         use crate::providers::credential_probe::CredentialProbe;
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
-        let gateway = providers::create_resilient_provider_with_options(
-            "litellm",
-            Some(F1_SPAWN_ROOT_SENTINEL),
-            Some(&root.base_url()),
-            &crate::config::ReliabilityConfig {
+        let gateway_config = crate::config::Config {
+            default_provider: Some("litellm".to_string()),
+            default_model: Some("probe-model".to_string()),
+            api_key: Some(F1_SPAWN_ROOT_SENTINEL.to_string()),
+            api_url: Some(root.base_url()),
+            reliability: crate::config::ReliabilityConfig {
                 provider_retries: 0,
                 provider_backoff_ms: 0,
                 ..crate::config::ReliabilityConfig::default()
             },
+            workspace_dir: temp.path().join("workspace"),
+            ..crate::config::Config::default()
+        };
+        let gateway = providers::create_provider_from_test_config(
+            &gateway_config,
             &providers::ProviderRuntimeOptions {
                 openprx_dir: Some(temp.path().to_path_buf()),
                 codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),

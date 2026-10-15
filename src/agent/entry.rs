@@ -1235,22 +1235,6 @@ mod agent_turn_origin_tests {
 
     #[test]
     fn oauth_placeholder_cannot_attest_to_root_wire_material() {
-        for (provider, value) in [
-            ("qwen-code", "qwen-oauth"),
-            ("minimax", "minimax-oauth"),
-            ("minimax-cn", "minimax-oauth-cn"),
-            ("claude-code", "claude-code"),
-            ("anthropic", "claude-cli"),
-        ] {
-            assert!(
-                providers::credential_override_is_runtime_indirection(provider, value),
-                "factory indirection must be visible to the proof guard"
-            );
-        }
-        assert!(!providers::credential_override_is_runtime_indirection(
-            "openai",
-            "prx-literal-key"
-        ));
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -1435,31 +1419,15 @@ pub(crate) fn resolve_agent_model_choice(
 pub(crate) struct AgentProviderSelection<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) model_name: &'a str,
-    #[cfg(test)]
-    pub(crate) connection: providers::ProviderConnection<'a>,
     resolved: &'a crate::providers::catalog::ResolvedModel,
 }
 
 /// Scope the connection for a resolved selection. Resolution already ran in
 /// [`resolve_agent_model_choice`]; this does not resolve again.
-pub(crate) fn agent_provider_selection<'a>(
-    config: &'a Config,
-    choice: &'a AgentModelChoice,
-) -> AgentProviderSelection<'a> {
-    #[cfg(test)]
-    let connection = providers::configured_connection_for(
-        &choice.provider_name,
-        providers::selection::default_provider(config),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-    );
-    #[cfg(not(test))]
-    let _ = config;
+pub(crate) fn agent_provider_selection(choice: &AgentModelChoice) -> AgentProviderSelection<'_> {
     AgentProviderSelection {
         provider_name: &choice.provider_name,
         model_name: &choice.model_name,
-        #[cfg(test)]
-        connection,
         resolved: &choice.resolved,
     }
 }
@@ -1637,7 +1605,7 @@ pub(crate) async fn run_with_runtime_envelope(
             .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
 
         // ── Provider (resolved before the bootstrap) ─────────────────
-        let selection = agent_provider_selection(&config, choice);
+        let selection = agent_provider_selection(choice);
         let provider_name = selection.provider_name;
         let model_name = selection.model_name;
 

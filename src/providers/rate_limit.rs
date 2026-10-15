@@ -193,7 +193,7 @@ impl RateLimitGate {
 }
 
 /// Process-wide gate shared by every provider chain built through
-/// [`create_resilient_provider_with_options`](super::create_resilient_provider_with_options).
+/// [`create_provider_for`](super::create_provider_for).
 ///
 /// Chains constructed directly via `ReliableProvider::new` get a private gate
 /// instead, so unit tests never leak cool-downs into each other.

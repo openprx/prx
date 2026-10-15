@@ -15,7 +15,7 @@ use crate::providers::tool_dialect_config_tests::{
     FIXTURE_MODEL, load_config, mergeable_tool, root_combinators_in, spawn_dialect_stub,
 };
 use crate::providers::traits::{ChatMessage, ChatRequest};
-use crate::providers::{create_resilient_provider_with_options, provider_runtime_options_from_config};
+use crate::providers::{create_provider_from_test_config, provider_runtime_options_from_config};
 use crate::tools::ToolSchemaDialect;
 
 const ROOT_SENTINEL: &str = "PMMB-CURATED-ROOT-SENTINEL";
@@ -54,14 +54,8 @@ async fn a_curated_no_root_combinators_declaration_reaches_the_wire() {
         ),
     )
     .expect("test: a curated declaration for a custom endpoint loads");
-    let provider = create_resilient_provider_with_options(
-        &label,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &provider_runtime_options_from_config(&config),
-    )
-    .expect("test: construct");
+    let provider = create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+        .expect("test: construct");
 
     let tools = [mergeable_tool()];
     let messages = [ChatMessage::user("look it up")];

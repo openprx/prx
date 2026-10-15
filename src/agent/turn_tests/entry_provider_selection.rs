@@ -36,7 +36,7 @@ async fn a_custom_override_does_not_receive_the_root_key() {
 
     let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
         .expect("test: a keyless custom endpoint is selectable");
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("test: a keyless custom endpoint builds");
     let reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -57,7 +57,7 @@ fn a_catalog_override_without_its_own_credential_is_refused() {
     let options = crate::providers::provider_runtime_options_from_config(&config);
 
     let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"))
-        .and_then(|choice| agent_provider_selection(&config, &choice).build_provider(&config, &options));
+        .and_then(|choice| agent_provider_selection(&choice).build_provider(&config, &options));
 
     let error = match outcome {
         Ok(_) => panic!("a catalog override must not build on the default provider's key"),
@@ -78,10 +78,13 @@ fn the_configured_default_keeps_its_connection() {
     for spelling in [None, Some("openai"), Some("OPENAI")] {
         let choice =
             resolve_agent_model_choice(&config, spelling, None).expect("test: the default provider is selectable");
-        let selection = agent_provider_selection(&config, &choice);
-        assert_eq!(selection.connection.api_key, Some(ROOT_SENTINEL), "{spelling:?}");
         assert_eq!(
-            selection.connection.api_url,
+            choice.resolved.credential().api_key(),
+            Some(ROOT_SENTINEL),
+            "{spelling:?}"
+        );
+        assert_eq!(
+            choice.resolved.credential().api_url(),
             Some("https://api.openai.example/v1"),
             "{spelling:?}"
         );
@@ -115,7 +118,7 @@ async fn a_custom_override_does_not_receive_the_rotation_keys() {
 
     let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
         .expect("test: a keyless custom endpoint is selectable");
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("test: a keyless custom endpoint builds");
     let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -137,11 +140,13 @@ fn an_override_does_not_inherit_the_root_base_url() {
 
     let choice = resolve_agent_model_choice(&config, Some("litellm"), Some("probe-model"))
         .expect("test: litellm accepts a bare model id");
-    let selection = agent_provider_selection(&config, &choice);
-
-    assert_eq!(selection.connection.api_url, None);
-    assert_eq!(selection.connection.api_key, None);
-    assert!(!selection.connection.released);
+    assert_eq!(choice.resolved.credential().api_url(), None);
+    assert_eq!(choice.resolved.credential().api_key(), None);
+    assert_eq!(
+        choice.resolved.credential().reference(),
+        &crate::providers::credentials::CredentialRef::ProviderStore,
+        "the override may use only its own credential store"
+    );
 }
 
 fn declare_decision_only(config: &mut Config, provider: &str) {
@@ -189,9 +194,15 @@ async fn a_route_to_a_decision_only_model_is_refused() {
         credential_ref: None,
     }];
 
-    let Err(error) = resolve_agent_model_choice(&config, None, None) else {
-        panic!("a route to a decision-only model was accepted");
-    };
+    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default model resolves");
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let provider = agent_provider_selection(&choice)
+        .build_provider(&config, &options)
+        .expect("test: the default builds with the refused route retained");
+    let error = provider
+        .simple_chat("ping", "hint:decide", 0.0)
+        .await
+        .expect_err("a route to a decision-only model was accepted");
     assert!(format!("{error:#}").contains("hint:decide"), "{error:#}");
     assert!(probe.requests().is_empty(), "nothing is sent");
 }
@@ -236,7 +247,7 @@ async fn direct_turn_keeps_root_credential_beside_a_keyed_route() {
     });
     let choice = resolve_agent_model_choice(&config, None, None).expect("direct model selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
@@ -276,7 +287,7 @@ async fn second_same_provider_hint_uses_its_own_wire_key() {
     }
     let choice = resolve_agent_model_choice(&config, None, Some("hint:second")).expect("second hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
@@ -321,7 +332,7 @@ async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
     ];
     let choice = resolve_agent_model_choice(&config, None, Some("hint:keyed")).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
@@ -361,7 +372,7 @@ async fn keyed_primary_hint_retries_without_root_rotation_key() {
     });
     let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     let _ = provider.simple_chat("ping", "hint:fast", 0.0).await;
@@ -387,7 +398,7 @@ fn keyed_primary_hint_does_not_inherit_root_endpoint() {
         credential_ref: None,
     });
     let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
-    let selection = agent_provider_selection(&config, &choice);
+    let selection = agent_provider_selection(&choice);
     assert_eq!(selection.resolved.credential().api_url(), None);
     selection
         .build_provider(
@@ -445,7 +456,7 @@ async fn root_url_without_root_key_uses_the_provider_profile() {
     let choice = resolve_agent_model_choice(&config, None, None).expect("PMM root URL selection");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let (built, counts) = crate::providers::credential_resolution_observation::observe(|| {
-        agent_provider_selection(&config, &choice).build_provider(&config, &options)
+        agent_provider_selection(&choice).build_provider(&config, &options)
     });
     let provider = built.expect("URL-only Root falls back to the provider's own credential store");
     assert_eq!(
@@ -474,7 +485,7 @@ fn openai_codex_ignores_root_key_url_and_rotation_material() {
     let choice = resolve_agent_model_choice(&config, None, None).expect("Codex Root selection resolves");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
-        agent_provider_selection(&config, &choice).build_provider(&config, &options)
+        agent_provider_selection(&choice).build_provider(&config, &options)
     });
     provider.expect("Codex builds from its own login despite unrelated Root material");
     assert_eq!(counts, [0, 0, 0], "Codex must not resolve Root API-key material");
@@ -567,7 +578,7 @@ async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire()
                 .expect("owned conflicting profile");
             let choice = resolve_agent_model_choice(&config, None, None).expect("actual resolved connection");
             let options = crate::providers::provider_runtime_options_from_config(&config);
-            let selection = agent_provider_selection(&config, &choice);
+            let selection = agent_provider_selection(&choice);
             let mut changed = config.clone();
             changed.model_routes.push(crate::config::ModelRouteConfig {
                 hint: "prx_route".into(),
@@ -590,7 +601,7 @@ async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire()
             );
             assert!(seen.lock().is_empty());
             let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
-                agent_provider_selection(&config, &choice).build_provider(&config, &options)
+                agent_provider_selection(&choice).build_provider(&config, &options)
             });
             let provider = provider.expect("actual provider construction");
             let reply = tokio::time::timeout(

@@ -7561,11 +7561,10 @@ fn the_owner_isolation_bit_is_never_asserted_by_memory_production_code() {
 /// Every provider-factory call in already-stripped production source, as the
 /// call's byte offset, the factory name and its top-level argument expressions.
 ///
-/// A factory is `create_provider`, `create_resilient_provider` or
-/// `create_routed_provider`, with or without a `_with_*` suffix, called as a
-/// free function (a method call such as `.build_provider(` is not a factory).
+/// A factory is the low-level `create_provider` family or one of the typed
+/// `create_provider_for` / `create_routed_provider_for` entrypoints, called as
+/// a free function (a method call such as `.build_provider(` is not a factory).
 fn provider_factory_calls(production: &str) -> Vec<(usize, String, Vec<String>)> {
-    const FACTORY_STEMS: [&str; 3] = ["create_provider", "create_resilient_provider", "create_routed_provider"];
     let bytes = production.as_bytes();
     let mut calls = Vec::new();
     let mut search = 0usize;
@@ -7580,9 +7579,12 @@ fn provider_factory_calls(production: &str) -> Vec<(usize, String, Vec<String>)>
             end += 1;
         }
         let name = &production[start..end];
-        let is_factory = FACTORY_STEMS
-            .iter()
-            .any(|stem| name == *stem || name.strip_prefix(stem).is_some_and(|rest| rest.starts_with("_with")));
+        let is_factory = name == "create_provider"
+            || name == "create_provider_for"
+            || name == "create_routed_provider_for"
+            || name
+                .strip_prefix("create_provider_with")
+                .is_some_and(|rest| rest.starts_with('_'));
         if !is_factory || production[..start].trim_end().ends_with("fn") {
             continue;
         }
@@ -7636,7 +7638,7 @@ fn agent_entries_reach_provider_factories_only_through_the_scoped_selection() {
     }
     assert_eq!(
         sites,
-        vec!["src/agent/entry.rs:build_provider:create_routed_provider_with_options".to_string()],
+        vec!["src/agent/entry.rs:build_provider:create_routed_provider_for".to_string()],
         "agent entries must build their provider through `AgentProviderSelection::build_provider`"
     );
 }
@@ -7833,13 +7835,19 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
                         .into_iter()
                         .rev()
                         .collect();
-                    let owner_checked_selection = function == "validate_worker_route"
-                        && ["selected.credential()", "resolved.credential()"]
-                            .iter()
-                            .any(|source| normalized[..at].ends_with(source));
+                    let owner_checked_selection = match function.as_str() {
+                        "validate_worker_route" => ["selected.credential()", "resolved.credential()"],
+                        "build_worker_provider_selection" => ["resolved.credential()", "sealed_connection"],
+                        _ => ["", ""],
+                    }
+                    .iter()
+                    .any(|source| !source.is_empty() && normalized[..at].ends_with(source));
+                    let owner_checked_agent = matches!(function.as_str(), "validate_worker_route" | "worker_provider")
+                        && receiver.ends_with("agent")
+                        && field == ".api_key";
                     assert!(
                         matches!(receiver.as_str(), "credentials.provider" | "config.composio")
-                            || (function == "validate_worker_route" && receiver == "agent" && field == ".api_key")
+                            || owner_checked_agent
                             || owner_checked_selection
                             || (relative == "src/session_worker/runner/ordinary_source.rs"
                                 && function == "restore"
@@ -7858,13 +7866,13 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner.rs:worker_provider:create_resilient_provider_with_options".to_string()],
+        vec!["src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for".to_string()],
         "a session worker builds its provider only through `worker_provider`"
     );
 }
 
 /// The factory stems a provider chain is built through.
-const PROVIDER_FACTORY_STEMS: [&str; 3] = ["create_provider", "create_resilient_provider", "create_routed_provider"];
+const PROVIDER_FACTORY_STEMS: [&str; 2] = ["create_provider", "create_routed_provider_for"];
 
 /// Concrete provider and chain constructors. Outside `src/providers/**` a
 /// provider is built only through the factories, which apply the credential
@@ -7887,7 +7895,7 @@ const PROVIDER_CONSTRUCTOR_TYPES: [&str; 11] = [
 /// directory. Three shapes would slip past them, and this guard closes each
 /// as far as a textual check can:
 ///
-/// - an import alias (`use …::create_resilient_provider_with_options as build;`)
+/// - an import alias (`use …::create_provider_for as build;`)
 ///   anywhere in production code;
 /// - a concrete provider or chain constructor (`ReliableProvider::new`,
 ///   `OpenAiCompatibleProvider::new_optional_credential`, …) outside
@@ -7968,24 +7976,21 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
 
     // Each site's credential source, as reviewed in C0 / R-C0:
     let expected: BTreeSet<String> = [
-        // `agent_provider_selection`: identity-scoped key and URL, scoped rotation keys.
-        "src/agent/entry.rs:build_provider:create_routed_provider_with_options",
-        // `/models` switch: `configured_connection_for` plus `scoped_reliability`.
-        "src/channels/mod.rs:get_or_create_provider_for_generation:create_resilient_provider_with_options",
-        // The configured default provider with the root connection.
-        "src/channels/mod.rs:start_channels_with_config:create_resilient_provider_with_options",
-        // Chat's own resolver plus `scoped_reliability` (P1-C).
-        "src/chat/mod.rs:chat_provider_chain:create_routed_provider_with_options",
-        // The configured default provider with the root connection.
-        "src/daemon/mod.rs:build_evolution_judge_model:create_resilient_provider_with_options",
+        "src/agent/entry.rs:build_provider:create_routed_provider_for",
+        "src/channels/decision_turn.rs:build_provider:create_provider_for",
+        "src/channels/mod.rs:build_channel_hint_provider:create_provider_for",
+        "src/channels/mod.rs:build_channel_startup_provider:create_routed_provider_for",
+        "src/channels/mod.rs:get_or_create_provider_for_generation:create_provider_for",
+        "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
+        "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
         // Keyless construction for validation only.
         "src/doctor/mod.rs:provider_validation_error:create_provider",
-        // The exact selected route or direct provider, with owner-scoped credentials.
-        // `worker_credentials`: key and URL together, scoped rotation keys.
-        "src/session_worker/runner.rs:worker_provider:create_resilient_provider_with_options",
-        // `child_connection`: an agent's own key, or the root key with its URL.
-        // `child_provider_plan`: only an agent's own key; never the gateway key.
-        "src/tools/sessions_spawn.rs:build_override_provider:create_resilient_provider_with_options",
+        "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
+        "src/runtime/child_source.rs:from_selection:create_provider_for",
+        "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
+        "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
+        "src/tools/sessions_spawn.rs:build_override_provider:create_provider_for",
+        "src/tools/sessions_spawn.rs:execute_spawn_with_id:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A single route: maps a task hint to a provider + model combo.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct Route {
     pub provider_name: String,
@@ -35,11 +36,12 @@ pub struct RouterProvider {
 }
 
 impl RouterProvider {
-    /// Create a new router with a default provider and optional routes.
+    /// Create a test router from name-indexed providers and routes.
     ///
     /// `providers` is a list of (name, provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
-    pub fn new(
+    #[cfg(test)]
+    pub(super) fn from_test_parts(
         providers: Vec<(String, Box<dyn Provider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
@@ -886,7 +888,7 @@ mod tests {
             })
             .collect();
 
-        let router = RouterProvider::new(provider_list, route_list, "default-model".to_string());
+        let router = RouterProvider::from_test_parts(provider_list, route_list, "default-model".to_string());
 
         (router, mocks)
     }
@@ -1031,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_system_passes_system_prompt() {
         let mock = Arc::new(MockProvider::new("response"));
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
@@ -1048,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_tools_delegates_to_resolved_provider() {
         let mock = Arc::new(MockProvider::new("tool-response"));
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
@@ -1108,7 +1110,7 @@ mod tests {
             seen_messages: Arc::clone(&seen_messages),
             seen_model: Arc::clone(&seen_model),
         };
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(provider) as Box<dyn Provider>)],
             vec![(
                 "stream".into(),
@@ -1205,7 +1207,7 @@ mod tests {
             response: "smart-answer",
             seen_model: Arc::clone(&seen_model),
         };
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
@@ -1256,7 +1258,7 @@ mod tests {
     async fn chat_traced_non_hint_uses_default_provider_real_attribution() {
         // A plain (non-hint) model still routes to the default provider but must
         // carry that provider's real label, not the trait-default "default".
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![(
                 "primary".into(),
                 Box::new(TracingInnerMock {
@@ -1284,7 +1286,7 @@ mod tests {
 
     #[test]
     fn supports_native_tools_is_true_if_any_routed_provider_supports_it() {
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
@@ -1304,7 +1306,7 @@ mod tests {
 
     #[test]
     fn mode_capabilities_follow_the_resolved_route_not_any_provider() {
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
