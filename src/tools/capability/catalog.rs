@@ -1683,6 +1683,70 @@ mod tests {
         assert_ne!(catalog.generation(), rebuilt.generation());
     }
 
+    #[test]
+    fn child_parity_rejects_same_schema_mcp_destination_change() {
+        use crate::tools::capability::child::{
+            AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest, VerifiedChildScope,
+        };
+
+        let state = Arc::new(AtomicUsize::new(0));
+        let mut sources = CatalogSources::default();
+        sources.mcp.push(McpCapabilitySpec {
+            server: "prx_server".into(),
+            tool: "read".into(),
+            state_digest: [1; 32],
+            spec: ToolSpec {
+                name: "mcp__prx_server__read".into(),
+                description: "Read remote data".into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+        });
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(MutableMcpDestinationTool(Arc::clone(&state)))];
+        let catalog = CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).unwrap();
+        let service =
+            ToolExecutionService::with_security_policy(registry, Arc::new(crate::security::SecurityPolicy::default()));
+        let child_reference = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.public_name == "mcp__prx_server__read")
+            .map(|entry| CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            })
+            .expect("MCP alias reference");
+        let allowed: BTreeSet<_> = catalog
+            .entries
+            .iter()
+            .map(|entry| CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            })
+            .collect();
+        let workspace = tempfile::tempdir().unwrap();
+        let key = DecisionKey::load_or_create(workspace.path()).unwrap();
+        let parent = CapabilityConstraints {
+            decision_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]),
+            allowed,
+            authority: AuthorityEnvelope {
+                owner: "prx_user".into(),
+                workspace: "prx_workspace".into(),
+                level: crate::security::AutonomyLevel::Supervised,
+                max_cost_cents: 100,
+                remaining_depth: 2,
+            },
+            catalog_generation: *catalog.generation(),
+            key,
+        };
+        let manifest = ChildCapabilityManifest::derive_strict_subset(&parent, &[child_reference]).unwrap();
+        let scope = VerifiedChildScope::new(manifest, &parent).unwrap();
+
+        assert!(catalog.check_child_parity(&service, &scope).is_ok());
+        state.store(1, Ordering::SeqCst);
+        assert!(catalog.check_child_parity(&service, &scope).is_err());
+    }
+
     struct MutableSchemaTool(Arc<AtomicUsize>);
 
     #[async_trait]
