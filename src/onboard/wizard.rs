@@ -1529,6 +1529,54 @@ fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, Str
         .collect()
 }
 
+#[derive(Debug)]
+enum WizardModelFetchStatus {
+    Fetched { fetched_count: usize, shown_count: usize },
+    Empty,
+    Failed { error: String, stale_age_secs: Option<u64> },
+}
+
+fn apply_wizard_model_fetch(
+    workspace_dir: &Path,
+    provider_name: &str,
+    live_options: &mut Option<Vec<(String, String)>>,
+    result: Result<Vec<DiscoveredModel>>,
+) -> Result<WizardModelFetchStatus> {
+    match result {
+        Ok(live_models) if !live_models.is_empty() => {
+            cache_live_models_for_provider(workspace_dir, provider_name, &live_models)?;
+            let live_model_ids = discovery::chat_model_ids(&live_models);
+            let fetched_count = live_model_ids.len();
+            let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
+            *live_options = Some(build_model_options(
+                live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
+                "live",
+            ));
+            Ok(WizardModelFetchStatus::Fetched {
+                fetched_count,
+                shown_count,
+            })
+        }
+        Ok(_) => Ok(WizardModelFetchStatus::Empty),
+        Err(error) => {
+            let mut stale_age_secs = None;
+            if live_options.is_none()
+                && let Some(stale) = load_any_cached_models_for_provider(workspace_dir, provider_name)?
+            {
+                stale_age_secs = Some(stale.age_secs);
+                *live_options = Some(build_model_options(
+                    stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
+                    "stale-cache",
+                ));
+            }
+            Ok(WizardModelFetchStatus::Failed {
+                error: error.to_string(),
+                stale_age_secs,
+            })
+        }
+    }
+}
+
 fn print_model_preview(models: &[String]) {
     for model in models.iter().take(MODEL_PREVIEW_LIMIT) {
         println!("  {} {model}", style("-"));
@@ -2239,51 +2287,33 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider_off_runtime(
+                let fetch = fetch_live_models_for_provider_off_runtime(
                     provider_name.to_string(),
                     api_key.clone(),
                     provider_api_url.clone(),
                 )
-                .await
-                {
-                    Ok(live_models) if !live_models.is_empty() => {
-                        cache_live_models_for_provider(workspace_dir, provider_name, &live_models)?;
-                        let live_model_ids = discovery::chat_model_ids(&live_models);
-
-                        let fetched_count = live_model_ids.len();
-                        let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
-                        let shown_models: Vec<String> =
-                            live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect();
-
+                .await;
+                match apply_wizard_model_fetch(workspace_dir, provider_name, &mut live_options, fetch)? {
+                    WizardModelFetchStatus::Fetched {
+                        fetched_count,
+                        shown_count,
+                    } => {
                         if shown_count < fetched_count {
                             print_bullet(&format!("Fetched {fetched_count} models. Showing first {shown_count}."));
                         } else {
                             print_bullet(&format!("Fetched {shown_count} live models."));
                         }
-
-                        live_options = Some(build_model_options(shown_models, "live"));
                     }
-                    Ok(_) => {
+                    WizardModelFetchStatus::Empty => {
                         print_bullet("Provider returned no models; using curated list.");
                     }
-                    Err(error) => {
+                    WizardModelFetchStatus::Failed { error, stale_age_secs } => {
                         print_bullet(&format!(
                             "Live fetch failed ({}); using cached/curated list.",
-                            style(error.to_string()).yellow()
+                            style(error).yellow()
                         ));
-
-                        if live_options.is_none() {
-                            if let Some(stale) = load_any_cached_models_for_provider(workspace_dir, provider_name)? {
-                                print_bullet(&format!(
-                                    "Loaded stale cache from {} ago.",
-                                    humanize_age(stale.age_secs)
-                                ));
-
-                                live_options = Some(build_model_options(
-                                    stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
-                                    "stale-cache",
-                                ));
-                            }
+                        if let Some(age_secs) = stale_age_secs {
+                            print_bullet(&format!("Loaded stale cache from {} ago.", humanize_age(age_secs)));
                         }
                     }
                 }
@@ -6157,7 +6187,7 @@ mod tests {
     /// A failing discovery surfaces a typed, contextual error and leaves the
     /// runtime healthy, so the wizard can report it and fall back to cache.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn onboard_model_discovery_failure_falls_back_to_cache() {
+    async fn onboard_model_discovery_failure_runs_wizard_cache_fallback() {
         let workspace = TempDir::new().unwrap();
         let (addr, server) = spawn_canned_discovery_endpoint(
             "HTTP/1.1 500 Internal Server Error",
@@ -6165,31 +6195,40 @@ mod tests {
         );
         let endpoint = format!("http://{addr}/v1/models");
 
-        let error = fetch_live_models_for_provider_off_runtime(
+        let fetch = fetch_live_models_for_provider_off_runtime(
             "compatible".to_string(),
             "prx_test_key".to_string(),
             Some(endpoint.clone()),
         )
-        .await
-        .expect_err("test: a 500 response must surface as an error, not an empty model list");
+        .await;
 
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(&format!("model fetch failed: GET {endpoint}")),
-            "discovery failure must stay reportable, got: {rendered}"
-        );
-
-        // The wizard falls back to whatever the cache holds.
         cache_live_models_for_provider(
             workspace.path(),
             "compatible",
             &id_only(&["prx-model-cached".to_string()]),
         )
         .unwrap();
-        let cached = load_any_cached_models_for_provider(workspace.path(), "compatible")
-            .unwrap()
-            .expect("test: cached models must remain available after a failed discovery");
-        assert_eq!(cached.models, vec!["prx-model-cached".to_string()]);
+        let mut live_options = None;
+        let status = apply_wizard_model_fetch(workspace.path(), "compatible", &mut live_options, fetch).unwrap();
+        let WizardModelFetchStatus::Failed { error, stale_age_secs } = status else {
+            panic!("test: a failed fetch must take the wizard fallback branch")
+        };
+        assert!(
+            error.contains(&format!("model fetch failed: GET {endpoint}")),
+            "discovery failure must stay reportable, got: {error}"
+        );
+        assert!(
+            stale_age_secs.is_some(),
+            "the wizard must report loading its stale cache"
+        );
+        assert_eq!(
+            live_options,
+            Some(vec![(
+                "prx-model-cached".to_string(),
+                "prx-model-cached (stale-cache)".to_string()
+            )]),
+            "the wizard's model-source selector must receive stale-cache options"
+        );
 
         // The property the panic used to destroy: the runtime still works.
         tokio::task::yield_now().await;
