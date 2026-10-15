@@ -1,15 +1,17 @@
 //! The `Memory` trait implementation for `PostgresMemory`.
 use super::rows::chat_profile_from_pg_row;
 use super::{PG_DIALECT, POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP, PostgresMemory, scope_params_to_strings};
-use crate::memory::principal::{ChatType, MemoryWriteContext, classify_memory};
-use crate::memory::traits::{
-    ChatProfile, CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,
-    DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
-    MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata,
-    MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
-    validate_memory_write_target,
+use crate::memory::{
+    principal::{ChatType, MemoryWriteContext, classify_memory},
+    traits::{
+        ChatProfile, CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,
+        DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
+        MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryReadMode,
+        MemoryStoreMetadata, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery,
+        SharedContextQuery, validate_memory_write_target,
+    },
+    vector,
 };
-use crate::memory::vector;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;

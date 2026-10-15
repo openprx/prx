@@ -1,7 +1,6 @@
 //! Embedding cache lookups and pgvector literal helpers.
 use super::PostgresMemory;
-use crate::memory::traits::MemoryCategory;
-use crate::memory::vector;
+use crate::memory::{traits::MemoryCategory, vector};
 use anyhow::{Context, Result};
 use chrono::Utc;
 
