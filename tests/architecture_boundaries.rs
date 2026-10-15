@@ -9356,7 +9356,7 @@ const CAUSAL_READ_ONLY_METHODS: &[&str] = &[
 
 /// The typed sections of `[causal_tree]`; a literal of one outside the
 /// writers builds a policy nobody reviewed.
-const CAUSAL_CONFIG_TYPES: [&str; 10] = [
+const CAUSAL_CONFIG_TYPES: [&str; 9] = [
     "CausalTreeConfig",
     "CausalPolicy",
     "DecisionBackendConfig",
@@ -9366,7 +9366,6 @@ const CAUSAL_CONFIG_TYPES: [&str; 10] = [
     "WeightOverrides",
     "DecisionStoreConfig",
     "EvaluationConfig",
-    "CausalObservabilityConfig",
 ];
 
 /// CDP-04 (SP-CDP-C V8.05 `runtime_never_rewrites_thresholds`, CDP 15 "no

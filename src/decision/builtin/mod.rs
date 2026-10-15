@@ -343,14 +343,12 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             } else {
                 0.0
             };
-            let evidence = sigmoid(state.fresh_artifacts as f64 + state.successful_lookups as f64 + decisive - 1.0);
-            if plain {
-                // Explicit floor: never below the plain-turn value, whatever the
-                // logistic rounds to.
-                evidence.max(weights::PLAIN_TURN_EVIDENCE)
-            } else {
-                evidence
+            if plain && state.fresh_artifacts == 0 && state.successful_lookups == 0 {
+                // Explicit rule: a plain turn without gathered evidence reports
+                // the named plain-turn value instead of an empty logistic sum.
+                return weights::PLAIN_TURN_EVIDENCE;
             }
+            sigmoid(state.fresh_artifacts as f64 + state.successful_lookups as f64 + decisive - 1.0)
         }
         Meaning::Global(GlobalQuestion::NeedsFreshState) => {
             sigmoid(1.5_f64.mul_add(state.stale_artifacts as f64, -(state.fresh_artifacts as f64)) - 0.5)
