@@ -13,7 +13,35 @@ use crate::decision::outbound::OutboundSecrets;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
 
-async fn decide(mcp: bool, with_call_fingerprint: bool) -> anyhow::Result<EngineDecision> {
+#[derive(Clone, Copy)]
+struct Scenario {
+    mcp: bool,
+    fingerprint: bool,
+    exact: bool,
+    approval_channel: bool,
+    mode: crate::causal_tree::state::SideEffectMode,
+}
+
+impl Scenario {
+    const fn mcp(fingerprint: bool) -> Self {
+        Self {
+            mcp: true,
+            fingerprint,
+            exact: true,
+            approval_channel: true,
+            mode: crate::causal_tree::state::SideEffectMode::ApprovalRequired,
+        }
+    }
+}
+
+async fn decide(scenario: Scenario) -> anyhow::Result<(EngineDecision, CandidateId)> {
+    let Scenario {
+        mcp,
+        fingerprint: with_call_fingerprint,
+        exact,
+        approval_channel,
+        mode,
+    } = scenario;
     let key = fixtures::key();
     let mut security = SecurityPolicy::default();
     security.autonomy = crate::security::AutonomyLevel::Supervised;
@@ -47,10 +75,12 @@ async fn decide(mcp: bool, with_call_fingerprint: bool) -> anyhow::Result<Engine
         .entries()
         .iter()
         .find(|entry| entry.public_name.contains("write"))
-        .ok_or_else(|| anyhow::anyhow!("missing file_write"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing write capability"))?;
     let mut state = fixtures::state(
         &key,
-        if mcp {
+        if mcp && !exact {
+            "please do something remotely"
+        } else if mcp {
             "please call mcp__prx_server__write now"
         } else {
             "please run file_write now"
@@ -60,7 +90,8 @@ async fn decide(mcp: bool, with_call_fingerprint: bool) -> anyhow::Result<Engine
     trusted.catalog_generation = *catalog.generation();
     trusted.channel = None;
     trusted.owner_id = Some(Arc::from("owner-1"));
-    trusted.side_effect_mode = crate::causal_tree::state::SideEffectMode::ApprovalRequired;
+    trusted.side_effect_mode = mode;
+    trusted.delivery.approval_channel = approval_channel;
     state.trusted = TrustedState::from_runtime(trusted);
     let estimate = (
         crate::causal_tree::branch::CostEstimate {
@@ -80,13 +111,13 @@ async fn decide(mcp: bool, with_call_fingerprint: bool) -> anyhow::Result<Engine
         },
         estimate,
     );
-    let exact = CandidateId::new(
+    let exact_id = CandidateId::new(
         CausalActionKind::UseTool,
         entry.family,
         Some(Ns8::of(&key, &entry.namespace)),
     );
     let calls = if with_call_fingerprint {
-        BTreeMap::from([(exact, [7; 32])])
+        BTreeMap::from([(exact_id.clone(), [7; 32])])
     } else {
         BTreeMap::new()
     };
@@ -144,20 +175,81 @@ async fn decide(mcp: bool, with_call_fingerprint: bool) -> anyhow::Result<Engine
         inject_builtin_failure: false,
         after_prediction_pause: None,
     };
-    Ok(CausalDecisionEngine::decide_once(&inputs).await?)
+    Ok((CausalDecisionEngine::decide_once(&inputs).await?, exact_id))
+}
+
+fn is_terminal_abstain(selection: &Selection) -> bool {
+    matches!(
+        selection,
+        Selection::Abstain {
+            action: CausalActionKind::Refuse | CausalActionKind::Clarify,
+            ..
+        }
+    )
+}
+
+fn is_answer(selection: &Selection) -> bool {
+    matches!(selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer)
 }
 
 /// Finding 66: an exactly named approval-required tool whose approval scope is
 /// available (`request_approval-mcp` is a passed terminal) asks for approval
-/// instead of answering.
+/// instead of answering, for exactly that tool.
 #[tokio::test]
 async fn exact_approval_required_tool_requests_approval_instead_of_answering() -> anyhow::Result<()> {
-    let decision = decide(true, true).await?;
+    let (decision, exact) = decide(Scenario::mcp(true)).await?;
     assert!(
-        matches!(decision.selection, Selection::RequestApproval { .. }),
+        matches!(&decision.selection, Selection::RequestApproval { pending_candidate_id, .. }
+            if *pending_candidate_id == exact),
         "selection={:?}",
         decision.selection
     );
+    Ok(())
+}
+
+/// Pins the accepted decision: without a call fingerprint no approval scope
+/// exists (an argumentless turn mints none), so the ordinary answer stands.
+#[tokio::test]
+async fn exact_mention_without_call_fingerprint_still_answers() -> anyhow::Result<()> {
+    let (decision, _) = decide(Scenario::mcp(false)).await?;
+    assert!(is_answer(&decision.selection), "selection={:?}", decision.selection);
+    Ok(())
+}
+
+/// A fingerprint for a tool the turn did not name never turns an answer into
+/// an approval request.
+#[tokio::test]
+async fn approval_only_tool_that_is_not_named_still_answers() -> anyhow::Result<()> {
+    let (decision, _) = decide(Scenario {
+        exact: false,
+        ..Scenario::mcp(true)
+    })
+    .await?;
+    assert!(is_answer(&decision.selection), "selection={:?}", decision.selection);
+    Ok(())
+}
+
+/// No approval channel, or a read-only turn that denies the write, offers no
+/// approval request.
+#[tokio::test]
+async fn unavailable_or_denied_approval_yields_no_request() -> anyhow::Result<()> {
+    for scenario in [
+        Scenario {
+            approval_channel: false,
+            ..Scenario::mcp(true)
+        },
+        Scenario {
+            mode: crate::causal_tree::state::SideEffectMode::ReadOnly,
+            ..Scenario::mcp(true)
+        },
+    ] {
+        let (decision, _) = decide(scenario).await?;
+        assert!(
+            !matches!(decision.selection, Selection::RequestApproval { .. }),
+            "selection={:?}",
+            decision.selection
+        );
+    }
     Ok(())
 }
 
@@ -165,15 +257,14 @@ async fn exact_approval_required_tool_requests_approval_instead_of_answering() -
 #[tokio::test]
 async fn exact_file_write_stays_on_the_approval_deferred_terminal_path() -> anyhow::Result<()> {
     for fingerprint in [false, true] {
-        let decision = decide(false, fingerprint).await?;
+        let (decision, _) = decide(Scenario {
+            mcp: false,
+            fingerprint,
+            ..Scenario::mcp(true)
+        })
+        .await?;
         assert!(
-            matches!(
-                decision.selection,
-                Selection::Abstain {
-                    action: CausalActionKind::Refuse | CausalActionKind::Clarify,
-                    ..
-                }
-            ),
+            is_terminal_abstain(&decision.selection),
             "selection={:?}",
             decision.selection
         );

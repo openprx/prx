@@ -266,7 +266,7 @@ impl CausalSelector {
         }
         if passed.is_empty() || working_count == 0 {
             return Ok(
-                if let Some(approval) = available_approval(candidates, approval_scopes, pre_commit) {
+                if let Some(approval) = available_approval(candidates, approval_scopes, pre_commit, None) {
                     approval
                 } else {
                     terminal_abstain(candidates, pre_commit, context, "all_gated")?
@@ -288,11 +288,12 @@ impl CausalSelector {
         };
         // An exactly named capability that needs approval, with an available
         // verified approval scope, asks for approval; a plain Answer must not
-        // silently replace the action the operator named.
+        // silently replace the action the operator named. Intent comes from the
+        // exact mention plus the bound call fingerprint (a scope exists only
+        // for a fingerprinted call), not from the prediction, so this runs
+        // before the choice_outside_legal_set / Clarify routing below.
         if top.action() == CausalActionKind::Answer
-            && let Some(approval) = available_approval(candidates, approval_scopes, pre_commit)
-            && matches!(&approval, Selection::RequestApproval { pending_candidate_id, .. }
-                if exact_mentions.contains(pending_candidate_id))
+            && let Some(approval) = available_approval(candidates, approval_scopes, pre_commit, Some(exact_mentions))
         {
             return Ok(approval);
         }
@@ -467,6 +468,7 @@ fn available_approval(
     candidates: &[CausalCandidate],
     scopes: &BTreeMap<CandidateId, Vec<PendingApproval>>,
     gates: &GateReport,
+    only_exact: Option<&BTreeSet<CandidateId>>,
 ) -> Option<Selection> {
     candidates
         .iter()
@@ -480,7 +482,9 @@ fn available_approval(
                 .into_iter()
                 .flatten()
                 .filter(move |pending| {
-                    pending.candidate.target() == terminal.target() && approval_verified(pending, gates)
+                    pending.candidate.target() == terminal.target()
+                        && approval_verified(pending, gates)
+                        && only_exact.is_none_or(|exact| exact.contains(pending.candidate.candidate_id()))
                 })
                 .map(move |pending| approval_selection(terminal.candidate_id(), pending))
         })
