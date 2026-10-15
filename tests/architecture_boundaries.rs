@@ -187,6 +187,28 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tunnel/tailscale.rs::start::.spawn()?;",
 ];
 
+/// The `.rs` files directly under `src/memory/sqlite/` that make up the split
+/// backend (everything but the tests directory). Both lists are compared with
+/// the directory, so a new file must be placed in one of them on purpose.
+const SQLITE_BACKEND_FILES: &[&str] = &[
+    "approval_grants.rs",
+    "documents.rs",
+    "drafts.rs",
+    "events.rs",
+    "evolution.rs",
+    "fixture_readback.rs",
+    "memory_impl.rs",
+    "mirror.rs",
+    "mod.rs",
+    "recall.rs",
+    "rows.rs",
+    "schema.rs",
+];
+
+/// Older child modules that were never part of the exemption for the
+/// repository root and stay scanned like any other file.
+const SQLITE_SEPARATE_MODULES: &[&str] = &["ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
     // is owned by IncidentStore, and is intentionally separate from message/memory events.
@@ -345,11 +367,17 @@ fn assert_inventory(boundary: &str, actual: Vec<String>, expected: &[&str]) {
 fn brain_db_is_not_opened_outside_the_sqlite_repository() {
     let mut actual = Vec::new();
     let mut sqlite_repository_files = 0usize;
+    let mut sqlite_directory_files = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if relative.starts_with("src/memory/sqlite/") {
-            sqlite_repository_files += 1;
-            continue;
+        if let Some(rest) = relative.strip_prefix("src/memory/sqlite/") {
+            if !rest.contains('/') {
+                sqlite_directory_files.push(rest.to_string());
+            }
+            if rest.starts_with("tests/") || SQLITE_BACKEND_FILES.contains(&rest) {
+                sqlite_repository_files += 1;
+                continue;
+            }
         }
         let source = read_source(&path);
         if !source.contains("brain.db") {
@@ -369,6 +397,18 @@ fn brain_db_is_not_opened_outside_the_sqlite_repository() {
     assert!(
         sqlite_repository_files > 0,
         "the sqlite repository exemption matched no files under src/memory/sqlite/; the guard would be blind"
+    );
+    sqlite_directory_files.sort();
+    let mut expected_directory_files = SQLITE_BACKEND_FILES
+        .iter()
+        .chain(SQLITE_SEPARATE_MODULES)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    expected_directory_files.sort();
+    assert_eq!(
+        sqlite_directory_files, expected_directory_files,
+        "the files directly under src/memory/sqlite/ changed; list each new file in SQLITE_BACKEND_FILES \
+         (exempt, and read by the config-generation check) or SQLITE_SEPARATE_MODULES (scanned)"
     );
     assert_inventory(
         "direct brain.db opens outside src/memory/sqlite/",
@@ -645,20 +685,38 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     // scanner that needs its own planted-violation probe). `include_str!`
     // fails the build if one of them moves, and a column that moves to a file
     // missing from this list fails the check below, so neither can go blind.
-    let sqlite_source = [
-        include_str!("../src/memory/sqlite/mod.rs"),
-        include_str!("../src/memory/sqlite/approval_grants.rs"),
-        include_str!("../src/memory/sqlite/documents.rs"),
-        include_str!("../src/memory/sqlite/drafts.rs"),
-        include_str!("../src/memory/sqlite/events.rs"),
-        include_str!("../src/memory/sqlite/evolution.rs"),
-        include_str!("../src/memory/sqlite/memory_impl.rs"),
-        include_str!("../src/memory/sqlite/mirror.rs"),
-        include_str!("../src/memory/sqlite/recall.rs"),
-        include_str!("../src/memory/sqlite/rows.rs"),
-        include_str!("../src/memory/sqlite/schema.rs"),
-    ]
-    .join("\n");
+    let sqlite_sources = [
+        ("mod.rs", include_str!("../src/memory/sqlite/mod.rs")),
+        (
+            "approval_grants.rs",
+            include_str!("../src/memory/sqlite/approval_grants.rs"),
+        ),
+        ("documents.rs", include_str!("../src/memory/sqlite/documents.rs")),
+        ("drafts.rs", include_str!("../src/memory/sqlite/drafts.rs")),
+        ("events.rs", include_str!("../src/memory/sqlite/events.rs")),
+        ("evolution.rs", include_str!("../src/memory/sqlite/evolution.rs")),
+        ("memory_impl.rs", include_str!("../src/memory/sqlite/memory_impl.rs")),
+        ("mirror.rs", include_str!("../src/memory/sqlite/mirror.rs")),
+        ("recall.rs", include_str!("../src/memory/sqlite/recall.rs")),
+        ("rows.rs", include_str!("../src/memory/sqlite/rows.rs")),
+        ("schema.rs", include_str!("../src/memory/sqlite/schema.rs")),
+    ];
+    // Every backend file except `fixture_readback.rs` (test-only observations)
+    // must be in the list above.
+    let mut listed = sqlite_sources.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    listed.push("fixture_readback.rs");
+    listed.sort_unstable();
+    let mut backend = SQLITE_BACKEND_FILES.to_vec();
+    backend.sort_unstable();
+    assert_eq!(
+        listed, backend,
+        "the sqlite sources read here must be the backend files"
+    );
+    let sqlite_source = sqlite_sources
+        .iter()
+        .map(|(_, text)| *text)
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !sqlite_source.trim().is_empty(),
         "the sqlite backend source files under src/memory/sqlite/ must not be empty"

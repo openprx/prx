@@ -624,7 +624,9 @@ mod message_event_contract_tests {
             .map(|entry| entry.expect("test: read directory entry").path())
             .filter(|path| {
                 path.extension().is_some_and(|extension| extension == "rs")
-                    && path.file_name().is_some_and(|name| name != "mod.rs")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name != "mod.rs" && name != "fixture_readback.rs")
             })
             .collect();
         files.sort();
@@ -667,7 +669,7 @@ mod message_event_contract_tests {
         // method `append_message_event` only delegates to it.
         let sqlite_append = sqlite
             .split_once("async fn append_event_with_recovery")
-            .map_or("", |(_, body)| body);
+            .map_or("", |(_, body)| body.split("\n    fn ").next().unwrap_or(body));
         let postgres_append = postgres
             .split_once("async fn append_message_event")
             .map_or("", |(_, body)| body);
@@ -684,7 +686,7 @@ mod message_event_contract_tests {
             assert!(sqlite_append.contains(field), "SQLite append must carry {field}");
             assert!(postgres_append.contains(field), "Postgres append must carry {field}");
         }
-        assert!(sqlite_append.contains("let tx = conn.transaction()?"));
+        assert!(sqlite_append.contains("let tx = conn.unchecked_transaction()?"));
         assert!(postgres_append.contains("let mut tx = client.transaction()?"));
         assert!(sqlite_append.contains("tx.commit()?"));
         assert!(postgres_append.contains("tx.commit()?"));

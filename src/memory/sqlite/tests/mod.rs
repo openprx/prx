@@ -540,7 +540,10 @@ fn r9_production_source() -> String {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "rs")
+                && path.file_name().is_some_and(|name| name != "fixture_readback.rs")
+        })
         .collect();
     files.sort();
     assert!(files.len() > 1, "test: the sqlite backend source files were not found");

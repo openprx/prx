@@ -363,49 +363,6 @@ impl SqliteMemory {
         .await?
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn update_chat_profile_impl(
-        &self,
-        channel: &str,
-        chat_id: &str,
-        chat_kind: &str,
-        purpose: Option<&str>,
-        notes: Option<&str>,
-        tags: Option<&[String]>,
-        updated_by: &str,
-    ) -> anyhow::Result<ChatProfile> {
-        let pool = self.pool.clone();
-        let channel = channel.to_string();
-        let chat_id = chat_id.to_string();
-        let chat_kind = chat_kind.to_string();
-        let purpose = purpose.map(str::to_string);
-        let notes = notes.map(str::to_string);
-        let tags_json = tags.map(serde_json::to_string).transpose()?;
-        let updated_by = updated_by.to_string();
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<ChatProfile> {
-            let now = Utc::now().to_rfc3339();
-            let id = Uuid::new_v4().to_string();
-            let conn = pool.write();
-            let profile = conn.query_row(
-                "INSERT INTO chat_profiles
-                    (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, COALESCE(?7, '[]'), ?8, ?9, ?9)
-                 ON CONFLICT(channel, chat_id) DO UPDATE SET
-                    chat_kind = excluded.chat_kind,
-                    purpose = COALESCE(excluded.purpose, chat_profiles.purpose),
-                    notes = COALESCE(excluded.notes, chat_profiles.notes),
-                    tags = COALESCE(?7, chat_profiles.tags),
-                    updated_by = excluded.updated_by,
-                    updated_at = excluded.updated_at
-                 RETURNING id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at",
-                params![id, channel, chat_id, chat_kind, purpose, notes, tags_json, updated_by, now],
-                Self::chat_profile_from_row,
-            )?;
-            Ok(profile)
-        })
-        .await?
-    }
-
     pub(super) async fn get_chat_profile_impl(
         &self,
         channel: &str,
@@ -427,79 +384,6 @@ impl SqliteMemory {
                 )
                 .optional()?;
             Ok(profile)
-        })
-        .await?
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn append_conversation_turn_impl(
-        &self,
-        session_key: &str,
-        channel: &str,
-        sender: &str,
-        role: &str,
-        content: &str,
-        timestamp: Option<&str>,
-        message_id: Option<&str>,
-        owner_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let pool = self.pool.clone();
-        let session_key = session_key.to_string();
-        let channel = channel.to_string();
-        let sender = sender.to_string();
-        let role = role.to_string();
-        let content = content.to_string();
-        let timestamp = Self::normalize_conversation_timestamp(timestamp);
-        let message_id = message_id.map(str::to_string);
-        let owner_id = owner_id
-            .map(str::to_string)
-            .or_else(|| Some(format!("legacy:{session_key}")));
-        let preview = Self::conversation_preview(&content);
-
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = pool.write();
-            let tx = conn.unchecked_transaction()?;
-            tx.execute(
-                "INSERT INTO sessions (
-                    session_key,
-                    channel,
-                    sender,
-                    owner_id,
-                    created_at,
-                    updated_at,
-                    message_count,
-                    last_message_preview
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)
-                 ON CONFLICT(session_key) DO UPDATE SET
-                    channel = excluded.channel,
-                    sender = excluded.sender,
-                    owner_id = COALESCE(excluded.owner_id, sessions.owner_id),
-                    updated_at = excluded.updated_at,
-                    message_count = COALESCE(sessions.message_count, 0) + 1,
-                    last_message_preview = excluded.last_message_preview",
-                params![
-                    &session_key,
-                    &channel,
-                    &sender,
-                    owner_id.as_deref(),
-                    &timestamp,
-                    &preview
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO conversation_turns (session_key, owner_id, role, content, timestamp, message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    &session_key,
-                    owner_id.as_deref(),
-                    &role,
-                    &content,
-                    &timestamp,
-                    message_id.as_deref()
-                ],
-            )?;
-            tx.commit()?;
-            Ok(())
         })
         .await?
     }
