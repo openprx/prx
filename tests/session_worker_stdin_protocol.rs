@@ -377,6 +377,13 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     assert!(
         requests
             .iter()
+            .filter(|request| request.marker == "PRX-ROUTE-CHILD")
+            .all(|request| request.body.contains("probe-model")),
+        "route child request used the wrong model"
+    );
+    assert!(
+        requests
+            .iter()
             .all(|request| !request.head.contains("PRX-WORKER-ROOT-KEY"))
     );
     assert!(
@@ -384,6 +391,13 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
             .iter()
             .filter(|request| request.marker == "PRX-AGENT-CHILD")
             .all(|request| request.head.contains("PRX-WORKER-AGENT-KEY"))
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.marker == "PRX-AGENT-CHILD")
+            .all(|request| request.body.contains("agent-model")),
+        "named-agent child request used the wrong model"
     );
     assert!(agent_requests > served_requests);
 }

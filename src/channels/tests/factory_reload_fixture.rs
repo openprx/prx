@@ -210,6 +210,8 @@ struct Endpoint {
     server: ChannelProbeServer,
     calls: Arc<Mutex<Vec<usize>>>,
     invalid: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 impl Endpoint {
     async fn start(endpoint_b: bool, memory: Arc<SelectedMemory>) -> std::io::Result<Self> {
@@ -218,12 +220,18 @@ impl Endpoint {
         let url = format!("http://{}/v1", listener.local_addr()?);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let invalid = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         let captured = Arc::clone(&calls);
         let bad = Arc::clone(&invalid);
+        let notified = Arc::clone(&entered);
+        let barrier = Arc::clone(&release);
         let handler = axum::routing::post(
             move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
                 let captured = Arc::clone(&captured);
                 let bad = Arc::clone(&bad);
+                let notified = Arc::clone(&notified);
+                let barrier = Arc::clone(&barrier);
                 let memory = Arc::clone(&memory);
                 async move {
                     let phase = KEYS.iter().position(|key| {
@@ -252,6 +260,11 @@ impl Endpoint {
                         }
                         seen.push(phase);
                     }
+                    if phase == 0 {
+                        notified.notify_one();
+                        let permit = barrier.acquire().await.expect("owned response barrier");
+                        permit.forget();
+                    }
                     axum::Json(serde_json::json!({"choices":[{"index":0,"message":{"role":"assistant","content":format!("prx-factory-generation-{phase}")},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})).into_response()
                 }
             },
@@ -273,9 +286,12 @@ impl Endpoint {
             },
             calls,
             invalid,
+            entered,
+            release,
         })
     }
     async fn close(&mut self) -> anyhow::Result<()> {
+        self.release.add_permits(8);
         self.server.stop.cancel();
         if let Some(mut task) = self.server.task.take() {
             match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
@@ -294,6 +310,12 @@ impl Endpoint {
             }
         }
         Ok(())
+    }
+}
+struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.add_permits(8);
     }
 }
 
@@ -498,10 +520,41 @@ pub(super) async fn run() {
             committed: Arc::clone(&committed),
         });
         config.register_participant(&participant);
-        run_owned_channel_probe(initial_ctx, message(0), CancellationToken::new()).await;
-        assert_eq!(*a.calls.lock(), vec![0]); assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
-        assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G0 turn must not retrieve memory");
-        let g1 = reload(&config, KEYS[1], &a.url, &["api_key"]);
+        let release = ReleaseOnDrop(Arc::clone(&a.release));
+        let control = std::panic::AssertUnwindSafe(async {
+            let _release = release;
+            tokio::time::timeout(Duration::from_secs(20), a.entered.notified())
+                .await
+                .expect("real G0 serving request without retrieval");
+            assert_eq!(*a.calls.lock(), vec![0]);
+            assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
+            assert_eq!(
+                memory.selected.load(Ordering::SeqCst),
+                0,
+                "plain G0 turn must not retrieve memory before the in-flight reload"
+            );
+            reload(&config, KEYS[1], &a.url, &["api_key"])
+        })
+        .catch_unwind();
+        let work = std::panic::AssertUnwindSafe(run_owned_channel_probe(
+            initial_ctx,
+            message(0),
+            CancellationToken::new(),
+        ))
+        .catch_unwind();
+        let (first, reloaded) = tokio::join!(work, control);
+        if let Err(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
+        let g1 = match reloaded {
+            Ok(generation) => generation,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert_eq!(
+            memory.selected.load(Ordering::SeqCst),
+            0,
+            "plain G0 turn must finish without memory retrieval"
+        );
         let recorded: Arc<dyn Memory> = recording.clone();
         run_owned_channel_probe(context(&tmp, Arc::clone(&config), Arc::clone(&recorded), channel.clone(), Arc::clone(&cache), Arc::clone(&histories)), message(1), CancellationToken::new()).await;
         assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G1 turn must not retrieve memory");
