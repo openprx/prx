@@ -46,6 +46,8 @@ struct Discovered {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
+    #[serde(default)]
+    release_revision: Option<String>,
     curated: Vec<Curated>,
     discovered: Vec<Discovered>,
     routes: Vec<RouteTarget>,
@@ -88,6 +90,7 @@ impl CatalogView {
     }
     fn process_payload(&self) -> anyhow::Result<String> {
         let snapshot = Snapshot {
+            release_revision: self.release_revision().map(str::to_owned),
             curated: self
                 .curated
                 .iter()
@@ -114,7 +117,7 @@ impl CatalogView {
                     features: item.features.clone(),
                     dialects: item.dialects,
                     context_window: item.context_window,
-                    source: item.source,
+                    source: item.source.clone(),
                 })
                 .collect(),
             routes: self.routes.clone(),
@@ -124,6 +127,17 @@ impl CatalogView {
 
     fn decode_process_payload(payload: &str) -> anyhow::Result<Arc<Self>> {
         let snapshot: Snapshot = serde_json::from_str(payload)?;
+        let (release, release_error) = if let Some(parent_revision) = snapshot.release_revision.as_deref() {
+            let embedded = super::ReleaseCatalog::embedded()
+                .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?;
+            anyhow::ensure!(
+                embedded.revision == parent_revision,
+                "child model catalog revision does not match its parent"
+            );
+            (Some(embedded), None)
+        } else {
+            (None, None)
+        };
         let curated = snapshot
             .curated
             .into_iter()
@@ -161,6 +175,8 @@ impl CatalogView {
             curated,
             discovered,
             routes: snapshot.routes,
+            release,
+            release_error,
         }))
     }
 
@@ -229,6 +245,8 @@ mod tests {
                 .map(|name| ModelDescriptor::id_only(ProviderId::of(name), "model"))
                 .collect(),
             routes: Vec::new(),
+            release: None,
+            release_error: None,
         }
     }
 
@@ -291,6 +309,26 @@ mod tests {
         assert_eq!(
             provider(configured.as_str()).expect("unknown identity stays unknown"),
             configured
+        );
+    }
+
+    #[test]
+    fn child_refuses_a_parent_catalog_revision_from_another_binary() {
+        let embedded = super::super::ReleaseCatalog::embedded().expect("test: embedded catalog validates");
+        let mut parent_release = (*embedded).clone();
+        parent_release.revision.push_str("-different-binary");
+        let parent_catalog = CatalogView::default().with_release_catalog(parent_release);
+        let key = DecisionKey::ephemeral();
+        let parent = DecisionId::new_runtime();
+        let snapshot = parent_catalog
+            .bind_process(&key, parent)
+            .expect("test: parent snapshot binds");
+
+        let error = CatalogView::restore_process(&snapshot, &key, parent)
+            .expect_err("a child running another embedded revision must refuse the parent snapshot");
+        assert_eq!(
+            error.to_string(),
+            "child model catalog revision does not match its parent"
         );
     }
 }

@@ -3,6 +3,7 @@
 This reference describes the local candidate as of 2026-10-04. Full runtime,
 browser, concurrency and independent acceptance remain pending. Consult
 [provider descriptors](providers.md#model-descriptors-and-the-resolver),
+[release model catalog](model-catalog.md),
 [configuration](configuration.md), [Console](web-console.md),
 [cost lifecycle](provider-routing-cost-lifecycle.md) and the
 [decision plane](decision-plane.md) for the related contracts.
@@ -41,6 +42,8 @@ for the candidate's scoped history, learning and replay limits.
 | `prx providers test <PROVIDER>` | Resolve configuration without a live model-list request |
 | `prx providers test <PROVIDER> --live` | Send a model-list request; not a generation |
 | `prx routes list --operation embedding` | Inspect embedding routes |
+| `prx models list [--provider <PROVIDER>]` | List live cached models when present, otherwise models from the embedded release catalog |
+| `prx models list --operation <OPERATION> [--executable]` | List the combined release, discovery and operator evidence used by the resolver |
 | `prx config status` | Revision, default resolution and unfinished history |
 | `prx config history` | Transaction records |
 | `prx config history show <ID>` | Redacted plan and recorded result |

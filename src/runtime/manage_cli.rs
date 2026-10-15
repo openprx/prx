@@ -1828,6 +1828,10 @@ mod tests {
         .await;
         result.expect("test: list");
         assert!(out.contains("openai  gpt-4o  [chat]  (operator declaration)"), "{out}");
+        assert!(
+            out.contains("openai  gpt-5.6  [chat]  (embedded release catalog)"),
+            "the real CLI listing must include release-catalog models: {out}"
+        );
         assert!(!out.contains("jev-decision-test"), "{out}");
         let (result, out) = run_cli(&["models", "show", "openrouter", "jev-decision-test"], config, "", &[]).await;
         result.expect("test: show");

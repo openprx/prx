@@ -233,7 +233,7 @@ impl FeatureSet {
         }
     }
 
-    const fn slot(&mut self, feature: Feature) -> &mut Support {
+    pub(crate) const fn slot(&mut self, feature: Feature) -> &mut Support {
         match feature {
             Feature::NativeTools => &mut self.native_tools,
             Feature::VisionInput => &mut self.vision_input,
@@ -281,7 +281,7 @@ pub struct Dialects {
 }
 
 /// Where a descriptor's evidence came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DescriptorSource {
     /// Only the adapter table: what the provider family can execute.
     AdapterStatic,
@@ -289,6 +289,8 @@ pub enum DescriptorSource {
     Curated,
     /// A provider catalog fetched at `fetched_at_unix`, with metadata.
     Discovery { fetched_at_unix: u64 },
+    /// The release-owned catalog embedded in the binary.
+    Catalog { revision: Arc<str> },
     /// A model known by id only: no metadata at all.
     LegacyIdOnly,
 }
@@ -296,11 +298,12 @@ pub enum DescriptorSource {
 impl DescriptorSource {
     /// A short phrase for messages.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::AdapterStatic => "provider adapter only",
             Self::Curated => "operator declaration",
             Self::Discovery { .. } => "discovered catalog metadata",
+            Self::Catalog { .. } => "embedded release catalog",
             Self::LegacyIdOnly => "model id only (unverified)",
         }
     }

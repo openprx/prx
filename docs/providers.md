@@ -4,12 +4,13 @@ See [provider management](provider-management.md) for inspection, configuration
 transactions, credential references and recovery.
 
 OpenPRX supports native and OpenAI-compatible LLM providers with model routing,
-ordered fallback, token refresh, streaming, tools, and usage attribution. Model
-catalogs move faster than releases, so `prx doctor models` (read-only) or
-`prx models refresh --provider <id>` (cache-updating) is the runtime source of
-truth whenever the provider exposes a model-list API.
+ordered fallback, token refresh, streaming, tools, and usage attribution. Each
+binary embeds a validated [release model catalog](model-catalog.md) for offline
+defaults, listings, and model evidence. `prx doctor models` (read-only) or
+`prx models refresh --provider <id>` (cache-updating) adds current provider
+discovery evidence when the provider exposes a model-list API.
 
-## Verified catalog baseline (2026-07-18)
+## Embedded release catalog baseline (2026-07-18)
 
 | PRX provider | Curated default / current IDs | Endpoint and authoritative source | Live discovery |
 |---|---|---|---|
@@ -31,7 +32,8 @@ truth whenever the provider exposes a model-list API.
 | `huggingface` | router model ID | `https://router.huggingface.co/v1`; [chat completion](https://huggingface.co/docs/inference-providers/en/tasks/chat-completion) | `GET /v1/models`, bearer token |
 | `compatible` | endpoint-defined | configured OpenAI-compatible `/v1` base URL | `GET <base>/models`; capabilities are endpoint/model-dependent |
 
-Curated entries are onboarding defaults, not entitlement claims. Live discovery
+Release entries are onboarding defaults and model evidence within the adapter
+ceiling; they do not grant credentials or transport support. Live discovery
 also reads the active auth profile when `api_key` is absent, and custom
 llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
 discovery. Kimi Code rejects model strings outside its three documented IDs
@@ -78,23 +80,28 @@ operations the model executes (`chat`, `embedding`, `decision_endpoint`,
 chat features it has (`native_tools`, `vision_input`, `streaming`,
 `structured_output`), and the tool dialects it speaks. Every fact is
 `supported`, `unsupported` or `unverified`; an unverified fact never counts as
-support. The evidence comes from three places, combined in this order:
+support. Evidence uses this precedence:
 
 1. **The adapter table.** What the provider family's adapter can put on the
    wire at all. It is the upper bound: nothing can make an operation without an
    adapter executable. In this release chat has an adapter everywhere,
    embeddings only for `openai`, `openrouter` and `custom:` endpoints, and the
    decision endpoint, rerank and media generation have none.
-2. **Discovered catalog metadata.** `prx models refresh` and onboarding keep
+2. **Negative discovery evidence.** `prx models refresh` and onboarding keep
    what a provider's model list says about each model (OpenRouter
    `architecture` and `supported_parameters`, Gemini
-   `supportedGenerationMethods`). Negative evidence wins: a model whose record
-   lists no `tools` is not a tool model, whatever the provider does for others.
-   A model known by id only is unverified.
+   `supportedGenerationMethods`). A provider record that rules out an
+   operation or feature cannot be lifted by local configuration.
 3. **Operator declarations** in `[[providers.models]]` (see
-   [configuration.md](configuration.md#provider-model-descriptors)) settle what
-   discovery left unverified and set the tool dialects where the adapter reads
-   them.
+   [configuration.md](configuration.md#provider-model-descriptors)) override
+   positive or absent discovery facts and release-catalog facts. They also set
+   tool dialects where the adapter reads them.
+4. **Positive discovery evidence.** A current provider record outranks the
+   release baseline when no operator declaration settles the fact.
+5. **The embedded release catalog.** `catalog/models.json` supplies the offline
+   baseline and carries its release revision in descriptor provenance. A model
+   absent from every evidence source is known by id only and remains
+   unverified.
 
 The resolver checks a selection against its descriptor before any provider is
 constructed, so a refusal sends nothing: provider, then model, then
@@ -153,9 +160,8 @@ redacted), the evidence and the fix:
 "Invocation" runs an id-only model with a warning. "Operator" is a durable
 choice the operator makes: it refuses only a model the evidence rules out
 (for example a decision-only model, or a model another provider's prefix
-names) and accepts an id-only model marked unverified, because a fresh
-install has no catalog yet; quick setup counts PRX's own curated models for
-the provider as declared, and `POST /api/config` answers with a `warning`
+names) and accepts an id-only model marked unverified. Quick setup reads PRX's
+embedded release models for the provider, and `POST /api/config` answers with a `warning`
 field. "Model-made durable" refuses an id-only model until it is declared in
 `[[providers.models]]` or confirmed by catalog metadata. `config.patch` never
 changes `[[providers.models]]` or `[[providers.tool_dialects]]`: any patch

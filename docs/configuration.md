@@ -2314,7 +2314,8 @@ fragment into `config.toml` and removes it from the fragment.
 ## Provider Model Descriptors
 
 `[[providers.models]]` declares what a provider's models can do. PRX reads it
-as operator evidence when it checks a selection (see
+as operator evidence over the embedded [release model catalog](model-catalog.md)
+when it checks a selection (see
 [providers.md](providers.md#model-descriptors-and-the-resolver)); it never
 makes an operation executable that the provider's adapter cannot run.
 
@@ -2346,8 +2347,9 @@ Every field but `provider` is optional and declares nothing when omitted.
 `operations` is the complete list: an operation not listed is unsupported for
 that model. `native_tools`, `vision_input`, `streaming` and `structured_output`
 are `true` or `false`. A model-scoped entry overrides the provider-wide entry
-field by field; a catalog record that says a feature is missing still wins
-over a declaration that says it is present.
+field by field. A declaration overrides release-catalog facts and positive
+discovery evidence. Negative discovery evidence still wins, and the provider
+adapter remains the upper bound.
 
 `tool_schema_dialect` and `tool_call_dialect` take the values of
 `[[providers.tool_dialects]]` `tool_schema` / `tool_call`, for the same

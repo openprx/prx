@@ -325,8 +325,8 @@ impl ResolvedModel {
 
     /// Where the evidence came from.
     #[must_use]
-    pub const fn source(&self) -> DescriptorSource {
-        self.source
+    pub fn source(&self) -> DescriptorSource {
+        self.source.clone()
     }
 
     /// Whether every requirement was proven.
@@ -505,7 +505,7 @@ pub fn check_descriptor(
                 model: model.to_string(),
                 operation: requirement.operation,
                 reason: reason.into_owned(),
-                evidence: descriptor.source,
+                evidence: descriptor.source.clone(),
             });
         }
         Support::Unknown => match policy {
@@ -518,7 +518,7 @@ pub fn check_descriptor(
                     provider: shown.to_string(),
                     model: model.to_string(),
                     operation: requirement.operation,
-                    evidence: descriptor.source,
+                    evidence: descriptor.source.clone(),
                 });
             }
         },
@@ -533,7 +533,7 @@ pub fn check_descriptor(
                         model: model.to_string(),
                         feature,
                         reason: reason.to_string(),
-                        evidence: descriptor.source,
+                        evidence: descriptor.source.clone(),
                     });
                 }
                 Support::Unknown => match policy {
@@ -544,7 +544,7 @@ pub fn check_descriptor(
                             provider: shown.to_string(),
                             model: model.to_string(),
                             feature,
-                            evidence: descriptor.source,
+                            evidence: descriptor.source.clone(),
                         });
                     }
                 },
