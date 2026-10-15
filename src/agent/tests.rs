@@ -39,15 +39,18 @@
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{AgentConfig, MemoryConfig, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{NoopObserver, Observer};
 use crate::providers::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall, ToolResultMessage,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilities, ToolCall,
+    ToolResultMessage,
 };
-use crate::tools::{Tool, ToolResult};
+use crate::tools::{SessionsSpawnTool, Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,6 +98,73 @@ impl Provider for ScriptedProvider {
             });
         }
         Ok(guard.remove(0))
+    }
+}
+
+/// A native-tool model used by the public embedded entrypoint proofs.
+/// Requests are retained so the test can prove the tool result returned to the
+/// same model turn rather than only observing a backend side effect.
+struct NativeScriptedProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+    requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+}
+
+impl NativeScriptedProvider {
+    fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                responses: Mutex::new(responses),
+                requests: Arc::clone(&requests),
+            },
+            requests,
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for NativeScriptedProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> Result<String> {
+        anyhow::bail!("entrypoint fixture must use the shared native tool loop")
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
+        self.requests.lock().unwrap().push(request.messages.to_vec());
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            return Ok(text_response("follow-up complete"));
+        }
+        Ok(responses.remove(0))
+    }
+}
+
+struct SilentEntryChannel;
+
+#[async_trait]
+impl Channel for SilentEntryChannel {
+    fn name(&self) -> &str {
+        "agent-entry"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> Result<()> {
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -341,6 +411,13 @@ fn fixture_runtime_config(workspace: &std::path::Path) -> crate::config::Config 
     runtime
 }
 
+fn default_causal_runtime_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut runtime = fixture_runtime_config(workspace);
+    runtime.causal_tree = crate::causal_tree::CausalTreeConfig::default();
+    runtime.autonomy.level = crate::security::AutonomyLevel::Full;
+    runtime
+}
+
 fn build_agent_with(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -463,6 +540,281 @@ async fn turn_returns_text_when_no_tools_called() {
         assert!(!source.5.is_empty(), "expected a non-empty value");
     })
     .await;
+}
+
+/// A public embedded Agent turn must admit an explicit Delegate request under
+/// the default causal configuration, let the model call the real tool, run the
+/// configured child provider, and settle child cleanup before another turn.
+#[tokio::test]
+async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup() -> Result<()> {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let (memory, workspace) = make_sqlite_memory();
+    let child_probe = CredentialProbe::start_replying("delegate child complete").await;
+    let child_provider = child_probe.custom_provider();
+    let mut config = default_causal_runtime_config(workspace.path());
+    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    config.auth.codex_auth_json_auto_import = false;
+    config.auth.codex_auth_json_path = workspace.path().join("no-codex-auth.json");
+    config.providers.models.push(serde_json::from_value(serde_json::json!({
+        "provider": child_provider,
+        "model": PROBE_MODEL,
+        "operations": ["chat"],
+        "native_tools": false
+    }))?);
+    config.cost.prices.insert(
+        format!("{child_provider}/{PROBE_MODEL}"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let agents = HashMap::from([(
+        "worker".to_owned(),
+        crate::config::DelegateAgentConfig {
+            provider: child_provider,
+            model: PROBE_MODEL.to_owned(),
+            system_prompt: None,
+            api_key: None,
+            credential_ref: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        },
+    )]);
+    config.agents = agents.clone();
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        workspace.path(),
+    ));
+    let delegate = crate::tools::DelegateTool::new_with_options(
+        agents,
+        Arc::clone(&security),
+        crate::providers::provider_runtime_options_from_config(&config),
+    )
+    .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
+    .with_model_catalog(crate::providers::selection::catalog_for(&config))
+    .with_hint_config(&config)
+    .with_reliability(config.reliability.clone())
+    .with_multimodal_config(config.multimodal.clone())
+    .with_compaction_resolver(crate::router::CompactionResolver::new(
+        config.agent.compaction.clone(),
+        config.router.clone(),
+        config.model_routes.clone(),
+    ))
+    .with_shared_memory(Arc::clone(&memory))
+    .with_event_recording(config.memory.event_recording_config());
+    let (parent, parent_requests) = NativeScriptedProvider::new(vec![
+        tool_response(vec![ToolCall {
+            id: "delegate-call".to_owned(),
+            name: "delegate".to_owned(),
+            arguments: serde_json::json!({"agent":"worker", "prompt":"inspect the child request"}).to_string(),
+        }]),
+        text_response("delegate parent complete"),
+    ]);
+    let mut agent = Agent::builder()
+        .runtime_config(config, "ollama")
+        .provider(Box::new(parent))
+        .tools(vec![Box::new(delegate)])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .security_policy(security)
+        .build()?;
+
+    let reply = agent
+        .turn("use delegate with worker to inspect the child request")
+        .await?;
+    assert_eq!(reply, "delegate parent complete");
+    assert_eq!(
+        child_probe
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("chat/completions"))
+            .count(),
+        1,
+        "the configured Delegate child must make one real provider request"
+    );
+    assert!(
+        parent_requests.lock().unwrap().iter().any(|messages| messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("delegate child complete"))),
+        "the parent model must receive the real Delegate child result"
+    );
+    assert_eq!(
+        agent.turn("hello after delegate cleanup").await?,
+        "follow-up complete",
+        "a follow-up turn proves the prior entrypoint cleanup acknowledgement settled"
+    );
+    Ok(())
+}
+
+/// The public embedded entrypoint must publish `sessions_spawn` only through
+/// the admitted default-causal turn, execute it without a forged approval, run
+/// the sealed model-only child, and observe its natural cleanup.
+#[tokio::test]
+async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_cleanup() -> Result<()> {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let (memory, workspace) = make_sqlite_memory();
+    let child_probe = CredentialProbe::start_replying("spawn child complete").await;
+    let provider_name = child_probe.custom_provider();
+    let mut config = default_causal_runtime_config(workspace.path());
+    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    config.default_provider = Some(provider_name.clone());
+    config.default_model = Some(PROBE_MODEL.to_owned());
+    config.reliability.provider_retries = 0;
+    config.auth.codex_auth_json_auto_import = false;
+    config.auth.codex_auth_json_path = workspace.path().join("no-codex-auth.json");
+    config.providers.models.push(serde_json::from_value(serde_json::json!({
+        "provider": provider_name,
+        "model": PROBE_MODEL,
+        "operations": ["chat"],
+        "native_tools": true
+    }))?);
+    config.cost.prices.insert(
+        format!("{provider_name}/{PROBE_MODEL}"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        workspace.path(),
+    ));
+    let model_catalog = crate::providers::selection::catalog_for(&config);
+    let resolved = crate::providers::selection::check(
+        &config,
+        &provider_name,
+        PROBE_MODEL,
+        &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    let child_provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
+        &resolved,
+        &model_catalog,
+        &config.reliability,
+        &crate::providers::provider_runtime_options_from_config(&config),
+    )?);
+    let spawn = SessionsSpawnTool::new(
+        Arc::new(SilentEntryChannel),
+        child_provider,
+        &provider_name,
+        PROBE_MODEL,
+        0.0,
+        Arc::clone(&security),
+        workspace.path().to_path_buf(),
+        config.multimodal.clone(),
+        config.agent.compaction.clone(),
+        HashMap::new(),
+        None,
+        crate::providers::provider_runtime_options_from_config(&config),
+        config.sessions_spawn.clone(),
+    )
+    .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
+    .with_model_catalog(model_catalog)
+    .with_hint_config(&config)
+    .with_shared_memory(Arc::clone(&memory))
+    .with_event_recording(config.memory.event_recording_config())
+    .with_process_recovery(config.causal_tree.enabled)?;
+    let runs = spawn.active_runs_arc();
+    let child_registry = Arc::new(Vec::<Box<dyn Tool>>::new());
+    assert!(spawn.tools_handle().set(&child_registry));
+    let (parent, parent_requests) = NativeScriptedProvider::new(vec![
+        tool_response(vec![ToolCall {
+            id: "spawn-call".to_owned(),
+            name: "sessions_spawn".to_owned(),
+            arguments: serde_json::json!({
+                "action":"spawn",
+                "task":"complete the sealed child task",
+                "mode":"task"
+            })
+            .to_string(),
+        }]),
+        text_response("spawn parent complete"),
+    ]);
+    let mut agent = Agent::builder()
+        .runtime_config(config, provider_name)
+        .provider(Box::new(parent))
+        .tools(vec![Box::new(spawn)])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .security_policy(security)
+        .build()?;
+
+    let reply = agent.turn("use sessions_spawn for the sealed child task").await?;
+    assert_eq!(reply, "spawn parent complete");
+    assert!(
+        parent_requests.lock().unwrap().iter().any(|messages| messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("Sub-agent spawned"))),
+        "the parent model must receive the real sessions_spawn result"
+    );
+    let settlement = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let settled = runs.read().await.first().is_some_and(|run| {
+                matches!(run.status, crate::tools::sessions_spawn::SubAgentStatus::Completed(_))
+                    && run.task_control.as_ref().and_then(|control| control.finalization())
+                        == Some(crate::tools::sessions_spawn::TaskFinalization::Natural)
+            });
+            if settled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if settlement.is_err() {
+        let snapshot = runs.read().await;
+        panic!(
+            "the independent sessions_spawn owner did not confirm natural child cleanup: requests={:?} runs={snapshot:?}",
+            child_probe.requests()
+        );
+    }
+    assert_eq!(
+        child_probe
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("chat/completions"))
+            .count(),
+        1,
+        "the spawned child must make exactly one real provider request"
+    );
+    let runs = runs.read().await;
+    let child = runs
+        .first()
+        .expect("the real sessions_spawn tool must register its child");
+    assert!(
+        matches!(&child.status, crate::tools::sessions_spawn::SubAgentStatus::Completed(text) if text == "spawn child complete"),
+        "the registered child must reach its natural terminal result: {:?}",
+        child.status
+    );
+    assert_eq!(
+        child.task_control.as_ref().and_then(|control| control.finalization()),
+        Some(crate::tools::sessions_spawn::TaskFinalization::Natural),
+        "the independent child owner must confirm natural cleanup"
+    );
+    drop(runs);
+    assert_eq!(
+        agent.turn("hello after spawn cleanup").await?,
+        "follow-up complete",
+        "a follow-up turn proves the prior entrypoint cleanup acknowledgement settled"
+    );
+    assert!(
+        child_registry.is_empty(),
+        "the sealed child registry remains the admitted strict subset"
+    );
+    Ok(())
 }
 
 #[tokio::test]
