@@ -1,5 +1,8 @@
+#![cfg(test)]
+
 mod bundle;
 mod manifest;
+mod publish;
 mod store;
 
 use super::{BundleEntry, OwnerScope};

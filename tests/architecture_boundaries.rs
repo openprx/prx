@@ -180,6 +180,11 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // ledger; discovery closes immediately and call sessions close on reset.
     "src/tools/mcp.rs::call_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
     "src/tools/mcp.rs::discover_server_tools_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
+    // Test-only: proving the skill publication generation CAS is process-safe
+    // needs real competing processes (the test binary re-executed), and proving
+    // the lock is released when its holder dies needs a child that is SIGKILLed.
+    "src/skills/lifecycle/tests/publish.rs::a_killed_lock_holder_releases_the_lock_and_publication_continues::.spawn()",
+    "src/skills/lifecycle/tests/publish.rs::processes_racing_on_one_generation_have_exactly_one_winner::.spawn()",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",

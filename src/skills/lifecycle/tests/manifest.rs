@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{entry, md};
 use crate::skills::lifecycle::{Bundle, ManifestError, validate_manifest};
 
