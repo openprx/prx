@@ -633,10 +633,27 @@ mod message_event_contract_tests {
         );
     }
 
+    /// The PostgreSQL backend's production text: the root file plus the sibling
+    /// files that were split out of it. Listed with `include_str!`, so a file
+    /// that moves or disappears breaks the build instead of blinding the scan.
+    fn postgres_backend_source() -> String {
+        [
+            include_str!("postgres.rs"),
+            include_str!("postgres/pool.rs"),
+            include_str!("postgres/schema.rs"),
+            include_str!("postgres/access.rs"),
+            include_str!("postgres/embedding.rs"),
+            include_str!("postgres/rows.rs"),
+            include_str!("postgres/memory_impl.rs"),
+            include_str!("postgres/events.rs"),
+        ]
+        .concat()
+    }
+
     #[test]
     fn sqlite_and_postgres_append_paths_share_lineage_and_transaction_boundaries() {
         let sqlite = include_str!("sqlite.rs");
-        let postgres = include_str!("postgres.rs");
+        let postgres = postgres_backend_source();
         let sqlite_append = sqlite
             .split_once("async fn append_message_event")
             .map_or("", |(_, body)| body);
@@ -730,7 +747,7 @@ mod message_event_contract_tests {
     #[test]
     fn sqlite_and_postgres_compaction_paths_persist_ids_and_covered_range() {
         let sqlite = include_str!("sqlite.rs");
-        let postgres = include_str!("postgres.rs");
+        let postgres = postgres_backend_source();
         let sqlite_append = sqlite
             .split_once("async fn append_compaction_run")
             .map_or("", |(_, body)| body);
