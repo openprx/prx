@@ -62,6 +62,8 @@ pub enum Verification {
 pub enum ResolutionError {
     #[error("provider '{provider}' is not one PRX can construct; use a name from `prx providers` or `custom:<url>`")]
     UnknownProvider { provider: String },
+    #[error("{detail}")]
+    MalformedProvider { provider: String, detail: String },
     #[error("no model is selected for provider '{provider}'; set `default_model` or pass `--model`")]
     EmptyModel { provider: String },
     #[error(
@@ -164,7 +166,7 @@ impl ResolutionError {
     #[must_use]
     pub fn capability(&self) -> String {
         match self {
-            Self::UnknownProvider { .. } => "provider".to_string(),
+            Self::UnknownProvider { .. } | Self::MalformedProvider { .. } => "provider".to_string(),
             Self::EmptyModel { .. }
             | Self::UnresolvedHint { .. }
             | Self::UnknownRouteHint { .. }
@@ -188,6 +190,7 @@ impl ResolutionError {
     fn provider(&self) -> &str {
         match self {
             Self::UnknownProvider { provider }
+            | Self::MalformedProvider { provider, .. }
             | Self::EmptyModel { provider }
             | Self::UnresolvedHint { provider, .. }
             | Self::UnknownRouteHint { provider, .. }
@@ -439,6 +442,18 @@ pub fn resolve_model(
     let shown = crate::security::redaction::redact_provider_text(label);
     let provider = ProviderId::of(label);
     if !provider.is_resolvable() {
+        if let Some((dialect, raw_url)) = crate::providers::identity::split_byo_provider(label) {
+            if let Err(error) =
+                crate::providers::parse_custom_provider_url(raw_url, dialect.label(), dialect.format_hint())
+            {
+                return Err(ResolutionError::MalformedProvider {
+                    provider: shown.clone(),
+                    detail: format!(
+                        "{error}; provider '{shown}' is not one PRX can construct; use an http:// or https:// URL"
+                    ),
+                });
+            }
+        }
         return Err(ResolutionError::UnknownProvider { provider: shown });
     }
     let model = model.trim();

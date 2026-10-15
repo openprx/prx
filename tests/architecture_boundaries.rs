@@ -7983,11 +7983,11 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/channels/mod.rs:get_or_create_provider_for_generation:create_provider_for",
         "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
         "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
-        // Keyless construction for validation only.
-        "src/doctor/mod.rs:provider_validation_error:create_provider",
+        "src/doctor/mod.rs:provider_validation_error:create_provider_for",
         "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
         "src/runtime/child_source.rs:from_selection:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
+        "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
         "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
         "src/tools/sessions_spawn.rs:build_override_provider:create_provider_for",
         "src/tools/sessions_spawn.rs:execute_spawn_with_id:create_provider_for",
@@ -8058,12 +8058,6 @@ fn agent_loop_entries_resolve_the_model_once() {
         1,
         "resolve_agent_model_choice resolves the selection once"
     );
-    assert_eq!(
-        resolution.matches("providers::selection::check_routes(").count(),
-        0,
-        "resolve_agent_model_choice leaves per-route resolution to the typed routed factory"
-    );
-
     let providers = production_part(&read_source(&repository_root().join("src/providers/mod.rs")));
     let routed_factory = function_body(&providers, "create_routed_provider_for");
     assert_eq!(

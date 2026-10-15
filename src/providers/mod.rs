@@ -2619,6 +2619,7 @@ fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &
 }
 
 /// Factory: create the right provider from config (without custom URL)
+#[cfg(test)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
@@ -2641,6 +2642,7 @@ pub fn create_provider_with_options(
 }
 
 /// Factory: create the right provider from config with optional custom base URL
+#[cfg(test)]
 pub fn create_provider_with_url(
     name: &str,
     api_key: Option<&str>,
@@ -3423,11 +3425,12 @@ fn create_resilient_provider_from_resolved(
                 // before falling through to unrelated fallback providers.
                 if provider_name == primary_name {
                     for extra_key in extra_api_keys(reliability, api_key) {
-                        let rotated = if is_openai_codex_alias(primary_name) {
-                            create_provider_with_options(primary_name, Some(extra_key), options)
-                        } else {
-                            create_provider_with_url_and_options(primary_name, Some(extra_key).into(), api_url, options)
-                        };
+                        let rotated = create_provider_with_url_and_options(
+                            primary_name,
+                            Some(extra_key).into(),
+                            api_url,
+                            options,
+                        );
                         match rotated {
                             Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
                             Err(error) => {

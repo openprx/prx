@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use openprx::providers::create_provider;
+use openprx::config::Config;
+use openprx::providers;
 use openprx::providers::traits::{ChatMessage, StreamOptions};
 use parking_lot::Mutex;
 
@@ -129,7 +130,30 @@ async fn s5_release_p0_2_pure_perf_baseline() {
         std::env::set_var("OPENPRX_MOCK_RESPONSE", "mock8byt");
     }
 
-    let provider = create_provider("mock", None).expect("create mock provider");
+    let config = Config {
+        default_provider: Some("mock".to_string()),
+        default_model: Some("mock".to_string()),
+        ..Config::default()
+    };
+    let catalog = providers::selection::catalog_for(&config);
+    let resolved = providers::selection::check_with(
+        &config,
+        &catalog,
+        "mock",
+        "mock",
+        providers::selection::credential_for(&config, "mock"),
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )
+    .expect("resolve mock provider");
+    let provider = providers::create_provider_for(
+        &resolved,
+        &catalog,
+        &config.reliability,
+        &config.cost,
+        &providers::provider_runtime_options_from_config(&config),
+    )
+    .expect("create mock provider");
     let recorder_chunk = PerfRecorder::new();
     let recorder_turn = PerfRecorder::new();
 

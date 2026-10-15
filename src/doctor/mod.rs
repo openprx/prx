@@ -1411,7 +1411,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Provider validity
     if let Some(ref provider) = config.default_provider {
-        if let Some(reason) = provider_validation_error(provider) {
+        if let Some(reason) = provider_validation_error(
+            config,
+            provider,
+            crate::providers::selection::default_model(config),
+            crate::providers::selection::credential_for(config, provider),
+        ) {
             items.push(DiagItem::error(
                 cat,
                 format!("default provider \"{provider}\" is invalid: {reason}"),
@@ -1486,7 +1491,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Reliability: fallback providers
     for fb in &config.reliability.fallback_providers {
-        if let Some(reason) = provider_validation_error(fb) {
+        if let Some(reason) = provider_validation_error(
+            config,
+            fb,
+            crate::providers::selection::default_model(config),
+            crate::providers::selection::credential_for(config, fb),
+        ) {
             items.push(DiagItem::warn(
                 cat,
                 format!("fallback provider \"{fb}\" is invalid: {reason}"),
@@ -1596,7 +1606,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.provider) {
+        let credential = route.credential_ref.as_deref().map_or_else(
+            || {
+                if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                    crate::providers::credentials::CredentialRef::LegacyInline(
+                        crate::providers::credentials::LegacySlot::ModelRoute(route.hint.clone()),
+                    )
+                } else {
+                    crate::providers::selection::credential_for(config, &route.provider)
+                }
+            },
+            |id| crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+        );
+        if let Some(reason) = provider_validation_error(config, &route.provider, &route.model, credential) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -1689,7 +1711,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         let Some(agent) = config.agents.get(name) else {
             continue;
         };
-        if let Some(reason) = provider_validation_error(&agent.provider) {
+        let credential = agent.credential_ref.as_deref().map_or_else(
+            || {
+                if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                    crate::providers::credentials::CredentialRef::LegacyInline(
+                        crate::providers::credentials::LegacySlot::Agent(name.clone()),
+                    )
+                } else {
+                    crate::providers::selection::credential_for(config, &agent.provider)
+                }
+            },
+            |id| crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+        );
+        if let Some(reason) = provider_validation_error(config, &agent.provider, &agent.model, credential) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -1747,10 +1781,42 @@ fn active_auth_profile_credential_status(config: &Config, provider: &str) -> Aut
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match crate::providers::create_provider(name, None) {
+fn provider_validation_error(
+    config: &Config,
+    name: &str,
+    model: &str,
+    credential: crate::providers::credentials::CredentialRef,
+) -> Option<String> {
+    let catalog = crate::providers::selection::catalog_for(config);
+    let resolved = match crate::providers::selection::check_with(
+        config,
+        &catalog,
+        name,
+        model,
+        credential,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error @ crate::providers::catalog::ResolutionError::UnknownProvider { .. }) => {
+            return Some(format!("Unknown provider: {error}"));
+        }
+        Err(error) => return Some(error.to_string()),
+    };
+    let mut reliability = config.reliability.clone();
+    reliability.fallback_providers.clear();
+    reliability.api_keys.clear();
+    reliability.model_fallbacks.clear();
+    match crate::providers::create_provider_for(
+        &resolved,
+        &catalog,
+        &reliability,
+        &config.cost,
+        &crate::providers::provider_runtime_options_from_config(config),
+    ) {
         Ok(_) => None,
-        Err(err) => Some(err.to_string().lines().next().unwrap_or("invalid provider").into()),
+        Err(error) if error.to_string().contains("missing credential/api key") => None,
+        Err(error) => Some(error.to_string().lines().next().unwrap_or("invalid provider").into()),
     }
 }
 
@@ -2923,14 +2989,23 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let config = Config::default();
+        let validate = |provider: &str| {
+            provider_validation_error(
+                &config,
+                provider,
+                crate::providers::selection::default_model(&config),
+                crate::providers::selection::credential_for(&config, provider),
+            )
+        };
+        assert!(validate("openrouter").is_none());
+        assert!(validate("custom:https://example.com").is_none());
+        assert!(validate("anthropic-custom:https://example.com").is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = validate("custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown = validate("totally-fake").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown provider"));
     }
 

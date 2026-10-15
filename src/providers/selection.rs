@@ -510,38 +510,6 @@ pub fn check_default(config: &Config, policy: UnknownPolicy) -> Result<ResolvedM
     )
 }
 
-/// Resolve every `[[model_routes]]` destination for chat with its own key,
-/// so a route to a model that cannot chat is refused where the routed chain
-/// is built rather than on the first turn that routes to it.
-///
-/// # Errors
-///
-/// The first refused route, named by its hint.
-pub fn check_routes(config: &Config, catalog: &CatalogView, policy: UnknownPolicy) -> anyhow::Result<()> {
-    resolve_routes(config, catalog, policy).map(|_| ())
-}
-
-/// Resolve every configured chat route with the credential owned by that
-/// route's destination. The returned selections are ready for the typed
-/// provider factory; callers must not reconstruct their connections from the
-/// raw route fields after this point.
-///
-/// # Errors
-///
-/// The first refused route, named by its hint.
-pub fn resolve_routes(
-    config: &Config,
-    catalog: &CatalogView,
-    policy: UnknownPolicy,
-) -> anyhow::Result<Vec<(String, ResolvedModel)>> {
-    let mut resolved = Vec::with_capacity(config.model_routes.len());
-    for route in &config.model_routes {
-        let selection = resolve_route(config, catalog, route, policy)?;
-        resolved.push((route.hint.clone(), selection));
-    }
-    Ok(resolved)
-}
-
 /// Resolve one configured chat route. Routed provider construction uses this
 /// per route so one refused destination cannot disable unrelated surfaces.
 pub(crate) fn resolve_route(
@@ -697,14 +665,15 @@ mod tests {
             operations: Some(vec![ModelOperation::DecisionEndpoint]),
             ..catalog::CuratedModel::new(ProviderId::of("openrouter"), Some("vendor/decision"))
         }]);
-        let error = check_routes(&config, &catalog, UnknownPolicy::Invocation).expect_err("refused");
+        let route = config.model_routes.first().expect("test: configured route");
+        let error = resolve_route(&config, &catalog, route, UnknownPolicy::Invocation).expect_err("refused");
         let text = format!("{error:#}");
         assert!(
             text.contains("hint:judge") && text.contains("cannot be used for chat"),
             "{text}"
         );
         assert!(!text.contains("PMMC-ROUTE-KEY"), "{text}");
-        check_routes(&config, &catalog_for(&config), UnknownPolicy::Invocation).expect("an id-only route runs");
+        resolve_route(&config, &catalog_for(&config), route, UnknownPolicy::Invocation).expect("an id-only route runs");
     }
 
     /// A catalog that declares `model` of `provider` for the given
@@ -1133,7 +1102,8 @@ mod tests {
             UnknownPolicy::Invocation,
         )
         .expect_err("a route to another hint is refused");
-        check_routes(&nested, &catalog_for(&nested), UnknownPolicy::Invocation)
+        let route = nested.model_routes.first().expect("test: configured route");
+        resolve_route(&nested, &catalog_for(&nested), route, UnknownPolicy::Invocation)
             .expect_err("chat start-up refuses a route whose model is a hint");
     }
 
