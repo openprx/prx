@@ -178,8 +178,9 @@ impl SkillReadTool {
         }
     }
 
-    /// Enables per-task revision pinning for managed skills. The caller must
-    /// release the pins (`lifecycle::release_task_pins`) at the task terminal.
+    /// Enables per-task revision pinning for managed skills. Test-only until
+    /// SL03 wires it together with `lifecycle::release_task_pins` at the task
+    /// terminal; the caller must release the pins there.
     #[must_use]
     pub const fn with_task_pinning(mut self, enabled: bool) -> Self {
         self.pin_tasks = enabled;

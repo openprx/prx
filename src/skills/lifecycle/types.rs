@@ -40,6 +40,8 @@ pub enum LifecycleError {
     UnsupportedSchema { what: &'static str, found: u32 },
     #[error("the task skill pin table is full ({0} pins); new pins are refused until tasks release theirs")]
     PinTableFull(usize),
+    #[error("legacy import of skill {skill_id} ended aborted in all {attempts} attempts")]
+    ImportAttemptsExhausted { skill_id: String, attempts: u32 },
     #[error("skill name {0:?} is bound to more than one skill id")]
     AmbiguousSkillName(String),
     #[error("skill {0:?} is disabled")]

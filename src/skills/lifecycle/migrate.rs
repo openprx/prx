@@ -270,9 +270,9 @@ fn import_one(
             other => return other.map(|_| ()),
         }
     }
-    Err(LifecycleError::InvalidRecord {
-        path: store.root().to_path_buf(),
-        reason: format!("{skill_id}: {MAX_IMPORT_ATTEMPTS} import attempts ended aborted"),
+    Err(LifecycleError::ImportAttemptsExhausted {
+        skill_id: skill_id.to_string(),
+        attempts: MAX_IMPORT_ATTEMPTS,
     })
 }
 
