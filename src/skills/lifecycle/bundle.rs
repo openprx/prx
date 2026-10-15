@@ -78,6 +78,8 @@ pub enum BundleError {
     FileTooLarge { path: String },
     #[error("bundle exceeds {MAX_BUNDLE_TOTAL_BYTES} bytes in total")]
     BundleTooLarge,
+    #[error("directory {0:?} changed while it was being read")]
+    ChangedDuringRead(String),
     #[error("i/o error at {path:?}: {message}")]
     Io { path: String, message: String },
 }
@@ -269,6 +271,12 @@ pub(super) fn normalize_relative_path(path: &Path) -> Result<String, BundleError
             reason: "empty path",
         });
     }
+    if raw.nfc().collect::<String>() != raw {
+        return Err(BundleError::InvalidPath {
+            path: lossy,
+            reason: "path is not in Unicode NFC form",
+        });
+    }
     let mut names: Vec<&str> = Vec::new();
     for component in path.components() {
         match component {
@@ -352,6 +360,7 @@ fn collect_dir(
             reason: "path is too deep",
         });
     }
+    let before = dir_identity(dir, rel)?;
     let mut children: Vec<(OsString, fs::FileType)> = Vec::new();
     for item in fs::read_dir(dir).map_err(|e| io_error(dir, &e))? {
         let item = item.map_err(|e| io_error(dir, &e))?;
@@ -360,6 +369,9 @@ fn collect_dir(
         if children.len() > MAX_BUNDLE_FILES {
             return Err(BundleError::TooManyFiles);
         }
+    }
+    if dir_identity(dir, rel)? != before {
+        return Err(BundleError::ChangedDuringRead(display(rel)));
     }
     if children.is_empty() && depth > 0 {
         return Err(BundleError::EmptyDirectory(display(rel)));
@@ -385,6 +397,28 @@ fn collect_dir(
         }
     }
     Ok(())
+}
+
+/// Device and inode of a real (non-symlink) directory, `None` where the
+/// platform exposes neither. Comparing it before and after listing a directory
+/// detects the directory being swapped for a link or another directory.
+fn dir_identity(dir: &Path, rel: &Path) -> Result<Option<(u64, u64)>, BundleError> {
+    let meta = fs::symlink_metadata(dir).map_err(|e| io_error(dir, &e))?;
+    if meta.file_type().is_symlink() {
+        return Err(BundleError::Symlink(display(rel)));
+    }
+    if !meta.is_dir() {
+        return Err(BundleError::UnsupportedFileType(display(rel)));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some((meta.dev(), meta.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
 }
 
 fn read_file(path: &Path, rel: &Path, total: &mut u64) -> Result<BundleEntry, BundleError> {

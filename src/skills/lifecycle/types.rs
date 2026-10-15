@@ -38,6 +38,8 @@ pub enum LifecycleError {
     OwnerMismatch { expected: String, found: String },
     #[error("unsupported {what} schema version {found}")]
     UnsupportedSchema { what: &'static str, found: u32 },
+    #[error("revision {revision} already exists with different {field}")]
+    RevisionConflict { revision: String, field: &'static str },
     #[error("tampered or inconsistent revision at {path}: {reason}")]
     Tampered { path: PathBuf, reason: String },
     #[error("revision not found: {0}")]
@@ -302,19 +304,4 @@ impl NewRevision {
             validation_receipt_ids: Vec::new(),
         }
     }
-}
-
-/// Pointer from a skill to its active revision. Type only: publication, the
-/// generation compare-and-swap and persistence belong to SL08.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActiveSkillBinding {
-    pub schema_version: u32,
-    pub record_id: String,
-    pub owner_scope: OwnerScope,
-    pub skill_id: SkillId,
-    pub revision_id: RevisionId,
-    pub generation: u64,
-    pub enabled: bool,
-    pub created_at: DateTime<Utc>,
 }

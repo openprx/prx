@@ -83,3 +83,19 @@ fn missing_or_malformed_manifests_are_rejected() {
     .expect_err("test: bad toml");
     assert!(matches!(err, ManifestError::InvalidToml(_)), "{err}");
 }
+
+#[test]
+fn duplicate_and_overriding_frontmatter_keys_are_rejected() {
+    let dup = b"---\nname: A\nname: B\ndescription: d\n---\nbody";
+    let err = manifest_of(vec![entry("SKILL.md", dup)]).expect_err("test: duplicate name");
+    assert!(matches!(err, ManifestError::DuplicateKey { key: "name" }), "{err}");
+    let dup = b"---\nname: A\ndescription: d\ndescription: e\n---\nbody";
+    let err = manifest_of(vec![entry("SKILL.md", dup)]).expect_err("test: duplicate description");
+    assert!(
+        matches!(err, ManifestError::DuplicateKey { key: "description" }),
+        "{err}"
+    );
+    let nested = b"---\nname: A\ndescription: d\nmetadata:\n  name: Evil\n---\nbody";
+    let err = manifest_of(vec![entry("SKILL.md", nested)]).expect_err("test: nested override");
+    assert!(matches!(err, ManifestError::AmbiguousFrontmatter), "{err}");
+}

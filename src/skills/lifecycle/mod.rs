@@ -15,8 +15,7 @@ pub use bundle::{
     MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, MAX_BUNDLE_PATH_BYTES, MAX_BUNDLE_TOTAL_BYTES,
 };
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest};
-pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome};
+pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use types::{
-    ActiveSkillBinding, LifecycleError, NewRevision, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision,
-    SourceKind,
+    LifecycleError, NewRevision, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision, SourceKind,
 };

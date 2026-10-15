@@ -19,6 +19,10 @@ pub enum ManifestError {
     TooLarge { file: &'static str },
     #[error("{SKILL_MD} has no frontmatter with both name and description")]
     MissingFrontmatter,
+    #[error("{SKILL_MD} frontmatter repeats the top-level key {key:?}")]
+    DuplicateKey { key: &'static str },
+    #[error("{SKILL_MD} frontmatter is ambiguous: an indented line redefines name or description")]
+    AmbiguousFrontmatter,
     #[error("invalid manifest {field}: {reason}")]
     InvalidField { field: &'static str, reason: &'static str },
     #[error("{SKILL_TOML} is malformed: {0}")]
@@ -42,8 +46,7 @@ pub struct ManifestInfo {
 pub fn validate_manifest(bundle: &Bundle) -> Result<ManifestInfo, ManifestError> {
     let skill_md = bundle.file(SKILL_MD).ok_or(ManifestError::MissingSkillMd)?;
     let markdown = std::str::from_utf8(skill_md.bytes()).map_err(|_| ManifestError::NotUtf8 { file: SKILL_MD })?;
-    let (name, description) =
-        super::super::parse_skill_frontmatter(markdown).ok_or(ManifestError::MissingFrontmatter)?;
+    let (name, description) = strict_frontmatter(markdown)?;
     let name = checked_name(&name)?;
     let description = checked_description(&description)?;
 
@@ -56,6 +59,43 @@ pub fn validate_manifest(bundle: &Bundle) -> Result<ManifestInfo, ManifestError>
         description,
         semantic_version,
     })
+}
+
+/// Reads name and description from the top-level frontmatter keys only, and
+/// refuses frontmatter the legacy catalog loader would read differently
+/// (repeated keys, or an indented `name:` that overrides the top-level one).
+fn strict_frontmatter(markdown: &str) -> Result<(String, String), ManifestError> {
+    let legacy = super::super::parse_skill_frontmatter(markdown).ok_or(ManifestError::MissingFrontmatter)?;
+    let rest = markdown.strip_prefix("---").ok_or(ManifestError::MissingFrontmatter)?;
+    let block = rest
+        .find("\n---")
+        .and_then(|end| rest.get(..end))
+        .ok_or(ManifestError::MissingFrontmatter)?;
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    for line in block.lines() {
+        let top_level = !line.starts_with(char::is_whitespace);
+        let trimmed = line.trim();
+        let (slot, key, value) = if let Some(value) = trimmed.strip_prefix("name:") {
+            (&mut name, "name", value)
+        } else if let Some(value) = trimmed.strip_prefix("description:") {
+            (&mut description, "description", value)
+        } else {
+            continue;
+        };
+        if !top_level {
+            return Err(ManifestError::AmbiguousFrontmatter);
+        }
+        if slot.is_some() {
+            return Err(ManifestError::DuplicateKey { key });
+        }
+        *slot = Some(super::super::parse_frontmatter_scalar(value));
+    }
+    match (name, description) {
+        (Some(name), Some(description)) if (&name, &description) == (&legacy.0, &legacy.1) => Ok((name, description)),
+        (Some(_), Some(_)) => Err(ManifestError::AmbiguousFrontmatter),
+        _ => Err(ManifestError::MissingFrontmatter),
+    }
 }
 
 /// Validates SKILL.toml against the already validated SKILL.md identity and

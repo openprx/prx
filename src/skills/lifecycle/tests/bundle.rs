@@ -124,8 +124,11 @@ fn duplicate_paths_are_rejected() {
 fn case_and_normalization_collisions_are_rejected() {
     let err = error_of(vec![entry("references/A.md", b"a"), entry("references/a.md", b"b")]);
     assert!(matches!(err, BundleError::CaseCollision { .. }), "{err}");
-    let err = error_of(vec![entry("caf\u{e9}.md", b"a"), entry("cafe\u{301}.md", b"b")]);
+    let err = error_of(vec![entry("caf\u{e9}.md", b"a"), entry("CAF\u{c9}.md", b"b")]);
     assert!(matches!(err, BundleError::CaseCollision { .. }), "{err}");
+    // A decomposed (NFD) spelling is not canonical and is refused outright.
+    let err = error_of(vec![entry("cafe\u{301}.md", b"b")]);
+    assert!(matches!(err, BundleError::InvalidPath { .. }), "{err}");
 }
 
 #[test]

@@ -56,14 +56,16 @@ fn private_dir(path: &Path) {
 }
 
 fn read_err(store: &SkillLifecycleStore, id: &RevisionId) -> LifecycleError {
-    store.read_revision(&skill(), id).expect_err("test: read must fail")
+    store
+        .read_revision(&skill(), id, None)
+        .expect_err("test: read must fail")
 }
 
 #[test]
 fn written_revision_reads_back_verified() {
     let (_tmp, store) = setup();
     let (id, dir) = publish(&store, basic_entries());
-    let verified = store.read_revision(&skill(), &id).expect("test: read");
+    let verified = store.read_revision(&skill(), &id, None).expect("test: read");
     assert_eq!(verified.bundle.revision_id(), &id);
     assert_eq!(verified.revision.owner_scope, owner(OWNER_A));
     assert_eq!(verified.revision.display_name, "Deploy helper");
@@ -80,10 +82,10 @@ fn written_revision_reads_back_verified() {
 }
 
 #[test]
-fn rewriting_an_existing_revision_is_idempotent_and_never_overwrites() {
+fn rewriting_an_existing_revision_is_idempotent_only_for_identical_provenance() {
     let (_tmp, store) = setup();
     let bundle = Bundle::from_entries(basic_entries()).expect("test: bundle");
-    let mut new = NewRevision::new(skill(), SourceKind::Operator);
+    let new = NewRevision::new(skill(), SourceKind::Operator);
     let first = store.write_revision(&new, &bundle).expect("test: first write");
     assert!(first.created);
     let record = store
@@ -93,11 +95,107 @@ fn rewriting_an_existing_revision_is_idempotent_and_never_overwrites() {
         .join(first.revision.revision_id.as_str())
         .join("revision.json");
     let before = fs::read(&record).expect("test: record");
-    new.source_kind = SourceKind::Learned;
-    let second = store.write_revision(&new, &bundle).expect("test: second write");
+
+    let second = store.write_revision(&new, &bundle).expect("test: identical rewrite");
     assert!(!second.created);
     assert_eq!(second.revision, first.revision);
+    assert_eq!(second.record_digest, first.record_digest);
+
+    let mut variants = Vec::new();
+    let mut v = new.clone();
+    v.source_kind = SourceKind::Learned;
+    variants.push((v, "source_kind"));
+    let mut v = new.clone();
+    v.proposal_id = Some("p-1".to_string());
+    variants.push((v, "proposal_id"));
+    let mut v = new.clone();
+    v.review_receipt_ids = vec!["rev-1".to_string()];
+    variants.push((v, "review_receipt_ids"));
+    let mut v = new;
+    v.parent_revision_id = Some(first.revision.revision_id);
+    variants.push((v, "parent_revision_id"));
+    for (variant, field) in variants {
+        let err = store
+            .write_revision(&variant, &bundle)
+            .expect_err("test: differing provenance");
+        assert!(
+            matches!(err, LifecycleError::RevisionConflict { field: f, .. } if f == field),
+            "{field}: {err}"
+        );
+    }
     assert_eq!(fs::read(&record).expect("test: record"), before);
+}
+
+#[test]
+fn pinned_record_digest_authenticates_non_derived_fields() {
+    let (_tmp, store) = setup();
+    let bundle = Bundle::from_entries(basic_entries()).expect("test: bundle");
+    let mut new = NewRevision::new(skill(), SourceKind::Learned);
+    new.review_receipt_ids = vec!["receipt-1".to_string()];
+    let outcome = store.write_revision(&new, &bundle).expect("test: write");
+    let id = outcome.revision.revision_id.clone();
+    let digest = outcome.record_digest;
+    let ok = store
+        .read_revision(&skill(), &id, Some(&digest))
+        .expect("test: pinned read");
+    assert_eq!(ok.record_digest, digest);
+    assert_eq!(
+        crate::skills::lifecycle::record_digest(&ok.revision).expect("test: digest"),
+        digest
+    );
+
+    let path = store
+        .root()
+        .join("revisions")
+        .join(skill().as_str())
+        .join(id.as_str())
+        .join("revision.json");
+    let text = fs::read_to_string(&path).expect("test: record");
+    fs::write(&path, text.replace("receipt-1", "receipt-2")).expect("test: edit receipt");
+    // Without a pinned digest the edit is undetectable; with one it is refused.
+    store
+        .read_revision(&skill(), &id, None)
+        .expect("test: unpinned read accepts");
+    let err = store
+        .read_revision(&skill(), &id, Some(&digest))
+        .expect_err("test: pinned read must fail");
+    assert!(matches!(err, LifecycleError::Tampered { .. }), "{err}");
+}
+
+#[test]
+fn losing_the_publication_race_verifies_and_compares_the_winner() {
+    let (_tmp, store) = setup();
+    let bundle = Bundle::from_entries(basic_entries()).expect("test: bundle");
+    let info = crate::skills::lifecycle::validate_manifest(&bundle).expect("test: manifest");
+    let new = NewRevision::new(skill(), SourceKind::Operator);
+    let winner = store.write_revision(&new, &bundle).expect("test: winner");
+    let final_dir = store
+        .root()
+        .join("revisions")
+        .join(skill().as_str())
+        .join(winner.revision.revision_id.as_str());
+    let staged = || store.root().join("staging").join(uuid::Uuid::new_v4().to_string());
+
+    // The final directory exists when the rename happens: identical provenance
+    // returns the winner, differing provenance conflicts.
+    let outcome = store
+        .stage_and_publish(&new, &bundle, &info, bundle.revision_id(), &staged(), &final_dir)
+        .expect("test: lost race, same provenance");
+    assert!(!outcome.created);
+    assert_eq!(outcome.record_digest, winner.record_digest);
+    let mut other = new.clone();
+    other.proposal_id = Some("p".to_string());
+    let err = store
+        .stage_and_publish(&other, &bundle, &info, bundle.revision_id(), &staged(), &final_dir)
+        .expect_err("test: lost race, different provenance");
+    assert!(matches!(err, LifecycleError::RevisionConflict { .. }), "{err}");
+
+    // A tampered winner is reported, not trusted.
+    fs::write(final_dir.join("bundle/references/guide.md"), b"changed").expect("test: tamper");
+    let err = store
+        .stage_and_publish(&new, &bundle, &info, bundle.revision_id(), &staged(), &final_dir)
+        .expect_err("test: lost race, tampered winner");
+    assert!(matches!(err, LifecycleError::Tampered { .. }), "{err}");
 }
 
 #[test]
@@ -109,7 +207,7 @@ fn changed_bundle_creates_a_distinct_revision() {
     let (second, _) = publish(&store, changed);
     assert_ne!(first, second);
     store
-        .read_revision(&skill(), &first)
+        .read_revision(&skill(), &first, None)
         .expect("test: first still verifies");
 }
 
@@ -157,7 +255,7 @@ fn added_removed_and_unexpected_entries_are_detected() {
     plant(&dir.join("bundle/extra.md"));
     assert!(matches!(read_err(&store, &id), LifecycleError::Tampered { .. }));
     fs::remove_file(dir.join("bundle/extra.md")).expect("test: rm");
-    store.read_revision(&skill(), &id).expect("test: restored");
+    store.read_revision(&skill(), &id, None).expect("test: restored");
 
     plant(&dir.join("notes.txt"));
     assert!(matches!(read_err(&store, &id), LifecycleError::Tampered { .. }));
@@ -247,7 +345,7 @@ fn identity_of_foreign_skills_cannot_be_swapped_by_moving_directories() {
     let other_dir = store.root().join("revisions").join(other.as_str());
     fs::create_dir_all(&other_dir).expect("test: mkdir");
     copy_tree(&dir, &other_dir.join(id.as_str()));
-    let err = store.read_revision(&other, &id).expect_err("test: moved record");
+    let err = store.read_revision(&other, &id, None).expect_err("test: moved record");
     assert!(matches!(err, LifecycleError::Tampered { .. }), "{err}");
 }
 
@@ -317,7 +415,7 @@ mod unix {
         }
         assert_eq!(mode(&dir.join("bundle/scripts/run.sh")) & 0o100, 0o100);
         assert_eq!(mode(&dir.join("bundle/SKILL.md")) & 0o111, 0);
-        let record = store.read_revision(&skill(), &id).expect("test: read").revision;
+        let record = store.read_revision(&skill(), &id, None).expect("test: read").revision;
         assert_eq!(record.recorded_dir_mode, Some(mode(&dir)));
         assert_eq!(record.recorded_dir_mode, Some(0o700));
     }
@@ -332,7 +430,7 @@ mod unix {
             LifecycleError::PermissionsTooOpen { .. }
         ));
         fs::set_permissions(dir.join("bundle/SKILL.md"), fs::Permissions::from_mode(0o600)).expect("test: chmod");
-        store.read_revision(&skill(), &id).expect("test: restored");
+        store.read_revision(&skill(), &id, None).expect("test: restored");
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("test: chmod");
         assert!(matches!(
@@ -379,7 +477,7 @@ mod unix {
         assert!(matches!(read_err(&store, &id), LifecycleError::Tampered { .. }));
         fs::remove_file(&dir).expect("test: rm");
         fs::rename(&moved, &dir).expect("test: rename back");
-        store.read_revision(&skill(), &id).expect("test: restored");
+        store.read_revision(&skill(), &id, None).expect("test: restored");
 
         fs::remove_file(dir.join("bundle/references/guide.md")).expect("test: rm");
         std::os::unix::fs::symlink(dir.join("bundle/SKILL.md"), dir.join("bundle/references/guide.md"))

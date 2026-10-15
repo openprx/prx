@@ -17,6 +17,7 @@ use super::manifest::{ManifestInfo, validate_manifest};
 use super::types::{LifecycleError, NewRevision, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,13 +56,54 @@ pub struct WriteOutcome {
     pub revision: SkillRevision,
     /// `false` when an identical, verified revision already existed.
     pub created: bool,
+    /// Canonical digest of the stored record (see [`record_digest`]).
+    pub record_digest: String,
 }
 
 /// A revision whose bundle hash, owner scope and manifest were re-verified.
 #[derive(Clone, Debug)]
 pub struct VerifiedRevision {
     pub revision: SkillRevision,
+    /// Canonical digest of the stored record (see [`record_digest`]).
+    pub record_digest: String,
     pub bundle: Bundle,
+}
+
+/// Canonical digest of a revision record: lowercase hex SHA-256 of its compact
+/// `serde_json` serialization (fixed field order, no maps). A digest stored
+/// inside the same directory does not authenticate the record, because whoever
+/// can edit the record can edit the digest too. The digest is meant to be
+/// pinned elsewhere, for example by the SL08 publication journal, and passed
+/// to [`SkillLifecycleStore::read_revision`].
+pub fn record_digest(revision: &SkillRevision) -> Result<String, LifecycleError> {
+    let bytes = serde_json::to_vec(revision).map_err(|e| LifecycleError::InvalidRecord {
+        path: PathBuf::from(REVISION_FILE),
+        reason: e.to_string(),
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// Name of the first provenance field in which `new` differs from `record`.
+fn provenance_difference(record: &SkillRevision, new: &NewRevision) -> Option<&'static str> {
+    if record.parent_revision_id != new.parent_revision_id {
+        Some("parent_revision_id")
+    } else if record.source_kind != new.source_kind {
+        Some("source_kind")
+    } else if record.source_commit != new.source_commit {
+        Some("source_commit")
+    } else if record.proposal_id != new.proposal_id {
+        Some("proposal_id")
+    } else if record.pattern_ids != new.pattern_ids {
+        Some("pattern_ids")
+    } else if record.capability_requirements != new.capability_requirements {
+        Some("capability_requirements")
+    } else if record.review_receipt_ids != new.review_receipt_ids {
+        Some("review_receipt_ids")
+    } else if record.validation_receipt_ids != new.validation_receipt_ids {
+        Some("validation_receipt_ids")
+    } else {
+        None
+    }
 }
 
 /// Handle to one owner's lifecycle store.
@@ -131,7 +173,9 @@ impl SkillLifecycleStore {
             // A hard link publishes the complete file atomically and refuses to
             // replace a schema another process created first.
             let linked = fs::hard_link(&tmp, &path);
-            let _ = fs::remove_file(&tmp);
+            if let Err(e) = fs::remove_file(&tmp) {
+                tracing::warn!(path = %tmp.display(), error = %e, "failed to remove temporary skill store schema file");
+            }
             match linked {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -177,22 +221,24 @@ impl SkillLifecycleStore {
     ///
     /// The bundle is validated (manifest included), staged on the same
     /// filesystem, re-read and re-hashed, then renamed into place. A revision
-    /// that already exists is verified and returned unchanged; it is never
+    /// that already exists is verified and returned unchanged when `new`
+    /// carries identical provenance; different provenance is a
+    /// [`LifecycleError::RevisionConflict`]. An existing revision is never
     /// overwritten, and a mismatching one is reported as tampered.
+    ///
+    /// Staging happens in `staging/`; a crash can leave a stale directory
+    /// there, which the SL08 recovery pass is responsible for sweeping.
     pub fn write_revision(&self, new: &NewRevision, bundle: &Bundle) -> Result<WriteOutcome, LifecycleError> {
         let info = validate_manifest(bundle)?;
         let revision_id = bundle.revision_id().clone();
         let final_dir = self.revision_dir(&new.skill_id, &revision_id);
         if fs::symlink_metadata(&final_dir).is_ok() {
-            let verified = self.verify_dir(&final_dir, &new.skill_id, &revision_id)?;
-            return Ok(WriteOutcome {
-                revision: verified.revision,
-                created: false,
-            });
+            return self.existing_outcome(&final_dir, new, &revision_id);
         }
 
         let skill_dir = self.root.join(REVISIONS_DIR).join(new.skill_id.as_str());
         ensure_real_dir(&skill_dir, true)?;
+        sync_dir(&self.root.join(REVISIONS_DIR))?;
         let staged = self.root.join(STAGING_DIR).join(uuid::Uuid::new_v4().to_string());
         let result = self.stage_and_publish(new, bundle, &info, &revision_id, &staged, &final_dir);
         if staged.exists()
@@ -203,7 +249,32 @@ impl SkillLifecycleStore {
         result
     }
 
-    fn stage_and_publish(
+    /// Verifies an already published revision and checks that the caller's
+    /// provenance matches it, so a differing request is never silently dropped.
+    fn existing_outcome(
+        &self,
+        dir: &Path,
+        new: &NewRevision,
+        revision_id: &RevisionId,
+    ) -> Result<WriteOutcome, LifecycleError> {
+        let verified = self.verify_dir(dir, &new.skill_id, revision_id)?;
+        if let Some(field) = provenance_difference(&verified.revision, new) {
+            return Err(LifecycleError::RevisionConflict {
+                revision: format!("{}/{revision_id}", new.skill_id),
+                field,
+            });
+        }
+        Ok(WriteOutcome {
+            revision: verified.revision,
+            created: false,
+            record_digest: verified.record_digest,
+        })
+    }
+
+    /// Stages, verifies and renames a revision into `final_dir`. When the
+    /// rename loses a race with another writer, the winner is verified and
+    /// compared with `new` exactly like a pre-existing revision.
+    pub(super) fn stage_and_publish(
         &self,
         new: &NewRevision,
         bundle: &Bundle,
@@ -246,7 +317,7 @@ impl SkillLifecycleStore {
         };
         let record_path = staged.join(REVISION_FILE);
         write_private_file(&record_path, &record_bytes(&revision, &record_path)?, false)?;
-        sync_dir(&bundle_dir)?;
+        sync_tree_dirs(&bundle_dir)?;
         sync_dir(staged)?;
 
         // Re-read what was written; a staging bug or disk fault must not
@@ -258,19 +329,17 @@ impl SkillLifecycleStore {
                 if let Some(parent) = final_dir.parent() {
                     sync_dir(parent)?;
                 }
+                let record_digest = record_digest(&revision)?;
                 Ok(WriteOutcome {
                     revision,
                     created: true,
+                    record_digest,
                 })
             }
             Err(e) => {
                 if fs::symlink_metadata(final_dir).is_ok() {
                     // Another writer published the same revision first.
-                    let verified = self.verify_dir(final_dir, &new.skill_id, revision_id)?;
-                    Ok(WriteOutcome {
-                        revision: verified.revision,
-                        created: false,
-                    })
+                    self.existing_outcome(final_dir, new, revision_id)
                 } else {
                     Err(LifecycleError::io(final_dir, e))
                 }
@@ -279,8 +348,15 @@ impl SkillLifecycleStore {
     }
 
     /// Reads a revision and verifies its record, owner scope, manifest and the
-    /// complete bundle hash.
-    pub fn read_revision(&self, skill: &SkillId, revision: &RevisionId) -> Result<VerifiedRevision, LifecycleError> {
+    /// complete bundle hash. With `expected_record_digest` the record's
+    /// canonical digest must match too, which authenticates the fields that
+    /// are not derived from the bundle (provenance, receipts, timestamps).
+    pub fn read_revision(
+        &self,
+        skill: &SkillId,
+        revision: &RevisionId,
+        expected_record_digest: Option<&str>,
+    ) -> Result<VerifiedRevision, LifecycleError> {
         let dir = self.revision_dir(skill, revision);
         match fs::symlink_metadata(&dir) {
             Ok(_) => {}
@@ -289,7 +365,16 @@ impl SkillLifecycleStore {
             }
             Err(e) => return Err(LifecycleError::io(&dir, e)),
         }
-        self.verify_dir(&dir, skill, revision)
+        let verified = self.verify_dir(&dir, skill, revision)?;
+        if let Some(expected) = expected_record_digest
+            && verified.record_digest != expected
+        {
+            return Err(LifecycleError::Tampered {
+                path: dir.join(REVISION_FILE),
+                reason: "record digest does not match the pinned digest".to_string(),
+            });
+        }
+        Ok(verified)
     }
 
     fn verify_dir(
@@ -358,8 +443,10 @@ impl SkillLifecycleStore {
                 "record metadata does not match the bundle manifest".to_string(),
             ));
         }
+        let record_digest = record_digest(&record)?;
         Ok(VerifiedRevision {
             revision: record,
+            record_digest,
             bundle,
         })
     }
@@ -482,6 +569,21 @@ fn write_private_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(),
     let mut file = options.open(path).map_err(|e| LifecycleError::io(path, e))?;
     file.write_all(bytes).map_err(|e| LifecycleError::io(path, e))?;
     file.sync_all().map_err(|e| LifecycleError::io(path, e))
+}
+
+/// Syncs `path` and every directory below it.
+fn sync_tree_dirs(path: &Path) -> Result<(), LifecycleError> {
+    for item in fs::read_dir(path).map_err(|e| LifecycleError::io(path, e))? {
+        let item = item.map_err(|e| LifecycleError::io(path, e))?;
+        if item
+            .file_type()
+            .map_err(|e| LifecycleError::io(item.path(), e))?
+            .is_dir()
+        {
+            sync_tree_dirs(&item.path())?;
+        }
+    }
+    sync_dir(path)
 }
 
 fn sync_dir(path: &Path) -> Result<(), LifecycleError> {
