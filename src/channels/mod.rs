@@ -136,11 +136,6 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
-/// 🟡 Behavior-limits Phase 1: raised 320 -> 1280 (4x).
-const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 1_280;
-/// 🟡 Behavior-limits Phase 1: raised 2400 -> 9600 (4x).
-const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 9_600;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str =
     "I could not identify this image with confidence. Please send a clearer picture or add some context.";
 
@@ -1232,73 +1227,6 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {
     ctx.conversation_histories.lock().remove(&key.canonical);
 }
 
-fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> bool {
-    let mut histories = ctx.conversation_histories.lock();
-
-    // Compact ONLY the canonical session, never the legacy entry. Legacy is the
-    // immutable, cross-recipient shared pre-cutover history; mutating or dropping
-    // it here would corrupt the pre-history of every other recipient of the same
-    // sender. Legacy is also already bounded (it was capped at MAX_CHANNEL_HISTORY
-    // when written, ≤ 50 turns), and `merged_history` re-applies that window
-    // across the union on every read — so the merged length the model sees stays
-    // bounded (≤ legacy_cap + compacted_canonical, then truncated to the window)
-    // without compaction needing to touch legacy at all. This is an in-memory
-    // cache operation only: durable rows are untouched and re-hydrate on restart.
-    let Some(canonical_turns) = histories.get(&key.canonical) else {
-        return false;
-    };
-    if canonical_turns.is_empty() {
-        return false;
-    }
-    let before_len = canonical_turns.len();
-    let before_chars = canonical_turns
-        .iter()
-        .map(|turn| turn.content.chars().count())
-        .sum::<usize>();
-
-    let keep_from = canonical_turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(
-        canonical_turns
-            .get(keep_from..)
-            .map(<[ChatMessage]>::to_vec)
-            .unwrap_or_default(),
-    );
-
-    for turn in &mut compacted {
-        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            // These turns are replayed to the provider verbatim, so the cut must
-            // not slice a media marker in half: a half marker either loses the
-            // attachment or forges a reference to a path that never existed.
-            turn.content = crate::multimodal::truncate_preserving_media_markers(
-                &turn.content,
-                CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
-            )
-            .into_owned();
-        }
-    }
-
-    // Enforce a hard total character budget to avoid repeated context overflow.
-    while compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>() > CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
-        && compacted.len() > 1
-    {
-        compacted.remove(0);
-    }
-
-    // Write the compacted result back under the canonical key only; the legacy
-    // entry is never removed or rewritten.
-    if compacted.is_empty() {
-        histories.remove(&key.canonical);
-        return true;
-    }
-
-    let after_len = compacted.len();
-    let after_chars = compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>();
-    histories.insert(key.canonical.clone(), compacted);
-    after_len < before_len || after_chars < before_chars
-}
-
 /// Resolve the inbound gate for this message. Production always uses the
 /// static-dispatch `InboundGate::for_policy` over the real `SideEffectGate`. In
 /// test builds, an injected `test_inbound_authorizer` (when present) takes
@@ -1547,97 +1475,18 @@ async fn load_persisted_histories(
     }
 }
 
-/// The mid-turn record of tool calls that have **already executed** in the
-/// current attempt, ready to be carried into a replayed history.
-///
-/// A replay rebuilds the conversation from `conversation_histories`, and that
-/// cache holds only completed user/assistant turns — `append_sender_turn` is
-/// never called for a mid-turn tool call or tool result. Handing the model a
-/// history with the tool evidence erased is an instruction to run everything
-/// again, and the tools on this path have real side effects: files written,
-/// messages sent, external APIs called. Nothing downstream catches the repeat
-/// either — the durable idempotency ledger keys on the provider-generated
-/// `tool_call_id`, which is freshly minted by the replayed response.
-///
-/// So the replay must re-ask the *model* without re-doing the *work*. The
-/// terminal chat retry (`chat::run`) gets this for free by never rebuilding its
-/// history; this is the channel path's equivalent.
-///
-/// The record is located by the first tool-result message rather than by an
-/// index into the previous history, so a mid-turn trim inside the tool loop
-/// cannot shift it out from under us. Everything from the assistant turn that
-/// requested those tools onwards is carried, which keeps the
-/// `assistant(tool_calls) → tool result` pairing that native-tool providers
-/// require. Mid-turn `system` messages (compaction and corrective-retry
-/// artifacts) are dropped: the rebuilt prefix already carries the real system
-/// prompt.
-fn executed_tool_records(history: &[ChatMessage]) -> Vec<ChatMessage> {
-    let Some(first_result) = history.iter().position(is_tool_result_message) else {
-        return Vec::new();
-    };
-    let start = history
-        .get(..first_result)
-        .and_then(|before| before.iter().rposition(|message| message.role == "assistant"))
-        .unwrap_or(first_result);
-    history
-        .get(start..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|message| message.role != "system")
-        .cloned()
-        .collect()
-}
-
-/// Rebuild the turn history for a replay while keeping the record of whatever
-/// the aborted attempt already executed.
-///
-/// See [`executed_tool_records`] for why the record has to survive: a replay is
-/// meant to re-ask the model, not to re-run the side effects it already caused.
-fn replayed_history(previous: &[ChatMessage], rebuild: &impl Fn() -> Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let carried = executed_tool_records(previous);
-    let mut next = rebuild();
-    if carried.is_empty() {
-        return next;
-    }
-    tracing::warn!(
-        carried_messages = carried.len(),
-        "channel turn replay: carrying already-executed tool records into the rebuilt history so the \
-         replay cannot repeat their side effects"
-    );
-    next.extend(carried);
-    next
-}
-
 /// Whether a history message carries the result of an executed tool call.
 ///
 /// Native-tool mode emits a dedicated `tool` role message per call; prompt mode
 /// folds every result of the iteration into one `user` message behind
 /// [`crate::agent::turn_contracts::TOOL_RESULTS_PREFIX`].
+#[cfg(test)]
 fn is_tool_result_message(message: &ChatMessage) -> bool {
     message.role == "tool"
         || (message.role == "user"
             && message
                 .content
                 .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX))
-}
-
-/// Wordings upstreams use to say "the prompt no longer fits". Shared by the
-/// overflow retry predicate and the user-facing failure classifier so the two
-/// cannot drift apart.
-const CONTEXT_WINDOW_OVERFLOW_HINTS: [&str; 8] = [
-    "exceeds the context window",
-    "context window of this model",
-    "maximum context length",
-    "context length exceeded",
-    "too many tokens",
-    "token limit exceeded",
-    "prompt is too long",
-    "input is too long",
-];
-
-pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    CONTEXT_WINDOW_OVERFLOW_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
 /// Number of hex digits in the short failure code shown to the user.
@@ -1780,6 +1629,9 @@ pub(crate) fn classify_turn_failure(err: &anyhow::Error) -> TurnFailureKind {
     {
         return TurnFailureKind::ToolSchemaRefused;
     }
+    if crate::recovery::overflow::is_context_overflow_error(err) {
+        return TurnFailureKind::ContextTooLong;
+    }
     let mut chain_text = String::new();
     for cause in err.chain() {
         use std::fmt::Write as _;
@@ -1811,14 +1663,6 @@ fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
         "image url targets a private/local address",
         "media artifact i/o failed",
         "media source is not a regular readable file",
-    ];
-    /// Extra overflow wordings that the retry predicate does not look for.
-    /// Kept separate so the predicate's behaviour is untouched.
-    const CONTEXT_EXTRA_HINTS: [&str; 4] = [
-        "context_length_exceeded",
-        "input token count",
-        "exceeds maximum context",
-        "exceed the maximum context",
     ];
     /// Billing / entitlement refusals: retrying cannot clear these.
     const QUOTA_HINTS: [&str; 9] = [
@@ -1908,8 +1752,6 @@ fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
     // bodies are part of this text.
     if hit(&ATTACHMENT_HINTS) {
         TurnFailureKind::Attachment
-    } else if hit(&CONTEXT_WINDOW_OVERFLOW_HINTS) || hit(&CONTEXT_EXTRA_HINTS) {
-        TurnFailureKind::ContextTooLong
     } else if hit(&QUOTA_HINTS) {
         TurnFailureKind::QuotaExhausted
     } else if hit(&CREDENTIAL_HINTS) {
@@ -3733,7 +3575,7 @@ async fn run_channel_turn(
     let mut history = rebuild_history();
     let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
 
-    let (mut delta_tx, delta_rx) = if use_streaming {
+    let (delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -3760,7 +3602,7 @@ async fn run_channel_turn(
     };
 
     let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
+    let draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
         (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
     {
         Some(spawn_channel_draft_updater(
@@ -3895,7 +3737,6 @@ async fn run_channel_turn(
             trace: crate::agent::turn_contracts::ToolLoopTrace,
         },
         Error(anyhow::Error),
-        ContextOverflowExhausted,
     }
 
     let scope_owner_id = runtime_envelope.resolved_owner_id();
@@ -3939,13 +3780,14 @@ async fn run_channel_turn(
         )
     });
 
-    // No wall clock wraps this loop. A turn runs for as long as it keeps
+    // No wall clock wraps this turn. It runs for as long as it keeps
     // working; the only automatic end is the stall detector inside
     // `run_turn` (see `crate::agent::idle`), and the only
     // manual one is cancellation — a newer message or `prx tasks kill`.
-    // This scope encloses every retry, while the terminal guard remains owned
-    // outside it. Forced drop must acknowledge descendant cleanup before the
-    // guard may persist the parent outcome.
+    // `run_turn` owns provider overflow compaction and replay. This outer scope
+    // owns descendant cleanup only, while the terminal guard remains outside
+    // it. Forced drop must acknowledge descendant cleanup before the guard may
+    // persist the parent outcome.
     let child_owner = crate::runtime::turn_cleanup::current_tracker();
     let (child_cleanup_tx, child_cleanup_rx) = tokio::sync::oneshot::channel();
     let channel_child_cleanup =
@@ -3957,7 +3799,7 @@ async fn run_channel_turn(
             }
         };
     let decision_turn = decision_turn.with_child_cleanup(child_cleanup_rx);
-    let final_outcome = channel_child_cleanup.run(async { Ok(loop {
+    let final_outcome = channel_child_cleanup.run(async { Ok({
         let llm_work = async {
             tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -4039,78 +3881,29 @@ async fn run_channel_turn(
         };
 
         match llm_result {
-            LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
+            LlmExecutionResult::Cancelled => LlmFinalOutcome::Cancelled,
             LlmExecutionResult::Completed(result) => match *result {
                 Ok((outcome, trace)) => match outcome {
                     crate::agent::turn_contracts::ToolLoopOutcome::Text(response)
                     | crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { reply: response } => {
-                        break LlmFinalOutcome::Success { response, trace };
+                        LlmFinalOutcome::Success { response, trace }
                     }
                     crate::agent::turn_contracts::ToolLoopOutcome::Silent { reason } => {
-                        break LlmFinalOutcome::Silent { reason, trace };
+                        LlmFinalOutcome::Silent { reason, trace }
                     }
                 },
                 Err(e) => {
                     if e.downcast_ref::<crate::runtime::turn_cleanup::CleanupIncomplete>()
                         .is_some()
                     {
-                        break LlmFinalOutcome::Error(e);
+                        LlmFinalOutcome::Error(e)
+                    } else if crate::agent::turn_contracts::is_tool_loop_cancelled(&e)
+                        || cancellation_token.is_cancelled()
+                    {
+                        LlmFinalOutcome::Cancelled
+                    } else {
+                        LlmFinalOutcome::Error(e)
                     }
-                    if crate::agent::turn_contracts::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
-                        break LlmFinalOutcome::Cancelled;
-                    }
-
-                    if is_context_window_overflow_error(&e) {
-                        let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                        // Report the merged-view char count; compaction folds legacy
-                        // into canonical, but reading the union keeps the figure honest
-                        // regardless of which keys remain populated.
-                        let compacted_chars = merged_history(&ctx.conversation_histories.lock(), &history_key)
-                            .iter()
-                            .map(|t| t.content.chars().count())
-                            .sum::<usize>();
-                        eprintln!(
-                            "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
-                            started_at.elapsed().as_millis(),
-                            compacted,
-                            compacted_chars
-                        );
-
-                        if compacted {
-                            // Restart the draft accumulator for the retried
-                            // attempt. The accumulator used to live for the whole
-                            // turn, so a retry's deltas were appended to the
-                            // half-finished text of the attempt that failed and
-                            // the user read "half a sentence + the whole answer
-                            // again". Closing the delta channel and waiting for
-                            // the old task to drain it means no stale delta can
-                            // arrive after the fresh accumulator starts.
-                            if let (Some(channel), Some(draft_id)) =
-                                (target_channel.as_ref(), draft_message_id.as_deref())
-                            {
-                                drop(delta_tx.take());
-                                if let Some(handle) = draft_updater.take() {
-                                    log_worker_join_result(handle.await);
-                                }
-                                draft_has_text.store(false, std::sync::atomic::Ordering::Release);
-                                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-                                delta_tx = Some(tx);
-                                draft_updater = Some(spawn_channel_draft_updater(
-                                    Arc::clone(channel),
-                                    msg.reply_target.clone(),
-                                    draft_id.to_string(),
-                                    rx,
-                                    Arc::clone(&draft_has_text),
-                                ));
-                            }
-                            history = replayed_history(&history, &rebuild_history);
-                            continue;
-                        }
-
-                        break LlmFinalOutcome::ContextOverflowExhausted;
-                    }
-
-                    break LlmFinalOutcome::Error(e);
                 }
             },
         }
@@ -4332,28 +4125,6 @@ async fn run_channel_turn(
                     let _ = send_recording_activity(
                         channel.as_ref(),
                         &SendMessage::new(error_text.as_str(), &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
-                }
-            }
-        }
-        LlmFinalOutcome::ContextOverflowExhausted => {
-            let summary = "channel context overflow exhausted";
-            let overflow_error = anyhow::anyhow!(summary);
-            if let Err(error) = decision_turn.fail(&overflow_error, false).await {
-                tracing::warn!(error = %error, "Failed to commit shared overflow channel terminal event");
-                return;
-            }
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text = "Session context was too long and has been reset. Please resend your message.";
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ =
-                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, error_text)
-                            .await;
-                } else {
-                    let _ = send_recording_activity(
-                        channel.as_ref(),
-                        &SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
                     )
                     .await;
                 }
@@ -6645,16 +6416,6 @@ mod tests {
     }
 
     #[test]
-    fn context_window_overflow_error_detector_matches_known_messages() {
-        let overflow_err =
-            anyhow::anyhow!("OpenAI Codex stream error: Your input exceeds the context window of this model.");
-        assert!(is_context_window_overflow_error(&overflow_err));
-
-        let other_err = anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
-        assert!(!is_context_window_overflow_error(&other_err));
-    }
-
-    #[test]
     fn normalize_cached_channel_turns_merges_consecutive_user_turns() {
         let turns = vec![
             ChatMessage::user("forwarded content"),
@@ -6684,91 +6445,6 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
-    }
-
-    #[test]
-    fn compact_sender_history_keeps_recent_truncated_messages() {
-        let mut histories = HashMap::new();
-        let sender = ConversationKey {
-            canonical: "channel:telegram:u1:chat-1".to_string(),
-            legacy: "telegram_u1".to_string(),
-        };
-        histories.insert(
-            sender.canonical.clone(),
-            (0..20)
-                .map(|idx| {
-                    let content = format!("msg-{idx}-{}", "x".repeat(700));
-                    if idx % 2 == 0 {
-                        ChatMessage::user(content)
-                    } else {
-                        ChatMessage::assistant(content)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        let ctx = ChannelRuntimeContext {
-            decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
-            channels_by_name: Arc::new(HashMap::new()),
-            provider: Arc::new(DummyProvider),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            memory_event_recording: MemoryEventRecording::default(),
-            read_only_tool_concurrency_window: 2,
-            priority_scheduling_enabled: false,
-            low_priority_tools: Vec::new(),
-
-            conversation_histories: Arc::new(Mutex::new(histories)),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
-                security: Arc::new(crate::security::SecurityPolicy::default()),
-            })),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-
-            tool_tiering: crate::config::ToolTieringConfig::default(),
-            signal_inbound_policy: None,
-            whatsapp_inbound_policy: None,
-            bot_names: vec!["prx".to_string()],
-            bot_uuids: vec![],
-            mention_only_by_channel: HashMap::new(),
-            group_reply_mode_by_channel: HashMap::new(),
-            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            test_inbound_authorizer: None,
-        };
-
-        assert!(compact_sender_history(&ctx, &sender));
-
-        let histories = ctx.conversation_histories.lock();
-        let kept = histories.get(&sender.canonical).expect("sender history should remain");
-        assert!(!kept.is_empty());
-        assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        assert!(kept.iter().all(|turn| {
-            let len = turn.content.chars().count();
-            len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
-                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3 && turn.content.ends_with("..."))
-        }));
-        let total_chars: usize = kept.iter().map(|turn| turn.content.chars().count()).sum();
-        assert!(
-            total_chars <= CHANNEL_HISTORY_COMPACT_TOTAL_CHARS,
-            "total chars {} exceeds budget {}",
-            total_chars,
-            CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
-        );
     }
 
     /// Build a minimal `ChannelRuntimeContext` whose conversation history map is
@@ -7478,58 +7154,6 @@ mod tests {
                 .iter()
                 .any(|message| message.role == "user" && message.content.contains(IM_BUDGET_REQUEST)),
             "the turn's own request must survive the budget (D-011)"
-        );
-    }
-
-    #[test]
-    fn compact_sender_history_never_removes_shared_legacy() {
-        // FIX-P1-25b bug 2: compaction must operate on the canonical session only.
-        // The legacy entry is the immutable, cross-recipient shared pre-history;
-        // compacting one recipient's session must not delete or mutate it, so the
-        // sender's other recipients still read the legacy pre-history afterwards.
-        let legacy = "telegram_alice".to_string();
-        let key_a = ConversationKey {
-            canonical: "channel:telegram:alice:chat-a".to_string(),
-            legacy: legacy.clone(),
-        };
-        let key_b = ConversationKey {
-            canonical: "channel:telegram:alice:chat-b".to_string(),
-            legacy: legacy.clone(),
-        };
-
-        let mut histories = HashMap::new();
-        histories.insert(legacy.clone(), vec![ChatMessage::user("legacy-prehistory")]);
-        // A canonical session long enough to actually compact.
-        histories.insert(
-            key_a.canonical.clone(),
-            (0..20)
-                .map(|idx| ChatMessage::user(format!("a-{idx}")))
-                .collect::<Vec<_>>(),
-        );
-        let ctx = ctx_with_histories(histories);
-
-        assert!(compact_sender_history(&ctx, &key_a));
-
-        let histories = ctx.conversation_histories.lock();
-        // Legacy untouched.
-        assert_eq!(
-            histories
-                .get(&legacy)
-                .map(|t| t.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()),
-            Some(vec!["legacy-prehistory"]),
-            "compaction must not delete or mutate the shared legacy entry"
-        );
-        // Recipient A's canonical was compacted.
-        let kept_a = histories.get(&key_a.canonical).expect("canonical A remains");
-        assert!(kept_a.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        drop(histories);
-
-        // Recipient B (same sender) still reads the legacy pre-history via merge.
-        let merged_b = merged_history(&ctx.conversation_histories.lock(), &key_b);
-        assert_eq!(
-            merged_b.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
-            vec!["legacy-prehistory"],
-            "other recipient still sees shared legacy after compaction of recipient A"
         );
     }
 
@@ -8891,17 +8515,13 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Stands in for a real model on the replay path: it asks for the tool while
+    /// Stands in for a real model on the engine recovery path: it asks for the tool while
     /// the history shows no tool has run, and once the history *does* show the
-    /// result it fails the call with a context-window error, which is what makes
-    /// the channel loop replay the turn.
-    ///
-    /// The error text matches the channel-level classifier but deliberately not
-    /// the tool loop's own overflow classifier, so the failure propagates
-    /// straight to the replay instead of being absorbed by the in-loop
-    /// compaction retry.
+    /// result it fails with a context-window error. The canonical engine
+    /// classifier must recognize this provider wording and retain the executed
+    /// tool record across every compaction retry.
     #[derive(Default)]
-    struct ReplayProbeProvider {
+    struct EngineOverflowProbeProvider {
         /// Whether each `chat_with_history` call saw evidence of an executed tool.
         saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
     }
@@ -8914,7 +8534,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[async_trait::async_trait]
-    impl Provider for ReplayProbeProvider {
+    impl Provider for EngineOverflowProbeProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -8955,10 +8575,10 @@ BTC is currently around $65,000 based on latest tool output."#
         ctx.conversation_histories.lock().insert(key.canonical, turns);
     }
 
-    /// A replayed channel turn must re-ask the model without re-running the
-    /// tools the aborted attempt already executed.
+    /// A channel turn must leave overflow recovery to the engine without
+    /// re-running tools the failed attempt already executed.
     #[tokio::test]
-    async fn channel_turn_replay_does_not_re_execute_already_executed_tools() {
+    async fn channel_turn_engine_overflow_recovery_does_not_re_execute_already_executed_tools() {
         let dir = TempDir::new().expect("test: tempdir");
         let audit = dir.path().join("audit.log");
 
@@ -8967,7 +8587,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let provider = Arc::new(ReplayProbeProvider::default());
+        let provider = Arc::new(EngineOverflowProbeProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
@@ -8979,7 +8599,7 @@ BTC is currently around $65,000 based on latest tool output."#
             // A real SQLite backend, because a side-effecting tool is refused
             // outright without the durable idempotency ledger. Running the tool
             // *with* the ledger in place is also the point: the ledger keys on
-            // the per-call tool id, which the replayed response mints afresh, so
+            // the per-call tool id, which a second model tool call would mint afresh, so
             // it cannot be what stops the repeat.
             memory: Arc::clone(&memory),
             tools_registry: Arc::new(vec![Box::new(AppendingTool { path: audit.clone() }) as Box<dyn Tool>]),
@@ -9040,13 +8660,14 @@ BTC is currently around $65,000 based on latest tool output."#
             is_group_hint: false,
             sender_is_bot: false,
         };
+        let history_key = ConversationKey::from_message(&message);
         seed_channel_history_for_overflow_progress(runtime_ctx.as_ref(), &message);
         run_owned_channel_probe(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
             evidence.len() >= 3,
-            "test: the turn must actually have been replayed: {evidence:?}"
+            "test: the engine must actually compact and retry: {evidence:?}"
         );
         assert!(
             evidence.iter().skip(1).all(|seen| *seen),
@@ -9057,7 +8678,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let lines = appended.lines().filter(|line| *line == "appended").count();
         assert_eq!(
             lines, 1,
-            "the replay must not run the tool a second time; audit file: {appended:?}"
+            "engine recovery must not run the tool a second time; audit file: {appended:?}"
+        );
+        let cached = runtime_ctx.conversation_histories.lock();
+        assert!(
+            cached
+                .get(&history_key.canonical)
+                .is_some_and(|turns| turns.iter().any(|turn| turn.content == "older user turn 0")),
+            "the channel layer must not run an independent cache compactor after the engine gives up"
         );
     }
 
@@ -9666,10 +9294,10 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Like [`ReplayProbeProvider`] but asks for a *batch* of two side-effecting
+    /// Like [`EngineOverflowProbeProvider`] but asks for a *batch* of two side-effecting
     /// tools in one iteration, which is the shape that used to lose records.
     #[derive(Default)]
-    struct BatchReplayProbeProvider {
+    struct BatchEngineOverflowProbeProvider {
         saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
     }
 
@@ -9684,7 +9312,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[async_trait::async_trait]
-    impl Provider for BatchReplayProbeProvider {
+    impl Provider for BatchEngineOverflowProbeProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -9711,18 +9339,18 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// **Core evidence 3 (end to end)** — a replayed turn re-runs none of the
-    /// tools a whole batch already executed.
+    /// **Core evidence 3 (end to end)** — engine overflow recovery re-runs none
+    /// of the tools a whole batch already executed.
     ///
     /// Two side-effecting tools in a single iteration, one audit file, and the
-    /// context-overflow replay path (the one that survived the timeout's
-    /// deletion). Each tool must appear exactly once in the file.
+    /// production engine context-overflow path. Each tool must appear exactly
+    /// once in the file.
     #[tokio::test]
-    async fn channel_turn_replay_does_not_re_execute_an_already_executed_batch() {
+    async fn channel_turn_engine_overflow_recovery_does_not_re_execute_an_already_executed_batch() {
         let dir = TempDir::new().expect("test: tempdir");
         let audit = dir.path().join("batch-audit.log");
         let channel_impl = Arc::new(RecordingChannel::default());
-        let provider = Arc::new(BatchReplayProbeProvider::default());
+        let provider = Arc::new(BatchEngineOverflowProbeProvider::default());
         let ctx = evidence_runtime_ctx(
             &dir,
             Arc::clone(&provider) as Arc<dyn Provider>,
@@ -9734,13 +9362,14 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let message = evidence_message("msg-batch-replay-1", "append both lines please");
+        let history_key = ConversationKey::from_message(&message);
         seed_channel_history_for_overflow_progress(ctx.as_ref(), &message);
-        run_owned_channel_probe(ctx, message, CancellationToken::new()).await;
+        run_owned_channel_probe(Arc::clone(&ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
             evidence.len() >= 3,
-            "test: the turn must actually have been replayed: {evidence:?}"
+            "test: the engine must actually compact and retry: {evidence:?}"
         );
         let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tools");
         let first = appended.lines().filter(|line| *line == "appended").count();
@@ -9748,7 +9377,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             (first, second),
             (1, 1),
-            "each tool in the batch must run exactly once across the replay; audit file: {appended:?}"
+            "each tool in the batch must run exactly once across engine recovery; audit file: {appended:?}"
+        );
+        let cached = ctx.conversation_histories.lock();
+        assert!(
+            cached
+                .get(&history_key.canonical)
+                .is_some_and(|turns| turns.iter().any(|turn| turn.content == "older user turn 0")),
+            "the channel layer must not run an independent cache compactor after the engine gives up"
         );
     }
 
@@ -9868,60 +9504,6 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    /// A replayed turn starts its draft over instead of appending to the text of
-    /// the attempt that failed.
-    ///
-    /// The accumulator used to live for the whole turn, so the retry's deltas
-    /// were appended to the aborted attempt's half-finished sentence and the
-    /// user read "half a thought + the whole answer again". Restarting the
-    /// updater is what makes the second attempt begin from empty.
-    #[tokio::test]
-    async fn a_restarted_draft_updater_does_not_carry_the_previous_attempts_text() {
-        let channel_impl = Arc::new(DraftRecordingChannel::default());
-        let channel: Arc<dyn Channel> = Arc::clone(&channel_impl) as Arc<dyn Channel>;
-        let has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let (first_tx, first_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let first = spawn_channel_draft_updater(
-            Arc::clone(&channel),
-            "chat-evidence".to_string(),
-            "draft-1".to_string(),
-            first_rx,
-            Arc::clone(&has_text),
-        );
-        first_tx
-            .send("half a thou".to_string())
-            .await
-            .expect("test: send delta");
-        drop(first_tx);
-        first.await.expect("test: first updater should finish");
-        assert!(has_text.load(std::sync::atomic::Ordering::Acquire));
-
-        // What the replay branch does before it retries.
-        has_text.store(false, std::sync::atomic::Ordering::Release);
-        let (second_tx, second_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let second = spawn_channel_draft_updater(
-            Arc::clone(&channel),
-            "chat-evidence".to_string(),
-            "draft-1".to_string(),
-            second_rx,
-            Arc::clone(&has_text),
-        );
-        second_tx
-            .send("the whole answer".to_string())
-            .await
-            .expect("test: send delta");
-        drop(second_tx);
-        second.await.expect("test: second updater should finish");
-
-        let updates = channel_impl.draft_updates.lock().await.clone();
-        assert_eq!(
-            updates,
-            vec!["half a thou".to_string(), "the whole answer".to_string()],
-            "the retried attempt must start from empty, not from the aborted attempt's text"
-        );
-    }
-
     #[test]
     fn progress_lines_read_as_progress_and_never_as_a_deadline() {
         assert_eq!(
@@ -9931,32 +9513,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             channel_progress_line("", 3, Duration::from_secs(9)),
             "⏳ working… (step 3, 9s)"
-        );
-    }
-
-    #[test]
-    fn executed_tool_records_carry_the_assistant_turn_and_drop_mid_turn_system_noise() {
-        let history = vec![
-            ChatMessage::system("system prompt"),
-            ChatMessage::user("please do it"),
-            ChatMessage::assistant("assistant text without tools"),
-            ChatMessage::assistant("<tool_call>{\"name\":\"append_line\"}</tool_call>"),
-            ChatMessage::system("mid-turn compaction note"),
-            ChatMessage::user(format!(
-                "{}\nappended one line",
-                crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
-            )),
-        ];
-        let carried = executed_tool_records(&history);
-        let roles: Vec<&str> = carried.iter().map(|message| message.role.as_str()).collect();
-        assert_eq!(roles, vec!["assistant", "user"], "carried: {carried:?}");
-        assert!(carried[0].content.contains("append_line"));
-        assert!(carried[1].content.contains("appended one line"));
-
-        // A history with no executed tool has nothing to carry.
-        assert!(
-            executed_tool_records(&[ChatMessage::system("s"), ChatMessage::user("u")]).is_empty(),
-            "a turn that executed nothing must carry nothing"
         );
     }
 

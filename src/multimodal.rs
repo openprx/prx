@@ -15,6 +15,7 @@ const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/we
 const ACTIONABLE_MEDIA_MARKER_KINDS: &[&str] = &["IMAGE", "DOCUMENT", "AUDIO", "VOICE", "VIDEO"];
 
 /// Suffix appended by every truncation helper in this module.
+#[cfg(test)]
 const TRUNCATION_ELLIPSIS: &str = "...";
 
 #[derive(Debug, Clone)]
@@ -186,7 +187,8 @@ pub fn project_image_markers_for_routing(content: &str) -> Cow<'_, str> {
 /// whole or not at all. Complete markers pushed past the cut are re-attached
 /// after the ellipsis, bounded by the same character budget, so the model
 /// still sees every attachment the turn carried.
-pub fn truncate_preserving_media_markers(content: &str, max_chars: usize) -> Cow<'_, str> {
+#[cfg(test)]
+fn truncate_preserving_media_markers(content: &str, max_chars: usize) -> Cow<'_, str> {
     let Some((char_cut, _)) = content.char_indices().nth(max_chars) else {
         return Cow::Borrowed(content);
     };

@@ -292,15 +292,14 @@ fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
     // call. Make that one fixture capability part of the configured Direct
     // surface; an absent registry entry still publishes nothing.
     config.tool_tiering.always_include.push(FIXTURE_TOOL.to_owned());
-    config.cost.prices.insert(
-        FIXTURE_MODEL.to_owned(),
-        crate::config::schema::ModelPricing {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 1.0,
-            cache_read: 1.0,
-        },
-    );
+    let pricing = crate::config::schema::ModelPricing {
+        input: 1.0,
+        output: 1.0,
+        cache_write: 1.0,
+        cache_read: 1.0,
+    };
+    config.cost.prices.insert(FIXTURE_MODEL.to_owned(), pricing.clone());
+    config.cost.prices.insert("ollama/prx-local-model".to_owned(), pricing);
     config
 }
 
@@ -313,8 +312,12 @@ fn initial_history() -> Vec<ChatMessage> {
 }
 
 fn overflow_history() -> Vec<ChatMessage> {
-    let mut history = initial_history();
-    history.extend((0..30).map(|index| ChatMessage::user(format!("fixture overflow turn {index}"))));
+    let mut history = vec![ChatMessage::system("fixture system")];
+    for index in 0..15 {
+        history.push(ChatMessage::user(format!("fixture question {index}")));
+        history.push(ChatMessage::assistant(format!("fixture answer {index}")));
+    }
+    history.push(ChatMessage::user("Explain the current fixture result."));
     history
 }
 
@@ -678,68 +681,192 @@ async fn run_agent_fixture(
 
 async fn run_agent_fixture_with_history(
     provider: Arc<FixtureProvider>,
-    tools: Vec<Box<dyn Tool>>,
+    mut tools: Vec<Box<dyn Tool>>,
     cancellation: CancellationToken,
     on_delta: Option<mpsc::Sender<String>>,
     on_tool_call: Option<mpsc::Sender<crate::agent::turn_contracts::ToolCallNotification>>,
     history: Vec<ChatMessage>,
 ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
-    let temp = tempfile::TempDir::new().expect("fixture tempdir");
+    use futures::FutureExt;
+
+    let workspace = tempfile::TempDir::new().expect("mechanics fixture workspace").keep();
     let memory: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
-    let mut history = history;
+        Arc::new(crate::memory::SqliteMemory::new(&workspace).expect("agent fixture sqlite"));
+    if !tools.iter().any(|tool| tool.name() == FIXTURE_TOOL) {
+        tools.push(fixture_tool(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+    }
     let tools = crate::agent::test_admission::registry_with_search(tools);
-    let admission = crate::agent::test_admission::AdmittedTurn::with_model(
-        admission_config(temp.path()),
-        &history
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .expect("source input")
-            .content,
-        Arc::clone(&tools),
-        memory,
-        (FIXTURE_PROVIDER, FIXTURE_MODEL),
-    )
-    .await;
-    let result = crate::agent::turn_engine::run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: crate::agent::turn_contracts::ChatMode::Edit,
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: provider.as_ref(),
-            provider_name: FIXTURE_PROVIDER,
-            model: FIXTURE_MODEL,
-            temperature: 0.0,
-            tools_registry: tools,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(temp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: admission.memory_runtime_with_ingest(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: Some(cancellation),
-            on_delta,
-            on_tool_call,
-        },
-    )
-    .await;
-    (result, history)
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned tool decision endpoint")
+        .retain_evidence_at(workspace.clone());
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+                .expect("mechanics fixture cleanup owner");
+            let caught = cleanup
+                .run(async {
+                    Ok(std::panic::AssertUnwindSafe(async {
+                        let mut history = history;
+                        let input = history
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == "user")
+                            .expect("source input")
+                            .content
+                            .clone();
+                        let admission = crate::agent::test_admission::AdmittedTurn::configured_native_mechanics(
+                            admission_config(&workspace),
+                            &input,
+                            Arc::clone(&tools),
+                            memory,
+                            &endpoint,
+                            provider.as_ref(),
+                        )
+                        .await;
+                        let result = crate::agent::turn_engine::run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: crate::agent::turn_contracts::ChatMode::Edit,
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider.as_ref(),
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry: tools,
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(workspace.clone()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: admission.memory_runtime_with_ingest(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: Some(cancellation),
+                                on_delta,
+                                on_tool_call,
+                            },
+                        )
+                        .await;
+                        let _ = admission.decision().context.terminal_execution_trace();
+                        (result, history)
+                    })
+                    .catch_unwind()
+                    .await)
+                })
+                .await
+                .expect("mechanics fixture service and owner drain");
+            match caught {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+        .await
+}
+
+async fn run_agent_answer_fixture_with_history(
+    provider: Arc<FixtureProvider>,
+    cancellation: CancellationToken,
+    history: Vec<ChatMessage>,
+) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
+    use futures::FutureExt;
+
+    let workspace = tempfile::TempDir::new().expect("answer fixture workspace").keep();
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned Answer decision endpoint")
+        .retain_evidence_at(workspace.clone());
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+                .expect("answer fixture cleanup owner");
+            let caught = cleanup
+                .run(async {
+                    Ok(std::panic::AssertUnwindSafe(async {
+                        let mut history = history;
+                        let input = history
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == "user")
+                            .expect("source input")
+                            .content
+                            .clone();
+                        let admission = crate::agent::test_admission::AdmittedTurn::configured_answer(
+                            workspace.as_path(),
+                            &input,
+                            &endpoint,
+                        )
+                        .await;
+                        admission.assert_selected_specs(&[]);
+                        let result = crate::agent::turn_engine::run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: crate::agent::turn_contracts::ChatMode::Edit,
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: Some(admission.compaction()),
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider.as_ref(),
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry: Arc::new(Vec::new()),
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(workspace.clone()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: admission.memory_runtime_with_ingest(),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: Some(cancellation),
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await;
+                        let _ = admission.decision().context.terminal_execution_trace();
+                        (result, history)
+                    })
+                    .catch_unwind()
+                    .await)
+                })
+                .await
+                .expect("answer fixture service and owner drain");
+            match caught {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+        .await
 }
 
 fn message_roles(history: &[ChatMessage]) -> Vec<&str> {
@@ -927,18 +1054,19 @@ async fn step_7_1_same_overflow_fixture_characterizes_recovery_signals() {
     )
     .await;
     let agent_provider = Arc::new(FixtureProvider::new(overflow_then_final_script()));
-    let (agent_result, agent_history) = run_agent_fixture_with_history(
+    let (agent_result, agent_history) = run_agent_answer_fixture_with_history(
         Arc::clone(&agent_provider),
-        Vec::new(),
         CancellationToken::new(),
-        None,
-        None,
         overflow_history(),
     )
     .await;
 
     assert_eq!(chat_provider.stream_calls(), 2);
-    assert_eq!(agent_provider.traced_calls(), 2);
+    assert_eq!(
+        agent_provider.traced_calls(),
+        2,
+        "buffered engine result: {agent_result:?}; history: {agent_history:?}"
+    );
     assert!(chat_actions.iter().any(|action| matches!(
         action,
         Action::HistoryCompacted {

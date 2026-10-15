@@ -83,9 +83,7 @@ use crate::agent::turn_contracts::{ScopeContext, ToolCallNotification, is_tool_l
 use crate::agent::turn_engine::run_turn;
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
-use crate::channels::{
-    Channel, SendMessage, TerminalChannel, is_context_window_overflow_error, sanitize_channel_response,
-};
+use crate::channels::{Channel, SendMessage, TerminalChannel, sanitize_channel_response};
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, payload_error};
@@ -95,9 +93,8 @@ use crate::llm::route_decision::{
 };
 #[cfg(test)]
 use crate::memory::MemoryPrincipal;
-use crate::memory::{
-    CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryStoreMetadata, MemoryVisibility, MessageEventScope,
-};
+use crate::memory::{CompactionRunInput, MemoryStoreMetadata};
+use crate::memory::{Memory, MemoryCategory, MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::observability::ObserverEvent;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -7941,16 +7938,14 @@ Retry with a compatible model: /provider {shown} <model>",
         }
         let provider_started_at = chrono::Utc::now();
 
-        // ── Retry loop (context overflow recovery) ──
-        //
-        // Mirrors the retry strategy in channels/mod.rs process_channel_message:
-        //  - Context overflow: compact history and retry while compaction makes progress
+        // The shared turn engine owns context-overflow recovery. Chat projects
+        // its final outcome and does not start a second compaction/replay loop.
         //
         // There is deliberately no wall-clock budget around the turn. A chat turn
         // ends when it finishes, when the user cancels it, or when the stall
         // detector in `crate::agent::idle` finds it has stopped making progress.
         #[cfg(feature = "terminal-tui")]
-        let mut history_len_before_tools;
+        let history_len_before_tools;
 
         // S2-A refinement: split the coarse `Failed` variant so the Redux
         // dispatch path can distinguish user-driven cancellation from real
@@ -8651,6 +8646,9 @@ Retry with a compatible model: /provider {shown} <model>",
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         if preflight_budget.over_hard_limit && !collection_turn {
+            let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+            let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+            let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
@@ -8682,6 +8680,15 @@ Retry with a compatible model: /provider {shown} <model>",
                     "chat.history_compacted_preflight",
                 );
             }
+            persist_legacy_chat_compaction_audit(
+                mem.as_ref(),
+                &runtime_envelope,
+                &audit_source_history,
+                &summary_projection,
+                token_metadata,
+                "chat_preflight",
+            )
+            .await;
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
@@ -8719,7 +8726,7 @@ Retry with a compatible model: /provider {shown} <model>",
         );
 
         // Keep the large trace inline outside the small outcome discriminator.
-        let (turn_outcome, successful_trace) = loop {
+        let (turn_outcome, successful_trace) = {
             #[cfg(feature = "terminal-tui")]
             {
                 history_len_before_tools = history.len();
@@ -8780,7 +8787,7 @@ Retry with a compatible model: /provider {shown} <model>",
 
             match result {
                 // ── Success ───────────────────────────────────────
-                Ok((resp, trace)) => break (TurnOutcome::Success(resp), Some(trace)),
+                Ok((resp, trace)) => (TurnOutcome::Success(resp), Some(trace)),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
                 Err(ref e) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
@@ -8789,109 +8796,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     // S2-A: user-driven cancel — distinguished from real
                     // failures so the reducer emits `StreamCancelled` (no
                     // Error hook fan-out) instead of `StreamFailed`.
-                    break (TurnOutcome::Cancelled, None);
-                }
-                // ── Context window overflow → compact + retry ─────
-                Err(ref e) if is_context_window_overflow_error(e) => {
-                    let audit_source_history =
-                        original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-                    let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-                    let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
-                    let turns_before = history
-                        .len()
-                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
-                    let tokens_before = estimate_chat_history_tokens(&history);
-                    if let Some(patch) = build_chat_compaction_patch(
-                        &history,
-                        &persisted_history_for_turn,
-                        provider.as_ref(),
-                        model_name,
-                        &effective_compaction.config,
-                        memory_runtime.ingest(),
-                        "chat_context_overflow",
-                    )
-                    .await
-                    {
-                        apply_chat_compaction_patch_and_sync(
-                            &mut history,
-                            Some(&persisted_history_for_turn),
-                            patch,
-                            &effective_compaction.config,
-                            crate::chat::action::CompactReason::ContextOverflow,
-                            &chat_dispatcher,
-                        );
-                    } else {
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::HistoryCompacted {
-                                reason: crate::chat::action::CompactReason::ContextOverflow,
-                            },
-                            "chat.history_compacted_overflow",
-                        );
-                        compact_chat_history(&mut history);
-                    }
-                    persist_legacy_chat_compaction_audit(
-                        mem.as_ref(),
-                        &runtime_envelope,
-                        &audit_source_history,
-                        &summary_projection,
-                        token_metadata,
-                        "chat_context_overflow",
-                    )
-                    .await;
-                    let turns_after = history
-                        .len()
-                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
-                    let tokens_after = estimate_chat_history_tokens(&history);
-                    #[cfg(feature = "terminal-tui")]
-                    refresh_context_budget_for_tui(
-                        &history,
-                        &effective_compaction.config,
-                        redraw_tx_for_main.is_some(),
-                        &chat_mirror,
-                        &chat_dispatcher,
-                    );
-                    let compact_msg = format_compact_feedback(
-                        turns_before,
-                        turns_after,
-                        tokens_before,
-                        tokens_after,
-                        effective_compaction.config.max_context_tokens,
-                    );
-                    surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
-                    let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
-                    let made_progress = turns_after < turns_before || tokens_after < tokens_before;
-                    tracing::warn!(
-                        compacted_chars,
-                        made_progress,
-                        "Context window overflow, history compacted"
-                    );
-
-                    if made_progress {
-                        continue;
-                    }
-                    // A minimal history that still overflows cannot be repaired
-                    // by repeating the same operation.
-                    if let Some(ref d_id) = draft_id {
-                        let _ = terminal.cancel_draft("user", d_id).await;
-                    }
-                    eprintln!("\nError: context window exceeded and compaction made no progress: {e}\n");
-                    if plain_mode {
-                        plain_mode_turn_failed = true;
-                    }
-                    // Phase E (5a-4): same dual_write_guard reasoning as the timeout branch.
-                    if !dual_write_guard.is_active() {
-                        hooks
-                            .emit(
-                                HookEvent::Error,
-                                payload_error("chat-turn", "context-overflow-no-progress"),
-                            )
-                            .await;
-                    }
-                    // No-progress overflow is non-retryable.
-                    break (TurnOutcome::FailedWithError {
-                        err: "context-overflow-no-progress".to_string(),
-                        retryable: false,
-                    }, None);
+                    (TurnOutcome::Cancelled, None)
                 }
                 // ── Other errors ──────────────────────────────────
                 Err(e) => {
@@ -8912,10 +8817,13 @@ Retry with a compatible model: /provider {shown} <model>",
                     // S2-A: generic provider/loop error — retryable hint is
                     // false (the caller already chose to surface and continue;
                     // retry policy is owned by upstream once tooling lands).
-                    break (TurnOutcome::FailedWithError {
-                        err: err_text,
-                        retryable: false,
-                    }, None);
+                    (
+                        TurnOutcome::FailedWithError {
+                            err: err_text,
+                            retryable: false,
+                        },
+                        None,
+                    )
                 }
             }
         };

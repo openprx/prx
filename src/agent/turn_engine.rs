@@ -1433,6 +1433,11 @@ async fn run_turn_unguarded(
                                 Ok(None) => {
                                     let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                                     trim_history_to_context_budget(history, config);
+                                    if history.len() == messages_before_compaction
+                                        && estimate_history_tokens(history) >= tokens_before_compaction
+                                    {
+                                        apply_aggressive_trim(history, config.keep_recent_messages);
+                                    }
                                     if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
                                         let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                                         tracing::warn!(
@@ -1467,30 +1472,51 @@ async fn run_turn_unguarded(
                                     }
                                 }
                             }
-                        } else if let Err(error) = apply_configurable_compaction(
-                            history,
-                            provider,
-                            model,
-                            config,
-                            document_ingest.as_ref(),
-                            "overflow_retry",
-                        )
-                        .await
-                        {
-                            tracing::warn!("Overflow retry compaction failed: {error}");
-                            let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                            apply_aggressive_trim(history, config.keep_recent_messages);
-                            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                persist_context_switch_degradation(
-                                    document_ingest.as_ref(),
-                                    "overflow_retry",
-                                    "handoff_failed",
-                                    before_trim.used_tokens,
-                                    after_trim.used_tokens,
-                                    after_trim.available_input_tokens,
-                                )
-                                .await;
+                        } else {
+                            match apply_configurable_compaction(
+                                history,
+                                provider,
+                                model,
+                                config,
+                                document_ingest.as_ref(),
+                                "overflow_retry",
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        persist_context_switch_degradation(
+                                            document_ingest.as_ref(),
+                                            "overflow_retry",
+                                            "handoff_unavailable",
+                                            before_trim.used_tokens,
+                                            after_trim.used_tokens,
+                                            after_trim.available_input_tokens,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!("Overflow retry compaction failed: {error}");
+                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        persist_context_switch_degradation(
+                                            document_ingest.as_ref(),
+                                            "overflow_retry",
+                                            "handoff_failed",
+                                            before_trim.used_tokens,
+                                            after_trim.used_tokens,
+                                            after_trim.available_input_tokens,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                     } else {

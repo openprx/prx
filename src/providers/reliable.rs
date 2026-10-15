@@ -33,7 +33,7 @@ fn is_tool_schema_refusal(err: &anyhow::Error) -> bool {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
-    if is_context_window_exceeded(err) || is_tool_schema_refusal(err) {
+    if crate::recovery::overflow::is_context_overflow_error(err) || is_tool_schema_refusal(err) {
         return true;
     }
 
@@ -127,22 +127,6 @@ fn is_non_retryable_provider_response_parse_error(msg_lower: &str) -> bool {
     // Unknown parse kinds remain non-retryable by default to preserve
     // fail-fast behavior on deterministic payload/protocol mismatches.
     true
-}
-
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    let hints = [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ];
-
-    hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -1068,7 +1052,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1216,7 +1200,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1426,7 +1410,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1619,7 +1603,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1989,7 +1973,7 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
     }
     let anyhow_err = anyhow::anyhow!("{message}");
 
-    if is_context_window_exceeded(&anyhow_err) {
+    if crate::recovery::overflow::is_context_overflow_error(&anyhow_err) {
         return StreamFailureClass::ContextOverflow;
     }
     if is_non_retryable_rate_limit(&anyhow_err) {
