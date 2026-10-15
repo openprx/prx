@@ -373,7 +373,7 @@ impl VerifiedOperatorProcessPublication {
             anyhow::ensure!(
                 crate::tools::execution::decide_tool_execution(
                     security,
-                    &entry.public_name,
+                    entry.policy_tool_name(),
                     parent.policy_sender(),
                     parent.policy_channel(),
                     parent.policy_chat_type()

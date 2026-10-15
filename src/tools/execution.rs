@@ -184,7 +184,7 @@ impl ToolBackend for SharedRegistryToolAdapter {
             ToolAdapterKind::McpAlias
         } else if self.root_name == "wasm_plugin_call" {
             ToolAdapterKind::WasmPlugin
-        } else if self.root_name == "skill_execute" {
+        } else if self.root_name == "skill_execute" || self.root_name == "skill_read" && public_name != self.root_name {
             ToolAdapterKind::Skill
         } else {
             ToolAdapterKind::Native
@@ -281,7 +281,9 @@ impl ToolBackend for LegacyToolAdapter {
             ToolAdapterKind::McpAlias
         } else if self.tool.name() == "wasm_plugin_call" {
             ToolAdapterKind::WasmPlugin
-        } else if self.tool.name() == "skill_execute" {
+        } else if self.tool.name() == "skill_execute"
+            || self.tool.name() == "skill_read" && public_name != self.tool.name()
+        {
             ToolAdapterKind::Skill
         } else {
             ToolAdapterKind::Native
@@ -984,9 +986,14 @@ impl SecurityEffectPolicy {
 
 impl EffectPolicy for SecurityEffectPolicy {
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision {
+        let policy_name = if descriptor.adapter == ToolAdapterKind::Skill {
+            &descriptor.backend_name
+        } else {
+            &descriptor.public_name
+        };
         decide_tool_execution(
             self.policy.as_ref(),
-            &descriptor.public_name,
+            policy_name,
             context.sender(),
             context.channel(),
             &context.chat_type,
@@ -1390,7 +1397,7 @@ fn tool_descriptor(
     availability: CapabilityAvailability,
 ) -> ToolDescriptor {
     let adapter = adapter_kind(&spec.name);
-    let effect = if crate::security::policy::is_read_only_tool(&spec.name) {
+    let effect = if backend_name == "skill_read" || crate::security::policy::is_read_only_tool(&spec.name) {
         ToolEffect::Read
     } else {
         ToolEffect::Act

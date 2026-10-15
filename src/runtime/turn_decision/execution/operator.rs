@@ -29,7 +29,7 @@ impl OperatorChildPublication {
             .filter(|entry| {
                 crate::tools::execution::decide_tool_execution(
                     security,
-                    &entry.public_name,
+                    entry.policy_tool_name(),
                     source.policy_sender(),
                     source.policy_channel(),
                     source.policy_chat_type(),
@@ -80,7 +80,7 @@ impl OperatorChildPublication {
                     && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                     && crate::tools::execution::decide_tool_execution(
                         security,
-                        &entry.public_name,
+                        entry.policy_tool_name(),
                         source.policy_sender(),
                         source.policy_channel(),
                         source.policy_chat_type(),

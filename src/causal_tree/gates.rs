@@ -308,7 +308,7 @@ impl HardGates {
         for entry in entries.iter().flatten() {
             let decision = decide_tool_execution(
                 inputs.policy,
-                &entry.public_name,
+                entry.policy_tool_name(),
                 inputs.sender,
                 inputs.policy_channel,
                 inputs.chat_type,

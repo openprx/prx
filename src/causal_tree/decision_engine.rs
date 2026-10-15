@@ -1260,7 +1260,7 @@ fn validate_delegation_refs(
             || entry.availability.level < CapabilityAvailabilityLevel::Configured
             || trusted.excludes_entry(catalog.model_admission_entry(entry))
             || (trusted.channel.is_some() && !entry.channel_eligible)
-            || decide_tool_execution(policy, &entry.public_name, sender, policy_channel, chat_type)
+            || decide_tool_execution(policy, entry.policy_tool_name(), sender, policy_channel, chat_type)
                 == ToolExecutionDecision::Deny
         {
             return Err(EngineError::InvalidDelegation);

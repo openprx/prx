@@ -91,7 +91,7 @@ impl TurnDecisionService {
             || entry.availability.level < CapabilityAvailabilityLevel::Configured
             || crate::tools::execution::decide_tool_execution(
                 &self.security,
-                &entry.public_name,
+                entry.policy_tool_name(),
                 proof.policy_sender(),
                 proof.policy_channel(),
                 proof.policy_chat_type(),
@@ -183,7 +183,7 @@ impl CapabilitySearchAuthority {
                 })
                 && crate::tools::execution::decide_tool_execution(
                     &service.security,
-                    &entry.public_name,
+                    entry.policy_tool_name(),
                     self.proof.policy_sender(),
                     self.proof.policy_channel(),
                     self.proof.policy_chat_type(),

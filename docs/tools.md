@@ -148,10 +148,13 @@ always_include = ["memory_recall", "document_search"]
 
 Skill publication supplies metadata from the workspace catalog. Instruction
 bodies are loaded through an admitted `skill_read`; they are not injected merely
-because a skill was named previously. Memory enrichment likewise comes from
-selected Retrieve results rather than unconditional recall. Memory, Document
-and Session evidence retain distinct types and source-owned access scopes;
-see the [backend support matrix](decision-plane.md#candidate-memory-backend-support).
+because a skill was named previously. An exact Skill search hit is admitted
+under its catalog name and executes through the registered `skill_read` root
+after the same source, policy, generation and binding checks as other discovered
+capabilities. Memory enrichment likewise comes from selected Retrieve results
+rather than unconditional recall. Memory, Document and Session evidence retain
+distinct types and source-owned access scopes; see the
+[backend support matrix](decision-plane.md#candidate-memory-backend-support).
 
 IM channel sessions (Signal, Telegram, Discord, WhatsApp/wacli, Slack,
 Mattermost, iMessage, Matrix …) additionally run under `channel_exclude`, which

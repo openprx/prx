@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
 use crate::config::Config;
 use crate::runtime::RuntimeAdapter;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
@@ -131,9 +131,27 @@ pub struct SkillReadTool {
     config: Config,
 }
 
+pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> ToolSpec {
+    ToolSpec {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"name": {"const": skill.name}},
+            "required": ["name"]
+        }),
+    }
+}
+
 impl SkillReadTool {
     pub const fn new(workspace_dir: PathBuf, config: Config) -> Self {
         Self { workspace_dir, config }
+    }
+
+    fn metadata_for_name(&self, name: &str) -> Option<crate::skills::SkillMetadata> {
+        crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
+            .into_iter()
+            .find(|skill| skill.name == name)
     }
 
     fn resolve_target(&self, name: &str, resource_path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf, bool)> {
@@ -193,6 +211,38 @@ impl Tool for SkillReadTool {
             .into_iter()
             .map(|skill| (skill.name.clone(), crate::skills::catalog_skill_binding_digest(&skill)))
             .collect()
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        name == self.name() || self.metadata_for_name(name).is_some()
+    }
+
+    fn spec_for_name(&self, name: &str) -> Option<ToolSpec> {
+        if name == self.name() {
+            return Some(self.spec());
+        }
+        self.metadata_for_name(name).as_ref().map(catalog_skill_read_spec)
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if name == self.name() {
+            return self.execute(args).await;
+        }
+        let skill = self
+            .metadata_for_name(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown or disabled skill '{name}'"))?;
+        let mut arguments = args
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Skill read arguments must be an object"))?;
+        if let Some(requested) = arguments.get("name") {
+            anyhow::ensure!(
+                requested.as_str() == Some(skill.name.as_str()),
+                "Skill read alias and requested name differ"
+            );
+        }
+        arguments.insert("name".to_string(), serde_json::Value::String(skill.name));
+        self.execute(serde_json::Value::Object(arguments)).await
     }
 
     fn description(&self) -> &str {

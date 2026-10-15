@@ -397,3 +397,193 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
         }
     }
 }
+
+#[tokio::test]
+async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_execution() {
+    const SKILL_NAME: &str = "prx_skill";
+    const BODY_MARKER: &str = "PRX-SKILL-BODY-MARKER";
+
+    let workspace = tempfile::tempdir().unwrap();
+    let skill_dir = workspace.path().join("skills").join(SKILL_NAME);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {SKILL_NAME}\ndescription: Inspect release metadata\n---\n{BODY_MARKER}\n"),
+    )
+    .unwrap();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.skills.open_skills_dir = Some(
+        workspace
+            .path()
+            .join("missing-open-skills")
+            .to_string_lossy()
+            .to_string(),
+    );
+    config.skills.openclaw_skills_dir = Some(
+        workspace
+            .path()
+            .join("missing-openclaw-skills")
+            .to_string_lossy()
+            .to_string(),
+    );
+    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+    config.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(DiscoverySurfaceTool {
+            name: "file_read",
+            dispatches: Arc::clone(&dispatches),
+        }),
+        Box::new(crate::tools::SkillReadTool::new(
+            workspace.path().to_owned(),
+            config.clone(),
+        )),
+        Box::new(CapabilitySearchTool),
+    ]);
+    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+        Arc::clone(&registry),
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    ));
+    let provider_catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let mut service = build_turn_decision_service(
+        TurnSurfaceKind::AgentLoop,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry,
+            execution,
+            catalog_sources: sources(&generation, &config),
+            surface_policy: SurfacePolicy {
+                direct_names: BTreeSet::from(["file_read".to_owned()]),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &provider_catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .unwrap();
+    let owning = Arc::get_mut(&mut service).unwrap();
+    owning.factory = DecisionBackendFactory::from_slots(
+        vec![Box::new(ExecuteContextProbeBackend {
+            identity: BackendIdentity {
+                kind: BackendKind::Mock,
+                provider: None,
+                configured_model: Arc::from("prx-local-model"),
+            },
+            calls: Arc::new(AtomicUsize::new(0)),
+        })],
+        Arc::clone(&owning.state_key),
+        OutboundSecrets::default(),
+        SlotLimits::default(),
+    );
+    let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+        &generation,
+        Arc::clone(&memory),
+        "inspect the available release metadata capability",
+        "prx_skill_discovery",
+    )
+    .await;
+    let cancellation = CancellationToken::new();
+    let context = service
+        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .await
+        .unwrap();
+    assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+    let selected = service.agent_execution_specs(&proof, &context).unwrap();
+    assert_eq!(
+        selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+        ["file_read"]
+    );
+
+    let port = service.capability_search_port(&proof, &context).unwrap();
+    let result = with_search_authority(
+        Some(port),
+        CapabilitySearchTool.execute(serde_json::json!({"query": SKILL_NAME, "limit": 1})),
+    )
+    .await
+    .unwrap();
+    assert!(result.success);
+    assert!(
+        !result.output.contains(BODY_MARKER),
+        "discovery must keep the Skill body lazy"
+    );
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    let hit = output
+        .get("hits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|hits| hits.first())
+        .unwrap();
+    let schema = hit.get("schema").unwrap();
+    assert_eq!(schema.get("name").and_then(serde_json::Value::as_str), Some(SKILL_NAME));
+    assert_eq!(
+        schema.get("description").and_then(serde_json::Value::as_str),
+        Some("Inspect release metadata")
+    );
+
+    let proposal = service
+        .admit_discovered_tool(&proof, &context, SKILL_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.admission, crate::causal_tree::gates::GateOutcome::Passed);
+    let appended = service.agent_appended_execution_specs(&proof, &context).unwrap();
+    assert_eq!(
+        appended.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+        [SKILL_NAME]
+    );
+    let mut published = selected.specs;
+    published.extend(appended.specs);
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(proof.workspace_id(), proof.run_id())
+        .with_config_generation(&generation)
+        .with_source_message_event_id(proof.source_event_id().unwrap());
+    let execution_context =
+        crate::tools::ToolExecutionContext::new(envelope, "private").with_chat_id(proof.session_key());
+    let (executor, bound) = service
+        .bind_agent_execution(&proof, &context, &execution_context, &published)
+        .unwrap();
+    let outcome = executor
+        .execute(
+            crate::tools::ToolExecutionCommand::new(SKILL_NAME, serde_json::json!({"name": SKILL_NAME})),
+            bound,
+            Some(cancellation),
+        )
+        .await;
+    assert!(
+        outcome.succeeded(),
+        "discovered Skill execution failed: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.result.unwrap().output.contains(BODY_MARKER),
+        "the selected Skill body must load through skill_read"
+    );
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+    context.terminal_execution_trace();
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}

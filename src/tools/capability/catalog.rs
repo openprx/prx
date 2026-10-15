@@ -66,6 +66,17 @@ pub(crate) struct CapabilityEntry {
 }
 
 impl CapabilityEntry {
+    /// Name understood by the execution policy. Synthetic Skill and Node
+    /// entries dispatch through their registered root and inherit that root's
+    /// read/write classification; public names remain available for search,
+    /// exclusion and exact binding.
+    pub(crate) fn policy_tool_name(&self) -> &str {
+        match &self.target {
+            ExecutionTarget::Skill { root, .. } | ExecutionTarget::Node { root, .. } => root,
+            ExecutionTarget::Tool(_) | ExecutionTarget::Hook => &self.public_name,
+        }
+    }
+
     /// Project the actual execution target into the domain's Plan policy.
     /// Aliases/effect labels never substitute for the registered root.
     pub(crate) fn plan_intercepted(&self) -> bool {
@@ -342,11 +353,7 @@ impl CapabilityCatalog {
             insert(entry, &mut entries, &mut seen_names, &mut seen_ids)?;
         }
         for skill in &sources.skills {
-            let spec = ToolSpec {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                parameters: json!({"type":"object","properties":{"name":{"const":skill.name}},"required":["name"]}),
-            };
+            let spec = crate::tools::skills::catalog_skill_read_spec(skill);
             let mut entry = entry_from_spec(
                 spec,
                 "skill_read".to_string(),

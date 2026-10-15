@@ -205,7 +205,7 @@ impl TurnDecisionService {
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && crate::tools::execution::decide_tool_execution(
                     &self.security,
-                    &entry.public_name,
+                    entry.policy_tool_name(),
                     proof.policy_sender(),
                     proof.policy_channel(),
                     proof.policy_chat_type(),
