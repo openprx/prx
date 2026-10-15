@@ -4670,7 +4670,7 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
 /// A webhook turn must run its tool loop inside its own spawn boundary.
 ///
-/// `gateway::tests::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
+/// `gateway::tests::tool_surface::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
 /// pins what `within_gateway_turn_spawn_context` does; this pins that the
 /// shipped webhook turn still goes through it. Without this guard the seeding
 /// can be deleted from `run_gateway_chat_with_multimodal` -- or replaced by a
@@ -5217,7 +5217,7 @@ fn a_session_worker_selects_its_tools_through_its_manifest() {
 /// `prx gateway` each carried a symmetric copy of the same registration block,
 /// and only the daemon copy had tests, so a change to one silently gave the two
 /// launch modes different tool surfaces (independent audit 2026-09-16 §2.3).
-/// `gateway::tests::both_gateway_launch_paths_publish_the_same_tool_surface`
+/// `gateway::tests::tool_surface::both_gateway_launch_paths_publish_the_same_tool_surface`
 /// compares what the shared registrar produces; this pins that both entry points
 /// still go through it rather than growing a second registration of their own.
 #[test]
