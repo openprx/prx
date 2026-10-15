@@ -9810,21 +9810,25 @@ fn decision_http_clients_come_only_from_the_pinned_builder() {
 }
 
 /// AG-10 (SP-CDP-A 5.10): the decision store's database is named, and so
-/// opened, only by `causal_tree/store.rs` and its `store/` child modules.
+/// opened, only by `causal_tree/store.rs`. Its `store/` child modules are
+/// scanned like any other file; test-only files are empty production text.
 /// Comments may mention it.
 #[test]
 fn the_decision_store_database_is_opened_only_by_the_store() {
     const STORE: &str = "src/causal_tree/store.rs";
-    const STORE_DIR: &str = "src/causal_tree/store/";
+    const SCANNED_CHILDREN: [&str; 2] = [
+        "src/causal_tree/store/child_outcome.rs",
+        "src/causal_tree/store/child_recovery.rs",
+    ];
     let mut violations = Vec::new();
-    let mut store_files = 0_usize;
+    let mut scanned_children = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if relative == STORE || relative.starts_with(STORE_DIR) {
-            store_files += 1;
-        }
-        if !relative.starts_with("src/") || relative == STORE || relative.starts_with(STORE_DIR) {
+        if !relative.starts_with("src/") || relative == STORE {
             continue;
+        }
+        if SCANNED_CHILDREN.contains(&relative.as_str()) {
+            scanned_children += 1;
         }
         let production = strip_cfg_test_items(&read_source(&path));
         let names_the_database = production.lines().any(|line| {
@@ -9835,7 +9839,11 @@ fn the_decision_store_database_is_opened_only_by_the_store() {
             violations.push(relative);
         }
     }
-    assert!(store_files >= 3, "the decision store files are scanned: {store_files}");
+    assert_eq!(
+        scanned_children,
+        SCANNED_CHILDREN.len(),
+        "the store child modules must be scanned, not exempted"
+    );
     assert!(
         violations.is_empty(),
         "only the decision store opens decisions.db (AG-10): {violations:?}"
