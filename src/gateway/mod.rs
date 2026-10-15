@@ -8783,6 +8783,32 @@ for line in sys.stdin:
         }
     }
 
+    #[derive(Default)]
+    struct ReloadPinnedProvider {
+        calls: AtomicUsize,
+        first_started: Notify,
+        release_first: Notify,
+        models: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for ReloadPinnedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.models.lock().push(model.to_string());
+            assert_eq!(call_index, 0, "the pinned turn needs exactly one provider round");
+            self.first_started.notify_one();
+            self.release_first.notified().await;
+            Ok("reload-pinned".to_string())
+        }
+    }
+
     fn budget_webhook_state(
         tmp: &tempfile::TempDir,
         config: Config,
@@ -8840,6 +8866,102 @@ for line in sys.stdin:
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    /// A real webhook turn pins one runtime generation before admission and
+    /// keeps its provider, model and event scope through completion,
+    /// even when the gateway commits a replacement generation mid-request.
+    #[tokio::test]
+    async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
+        let tmp = tempfile::TempDir::new().expect("test: temp dir");
+        let config = budget_test_config(&tmp);
+        let old_provider_impl = Arc::new(ReloadPinnedProvider::default());
+        let old_provider: Arc<dyn Provider> = old_provider_impl.clone();
+        let (state, _) = budget_webhook_state(&tmp, config, old_provider, Vec::new(), None);
+        let event_state = state.clone();
+        let owner = Arc::clone(state.turn_runtime.as_ref().expect("test: turn runtime owner"));
+        let first_started = old_provider_impl.first_started.notified();
+        tokio::pin!(first_started);
+        let mut turn = tokio::spawn(post_budget_webhook(state, "hello across reload"));
+
+        tokio::select! {
+            () = &mut first_started => {}
+            result = &mut turn => panic!("the webhook ended before reaching its provider: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(15)) => {
+                turn.abort();
+                panic!("the webhook did not reach its provider within 15 seconds");
+            }
+        }
+        let previous = owner.current.load_full();
+        let replacement_provider_impl = Arc::new(MockProvider::default());
+        let replacement_provider: Arc<dyn Provider> = replacement_provider_impl.clone();
+        let config = previous.config_generation.effective.as_ref();
+        let provider_name = crate::providers::selection::default_provider(config);
+        let resolved = crate::providers::selection::check_with(
+            config,
+            &crate::providers::selection::catalog_for(config),
+            provider_name,
+            &previous.model,
+            crate::providers::selection::credential_for(config, provider_name),
+            &crate::providers::catalog::Requirement::chat(),
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: replacement provider binding");
+        let next_generation = Arc::new(crate::config::ConfigGeneration {
+            id: crate::config::ConfigGenerationId(previous.config_generation.id.0 + 1),
+            source_revision: previous.config_generation.source_revision.clone(),
+            effective: Arc::clone(&previous.config_generation.effective),
+            applied_at: chrono::Utc::now(),
+            trigger: crate::config::ConfigReloadTrigger::Test,
+            deferred_changes: Arc::from([]),
+        });
+        let mut replacement_slot = decision_runtime::GatewayDecisionSlot::new(
+            Arc::new(crate::security::SecurityPolicy::from_config(
+                &config.autonomy,
+                &config.workspace_dir,
+            )),
+            0,
+        );
+        replacement_slot.cleanup = Arc::clone(&owner.cleanup);
+        let mut prepared = PreparedGatewayTurnRuntime {
+            current: Arc::clone(&owner.current),
+            previous: Arc::clone(&previous),
+            generation: TurnRuntimeGeneration {
+                provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                    Arc::clone(&replacement_provider),
+                    resolved,
+                ))),
+                decision_slot: Arc::new(replacement_slot),
+                config_generation: Arc::clone(&next_generation),
+                provider: replacement_provider,
+                model: previous.model.clone(),
+                temperature: 0.9,
+                tools_registry: Arc::new(Vec::new()),
+                mcp_tool: None,
+            },
+        };
+        crate::config::PreparedConfigGeneration::commit(&mut prepared).expect("test: commit replacement runtime");
+        assert_eq!(owner.pin().config_generation.id, next_generation.id);
+        assert!(owner.pin().tools_registry.is_empty());
+
+        old_provider_impl.release_first.notify_one();
+        turn.await.expect("test: webhook task");
+
+        assert_eq!(old_provider_impl.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(old_provider_impl.models.lock().as_slice(), ["test-model"]);
+        assert_eq!(replacement_provider_impl.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.pin().config_generation.id, next_generation.id);
+        let events = all_workspace_message_events(&event_state, tmp.path()).await;
+        assert!(
+            events.iter().any(|event| event.event_type == "turn.finalized"),
+            "the in-flight turn must finish after the replacement commits"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.config_generation_id == Some(previous.config_generation.id.0)),
+            "every event from the admitted turn must retain generation zero: {events:?}"
+        );
     }
 
     /// The durable `llm.request.context.compiled` payloads of the turn, in
