@@ -37,13 +37,13 @@
 //! provider and checks the authorization headers observed on the wire.
 
 use base64::Engine as _;
-use openprx::memory::MemoryEventRecording;
+use openprx::memory::{Memory as _, MemoryEventRecording};
 use openprx::session_worker::protocol::{WorkerControlFrame, WorkerManifest, WorkerResult};
 use ring::hmac;
 use sha2::{Digest, Sha256};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 
 /// Exercise the real worker executable with a sealed route and an isolated
 /// loopback provider. The listener records headers from the OS child, while
@@ -52,20 +52,25 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     use openprx::providers::credentials::{CredentialRef, LegacySlot};
     use parking_lot::Mutex;
+    use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (_root, config_dir, workspace_dir, home) = worker_dirs();
+    let parent_workspace = config_dir.join("workspace");
+    let worker_workspace_root = workspace_dir.join("workers");
+    std::fs::create_dir_all(&worker_workspace_root).expect("worker workspace root");
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
     listener.set_nonblocking(true).expect("nonblocking loopback");
     let destination = format!("custom:http://{}/v1", listener.local_addr().expect("loopback address"));
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let nested_seen = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+    let seen = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
+    let captured = Arc::new(Mutex::new(BTreeMap::<String, WorkerManifest>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let server_seen = Arc::clone(&seen);
-    let server_nested_seen = Arc::clone(&nested_seen);
+    let server_captured = Arc::clone(&captured);
     let server_stop = Arc::clone(&stop);
+    let server_workspace_root = worker_workspace_root.clone();
     let server = std::thread::spawn(move || {
         while !server_stop.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -110,40 +115,43 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         buffer.extend_from_slice(&chunk[..read]);
                     }
                     let request_body = String::from_utf8_lossy(&buffer[head_end..]).to_string();
-                    server_seen.lock().push(head.clone());
-                    let nested_marker = [
-                        "PRX-NEST-PARENT",
-                        "PRX-NEST-ROUTE",
-                        "PRX-NEST-AGENT-DIRECT",
-                        "PRX-NEST-AGENT",
-                        "PRX-NEST-GRANDCHILD",
+                    let marker = [
+                        "PRX-ROUTE-PARENT",
+                        "PRX-AGENT-PARENT",
+                        "PRX-ROUTE-CHILD",
+                        "PRX-AGENT-CHILD",
                     ]
                     .into_iter()
-                    .find(|marker| request_body.contains(marker));
-                    if let Some(marker) = nested_marker {
-                        server_nested_seen
-                            .lock()
-                            .push((marker.to_string(), head.clone(), request_body.clone()));
+                    .find(|candidate| request_body.contains(candidate))
+                    .expect("fixture request marker");
+                    if !matches!(marker, "PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT") {
+                        let mut manifests = server_captured.lock();
+                        if !manifests.contains_key(marker) {
+                            manifests.insert(
+                                marker.to_string(),
+                                capture_live_worker_manifest(&server_workspace_root, marker),
+                            );
+                        }
                     }
-                    let nested_step = nested_marker.map(|marker| {
-                        server_nested_seen
-                            .lock()
-                            .iter()
-                            .filter(|(name, _, _)| name == marker)
-                            .count()
-                    });
-                    let assistant = match (nested_marker, nested_step) {
-                        (Some("PRX-NEST-PARENT"), Some(1)) => scripted_spawn_call(&serde_json::json!({
+                    let request_index = {
+                        let mut requests = server_seen.lock();
+                        requests.push(ProviderRequest {
+                            marker: marker.to_string(),
+                            head: head.clone(),
+                            body: request_body.clone(),
+                        });
+                        requests.iter().filter(|request| request.marker == marker).count()
+                    };
+                    let assistant = match (marker, request_index) {
+                        ("PRX-ROUTE-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-ROUTE-CHILD"]
+                        })),
+                        ("PRX-AGENT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
                             "action": "spawn_batch", "mode": "process", "tasks": [
-                                {"task": "PRX-NEST-ROUTE"},
-                                {"task": "PRX-NEST-AGENT", "agent": "prx_agent"},
-                                {"task": "PRX-NEST-AGENT-DIRECT", "agent": "prx_agent", "model": "probe-model"}
+                                {"task": "PRX-AGENT-CHILD", "agent": "prx_agent"}
                             ]
                         })),
-                        (Some("PRX-NEST-PARENT" | "PRX-NEST-ROUTE"), Some(2)) => scripted_join_call(&request_body),
-                        (Some("PRX-NEST-ROUTE"), Some(1)) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-NEST-GRANDCHILD"]
-                        })),
+                        ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT", 2) => scripted_join_call(&request_body),
                         _ => serde_json::json!({"role": "assistant", "content": "PRX-WORKER-OK"}),
                     };
                     let body = serde_json::json!({
@@ -155,8 +163,32 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                     })
                     .to_string();
+                    let (content_type, body) = if request_body.contains("\"stream\":true") {
+                        let (delta, finish_reason) = assistant.get("tool_calls").map_or_else(
+                            || (serde_json::json!({"content": assistant["content"]}), "stop"),
+                            |calls| {
+                                let mut calls = calls.as_array().expect("tool calls array").clone();
+                                for (index, call) in calls.iter_mut().enumerate() {
+                                    call["index"] = serde_json::json!(index);
+                                }
+                                (serde_json::json!({"tool_calls": calls}), "tool_calls")
+                            },
+                        );
+                        let chunk = serde_json::json!({
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                        });
+                        let finish = serde_json::json!({
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                        });
+                        (
+                            "text/event-stream",
+                            format!("data: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+                        )
+                    } else {
+                        ("application/json", body)
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     stream.write_all(response.as_bytes()).expect("loopback reply");
@@ -171,7 +203,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
 
     let mut config = openprx::config::Config {
         config_path: config_dir.join("config.toml"),
-        workspace_dir: workspace_dir.clone(),
+        workspace_dir,
         default_provider: Some(destination.clone()),
         default_model: Some("hint:fast".to_string()),
         api_key: Some("PRX-WORKER-ROOT-KEY".to_string()),
@@ -179,6 +211,9 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     };
     config.secrets.encrypt = false;
     config.sessions_spawn.process_memory_strategy = "isolated_private".to_string();
+    config.sessions_spawn.worker_workspace_root = Some(worker_workspace_root.to_string_lossy().into_owned());
+    config.sessions_spawn.cleanup_on_complete = false;
+    config.tool_tiering.always_include.push("sessions_spawn".to_string());
     config.model_routes.push(openprx::config::ModelRouteConfig {
         hint: "fast".to_string(),
         provider: destination.clone(),
@@ -186,49 +221,50 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         api_key: Some("PRX-WORKER-ROUTE-KEY".to_string()),
         credential_ref: None,
     });
-    std::fs::write(
-        &config.config_path,
-        toml::to_string_pretty(&config).expect("serialize isolated config"),
-    )
-    .expect("write isolated config");
-    let mut manifest = manifest_for(&config_dir, &workspace_dir);
-    manifest.provider_name = destination.clone();
-    manifest.model = "probe-model".to_string();
-    manifest.api_key = Some("PRX-WORKER-ROUTE-KEY".to_string());
-    manifest.route_hint = Some("fast".to_string());
-    manifest.route_source_provider = Some(destination);
-    manifest.route_credential = Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string())));
-    manifest.memory_strategy = Some("isolated_private".to_string());
-    manifest.memory_db_path = workspace_dir.join("worker.db");
-    manifest.worker_memory_db_path = Some(manifest.memory_db_path.clone());
-    manifest.allowed_tools.clear();
-    manifest.config_generation =
-        openprx::session_worker::protocol::config_source_generation(&config_dir).expect("config generation");
-    let expiry = far_future_expiry();
-    let capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(capability.clone());
-    let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
-    let mut stdin = take_stdin(&mut child);
-    write_line(
-        &mut stdin,
-        &serde_json::to_string(&manifest).expect("sealed manifest JSON"),
-    );
-    drop(stdin);
-    let run = finish(child, None);
-    let result = assert_single_json_line(&run.stdout);
-    assert!(run.status.success(), "worker exits cleanly: {:?}", run.status);
-    assert!(result.success, "worker result: {:?}", result.error);
-    let served_requests = seen.lock().len();
-    assert!(served_requests > 0, "worker must call the route destination");
+    add_provider_fixture_model(&mut config, &destination, "probe-model");
+    write_worker_config(&config);
 
-    manifest.run_id = "prx-tampered-route-key".to_string();
+    let route_output = run_model_parent(&config_dir, &home, "PRX-ROUTE-PARENT");
+    assert!(
+        route_output.status.success(),
+        "route parent stderr: {}",
+        String::from_utf8_lossy(&route_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&route_output.stdout).contains("PRX-WORKER-OK"));
+    assert_parent_join(&seen.lock(), "PRX-ROUTE-PARENT", 1);
+    let mut manifest = captured
+        .lock()
+        .get("PRX-ROUTE-CHILD")
+        .cloned()
+        .expect("production route manifest");
+    assert_authenticated_source(&manifest);
+    assert_sealed_child(&manifest, &seen.lock(), "PRX-ROUTE-CHILD");
+    assert_completion_journal(&parent_workspace, &manifest);
+    let served_requests = seen.lock().len();
+    assert!(
+        seen.lock()
+            .iter()
+            .filter(|request| request.marker == "PRX-ROUTE-CHILD")
+            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY"))
+    );
+
+    // Replay the genuine production-issued source with only the selected
+    // credential changed. A fresh outer HMAC cannot make that mutation match
+    // the authenticated model selection carried by the inner source.
+    assert_eq!(manifest.route_hint.as_deref(), Some("fast"));
+    assert_eq!(
+        manifest.route_credential,
+        Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string())))
+    );
     manifest.api_key = Some("PRX-WORKER-ROOT-KEY".to_string());
     manifest.parent_capability = None;
+    let sealed_config_dir = manifest.config_dir.clone();
+    let expiry = far_future_expiry();
     let bad_capability = worker_capability(&manifest, expiry);
     manifest.parent_capability = Some(bad_capability.clone());
-    let mut bad_child = spawn_worker(&config_dir, &home, Some((&bad_capability, expiry)));
+    let mut bad_child = spawn_worker(&sealed_config_dir, &home, Some((&bad_capability, expiry)));
     let mut bad_stdin = take_stdin(&mut bad_child);
-    write_line(
+    write_production_manifest_line(
         &mut bad_stdin,
         &serde_json::to_string(&manifest).expect("tampered manifest JSON"),
     );
@@ -236,6 +272,10 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let bad_run = finish(bad_child, None);
     let bad_result = assert_single_json_line(&bad_run.stdout);
     assert!(!bad_result.success, "wrong sealed key must be refused");
+    assert_eq!(
+        bad_result.error.as_deref(),
+        Some("worker provider or credential provenance differs from issued selection")
+    );
     assert_eq!(seen.lock().len(), served_requests);
 
     // A second worker inherits a named agent's profile on a same-provider
@@ -243,91 +283,64 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     // credential reference, not `agent_id`, is the source of authority.
     let profile = openprx::config::manage::credentials::CredentialReferences::for_config(&config)
         .expect("isolated credential store")
-        .set(&manifest.provider_name, "prx-agent-route", "PRX-WORKER-AGENT-KEY")
+        .set(&destination, "prx-agent-route", "PRX-WORKER-AGENT-KEY")
         .expect("store isolated agent credential");
-    config.model_routes[0].api_key = None;
-    config.agents.insert(
-        "prx_agent".to_string(),
-        toml::from_str(&format!(
-            "provider = \"{}\"\nmodel = \"hint:fast\"\ncredential_ref = \"{}\"\n",
-            manifest.provider_name, profile.id
-        ))
-        .expect("agent config"),
-    );
-    std::fs::write(
-        &config.config_path,
-        toml::to_string_pretty(&config).expect("serialize agent config"),
-    )
-    .expect("write agent config");
-    manifest.run_id = "prx-nested-agent-route".to_string();
-    manifest.api_key = Some("PRX-WORKER-AGENT-KEY".to_string());
-    manifest.route_credential = Some(CredentialRef::Profile { id: profile.id });
-    manifest.agent_id = None;
-    manifest.config_generation =
-        openprx::session_worker::protocol::config_source_generation(&config_dir).expect("agent config generation");
-    manifest.parent_capability = None;
-    let agent_capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(agent_capability.clone());
-    let mut agent_child = spawn_worker(&config_dir, &home, Some((&agent_capability, expiry)));
-    let mut agent_stdin = take_stdin(&mut agent_child);
-    write_line(
-        &mut agent_stdin,
-        &serde_json::to_string(&manifest).expect("agent manifest JSON"),
-    );
-    drop(agent_stdin);
-    let agent_run = finish(agent_child, None);
-    let agent_result = assert_single_json_line(&agent_run.stdout);
-    let agent_requests = seen.lock().len();
-
-    // The first manifest is sealed by the fixture. Every descendant is
-    // launched by the worker's production SessionsSpawnTool in process mode.
-    // The parent joins a batch containing an inherited route and an agent
-    // override, so it cannot finish before both descendants report results.
-    config.model_routes[0].api_key = Some("PRX-WORKER-ROUTE-KEY".to_string());
     config.model_routes.push(openprx::config::ModelRouteConfig {
         hint: "agent".to_string(),
-        provider: manifest.provider_name.clone(),
+        provider: destination.clone(),
         model: "agent-model".to_string(),
         api_key: None,
         credential_ref: None,
     });
-    config.agents.get_mut("prx_agent").expect("agent fixture").model = "hint:agent".to_string();
-    std::fs::write(
-        &config.config_path,
-        toml::to_string_pretty(&config).expect("serialize nested config"),
-    )
-    .expect("write nested config");
-    manifest.run_id = "prx-nested-process-parent".to_string();
-    manifest.task = "PRX-NEST-PARENT".to_string();
-    manifest.model = "probe-model".to_string();
-    manifest.api_key = Some("PRX-WORKER-ROUTE-KEY".to_string());
-    manifest.route_hint = Some("fast".to_string());
-    manifest.route_credential = Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string())));
-    manifest.config_generation =
-        openprx::session_worker::protocol::config_source_generation(&config_dir).expect("nested config generation");
-    manifest.parent_capability = None;
-    let nested_capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(nested_capability.clone());
-    let mut nested_child = spawn_worker(&config_dir, &home, Some((&nested_capability, expiry)));
-    let mut nested_stdin = take_stdin(&mut nested_child);
-    write_line(
-        &mut nested_stdin,
-        &serde_json::to_string(&manifest).expect("nested parent manifest JSON"),
+    add_provider_fixture_model(&mut config, &destination, "agent-model");
+    config.agents.insert(
+        "prx_agent".to_string(),
+        toml::from_str(&format!(
+            "provider = \"{destination}\"\nmodel = \"hint:agent\"\ncredential_ref = \"{}\"\n",
+            profile.id
+        ))
+        .expect("agent config"),
     );
-    drop(nested_stdin);
-    let nested_run = finish(nested_child, None);
-    let nested_result = assert_single_json_line(&nested_run.stdout);
+    write_worker_config(&config);
+    let agent_output = run_model_parent(&config_dir, &home, "PRX-AGENT-PARENT");
+    assert!(
+        agent_output.status.success(),
+        "agent parent stderr: {}",
+        String::from_utf8_lossy(&agent_output.stderr)
+    );
+    assert_parent_join(&seen.lock(), "PRX-AGENT-PARENT", 1);
+    let agent_manifest = captured
+        .lock()
+        .get("PRX-AGENT-CHILD")
+        .cloned()
+        .expect("production agent manifest");
+    assert_authenticated_source(&agent_manifest);
+    assert_sealed_child(&agent_manifest, &seen.lock(), "PRX-AGENT-CHILD");
+    assert_eq!(
+        agent_manifest.route_credential,
+        Some(CredentialRef::Profile { id: profile.id })
+    );
+    assert_completion_journal(&parent_workspace, &agent_manifest);
+    let agent_requests = seen.lock().len();
+
+    // Keep the physical refusal controls from the original contract. They
+    // replay a genuine production-issued source and change only the field the
+    // refusal names; neither direct invocation may reach the provider.
     let requests_before_missing_source = seen.lock().len();
-    manifest.run_id = "prx-nested-missing-source".to_string();
-    manifest.route_source_provider = None;
-    manifest.parent_capability = None;
-    let missing_source_capability = worker_capability(&manifest, expiry);
-    manifest.parent_capability = Some(missing_source_capability.clone());
-    let mut missing_source_child = spawn_worker(&config_dir, &home, Some((&missing_source_capability, expiry)));
+    let mut missing_source_manifest = agent_manifest;
+    missing_source_manifest.route_source_provider = None;
+    missing_source_manifest.parent_capability = None;
+    let missing_source_capability = worker_capability(&missing_source_manifest, expiry);
+    missing_source_manifest.parent_capability = Some(missing_source_capability.clone());
+    let mut missing_source_child = spawn_worker(
+        &missing_source_manifest.config_dir,
+        &home,
+        Some((&missing_source_capability, expiry)),
+    );
     let mut missing_source_stdin = take_stdin(&mut missing_source_child);
-    write_line(
+    write_production_manifest_line(
         &mut missing_source_stdin,
-        &serde_json::to_string(&manifest).expect("missing-source manifest JSON"),
+        &serde_json::to_string(&missing_source_manifest).expect("missing-source manifest JSON"),
     );
     drop(missing_source_stdin);
     let missing_source_run = finish(missing_source_child, None);
@@ -341,22 +354,14 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         bad_run.status
     );
     assert!(
-        agent_run.status.success(),
-        "agent worker exits cleanly: {:?}",
-        agent_run.status
-    );
-    assert!(agent_result.success, "agent worker result: {:?}", agent_result.error);
-    assert!(
-        nested_run.status.success(),
-        "nested parent exits cleanly: {:?}",
-        nested_run.status
-    );
-    assert!(nested_result.success, "nested parent result: {:?}", nested_result.error);
-    assert!(
         missing_source_run.status.success(),
         "refused missing-source worker exits cleanly"
     );
     assert!(!missing_source_result.success, "missing provenance must be refused");
+    assert_eq!(
+        missing_source_result.error.as_deref(),
+        Some("worker provider or credential provenance differs from issued selection")
+    );
     assert_eq!(
         requests.len(),
         requests_before_missing_source,
@@ -364,69 +369,251 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     );
     assert!(requests.len() > served_requests, "agent worker must call the route");
     assert!(
-        requests[..served_requests]
+        requests
             .iter()
-            .all(|head| head.contains("PRX-WORKER-ROUTE-KEY"))
+            .filter(|request| request.marker == "PRX-ROUTE-CHILD")
+            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY"))
     );
-    assert!(requests.iter().all(|head| !head.contains("PRX-WORKER-ROOT-KEY")));
     assert!(
-        requests[served_requests..agent_requests]
+        requests
             .iter()
-            .all(|head| head.contains("PRX-WORKER-AGENT-KEY"))
+            .all(|request| !request.head.contains("PRX-WORKER-ROOT-KEY"))
     );
-    let nested = nested_seen.lock();
-    assert!(nested.iter().any(|(name, _, _)| name == "PRX-NEST-PARENT"));
-    assert!(nested.iter().any(|(name, _, _)| name == "PRX-NEST-ROUTE"));
     assert!(
-        nested.iter().any(|(name, _, _)| name == "PRX-NEST-AGENT"),
-        "nested request sequence: {:?}",
-        nested.iter().map(|(name, _, _)| name).collect::<Vec<_>>()
-    );
-    assert!(nested.iter().any(|(name, _, _)| name == "PRX-NEST-AGENT-DIRECT"));
-    assert!(
-        nested.iter().any(|(name, _, _)| name == "PRX-NEST-GRANDCHILD"),
-        "nested request sequence: {:?}",
-        nested
+        requests
             .iter()
-            .map(|(name, _, body)| (name, &body[..body.len().min(250)]))
-            .collect::<Vec<_>>()
+            .filter(|request| request.marker == "PRX-AGENT-CHILD")
+            .all(|request| request.head.contains("PRX-WORKER-AGENT-KEY"))
     );
-    for (name, head, body) in nested.iter() {
-        let expected_key = if name.starts_with("PRX-NEST-AGENT") {
-            "PRX-WORKER-AGENT-KEY"
-        } else {
-            "PRX-WORKER-ROUTE-KEY"
-        };
-        assert!(head.contains(expected_key), "{name} wrong credential");
-        assert!(!head.contains("PRX-WORKER-ROOT-KEY"), "{name} got root credential");
-        let expected_model = if name == "PRX-NEST-AGENT" {
-            "agent-model"
-        } else {
-            "probe-model"
-        };
-        assert!(body.contains(expected_model), "{name} wrong model");
+    assert!(agent_requests > served_requests);
+}
+
+struct ProviderRequest {
+    marker: String,
+    head: String,
+    body: String,
+}
+
+fn capture_live_worker_manifest(worker_workspace_root: &Path, task: &str) -> WorkerManifest {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(runs) = std::fs::read_dir(worker_workspace_root) {
+            for run in runs.flatten() {
+                let Ok(file_type) = run.file_type() else { continue };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(run.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if !name.to_string_lossy().starts_with(".prx-worker-") {
+                        continue;
+                    }
+                    let path = entry.path().join("manifest.json");
+                    let Ok(bytes) = std::fs::read(path) else { continue };
+                    let Ok(manifest) = serde_json::from_slice::<WorkerManifest>(&bytes) else {
+                        continue;
+                    };
+                    if manifest.task == task {
+                        return manifest;
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live production manifest for {task} was not found"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    for marker in ["PRX-NEST-PARENT", "PRX-NEST-ROUTE"] {
-        let requests = nested.iter().filter(|(name, _, _)| name == marker).collect::<Vec<_>>();
-        assert!(requests.len() >= 3, "{marker} did not complete its batch join");
-        let request: serde_json::Value = serde_json::from_str(&requests[2].2).expect("post-join request JSON");
-        let joined = request["messages"]
-            .as_array()
-            .expect("post-join messages")
-            .iter()
-            .rev()
-            .find(|message| message["role"] == "tool")
-            .and_then(|message| message["content"].as_str())
-            .expect("join result content");
-        let summary: serde_json::Value = serde_json::from_str(joined).expect("join summary JSON");
-        let expected_total = if marker == "PRX-NEST-PARENT" { 3 } else { 1 };
-        assert_eq!(summary["total"], expected_total, "{marker} join total");
-        assert_eq!(summary["completed"].as_array().map(Vec::len), Some(expected_total));
-        assert_eq!(summary["failed"].as_array().map(Vec::len), Some(0));
-        assert_eq!(summary["killed"].as_array().map(Vec::len), Some(0));
-        assert_eq!(summary["no_result"].as_array().map(Vec::len), Some(0));
-        assert!(joined.contains("PRX-WORKER-OK"), "{marker} missing child output");
+}
+
+fn add_provider_fixture_model(config: &mut openprx::config::Config, provider: &str, model: &str) {
+    config.cost.prices.insert(
+        format!("{provider}/{model}"),
+        openprx::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    if !config
+        .providers
+        .models
+        .iter()
+        .any(|entry| entry.provider == provider && entry.model.as_deref() == Some(model))
+    {
+        config
+            .providers
+            .models
+            .push(openprx::config::schema::ProviderModelConfig {
+                provider: provider.to_string(),
+                model: Some(model.to_string()),
+                operations: Some(vec![openprx::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
     }
+}
+
+fn write_worker_config(config: &openprx::config::Config) {
+    std::fs::write(
+        &config.config_path,
+        toml::to_string_pretty(config).expect("serialize worker config"),
+    )
+    .expect("write worker config");
+}
+
+fn run_model_parent(config_dir: &Path, home: &Path, message: &str) -> Output {
+    let xdg_data = home.join("xdg-data");
+    let xdg_cache = home.join("xdg-cache");
+    let xdg_state = home.join("xdg-state");
+    let xdg_config = home.join("xdg-config");
+    for path in [&xdg_data, &xdg_cache, &xdg_state, &xdg_config] {
+        std::fs::create_dir_all(path).expect("isolated parent directory");
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
+        .arg("--config-dir")
+        .arg(config_dir)
+        .arg("chat")
+        .arg("--plain")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", xdg_data)
+        .env("XDG_CACHE_HOME", xdg_cache)
+        .env("XDG_STATE_HOME", xdg_state)
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("PRX_TUI", "0")
+        .env("NO_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("RUST_LOG", "off")
+        .env("SESSION_WORKER_SECRET", TEST_SECRET)
+        .env("OPENPRX_SESSION_WORKER_SECRET_PATH", home.join("session_worker.secret"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("model parent binary");
+    child
+        .stdin
+        .take()
+        .expect("model parent stdin")
+        .write_all(format!("Use sessions_spawn in process mode for {message}.\n/exit\n").as_bytes())
+        .expect("model parent script");
+    child.wait_with_output().expect("model parent output")
+}
+
+fn assert_authenticated_source(manifest: &WorkerManifest) {
+    assert_eq!(
+        usize::from(manifest.child_source.is_some())
+            + usize::from(manifest.ordinary_source.is_some())
+            + usize::from(manifest.operator_source.is_some()),
+        1,
+        "production parent must issue exactly one authenticated source"
+    );
+}
+
+fn assert_sealed_child(manifest: &WorkerManifest, requests: &[ProviderRequest], marker: &str) {
+    assert!(
+        manifest.allowed_tools.is_empty(),
+        "sealed child widened its explicit tool allowlist"
+    );
+    let request = requests
+        .iter()
+        .find(|request| request.marker == marker)
+        .expect("sealed child provider request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("sealed child request JSON");
+    assert!(
+        body["tools"].as_array().is_none_or(|tools| tools
+            .iter()
+            .all(|tool| tool.pointer("/function/name").and_then(serde_json::Value::as_str) != Some("sessions_spawn"))),
+        "sealed child published sessions_spawn"
+    );
+}
+
+fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
+    let owner = manifest.owner_id.as_deref().expect("worker owner");
+    let (workspace_id, key, event_type, evidence) = match (
+        &manifest.child_source,
+        &manifest.ordinary_source,
+        &manifest.operator_source,
+    ) {
+        (Some(source), None, None) => (
+            source.parent_constraints.workspace.as_str(),
+            format!("worker:{}:completion", manifest.run_id),
+            "worker.completion.confirmed",
+            "granted",
+        ),
+        (None, Some(source), None) => (
+            source.parent_constraints.workspace.as_str(),
+            format!("worker:{}:ordinary-completion", manifest.run_id),
+            "worker.ordinary.completion.confirmed",
+            "ordinary",
+        ),
+        (None, None, Some(source)) => (
+            source.publication.workspace.as_str(),
+            format!("worker:{}:operator-completion", manifest.run_id),
+            "worker.operator.completion.confirmed",
+            "operator",
+        ),
+        _ => panic!("completion journal requires exactly one authenticated source"),
+    };
+    assert_eq!(Path::new(workspace_id), workspace, "journal workspace lineage");
+    let memory = openprx::memory::SqliteMemory::new(workspace).expect("open parent completion memory");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("completion journal runtime");
+    let event = runtime
+        .block_on(memory.find_owned_message_event_by_idempotency_key(workspace_id, owner, &key))
+        .expect("completion journal lookup")
+        .expect("completion journal");
+    assert_eq!(event.event_type, event_type);
+    assert_eq!(event.run_id.as_deref(), Some(manifest.run_id.as_str()));
+    let result: WorkerResult = serde_json::from_str(event.raw_payload_json.as_deref().expect("completion payload"))
+        .expect("completion result");
+    assert!(result.success, "{evidence} completion result: {:?}", result.error);
+    let evidence_run_id = result
+        .completion_evidence
+        .as_ref()
+        .map(|value| value.run_id.as_str())
+        .or_else(|| result.ordinary_completion.as_ref().map(|value| value.run_id.as_str()))
+        .or_else(|| result.operator_completion.as_ref().map(|value| value.run_id.as_str()));
+    assert_eq!(evidence_run_id, Some(manifest.run_id.as_str()));
+}
+
+fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total: usize) {
+    let post_join = requests
+        .iter()
+        .filter(|request| request.marker == marker)
+        .nth(2)
+        .expect("parent post-join request");
+    let request: serde_json::Value = serde_json::from_str(&post_join.body).expect("parent post-join JSON");
+    let summary = request["messages"]
+        .as_array()
+        .expect("parent messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .expect("parent join summary");
+    assert_eq!(summary["total"], expected_total);
+    assert_eq!(summary["completed"].as_array().map(Vec::len), Some(expected_total));
+    assert_eq!(summary["failed"], serde_json::json!([]));
+    assert_eq!(summary["killed"], serde_json::json!([]));
+    assert_eq!(summary["no_result"], serde_json::json!([]));
 }
 
 fn scripted_spawn_call(arguments: &serde_json::Value) -> serde_json::Value {
@@ -445,7 +632,10 @@ fn scripted_spawn_call(arguments: &serde_json::Value) -> serde_json::Value {
 }
 
 fn scripted_join_call(request_body: &str) -> serde_json::Value {
-    let start = request_body.find("batch-").expect("spawn batch id in parent request");
+    let start = request_body.find("batch-").unwrap_or_else(|| {
+        let start = request_body.len().saturating_sub(4_000);
+        panic!("spawn batch id in parent request: {}", &request_body[start..])
+    });
     let batch_id = &request_body[start..start + 42];
     scripted_spawn_call(&serde_json::json!({"action": "join", "batch_id": batch_id}))
 }
@@ -601,6 +791,14 @@ fn write_line(stdin: &mut ChildStdin, line: &str) {
     stdin.write_all(line.as_bytes()).expect("write worker stdin line");
     stdin.write_all(b"\n").expect("write worker stdin newline");
     stdin.flush().expect("flush worker stdin");
+}
+
+fn write_production_manifest_line(stdin: &mut ChildStdin, line: &str) {
+    stdin
+        .write_all(line.as_bytes())
+        .expect("write production manifest line");
+    stdin.write_all(b"\n").expect("write production manifest newline");
+    stdin.flush().expect("flush production manifest");
 }
 
 fn steer_frame(message: &str) -> String {

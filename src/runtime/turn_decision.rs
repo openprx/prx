@@ -3426,6 +3426,8 @@ pub(crate) fn build_turn_decision_service(
 }
 
 #[cfg(test)]
+pub(crate) use tests::exact_call_approval::collection::exact_file_collection_for_review as run_chat_approval_contract_fixture;
+#[cfg(test)]
 pub(crate) use tests::with_worker_probe_manifest;
 
 #[cfg(test)]
@@ -3433,7 +3435,7 @@ mod tests {
     mod child_process;
     pub(crate) use child_process::worker_probe::with_manifest as with_worker_probe_manifest;
     mod discovery_surface;
-    mod exact_call_approval;
+    pub(crate) mod exact_call_approval;
     mod ledger_probe;
     mod performance;
     mod terminal_scope;

@@ -13,7 +13,15 @@ async fn fresh_chat_file_edit_collects_then_reviews_and_resumes_once() {
     Box::pin(exact_file_collection(true)).await;
 }
 
+pub(crate) async fn exact_file_collection_for_review(approved: bool) {
+    Box::pin(exact_file_collection_with_review(false, approved)).await;
+}
+
 async fn exact_file_collection(edit: bool) {
+    Box::pin(exact_file_collection_with_review(edit, true)).await;
+}
+
+async fn exact_file_collection_with_review(edit: bool, approved: bool) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = if edit { "file_edit" } else { "file_write" };
@@ -239,17 +247,49 @@ async fn exact_file_collection(edit: bool) {
                 .await
                 .is_err()
         );
-        service
-            .review_pending_decision_approval(owner, session, id, true)
+        let review = service
+            .review_pending_decision_approval(owner, session, id, approved)
             .await
             .unwrap();
+        let review = serde_json::to_value(review).unwrap();
+        assert_eq!(review.get("approved"), Some(&serde_json::json!(approved)));
+        assert_eq!(
+            review.get("grant_count"),
+            Some(&serde_json::json!(usize::from(approved)))
+        );
+        let resume_input = serde_json::json!({"decision_id":id.to_string()}).to_string();
+        if !approved {
+            let (denied_resume, _) = recorded_approval_source(
+                &generation,
+                Arc::clone(&memory),
+                &resume_input,
+                ChatMode::Edit,
+                "prx_approval_denied_resume",
+                20,
+            )
+            .await;
+            assert!(
+                service
+                    .decide_agent_resume(denied_resume.as_ref(), AgentTurnKind::Repl, &cancel)
+                    .await
+                    .is_err(),
+                "a denied review must not produce executable resume authority"
+            );
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+            assert_unmodified();
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("prx-unrelated.txt")).unwrap(),
+                "unrelated contents"
+            );
+            assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+            return;
+        }
         assert!(
             service
                 .prepare_decision_resume(owner, session, id, ToolExecutionCommand::new(tool_name, altered))
                 .await
                 .is_err()
         );
-        let resume_input = serde_json::json!({"decision_id":id.to_string()}).to_string();
 
         let (plan, plan_envelope) = recorded_approval_source(
             &generation,
