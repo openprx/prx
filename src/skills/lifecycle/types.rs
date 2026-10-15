@@ -46,6 +46,23 @@ pub enum LifecycleError {
     RevisionNotFound(String),
     #[error("record {path} is invalid: {reason}")]
     InvalidRecord { path: PathBuf, reason: String },
+    #[error("stale generation for skill {skill}: expected {expected}, active is {actual}")]
+    StaleGeneration { skill: String, expected: u64, actual: u64 },
+    #[error("transaction {transaction_id} conflicts with an earlier request that used the same id")]
+    TransactionConflict { transaction_id: String },
+    #[error("transaction {transaction_id} did not commit (state {state}); use a new transaction id")]
+    TransactionNotCommitted {
+        transaction_id: String,
+        state: &'static str,
+    },
+    #[error("rollback target {0} was never published for this skill")]
+    RollbackTargetUnknown(String),
+    #[error("revision {0} is already the active revision")]
+    RevisionAlreadyActive(String),
+    #[error("transaction {transaction_id} is committed but needs repair or recovery: {reason}")]
+    CommittedRepairRequired { transaction_id: String, reason: String },
+    #[error("timed out waiting for publication lock {path}")]
+    LockTimeout { path: PathBuf },
     #[error("i/o error at {path}: {source}")]
     Io {
         path: PathBuf,

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{basic_entries, entry, md};
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, BundleError, MAX_BUNDLE_COMPONENT_BYTES, MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES,
