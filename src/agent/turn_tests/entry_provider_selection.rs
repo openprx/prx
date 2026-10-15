@@ -579,7 +579,13 @@ async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
             // of the CLI routed entry, with the same non-vacuous legacy control.
             let catalog = crate::providers::selection::catalog_for(&config);
             let (typed, typed_counts) = crate::providers::credential_resolution_observation::observe(|| {
-                crate::providers::create_provider_for(&choice.resolved, &catalog, &config.reliability, &options)
+                crate::providers::create_provider_for(
+                    &choice.resolved,
+                    &catalog,
+                    &config.reliability,
+                    &config.cost,
+                    &options,
+                )
             });
             let typed = typed.expect("typed resolved construction");
             let reply = tokio::time::timeout(

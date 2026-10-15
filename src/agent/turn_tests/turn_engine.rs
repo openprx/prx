@@ -3293,6 +3293,227 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
     );
 }
 
+/// One member of the finding-40 fallback chain. Every member records whether
+/// the real turn sent tool definitions; only the primary returns a 429. The
+/// two fallback members would answer successfully if the reliability loop
+/// reached their transports.
+struct FallbackAdmissionMember {
+    calls: Arc<AtomicUsize>,
+    saw_tools: Arc<std::sync::atomic::AtomicBool>,
+    native_tools: bool,
+    rate_limited: bool,
+}
+
+#[async_trait]
+impl Provider for FallbackAdmissionMember {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: self.native_tools,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("chat_with_system unused in fallback admission test")
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_tools
+            .store(request.tools.is_some_and(|tools| !tools.is_empty()), Ordering::SeqCst);
+        if self.rate_limited {
+            anyhow::bail!("API error (429): rate limited")
+        }
+        Ok(ChatResponse {
+            text: Some("fallback should not serve".to_string()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+/// Finding 40: fallback members cannot escape the price and native-tool
+/// requirements that admitted the primary. This uses the real `run_turn`
+/// request: the primary receives published tool definitions and returns 429;
+/// an unpriced native-tools fallback and a priced tool-less fallback are both
+/// refused before their transports run.
+#[tokio::test]
+async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
+    const PRIMARY: &str = "custom:http://127.0.0.1:41/v1";
+    const UNPRICED: &str = "custom:http://127.0.0.1:42/v1";
+    const TOOL_LESS: &str = "custom:http://127.0.0.1:43/v1";
+    const MODEL: &str = "fallback-admission-model";
+
+    let tmp = TempDir::new().expect("fallback admission workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = tmp.path().to_path_buf();
+    config.reliability.provider_retries = 0;
+    config.reliability.provider_backoff_ms = 1;
+    config.reliability.fallback_providers = vec![UNPRICED.to_string(), TOOL_LESS.to_string()];
+    for (provider, native_tools) in [(PRIMARY, true), (UNPRICED, true), (TOOL_LESS, false)] {
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": provider,
+                "model": MODEL,
+                "operations": ["chat"],
+                "native_tools": native_tools,
+            }))
+            .expect("fallback admission model declaration"),
+        );
+    }
+    for provider in [PRIMARY, TOOL_LESS] {
+        config.cost.prices.insert(
+            format!("{provider}/{MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
+
+    let catalog = crate::providers::catalog::CatalogView::from_config(&config);
+    let resolved = crate::providers::selection::check(
+        &config,
+        PRIMARY,
+        MODEL,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    )
+    .expect("primary chat selection resolves");
+    let fallback_admission =
+        crate::providers::fallback_admission_for(&resolved, &catalog, &config.reliability, &config.cost);
+
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let unpriced_calls = Arc::new(AtomicUsize::new(0));
+    let tool_less_calls = Arc::new(AtomicUsize::new(0));
+    let primary_saw_tools = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let chain = crate::providers::reliable::ReliableProvider::new(
+        vec![
+            (
+                PRIMARY.to_string(),
+                Box::new(FallbackAdmissionMember {
+                    calls: Arc::clone(&primary_calls),
+                    saw_tools: Arc::clone(&primary_saw_tools),
+                    native_tools: true,
+                    rate_limited: true,
+                }) as Box<dyn Provider>,
+            ),
+            (
+                UNPRICED.to_string(),
+                Box::new(FallbackAdmissionMember {
+                    calls: Arc::clone(&unpriced_calls),
+                    saw_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    native_tools: true,
+                    rate_limited: false,
+                }),
+            ),
+            (
+                TOOL_LESS.to_string(),
+                Box::new(FallbackAdmissionMember {
+                    calls: Arc::clone(&tool_less_calls),
+                    saw_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    native_tools: false,
+                    rate_limited: false,
+                }),
+            ),
+        ],
+        0,
+        1,
+    )
+    .with_fallback_admission(fallback_admission);
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(vec![Box::new(MinimumSchemaTool {
+        executions: Arc::clone(&executions),
+    })]);
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("fallback admission memory"));
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("Use file_read.")];
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
+        config,
+        &history.last().expect("source input").content,
+        Arc::clone(&tools_registry),
+        memory,
+        (PRIMARY, MODEL),
+    )
+    .await;
+    let expected_specs = tool_specs_of(&tools_registry)
+        .into_iter()
+        .filter(|spec| spec.name != "capability_search")
+        .collect::<Vec<_>>();
+    admission.assert_core_specs(&expected_specs);
+
+    let error = run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "cli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: &chain,
+            provider_name: PRIMARY,
+            model: MODEL,
+            temperature: 0.0,
+            tools_registry,
+            observer: &NoopObserver,
+            hooks: &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admission.adapter()),
+            memory: admission.memory_runtime(),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .expect_err("no fallback may escape the primary's admission requirements");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("no valid price is configured"), "{rendered}");
+    assert!(rendered.contains("NativeTools is not verified"), "{rendered}");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1, "the primary is attempted once");
+    assert!(
+        primary_saw_tools.load(Ordering::SeqCst),
+        "the real turn published tools"
+    );
+    assert_eq!(
+        unpriced_calls.load(Ordering::SeqCst),
+        0,
+        "the unpriced fallback must not execute"
+    );
+    assert_eq!(
+        tool_less_calls.load(Ordering::SeqCst),
+        0,
+        "the tool-less fallback must not execute"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "no tool call was returned or executed"
+    );
+}
+
 #[inline(never)]
 fn q79_boxed_fixture_work<'a, F: std::future::Future + 'a>(
     work: F,

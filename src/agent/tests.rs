@@ -703,6 +703,7 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
         &resolved,
         &model_catalog,
         &config.reliability,
+        &config.cost,
         &crate::providers::provider_runtime_options_from_config(&config),
     )?);
     let spawn = SessionsSpawnTool::new(

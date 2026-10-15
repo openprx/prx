@@ -1035,6 +1035,7 @@ mod tests {
                 &resolved,
                 &catalog,
                 &reliability,
+                &config.cost,
                 &crate::providers::ProviderRuntimeOptions::default(),
             )
             .expect("test: exact route provider builds");

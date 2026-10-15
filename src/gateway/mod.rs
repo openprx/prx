@@ -1539,6 +1539,7 @@ fn build_gateway_turn_provider(
         &resolved,
         &catalog,
         &config.reliability,
+        &config.cost,
         options,
     )?);
     let model = resolved.model().to_owned();

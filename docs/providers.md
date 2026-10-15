@@ -176,6 +176,13 @@ then build with their existing credential-scoped chains, so this refusal is
 reached only through `create_provider_for`; it becomes a start-up refusal for
 each surface that switches its construction to it.
 
+At failover time, every fallback pair is checked against the primary turn's
+admission facts before a request is sent. A fallback needs a valid cost entry
+(except the existing local Ollama zero-cost case), and a turn that published
+native tools skips any fallback whose exact model lacks verified native-tool
+support. A rate-limited primary therefore cannot move the request onto an
+unpriced or tool-less fallback.
+
 ## Streaming failure rules
 
 A streamed reply is used only if it ended the way the provider's protocol says

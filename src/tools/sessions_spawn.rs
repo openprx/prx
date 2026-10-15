@@ -5508,7 +5508,14 @@ impl SessionsSpawnTool {
                 fallback_providers: Vec::new(),
                 ..provider_reliability.clone()
             };
-            providers::create_provider_for(resolved, child_model_catalog, &reliability, provider_options).map(Arc::from)
+            providers::create_provider_for(
+                resolved,
+                child_model_catalog,
+                &reliability,
+                &child_model_config.cost,
+                provider_options,
+            )
+            .map(Arc::from)
         } else {
             match task_provider_plan {
                 ChildProvider::Root => {
@@ -5529,6 +5536,7 @@ impl SessionsSpawnTool {
                         &resolved,
                         child_model_catalog,
                         provider_reliability,
+                        &child_model_config.cost,
                         provider_options,
                     )
                     .map(Arc::from)
@@ -12459,7 +12467,7 @@ mod tests {
                     &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
                     crate::providers::catalog::UnknownPolicy::Invocation)?;
                 let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
-                    &resolved, &model_catalog, &config.reliability, &crate::providers::provider_runtime_options_from_config(config),
+                    &resolved, &model_catalog, &config.reliability, &config.cost, &crate::providers::provider_runtime_options_from_config(config),
                 )?);
                 let (channel, _) = NamedRecordingChannel::new("terminal");
                 let tool = SessionsSpawnTool::new(
@@ -17688,6 +17696,7 @@ mod tests {
             &selected,
             &catalog,
             &config.reliability,
+            &config.cost,
             &providers::ProviderRuntimeOptions::default(),
         )
         .expect("test: routed provider builds");
@@ -17748,6 +17757,7 @@ mod tests {
             &selected,
             &catalog,
             &config.reliability,
+            &config.cost,
             &providers::ProviderRuntimeOptions::default(),
         )
         .expect("test: routed provider builds");

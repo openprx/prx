@@ -177,7 +177,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         // Construct through the same production factory, without issuing a send.
         let prepared_provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
             &resolved, &crate::providers::selection::catalog_for(&config),
-            &config.reliability, &crate::providers::provider_runtime_options_from_config(&config),
+            &config.reliability, &config.cost, &crate::providers::provider_runtime_options_from_config(&config),
         ).expect("actual PMM loopback provider factory"));
         assert!(prepared_provider.capabilities_for(
             MODEL, crate::providers::traits::ProviderRequestMode::NonStreaming,

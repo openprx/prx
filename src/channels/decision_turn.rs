@@ -109,6 +109,7 @@ impl ChannelDecisionTurn {
             &resolved,
             &catalog,
             &self.config.reliability,
+            &self.config.cost,
             &crate::providers::provider_runtime_options_from_config(&self.config),
         )?;
         Ok((

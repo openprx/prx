@@ -673,7 +673,7 @@ mod tests {
                         &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
                         crate::providers::catalog::UnknownPolicy::Invocation)?;
                     let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_provider_for(
-                        &resolved, &catalog, &config.reliability, &crate::providers::provider_runtime_options_from_config(config),
+                        &resolved, &catalog, &config.reliability, &config.cost, &crate::providers::provider_runtime_options_from_config(config),
                     )?);
                     let security = Arc::new(crate::security::SecurityPolicy { workspace_dir:workspace.to_path_buf(), ..Default::default() });
                     let memory: Arc<dyn crate::memory::Memory> = Arc::new(SqliteMemory::new(workspace)?);

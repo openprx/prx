@@ -125,6 +125,7 @@ fn factory(config: &Config) -> Arc<dyn Provider> {
             &selection,
             &providers::selection::catalog_for(config),
             &config.reliability,
+            &config.cost,
             &providers::provider_runtime_options_from_config(config),
         )
         .expect("fixture real provider factory"),

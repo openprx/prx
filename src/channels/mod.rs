@@ -2039,7 +2039,7 @@ fn build_channel_hint_provider(
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )?;
-    let provider = providers::create_provider_for(&resolved, &catalog, &config.reliability, options)?;
+    let provider = providers::create_provider_for(&resolved, &catalog, &config.reliability, &config.cost, options)?;
     let route = ChannelRouteSelection {
         provider: resolved.provider_label().to_string(),
         model: resolved.model().to_string(),
@@ -11263,6 +11263,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             &resolved,
                             &catalog,
                             &config.reliability,
+                            &config.cost,
                             &providers::provider_runtime_options_from_config(&config),
                         )
                         .expect("real channel provider factory"),

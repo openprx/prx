@@ -342,7 +342,107 @@ struct ChainMember {
     /// differ only in URL userinfo print the same, but are two providers.
     /// In-process only: never printed, recorded or persisted.
     key: Arc<str>,
+    /// Canonical provider identity used only for admission comparisons. Its
+    /// raw form may contain URL userinfo, so it is never printed.
+    id: super::ProviderId,
     provider: Arc<dyn Provider>,
+}
+
+/// The gate facts for one fallback provider/model pair.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FallbackEligibility {
+    pub(crate) cost_admitted: bool,
+    pub(crate) native_tools: bool,
+}
+
+/// Admission facts pinned when a resolver-built provider chain is created.
+///
+/// The primary pair already passed G6/G7. Every other pair must be present in
+/// this map before the reliability loop may send it a request.
+#[derive(Debug, Clone)]
+pub(crate) struct FallbackAdmission {
+    primary_provider: super::ProviderId,
+    primary_model: String,
+    candidates: HashMap<(super::ProviderId, String), FallbackEligibility>,
+}
+
+impl FallbackAdmission {
+    pub(crate) fn new(primary_provider: super::ProviderId, primary_model: impl Into<String>) -> Self {
+        Self {
+            primary_provider,
+            primary_model: primary_model.into(),
+            candidates: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        provider: super::ProviderId,
+        model: impl Into<String>,
+        eligibility: FallbackEligibility,
+    ) {
+        self.candidates.insert((provider, model.into()), eligibility);
+    }
+
+    fn eligibility(&self, provider: &super::ProviderId, model: &str) -> Option<FallbackEligibility> {
+        if provider == &self.primary_provider && model == self.primary_model {
+            return Some(FallbackEligibility {
+                cost_admitted: true,
+                native_tools: true,
+            });
+        }
+        self.candidates.get(&(provider.clone(), model.to_string())).copied()
+    }
+
+    fn refusal(
+        &self,
+        provider: &super::ProviderId,
+        display_provider: &str,
+        model: &str,
+        requires_native_tools: bool,
+    ) -> Option<FallbackAdmissionError> {
+        let Some(eligibility) = self.eligibility(provider, model) else {
+            return Some(FallbackAdmissionError::new(
+                display_provider,
+                model,
+                "pair was not admitted with the resolved chain",
+            ));
+        };
+        if !eligibility.cost_admitted {
+            return Some(FallbackAdmissionError::new(
+                display_provider,
+                model,
+                "no valid price is configured",
+            ));
+        }
+        if requires_native_tools && !eligibility.native_tools {
+            return Some(FallbackAdmissionError::new(
+                display_provider,
+                model,
+                "NativeTools is not verified",
+            ));
+        }
+        None
+    }
+}
+
+/// A fallback rejected locally before any transport starts.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("fallback provider '{provider}' model '{model}' refused before transport: {reason}")]
+pub(crate) struct FallbackAdmissionError {
+    provider: String,
+    model: String,
+    reason: &'static str,
+}
+
+impl FallbackAdmissionError {
+    fn new(provider: &str, model: &str, reason: &'static str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reason,
+        }
+    }
 }
 
 /// The key a chain member's refusals and rate-limit cool-down are kept under.
@@ -466,6 +566,9 @@ pub struct ReliableProvider {
     base_backoff_ms: u64,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Per-fallback G6/G7 facts for resolver-built chains. Legacy factories
+    /// leave this absent and retain their historical behavior.
+    fallback_admission: Option<FallbackAdmission>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
     unavailable_providers: Vec<(String, String)>,
     /// Per-provider cool-down learned from upstream 429/503 responses.
@@ -496,6 +599,7 @@ impl ReliableProvider {
                 ChainMember {
                     name,
                     key,
+                    id: super::ProviderId::of(&label),
                     provider: Arc::from(provider),
                 }
             })
@@ -505,6 +609,7 @@ impl ReliableProvider {
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
             model_fallbacks: HashMap::new(),
+            fallback_admission: None,
             unavailable_providers: Vec::new(),
             rate_limit_gate: Arc::new(RateLimitGate::new()),
         }
@@ -520,6 +625,13 @@ impl ReliableProvider {
     /// Set per-model fallback chains.
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
+        self
+    }
+
+    /// Attach the G6/G7 facts pinned by the resolver-built factory.
+    #[must_use]
+    pub(crate) fn with_fallback_admission(mut self, admission: FallbackAdmission) -> Self {
+        self.fallback_admission = Some(admission);
         self
     }
 
@@ -605,6 +717,18 @@ impl ReliableProvider {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
         chain
+    }
+
+    fn fallback_refusal(
+        &self,
+        provider: &super::ProviderId,
+        display_provider: &str,
+        model: &str,
+        requires_native_tools: bool,
+    ) -> Option<FallbackAdmissionError> {
+        self.fallback_admission
+            .as_ref()
+            .and_then(|admission| admission.refusal(provider, display_provider, model, requires_native_tools))
     }
 
     /// Emit rate-limit telemetry, publish the cool-down to the shared gate and
@@ -721,6 +845,9 @@ impl Provider for ReliableProvider {
         for current_model in self.model_chain(model) {
             for member in &self.providers {
                 if self.provider_model_compatible(&member.name, current_model, model)
+                    && self
+                        .fallback_refusal(&member.id, &member.name, current_model, false)
+                        .is_none()
                     && let Some(descriptor) = member.provider.accounting_targets(current_model)
                 {
                     targets.append_member(descriptor, &member.name);
@@ -735,6 +862,40 @@ impl Provider for ReliableProvider {
     }
 
     fn capabilities_for(&self, model: &str, mode: ProviderRequestMode) -> ProviderCapabilities {
+        if self.fallback_admission.is_some() {
+            let mut viable = Vec::new();
+            let mut native_viable = Vec::new();
+            for current_model in self.model_chain(model) {
+                for member in &self.providers {
+                    if !self.provider_model_compatible(&member.name, current_model, model)
+                        || (mode == ProviderRequestMode::Streaming && !member.provider.supports_streaming())
+                        || self
+                            .fallback_refusal(&member.id, &member.name, current_model, false)
+                            .is_some()
+                    {
+                        continue;
+                    }
+                    let capabilities = member.provider.capabilities_for(current_model, mode);
+                    viable.push(capabilities.clone());
+                    if self
+                        .fallback_refusal(&member.id, &member.name, current_model, true)
+                        .is_none()
+                    {
+                        native_viable.push(capabilities);
+                    }
+                }
+            }
+            let vision = viable
+                .first()
+                .is_some_and(|first| first.vision && viable.iter().all(|next| next.vision));
+            let native_tool_calling = native_viable.first().is_some_and(|first| {
+                first.native_tool_calling && native_viable.iter().all(|next| next.native_tool_calling)
+            });
+            return ProviderCapabilities {
+                native_tool_calling,
+                vision,
+            };
+        }
         let mut matched = self
             .providers
             .iter()
@@ -777,6 +938,17 @@ impl Provider for ReliableProvider {
     /// when they agree, `Raw` when they do not.
     fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
         let models = self.model_chain(model);
+        if self.fallback_admission.is_some() {
+            return super::traits::unanimous_dialect(self.providers.iter().flat_map(|member| {
+                models
+                    .iter()
+                    .filter(move |candidate| {
+                        self.fallback_refusal(&member.id, &member.name, candidate, true)
+                            .is_none()
+                    })
+                    .map(move |candidate| member.provider.tool_schema_dialect_for(candidate))
+            }));
+        }
         super::traits::unanimous_dialect(self.providers.iter().flat_map(|member| {
             models
                 .iter()
@@ -827,6 +999,7 @@ impl Provider for ReliableProvider {
             for ChainMember {
                 name: provider_name,
                 key: member_key,
+                id: provider_id,
                 provider,
             } in &self.providers
             {
@@ -835,6 +1008,10 @@ impl Provider for ReliableProvider {
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
                     ));
+                    continue;
+                }
+                if let Some(refusal) = self.fallback_refusal(provider_id, provider_name, current_model, false) {
+                    runtime_unavailable.push((provider_name.to_string(), refusal.to_string()));
                     continue;
                 }
 
@@ -973,6 +1150,7 @@ impl Provider for ReliableProvider {
             for ChainMember {
                 name: provider_name,
                 key: member_key,
+                id: provider_id,
                 provider,
             } in &self.providers
             {
@@ -981,6 +1159,10 @@ impl Provider for ReliableProvider {
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
                     ));
+                    continue;
+                }
+                if let Some(refusal) = self.fallback_refusal(provider_id, provider_name, current_model, false) {
+                    runtime_unavailable.push((provider_name.to_string(), refusal.to_string()));
                     continue;
                 }
 
@@ -1131,6 +1313,7 @@ impl Provider for ReliableProvider {
             for ChainMember {
                 name: provider_name,
                 key: member_key,
+                id: provider_id,
                 provider,
             } in &self.providers
             {
@@ -1139,6 +1322,15 @@ impl Provider for ReliableProvider {
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
                     ));
+                    continue;
+                }
+                if let Some(refusal) = self.fallback_refusal(
+                    provider_id,
+                    provider_name,
+                    current_model,
+                    request.tools.is_some_and(|tools| !tools.is_empty()),
+                ) {
+                    runtime_unavailable.push((provider_name.to_string(), refusal.to_string()));
                     continue;
                 }
                 if refused.contains(member_key, current_model) {
@@ -1356,6 +1548,7 @@ impl Provider for ReliableProvider {
             for ChainMember {
                 name: provider_name,
                 key: member_key,
+                id: provider_id,
                 provider,
             } in &self.providers
             {
@@ -1364,6 +1557,12 @@ impl Provider for ReliableProvider {
                         provider_name.to_string(),
                         format!("model '{current_model}' not compatible with provider"),
                     ));
+                    continue;
+                }
+                if let Some(refusal) =
+                    self.fallback_refusal(provider_id, provider_name, current_model, !tools.is_empty())
+                {
+                    runtime_unavailable.push((provider_name.to_string(), refusal.to_string()));
                     continue;
                 }
 
@@ -1559,6 +1758,7 @@ impl ReliableProvider {
             for ChainMember {
                 name: provider_name,
                 key: member_key,
+                id: provider_id,
                 provider,
             } in &self.providers
             {
@@ -1566,6 +1766,17 @@ impl ReliableProvider {
                     continue;
                 }
                 if !self.provider_model_compatible(provider_name, current_model, model) {
+                    continue;
+                }
+                if self
+                    .fallback_refusal(
+                        provider_id,
+                        provider_name,
+                        current_model,
+                        options.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+                    )
+                    .is_some()
+                {
                     continue;
                 }
                 attempts.push(StreamAttempt {
