@@ -145,6 +145,13 @@ not inherit the root URL or root rotation keys. Each route is resolved and
 built independently, so a refused route is retained as that hint's refusal and
 does not disable the default provider or another route.
 
+For the configured default provider the credential is chosen in this order:
+the inline root `api_key`, then the credential reference `cred-<provider>` that
+`prx providers credential set <provider>` stores under its default name (it
+must be owned by that provider), then the provider's own credential store. An
+unreadable credential store is logged as a warning and the provider's own store
+is used.
+
 Where the resolver runs. Every surface resolves before it builds a provider,
 so a refusal sends nothing and names the model, the provider (URL userinfo
 redacted), the evidence and the fix:

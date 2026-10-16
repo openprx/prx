@@ -232,6 +232,17 @@ numeric alternate IP forms, mapped IPv6, `localhost.` and subdomains are not
 loopback exemptions. Other endpoints require HTTPS. URL user information,
 query strings and fragments are refused.
 
+`prx onboard --decision-backend typesafe|openrouter --decision-model <id>
+--decision-credential-stdin` (and the interactive wizard) store the hosted
+credential as `cred-decision-<kind>`, reference it and leave remote processing
+off; setup refuses when that reference already exists and never replaces it.
+
+`prx causal config set auto` (Gateway `{"op":"reset_backend_to_auto"}`) returns
+to `kind = auto`: it clears the endpoint, model, pinned snapshot and credential
+reference and turns remote processing off. The credential it referenced stays in
+the store, unreferenced; `prx doctor` lists it as an orphaned decision credential
+and `prx providers credential remove cred-<name>` deletes it.
+
 `credential_ref` names a stored credential; it is not a raw key. Use the
 credential management flow and protected input, never URL parameters, logs or
 shell command arguments containing a secret. Backend changes are available

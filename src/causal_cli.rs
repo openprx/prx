@@ -422,6 +422,44 @@ impl DecisionSetup {
         Ok(())
     }
 
+    /// Check a hosted choice before anything is written: the kind is hosted, a
+    /// model is given, and the section rules accept the backend with a
+    /// credential reference (an openrouter model absent from the release
+    /// catalog still needs a pinned snapshot, so it is refused here).
+    ///
+    /// # Errors
+    ///
+    /// A kind that is not hosted, a missing model, or the refusal of the rules.
+    pub fn check_hosted(&self) -> Result<()> {
+        anyhow::ensure!(
+            hosted_owner(self.kind).is_some(),
+            "the decision backend `{}` is not a hosted service",
+            self.kind.as_str()
+        );
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .context("a hosted decision backend needs --decision-model, one exact version")?;
+        let mutations = vec![
+            CausalMutation::SetBackend {
+                kind: self.kind,
+                endpoint: self.endpoint.clone(),
+                model: Some(model.to_string()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            },
+            CausalMutation::SetCredentialRef(CredentialRefSetting::Profile(format!(
+                "cred-decision-{}",
+                self.kind.as_str()
+            ))),
+        ];
+        crate::config::manage::mutation::causal::CausalConfigService::mutate(&Config::default(), &mutations)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
     /// Apply this choice to the configuration written at `config`'s path,
     /// through the management service, as one recorded transaction, and
     /// return the plan text.
@@ -496,10 +534,26 @@ impl DecisionSetup {
             "the decision credential is empty; nothing was stored"
         );
         let references = CredentialReferences::for_config(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
-        let id = references
-            .set(owner, &format!("decision-{}", self.kind.as_str()), secret.expose())
+        let name = format!("decision-{}", self.kind.as_str());
+        let id = CredentialReferences::id_for(&name).map_err(|error| anyhow::anyhow!("{error}"))?;
+        // `set` creates or replaces. Setup must never overwrite (and, on a
+        // refusal, then delete) a credential an operator already stored under
+        // the documented name, so an existing one stops setup here.
+        if references
+            .status(&id)
             .map_err(|error| anyhow::anyhow!("{error}"))?
-            .id;
+            .is_some()
+        {
+            anyhow::bail!(
+                "the credential reference {id} already exists and setup never replaces it: keep it with `prx causal \
+                 config set backend --kind {kind} --model {model} --reference {id}`, rotate it with `prx causal \
+                 config set secret`, or remove it first with `prx providers credential remove {id}`",
+                kind = self.kind.as_str()
+            );
+        }
+        references
+            .set(owner, &name, secret.expose())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         drop(secret);
         let applied = async {
             let mut mutations = vec![
@@ -1194,6 +1248,24 @@ async fn execute(admin: &DecisionAdmin, json: bool, command: CausalReadCommands,
 mod tests {
     use super::*;
 
+    #[derive(clap::Parser)]
+    struct ConfigCli {
+        #[command(subcommand)]
+        command: CausalConfigCommands,
+    }
+
+    #[test]
+    fn set_auto_parses_and_plans_the_reset() {
+        use clap::Parser as _;
+        let parsed = ConfigCli::try_parse_from(["causal-config", "set", "auto", "--yes"]).expect("test: parses");
+        let change = config_change(parsed.command, &Config::default()).expect("test: plans");
+        assert!(matches!(
+            change,
+            CausalConfigChange::Plan { ref mutations, ref apply }
+                if apply.yes && matches!(mutations.as_slice(), [CausalMutation::ResetBackendToAuto])
+        ));
+    }
+
     // Exercise the production admin accounting entry under its real cleanup owner.
     #[tokio::test]
     async fn admin_accounting_accepts_real_configured_physical_slot() {
@@ -1576,6 +1648,42 @@ mod tests {
                 .check_reference("cred-decision-openrouter", "openrouter")
                 .is_ok()
         );
+
+        // A second run never replaces the stored credential, and says how to keep it.
+        let before = references.status("cred-decision-openrouter").expect("test: status");
+        let error = setup
+            .apply_hosted(
+                config.clone(),
+                SecretString::new("sk-or-test-hosted-credential-0003".to_string()),
+            )
+            .await
+            .expect_err("test: existing credential is kept")
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(
+            references.status("cred-decision-openrouter").expect("test: status"),
+            before,
+            "the existing credential was left untouched"
+        );
+
+        // A refusal after the store (an uncatalogued OpenRouter model has no
+        // pinned snapshot) removes only the credential this run stored.
+        let refused_dir = tempfile::TempDir::new().expect("test: temp");
+        let config = written(refused_dir.path(), |_| {}).await;
+        let error = DecisionSetup {
+            model: Some("vendor/not-in-the-catalog".to_string()),
+            ..setup.clone()
+        }
+        .apply_hosted(
+            config.clone(),
+            SecretString::new("sk-or-test-hosted-credential-0004".to_string()),
+        )
+        .await
+        .expect_err("test: plan refused")
+        .to_string();
+        assert!(error.contains("hosted decision backend was not configured"), "{error}");
+        let references_after = CredentialReferences::for_config(&config).expect("test: store");
+        assert_eq!(references_after.list().expect("test: list").len(), 0);
 
         // A model-less choice is refused before anything is stored.
         let other = tempfile::TempDir::new().expect("test: temp");

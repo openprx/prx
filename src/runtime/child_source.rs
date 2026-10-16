@@ -959,8 +959,10 @@ tokio::task_local! {
 ///
 /// * `fallback_providers` -- the caller named the provider, so serving the
 ///   request from another vendor would defeat it while looking like success.
-/// * `api_keys` -- those rotation credentials belong to the root provider and
-///   would only buy a run of 401s against a different vendor.
+/// * `api_keys` -- cleared defensively so no root rotation credential is
+///   visible to the child's settings. The provider factory takes the rotation
+///   keys from the resolved credential (`create_provider_for`) and overwrites
+///   this field either way, so this does not change what the factory builds.
 pub(crate) fn pinned_provider_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
     crate::config::ReliabilityConfig {
         fallback_providers: Vec::new(),
@@ -1522,7 +1524,7 @@ mod pinned_reliability_tests {
     use super::pinned_provider_reliability;
 
     #[test]
-    fn pinned_child_reliability_drops_both_chain_widening_knobs_and_keeps_the_rest() {
+    fn pinned_child_reliability_clears_both_fields_and_keeps_the_rest() {
         let base = crate::config::ReliabilityConfig {
             fallback_providers: vec!["openai".to_string()],
             api_keys: vec!["root-rotation-key".to_string()],

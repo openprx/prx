@@ -92,14 +92,31 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
 /// The credential reference `prx providers credential set <provider>` stores
 /// under its default name (`cred-<catalog name>`), when the configured default
 /// provider has one and it was issued for that provider. Used only when the
-/// root holds nothing, so an inline root key keeps winning. A missing store, a
-/// missing reference or one owned by another provider means no reference.
+/// root holds nothing, so the precedence is: inline root key, then
+/// `cred-<name>`, then the provider's own store. A missing or foreign
+/// reference means no reference. An unreadable store is reported with a
+/// warning (never the value) and falls back to the provider store. The store
+/// is read on each call, not cached, so a credential stored a moment ago is
+/// used by the next provider construction.
 fn default_credential_reference(config: &Config, provider: &str) -> Option<CredentialRef> {
+    use crate::config::manage::credentials::{CredentialReferenceError, CredentialReferences};
     let name = ProviderId::of(provider).catalog_name()?.to_ascii_lowercase();
-    let id = crate::config::manage::credentials::CredentialReferences::id_for(&name).ok()?;
-    let references = crate::config::manage::credentials::CredentialReferences::for_config(config).ok()?;
-    references.check_reference(&id, provider).ok()?;
-    crate::config::manage::credentials::CredentialReferences::reference(&id).ok()
+    let id = CredentialReferences::id_for(&name).ok()?;
+    let references = match CredentialReferences::for_config(config) {
+        Ok(references) => references,
+        Err(error) => {
+            tracing::warn!(%error, "credential store location unavailable; using the provider's own store");
+            return None;
+        }
+    };
+    match references.check_reference(&id, provider) {
+        Ok(_) => CredentialReferences::reference(&id).ok(),
+        Err(CredentialReferenceError::Store(reason)) => {
+            tracing::warn!(reference = %id, %reason, "credential store unreadable; using the provider's own store");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Resolve `provider`/`model` for `requirement` with the credential

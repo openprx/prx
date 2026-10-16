@@ -81,11 +81,21 @@ impl AccountingScope {
 
 impl budget::sealed::AccountingOwner for AccountingScope {}
 
+/// The base URL a provider is reached at: the root connection's `api_url`
+/// when `provider` is the configured default provider, otherwise unset (the
+/// provider's own default).
+fn effective_api_url<'a>(config: &'a Config, provider: &str) -> Option<&'a str> {
+    (ProviderId::of(provider) == ProviderId::of(crate::providers::selection::default_provider(config)))
+        .then_some(config.api_url.as_deref())
+        .flatten()
+}
+
 /// Reserve the declared available decision allowance at the highest applicable
 /// PMM rate. This is a versioned local estimate, never a vendor billing cap.
 fn estimated_cost(
     config: &crate::config::schema::CostConfig,
     provider: &str,
+    api_url: Option<&str>,
     model: &str,
     tokens: u64,
 ) -> Result<u64, DecisionError> {
@@ -98,7 +108,11 @@ fn estimated_cost(
     ] {
         let cost = match usage_cost_resolution(provider, model, input, output, write, read, config) {
             UsagePrice::Priced(cost) => cost,
-            UsagePrice::Missing if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider)) => 0.0,
+            UsagePrice::Missing
+                if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
+            {
+                0.0
+            }
             UsagePrice::Missing | UsagePrice::Invalid => return Err(DecisionError::BudgetExceeded),
         };
         maximum = maximum.max(cost);
@@ -198,7 +212,13 @@ impl AccountingScope {
                 Err(current) => available = current,
             }
         };
-        let maximum = match estimated_cost(&self.config.cost, attempt.provider, attempt.model, tokens) {
+        let maximum = match estimated_cost(
+            &self.config.cost,
+            attempt.provider,
+            effective_api_url(&self.config, attempt.provider),
+            attempt.model,
+            tokens,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
@@ -517,7 +537,10 @@ impl OwnedReceipt {
                 ) {
                     UsagePrice::Priced(cost) => cost,
                     UsagePrice::Missing
-                        if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(&self.provider)) =>
+                        if super::turn_cost::provider_is_zero_price_exempt(
+                            &ProviderId::of(&self.provider),
+                            effective_api_url(&self.config, &self.provider),
+                        ) =>
                     {
                         0.0
                     }
@@ -597,14 +620,46 @@ mod tranche_tests {
     }
 
     #[test]
-    fn an_unpriced_ollama_model_reserves_zero_money_like_g6_and_an_unpriced_cloud_model_is_refused() {
+    fn only_a_local_unpriced_ollama_reserves_zero_money() {
         let config = crate::config::schema::CostConfig::default();
-        assert!(config.prices.is_empty() || !config.prices.contains_key("ollama/prx-local-model"));
-        assert_eq!(estimated_cost(&config, "ollama", "prx-local-model", 1000).ok(), Some(0));
+        let reserve =
+            |provider: &str, url: Option<&str>| estimated_cost(&config, provider, url, "prx-local-model", 1000);
+        assert_eq!(reserve("ollama", None).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://127.0.0.1:11434")).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://localhost:11434")).ok(), Some(0));
         assert!(matches!(
-            estimated_cost(&config, "acme-unpriced", "no-price-model", 1000),
+            reserve("ollama", Some("https://ollama.com")),
             Err(DecisionError::BudgetExceeded)
         ));
+        assert!(matches!(
+            reserve("ollama", Some("http://192.168.1.20:11434")),
+            Err(DecisionError::BudgetExceeded)
+        ));
+        assert!(matches!(
+            reserve("acme-unpriced", None),
+            Err(DecisionError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn the_settlement_exemption_follows_the_effective_endpoint() {
+        let mut config = Config::default();
+        config.default_provider = Some("ollama".to_string());
+        assert_eq!(effective_api_url(&config, "ollama"), None);
+        config.api_url = Some("https://ollama.com".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(!super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        config.api_url = Some("http://localhost:11434".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        // Another provider never inherits the root URL.
+        assert_eq!(effective_api_url(&config, "openai"), None);
     }
 
     #[test]

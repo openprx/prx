@@ -1779,8 +1779,18 @@ async fn async_main() -> Result<()> {
         } else {
             // Checked before anything is written; applied to the written
             // configuration as its own transaction.
-            if let Some(decision) = decision.as_ref().filter(|_| !hosted) {
-                decision.check()?;
+            if let Some(decision) = &decision {
+                if hosted {
+                    decision.check_hosted()?;
+                    anyhow::ensure!(
+                        decision_secret
+                            .as_ref()
+                            .is_some_and(|secret| !secret.expose().trim().is_empty()),
+                        "the decision credential read from standard input is empty; nothing was written"
+                    );
+                } else {
+                    decision.check()?;
+                }
             }
             let config = onboard::wizard::run_quick_setup(
                 api_key.as_deref(),

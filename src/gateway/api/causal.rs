@@ -626,6 +626,16 @@ pub(super) async fn put_credential(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    #[test]
+    fn reset_backend_to_auto_body_parses_and_maps() {
+        let body: MutationBody = serde_json::from_str(r#"{"op":"reset_backend_to_auto"}"#).expect("test: body parses");
+        assert!(matches!(
+            body.into_mutation().expect("test: maps"),
+            CausalMutation::ResetBackendToAuto
+        ));
+        assert!(serde_json::from_str::<MutationBody>(r#"{"op":"reset_backend_to_auto","kind":"x"}"#).is_err());
+    }
+
     use super::super::test_support::{TOKEN, at, json, serve_config};
     use super::*;
     use reqwest::Method;

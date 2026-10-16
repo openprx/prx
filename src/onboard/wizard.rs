@@ -2469,10 +2469,12 @@ fn setup_decision_plane() -> Result<
                 .with_prompt("  Turn the decision plane on now?")
                 .default(true)
                 .interact()?;
-            let secret = Password::new()
-                .with_prompt("  Service credential (input hidden)")
-                .interact()?;
-            if secret.trim().is_empty() {
+            let secret = crate::config::manage::credentials::SecretString::new(
+                Password::new()
+                    .with_prompt("  Service credential (input hidden)")
+                    .interact()?,
+            );
+            if secret.expose().trim().is_empty() {
                 println!(
                     "  {} No credential entered; the hosted backend is not set up.",
                     style("→").dim()
@@ -2485,10 +2487,7 @@ fn setup_decision_plane() -> Result<
                 model: Some(model.trim().to_string()),
                 enable,
             };
-            Ok(Some((
-                setup,
-                Some(crate::config::manage::credentials::SecretString::new(secret)),
-            )))
+            Ok(Some((setup, Some(secret))))
         }
         _ => Ok(None),
     }
