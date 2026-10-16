@@ -9,6 +9,7 @@
 //! the pinned record digest.
 
 use super::bundle::{Bundle, BundleFile};
+use super::capture::Correlation;
 use super::generation::{ACTIVE_DIR, ActiveBinding};
 use super::store::{SkillLifecycleStore, VerifiedRevision};
 use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, SkillId};
@@ -17,12 +18,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Upper bound on bindings listed for one owner store.
 pub const MAX_ACTIVE_BINDINGS: usize = 512;
 /// Upper bound on concurrently remembered task pins in this process. When the
-/// table is full, new pins are refused with [`LifecycleError::PinTableFull`];
-/// a live pin is never evicted.
+/// table is full of pins younger than [`ORPHAN_PIN_AGE`], new pins are refused
+/// with [`LifecycleError::PinTableFull`]; a live pin is never evicted.
 pub const MAX_TASK_PINS: usize = 4096;
 const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
 
@@ -131,30 +133,59 @@ struct PinKey {
     skill: SkillId,
 }
 
-type PinEntries = VecDeque<(PinKey, Arc<PinnedSkillRevision>)>;
+/// Key, pin and the time of its last access.
+type PinEntries = VecDeque<(PinKey, Arc<PinnedSkillRevision>, Instant)>;
+
+/// A pin not read for this long is considered orphaned (its task ended without
+/// reaching a terminal that releases pins, for example a turn that failed
+/// before finalization) and may be reclaimed, but only when the table is full.
+/// Every pinned read refreshes the pin's last-access time, so a task that is
+/// still reading is never reclaimed.
+pub const ORPHAN_PIN_AGE: Duration = Duration::from_hours(24);
 
 /// Bounded table of the pins issued to tasks. A pin lives until
-/// [`release_task_pins`] removes it; SL03 calls that at the task terminal.
-/// Nothing is ever evicted: when the table is full a new pin is refused, so a
-/// running task never silently switches revision.
+/// [`release_task_pins`] removes it (the task terminal does, and so does every
+/// exit of `finalize_turn`). Live pins are never evicted: when the table is
+/// full, only pins not accessed for `orphan_age` are reclaimed, and if none are the
+/// new pin is refused, so a running task never silently switches revision.
 pub(super) struct PinTable {
     cap: usize,
+    orphan_age: Duration,
     entries: Mutex<PinEntries>,
 }
 
 impl PinTable {
-    pub(super) const fn new(cap: usize) -> Self {
+    pub(super) const fn new(cap: usize, orphan_age: Duration) -> Self {
         Self {
             cap,
+            orphan_age,
             entries: Mutex::new(VecDeque::new()),
         }
     }
 
-    fn lookup(entries: &PinEntries, key: &PinKey) -> Option<Arc<PinnedSkillRevision>> {
+    /// Makes room for one pin; `false` when the table is full of live pins.
+    fn make_room(&self, entries: &mut PinEntries) -> bool {
+        if entries.len() < self.cap {
+            return true;
+        }
+        let before = entries.len();
+        entries.retain(|(_, _, accessed)| accessed.elapsed() < self.orphan_age);
+        let reclaimed = before - entries.len();
+        if reclaimed > 0 {
+            tracing::warn!(reclaimed, "reclaimed orphaned task skill pins");
+        }
+        entries.len() < self.cap
+    }
+
+    /// Finds the pin and refreshes its last-access time.
+    fn lookup(entries: &mut PinEntries, key: &PinKey) -> Option<Arc<PinnedSkillRevision>> {
         entries
-            .iter()
-            .find(|(existing, _)| existing == key)
-            .map(|(_, pin)| Arc::clone(pin))
+            .iter_mut()
+            .find(|(existing, _, _)| existing == key)
+            .map(|(_, pin, accessed)| {
+                *accessed = Instant::now();
+                Arc::clone(pin)
+            })
     }
 
     pub(super) fn pin(
@@ -169,25 +200,22 @@ impl PinTable {
             task_id: task_id.to_string(),
             skill: skill.clone(),
         };
-        let existing = Self::lookup(&self.entries.lock(), &key);
+        let existing = Self::lookup(&mut self.entries.lock(), &key);
         if let Some(pin) = existing {
             return Ok(Some(pin));
-        }
-        if self.entries.lock().len() >= self.cap {
-            return Err(LifecycleError::PinTableFull(self.cap));
         }
         let Some(issued) = issue()? else {
             return Ok(None);
         };
         let mut entries = self.entries.lock();
-        if let Some(pin) = Self::lookup(&entries, &key) {
+        if let Some(pin) = Self::lookup(&mut entries, &key) {
             return Ok(Some(pin));
         }
-        if entries.len() >= self.cap {
+        if !self.make_room(&mut entries) {
             return Err(LifecycleError::PinTableFull(self.cap));
         }
         let pin = Arc::new(issued);
-        entries.push_back((key, Arc::clone(&pin)));
+        entries.push_back((key, Arc::clone(&pin), Instant::now()));
         Ok(Some(pin))
     }
 
@@ -201,21 +229,24 @@ impl PinTable {
     ) -> Option<Arc<PinnedSkillRevision>> {
         self.entries
             .lock()
-            .iter()
-            .find(|(key, pin)| {
+            .iter_mut()
+            .find(|(key, pin, _)| {
                 key.owner == *owner && key.task_id == task_id && pin.display_name.eq_ignore_ascii_case(name)
             })
-            .map(|(_, pin)| Arc::clone(pin))
+            .map(|(_, pin, accessed)| {
+                *accessed = Instant::now();
+                Arc::clone(pin)
+            })
     }
 
     pub(super) fn release(&self, owner: &OwnerScope, task_id: &str) {
         self.entries
             .lock()
-            .retain(|(key, _)| !(key.owner == *owner && key.task_id == task_id));
+            .retain(|(key, _, _)| !(key.owner == *owner && key.task_id == task_id));
     }
 }
 
-static TASK_PINS: PinTable = PinTable::new(MAX_TASK_PINS);
+static TASK_PINS: PinTable = PinTable::new(MAX_TASK_PINS, ORPHAN_PIN_AGE);
 
 /// Returns the pin of `task_id` for `skill`, issuing it with `issue` on first
 /// use. Later calls return the same pin even if the active binding moved.
@@ -247,25 +278,48 @@ pub struct ManagedSkillRead {
     pub untrusted_origin: bool,
 }
 
-/// Resolves `skill_name` through the owner's lifecycle store and reads one
+/// One managed-skill read.
+#[derive(Clone, Debug)]
+pub struct ManagedReadRequest<'a> {
+    pub workspace_dir: &'a Path,
+    pub owner: &'a OwnerScope,
+    pub skill_name: &'a str,
+    pub resource_path: Option<&'a str>,
+    /// The trusted task the read belongs to; hydration is captured for it.
+    pub task_id: Option<&'a str>,
+    /// Run, segment and child identities of the call, recorded as given.
+    pub correlation: Correlation,
+    /// Keep the task on the revision it first read (requires `task_id`). The
+    /// pins live until [`release_task_pins`] / [`on_task_terminal`].
+    pub pin_task: bool,
+    pub max_bytes: u64,
+}
+
+/// Resolves the skill through the owner's lifecycle store and reads one
 /// resource of its revision.
 ///
 /// `Ok(None)` means the skill is not lifecycle-managed for this owner (no
 /// store, a store of another owner, or no binding), and the caller keeps the
 /// legacy behaviour. A managed skill that is disabled, whose revision is
 /// missing or tampered, or whose resource is absent or too large is an error:
-/// nothing falls back to another revision.
-pub fn read_managed_resource(
-    workspace_dir: &Path,
-    owner: &OwnerScope,
-    skill_name: &str,
-    resource_path: Option<&str>,
-    task_id: Option<&str>,
-    max_bytes: u64,
-) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+/// nothing falls back to another revision. A successful read with a task id
+/// records a hydration receipt; a capture failure is logged and marks the
+/// experience as having dropped evidence, but never fails the read.
+pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+    let ManagedReadRequest {
+        workspace_dir,
+        owner,
+        skill_name,
+        resource_path,
+        task_id,
+        pin_task,
+        max_bytes,
+        ..
+    } = *request;
+    let pin_task_id = task_id.filter(|_| pin_task);
     // A task that already holds a pin for this skill name keeps it, even if
     // the active binding was renamed, disabled or removed since.
-    let held = task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
+    let held = pin_task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
     let store = match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
         Ok(Some(store)) => store,
         Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) if held.is_none() => return Ok(None),
@@ -284,7 +338,7 @@ pub fn read_managed_resource(
         }
         // One verification of the bundle serves both the pin and the read.
         let (issued, verified) = store.verify_binding(&binding)?;
-        match task_id {
+        match pin_task_id {
             Some(task) => {
                 let pin = task_pin(owner, task, &binding.skill_id, || Ok(Some(issued)))?
                     .ok_or_else(|| LifecycleError::RevisionNotFound(binding.skill_id.to_string()))?;
@@ -309,6 +363,9 @@ pub fn read_managed_resource(
     }
     let content = String::from_utf8(file.bytes().to_vec())
         .map_err(|_| LifecycleError::ResourceUnavailable(format!("{} is not valid UTF-8", file.path())))?;
+    if let Some(task) = task_id {
+        capture_hydration(&store, task, &pin, file.path(), file.bytes(), &request.correlation);
+    }
     let untrusted_origin = verified.bundle.file(UNTRUSTED_ORIGIN_MARKER).is_some();
     Ok(Some(ManagedSkillRead {
         resource_path: file.path().to_string(),
@@ -318,6 +375,21 @@ pub fn read_managed_resource(
         content,
         untrusted_origin,
     }))
+}
+
+fn capture_hydration(
+    store: &SkillLifecycleStore,
+    task: &str,
+    pin: &PinnedSkillRevision,
+    path: &str,
+    content: &[u8],
+    correlation: &Correlation,
+) {
+    if let Err(error) = store.record_hydration(task, pin, path, content, correlation) {
+        tracing::warn!(%error, task, "failed to record a skill hydration receipt");
+        // Lock-free, so it still works when the failure was a lock timeout.
+        store.mark_dropped_evidence(task);
+    }
 }
 
 /// Default resource follows the catalog: SKILL.toml when present, else SKILL.md.
