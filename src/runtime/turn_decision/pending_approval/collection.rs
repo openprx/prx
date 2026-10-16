@@ -25,7 +25,7 @@ impl TurnDecisionService {
         let entries = self.catalog.resolve(std::slice::from_ref(&capability))?;
         let entry = entries.first().context("collection capability missing")?;
         anyhow::ensure!(
-            crate::causal_tree::candidate_generator::collectable_mutation(entry),
+            crate::causal_tree::candidate_generator::collectable_approval_entry(entry),
             "unsupported collection tool"
         );
         let descriptor = self
@@ -81,7 +81,10 @@ impl ApprovalCollectionLease {
             .context("collection capability missing")?;
         let (operation, risk) = if entry.family == crate::causal_tree::branch::CapabilityTarget::Mcp {
             // An MCP tool has one fixed approval operation. Resume derives the
-            // same operation and risk from the pinned entry.
+            // same operation and risk from the pinned entry. No owner-isolated
+            // (or Console file-scoped) source reaches here: gate 1
+            // `owner_isolation` blocks MCP candidates for such sources before
+            // collection is ever issued, so no filesystem scope is needed.
             let [operation] = entry.op_ids.as_slice() else {
                 anyhow::bail!("collection operation is not fixed");
             };

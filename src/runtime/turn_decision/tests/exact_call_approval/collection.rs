@@ -520,7 +520,7 @@ for line in sys.stdin:
             "serverInfo": {"name": "prx-server", "version": "1.0.0"},
         }
     elif method == "tools/list":
-        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}]}
+        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}, {"name": "search", "description": "Search remote data", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}}]}
     elif method == "tools/call":
         with open("@MARKER@", "a") as marker:
             marker.write("executed\n")
@@ -537,10 +537,14 @@ for line in sys.stdin:
 #[tokio::test]
 async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
-    std::process::Command::new("python3")
+    if !std::process::Command::new("python3")
         .arg("--version")
-        .output()
-        .expect("test: python3 runs the stdio MCP fixture");
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        tracing::warn!("skipping MCP collection test: python3 is unavailable");
+        return;
+    }
     let workspace = tempfile::tempdir().unwrap();
     let marker = workspace.path().join("mcp-executed.marker");
     let tool_name = "mcp__prx_server__write";
@@ -661,6 +665,51 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             OutboundSecrets::default(),
             SlotLimits::default(),
         );
+        let cancel = CancellationToken::new();
+        // Bare server-side names are ordinary words, never a collection trigger.
+        for (seq, prose) in [
+            (11_u64, "write a poem about spring"),
+            (12, "search the docs for the release notes"),
+        ] {
+            let (prose_proof, _) = recorded_approval_source(
+                &generation,
+                Arc::clone(&memory),
+                prose,
+                ChatMode::Edit,
+                &format!("prx_mcp_prose_{seq}"),
+                seq,
+            )
+            .await;
+            let prose_context = service
+                .decide_agent_initial(prose_proof.as_ref(), AgentTurnKind::Repl, &cancel)
+                .await
+                .unwrap();
+            assert!(
+                prose_context.approval_collection_proof().is_none(),
+                "{prose:?} must not park an owner review"
+            );
+        }
+        // The full public name wins over other plain-word matches in the text.
+        let (mixed_proof, _) = recorded_approval_source(
+            &generation,
+            Arc::clone(&memory),
+            "Use mcp__prx_server__write after you search the notes",
+            ChatMode::Edit,
+            "prx_mcp_mixed",
+            13,
+        )
+        .await;
+        let mixed = service
+            .decide_agent_initial(mixed_proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            mixed
+                .approval_collection_proof()
+                .is_some_and(|proof| proof.capability().id.as_str().contains("write")),
+            "one full-name approval-required mention collects despite other matches"
+        );
+        assert_eq!(executions(), 0);
         let input = format!("Call {tool_name} with path remote.txt and content approved exact contents");
         let (proof, envelope) = recorded_approval_source(
             &generation,
@@ -671,7 +720,6 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             1,
         )
         .await;
-        let cancel = CancellationToken::new();
         let context = service
             .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await

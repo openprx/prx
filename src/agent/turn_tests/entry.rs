@@ -408,7 +408,7 @@ for line in sys.stdin:
             "serverInfo": {"name": "prx-server", "version": "1.0.0"},
         }
     elif method == "tools/list":
-        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}]}
+        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}, {"name": "search", "description": "Search remote data", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}}]}
     elif method == "tools/call":
         with open("@MARKER@", "w") as marker:
             marker.write("executed")
@@ -417,10 +417,14 @@ for line in sys.stdin:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
 "#;
-    std::process::Command::new("python3")
+    if !std::process::Command::new("python3")
         .arg("--version")
-        .output()
-        .expect("test: python3 runs the stdio MCP fixture");
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        tracing::warn!("skipping MCP close test: python3 is unavailable");
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let marker = tmp.path().join("mcp-executed.marker");
     let mut config = crate::config::Config::default();
@@ -470,16 +474,18 @@ for line in sys.stdin:
     );
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(vec![mcp.test_boxed_tool()]);
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let admit = |input: &'static str| {
+        crate::agent::turn_tests::admission::AdmittedTurn::with_enabled_builtin_model_and_mcp(
+            config.clone(),
+            input,
+            Arc::clone(&tools_registry),
+            Arc::clone(&mem),
+            ("ollama", "prx-local-model"),
+            snapshot.clone(),
+        )
+    };
     let input = "call mcp__prx_server__write with path remote.txt and content \"approved exact contents\"";
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_enabled_builtin_model_and_mcp(
-        config,
-        input,
-        Arc::clone(&tools_registry),
-        Arc::clone(&mem),
-        ("ollama", "prx-local-model"),
-        snapshot,
-    )
-    .await;
+    let admission = admit(input).await;
     let directive = admission.decision().context.directive();
     assert!(
         matches!(
@@ -489,6 +495,22 @@ for line in sys.stdin:
         ),
         "an exact approval-required write must close, not answer or execute: {directive:?}"
     );
+    assert_eq!(
+        crate::causal_tree::directive::render_terminal_directive(directive).expect("test: terminal text"),
+        "This action needs owner approval, which this surface cannot collect; nothing was run."
+    );
+    // Bare server-side tool names are ordinary words: prose still answers.
+    for prose in ["write a poem about spring", "search the docs for the release notes"] {
+        let admission = admit(prose).await;
+        assert!(
+            matches!(
+                admission.decision().context.directive(),
+                crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+            ),
+            "{prose:?} must still answer: {:?}",
+            admission.decision().context.directive()
+        );
+    }
     assert!(!marker.exists(), "the MCP server saw an unapproved write call");
 }
 
