@@ -760,9 +760,9 @@ impl CausalTreeConfig {
             "a number between 0 and 0.5",
         )?;
         ensure(
-            policy.extra_token_ratio_limit.is_finite() && policy.extra_token_ratio_limit >= 0.0,
+            policy.extra_token_ratio_limit.is_finite() && policy.extra_token_ratio_limit > 0.0,
             "causal_tree.policy.extra_token_ratio_limit",
-            "a number of at least 0",
+            "a finite number greater than 0 (a zero ratio refuses every Agent turn)",
         )?;
         for weight in self.scoring.weights.values() {
             ensure(
@@ -1465,6 +1465,11 @@ mod tests {
         assert!(range("causal_tree.policy.extra_token_ratio_limit")(&broken(|config| {
             config.policy.extra_token_ratio_limit = f32::INFINITY
         })));
+        for zero in [0.0_f32, -0.0, -0.1, f32::NAN] {
+            assert!(range("causal_tree.policy.extra_token_ratio_limit")(&broken(|config| {
+                config.policy.extra_token_ratio_limit = zero
+            })));
+        }
         assert!(range("causal_tree.scoring.weights")(&broken(|config| config
             .scoring
             .weights
