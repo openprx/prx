@@ -122,7 +122,7 @@ pub(super) fn sorted_unique(items: &[String]) -> Vec<String> {
 }
 
 fn is_canonical(items: &[String]) -> bool {
-    items.windows(2).all(|pair| pair[0] < pair[1])
+    items.iter().zip(items.iter().skip(1)).all(|(a, b)| a < b)
 }
 
 impl ConsolidationRequest {
@@ -626,12 +626,12 @@ impl SkillLifecycleStore {
         let mut changed = false;
         for candidate in candidates {
             let entry = PatternIndexEntry::of(&candidate);
-            let Some(position) = index.entries.iter().position(|e| e.same_group(&entry)) else {
+            let Some(slot) = index.entries.iter_mut().find(|e| e.same_group(&entry)) else {
                 index.entries.push(entry);
                 changed = true;
                 continue;
             };
-            let current_id = index.entries[position].pattern_id.clone();
+            let current_id = slot.pattern_id.clone();
             let wins = if candidate.supersedes.contains(&current_id) {
                 true
             } else {
@@ -642,7 +642,7 @@ impl SkillLifecycleStore {
                     && (candidate.created_at, &candidate.pattern_id) > (current.created_at, &current.pattern_id)
             };
             if wins {
-                index.entries[position] = entry;
+                *slot = entry;
                 changed = true;
             }
         }

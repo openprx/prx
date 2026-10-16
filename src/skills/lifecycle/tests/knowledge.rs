@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(clippy::indexing_slicing)]
 
 use super::{activate, entry, md, owner};
 use crate::skills::lifecycle::{
@@ -727,7 +728,7 @@ fn different_statements_are_different_groups_and_a_to_b_to_a_stays_correct() {
         .consolidate_pattern(&lesson("Lesson A: run the migration.", &[&ids[3]]))
         .expect("test: A extended")
         .pattern;
-    assert_eq!(a2.supersedes, vec![a1.pattern_id.clone()]);
+    assert_eq!(a2.supersedes, vec![a1.pattern_id]);
     let active: Vec<_> = store
         .active_patterns()
         .expect("test: active")
@@ -792,7 +793,10 @@ fn the_index_stays_bounded_and_a_full_index_is_refused_without_orphans() {
         .filter(|e| e.file_name().to_string_lossy().starts_with("pat-"))
         .count();
     assert_eq!(files, group + 3, "no orphan pattern file for the refused request");
-    assert!(store.rebuild_pattern_index().expect("test: rebuild") == index.entries.len());
+    assert_eq!(
+        store.rebuild_pattern_index().expect("test: rebuild"),
+        index.entries.len()
+    );
 }
 
 #[test]
@@ -844,7 +848,7 @@ fn rebuild_resolves_two_successors_of_one_predecessor_deterministically() {
     rival.applicability.push("zzz rival".to_string());
     rival.applicability.sort();
     rival.created_at = second.created_at + chrono::Duration::seconds(5);
-    rival.supersedes = vec![first.pattern_id.clone()];
+    rival.supersedes = vec![first.pattern_id];
     let rival_id = PatternId::from_digest(&rival.content_digest());
     rival.pattern_id = rival_id.clone();
     rival.record_id = rival_id.to_string();
