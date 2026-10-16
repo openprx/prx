@@ -120,7 +120,9 @@ separate contracts. The admission input is currently populated as follows:
 The effective model window is pinned before decision dispatch. After the
 configured response reserve, the runtime reserves one sixteenth of the remaining
 window for the sealed decision request, capped at 4,096 tokens and by
-`causal_tree.policy.extra_token_ratio_limit` times that baseline window. The
+`causal_tree.policy.extra_token_ratio_limit` times that baseline window
+(the limit must be finite and greater than 0; zero or non-finite values are
+rejected at config load). The
 decision and main-turn input slices must both be positive. A smaller effective
 window, or a configured ratio too small to fund one decision token, fails closed with
 `resolved Agent context window has no safe decision reserve` before provider

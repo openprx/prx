@@ -98,6 +98,21 @@ fn the_configured_default_keeps_its_connection() {
     }
 }
 
+/// Finding 79(a): the construction-time attestation exists to catch a reload
+/// that changes the key under the same credential reference.
+#[test]
+fn a_changed_key_under_the_same_credential_reference_fails_the_attestation() {
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let mut config = isolated_config(&temp);
+    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default provider is selectable");
+    assert!(choice.factory_credential_source_matches(&config));
+    config.api_key = Some("C0-AGENT-ROTATED-ROOT".to_string());
+    assert!(
+        !choice.factory_credential_source_matches(&config),
+        "a rotated key under the same reference must not attest"
+    );
+}
+
 /// T4: a model the selected provider cannot serve is refused before any
 /// connection is resolved, as `prx chat` already does.
 #[test]

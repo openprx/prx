@@ -293,3 +293,21 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
         "a refused route reached the default transport"
     );
 }
+
+/// Finding 79(e): `/models <provider>` from a sender whose current model is an
+/// unroutable or malformed hint reports the route refusal and leaves the
+/// selection unchanged.
+#[tokio::test]
+async fn provider_command_reports_an_unroutable_hint_and_keeps_the_selection() {
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let config = cross_dialect_config(&temp);
+    for (model, text) in [
+        ("hint:does-not-exist", "does-not-exist"),
+        ("hint:has space", "whitespace"),
+    ] {
+        let (reply, after) = crate::channels::route_command_response(&config, "/models openai", model).await;
+        assert!(reply.contains(text), "{model}: {reply}");
+        assert!(reply.contains("Route unchanged"), "{model}: {reply}");
+        assert_eq!(after, model, "the sender's selection must not change");
+    }
+}

@@ -2041,6 +2041,13 @@ async fn handle_runtime_command_if_needed(
 /// Kept test-only because the runtime owns its context and outbound channel.
 #[cfg(test)]
 pub(crate) async fn broken_route_models_command_response(config: &Config) -> String {
+    route_command_response(config, "/models openai", "hint:broken").await.0
+}
+
+/// Send `command` for a sender whose current model is `model` and return the
+/// reply plus the sender's selected model afterwards.
+#[cfg(test)]
+pub(crate) async fn route_command_response(config: &Config, command: &str, model: &str) -> (String, String) {
     #[derive(Default)]
     struct RefusalChannel {
         sent: tokio::sync::Mutex<Vec<String>>,
@@ -2071,7 +2078,7 @@ pub(crate) async fn broken_route_models_command_response(config: &Config) -> Str
         id: "prx-broken-route-command".to_string(),
         sender: "prx_user".to_string(),
         reply_target: "prx_channel".to_string(),
-        content: "/models openai".to_string(),
+        content: command.to_string(),
         channel: "telegram".to_string(),
         ..traits::ChannelMessage::default()
     };
@@ -2082,20 +2089,22 @@ pub(crate) async fn broken_route_models_command_response(config: &Config) -> Str
         &key,
         ChannelRouteSelection {
             provider: providers::selection::default_provider(config).to_string(),
-            model: "hint:broken".to_string(),
+            model: model.to_string(),
         },
     );
     assert!(
         handle_runtime_command_if_needed(&ctx, &generation, &msg, Some(&channel)).await,
         "the production /models handler did not claim the command"
     );
-    channel_impl
+    let reply = channel_impl
         .sent
         .lock()
         .await
         .last()
         .cloned()
-        .expect("the production /models handler did not send a refusal")
+        .expect("the production runtime command did not send a reply");
+    let after = get_route_selection_for_generation(&ctx, &key, &generation);
+    (reply, after.model)
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {

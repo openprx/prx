@@ -527,9 +527,14 @@ impl TurnTerminalGuard {
             .pending
             .clone()
             .ok_or_else(|| anyhow::anyhow!("runtime terminal proposal missing"))?;
-        for call in &self.auxiliary_calls {
-            persist_auxiliary_reply(call, &self.fabric, &self.config, &self.context, &mut proposal).await?;
-        }
+        persist_auxiliary_replies(
+            &self.auxiliary_calls,
+            &self.fabric,
+            &self.config,
+            &self.context,
+            &mut proposal,
+        )
+        .await?;
         // Settling a completed auxiliary call does not assert parent or child
         // completion. Preserve its known cost even when descendant drain fails.
         if let Some(cleanup) = &self.child_cleanup {
@@ -572,6 +577,54 @@ impl TurnTerminalGuard {
     }
 }
 
+type AuxiliaryReceipt = (
+    Arc<super::auxiliary_call::AuxiliaryProviderCall>,
+    Option<crate::memory::MessageEvent>,
+);
+
+/// Persist every registered call independently: a failure on one must not skip
+/// the receipt of another, so all are attempted. Returns the persisted
+/// receipts and the combined failures.
+async fn persist_auxiliary_events(
+    calls: &[Arc<super::auxiliary_call::AuxiliaryProviderCall>],
+    fabric: &crate::memory::MemoryFabric,
+    config: &crate::config::Config,
+    proposal: &mut crate::agent::terminal::TurnTerminalDraft,
+) -> (Vec<AuxiliaryReceipt>, Vec<String>) {
+    let mut receipts = Vec::new();
+    let mut failures = Vec::new();
+    for call in calls {
+        match call.persist(fabric, config, proposal).await {
+            Ok(event) => receipts.push((Arc::clone(call), event)),
+            Err(error) => failures.push(format!("{}: {error:#}", call.purpose_label())),
+        }
+    }
+    (receipts, failures)
+}
+
+/// Persist every auxiliary receipt, bind a served reply, and only then report
+/// any failure so one bad call never hides another's receipt.
+async fn persist_auxiliary_replies(
+    calls: &[Arc<super::auxiliary_call::AuxiliaryProviderCall>],
+    fabric: &crate::memory::MemoryFabric,
+    config: &crate::config::Config,
+    context: &crate::runtime::turn_decision::TurnDecisionContext,
+    proposal: &mut crate::agent::terminal::TurnTerminalDraft,
+) -> anyhow::Result<()> {
+    let (receipts, mut failures) = persist_auxiliary_events(calls, fabric, config, proposal).await;
+    for (call, event) in receipts {
+        if let Err(error) = bind_served_auxiliary(&call, context, proposal, event) {
+            failures.push(format!("{}: {error:#}", call.purpose_label()));
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "auxiliary receipt persistence failed: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
 fn ensure_purpose_unclaimed(
     registered: &[Arc<super::auxiliary_call::AuxiliaryProviderCall>],
     call: &super::auxiliary_call::AuxiliaryProviderCall,
@@ -592,7 +645,11 @@ mod auxiliary_registration_tests {
     use crate::runtime::auxiliary_call::{AuxiliaryProviderCall, AuxiliaryPurpose};
 
     fn call(purpose: AuxiliaryPurpose) -> Arc<AuxiliaryProviderCall> {
-        let route = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        AuxiliaryProviderCall::new_for(purpose, route(purpose), "0".repeat(64))
+    }
+
+    fn route(purpose: AuxiliaryPurpose) -> crate::llm::route_decision::RouteDecision {
+        crate::llm::route_decision::RouteDecision::single_candidate_for_context(
             "prx_provider".to_owned(),
             "prx_model".to_owned(),
             "owner".to_owned(),
@@ -603,8 +660,89 @@ mod auxiliary_registration_tests {
             1,
             false,
             false,
+        )
+    }
+
+    fn draft(scope: crate::memory::MessageEventScope) -> crate::agent::terminal::TurnTerminalDraft {
+        let now = chrono::Utc::now();
+        crate::agent::terminal::TurnTerminalDraft {
+            decision: None,
+            terminal_id: "prx_aux_terminal".to_owned(),
+            scope,
+            status: crate::agent::terminal::TurnTerminalStatus::Failed,
+            history: None,
+            history_scope: None,
+            provider_outcome: None,
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: "aux".to_owned(),
+                started_at: now,
+                finished_at: now,
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_first_call_does_not_skip_the_second_receipt() {
+        let temp = tempfile::tempdir().expect("test: workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.causal_tree.enabled = false;
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config());
+        // An invalid accounting scope makes the first call's persistence fail.
+        let route = route(AuxiliaryPurpose::SmartGroupClassifier);
+        let broken = AuxiliaryProviderCall::new_for(AuxiliaryPurpose::SmartGroupClassifier, route, "bad".to_owned());
+        let healthy = call(AuxiliaryPurpose::SignalVision);
+        for call in [&broken, &healthy] {
+            call.begin().expect("test: begin");
+        }
+        let scope = crate::memory::MessageEventScope::new("test", crate::memory::MemoryVisibility::Workspace)
+            .with_owner_id("prx_aux_owner")
+            .with_run_id("prx_aux_run")
+            .with_session_key("prx_aux_session");
+        let mut proposal = draft(scope);
+        let (receipts, failures) = persist_auxiliary_events(&[broken, healthy], &fabric, &config, &mut proposal).await;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("smart_group_classifier"), "{failures:?}");
+        assert_eq!(receipts.len(), 1, "the second call still persisted");
+        assert_eq!(receipts[0].0.purpose_label(), "signal_vision");
+    }
+
+    #[tokio::test]
+    async fn classifier_and_vision_on_one_terminal_persist_two_settled_events() {
+        let temp = tempfile::tempdir().expect("test: workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.causal_tree.enabled = false;
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
+            .with_event_recording(config.memory.event_recording_config());
+        let calls = [
+            call(AuxiliaryPurpose::SmartGroupClassifier),
+            call(AuxiliaryPurpose::SignalVision),
+        ];
+        for call in &calls {
+            call.begin().expect("test: begin");
+        }
+        let scope = crate::memory::MessageEventScope::new("test", crate::memory::MemoryVisibility::Workspace)
+            .with_owner_id("prx_aux_owner")
+            .with_run_id("prx_aux_run")
+            .with_session_key("prx_aux_session");
+        let mut proposal = draft(scope);
+        let (receipts, failures) = persist_auxiliary_events(&calls, &fabric, &config, &mut proposal).await;
+        assert!(failures.is_empty(), "{failures:?}");
+        let events: Vec<_> = receipts.into_iter().filter_map(|(_, event)| event).collect();
+        assert_eq!(events.len(), 2, "one settled event per registered call");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type == "provider.auxiliary.settled")
         );
-        AuxiliaryProviderCall::new_for(purpose, route, "0".repeat(64))
+        assert_ne!(events[0].event_id, events[1].event_id);
     }
 
     #[test]
@@ -623,14 +761,12 @@ mod auxiliary_registration_tests {
 /// Both normal commit and interrupted pending-commit recovery use the same
 /// real receipt binding. A successful auxiliary observation never turns a
 /// Failed/Cancelled parent into a Completed reply.
-async fn persist_auxiliary_reply(
+fn bind_served_auxiliary(
     call: &super::auxiliary_call::AuxiliaryProviderCall,
-    fabric: &crate::memory::MemoryFabric,
-    config: &crate::config::Config,
     context: &crate::runtime::turn_decision::TurnDecisionContext,
-    proposal: &mut crate::agent::terminal::TurnTerminalDraft,
+    proposal: &crate::agent::terminal::TurnTerminalDraft,
+    event: Option<crate::memory::MessageEvent>,
 ) -> anyhow::Result<()> {
-    let event = call.persist(fabric, config, proposal).await?;
     if proposal.status == crate::agent::terminal::TurnTerminalStatus::Completed && context.served_auxiliary().is_none()
     {
         if let Some(link) =
@@ -713,9 +849,7 @@ impl Drop for TurnTerminalGuard {
                         super::turn_cleanup::diagnostic::StageName::TerminalDropFinalize,
                     );
                     let result = async {
-                        for call in &auxiliary_calls {
-                            persist_auxiliary_reply(call, &fabric, &config, &context, &mut proposal).await?;
-                        }
+                        persist_auxiliary_replies(&auxiliary_calls, &fabric, &config, &context, &mut proposal).await?;
                         if let Some(cleanup) = child_cleanup {
                             cleanup.wait().await?;
                         }
