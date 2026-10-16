@@ -63,6 +63,12 @@ pub enum CausalMutation {
         pinned_snapshot: Option<String>,
         timeout_ms: Option<u32>,
     },
+    /// Go back to `kind = "auto"` (the factory's order: a configured
+    /// endpoint, else the builtin): clears the endpoint, model, pinned
+    /// snapshot and credential reference, and turns remote processing off in
+    /// the same plan. The stored credential is not deleted; it stays
+    /// unreferenced and `prx doctor` lists it as an orphaned decision credential.
+    ResetBackendToAuto,
     /// Allow or forbid decision state leaving this machine.
     SetRemote(bool),
     /// Set the credential reference (`""`, `"none"` or `cred-<name>`).
@@ -389,6 +395,14 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
     let section = &mut config.causal_tree;
     match mutation {
         CausalMutation::SetEnabled(enabled) => section.enabled = *enabled,
+        CausalMutation::ResetBackendToAuto => {
+            section.backend.kind = BackendSelection::Auto;
+            section.backend.endpoint.clear();
+            section.backend.model.clear();
+            section.backend.pinned_snapshot.clear();
+            section.backend.credential_ref = CredentialRefSetting::Unset;
+            section.backend.remote_enabled = false;
+        }
         CausalMutation::SetRemote(remote) => section.backend.remote_enabled = *remote,
         CausalMutation::SetCredentialRef(reference) => section.backend.credential_ref = reference.clone(),
         CausalMutation::SetBackend {
@@ -680,6 +694,36 @@ mod tests {
             declarations(&again),
             "a switch never removes a declaration"
         );
+    }
+
+    #[test]
+    fn reset_backend_to_auto_clears_the_hosted_choice_and_remote() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let entry = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
+            .expect("hosted decision entry");
+        let hosted = CausalConfigService::mutate(
+            &Config::default(),
+            &[
+                CausalMutation::SetBackend {
+                    kind: BackendKind::OpenRouter,
+                    endpoint: None,
+                    model: Some(entry.api_model.clone()),
+                    pinned_snapshot: None,
+                    timeout_ms: None,
+                },
+                CausalMutation::SetCredentialRef(CredentialRefSetting::Profile("cred-decision-openrouter".to_string())),
+                CausalMutation::SetRemote(true),
+            ],
+        )
+        .expect("hosted backend");
+        assert!(matches!(hosted.causal_tree.backend.kind, BackendSelection::Fixed(_)));
+        let auto = CausalConfigService::mutate(&hosted, &[CausalMutation::ResetBackendToAuto]).expect("back to auto");
+        let backend = &auto.causal_tree.backend;
+        assert_eq!(backend.kind, BackendSelection::Auto);
+        assert!(backend.endpoint.is_empty() && backend.model.is_empty() && backend.pinned_snapshot.is_empty());
+        assert_eq!(backend.credential_ref, CredentialRefSetting::Unset);
+        assert!(!backend.remote_enabled);
     }
 
     #[test]

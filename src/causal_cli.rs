@@ -170,6 +170,13 @@ pub enum CausalSetCommands {
         #[command(flatten)]
         apply: CausalApplyArgs,
     },
+    /// Go back to `kind = auto`: no endpoint, model, snapshot or credential
+    /// reference, and remote processing off (the builtin serves decisions
+    /// again)
+    Auto {
+        #[command(flatten)]
+        apply: CausalApplyArgs,
+    },
     /// Store a new credential for the configured backend and reference it,
     /// in one high-risk change (the previous decision credential is removed)
     Secret {
@@ -284,6 +291,7 @@ pub fn config_change(command: CausalConfigCommands, config: &Config) -> Result<C
                     apply,
                 }
             }
+            CausalSetCommands::Auto { apply } => plan(CausalMutation::ResetBackendToAuto, apply),
             CausalSetCommands::Policy {
                 max_candidates,
                 max_decision_hops,

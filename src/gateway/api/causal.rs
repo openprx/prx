@@ -397,6 +397,9 @@ pub(super) enum MutationBody {
         #[serde(default)]
         timeout_ms: Option<u32>,
     },
+    /// Back to `kind = "auto"`: no endpoint, model, snapshot or credential
+    /// reference, and remote processing off.
+    ResetBackendToAuto,
     SetRemote {
         remote: bool,
     },
@@ -448,6 +451,7 @@ impl MutationBody {
                     timeout_ms,
                 }
             }
+            Self::ResetBackendToAuto => CausalMutation::ResetBackendToAuto,
             Self::SetRemote { remote } => CausalMutation::SetRemote(remote),
             Self::SetCredentialRef { reference } => {
                 CausalMutation::SetCredentialRef(CredentialRefSetting::try_from(reference)?)
