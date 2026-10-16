@@ -16,12 +16,18 @@
 //! replaced, and evidence carried over that stopped being eligible is moved to
 //! `withdrawn_evidence` instead of blocking the group.
 //!
-//! The index lists only the active pattern of each group (bounded; history is
-//! reached through `supersedes`). A crash between the pattern write and the
-//! index write leaves an unindexed pattern file; every consolidation and every
-//! rebuild adopts such files before doing anything else, resolving two
-//! successors of one predecessor to a single active pattern (the later
-//! `created_at`, ties by pattern id).
+//! The index lists only the active pattern of each group. Superseded and losing
+//! patterns are moved to `patterns/history/` after the index write; a crash
+//! before or after that write leaves an unindexed top-level file, which every
+//! consolidation and every rebuild adopts before doing anything else. Within a
+//! group the higher lineage `generation` wins, ties by pattern id; the clock is
+//! never consulted. Forged or malformed leftovers move to `patterns/quarantine/`;
+//! any other read failure (wrong owner, unsupported schema, unsafe permissions,
+//! I/O) fails closed and blocks consolidation until an operator fixes the file.
+//!
+//! Distinct tasks are counted per root task, walking parent experiences up to 8
+//! hops. A missing middle experience in a longer chain, a chain deeper than 8
+//! hops, or a forged parent cycle can make one incident count as two tasks.
 
 use super::capture::{ExperienceOutcome, experience_id, is_experience_id};
 use super::generation::ensure_dir_synced;
