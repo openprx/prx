@@ -69,18 +69,27 @@ pub struct VerifiedRevision {
     pub bundle: Bundle,
 }
 
-/// Canonical digest of a revision record: lowercase hex SHA-256 of its compact
-/// `serde_json` serialization (fixed field order, no maps). A digest stored
-/// inside the same directory does not authenticate the record, because whoever
-/// can edit the record can edit the digest too. The digest is meant to be
-/// pinned elsewhere, for example by the SL08 publication journal, and passed
-/// to [`SkillLifecycleStore::read_revision`].
+/// Version of the record digest encoding.
+const RECORD_DIGEST_VERSION: u32 = 1;
+const RECORD_DIGEST_DOMAIN: &[u8] = b"prx-skill-record\0";
+
+/// Canonical digest of a revision record: lowercase hex SHA-256 of
+/// `b"prx-skill-record\0"`, the `u32` big-endian digest version (1) and the
+/// compact `serde_json` serialization of the record (fixed field order, no
+/// maps). A digest stored inside the same directory does not authenticate the
+/// record, because whoever can edit the record can edit the digest too. The
+/// digest is meant to be pinned elsewhere, for example by the SL08 publication
+/// journal, and passed to [`SkillLifecycleStore::read_revision`].
 pub fn record_digest(revision: &SkillRevision) -> Result<String, LifecycleError> {
     let bytes = serde_json::to_vec(revision).map_err(|e| LifecycleError::InvalidRecord {
         path: PathBuf::from(REVISION_FILE),
         reason: e.to_string(),
     })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    let mut hasher = Sha256::new();
+    hasher.update(RECORD_DIGEST_DOMAIN);
+    hasher.update(RECORD_DIGEST_VERSION.to_be_bytes());
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Name of the first provenance field in which `new` differs from `record`.
@@ -143,6 +152,43 @@ impl SkillLifecycleStore {
         Ok(store)
     }
 
+    /// Opens an existing store without creating anything. `Ok(None)` means the
+    /// owner workspace has no lifecycle store (nothing is managed). A store
+    /// that exists but belongs to another owner scope is
+    /// [`LifecycleError::OwnerMismatch`], and any unsafe component is refused.
+    pub fn open_existing(workspace_dir: &Path, owner: OwnerScope) -> Result<Option<Self>, LifecycleError> {
+        let workspace = workspace_dir
+            .canonicalize()
+            .map_err(|e| LifecycleError::WorkspaceUnavailable {
+                path: workspace_dir.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        let self_dir = workspace.join(SELF_DIR);
+        let root = self_dir.join(STORE_DIR);
+        for path in [&self_dir, &root] {
+            match fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(LifecycleError::UnsafeStorePath {
+                            path: path.clone(),
+                            reason: "must be a real directory, not a symlink or file".to_string(),
+                        });
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(LifecycleError::io(path, e)),
+            }
+        }
+        check_private(&root)?;
+        let schema = root.join(SCHEMA_FILE);
+        if fs::symlink_metadata(&schema).is_err() {
+            return Ok(None);
+        }
+        let store = Self { root, owner };
+        store.verify_schema()?;
+        Ok(Some(store))
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -182,6 +228,11 @@ impl SkillLifecycleStore {
                 Err(e) => return Err(LifecycleError::io(&path, e)),
             }
         }
+        self.verify_schema()
+    }
+
+    fn verify_schema(&self) -> Result<(), LifecycleError> {
+        let path = self.root.join(SCHEMA_FILE);
         let schema: StoreSchema = read_record(&path)?;
         if schema.schema_version != SCHEMA_VERSION {
             return Err(LifecycleError::UnsupportedSchema {
@@ -208,6 +259,37 @@ impl SkillLifecycleStore {
                 found: found.to_string(),
             })
         }
+    }
+
+    pub(super) fn bundle_dir(&self, skill: &SkillId, revision: &RevisionId) -> PathBuf {
+        self.revision_dir(skill, revision).join(BUNDLE_DIR)
+    }
+
+    /// Reads `revision.json` only (no bundle hashing) and accepts it when its
+    /// canonical digest equals `digest`, which an active binding pins. This is
+    /// enough to learn the authentic display name without verifying the whole
+    /// bundle.
+    pub(super) fn pinned_revision_record(
+        &self,
+        skill: &SkillId,
+        revision: &RevisionId,
+        digest: &str,
+    ) -> Result<SkillRevision, LifecycleError> {
+        let path = self.revision_dir(skill, revision).join(REVISION_FILE);
+        check_private(&path)?;
+        let record: SkillRevision = read_record(&path)?;
+        self.check_owner(&record.owner_scope)?;
+        if record.skill_id != *skill || record.revision_id != *revision || record_digest(&record)? != digest {
+            return Err(LifecycleError::Tampered {
+                path,
+                reason: "revision record does not match the digest pinned by the binding".to_string(),
+            });
+        }
+        Ok(record)
+    }
+
+    pub(super) fn check_owner_scope(&self, found: &OwnerScope) -> Result<(), LifecycleError> {
+        self.check_owner(found)
     }
 
     fn revision_dir(&self, skill: &SkillId, revision: &RevisionId) -> PathBuf {

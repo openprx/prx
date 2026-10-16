@@ -1,11 +1,15 @@
 #![cfg(test)]
 
+mod binding;
 mod bundle;
 mod manifest;
+mod migrate;
 mod publish;
 mod store;
 
-use super::{BundleEntry, OwnerScope};
+use super::{
+    ActiveBinding, BundleEntry, OwnerScope, PublishRequest, RevisionId, SkillId, SkillLifecycleStore, TransactionId,
+};
 use std::path::PathBuf;
 
 pub(super) fn md(name: &str, description: &str) -> String {
@@ -37,4 +41,28 @@ pub(super) fn basic_entries() -> Vec<BundleEntry> {
 
 pub(super) fn owner(id: &str) -> OwnerScope {
     OwnerScope::new(id).expect("test: valid owner scope")
+}
+
+/// Publishes `revision` through the SL08 path with a fresh transaction id.
+pub(super) fn activate(
+    store: &SkillLifecycleStore,
+    skill: &SkillId,
+    revision: &(RevisionId, String),
+    expected_generation: u64,
+    enabled: bool,
+) -> ActiveBinding {
+    store
+        .publish(&PublishRequest {
+            transaction_id: TransactionId::generate(),
+            skill_id: skill.clone(),
+            candidate: revision.0.clone(),
+            candidate_record_digest: revision.1.clone(),
+            expected_generation,
+            enabled,
+        })
+        .expect("test: publish");
+    store
+        .active_binding(skill)
+        .expect("test: binding readable")
+        .expect("test: binding present")
 }
