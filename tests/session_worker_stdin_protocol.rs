@@ -1094,9 +1094,10 @@ fn the_stdin_control_reader_stays_a_detached_os_thread() {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("session_worker")
-            .join("runner.rs"),
+            .join("runner")
+            .join("steering.rs"),
     )
-    .expect("read src/session_worker/runner.rs");
+    .expect("read src/session_worker/runner/steering.rs");
     let body = function_body(&source, "spawn_stdin_control_reader");
 
     assert!(

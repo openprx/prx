@@ -17472,7 +17472,7 @@ mod tests {
             "chat/mod.rs",
             "gateway/mod.rs",
             "channels/mod.rs",
-            "session_worker/runner.rs",
+            "session_worker/runner/provider.rs",
         ] {
             let text = std::fs::read_to_string(root.join(file)).expect("test: read source");
             let mut offset = 0;
