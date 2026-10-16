@@ -4310,7 +4310,7 @@ impl AdmittedSmartPreGate {
     /// The completed classifier outcome that authorizes silence, or `None`
     /// when the message must enter the loop (fail-open): either the gate
     /// chose to enter, or it skipped without a settled classifier receipt.
-    fn silence_provider_outcome(&mut self) -> Option<crate::llm::route_decision::ProviderExecutionOutcome> {
+    const fn silence_provider_outcome(&mut self) -> Option<crate::llm::route_decision::ProviderExecutionOutcome> {
         if self.outcome.should_enter_loop() {
             return None;
         }
