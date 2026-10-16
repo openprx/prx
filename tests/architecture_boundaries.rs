@@ -8102,7 +8102,6 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/channels/decision_turn.rs:build_provider:create_provider_for",
         "src/channels/mod.rs:build_channel_hint_provider:create_provider_for",
         "src/channels/mod.rs:build_channel_startup_provider:create_routed_provider_for",
-        "src/channels/mod.rs:get_or_create_provider_for_generation:create_provider_for",
         "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
         "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
         "src/doctor/mod.rs:provider_validation_error:create_provider_for",
