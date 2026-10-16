@@ -417,10 +417,10 @@ for line in sys.stdin:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
 "#;
-    if std::process::Command::new("python3").arg("--version").output().is_err() {
-        eprintln!("skipping MCP approval end-to-end test: python3 is unavailable");
-        return;
-    }
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .expect("test: python3 runs the stdio MCP fixture");
     let tmp = TempDir::new().unwrap();
     let marker = tmp.path().join("mcp-executed.marker");
     let mut config = crate::config::Config::default();
