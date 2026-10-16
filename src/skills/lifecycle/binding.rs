@@ -9,6 +9,7 @@
 //! the pinned record digest.
 
 use super::bundle::{Bundle, BundleFile};
+use super::capture::Correlation;
 use super::generation::{ACTIVE_DIR, ActiveBinding};
 use super::store::{SkillLifecycleStore, VerifiedRevision};
 use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, SkillId};
@@ -247,25 +248,48 @@ pub struct ManagedSkillRead {
     pub untrusted_origin: bool,
 }
 
-/// Resolves `skill_name` through the owner's lifecycle store and reads one
+/// One managed-skill read.
+#[derive(Clone, Debug)]
+pub struct ManagedReadRequest<'a> {
+    pub workspace_dir: &'a Path,
+    pub owner: &'a OwnerScope,
+    pub skill_name: &'a str,
+    pub resource_path: Option<&'a str>,
+    /// The trusted task the read belongs to; hydration is captured for it.
+    pub task_id: Option<&'a str>,
+    /// Run, segment and child identities of the call, recorded as given.
+    pub correlation: Correlation,
+    /// Keep the task on the revision it first read (requires `task_id`). The
+    /// pins live until [`release_task_pins`] / [`on_task_terminal`].
+    pub pin_task: bool,
+    pub max_bytes: u64,
+}
+
+/// Resolves the skill through the owner's lifecycle store and reads one
 /// resource of its revision.
 ///
 /// `Ok(None)` means the skill is not lifecycle-managed for this owner (no
 /// store, a store of another owner, or no binding), and the caller keeps the
 /// legacy behaviour. A managed skill that is disabled, whose revision is
 /// missing or tampered, or whose resource is absent or too large is an error:
-/// nothing falls back to another revision.
-pub fn read_managed_resource(
-    workspace_dir: &Path,
-    owner: &OwnerScope,
-    skill_name: &str,
-    resource_path: Option<&str>,
-    task_id: Option<&str>,
-    max_bytes: u64,
-) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+/// nothing falls back to another revision. A successful read with a task id
+/// records a hydration receipt; a capture failure is logged and marks the
+/// experience as having dropped evidence, but never fails the read.
+pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+    let ManagedReadRequest {
+        workspace_dir,
+        owner,
+        skill_name,
+        resource_path,
+        task_id,
+        pin_task,
+        max_bytes,
+        ..
+    } = *request;
+    let pin_task_id = task_id.filter(|_| pin_task);
     // A task that already holds a pin for this skill name keeps it, even if
     // the active binding was renamed, disabled or removed since.
-    let held = task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
+    let held = pin_task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
     let store = match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
         Ok(Some(store)) => store,
         Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) if held.is_none() => return Ok(None),
@@ -284,7 +308,7 @@ pub fn read_managed_resource(
         }
         // One verification of the bundle serves both the pin and the read.
         let (issued, verified) = store.verify_binding(&binding)?;
-        match task_id {
+        match pin_task_id {
             Some(task) => {
                 let pin = task_pin(owner, task, &binding.skill_id, || Ok(Some(issued)))?
                     .ok_or_else(|| LifecycleError::RevisionNotFound(binding.skill_id.to_string()))?;
@@ -309,6 +333,9 @@ pub fn read_managed_resource(
     }
     let content = String::from_utf8(file.bytes().to_vec())
         .map_err(|_| LifecycleError::ResourceUnavailable(format!("{} is not valid UTF-8", file.path())))?;
+    if let Some(task) = task_id {
+        capture_hydration(&store, task, &pin, file.path(), file.bytes(), &request.correlation);
+    }
     let untrusted_origin = verified.bundle.file(UNTRUSTED_ORIGIN_MARKER).is_some();
     Ok(Some(ManagedSkillRead {
         resource_path: file.path().to_string(),
@@ -318,6 +345,22 @@ pub fn read_managed_resource(
         content,
         untrusted_origin,
     }))
+}
+
+fn capture_hydration(
+    store: &SkillLifecycleStore,
+    task: &str,
+    pin: &PinnedSkillRevision,
+    path: &str,
+    content: &[u8],
+    correlation: &Correlation,
+) {
+    if let Err(error) = store.record_hydration(task, pin, path, content, correlation) {
+        tracing::warn!(%error, task, "failed to record a skill hydration receipt");
+        if let Err(error) = store.record_dropped_evidence(task) {
+            tracing::warn!(%error, task, "failed to mark dropped skill evidence");
+        }
+    }
 }
 
 /// Default resource follows the catalog: SKILL.toml when present, else SKILL.md.

@@ -126,9 +126,9 @@ impl Tool for SkillsListTool {
     }
 }
 
-/// The task a trusted, runtime-authored scope belongs to (`task_id`, else
-/// `run_id`). Absent for untrusted or direct calls, which are never pinned.
-fn trusted_task_id(args: &serde_json::Value) -> Option<String> {
+/// First non-empty string among `keys` of a trusted, runtime-authored scope.
+/// Absent for untrusted or direct calls.
+fn trusted_scope_field(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
     if !args
         .get("_zc_scope_trusted")
         .and_then(serde_json::Value::as_bool)
@@ -137,9 +137,9 @@ fn trusted_task_id(args: &serde_json::Value) -> Option<String> {
         return None;
     }
     let scope = args.get("_zc_scope")?.as_object()?;
-    ["task_id", "run_id"].into_iter().find_map(|key| {
+    keys.iter().find_map(|key| {
         scope
-            .get(key)
+            .get(*key)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -163,8 +163,12 @@ pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> T
         description: skill.description.clone(),
         parameters: json!({
             "type": "object",
-            "properties": {"name": {"const": skill.name}},
-            "required": ["name"]
+            "properties": {
+                "name": {"const": skill.name},
+                "resource_path": {"type": "string"}
+            },
+            "required": ["name"],
+            "additionalProperties": false
         }),
     }
 }
@@ -221,19 +225,29 @@ impl SkillReadTool {
         if !in_catalog {
             return Ok(None);
         }
-        let task_id = if self.pin_tasks { trusted_task_id(args) } else { None };
+        // The task the trusted scope belongs to (`task_id`, else `run_id`);
+        // hydration is captured for it, and pinned when pinning is enabled.
+        let task_id = trusted_scope_field(args, &["task_id", "run_id"]);
+        let correlation = crate::skills::lifecycle::Correlation {
+            run_id: trusted_scope_field(args, &["run_id"]),
+            segment_id: None,
+            child_id: None,
+        };
+        let pin_task = self.pin_tasks;
         let workspace = self.workspace_dir.clone();
         let skill_name = name.to_string();
         let resource = resource_path.map(str::to_string);
         let read = tokio::task::spawn_blocking(move || {
-            crate::skills::lifecycle::read_managed_resource(
-                &workspace,
-                &owner,
-                &skill_name,
-                resource.as_deref(),
-                task_id.as_deref(),
-                MAX_SKILL_RESOURCE_BYTES,
-            )
+            crate::skills::lifecycle::read_managed_resource(&crate::skills::lifecycle::ManagedReadRequest {
+                workspace_dir: &workspace,
+                owner: &owner,
+                skill_name: &skill_name,
+                resource_path: resource.as_deref(),
+                task_id: task_id.as_deref(),
+                correlation,
+                pin_task,
+                max_bytes: MAX_SKILL_RESOURCE_BYTES,
+            })
         })
         .await
         .map_err(|error| anyhow::anyhow!("lifecycle skill read task failed: {error}"))?
@@ -339,6 +353,15 @@ impl Tool for SkillReadTool {
             .as_object()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Skill read arguments must be an object"))?;
+        // The alias schema is closed; enforce the same on the direct path.
+        if let Some(unknown) = arguments.keys().find(|key| {
+            !matches!(key.as_str(), "name" | "resource_path")
+                && !super::execution::RUNTIME_ONLY_ARG_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+        }) {
+            anyhow::bail!("Unexpected skill read argument '{unknown}'");
+        }
         if let Some(requested) = arguments.get("name") {
             anyhow::ensure!(
                 requested.as_str() == Some(skill.name.as_str()),
@@ -1303,6 +1326,43 @@ mod tests {
         let owner_scope = OwnerScope::new(owner).unwrap();
         for task in ["task-tool-1", "task-tool-2", "task-tool-3"] {
             crate::skills::lifecycle::release_task_pins(&owner_scope, task);
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_read_alias_schema_is_closed_and_paths_stay_confined() {
+        let temp = TempDir::new().unwrap();
+        let skill_dir = temp.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md("body")).unwrap();
+        std::fs::write(temp.path().join("secret.txt"), "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(temp.path().join("secret.txt"), skill_dir.join("link.txt")).unwrap();
+        let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
+
+        let metadata = crate::skills::catalog_skill_metadata(temp.path(), &test_config(temp.path()));
+        let spec = catalog_skill_read_spec(metadata.first().unwrap());
+        assert_eq!(spec.parameters.get("additionalProperties").unwrap(), &json!(false));
+        assert!(spec.parameters.pointer("/properties/resource_path").is_some());
+
+        let junk = tool
+            .execute_named("demo", json!({"name": "demo", "extra": 1}))
+            .await
+            .expect_err("unknown alias argument must fail");
+        assert!(junk.to_string().contains("Unexpected skill read argument"));
+        let read = tool
+            .execute_named("demo", json!({"name": "demo", "resource_path": "SKILL.md"}))
+            .await
+            .unwrap();
+        assert!(read.success);
+
+        for bad in ["../../secret.txt", "/etc/passwd", "link.txt"] {
+            let error = tool
+                .execute_named("demo", json!({"name": "demo", "resource_path": bad}))
+                .await
+                .expect_err("resource must stay inside the skill directory");
+            let text = error.to_string();
+            assert!(text.contains("escapes") || text.contains("relative"), "{bad}: {text}");
         }
     }
 }

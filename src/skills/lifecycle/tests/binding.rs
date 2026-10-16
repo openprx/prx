@@ -3,8 +3,8 @@
 use super::{activate, basic_entries, entry, md, owner};
 use crate::skills::lifecycle::binding::PinTable;
 use crate::skills::lifecycle::{
-    Bundle, BundleEntry, LifecycleError, NewRevision, OwnerScope, RevisionId, SkillId, SkillLifecycleStore, SourceKind,
-    read_managed_resource, release_task_pins, task_pin,
+    Bundle, BundleEntry, Correlation, LifecycleError, ManagedReadRequest, NewRevision, OwnerScope, RevisionId, SkillId,
+    SkillLifecycleStore, SourceKind, read_managed_resource, release_task_pins, task_pin,
 };
 use std::fs;
 use std::path::Path;
@@ -48,7 +48,16 @@ fn read(
     resource: Option<&str>,
     task: Option<&str>,
 ) -> Result<Option<crate::skills::lifecycle::ManagedSkillRead>, LifecycleError> {
-    read_managed_resource(workspace, &owner(who), name, resource, task, LIMIT)
+    read_managed_resource(&ManagedReadRequest {
+        workspace_dir: workspace,
+        owner: &owner(who),
+        skill_name: name,
+        resource_path: resource,
+        task_id: task,
+        correlation: Correlation::default(),
+        pin_task: task.is_some(),
+        max_bytes: LIMIT,
+    })
 }
 
 #[test]
@@ -293,14 +302,16 @@ fn managed_reads_refuse_instead_of_falling_back() {
         let err = read(tmp.path(), OWNER_A, "deploy helper", Some(bad), None).expect_err("test: bad resource");
         assert!(matches!(err, LifecycleError::ResourceUnavailable(_)), "{bad}: {err}");
     }
-    let err = read_managed_resource(
-        tmp.path(),
-        &owner(OWNER_A),
-        "deploy helper",
-        Some("references/guide.md"),
-        None,
-        3,
-    )
+    let err = read_managed_resource(&ManagedReadRequest {
+        workspace_dir: tmp.path(),
+        owner: &owner(OWNER_A),
+        skill_name: "deploy helper",
+        resource_path: Some("references/guide.md"),
+        task_id: None,
+        correlation: Correlation::default(),
+        pin_task: false,
+        max_bytes: 3,
+    })
     .expect_err("test: too large");
     assert!(matches!(err, LifecycleError::ResourceUnavailable(_)), "{err}");
 
