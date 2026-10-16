@@ -79,11 +79,27 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
         .flatten()
         .any(|value| !value.trim().is_empty())
         || config.reliability.api_keys.iter().any(|key| !key.trim().is_empty());
-    if root_holds_material && ProviderId::of(provider) == ProviderId::of(default_provider(config)) {
+    let is_default = ProviderId::of(provider) == ProviderId::of(default_provider(config));
+    if root_holds_material && is_default {
         CredentialRef::LegacyInline(LegacySlot::Root)
+    } else if is_default && let Some(reference) = default_credential_reference(config, provider) {
+        reference
     } else {
         CredentialRef::ProviderStore
     }
+}
+
+/// The credential reference `prx providers credential set <provider>` stores
+/// under its default name (`cred-<catalog name>`), when the configured default
+/// provider has one and it was issued for that provider. Used only when the
+/// root holds nothing, so an inline root key keeps winning. A missing store, a
+/// missing reference or one owned by another provider means no reference.
+fn default_credential_reference(config: &Config, provider: &str) -> Option<CredentialRef> {
+    let name = ProviderId::of(provider).catalog_name()?.to_ascii_lowercase();
+    let id = crate::config::manage::credentials::CredentialReferences::id_for(&name).ok()?;
+    let references = crate::config::manage::credentials::CredentialReferences::for_config(config).ok()?;
+    references.check_reference(&id, provider).ok()?;
+    crate::config::manage::credentials::CredentialReferences::reference(&id).ok()
 }
 
 /// Resolve `provider`/`model` for `requirement` with the credential
@@ -640,6 +656,31 @@ mod tests {
         config.api_key = Some("PMMC-SELECTION-ROOT".to_string());
         config.secrets.encrypt = false;
         config
+    }
+
+    #[test]
+    fn a_stored_default_provider_credential_is_used_when_the_root_holds_no_key() {
+        let temp = tempfile::TempDir::new().expect("test: temp dir");
+        let mut config = config_in(&temp, "openai", "gpt-5");
+        config.api_key = None;
+        assert_eq!(credential_for(&config, "openai"), CredentialRef::ProviderStore);
+
+        let references = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .expect("test: reference store");
+        references
+            .set("openai", "openai", "sk-test-default-credential-0001")
+            .expect("test: store credential");
+        assert_eq!(
+            credential_for(&config, "openai"),
+            CredentialRef::Profile {
+                id: "cred-openai".to_string()
+            }
+        );
+        // Another provider never receives the default provider's reference.
+        assert_eq!(credential_for(&config, "anthropic"), CredentialRef::ProviderStore);
+        // An inline root key keeps winning over the store.
+        config.api_key = Some("PMMC-SELECTION-ROOT".to_string());
+        assert_eq!(credential_for(&config, "openai"), CredentialRef::LegacyInline(LegacySlot::Root));
     }
 
     #[test]
