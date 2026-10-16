@@ -624,6 +624,20 @@ fn daemon_owned_components_do_not_reload_process_config_from_disk() {
 
     for relative in [
         "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
         "src/cron/scheduler.rs",
         "src/xin/runner.rs",
         "src/heartbeat/engine.rs",
@@ -664,11 +678,30 @@ fn gateway_and_channels_have_one_shared_config_owner() {
         "AppState must not restore the former config/shared_config split"
     );
 
-    let channels = fs::read_to_string(repository_root().join("src/channels/mod.rs")).expect("read src/channels/mod.rs");
-    assert!(
-        !channels.contains("HotReloadManager") && !channels.contains("ArcSwap<Config>"),
-        "Channels must not own an independent config watcher or config publisher"
-    );
+    for relative in [
+        "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
+    ] {
+        let channels = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            !channels.contains("HotReloadManager") && !channels.contains("ArcSwap<Config>"),
+            "{relative}: Channels must not own an independent config watcher or config publisher"
+        );
+    }
 }
 
 #[test]
@@ -986,7 +1019,7 @@ fn config_writes_route_through_the_transaction_layer() {
             "not yet migrated: pairing-token persistence",
         ),
         (
-            "src/channels/mod.rs",
+            "src/channels/service.rs",
             ".save()",
             1,
             "not yet migrated: prx channel bind-telegram",
@@ -1132,13 +1165,13 @@ const ALLOWED_GIT_PROGRAM_LITERALS: &[&str] = &[
 /// git must go through `security::git_launch::git_command`.
 const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/channels/imessage.rs::send::let output = tokio::process::Command::new(\"osascript\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::if let Ok(status_output) = Command::new(\"rc-service\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let _ = Command::new(\"launchctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let active_output = Command::new(\"systemctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let list_output = Command::new(\"launchctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"rc-service\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"systemctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let start_output = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::if let Ok(status_output) = Command::new(\"rc-service\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let _ = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let active_output = Command::new(\"systemctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let list_output = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"rc-service\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"systemctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let start_output = Command::new(\"launchctl\")",
     "src/channels/signal.rs::run_command::let output = tokio::process::Command::new(cmd)",
     "src/channels/signal_native.rs::build_command::let mut cmd = Command::new(&self.cli_path);",
     "src/channels/wacli.rs::health_check::let mut cmd = tokio::process::Command::new(self.cli_binary());",
@@ -2717,7 +2750,8 @@ fn prompt_guided_tool_protocol_has_one_production_owner() {
 
 #[test]
 fn channel_system_prompt_delegates_to_the_canonical_agent_builder() {
-    let channels = fs::read_to_string(repository_root().join("src/channels/mod.rs")).expect("read src/channels/mod.rs");
+    let channels = fs::read_to_string(repository_root().join("src/channels/prompt_context.rs"))
+        .expect("read src/channels/prompt_context.rs");
     let body = function_body(&channels, "build_system_prompt_with_mode");
 
     assert!(body.contains("crate::agent::prompt::SystemPromptBuilder::with_defaults()"));
@@ -2744,6 +2778,20 @@ fn channel_system_prompt_delegates_to_the_canonical_agent_builder() {
 fn runtime_prompt_has_no_parallel_tool_description_catalog() {
     const BUILDERS_OUTSIDE_AGENT: &[&str] = &[
         "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
         "src/chat/mod.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
@@ -2844,7 +2892,7 @@ fn outbound_middleware_has_one_production_owner() {
 fn production_tool_loop_memory_is_wired_to_request_context_events() {
     for relative in [
         "src/agent/entry.rs",
-        "src/channels/mod.rs",
+        "src/channels/turn.rs",
         "src/chat/mod.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
@@ -2893,7 +2941,7 @@ const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         2,
         "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,proof:decision_proof,}",
     ),
-    ("src/channels/mod.rs", 1, "decision_turn.routing()"),
+    ("src/channels/turn.rs", 1, "decision_turn.routing()"),
     ("src/chat/dispatcher.rs", 1, "routing"),
     (
         "src/chat/mod.rs",
@@ -3492,7 +3540,7 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     "src/agent/embedded_turn.rs::run_work",
     "src/agent/entry.rs::run_with_runtime_envelope",
     "src/agent/entry.rs::run_with_runtime_envelope",
-    "src/channels/mod.rs::run_channel_turn",
+    "src/channels/turn.rs::run_channel_turn",
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
     // Workers prefer admitted child context, retaining the signed manifest fallback.
@@ -3751,7 +3799,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         "production sub-agent tool constructions with .with_compaction_resolver(",
         with_resolver,
         &[
-            "src/channels/mod.rs::start_channels_with_config",
+            "src/channels/startup.rs::start_channels_with_config",
             "src/chat/mod.rs::run",
             "src/gateway/mod.rs::register_gateway_turn_tools",
             "src/session_worker/runner.rs::worker_spawn_tool",
@@ -3961,7 +4009,7 @@ fn production_turns_budget_on_the_effective_context_window() {
                     let expected = match site.as_str() {
                         "src/agent/embedded_turn.rs::run_work" => "Some(decision.main_compaction())",
                         "src/agent/entry.rs::run_with_runtime_envelope" => "Some(decision_context.main_compaction())",
-                        "src/channels/mod.rs::run_channel_turn" => "Some(decision_turn.compaction())",
+                        "src/channels/turn.rs::run_channel_turn" => "Some(decision_turn.compaction())",
                         "src/chat/dispatcher.rs::drive_start_turn_stream" => "compaction_config.as_ref()",
                         "src/session_worker/runner.rs::run_owned_manifest" => {
                             "child_turn.as_ref().map(|turn|turn.compaction()).or(compaction_config_ref)"
@@ -8114,8 +8162,8 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
     let expected: BTreeSet<String> = [
         "src/agent/entry.rs:build_provider:create_routed_provider_for",
         "src/channels/decision_turn.rs:build_provider:create_provider_for",
-        "src/channels/mod.rs:build_channel_hint_provider:create_provider_for",
-        "src/channels/mod.rs:build_channel_startup_provider:create_routed_provider_for",
+        "src/channels/runtime_commands.rs:build_channel_hint_provider:create_provider_for",
+        "src/channels/runtime_commands.rs:build_channel_startup_provider:create_routed_provider_for",
         "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
         "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
         "src/doctor/mod.rs:provider_validation_error:create_provider_for",

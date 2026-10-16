@@ -27,6 +27,13 @@ mod supervisor;
 mod turn_execution;
 mod turn_failure;
 
+use super::dispatch::*;
+use super::history::*;
+use super::inbound_policy::*;
+use super::signal_vision::*;
+use super::smart_gate::*;
+use super::supervisor::*;
+use super::turn::*;
 use super::*;
 use crate::memory::{Memory, MemoryCategory, MemoryPrincipal, SqliteMemory};
 use crate::observability::NoopObserver;
