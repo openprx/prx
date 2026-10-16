@@ -486,7 +486,7 @@ pub async fn put_config_secret(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": crate::providers::sanitize_api_error(&format!("Config validation failed: {error}"))
+                "error": secret_paths::scrub_message(None, &format!("Config validation failed: {error}"))
             })),
         )
             .into_response();

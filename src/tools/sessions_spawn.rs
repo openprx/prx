@@ -1807,11 +1807,7 @@ impl SessionsSpawnTool {
     ///   provider. Replaying them against a different vendor only buys a run of
     ///   guaranteed 401s inside the retry budget.
     fn override_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
-        crate::config::ReliabilityConfig {
-            fallback_providers: Vec::new(),
-            api_keys: Vec::new(),
-            ..base.clone()
-        }
+        crate::runtime::child_source::pinned_provider_reliability(base)
     }
 
     /// Build the provider for a sub-agent that overrides the gateway provider.
@@ -5529,10 +5525,7 @@ impl SessionsSpawnTool {
         {
             resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
         } else if let Some(resolved) = selected_hint.as_ref() {
-            let reliability = crate::config::ReliabilityConfig {
-                fallback_providers: Vec::new(),
-                ..provider_reliability.clone()
-            };
+            let reliability = crate::runtime::child_source::pinned_provider_reliability(provider_reliability);
             providers::create_provider_for(
                 resolved,
                 child_model_catalog,
