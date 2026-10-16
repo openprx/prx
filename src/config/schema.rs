@@ -6705,13 +6705,11 @@ impl Config {
 
     fn validate_stored_merged(merged: toml::Value, config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let causal_extra_latency_explicit = causal_extra_latency_budget_present(&merged);
         let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
-        config.causal_tree.policy.extra_latency_budget_ms_explicit = causal_extra_latency_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
         config.validate()
     }
@@ -6738,13 +6736,11 @@ impl Config {
         crate::config::secret_paths::warn_on_stored_masks(&merged);
 
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let causal_extra_latency_explicit = causal_extra_latency_budget_present(&merged);
         let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
-        config.causal_tree.policy.extra_latency_budget_ms_explicit = causal_extra_latency_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
         config.validate()?;
         Ok(config)
@@ -7576,14 +7572,6 @@ fn agent_compaction_max_context_tokens_present(config: &toml::Value) -> bool {
         .get("agent")
         .and_then(|agent| agent.get("compaction"))
         .and_then(|compaction| compaction.get("max_context_tokens"))
-        .is_some()
-}
-
-fn causal_extra_latency_budget_present(config: &toml::Value) -> bool {
-    config
-        .get("causal_tree")
-        .and_then(|causal| causal.get("policy"))
-        .and_then(|policy| policy.get("extra_latency_budget_ms"))
         .is_some()
 }
 

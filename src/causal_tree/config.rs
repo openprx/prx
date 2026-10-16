@@ -322,7 +322,7 @@ impl From<CalibrationProfile> for CalibrationProfileSetting {
 }
 
 /// Decision policy (`[causal_tree.policy]`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(default)]
 pub struct CausalPolicy {
     /// The most candidates a decision considers (1 to 32).
@@ -331,10 +331,10 @@ pub struct CausalPolicy {
     pub max_decision_hops: u8,
     /// The extra latency one turn may spend deciding (50 to 5000 ms).
     pub extra_latency_budget_ms: u64,
-    /// Internal presence bit populated by `Config::load_from_path`. A stored
-    /// value equal to the default is still an operator value and must not be
-    /// replaced by a catalog transport recommendation.
-    #[serde(default, skip_serializing)]
+    /// Internal presence bit populated while deserializing the policy. A
+    /// stored value equal to the default is still an operator value and must
+    /// not be replaced by a catalog transport recommendation.
+    #[serde(skip)]
     #[schemars(skip)]
     pub extra_latency_budget_ms_explicit: bool,
     /// Minimum score to commit a candidate.
@@ -348,6 +348,56 @@ pub struct CausalPolicy {
     /// The calibration in force, if an operator applied one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration_profile: Option<CalibrationProfile>,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct StoredCausalPolicy {
+    max_candidates: u8,
+    max_decision_hops: u8,
+    extra_latency_budget_ms: Option<u64>,
+    commit_threshold: f32,
+    minimum_choice_confidence: f64,
+    minimum_top_margin: f64,
+    extra_token_ratio_limit: f32,
+    calibration_profile: Option<CalibrationProfile>,
+}
+
+impl Default for StoredCausalPolicy {
+    fn default() -> Self {
+        let policy = CausalPolicy::default();
+        Self {
+            max_candidates: policy.max_candidates,
+            max_decision_hops: policy.max_decision_hops,
+            extra_latency_budget_ms: None,
+            commit_threshold: policy.commit_threshold,
+            minimum_choice_confidence: policy.minimum_choice_confidence,
+            minimum_top_margin: policy.minimum_top_margin,
+            extra_token_ratio_limit: policy.extra_token_ratio_limit,
+            calibration_profile: policy.calibration_profile,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CausalPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let stored = StoredCausalPolicy::deserialize(deserializer)?;
+        let default_latency = DEFAULT_EXTRA_LATENCY_BUDGET_MS;
+        Ok(Self {
+            max_candidates: stored.max_candidates,
+            max_decision_hops: stored.max_decision_hops,
+            extra_latency_budget_ms: stored.extra_latency_budget_ms.unwrap_or(default_latency),
+            extra_latency_budget_ms_explicit: stored.extra_latency_budget_ms.is_some(),
+            commit_threshold: stored.commit_threshold,
+            minimum_choice_confidence: stored.minimum_choice_confidence,
+            minimum_top_margin: stored.minimum_top_margin,
+            extra_token_ratio_limit: stored.extra_token_ratio_limit,
+            calibration_profile: stored.calibration_profile,
+        })
+    }
 }
 
 impl Default for CausalPolicy {
