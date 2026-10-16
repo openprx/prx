@@ -11,7 +11,7 @@ live in the linked pages and in the `[Unreleased]` section of the
 | Change | Action | Required |
 | --- | --- | --- |
 | Matrix is opt-in (`channel-matrix` Cargo feature) | Source builders that use a `[channels_config.matrix]` channel must build with `--features channel-matrix`. Prebuilt default and release binaries omit Matrix. | Only with Matrix configured |
-| `[causal_tree]` schema (decision plane) | None for most files: an old file is mapped on load and rewritten on the next save. Fix any file refused with a file/key error as listed in the changelog. | Only if the load is refused |
+| `[causal_tree]` schema (decision plane) and new default `enabled = true` | An old file is mapped on load and rewritten on the next save. **The decision plane turns on after upgrade** when the file has no `schema_version` and its `enabled = false` is the old default (an old-template file, one with legacy-only keys, or a bare `[causal_tree] enabled = false`): that false is dropped as unset. To keep it off, set `schema_version = 1` and `enabled = false` (example below). Fix any file refused with a file/key error as listed in the changelog. | Only to keep it off, or if the load is refused |
 | `agent.tool_dispatcher` is never read | Delete the key. It still loads and logs a deprecation warning. | No |
 | `causal_tree.observability.*` removed | Delete the section. A file that carries it still loads; the keys are dropped and the load logs which. Choose the `[observability]` backend to control where decision events go. | No |
 
@@ -44,7 +44,7 @@ backend = "prometheus"
 backend = "prometheus"
 ```
 
-Legacy `[causal_tree]` keys that moved (see [configuration](configuration.md)):
+Legacy `[causal_tree]` keys that moved (the full list of moves and refusals is in the `[causal_tree]` entry of the [changelog](../CHANGELOG.md)). The "after" block is a hand-written equivalent; a saved file also records `enabled = true`:
 
 ```toml
 # before
@@ -55,12 +55,26 @@ rehearsal_timeout_ms = 300
 # after
 [causal_tree]
 schema_version = 1
+enabled = true
 
 [causal_tree.policy]
 max_candidates = 8
 
 [causal_tree.rehearsal]
 timeout_ms = 300
+```
+
+Keeping the decision plane off:
+
+```toml
+# before (unversioned false: read as the old default and dropped, so the plane turns on)
+[causal_tree]
+enabled = false
+
+# after (explicit, stays off)
+[causal_tree]
+schema_version = 1
+enabled = false
 ```
 
 ## No action needed

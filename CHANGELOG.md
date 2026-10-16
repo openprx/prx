@@ -100,7 +100,7 @@ for integration, validation and rollback limits.
 - Skill lifecycle groundwork: immutable owner-scoped skill revisions, a
   publication journal with generation compare-and-swap and rollback, and a
   replay-safe import of existing skill directories. `skill_read` serves a
-  managed revision, pinned per task, only for a caller that has a managed
+  managed revision only for a caller that has a managed
   binding; otherwise it reads the existing skill files exactly as before. No
   command creates managed revisions in this candidate and nothing rewrites an
   existing skill directory.
