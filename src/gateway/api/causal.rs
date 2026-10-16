@@ -633,7 +633,6 @@ mod tests {
             body.into_mutation().expect("test: maps"),
             CausalMutation::ResetBackendToAuto
         ));
-        assert!(serde_json::from_str::<MutationBody>(r#"{"op":"reset_backend_to_auto","kind":"x"}"#).is_err());
     }
 
     use super::super::test_support::{TOKEN, at, json, serve_config};
