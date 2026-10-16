@@ -218,10 +218,7 @@ impl CausalCandidateGenerator {
         let raw = state.routing_input.as_str();
         let possible = catalog
             .iter_entries()
-            .filter(|entry| {
-                entry.family == CapabilityTarget::Filesystem
-                    && matches!(entry.public_name.as_str(), "file_write" | "file_edit")
-            })
+            .filter(|entry| collectable_mutation(entry))
             .any(|entry| {
                 entry.exact_mention_terms.iter().any(|term| {
                     !term.is_empty()
@@ -239,10 +236,7 @@ impl CausalCandidateGenerator {
         let folded = state.routing_input.as_str().to_lowercase();
         let mut exact = catalog.iter_entries().filter(|entry| exact_mention(&folded, entry));
         let entry = exact.next()?;
-        if exact.next().is_some()
-            || entry.family != CapabilityTarget::Filesystem
-            || !matches!(entry.public_name.as_str(), "file_write" | "file_edit")
-        {
+        if exact.next().is_some() || !collectable_mutation(entry) {
             return None;
         }
         let candidate = from_entry(
@@ -252,7 +246,14 @@ impl CausalCandidateGenerator {
             policy,
             Some(Ns8::of(policy.key, &entry.namespace)),
         );
-        (HardGates::check_one(state, catalog, &candidate, gates) == GateOutcome::ApprovalDeferred).then_some(candidate)
+        // A file mutation derives its exact operation from arguments, so it is
+        // deferred. An MCP tool has a fixed operation but its call is still
+        // unbound on a fresh turn, which collection binds before any review.
+        matches!(
+            HardGates::check_one(state, catalog, &candidate, gates),
+            GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. }
+        )
+        .then_some(candidate)
     }
 
     pub(crate) fn generate(
@@ -633,12 +634,17 @@ impl CausalCandidateGenerator {
             }
         }
         // An exactly named capability that is approval-only stays recorded as an
-        // exact mention: the selector uses it to prefer the approval request.
+        // exact mention: the selector uses it to prefer the approval request,
+        // or, with no bound call yet, to refuse a plain answer in its place.
         exact_mentions.retain(|id| {
             kept.iter().any(|candidate| candidate.candidate_id() == id)
                 || approval_only
                     .iter()
                     .any(|pending| pending.candidate.candidate_id() == id)
+                || matches!(
+                    report.outcomes.get(id),
+                    Some(GateOutcome::ApprovalOnly { op_ids }) if !op_ids.is_empty()
+                )
         });
         approval_scopes.retain(|id, _| kept.iter().any(|candidate| candidate.candidate_id() == id));
         Ok(CandidateSet::Legal {
@@ -795,6 +801,17 @@ fn approval_candidate(target: CapabilityTarget) -> CausalCandidate {
             estimated_latency_ms: Some(0),
         },
     )
+}
+
+/// Capabilities whose fresh-turn call arguments are collected, never executed,
+/// before an owner reviews them: the file mutations and a discovered MCP tool
+/// with one fixed approval operation.
+pub(crate) fn collectable_mutation(entry: &CapabilityEntry) -> bool {
+    match entry.family {
+        CapabilityTarget::Filesystem => matches!(entry.public_name.as_str(), "file_write" | "file_edit"),
+        CapabilityTarget::Mcp => entry.effect > SideEffectClass::ReadOnly && entry.op_ids.len() == 1,
+        _ => false,
+    }
 }
 
 fn available_for_fallback(entry: &CapabilityEntry, policy: &CandidatePolicy<'_>) -> bool {

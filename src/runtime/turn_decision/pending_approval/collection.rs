@@ -25,7 +25,7 @@ impl TurnDecisionService {
         let entries = self.catalog.resolve(std::slice::from_ref(&capability))?;
         let entry = entries.first().context("collection capability missing")?;
         anyhow::ensure!(
-            matches!(entry.public_name.as_str(), "file_write" | "file_edit"),
+            crate::causal_tree::candidate_generator::collectable_mutation(entry),
             "unsupported collection tool"
         );
         let descriptor = self
@@ -74,20 +74,36 @@ impl ApprovalCollectionLease {
             serde_json::from_str(&call.arguments).context("invalid collection arguments")?;
         let arguments = crate::tools::execution::normalize_collection_arguments(&arguments, &self.descriptor, dialect)
             .map_err(anyhow::Error::msg)?;
-        let path = arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .context("collection file path missing")?;
-        self.service
-            .verify_console_filesystem_context(&self.source, &self.context)?;
-        anyhow::ensure!(
-            !self.source.owner_isolated() || self.context.owner_filesystem.is_some(),
-            "isolated file scope unavailable"
-        );
-        let (operation, risk) = self
+        let entry = self
             .service
-            .scoped_file_operation(self.context.owner_filesystem.as_ref(), &call.name, path)
-            .await?;
+            .catalog
+            .entry_for_public_name(&call.name)
+            .context("collection capability missing")?;
+        let (operation, risk) = if entry.family == crate::causal_tree::branch::CapabilityTarget::Mcp {
+            // An MCP tool has one fixed approval operation. Resume derives the
+            // same operation and risk from the pinned entry.
+            let [operation] = entry.op_ids.as_slice() else {
+                anyhow::bail!("collection operation is not fixed");
+            };
+            (
+                operation.as_str().to_owned(),
+                crate::acl::approval_grant::RiskLevel::High,
+            )
+        } else {
+            let path = arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .context("collection file path missing")?;
+            self.service
+                .verify_console_filesystem_context(&self.source, &self.context)?;
+            anyhow::ensure!(
+                !self.source.owner_isolated() || self.context.owner_filesystem.is_some(),
+                "isolated file scope unavailable"
+            );
+            self.service
+                .scoped_file_operation(self.context.owner_filesystem.as_ref(), &call.name, path)
+                .await?
+        };
         anyhow::ensure!(!operation.is_empty(), "collection exact operation missing");
         self.service.validate_approval_collection(&self.source, &self.context)?;
         self.service
@@ -163,11 +179,6 @@ impl ApprovalCollectionLease {
             self.source.session_key(),
             vec![crate::memory::principal::Role::Anonymous],
         );
-        let entry = self
-            .service
-            .catalog
-            .entry_for_public_name(&call.name)
-            .context("collection capability missing")?;
         anyhow::ensure!(
             entry.op_ids.is_empty() || entry.op_ids.iter().any(|id| id.as_str() == operation),
             "collection operation differs from pinned capability"

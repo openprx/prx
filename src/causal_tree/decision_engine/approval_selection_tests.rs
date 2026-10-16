@@ -222,12 +222,18 @@ async fn exact_approval_required_tool_requests_approval_instead_of_answering() -
     Ok(())
 }
 
-/// Pins the accepted decision: without a call fingerprint no approval scope
-/// exists (an argumentless turn mints none), so the ordinary answer stands.
+/// Finding 76 (supersedes the 66 "still answers" decision): without a call
+/// fingerprint no approval scope exists, but the named action must still not be
+/// replaced by a plain answer. This tool is directly exposed, so there is no
+/// discovery step that could pend its call; the turn closes.
 #[tokio::test]
-async fn exact_mention_without_call_fingerprint_still_answers() -> anyhow::Result<()> {
+async fn exact_mention_without_call_fingerprint_does_not_answer() -> anyhow::Result<()> {
     let (decision, _) = decide(Scenario::mcp(false)).await?;
-    assert!(is_answer(&decision.selection), "selection={:?}", decision.selection);
+    assert!(
+        is_terminal_abstain(&decision.selection),
+        "selection={:?}",
+        decision.selection
+    );
     Ok(())
 }
 

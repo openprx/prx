@@ -145,6 +145,37 @@ impl AdmittedTurn {
             None,
             None,
             true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// The enabled builtin plane over a registry whose MCP root has already
+    /// discovered its servers; `mcp_snapshot` is that root's published state.
+    pub(crate) async fn with_enabled_builtin_model_and_mcp(
+        config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+        mcp_snapshot: Vec<crate::tools::mcp::McpCapabilitySpec>,
+    ) -> Self {
+        assert!(
+            config.causal_tree.enabled,
+            "enabled-builtin fixture requires causal tree"
+        );
+        Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            selection,
+            None,
+            None,
+            None,
+            true,
+            mcp_snapshot,
         )
         .await
     }
@@ -228,6 +259,7 @@ impl AdmittedTurn {
             None,
             None,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -259,6 +291,7 @@ impl AdmittedTurn {
             None,
             Some(generation),
             false,
+            Vec::new(),
         )
         .await
     }
@@ -290,7 +323,17 @@ impl AdmittedTurn {
         selection: (&str, &str),
     ) -> Self {
         Self::build_mode(
-            config, input, registry, memory, origin, selection, None, None, None, false,
+            config,
+            input,
+            registry,
+            memory,
+            origin,
+            selection,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
         )
         .await
     }
@@ -324,6 +367,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -354,6 +398,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await;
         if admitted
@@ -414,6 +459,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await;
         if admitted
@@ -474,6 +520,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -509,6 +556,7 @@ impl AdmittedTurn {
                 audit,
                 None,
                 false,
+                Vec::new(),
             )
             .await
         })
@@ -525,6 +573,7 @@ impl AdmittedTurn {
         audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
         generation_override: Option<Arc<crate::config::ConfigGeneration>>,
         keep_builtin_enabled: bool,
+        mcp_snapshot: Vec<crate::tools::mcp::McpCapabilitySpec>,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
@@ -596,7 +645,7 @@ impl AdmittedTurn {
                 catalog_sources: CatalogSources::from_runtime_inputs(
                     generation.id.0.to_string(),
                     &config,
-                    Vec::new(),
+                    mcp_snapshot,
                     &hooks,
                     0,
                 ),
