@@ -1739,9 +1739,12 @@ impl Tool for McpTool {
         // target so an approval for server-A can never authorize server-B
         // (op naming per design d03).
         let operation_name = op_id::op_id(self.name(), "call", &[&server_name, &tool_name]);
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        // The grant names the capability that was approved: the alias public
+        // name for a discovered tool, the root name for a root call. The
+        // operation id stays root-based so one approval never crosses targets.
+        let approval_grant = ApprovalGrant::from_runtime_args(name, &args);
         if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
+            name,
             &operation_name,
             ResourceRiskLevel::High,
             approval_grant.as_ref(),
