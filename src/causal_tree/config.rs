@@ -322,7 +322,7 @@ impl From<CalibrationProfile> for CalibrationProfileSetting {
 }
 
 /// Decision policy (`[causal_tree.policy]`).
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
 #[serde(default)]
 pub struct CausalPolicy {
     /// The most candidates a decision considers (1 to 32).
@@ -348,6 +348,41 @@ pub struct CausalPolicy {
     /// The calibration in force, if an operator applied one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration_profile: Option<CalibrationProfile>,
+}
+
+#[derive(Serialize)]
+struct SerializedCausalPolicy<'a> {
+    max_candidates: u8,
+    max_decision_hops: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_latency_budget_ms: Option<u64>,
+    commit_threshold: f32,
+    minimum_choice_confidence: f64,
+    minimum_top_margin: f64,
+    extra_token_ratio_limit: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calibration_profile: Option<&'a CalibrationProfile>,
+}
+
+impl Serialize for CausalPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SerializedCausalPolicy {
+            max_candidates: self.max_candidates,
+            max_decision_hops: self.max_decision_hops,
+            extra_latency_budget_ms: (self.extra_latency_budget_ms_explicit
+                || self.extra_latency_budget_ms != DEFAULT_EXTRA_LATENCY_BUDGET_MS)
+                .then_some(self.extra_latency_budget_ms),
+            commit_threshold: self.commit_threshold,
+            minimum_choice_confidence: self.minimum_choice_confidence,
+            minimum_top_margin: self.minimum_top_margin,
+            extra_token_ratio_limit: self.extra_token_ratio_limit,
+            calibration_profile: self.calibration_profile.as_ref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1913,6 +1948,10 @@ circuit_breaker_cooldown_secs = 120
         config.scoring.weights.w_cost = Some(0.4);
         let json = serde_json::to_value(&config).expect("test: json");
         assert_eq!(json["schema_version"], serde_json::json!(1));
+        assert!(
+            json["policy"].get("extra_latency_budget_ms").is_none(),
+            "an implicit default must stay absent"
+        );
         assert!(json.get("w_cost").is_none() && json["policy"].get("max_branches").is_none());
         let back: CausalTreeConfig = serde_json::from_value(json).expect("test: back");
         assert_eq!(back, config);
@@ -1921,6 +1960,13 @@ circuit_breaker_cooldown_secs = 120
         assert_eq!(back.backend.circuit_breaker.failure_threshold, 9);
         assert_eq!(back.backend.circuit_breaker.cooldown_secs, 30);
         assert_eq!(back.scoring.weights.w_cost, Some(0.4));
+
+        config.policy.extra_latency_budget_ms_explicit = true;
+        let json = serde_json::to_value(&config).expect("test: explicit json");
+        assert_eq!(json["policy"]["extra_latency_budget_ms"], 500);
+        let back: CausalTreeConfig = serde_json::from_value(json).expect("test: explicit back");
+        assert_eq!(back, config);
+        assert!(back.policy.extra_latency_budget_ms_explicit);
     }
 
     #[test]

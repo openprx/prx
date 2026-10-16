@@ -434,6 +434,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
                         && let Some(recommended) = entry.transport.extra_latency_budget_ms
                     {
                         section.policy.extra_latency_budget_ms = recommended;
+                        section.policy.extra_latency_budget_ms_explicit = true;
                     }
                 }
                 declare_decision_model(config, &selection.provider, &model);
@@ -712,6 +713,7 @@ mod tests {
             next.causal_tree.policy.extra_latency_budget_ms,
             entry.transport.extra_latency_budget_ms.expect("catalog latency budget")
         );
+        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
         assert!(next.cost.prices.is_empty(), "built-in prices stay in the catalog");
         assert!(matches!(
             crate::llm::route_decision::usage_cost_resolution(
