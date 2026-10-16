@@ -10,28 +10,38 @@ use super::external_editor::{
 };
 #[cfg(feature = "terminal-tui")]
 use super::input_queue::format_queued_input_notice;
+#[cfg(feature = "terminal-tui")]
 use super::input_queue::input_priority_from_text;
+#[cfg(feature = "terminal-tui")]
 use super::session_glue::{now_ms, surface_session_message};
+#[cfg(feature = "terminal-tui")]
 use super::session_switch::ChatControlEvent;
 #[cfg(feature = "terminal-tui")]
 use super::tui;
-use super::views::apply_optimistic_focus;
 #[cfg(feature = "terminal-tui")]
 use super::views::{
-    TRANSCRIPT_COMMAND, attach_command_for_seq, close_diff_view, close_provider_worker_view, close_transcript_view,
-    open_provider_worker_view, scroll_active_session_view,
+    TRANSCRIPT_COMMAND, apply_optimistic_focus, attach_command_for_seq, close_diff_view, close_provider_worker_view,
+    close_transcript_view, open_provider_worker_view, scroll_active_session_view,
 };
+#[cfg(feature = "terminal-tui")]
 use super::{DOUBLE_CTRLC_WINDOW_MS, SYNTHETIC_UI_COMMAND_SENDER, dispatcher};
+#[cfg(feature = "terminal-tui")]
 use anyhow::Result;
 #[cfg(feature = "terminal-tui")]
 use std::collections::VecDeque;
+#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
+#[cfg(feature = "terminal-tui")]
 use std::sync::atomic::AtomicU64;
+#[cfg(feature = "terminal-tui")]
 use std::sync::atomic::Ordering;
+#[cfg(feature = "terminal-tui")]
 use std::time::Duration;
 #[cfg(feature = "terminal-tui")]
 use std::time::Instant;
+#[cfg(feature = "terminal-tui")]
 use tokio::sync::mpsc;
+#[cfg(feature = "terminal-tui")]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "terminal-tui")]

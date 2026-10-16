@@ -1,19 +1,27 @@
 //! Operator commands handled while a provider turn is active (`/queue`, `/workers`, `/cost`) and worker reports.
 
+use super::input_queue::is_local_operator_input;
+#[cfg(feature = "terminal-tui")]
 use super::input_queue::{
     QueuedInputMessage, classify_input_priority, enqueue_input_message_and_return_priority_with_scheduler,
-    format_input_backlog_report, input_priority_from_text, is_local_operator_input, truncate_chars_for_queued_notice,
+    format_input_backlog_report, input_priority_from_text, truncate_chars_for_queued_notice,
 };
-use super::provider_turns::{provider_worker_status, publish_provider_worker_status, request_provider_turn_cancel};
+use super::provider_turns::request_provider_turn_cancel;
+#[cfg(feature = "terminal-tui")]
+use super::provider_turns::{provider_worker_status, publish_provider_worker_status};
+#[cfg(feature = "terminal-tui")]
 use super::session_glue::{
     DaemonControl, ReapedSessionLogArchive, handle_local_session_command, start_daemon_session_command,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_glue::{is_daemon_session_command, local_session_command};
+#[cfg(feature = "terminal-tui")]
 use super::{commands, session};
 use crate::providers::ChatMessage;
+#[cfg(feature = "terminal-tui")]
 use crate::tools::Tool;
 use anyhow::Result;
+#[cfg(feature = "terminal-tui")]
 use tokio::sync::mpsc;
 
 pub(super) fn is_queue_command(input: &str) -> bool {

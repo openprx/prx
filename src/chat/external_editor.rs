@@ -1,6 +1,5 @@
 //! External `$EDITOR` integration for the fullscreen chat input.
 
-#[cfg(feature = "terminal-tui")]
 use super::terminal::{CHAT_KEYBOARD_ENHANCEMENT_ACTIVE, CHAT_MOUSE_CAPTURE_ACTIVE};
 use std::io::Write as _;
 

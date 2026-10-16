@@ -1,26 +1,45 @@
 //! Provider-turn lifecycle: completion events, ordered commit and finalization of per-turn contexts.
 
+#[cfg(feature = "terminal-tui")]
 use super::active_turn::rollback_cancelled_turn_history;
+#[cfg(feature = "terminal-tui")]
 use super::chat_events::{finalize_chat_non_success_turn, finalize_chat_success_turn};
+use super::dispatcher;
+#[cfg(feature = "terminal-tui")]
 use super::input_queue::publish_main_queue_status;
+#[cfg(feature = "terminal-tui")]
 use super::session_glue::{surface_session_message, surface_turn_elapsed_message};
 #[cfg(feature = "terminal-tui")]
 use super::tui;
-use super::{decision_source, dispatcher, session};
+#[cfg(feature = "terminal-tui")]
+use super::{decision_source, session};
+#[cfg(feature = "terminal-tui")]
 use crate::agent::turn_contracts::ToolCallNotification;
+#[cfg(feature = "terminal-tui")]
 use crate::channels::Channel;
+#[cfg(feature = "terminal-tui")]
 use crate::channels::TerminalChannel;
+#[cfg(feature = "terminal-tui")]
 use crate::channels::sanitize_channel_response;
+#[cfg(feature = "terminal-tui")]
 use crate::config::Config;
+#[cfg(feature = "terminal-tui")]
 use crate::llm::route_decision::ProviderExecutionOutcome;
+#[cfg(feature = "terminal-tui")]
 use crate::llm::route_decision::RouteDecision;
+#[cfg(feature = "terminal-tui")]
 use crate::memory::MemoryFabric;
+#[cfg(feature = "terminal-tui")]
 use crate::memory::MessageEventScope;
+#[cfg(feature = "terminal-tui")]
 use crate::providers::ChatMessage;
+#[cfg(feature = "terminal-tui")]
 use crate::tools::Tool;
+#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+#[cfg(feature = "terminal-tui")]
 use tokio_util::sync::CancellationToken;
 
 /// Queue depth for provider-turn lifecycle events (`HandleAttached`, `Started`,

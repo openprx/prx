@@ -16,6 +16,7 @@ use crate::providers::ChatMessage;
 use crate::providers::Provider;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::util::truncate_with_ellipsis;
+#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
 
 /// Keep last N non-system messages during history compaction.

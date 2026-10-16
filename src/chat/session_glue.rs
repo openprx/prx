@@ -1,7 +1,9 @@
 //! Background/managed session glue: local session commands, daemon and assignment requests, exit shutdown.
 
+#[cfg(feature = "terminal-tui")]
 use super::input_queue::QueuedInputMessage;
 use super::output::print_fallback_chat_output;
+#[cfg(feature = "terminal-tui")]
 use super::provider_turns::provider_turn_visible_admission;
 #[cfg(feature = "terminal-tui")]
 use super::tui;

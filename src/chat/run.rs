@@ -1,12 +1,11 @@
 //! The `prx chat` entry point.
 
 use super::DELTA_CHANNEL_CAPACITY;
-use super::active_turn::{
-    dispatch_provider_worker_cancel_signal, format_provider_worker_report, provider_workers_cancel_output_for_input,
-};
 #[cfg(feature = "terminal-tui")]
+use super::active_turn::process_active_turn_input_batch;
 use super::active_turn::{
-    is_queue_command, is_workers_command, process_active_turn_input_batch, rollback_cancelled_turn_history,
+    dispatch_provider_worker_cancel_signal, format_provider_worker_report, is_queue_command, is_workers_command,
+    provider_workers_cancel_output_for_input, rollback_cancelled_turn_history,
 };
 use super::bootstrap::{chat_model_switch, chat_provider_chain, initial_chat_dispatcher_state, startup_banner};
 #[cfg(feature = "terminal-tui")]
@@ -18,13 +17,11 @@ use super::chat_events::{
 #[cfg(feature = "terminal-tui")]
 use super::compaction::refresh_context_budget_for_tui;
 use super::compaction::{
-    apply_chat_compaction_patch_and_sync, build_chat_compaction_patch, chat_embedding_upgrade_notice,
-    compact_chat_history, estimate_chat_history_tokens, format_compact_feedback_after_history,
-    format_nothing_to_compact_feedback, manual_compact_below_trigger_threshold, persist_legacy_chat_compaction_audit,
-};
-use super::compaction::{
-    bounded_legacy_chat_compaction_audit_source, legacy_compaction_token_metadata,
-    original_legacy_chat_compaction_audit_source,
+    apply_chat_compaction_patch_and_sync, bounded_legacy_chat_compaction_audit_source, build_chat_compaction_patch,
+    chat_embedding_upgrade_notice, compact_chat_history, estimate_chat_history_tokens,
+    format_compact_feedback_after_history, format_nothing_to_compact_feedback, legacy_compaction_token_metadata,
+    manual_compact_below_trigger_threshold, original_legacy_chat_compaction_audit_source,
+    persist_legacy_chat_compaction_audit,
 };
 use super::copy_select::{copy_success_message, is_copy_command, select_copy_content};
 use super::file_mention::{FileMentionEnrichment, enrich_file_mentions_for_prompt};
@@ -33,37 +30,37 @@ use super::input_queue::{
     format_input_backlog_report, is_local_operator_input, is_synthetic_ui_command,
     pop_next_visible_input_task_with_scheduler, publish_main_queue_status, requeue_post_route_admission_rejected_input,
 };
-use super::output::should_resend_on_finalize_failure;
-use super::output::{print_fallback_chat_output, render_response};
+use super::output::{print_fallback_chat_output, render_response, should_resend_on_finalize_failure};
 use super::provider_turns::{
-    PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionEvent,
-    dispatch_ordered_provider_turn_commit_and_wait, gate_completed_provider_turn_finalization,
-    gate_failed_provider_turn_finalization, mark_provider_turn_completed, provider_turn_visible_admission,
-    provider_worker_status, publish_provider_worker_status, record_provider_turn_completion_context,
-    record_provider_turn_lifecycle_event, record_provider_turn_usage, register_provider_history_commit_task,
-    register_provider_turn_worker, route_provider_completion_event_and_publish, start_provider_turn_task,
-    take_provider_turn_completion_history_len,
+    PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext, ProviderTurnCompletionEvent,
+    dispatch_ordered_provider_turn_commit_and_wait, gate_cancelled_provider_turn_finalization,
+    gate_completed_provider_turn_finalization, gate_failed_provider_turn_finalization, mark_provider_turn_completed,
+    provider_turn_visible_admission, provider_worker_status, publish_provider_worker_status,
+    record_provider_turn_completion_context, record_provider_turn_lifecycle_event, record_provider_turn_usage,
+    register_provider_history_commit_task, register_provider_turn_worker, route_provider_completion_event_and_publish,
+    start_provider_turn_task, take_provider_turn_completion_history_len,
 };
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
-    PendingOrderedProviderTurnCommit, PerTurnContext, ProviderTurnCompletionContext, ProviderTurnFinalizerEvent,
-    ProviderTurnFinalizerResult, ProviderTurnTerminalPlan, apply_ready_ordered_provider_turn_commits,
+    PendingOrderedProviderTurnCommit, PerTurnContext, ProviderTurnFinalizerEvent, ProviderTurnFinalizerResult,
+    ProviderTurnTerminalPlan, apply_ready_ordered_provider_turn_commits,
     drain_provider_turn_finalizer_events_and_publish, enqueue_provider_turn_finalizer_event,
     finalize_all_per_turn_contexts_as_cancelled, finalize_ready_per_turn_contexts,
-    gate_cancelled_provider_turn_finalization, provider_turn_terminal_plan_from_completion,
-    resolve_provider_turn_completion, spawn_provider_turn_completion_waiter,
+    provider_turn_terminal_plan_from_completion, resolve_provider_turn_completion,
+    spawn_provider_turn_completion_waiter,
 };
+#[cfg(feature = "terminal-tui")]
 use super::pty_attach::{handle_pty_command, reattach_pty};
 use super::session_glue::{
-    DaemonControl, ReapedSessionLogArchive, assignment_turn_guard, consume_deferred_visible_input_pop,
-    format_finished_session_announcement, format_observed_session_announcement, format_reloaded_background_sessions,
-    handle_local_session_command, is_chat_quit_command, now_ms, shutdown_child_sessions_for_exit,
-    start_assignment_enrolment, start_daemon_session_command, surface_session_message, surface_turn_elapsed_message,
-    withdraw_assignment_enrolment,
+    DaemonControl, ReapedSessionLogArchive, assignment_turn_guard, compact_child_completion_summary,
+    consume_deferred_visible_input_pop, format_finished_session_announcement, format_observed_session_announcement,
+    format_reloaded_background_sessions, handle_local_session_command, is_chat_quit_command, now_ms,
+    shutdown_child_sessions_for_exit, start_assignment_enrolment, start_daemon_session_command,
+    surface_session_message, surface_turn_elapsed_message, withdraw_assignment_enrolment,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_glue::{
-    compact_child_completion_summary, defer_resume_saved_session_if_provider_turn_pending, refresh_sessions_cache,
+    defer_resume_saved_session_if_provider_turn_pending, refresh_sessions_cache,
     should_continue_event_pump_after_input_closed, should_drain_deferred_resume_after_visible_inputs,
     surface_active_turn_message,
 };
@@ -76,18 +73,21 @@ use super::session_store::{
     persisted_history_for_current_turn, save_session, saved_chat_sessions, session_turns_to_history,
     upsert_leading_system_prompt,
 };
+#[cfg(feature = "terminal-tui")]
+use super::session_switch::request_diff_apply_approval;
 use super::session_switch::{
     ChatControlEvent, ChatSwitchCtx, PendingChatRewind, PendingDiffApply, RewindApprovalOutcome,
     apply_chat_session_switch, approval_already_pending_message, approval_in_progress, resolve_rewind_approval,
-    resume_saved_session_by_id, start_new_chat_session,
+    resume_saved_session_by_id, should_ignore_session_event_after_chat_resume, start_new_chat_session,
 };
 #[cfg(feature = "terminal-tui")]
-use super::session_switch::{request_diff_apply_approval, should_ignore_session_event_after_chat_resume};
+use super::terminal::TerminalGuard;
 #[cfg(feature = "terminal-tui")]
 use super::terminal::select_chat_tui;
-use super::terminal::{TerminalGuard, TracingChatGuard, ensure_chat_tracing_to_file, install_chat_panic_hook};
+use super::terminal::{TracingChatGuard, ensure_chat_tracing_to_file, install_chat_panic_hook};
 #[cfg(feature = "terminal-tui")]
 use super::tui;
+#[cfg(feature = "terminal-tui")]
 use super::tui_loop::spawn_tui_unified_loop;
 use super::views::collect_workspace_diff;
 #[cfg(feature = "terminal-tui")]

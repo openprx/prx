@@ -9,6 +9,7 @@ use crate::llm::route_decision::record_route_decision_event as record_raw_route_
 use crate::memory::MemoryFabric;
 use crate::memory::MemoryVisibility;
 use crate::memory::MessageEventScope;
+#[cfg(feature = "terminal-tui")]
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;

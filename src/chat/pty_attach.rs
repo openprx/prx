@@ -2,9 +2,13 @@
 
 #[cfg(feature = "terminal-tui")]
 use super::terminal::{CHAT_KEYBOARD_ENHANCEMENT_ACTIVE, CHAT_MOUSE_CAPTURE_ACTIVE};
+#[cfg(feature = "terminal-tui")]
 use anyhow::Result;
+#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
+#[cfg(feature = "terminal-tui")]
 use std::sync::atomic::Ordering;
+#[cfg(feature = "terminal-tui")]
 use tokio::sync::mpsc;
 
 /// Handle `/pty <command>` (v3a): spawn an interactive PTY shell and hand the

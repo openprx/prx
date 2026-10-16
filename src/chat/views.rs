@@ -1,11 +1,14 @@
 //! Transcript, diff and provider-worker views and attached-session projection.
 
+#[cfg(feature = "terminal-tui")]
 use super::dispatcher;
 #[cfg(feature = "terminal-tui")]
 use super::tui;
 use anyhow::Result;
+#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "terminal-tui")]
 use tokio::sync::mpsc;
 
 #[cfg(feature = "terminal-tui")]

@@ -1,12 +1,17 @@
 //! Copy-to-clipboard selection and transcript mouse selection helpers.
 
 use super::file_mention::truncate_utf8_to_byte_cap;
+use super::session;
+#[cfg(feature = "terminal-tui")]
 use super::session_glue::surface_session_message;
 #[cfg(feature = "terminal-tui")]
 use super::tui;
+#[cfg(feature = "terminal-tui")]
 use super::tui_loop::RenderSource;
-use super::{dispatcher, session, terminal_proto};
+#[cfg(feature = "terminal-tui")]
+use super::{dispatcher, terminal_proto};
 use anyhow::Result;
+#[cfg(feature = "terminal-tui")]
 use tokio::sync::mpsc;
 
 pub(super) const COPY_OSC52_MAX_BYTES: usize = 74 * 1024;
