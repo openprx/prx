@@ -105,6 +105,10 @@ impl TransactionState {
     }
 }
 
+const fn default_enabled() -> bool {
+    true
+}
+
 /// One publication or rollback transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +126,10 @@ pub struct JournalEntry {
     pub candidate_record_digest: String,
     pub expected_generation: u64,
     pub new_generation: u64,
+    /// Enabled state the binding takes when this transaction commits. Entries
+    /// written before this field existed were always enabled.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub state: TransactionState,
     pub prepared_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,

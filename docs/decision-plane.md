@@ -423,6 +423,51 @@ generation, store mode, recordability and bounded backend state. It does not
 prove backend admission, a completed turn or directive execution. The startup
 configuration snapshot remains separate and is independent of `llm-router`.
 
+### Decision metrics and events
+
+Decision-plane events always flow to the configured `[observability]` backend
+(`log`, `otel` or `prometheus`). `[causal_tree.observability]` (`decision_log`,
+`metrics`) and the earlier `write_decision_log` / `write_metrics` never had a
+runtime effect and are gone; an existing file that carries them still loads,
+the keys are dropped and the load logs which. To stop the events, choose a
+different `[observability]` backend.
+
+The Prometheus backend implements these seven decision metrics:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `prx_causal_decisions_total` | counter | `backend`, `locality`, `served_by` |
+| `prx_causal_prediction_failures_total` | counter | `backend`, `error_class` |
+| `prx_causal_fallbacks_total` | counter | `from`, `to` |
+| `prx_causal_circuit_transitions_total` | counter | `backend`, `state` |
+| `prx_causal_decision_latency_seconds` | histogram | `backend` |
+| `prx_causal_outcome_delay_seconds` | histogram | none |
+| `prx_causal_store_dropped_total` | counter | none |
+
+This is seven of the fourteen metrics the decision-plane specification names;
+the other seven are not implemented, so a dashboard must not expect them.
+Candidate generation, gating, scoring and commit events are still emitted as
+events (logs and OpenTelemetry spans) but do not increment a Prometheus series.
+
+`[causal_tree.scoring] version`, when set, is checked against the scorer
+(`scorer-v1`): a different value refuses the configuration instead of applying
+weights chosen for other scoring. A calibration applied with
+`prx causal config apply-calibration` writes its thresholds into
+`[causal_tree.policy]`, which selection reads, and records the backend it was
+measured on in `calibration_profile`; validation refuses any configuration
+whose backend kind, endpoint or model no longer matches it.
+
+### Selection thresholds
+
+These values are fixed constants, not configuration:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it is sufficient to answer; below it the selector retrieves, discovers or abstains. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
+| Freshness threshold | 0.5, exclusive | `needs_fresh_state` above it marks observed artifacts stale and prefers a retrieve |
+| Deterministic propensity | 1.0 | recorded for every non-exploratory selection; only read-only exploration replaces it |
+| Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
+
 ## Terminal authority and logical task completion
 
 Enabled and disabled model turns finalize through `TurnTerminalCommit`, whose

@@ -68,15 +68,15 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // refused `memory_store` left the victim row's `owner_id` unchanged and wrote
     // no identity binding, and no memory API returns either. Every write in that
     // test goes through the production MCP handler.
-    "src/gateway/compat.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
-    "src/gateway/compat.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    "src/gateway/compat/tests/handler.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
+    "src/gateway/compat/tests/card_jwt.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     // Test-only (V02-R5): the anti-over-correction lock needs one row at
     // `visibility = 'public'`, and no memory API writes that visibility —
     // `classify_memory` produces `owner`, `group` or `private` only, and
     // `MemoryStoreMetadata` carries no visibility field. The row is published
     // with a single parameterized UPDATE on the seeded test database; every
     // read in that test still goes through the production MCP seam.
-    "src/gateway/compat.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
+    "src/gateway/compat/tests/memory_tools.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",
@@ -3503,10 +3503,7 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
 
 /// The sub-agent tool types and their constructors (INT-2B a46).
 const SUB_AGENT_TOOL_CONSTRUCTORS: &[(&str, &[&str])] = &[
-    (
-        "DelegateTool",
-        &["new", "new_with_options", "with_depth", "with_depth_and_options"],
-    ),
+    ("DelegateTool", &["new", "with_depth"]),
     ("SessionsSpawnTool", &["new", "new_with_registry"]),
 ];
 
@@ -3740,8 +3737,8 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         "production CompactionResolver::from_base calls",
         from_base,
         &[
-            "src/tools/delegate.rs::new_with_options",
-            "src/tools/delegate.rs::with_depth_and_options",
+            "src/tools/delegate.rs::new",
+            "src/tools/delegate.rs::with_depth",
             "src/tools/sessions_spawn.rs::new_with_registry",
         ],
     );
@@ -4406,7 +4403,6 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // The legacy `Agent` dispatcher's own tool-result block and its conversion of
     // an already-built conversation (the user turns in it came through
     // `inbound_user_message` in `agent.rs`).
-    "src/agent/dispatcher.rs::format_results",
     "src/agent/dispatcher.rs::to_provider_messages",
     // Copies of messages already in a history (content truncated or normalised,
     // role kept): compaction and audit projections, multimodal normalisation.
@@ -4772,8 +4768,14 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
     let execute = function_body(production, "execute");
     assert!(
-        compact_rust_tokens(&execute).contains("self.execute_inner(command,context,cancellation).await")
-            && execute.matches("execute_inner(").count() == 1
+        {
+            // The canonical pipeline is boxed so callers carry a pointer, not the
+            // whole state machine; the boxed and the bare await are both the one
+            // call into `execute_inner`.
+            let compact = compact_rust_tokens(&execute);
+            compact.contains("self.execute_inner(command,context,cancellation).await")
+                || compact.contains("Box::pin(self.execute_inner(command,context,cancellation)).await")
+        } && execute.matches("execute_inner(").count() == 1
             && function_body(production, "execute_inner")
                 .matches("enforce_command_contract(")
                 .count()
@@ -4792,7 +4794,7 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
 /// A webhook turn must run its tool loop inside its own spawn boundary.
 ///
-/// `gateway::tests::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
+/// `gateway::tests::tool_surface::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
 /// pins what `within_gateway_turn_spawn_context` does; this pins that the
 /// shipped webhook turn still goes through it. Without this guard the seeding
 /// can be deleted from `run_gateway_chat_with_multimodal` -- or replaced by a
@@ -5339,7 +5341,7 @@ fn a_session_worker_selects_its_tools_through_its_manifest() {
 /// `prx gateway` each carried a symmetric copy of the same registration block,
 /// and only the daemon copy had tests, so a change to one silently gave the two
 /// launch modes different tool surfaces (independent audit 2026-09-16 §2.3).
-/// `gateway::tests::both_gateway_launch_paths_publish_the_same_tool_surface`
+/// `gateway::tests::tool_surface::both_gateway_launch_paths_publish_the_same_tool_surface`
 /// compares what the shared registrar produces; this pins that both entry points
 /// still go through it rather than growing a second registration of their own.
 #[test]
@@ -5679,8 +5681,11 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/tools/skills.rs::execute_named",
-        1,
-        "decorator: skill aliases forward to the skill runner",
+        3,
+        "decorator, three sites, each inside an already-gated ToolExecutionService call: \
+         `SkillReadTool::execute_named` re-enters its own `self.execute` twice (the exact name, \
+         and a catalog alias rewritten into its `name` argument), and \
+         `SkillExecuteTool::execute_named` forwards to `execute_named_with_cancellation`",
     ),
     (
         "src/tools/skills.rs::execute_resolved",
@@ -6552,6 +6557,15 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         evidence_file: "src/memory/postgres/ingress_recovery.rs",
         evidence: "client: Client,",
         reason: "private Session owns the actual tokio-postgres Client; three SQL executions persist backend identity and acquire or reclaim lifetime fencing",
+    },
+    NonToolCallSite {
+        entry: "src/agent/tool_scheduler.rs::spawn_delegation_tool",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/agent/tool_scheduler.rs",
+        evidence: "service: Arc<crate::tools::ToolExecutionService>,",
+        reason: "the parameter is the shared approved execution service; the delegation task \
+                 dispatches the already-built command through it on its own spawned task",
     },
     NonToolCallSite {
         entry: "src/agent/tool_scheduler.rs::execute_one_unrecorded",
@@ -9497,7 +9511,7 @@ const CAUSAL_READ_ONLY_METHODS: &[&str] = &[
 
 /// The typed sections of `[causal_tree]`; a literal of one outside the
 /// writers builds a policy nobody reviewed.
-const CAUSAL_CONFIG_TYPES: [&str; 10] = [
+const CAUSAL_CONFIG_TYPES: [&str; 9] = [
     "CausalTreeConfig",
     "CausalPolicy",
     "DecisionBackendConfig",
@@ -9507,7 +9521,6 @@ const CAUSAL_CONFIG_TYPES: [&str; 10] = [
     "WeightOverrides",
     "DecisionStoreConfig",
     "EvaluationConfig",
-    "CausalObservabilityConfig",
 ];
 
 /// CDP-04 (SP-CDP-C V8.05 `runtime_never_rewrites_thresholds`, CDP 15 "no
@@ -9947,15 +9960,25 @@ fn decision_http_clients_come_only_from_the_pinned_builder() {
 }
 
 /// AG-10 (SP-CDP-A 5.10): the decision store's database is named, and so
-/// opened, only by `causal_tree/store.rs`. Comments may mention it.
+/// opened, only by `causal_tree/store.rs`. Its `store/` child modules are
+/// scanned like any other file; test-only files are empty production text.
+/// Comments may mention it.
 #[test]
 fn the_decision_store_database_is_opened_only_by_the_store() {
     const STORE: &str = "src/causal_tree/store.rs";
+    const SCANNED_CHILDREN: [&str; 2] = [
+        "src/causal_tree/store/child_outcome.rs",
+        "src/causal_tree/store/child_recovery.rs",
+    ];
     let mut violations = Vec::new();
+    let mut scanned_children = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/") || relative == STORE {
             continue;
+        }
+        if SCANNED_CHILDREN.contains(&relative.as_str()) {
+            scanned_children += 1;
         }
         let production = strip_cfg_test_items(&read_source(&path));
         let names_the_database = production.lines().any(|line| {
@@ -9966,6 +9989,11 @@ fn the_decision_store_database_is_opened_only_by_the_store() {
             violations.push(relative);
         }
     }
+    assert_eq!(
+        scanned_children,
+        SCANNED_CHILDREN.len(),
+        "the store child modules must be scanned, not exempted"
+    );
     assert!(
         violations.is_empty(),
         "only the decision store opens decisions.db (AG-10): {violations:?}"

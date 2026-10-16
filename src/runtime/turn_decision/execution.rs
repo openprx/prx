@@ -15,7 +15,7 @@ use super::{
     effective_agent_exclusions, pinned_policy_version, validate_agent_retrieval_provenance,
 };
 use crate::causal_tree::candidate_generator::CandidateSet;
-use crate::causal_tree::gates::{GateOutcome, GatePass, HardGates};
+use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
@@ -936,8 +936,7 @@ impl TurnDecisionService {
             _ => anyhow::bail!("terminal or intermediate directive cannot enter the tool loop"),
         };
         anyhow::ensure!(
-            HardGates::check_one(GatePass::PreCommit, &context.engine.state, &catalog, selected, &gates)
-                == GateOutcome::Passed,
+            HardGates::check_one(&context.engine.state, &catalog, selected, &gates) == GateOutcome::Passed,
             "selected capability no longer passes execution gates"
         );
         let references: Vec<_> = references.into_iter().collect();

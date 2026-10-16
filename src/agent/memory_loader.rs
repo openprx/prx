@@ -549,7 +549,6 @@ mod tests {
         for kind in [
             crate::causal_tree::state::ObservedArtifactKind::Document,
             crate::causal_tree::state::ObservedArtifactKind::Session,
-            crate::causal_tree::state::ObservedArtifactKind::Discovery,
         ] {
             let mut artifact = selected_memory_artifact("other selected evidence");
             artifact.kind = kind;
@@ -584,12 +583,9 @@ mod tests {
         let mut artifact = selected_memory_artifact("assistant: prior response");
         artifact.kind = crate::causal_tree::state::ObservedArtifactKind::Session;
         assert_eq!(
-            format_selected_context(Some(&formatter), &[artifact.clone()]).unwrap(),
+            format_selected_context(Some(&formatter), &[artifact]).unwrap(),
             "[Selected session history]\nassistant: prior response\n"
         );
-        assert_eq!(formatter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-        artifact.kind = crate::causal_tree::state::ObservedArtifactKind::Discovery;
-        assert!(format_selected_context(Some(&formatter), &[artifact]).is_err());
         assert_eq!(formatter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -613,9 +609,6 @@ mod tests {
             format_selected_context(None, &[]).unwrap().is_empty(),
             "expected an empty value"
         );
-        let mut discovery = selected_memory_artifact("tool metadata");
-        discovery.kind = ObservedArtifactKind::Discovery;
-        assert!(format_selected_context(None, &[discovery]).is_err());
     }
 
     #[test]

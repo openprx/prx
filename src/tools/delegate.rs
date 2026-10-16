@@ -249,14 +249,6 @@ impl std::fmt::Debug for RootConnection {
 
 impl DelegateTool {
     pub fn new(agents: HashMap<String, DelegateAgentConfig>, security: Arc<SecurityPolicy>) -> Self {
-        Self::new_with_options(agents, security, providers::ProviderRuntimeOptions::default())
-    }
-
-    pub fn new_with_options(
-        agents: HashMap<String, DelegateAgentConfig>,
-        security: Arc<SecurityPolicy>,
-        _provider_runtime_options: providers::ProviderRuntimeOptions,
-    ) -> Self {
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(agents.values().map(|agent| agent.provider.as_str()));
         Self {
@@ -289,15 +281,6 @@ impl DelegateTool {
     /// When sub-agents eventually get their own tool registry, construct
     /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(agents: HashMap<String, DelegateAgentConfig>, security: Arc<SecurityPolicy>, depth: u32) -> Self {
-        Self::with_depth_and_options(agents, security, depth, providers::ProviderRuntimeOptions::default())
-    }
-
-    pub fn with_depth_and_options(
-        agents: HashMap<String, DelegateAgentConfig>,
-        security: Arc<SecurityPolicy>,
-        depth: u32,
-        _provider_runtime_options: providers::ProviderRuntimeOptions,
-    ) -> Self {
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(agents.values().map(|agent| agent.provider.as_str()));
         Self {
@@ -3610,15 +3593,6 @@ mod credential_containment_tests {
         })
     }
 
-    fn options(temp: &tempfile::TempDir) -> providers::ProviderRuntimeOptions {
-        providers::ProviderRuntimeOptions {
-            openprx_dir: Some(temp.path().to_path_buf()),
-            codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),
-            codex_auth_json_auto_import: false,
-            ..providers::ProviderRuntimeOptions::default()
-        }
-    }
-
     fn fixture_price() -> crate::config::schema::ModelPricing {
         crate::config::schema::ModelPricing {
             input: 1.0,
@@ -3682,7 +3656,7 @@ mod credential_containment_tests {
                 tool_call_dialect: None,
                 context_window: None,
             });
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp));
+        let tool = DelegateTool::new(agents, security(&temp));
         let result =
             super::tests::dispatch_admitted_delegate(config, tool, json!({"agent": "a", "prompt": "hi"})).await;
         assert!(!result.success, "a decision-only model served a delegation");
@@ -3701,7 +3675,7 @@ mod credential_containment_tests {
         let foreign = CredentialProbe::start().await;
         let agents = HashMap::from([("a".to_string(), agent(&own.custom_provider(), Some(AGENT_SENTINEL)))]);
         let config = admitted_config(&temp, agents.clone());
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp));
+        let tool = DelegateTool::new(agents, security(&temp));
         let result = super::tests::dispatch_admitted_delegate(
             config,
             tool,
@@ -3732,7 +3706,7 @@ mod credential_containment_tests {
             ("b".to_string(), agent(&other.custom_provider(), None)),
         ]);
         let config = admitted_config(&temp, agents.clone());
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp));
+        let tool = DelegateTool::new(agents, security(&temp));
         let result = super::tests::dispatch_admitted_delegate(
             config,
             tool,
@@ -3774,7 +3748,7 @@ mod credential_containment_tests {
             .cost
             .prices
             .insert(format!("{}/{}", route.custom_provider(), PROBE_MODEL), fixture_price());
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
+        let tool = DelegateTool::new(agents, security(&temp))
             .with_hint_config(&config)
             .with_model_catalog(providers::selection::catalog_for(&config))
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
@@ -3802,8 +3776,8 @@ mod credential_containment_tests {
         let mut config = admitted_config(&temp, agents.clone());
         config.default_provider = Some(root.custom_provider());
         config.api_key = Some(ROOT_SENTINEL.to_owned());
-        let first_tool = DelegateTool::new_with_options(agents.clone(), security(&temp), options(&temp));
-        let second_tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp));
+        let first_tool = DelegateTool::new(agents.clone(), security(&temp));
+        let second_tool = DelegateTool::new(agents, security(&temp));
         let first = super::tests::dispatch_admitted_delegate(
             config.clone(),
             first_tool,
@@ -3828,7 +3802,7 @@ mod credential_containment_tests {
 
     fn root_bound_tool(temp: &tempfile::TempDir, default_provider: &str, api_url: &str) -> DelegateTool {
         let agents = HashMap::from([("a".to_string(), agent("groq", None))]);
-        DelegateTool::new_with_options(agents, security(temp), options(temp)).with_root_connection(RootConnection {
+        DelegateTool::new(agents, security(temp)).with_root_connection(RootConnection {
             provider: Some(default_provider.to_string()),
             key: Some(F1_ROOT_SENTINEL.to_string()),
             api_url: Some(api_url.to_string()),
@@ -3865,12 +3839,11 @@ mod credential_containment_tests {
     #[test]
     fn a_keyless_root_default_keeps_its_base_url() {
         let temp = tempfile::tempdir().expect("test: temp dir");
-        let tool = DelegateTool::new_with_options(HashMap::new(), security(&temp), options(&temp))
-            .with_root_connection(RootConnection {
-                provider: Some("ollama".to_string()),
-                key: None,
-                api_url: Some("http://127.0.0.1:9/ollama".to_string()),
-            });
+        let tool = DelegateTool::new(HashMap::new(), security(&temp)).with_root_connection(RootConnection {
+            provider: Some("ollama".to_string()),
+            key: None,
+            api_url: Some("http://127.0.0.1:9/ollama".to_string()),
+        });
         let child = agent("ollama", None);
 
         let connection = tool.child_connection(&child, "ollama");
@@ -3911,8 +3884,8 @@ mod credential_containment_tests {
         config.default_provider = Some(root.custom_provider());
         config.api_key = None;
         config.reliability = reliability.clone();
-        let other_tool = DelegateTool::new_with_options(agents.clone(), security(&temp), options(&temp));
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
+        let other_tool = DelegateTool::new(agents.clone(), security(&temp));
+        let tool = DelegateTool::new(agents, security(&temp))
             .with_root_connection(RootConnection {
                 provider: Some(root.custom_provider()),
                 key: None,
@@ -4046,10 +4019,8 @@ mod credential_containment_tests {
             ),
         ]);
         let config = admitted_config(&temp, agents.clone());
-        let success_tool = DelegateTool::new_with_options(agents.clone(), security(&temp), options(&temp))
-            .with_shared_memory(Arc::clone(&memory));
-        let failure_tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
-            .with_shared_memory(Arc::clone(&memory));
+        let success_tool = DelegateTool::new(agents.clone(), security(&temp)).with_shared_memory(Arc::clone(&memory));
+        let failure_tool = DelegateTool::new(agents, security(&temp)).with_shared_memory(Arc::clone(&memory));
         let served = super::tests::dispatch_admitted_delegate(
             config.clone(),
             success_tool,
@@ -4136,8 +4107,7 @@ mod credential_containment_tests {
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
         let agents = HashMap::from([("a".to_string(), agent(&probe.custom_provider(), None))]);
         let config = admitted_config(&temp, agents.clone());
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
-            .with_shared_memory(Arc::clone(&memory));
+        let tool = DelegateTool::new(agents, security(&temp)).with_shared_memory(Arc::clone(&memory));
         let served =
             super::tests::dispatch_admitted_delegate(config, tool, json!({"agent": "a", "prompt": "hi"})).await;
         assert!(served.success, "{served:?}");
@@ -4171,8 +4141,7 @@ mod credential_containment_tests {
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
         let agents = HashMap::from([("a".to_string(), agent(&probe.custom_provider(), None))]);
         let config = admitted_config(&temp, agents.clone());
-        let tool = DelegateTool::new_with_options(agents, security(&temp), options(&temp))
-            .with_shared_memory(Arc::clone(&memory));
+        let tool = DelegateTool::new(agents, security(&temp)).with_shared_memory(Arc::clone(&memory));
         let failed =
             super::tests::dispatch_admitted_delegate(config, tool, json!({"agent": "a", "prompt": "hi"})).await;
         assert!(!failed.success, "a failing upstream must fail the delegation");

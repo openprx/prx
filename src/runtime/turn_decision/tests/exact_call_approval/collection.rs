@@ -372,7 +372,6 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
         };
         assert!(matches!(
             crate::causal_tree::gates::HardGates::check_one(
-                crate::causal_tree::gates::GatePass::PreCommit,
                 &plan_context.engine.state,
                 &service.catalog_view(),
                 &candidate,

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+mod approval_selection_tests;
+#[cfg(test)]
 pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
@@ -24,7 +26,7 @@ use super::decision_score::{
 };
 use super::decision_select::{CausalSelector, SelectError, Selection, SelectorContext};
 use super::directive::{DirectiveContext, TurnExecutionDirective, directive_from_selection};
-use super::gates::{GateError, GateInputs, GateOutcome, GatePass, GateReport, HardGates};
+use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
 use super::ids::DecisionId;
 use super::questions::{CompileError, CompiledQuestionRequest, CompilerPolicy, QuestionCompiler};
 use super::state::{
@@ -668,22 +670,10 @@ impl CausalDecisionEngine {
             return Err(EngineError::CandidateDrift);
         }
         let remaining_budget = remaining_budget(&inputs, &state);
-        let post_rehearsal = HardGates::apply_with_remaining_budget(
-            GatePass::PostRehearsal,
-            &state,
-            inputs.catalog,
-            &all,
-            inputs.gates,
-            remaining_budget,
-        )?;
-        let pre_commit = HardGates::apply_with_remaining_budget(
-            GatePass::PreCommit,
-            &state,
-            inputs.catalog,
-            &all,
-            inputs.gates,
-            remaining_budget,
-        )?;
+        let post_rehearsal =
+            HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
+        let pre_commit =
+            HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
         let pre_commit = meet_gate_reports(&post_rehearsal, pre_commit)?;
         let admitted = match &candidates {
             CandidateSet::Legal { candidates, .. } => candidates,
@@ -812,7 +802,6 @@ impl CausalDecisionEngine {
         };
         let remaining = remaining_budget(inputs, &prepared.state);
         let post_rehearsal = HardGates::apply_with_remaining_budget(
-            GatePass::PostRehearsal,
             &prepared.state,
             inputs.catalog,
             std::slice::from_ref(&candidate),
@@ -820,7 +809,6 @@ impl CausalDecisionEngine {
             remaining,
         )?;
         let pre_commit = HardGates::apply_with_remaining_budget(
-            GatePass::PreCommit,
             &prepared.state,
             inputs.catalog,
             std::slice::from_ref(&candidate),
@@ -913,6 +901,14 @@ impl CausalDecisionEngine {
         let mut audit_trace = None;
         let mut evidence = None;
         let mut fallback_cause = None;
+        if let CandidateSet::Legal { truncated, .. } = &candidates {
+            if !truncated.is_empty() {
+                tracing::debug!(
+                    dropped = truncated.len(),
+                    "candidate set truncated to the candidate limit"
+                );
+            }
+        }
         if matches!(candidates, CandidateSet::Legal { .. }) && Instant::now() < inputs.deadline {
             let compiled = QuestionCompiler::compile(
                 &state,
@@ -995,6 +991,9 @@ impl CausalDecisionEngine {
             fallback_cause = Some(FallbackCause::ExpiredBeforePrediction);
             evidence = Some(terminal_evidence(&candidates));
         } else {
+            if let CandidateSet::NoLegalPath { reason, .. } = &candidates {
+                tracing::debug!(reason = ?reason, "no legal causal path; terminal fallback");
+            }
             fallback_cause = Some(FallbackCause::NoLegalPath);
         }
 
@@ -1015,22 +1014,10 @@ impl CausalDecisionEngine {
             BTreeMap::new()
         };
         let remaining_budget = remaining_budget(inputs, &state);
-        let post_rehearsal = HardGates::apply_with_remaining_budget(
-            GatePass::PostRehearsal,
-            &state,
-            inputs.catalog,
-            &all,
-            inputs.gates,
-            remaining_budget,
-        )?;
-        let pre_commit = HardGates::apply_with_remaining_budget(
-            GatePass::PreCommit,
-            &state,
-            inputs.catalog,
-            &all,
-            inputs.gates,
-            remaining_budget,
-        )?;
+        let post_rehearsal =
+            HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
+        let pre_commit =
+            HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
         let pre_commit = meet_gate_reports(&post_rehearsal, pre_commit)?;
 
         let mut scores = BTreeMap::new();
@@ -3143,28 +3130,6 @@ mod tests {
             },
         )
         .expect("stale-only recovery is gated");
-        assert!(matches!(
-            directive,
-            TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-        ));
-
-        let mut discovered = state.clone();
-        let mut artifacts = discovered.observed.artifacts().to_vec();
-        artifacts[0].kind = ObservedArtifactKind::Discovery;
-        discovered.observed = super::super::state::ObservedState::from_runtime_records(Vec::new(), artifacts, 0);
-        inputs.state = &discovered;
-        let prepared = CausalDecisionEngine::prepare_hop(&inputs).expect("discovery-only terminal candidates");
-        let discovery_terminal =
-            CausalDecisionEngine::decide_terminal_prepared(prepared).expect("gated discovery terminal");
-        let directive = directive_from_selection(
-            &discovery_terminal,
-            &DirectiveContext {
-                current_generation: view.generation(),
-                approval_expires_at: chrono::Utc::now(),
-                discovery_limit: 1,
-            },
-        )
-        .expect("discovery-only recovery is gated");
         assert!(matches!(
             directive,
             TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }

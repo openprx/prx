@@ -38,7 +38,7 @@
 )]
 
 use crate::agent::agent::Agent;
-use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher};
+use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{AgentConfig, MemoryConfig, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule};
 use crate::memory::{self, Memory, MemoryCategory};
@@ -593,23 +593,19 @@ async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup()
         &config.autonomy,
         workspace.path(),
     ));
-    let delegate = crate::tools::DelegateTool::new_with_options(
-        agents,
-        Arc::clone(&security),
-        crate::providers::provider_runtime_options_from_config(&config),
-    )
-    .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
-    .with_model_catalog(crate::providers::selection::catalog_for(&config))
-    .with_hint_config(&config)
-    .with_reliability(config.reliability.clone())
-    .with_multimodal_config(config.multimodal.clone())
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
-    .with_shared_memory(Arc::clone(&memory))
-    .with_event_recording(config.memory.event_recording_config());
+    let delegate = crate::tools::DelegateTool::new(agents, Arc::clone(&security))
+        .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
+        .with_model_catalog(crate::providers::selection::catalog_for(&config))
+        .with_hint_config(&config)
+        .with_reliability(config.reliability.clone())
+        .with_multimodal_config(config.multimodal.clone())
+        .with_compaction_resolver(crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        ))
+        .with_shared_memory(Arc::clone(&memory))
+        .with_event_recording(config.memory.event_recording_config());
     let (parent, parent_requests) = NativeScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "delegate-call".to_owned(),
@@ -1146,21 +1142,15 @@ async fn xml_dispatcher_parses_and_loops() {
 }
 
 #[tokio::test]
-async fn native_dispatcher_sends_tool_specs() {
+async fn native_dispatcher_completes_a_text_turn() {
     let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
     let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
-    let _ = agent.turn("hi").await.unwrap();
-
-    // NativeToolDispatcher.should_send_tool_specs() returns true
-    let dispatcher = NativeToolDispatcher;
-    assert!(dispatcher.should_send_tool_specs());
-}
-
-#[tokio::test]
-async fn xml_dispatcher_does_not_send_tool_specs() {
-    let dispatcher = XmlToolDispatcher;
-    assert!(!dispatcher.should_send_tool_specs());
+    let response = agent.turn("hi").await.unwrap();
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response from native dispatcher"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1509,82 +1499,6 @@ async fn multi_turn_maintains_growing_history() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 18. Tool call with stringified JSON arguments (common LLM pattern)
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn native_dispatcher_handles_stringified_arguments() {
-    let dispatcher = NativeToolDispatcher;
-    let response = ChatResponse {
-        text: Some(String::new()),
-        tool_calls: vec![ToolCall {
-            id: "tc1".into(),
-            name: "echo".into(),
-            arguments: r#"{"message": "hello"}"#.into(),
-        }],
-        reasoning_content: None,
-    };
-
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "echo");
-    assert_eq!(calls[0].arguments.get("message").unwrap().as_str().unwrap(), "hello");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 19. XML dispatcher edge cases
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_dispatcher_handles_nested_json() {
-    let response = ChatResponse {
-        text: Some(
-            r#"<tool_call>
-{"name": "file_write", "arguments": {"path": "test.json", "content": "{\"key\": \"value\"}"}}
-</tool_call>"#
-                .into(),
-        ),
-        tool_calls: vec![],
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "file_write");
-    assert_eq!(calls[0].arguments.get("path").unwrap().as_str().unwrap(), "test.json");
-}
-
-#[test]
-fn xml_dispatcher_handles_empty_tool_call_tag() {
-    let response = ChatResponse {
-        text: Some("<tool_call>\n</tool_call>\nSome text".into()),
-        tool_calls: vec![],
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
-    assert!(calls.is_empty());
-    assert!(text.contains("Some text"));
-}
-
-#[test]
-fn xml_dispatcher_handles_unclosed_tool_call() {
-    let response = ChatResponse {
-        text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
-        tool_calls: vec![],
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
-    // Should not panic — just treat as text
-    assert!(calls.is_empty());
-    assert!(text.contains("Before"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // 20. ConversationMessage serialization round-trip
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1636,72 +1550,6 @@ fn conversation_message_serialization_roundtrip() {
             }
             _ => panic!("Variant mismatch after serialization"),
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 21. Tool dispatcher format_results
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_format_results_includes_status_and_output() {
-    let dispatcher = XmlToolDispatcher;
-    let results = vec![
-        ToolExecutionResult {
-            name: "shell".into(),
-            output: "file1.txt\nfile2.txt".into(),
-            success: true,
-            tool_call_id: None,
-        },
-        ToolExecutionResult {
-            name: "file_read".into(),
-            output: "Error: file not found".into(),
-            success: false,
-            tool_call_id: None,
-        },
-    ];
-
-    let msg = dispatcher.format_results(&results);
-    let content = match msg {
-        ConversationMessage::Chat(c) => c.content,
-        _ => panic!("Expected Chat variant"),
-    };
-
-    assert!(content.contains("shell"));
-    assert!(content.contains("file1.txt"));
-    assert!(content.contains("ok"));
-    assert!(content.contains("file_read"));
-    assert!(content.contains("error"));
-}
-
-#[test]
-fn native_format_results_maps_tool_call_ids() {
-    let dispatcher = NativeToolDispatcher;
-    let results = vec![
-        ToolExecutionResult {
-            name: "a".into(),
-            output: "out1".into(),
-            success: true,
-            tool_call_id: Some("tc-001".into()),
-        },
-        ToolExecutionResult {
-            name: "b".into(),
-            output: "out2".into(),
-            success: true,
-            tool_call_id: Some("tc-002".into()),
-        },
-    ];
-
-    let msg = dispatcher.format_results(&results);
-    match msg {
-        ConversationMessage::ToolResults(r) => {
-            assert_eq!(r.len(), 2);
-            assert_eq!(r[0].tool_call_id, "tc-001");
-            assert_eq!(r[0].content, "out1");
-            assert_eq!(r[1].tool_call_id, "tc-002");
-            assert_eq!(r[1].content, "out2");
-        }
-        _ => panic!("Expected ToolResults"),
     }
 }
 

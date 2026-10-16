@@ -790,6 +790,7 @@ effect) and its response carries the same `warning`.
 |---|---|
 | `agent.max_tool_iterations` | progressing agent work has no arbitrary tool-round ceiling |
 | `agent.parallel_tools` | no concurrency ceiling to switch |
+| `agent.tool_dispatcher` | never read: the tool-call wire form follows the provider's capabilities |
 | `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
 | `agent.concurrency_kill_switch_force_serial` | staged rollout retired |
 | `agent.concurrency_rollout_stage` | staged rollout retired |
@@ -813,6 +814,7 @@ effect) and its response carries the same `warning`.
 | `security.audit.sign_events` | audit signing was never implemented; the setting had no effect |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
+| `causal_tree.observability.decision_log`, `causal_tree.observability.metrics` (and the earlier `write_decision_log`, `write_metrics`) | never read; decision events follow the `[observability]` backend |
 
 The `sessions_spawn` tool also no longer accepts `max_iterations` or
 `timeout_seconds`; task-mode and process-mode sub-agents share the same

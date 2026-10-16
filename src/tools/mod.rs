@@ -656,29 +656,25 @@ pub fn all_tools_with_runtime_ext_and_extensions(
             .filter(|value| !value.is_empty() && Some(*value) == root_api_key)
             .map(str::to_owned);
         let parent_tools = Arc::new(tool_arcs.clone());
-        let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents,
-            security.clone(),
-            crate::providers::provider_runtime_options_from_config(root_config),
-        )
-        .with_root_connection(delegate::RootConnection {
-            provider: root_config.default_provider.clone(),
-            key: delegate_fallback_credential,
-            api_url: root_config.api_url.clone(),
-        })
-        .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(root_config))
-        .with_model_catalog(crate::providers::selection::catalog_for(root_config))
-        .with_hint_config(root_config)
-        .with_parent_tools(parent_tools)
-        .with_reliability(root_config.reliability.clone())
-        .with_multimodal_config(root_config.multimodal.clone())
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            root_config.agent.compaction.clone(),
-            root_config.router.clone(),
-            root_config.model_routes.clone(),
-        ))
-        .with_shared_memory(Arc::clone(&memory))
-        .with_event_recording(root_config.memory.event_recording_config());
+        let delegate_tool = DelegateTool::new(delegate_agents, security.clone())
+            .with_root_connection(delegate::RootConnection {
+                provider: root_config.default_provider.clone(),
+                key: delegate_fallback_credential,
+                api_url: root_config.api_url.clone(),
+            })
+            .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(root_config))
+            .with_model_catalog(crate::providers::selection::catalog_for(root_config))
+            .with_hint_config(root_config)
+            .with_parent_tools(parent_tools)
+            .with_reliability(root_config.reliability.clone())
+            .with_multimodal_config(root_config.multimodal.clone())
+            .with_compaction_resolver(crate::router::CompactionResolver::new(
+                root_config.agent.compaction.clone(),
+                root_config.router.clone(),
+                root_config.model_routes.clone(),
+            ))
+            .with_shared_memory(Arc::clone(&memory))
+            .with_event_recording(root_config.memory.event_recording_config());
         tool_arcs.push(Arc::new(delegate_tool));
     }
 

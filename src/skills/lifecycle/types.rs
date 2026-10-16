@@ -38,6 +38,16 @@ pub enum LifecycleError {
     OwnerMismatch { expected: String, found: String },
     #[error("unsupported {what} schema version {found}")]
     UnsupportedSchema { what: &'static str, found: u32 },
+    #[error("the task skill pin table is full ({0} pins); new pins are refused until tasks release theirs")]
+    PinTableFull(usize),
+    #[error("legacy import of skill {skill_id} ended aborted in all {attempts} attempts")]
+    ImportAttemptsExhausted { skill_id: String, attempts: u32 },
+    #[error("skill name {0:?} is bound to more than one skill id")]
+    AmbiguousSkillName(String),
+    #[error("skill {0:?} is disabled")]
+    SkillDisabled(String),
+    #[error("resource unavailable in the pinned revision: {0}")]
+    ResourceUnavailable(String),
     #[error("revision {revision} already exists with different {field}")]
     RevisionConflict { revision: String, field: &'static str },
     #[error("tampered or inconsistent revision at {path}: {reason}")]
@@ -160,6 +170,31 @@ impl SkillId {
             return Err(invalid("must match [a-z0-9][a-z0-9_-]*"));
         }
         Ok(Self(value.to_string()))
+    }
+
+    /// Deterministic identity of a legacy `skills/<directory>` entry: a
+    /// readable slug of the directory name plus the first 8 hex digits of the
+    /// SHA-256 of the exact directory name, so two directories that differ only
+    /// in case or punctuation never share an id, and the id does not depend on
+    /// the skill's display name.
+    pub fn from_legacy_dir(directory: &str) -> Result<Self, LifecycleError> {
+        use sha2::{Digest, Sha256};
+        let mut slug: String = directory
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        slug.truncate(40);
+        let slug = slug.trim_start_matches(['-', '_']);
+        let slug = if slug.is_empty() { "skill" } else { slug };
+        let digest = hex::encode(Sha256::digest(directory.as_bytes()));
+        Self::parse(&format!("{slug}-{}", digest.get(..8).unwrap_or("00000000")))
     }
 
     /// Allocates a fresh identity that carries no display-name information.
@@ -321,4 +356,17 @@ impl NewRevision {
             validation_receipt_ids: Vec::new(),
         }
     }
+}
+
+/// Task-local, immutable reference to one revision issued from the active
+/// binding (generation and pinned record digest included). Reads through it never follow a newer binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedSkillRevision {
+    pub owner_scope: OwnerScope,
+    pub skill_id: SkillId,
+    pub revision_id: RevisionId,
+    pub generation: u64,
+    pub display_name: String,
+    /// Canonical record digest the pin was issued against.
+    pub record_digest: String,
 }

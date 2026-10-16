@@ -17,15 +17,6 @@ use crate::tools::capability::catalog::{CatalogView, Exposure};
 use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest};
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
-/// The same checks run before prediction, after read-only rehearsal, and
-/// immediately before committing a directive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GatePass {
-    PrePrediction,
-    PostRehearsal,
-    PreCommit,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateOutcome {
     Passed,
@@ -82,23 +73,23 @@ enum GateScope {
     CapabilityPublication,
 }
 
+/// The same checks run before prediction, after read-only rehearsal, and
+/// immediately before committing a directive.
 pub(crate) struct HardGates;
 
 impl HardGates {
     pub(crate) fn apply(
-        pass: GatePass,
         state: &CausalState,
         catalog: &CatalogView<'_>,
         candidates: &[CausalCandidate],
         inputs: &GateInputs<'_>,
     ) -> Result<GateReport, GateError> {
-        Self::apply_with_remaining_budget(pass, state, catalog, candidates, inputs, state.trusted.parts().budgets)
+        Self::apply_with_remaining_budget(state, catalog, candidates, inputs, state.trusted.parts().budgets)
     }
 
     /// Recheck with a monotonically narrowed runtime accounting snapshot. The
     /// compiled state remains immutable for request/record fingerprint parity.
     pub(crate) fn apply_with_remaining_budget(
-        pass: GatePass,
         state: &CausalState,
         catalog: &CatalogView<'_>,
         candidates: &[CausalCandidate],
@@ -111,7 +102,6 @@ impl HardGates {
             micro_usd: original.micro_usd.min(remaining.micro_usd),
             latency_ms: original.latency_ms.min(remaining.latency_ms),
         };
-        let _ = pass;
         let mut outcomes = BTreeMap::new();
         for candidate in candidates {
             if outcomes
@@ -134,7 +124,6 @@ impl HardGates {
     /// Final candidate sets still use `apply` for duplicate detection and
     /// durable gate evidence.
     pub(crate) fn check_one(
-        _pass: GatePass,
         state: &CausalState,
         catalog: &CatalogView<'_>,
         candidate: &CausalCandidate,
@@ -334,9 +323,6 @@ impl HardGates {
                     && approved.len() == references.len()
                     && approved.iter().all(|reference| references.contains(reference))
             });
-        if matches!(candidate.approval(), ApprovalRequirement::Satisfied { .. }) && !grant_verified {
-            return blocked(4, "unverified_approval");
-        }
         if let ApprovalRequirement::Required { op_ids } = candidate.approval() {
             approval_ids.extend(op_ids.iter().cloned());
         }
@@ -604,27 +590,13 @@ mod tests {
         inputs.sender = "agent";
         inputs.policy_channel = "cli";
         inputs.chat_type = "private";
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed)
         );
         inputs.owner_id = "forged_owner";
-        let denied = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let denied = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             denied.outcomes.get(candidate.candidate_id()),
             Some(&blocked(1, "scope"))
@@ -675,14 +647,7 @@ mod tests {
         });
         assert!(view.entries().is_empty());
         assert!(view.entry_any(&entry.id).is_some());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(3, "unavailable_or_stale"))
@@ -765,89 +730,26 @@ mod tests {
                 )
             })
             .collect();
-        for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
-            let report = HardGates::apply(
-                pass,
-                &state,
-                &view,
-                &[
-                    answer.clone(),
-                    refusal.clone(),
-                    fixed_terminals.first().unwrap().clone(),
-                    fixed_terminals.get(1).unwrap().clone(),
-                ],
-                &inputs,
-            )
-            .unwrap();
-            assert_eq!(report.outcomes.get(answer.candidate_id()), Some(&blocked(6, "budget")));
-            assert_eq!(report.outcomes.get(refusal.candidate_id()), Some(&GateOutcome::Passed));
-            for candidate in &fixed_terminals {
-                assert_eq!(
-                    report.outcomes.get(candidate.candidate_id()),
-                    Some(&GateOutcome::Passed)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn approval_label_cannot_supply_its_own_grant() {
-        let key = fixtures::key();
-        let mut state = fixtures::state(&key, "neutral request");
-        let catalog = CapabilityCatalog::build(&[], &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
-        let mut trusted = fixtures::trusted();
-        trusted.catalog_generation = *catalog.generation();
-        state.trusted = TrustedState::from_runtime(trusted);
-        let policy = SecurityPolicy::default();
-        let calls_seen = BTreeSet::<[u8; 32]>::new();
-        let calls = BTreeMap::new();
-        let candidate = CausalCandidate::new(
-            CausalActionKind::Answer,
-            CapabilityTarget::None,
-            CandidateSpec {
-                namespace: None,
-                required_capabilities: Vec::new(),
-                side_effect: SideEffectClass::ReadOnly,
-                approval: ApprovalRequirement::Satisfied {
-                    grant_id: "untrusted-label".into(),
-                },
-                estimated_cost: Some(CostEstimate {
-                    tokens: 1,
-                    micro_usd: 0,
-                }),
-                estimated_latency_ms: Some(1),
-            },
-        );
-        let inputs = GateInputs {
-            policy: &policy,
-            owner_id: "owner-1",
-            sender: "owner-1",
-            policy_channel: "terminal",
-            chat_type: "dm",
-            model_ref: "anthropic:claude",
-            model_can_chat: true,
-            model_can_call_tools: true,
-            decision_endpoint_ready: true,
-            child_scope: None,
-            verified_approval_calls: BTreeMap::new(),
-            call_fingerprints: &calls,
-            failed_call_counts: BTreeMap::new(),
-            replayed_non_idempotent: &calls_seen,
-            retry_limit: Some(2),
-        };
-        let view = catalog.view(&CatalogScope::default());
         let report = HardGates::apply(
-            GatePass::PreCommit,
             &state,
             &view,
-            std::slice::from_ref(&candidate),
+            &[
+                answer.clone(),
+                refusal.clone(),
+                fixed_terminals.first().unwrap().clone(),
+                fixed_terminals.get(1).unwrap().clone(),
+            ],
             &inputs,
         )
         .unwrap();
-        assert_eq!(
-            report.outcomes.get(candidate.candidate_id()),
-            Some(&blocked(4, "unverified_approval"))
-        );
+        assert_eq!(report.outcomes.get(answer.candidate_id()), Some(&blocked(6, "budget")));
+        assert_eq!(report.outcomes.get(refusal.candidate_id()), Some(&GateOutcome::Passed));
+        for candidate in &fixed_terminals {
+            assert_eq!(
+                report.outcomes.get(candidate.candidate_id()),
+                Some(&GateOutcome::Passed)
+            );
+        }
     }
 
     #[test]
@@ -889,14 +791,7 @@ mod tests {
                 fingerprint: entry.fingerprint,
                 generation: entry.generation,
             });
-            let report = HardGates::apply(
-                GatePass::PreCommit,
-                &state,
-                &view,
-                std::slice::from_ref(&candidate),
-                &inputs,
-            )
-            .unwrap();
+            let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
             if expected_intercept {
                 assert_eq!(
                     report.outcomes.get(candidate.candidate_id()),
@@ -925,14 +820,7 @@ mod tests {
                     estimated_latency_ms: Some(1),
                 },
             );
-            let report = HardGates::apply(
-                GatePass::PreCommit,
-                &state,
-                &view,
-                std::slice::from_ref(&candidate),
-                &inputs,
-            )
-            .unwrap();
+            let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
             assert!(matches!(
                 report.outcomes.get(candidate.candidate_id()),
                 Some(GateOutcome::Passed | GateOutcome::ApprovalOnly { .. } | GateOutcome::ApprovalDeferred)
@@ -990,14 +878,7 @@ mod tests {
                     estimated_latency_ms: Some(1),
                 },
             );
-            let report = HardGates::apply(
-                GatePass::PrePrediction,
-                &state,
-                &view,
-                std::slice::from_ref(&candidate),
-                &inputs,
-            )
-            .unwrap();
+            let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
             assert_eq!(
                 report.outcomes.get(candidate.candidate_id()),
                 Some(&blocked(7, "model_operation"))
@@ -1021,14 +902,7 @@ mod tests {
                 estimated_latency_ms: Some(1),
             },
         );
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(9, "explicit_restriction"))
@@ -1052,14 +926,7 @@ mod tests {
                     estimated_latency_ms: Some(1),
                 },
             );
-            let report = HardGates::apply(
-                GatePass::PreCommit,
-                &state,
-                &view,
-                std::slice::from_ref(&candidate),
-                &inputs,
-            )
-            .unwrap();
+            let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
             assert_eq!(
                 report.outcomes.get(candidate.candidate_id()),
                 Some(&GateOutcome::Passed)
@@ -1113,26 +980,13 @@ mod tests {
             },
         );
         let view = catalog.view(&CatalogScope::default());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::ApprovalDeferred)
         );
         assert_eq!(
-            Some(&HardGates::check_one(
-                GatePass::PrePrediction,
-                &state,
-                &view,
-                &candidate,
-                &inputs
-            )),
+            Some(&HardGates::check_one(&state, &view, &candidate, &inputs)),
             report.outcomes.get(candidate.candidate_id())
         );
         let scoped = CausalCandidate::new(
@@ -1152,15 +1006,8 @@ mod tests {
                 estimated_latency_ms: Some(1),
             },
         );
-        let scoped_report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&scoped),
-            &inputs,
-        )
-        .unwrap();
-        let scoped_outcome = HardGates::check_one(GatePass::PrePrediction, &state, &view, &scoped, &inputs);
+        let scoped_report = HardGates::apply(&state, &view, std::slice::from_ref(&scoped), &inputs).unwrap();
+        let scoped_outcome = HardGates::check_one(&state, &view, &scoped, &inputs);
         assert_eq!(
             scoped_report.outcomes.get(scoped.candidate_id()),
             Some(&GateOutcome::ApprovalOnly {
@@ -1169,13 +1016,7 @@ mod tests {
         );
         assert_eq!(Some(&scoped_outcome), scoped_report.outcomes.get(scoped.candidate_id()));
         assert!(matches!(
-            HardGates::apply(
-                GatePass::PrePrediction,
-                &state,
-                &view,
-                &[candidate.clone(), candidate],
-                &inputs
-            ),
+            HardGates::apply(&state, &view, &[candidate.clone(), candidate], &inputs),
             Err(GateError::DuplicateCandidate)
         ));
     }
@@ -1221,27 +1062,13 @@ mod tests {
             },
         );
         inputs.model_can_call_tools = false;
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&retrieval),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&retrieval), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(retrieval.candidate_id()),
             Some(&blocked(7, "model_operation"))
         );
         inputs.model_can_call_tools = true;
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&retrieval),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&retrieval), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(retrieval.candidate_id()),
             Some(&GateOutcome::Passed)
@@ -1261,26 +1088,12 @@ mod tests {
                 estimated_latency_ms: Some(1),
             },
         );
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&discover),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&discover), &inputs).unwrap();
         assert_eq!(report.outcomes.get(discover.candidate_id()), Some(&GateOutcome::Passed));
         let mut stale = reference.clone();
         stale.generation = CatalogGeneration([91; 32]);
         let candidate = probe_candidate(stale);
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(3, "unavailable_or_stale"))
@@ -1288,14 +1101,7 @@ mod tests {
         let mut changed = reference.clone();
         changed.fingerprint = SchemaFingerprint([92; 32]);
         let candidate = probe_candidate(changed);
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(5, "schema_changed"))
@@ -1315,7 +1121,7 @@ mod tests {
         stale_model_ref.generation = CatalogGeneration([93; 32]);
         let model_candidate = probe_candidate(stale_model_ref);
         assert_eq!(
-            HardGates::check_one(GatePass::PrePrediction, &state, &view, &model_candidate, &inputs),
+            HardGates::check_one(&state, &view, &model_candidate, &inputs),
             blocked(2, "excluded")
         );
         // A bitmap from a different slot layout cannot report a model-policy G2
@@ -1333,13 +1139,7 @@ mod tests {
         ));
         state.trusted = TrustedState::from_runtime(trusted.clone());
         assert_eq!(
-            HardGates::check_one(
-                GatePass::PrePrediction,
-                &state,
-                &view,
-                &probe_candidate(reference.clone()),
-                &inputs
-            ),
+            HardGates::check_one(&state, &view, &probe_candidate(reference.clone()), &inputs),
             blocked(3, "unavailable_or_stale")
         );
         trusted.model_admission = None;
@@ -1360,26 +1160,13 @@ mod tests {
         state.trusted = TrustedState::from_runtime(trusted);
         assert!(hidden_view.entries().is_empty());
         let candidate = probe_candidate(excluded_ref);
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &hidden_view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &hidden_view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(2, "excluded"))
         );
         assert_eq!(
-            Some(&HardGates::check_one(
-                GatePass::PrePrediction,
-                &state,
-                &hidden_view,
-                &candidate,
-                &inputs
-            )),
+            Some(&HardGates::check_one(&state, &hidden_view, &candidate, &inputs)),
             report.outcomes.get(candidate.candidate_id())
         );
     }
@@ -1437,24 +1224,24 @@ mod tests {
         missing.id = missing_id;
         let single_missing = candidate_for(vec![missing.clone()]);
         assert_eq!(
-            HardGates::check_one(GatePass::PrePrediction, &state, &view, &single_missing, &inputs),
+            HardGates::check_one(&state, &view, &single_missing, &inputs),
             blocked(3, "unavailable_or_stale")
         );
         let second_missing = candidate_for(vec![references.first().unwrap().clone(), missing]);
         assert_eq!(
-            HardGates::check_one(GatePass::PrePrediction, &state, &view, &second_missing, &inputs),
+            HardGates::check_one(&state, &view, &second_missing, &inputs),
             blocked(3, "unavailable_or_stale")
         );
         let mut stale_second = references.get(1).unwrap().clone();
         stale_second.fingerprint = SchemaFingerprint([99; 32]);
         let second_stale = candidate_for(vec![references.first().unwrap().clone(), stale_second]);
         assert_eq!(
-            HardGates::check_one(GatePass::PrePrediction, &state, &view, &second_stale, &inputs),
+            HardGates::check_one(&state, &view, &second_stale, &inputs),
             blocked(5, "schema_changed")
         );
         let valid = candidate_for(references);
         assert_eq!(
-            HardGates::check_one(GatePass::PrePrediction, &state, &view, &valid, &inputs),
+            HardGates::check_one(&state, &view, &valid, &inputs),
             GateOutcome::Passed
         );
     }
@@ -1484,39 +1271,20 @@ mod tests {
         let mut history = BTreeSet::from([[2; 32]]);
         let view = catalog.view(&CatalogScope::default());
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed)
         );
         assert_eq!(
-            Some(&HardGates::check_one(
-                GatePass::PreCommit,
-                &state,
-                &view,
-                &candidate,
-                &inputs
-            )),
+            Some(&HardGates::check_one(&state, &view, &candidate, &inputs)),
             report.outcomes.get(candidate.candidate_id())
         );
         let mut inputs = probe_inputs(&policy, &empty, &calls, &history);
         inputs.retry_limit = None;
         inputs.failed_call_counts.insert([1; 32], 99);
-        let absent_limit = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .expect("gate report");
+        let absent_limit =
+            HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).expect("gate report");
         assert_eq!(
             absent_limit.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed),
@@ -1524,65 +1292,31 @@ mod tests {
         );
         inputs.retry_limit = Some(2);
         inputs.failed_call_counts = BTreeMap::from([([1; 32], 1), ([2; 32], 99)]);
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed)
         );
         inputs.failed_call_counts.insert([1; 32], 2);
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(8, "retry_or_replay"))
         );
         assert_eq!(
-            Some(&HardGates::check_one(
-                GatePass::PreCommit,
-                &state,
-                &view,
-                &candidate,
-                &inputs
-            )),
+            Some(&HardGates::check_one(&state, &view, &candidate, &inputs)),
             report.outcomes.get(candidate.candidate_id())
         );
         history.insert([1; 32]);
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(8, "retry_or_replay"))
         );
         calls.clear();
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed)
@@ -1628,14 +1362,7 @@ mod tests {
         let history = BTreeSet::new();
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
         let view = catalog.view(&CatalogScope::default());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::ApprovalDeferred)
@@ -1650,13 +1377,11 @@ mod tests {
         approved
             .verified_approval_calls
             .insert([1; 32], candidate.required_capabilities().iter().cloned().collect());
-        for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
-            for inputs in [&inputs, &approved] {
-                assert_eq!(
-                    HardGates::check_one(pass, &state, &view, &candidate, inputs),
-                    blocked(1, "owner_isolation")
-                );
-            }
+        for inputs in [&inputs, &approved] {
+            assert_eq!(
+                HardGates::check_one(&state, &view, &candidate, inputs),
+                blocked(1, "owner_isolation")
+            );
         }
     }
 
@@ -1699,14 +1424,7 @@ mod tests {
         let history = BTreeSet::new();
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
         let view = catalog.view(&CatalogScope::default());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::ApprovalDeferred)
@@ -1716,41 +1434,20 @@ mod tests {
         scoped
             .verified_approval_calls
             .insert([1; 32], candidate.required_capabilities().iter().cloned().collect());
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &scoped,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &scoped).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::Passed)
         );
         scoped.model_can_chat = false;
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &scoped,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &scoped).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(7, "model_operation"))
         );
         scoped.model_can_chat = true;
         scoped.decision_endpoint_ready = false;
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &scoped,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &scoped).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(7, "model_operation"))
@@ -1760,14 +1457,7 @@ mod tests {
         changed
             .verified_approval_calls
             .insert([1; 32], candidate.required_capabilities().iter().cloned().collect());
-        let report = HardGates::apply(
-            GatePass::PreCommit,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &changed,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &changed).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::ApprovalDeferred)
@@ -1839,14 +1529,7 @@ mod tests {
         let history = BTreeSet::new();
         let inputs = probe_inputs(&policy, &empty, &calls, &history);
         let view = catalog.view(&CatalogScope::default());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&candidate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
         assert_eq!(
             report.outcomes.get(candidate.candidate_id()),
             Some(&blocked(4, "policy_deny"))
@@ -1897,14 +1580,7 @@ mod tests {
                     estimated_latency_ms: Some(1),
                 },
             );
-            let report = HardGates::apply(
-                GatePass::PrePrediction,
-                &state,
-                &view,
-                std::slice::from_ref(&candidate),
-                &inputs,
-            )
-            .unwrap();
+            let report = HardGates::apply(&state, &view, std::slice::from_ref(&candidate), &inputs).unwrap();
             assert_eq!(
                 report.outcomes.get(candidate.candidate_id()),
                 Some(&GateOutcome::Passed)
@@ -1956,38 +1632,17 @@ mod tests {
         let mut inputs = probe_inputs(&policy, &empty, &calls, &history);
         inputs.child_scope = Some((&manifest, &parent));
         let allowed = probe_candidate(refs.first().unwrap().clone());
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&allowed),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&allowed), &inputs).unwrap();
         assert_eq!(report.outcomes.get(allowed.candidate_id()), Some(&GateOutcome::Passed));
         let mut stale = refs.first().unwrap().clone();
         stale.fingerprint = SchemaFingerprint([99; 32]);
         let denied = probe_candidate(stale);
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&denied),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&denied), &inputs).unwrap();
         assert_eq!(report.outcomes.get(denied.candidate_id()), Some(&blocked(1, "scope")));
         let mut forged = manifest.clone();
         forged.authority.owner = "other_owner".into();
         inputs.child_scope = Some((&forged, &parent));
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&allowed),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&allowed), &inputs).unwrap();
         assert_eq!(report.outcomes.get(allowed.candidate_id()), Some(&blocked(1, "scope")));
         let read_only_parent = CapabilityConstraints {
             decision_id: parent.decision_id,
@@ -2002,14 +1657,7 @@ mod tests {
         let read_only =
             ChildCapabilityManifest::derive_strict_subset(&read_only_parent, refs.get(..1).unwrap()).unwrap();
         inputs.child_scope = Some((&read_only, &read_only_parent));
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&allowed),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&allowed), &inputs).unwrap();
         assert_eq!(report.outcomes.get(allowed.candidate_id()), Some(&blocked(1, "scope")));
 
         let cost_parent = CapabilityConstraints {
@@ -2039,14 +1687,7 @@ mod tests {
                 estimated_latency_ms: Some(1),
             },
         );
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&costly),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&costly), &inputs).unwrap();
         assert_eq!(report.outcomes.get(costly.candidate_id()), Some(&blocked(1, "scope")));
 
         let depth_parent = CapabilityConstraints {
@@ -2076,14 +1717,7 @@ mod tests {
                 estimated_latency_ms: Some(1),
             },
         );
-        let report = HardGates::apply(
-            GatePass::PrePrediction,
-            &state,
-            &view,
-            std::slice::from_ref(&delegate),
-            &inputs,
-        )
-        .unwrap();
+        let report = HardGates::apply(&state, &view, std::slice::from_ref(&delegate), &inputs).unwrap();
         assert_eq!(report.outcomes.get(delegate.candidate_id()), Some(&blocked(1, "scope")));
     }
 }

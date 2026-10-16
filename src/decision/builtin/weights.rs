@@ -12,6 +12,14 @@ pub const FRESH_ARTIFACT_MS: u64 = 5 * 60 * 1000;
 /// An artifact older than this (ms) may be stale.
 pub const STALE_ARTIFACT_MS: u64 = 60 * 60 * 1000;
 
+/// The evidence-sufficient probability of a plain conversational turn (or a
+/// model-managed delegation) with no artifacts and no lookups. The builtin
+/// returns exactly this value for such a turn, rather than whatever the
+/// logistic of an empty evidence sum rounds to; the selector treats a value at
+/// or above its threshold (also 0.5) as sufficient, so these turns answer
+/// directly without a retrieve hop.
+pub const PLAIN_TURN_EVIDENCE: f64 = 0.5;
+
 /// Log-score bonus for a candidate the user named exactly.
 pub const EXACT_MENTION: f64 = 2.0;
 /// Log-score bonus for a web target when the text carries a URL. Above

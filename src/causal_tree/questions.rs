@@ -417,7 +417,6 @@ fn hash_candidate(hasher: &mut Sha256, candidate: &CausalCandidate) {
                 hash_text(hasher, op_id.as_str());
             }
         }
-        ApprovalRequirement::Satisfied { grant_id } => hash_text(hasher, grant_id),
     }
     let mut refs = candidate.required_capabilities().iter().collect::<Vec<_>>();
     refs.sort();

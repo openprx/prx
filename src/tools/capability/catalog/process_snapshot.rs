@@ -61,9 +61,6 @@ impl CapabilityCatalog {
                     ApprovalRequirement::Required { op_ids } => {
                         Some(op_ids.iter().map(|op| op.as_str().to_owned()).collect())
                     }
-                    ApprovalRequirement::Satisfied { .. } => {
-                        anyhow::bail!("catalog transport cannot transfer satisfied approval")
-                    }
                 };
                 Ok(Entry {
                     id: entry.id.as_str().to_owned(),

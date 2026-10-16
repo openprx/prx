@@ -46,15 +46,6 @@ fn config_default_temperature_positive() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn agent_config_default_tool_dispatcher() {
-    let agent = AgentConfig::default();
-    assert_eq!(
-        agent.tool_dispatcher, "auto",
-        "default tool_dispatcher should be 'auto'"
-    );
-}
-
-#[test]
 fn agent_config_default_compact_context_off() {
     let agent = AgentConfig::default();
     assert!(!agent.compact_context, "compact_context should default to false");

@@ -2709,10 +2709,7 @@ mod tests {
                 let mut index = 0usize;
                 while payload.len() < 47_000 {
                     use std::fmt::Write as _;
-                    let _ = write!(
-                        payload,
-                        "{CONSOLE_BULKY_MARKER}-{index}-龘齉靐齾爩鱻麤灪爨籱癵驫麣纞虋讟钃鸜麷韽饢顟顠顡 "
-                    );
+                    let _ = write!(payload, "{CONSOLE_BULKY_MARKER}-{index}-갇걇겇곇괇굇궇귇긇깇꺇껇꼇꽇꾇꿇뀇끇낇냇넇녇놇뇇 ");
                     index += 1;
                 }
                 assert!(payload.len() < 48_000, "fixture must remain below the native inline cap");
