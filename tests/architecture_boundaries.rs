@@ -68,15 +68,15 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // refused `memory_store` left the victim row's `owner_id` unchanged and wrote
     // no identity binding, and no memory API returns either. Every write in that
     // test goes through the production MCP handler.
-    "src/gateway/compat.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
-    "src/gateway/compat.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    "src/gateway/compat/tests/handler.rs::brain_db_probe::let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)",
+    "src/gateway/compat/tests/card_jwt.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     // Test-only (V02-R5): the anti-over-correction lock needs one row at
     // `visibility = 'public'`, and no memory API writes that visibility —
     // `classify_memory` produces `owner`, `group` or `private` only, and
     // `MemoryStoreMetadata` carries no visibility field. The row is published
     // with a single parameterized UPDATE on the seeded test database; every
     // read in that test still goes through the production MCP seam.
-    "src/gateway/compat.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
+    "src/gateway/compat/tests/memory_tools.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",
@@ -4792,7 +4792,7 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
 /// A webhook turn must run its tool loop inside its own spawn boundary.
 ///
-/// `gateway::tests::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
+/// `gateway::tests::tool_surface::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
 /// pins what `within_gateway_turn_spawn_context` does; this pins that the
 /// shipped webhook turn still goes through it. Without this guard the seeding
 /// can be deleted from `run_gateway_chat_with_multimodal` -- or replaced by a
@@ -5339,7 +5339,7 @@ fn a_session_worker_selects_its_tools_through_its_manifest() {
 /// `prx gateway` each carried a symmetric copy of the same registration block,
 /// and only the daemon copy had tests, so a change to one silently gave the two
 /// launch modes different tool surfaces (independent audit 2026-09-16 §2.3).
-/// `gateway::tests::both_gateway_launch_paths_publish_the_same_tool_surface`
+/// `gateway::tests::tool_surface::both_gateway_launch_paths_publish_the_same_tool_surface`
 /// compares what the shared registrar produces; this pins that both entry points
 /// still go through it rather than growing a second registration of their own.
 #[test]
@@ -9943,15 +9943,25 @@ fn decision_http_clients_come_only_from_the_pinned_builder() {
 }
 
 /// AG-10 (SP-CDP-A 5.10): the decision store's database is named, and so
-/// opened, only by `causal_tree/store.rs`. Comments may mention it.
+/// opened, only by `causal_tree/store.rs`. Its `store/` child modules are
+/// scanned like any other file; test-only files are empty production text.
+/// Comments may mention it.
 #[test]
 fn the_decision_store_database_is_opened_only_by_the_store() {
     const STORE: &str = "src/causal_tree/store.rs";
+    const SCANNED_CHILDREN: [&str; 2] = [
+        "src/causal_tree/store/child_outcome.rs",
+        "src/causal_tree/store/child_recovery.rs",
+    ];
     let mut violations = Vec::new();
+    let mut scanned_children = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/") || relative == STORE {
             continue;
+        }
+        if SCANNED_CHILDREN.contains(&relative.as_str()) {
+            scanned_children += 1;
         }
         let production = strip_cfg_test_items(&read_source(&path));
         let names_the_database = production.lines().any(|line| {
@@ -9962,6 +9972,11 @@ fn the_decision_store_database_is_opened_only_by_the_store() {
             violations.push(relative);
         }
     }
+    assert_eq!(
+        scanned_children,
+        SCANNED_CHILDREN.len(),
+        "the store child modules must be scanned, not exempted"
+    );
     assert!(
         violations.is_empty(),
         "only the decision store opens decisions.db (AG-10): {violations:?}"
