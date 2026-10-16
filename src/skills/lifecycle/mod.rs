@@ -15,6 +15,7 @@ macro_rules! crash_point {
 
 mod binding;
 mod bundle;
+mod capture;
 mod generation;
 mod journal;
 mod manifest;
@@ -27,11 +28,17 @@ mod types;
 mod tests;
 
 pub use binding::{
-    MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedSkillRead, read_managed_resource, release_task_pins, task_pin,
+    MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
+    release_task_pins, task_pin,
 };
 pub use bundle::{
     BUNDLE_FORMAT_VERSION, Bundle, BundleEntry, BundleError, BundleFile, MAX_BUNDLE_COMPONENT_BYTES, MAX_BUNDLE_DEPTH,
     MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_FILES, MAX_BUNDLE_PATH_BYTES, MAX_BUNDLE_TOTAL_BYTES,
+};
+pub use capture::{
+    CAPTURE_LOCK_TIMEOUT, Correlation, ExperienceOutcome, ExperienceRetention, HydrationReceipt,
+    MAX_HYDRATION_RECEIPTS, MAX_SELECTION_RECEIPTS, SelectionReceipt, SkillExperience, TaskTerminal, TerminalJoin,
+    TerminalJoinOutcome, experience_id, on_task_terminal, task_key,
 };
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
