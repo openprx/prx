@@ -63,7 +63,13 @@ fn legacy_directory_ids_are_stable_distinct_and_name_independent() {
         SkillId::from_legacy_dir("a b").expect("test: id"),
         SkillId::from_legacy_dir("a-b").expect("test: id")
     );
-    for odd in ["...", "--", "\u{4e2d}\u{6587}", &"x".repeat(128), "_leading"] {
+    for odd in [
+        "...",
+        "--",
+        "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+        &"x".repeat(128),
+        "_leading",
+    ] {
         let id = SkillId::from_legacy_dir(odd).expect("test: odd names still map");
         assert!(SkillId::parse(id.as_str()).is_ok(), "{odd}");
     }
