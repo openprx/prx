@@ -585,13 +585,20 @@ fn decision_answers(body: &serde_json::Value) -> anyhow::Result<serde_json::Valu
         .pointer("/state/candidates")
         .and_then(Value::as_array)
         .context("actual candidate projection")?;
-    let target_index = candidates
+    let (target_index, selected_action, selected_target) = candidates
         .iter()
         .position(|candidate| {
             candidate.get("action").and_then(Value::as_str) == Some("use_tool")
                 && candidate.get("target").and_then(Value::as_str) == Some("filesystem")
         })
-        .context("actual filesystem use-tool candidate")?;
+        .map(|index| (index, "use_tool", "filesystem"))
+        .or_else(|| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.get("action").and_then(Value::as_str) == Some("answer"))
+                .map(|index| (index, "answer", "none"))
+        })
+        .context("actual filesystem use-tool or terminal answer candidate")?;
     let target_path = format!("$.candidates[{target_index}]");
     let questions = body
         .get("questions")
@@ -619,8 +626,8 @@ fn decision_answers(body: &serde_json::Value) -> anyhow::Result<serde_json::Valu
         let answer = match kind {
             "choice" => {
                 let chosen = match instruction {
-                    "Choose the best legal next action." => "use_tool",
-                    "Choose the capability family needed by the next action." => "filesystem",
+                    "Choose the best legal next action." => selected_action,
+                    "Choose the capability family needed by the next action." => selected_target,
                     _ => anyhow::bail!("unexpected choice question"),
                 };
                 let options = question

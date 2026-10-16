@@ -755,7 +755,7 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
         Arc::clone(&memory),
     )
     .await;
-    admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
+    admission.assert_core_specs(&tool_specs_of(&tools_registry));
 
     let result = run_turn(
         &mut history,
@@ -1305,10 +1305,7 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             Arc::clone(&memory),
         )
         .await;
-        let expected_specs = tool_specs_of(&tools_registry)
-            .into_iter()
-            .filter(|spec| spec.name != "capability_search")
-            .collect::<Vec<_>>();
+        let expected_specs = tool_specs_of(&tools_registry);
         admission.assert_core_specs(&expected_specs);
         let runtime = admission.memory_runtime();
 
@@ -1362,9 +1359,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
         let raw = event.raw_payload_json.as_deref().expect("request context payload");
         let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
 
-        // The exact business tool is the only discoverable family, so the
-        // request contains its schema without a redundant search control.
-        assert_eq!(payload["tool_snapshot"]["count"], 1);
+        // Finding 80 keeps the gated search control beside the exact business
+        // schema on this structural terminal hop, and both must be measured.
+        assert_eq!(payload["tool_snapshot"]["count"], 2);
         assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
 
         let estimate = &payload["request_estimate"];
@@ -3062,10 +3059,7 @@ async fn tool_arguments_are_validated_in_the_serving_models_dialect() {
         (PER_MODEL_LABEL, GEMINI_SERVED_MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     run_turn(
@@ -3240,10 +3234,7 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
         (PRIMARY, MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     let (_, trace) = run_turn(
@@ -3444,10 +3435,7 @@ async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
         (PRIMARY, MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     let error = run_turn(

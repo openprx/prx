@@ -353,6 +353,17 @@ impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction
     fn remaining_budget(&self) -> Option<(u64, u64)> {
         self.accounting.map(|owner| owner.remaining_budget())
     }
+    fn terminal_fallback_cause(
+        &self,
+        result: &PredictionResult,
+    ) -> Option<crate::causal_tree::decision_engine::FallbackCause> {
+        use crate::causal_tree::decision_engine::FallbackCause;
+        match result.reason {
+            Some(FallbackReason::AllFailed) => Some(FallbackCause::DecisionFailed),
+            Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
+            Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
+        }
+    }
     async fn predict<'a>(
         &'a self,
         request: &'a crate::decision::DecisionRequest,

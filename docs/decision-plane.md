@@ -90,7 +90,12 @@ An Answer turn may publish the bounded Direct core plus `capability_search` when
 the source/model may call tools and an eligible discovery family exists. A brief
 answer with no structural target, such as a greeting, keeps only the Direct core;
 search becomes available when the input has a URL, path or code shape, or exceeds
-the builtin brief-request bound. An Answer turn may also publish an exactly named
+the builtin brief-request bound. If the runtime has no current
+`capability_search` backend, it omits that control instead of failing the Answer.
+An Answer that follows a successful selected Memory, Document or Session read
+consumes the admitted evidence with no executable tool surface; it cannot reopen
+Direct tools or discovery after the engine committed the retrieval. An Answer
+turn may also publish an exactly named
 `delegate` or `sessions_spawn` on any surface that admits delegation, even when
 that delegator is Searchable rather than configured as Direct, but only when the
 same decision carries a sealed child manifest.

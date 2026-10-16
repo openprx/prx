@@ -74,6 +74,12 @@ impl TurnDecisionService {
             return Ok(None);
         }
         if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly) {
+            if context.engine.state.observed.completed_steps().iter().any(|step| {
+                step.kind() == crate::causal_tree::state::ObservedStepKind::Retrieve
+                    && step.status() == crate::causal_tree::state::ObservedStepStatus::Ok
+            }) {
+                return Ok(None);
+            }
             let signals = crate::decision::builtin::features::text_signals(context.engine.state.routing_input.as_str());
             if !signals.structural()
                 && signals.request_weight <= crate::decision::builtin::weights::BRIEF_REQUEST_MAX_WEIGHT
@@ -84,10 +90,9 @@ impl TurnDecisionService {
         if self.discovery_families(proof, context)?.is_empty() {
             return Ok(None);
         }
-        let entry = self
-            .catalog
-            .entry_for_public_name("capability_search")
-            .context("discoverable turn lacks the capability search backend")?;
+        let Some(entry) = self.catalog.entry_for_public_name("capability_search") else {
+            return Ok(None);
+        };
         let trusted = context.engine.state.trusted.parts();
         if self.catalog_view().surface_excludes(entry)
             || trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))

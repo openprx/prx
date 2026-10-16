@@ -35,7 +35,7 @@ use crate::capability::CapabilityAvailabilityLevel;
 use crate::decision::DecisionError;
 #[cfg(test)]
 use crate::decision::factory::DecisionBackendFactory;
-use crate::decision::factory::{FallbackReason, PredictionResult};
+use crate::decision::factory::PredictionResult;
 use crate::decision::telemetry::CausalLineage;
 use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, RequestLimits, ValidatedDecision};
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -53,6 +53,7 @@ pub(crate) mod prediction_sealed {
 
 pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
     fn remaining_budget(&self) -> Option<(u64, u64)>;
+    fn terminal_fallback_cause(&self, result: &PredictionResult) -> Option<FallbackCause>;
     fn predict<'a>(
         &'a self,
         request: &'a crate::decision::DecisionRequest,
@@ -944,11 +945,7 @@ impl CausalDecisionEngine {
             .await;
             match outcome {
                 Ok(Ok(result)) if Instant::now() < inputs.deadline => {
-                    let terminal_cause = match result.reason {
-                        Some(FallbackReason::AllFailed) => Some(FallbackCause::DecisionFailed),
-                        Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
-                        Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
-                    };
+                    let terminal_cause = inputs.prediction.terminal_fallback_cause(&result);
                     if let Some(cause) = terminal_cause {
                         // Keep the factory result for truthful attempt and
                         // accounting records, but never score or execute the

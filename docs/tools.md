@@ -61,7 +61,12 @@ used directly for an initial search hop; a later model-supplied search query
 must independently meet the 1024-byte limit. Registration by itself does not
 expose search: the current source/model must permit tool calls and at least one
 eligible family must survive the surface gates. Search uses the indexed,
-source-filtered catalog and does not refresh external backends. Returned
+source-filtered catalog and does not refresh external backends. If the runtime
+has no current `capability_search` backend, it omits the control and continues
+the admitted Answer. A terminal Answer after a successful selected Memory,
+Document or Session read publishes no executable tool surface, because that hop
+consumes the already selected evidence rather than opening another capability
+action. Returned
 references are retained only in that live turn and cleared when it closes. A
 search result alone grants no execution authority; fresh admission must append
 the exact offered schema before it can bind for execution. The tool requires an

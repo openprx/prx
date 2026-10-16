@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::turn_tests::business_tool_specs_of;
 
 /// The only part of the appended prompt sections the preflight cannot pin
 /// exactly. `CompiledToolContext::apply_to_messages` joins them onto the
@@ -813,7 +814,9 @@ async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals
 async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_call() {
     let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "gpio_read" })];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
+    // This structural request retains the separately gated search control on
+    // its terminal provider hop, so the budget must include that exact schema.
+    let tool_specs = tool_specs_of(&tools_registry);
     let appended_tokens = compiled_instruction_tokens(&tool_specs);
     let payload_tokens =
         budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);

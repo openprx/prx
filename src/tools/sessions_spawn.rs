@@ -11809,9 +11809,10 @@ mod tests {
         let denied = execute_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
             .await
             .expect_err("an unapproved side-effect tool must not be offered for execution");
-        assert!(
-            denied.to_string().contains("did not select tool 'sessions_spawn'"),
-            "the admitted surface must exclude the unapproved tool: {denied}"
+        assert_eq!(
+            denied.to_string(),
+            "decision has no executable selection",
+            "the admitted surface must exclude the unapproved tool"
         );
 
         // No run should have been registered.
@@ -12713,7 +12714,11 @@ mod tests {
         let error = execute_admitted_spawn(&tool, json!({"task": "blocked"}))
             .await
             .expect_err("a side-effect tool must not be offered on a read-only surface");
-        assert!(error.to_string().contains("did not select tool 'sessions_spawn'"));
+        assert_eq!(
+            error.to_string(),
+            "decision has no executable selection",
+            "a read-only turn must close before publishing an executable spawn selection"
+        );
         assert!(tool.active_runs_snapshot().await.is_empty());
     }
 

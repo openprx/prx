@@ -918,6 +918,22 @@ fn direct_answer_refs(
     if !gates.model_can_call_tools {
         return BTreeSet::new();
     }
+    // A selected retrieval has already completed the only capability action
+    // authorized for this turn. The following Answer consumes that evidence;
+    // publishing the ordinary Direct surface here would reopen execution after
+    // the engine committed the terminal action. A completed discovery is
+    // different: its exact selected references are intentionally offered to
+    // the serving model for the bounded final hop below.
+    if selected_discovery_refs.is_empty()
+        && decision
+            .state
+            .observed
+            .completed_steps()
+            .iter()
+            .any(|step| step.kind() == ObservedStepKind::Retrieve && step.status() == ObservedStepStatus::Ok)
+    {
+        return BTreeSet::new();
+    }
     let trusted = decision.state.trusted.parts();
     catalog
         .iter_entries()
