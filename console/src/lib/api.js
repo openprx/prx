@@ -191,11 +191,6 @@ export const api = {
     const { body, etag } = await request('/api/config/files', {}, { withEtag: true });
     return { files: body, revision: etag ? etag.replace(/^"|"$/g, '') : null };
   },
-  saveConfig: (data) =>
-    request('/api/config', {
-      method: 'POST',
-      body: JSON.stringify(data)
-    }),
   // `confirmHighRisk` confirms a change the server classifies high risk
   // (a credential, `secrets.encrypt = false`, a provider endpoint); without
   // it such a save answers 428 with the reasons and the revision the refused

@@ -152,28 +152,16 @@ impl OpId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalRequirement {
     None,
-    Required {
-        op_ids: Vec<OpId>,
-    },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retain canonical approval states and defensive gates; live grants are verified through GateInputs"
-        )
-    )]
-    Satisfied {
-        grant_id: Arc<str>,
-    },
+    Required { op_ids: Vec<OpId> },
 }
 
 impl ApprovalRequirement {
-    /// The state v1 code: `none`, `required` or `satisfied`.
+    /// The state v1 code: `none` or `required`. Live grants are verified per
+    /// call through `GateInputs`, never carried on the candidate.
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Required { .. } => "required",
-            Self::Satisfied { .. } => "satisfied",
         }
     }
 }
@@ -676,13 +664,6 @@ mod candidate_tests {
             }
             .code(),
             "required"
-        );
-        assert_eq!(
-            ApprovalRequirement::Satisfied {
-                grant_id: Arc::from("g-1")
-            }
-            .code(),
-            "satisfied"
         );
         assert_eq!(OpId::new("fs:write:abc").as_str(), "fs:write:abc");
     }

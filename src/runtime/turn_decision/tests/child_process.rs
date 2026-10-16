@@ -1049,7 +1049,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
 
         // Recheck the actual selected parent capability against the real
         // narrower child seal. Full runtime mode cannot widen that scope.
-        use crate::causal_tree::gates::{GateInputs, GateOutcome, GatePass, HardGates};
+        use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
         let crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } =
             &context.engine.candidates
         else {
@@ -1079,37 +1079,35 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
             retry_limit: Some(0),
         };
         let view = service.catalog_view();
-        for pass in [GatePass::PrePrediction, GatePass::PostRehearsal, GatePass::PreCommit] {
-            assert_eq!(
-                HardGates::check_one(pass, &context.engine.state, &view, candidate, &gates),
-                GateOutcome::Passed
-            );
-            gates.child_scope = Some((manifest, parent));
-            assert_eq!(
-                HardGates::check_one(pass, &context.engine.state, &view, candidate, &gates),
-                GateOutcome::Blocked {
-                    gate: 1,
-                    reason_code: "scope"
-                }
-            );
-            gates.child_scope = None;
-            // Negative gate projection only: no resume receipt or approval is
-            // minted. An exact-resume restriction cannot borrow Full policy
-            // to admit this otherwise legal, unapproved executable candidate.
-            let mut resumed = context.engine.state.clone();
-            let mut trusted = resumed.trusted.parts().clone();
-            trusted
-                .constraints
-                .push(crate::causal_tree::state::ConstraintCode::new("resume_exact_call"));
-            resumed.trusted = TrustedState::from_runtime(trusted);
-            assert_eq!(
-                HardGates::check_one(pass, &resumed, &view, candidate, &gates),
-                GateOutcome::Blocked {
-                    gate: 9,
-                    reason_code: "resume_scope"
-                }
-            );
-        }
+        assert_eq!(
+            HardGates::check_one(&context.engine.state, &view, candidate, &gates),
+            GateOutcome::Passed
+        );
+        gates.child_scope = Some((manifest, parent));
+        assert_eq!(
+            HardGates::check_one(&context.engine.state, &view, candidate, &gates),
+            GateOutcome::Blocked {
+                gate: 1,
+                reason_code: "scope"
+            }
+        );
+        gates.child_scope = None;
+        // Negative gate projection only: no resume receipt or approval is
+        // minted. An exact-resume restriction cannot borrow Full policy
+        // to admit this otherwise legal, unapproved executable candidate.
+        let mut resumed = context.engine.state.clone();
+        let mut trusted = resumed.trusted.parts().clone();
+        trusted
+            .constraints
+            .push(crate::causal_tree::state::ConstraintCode::new("resume_exact_call"));
+        resumed.trusted = TrustedState::from_runtime(trusted);
+        assert_eq!(
+            HardGates::check_one(&resumed, &view, candidate, &gates),
+            GateOutcome::Blocked {
+                gate: 9,
+                reason_code: "resume_scope"
+            }
+        );
     } else {
         assert!(matches!(context.disposition()?, TurnDisposition::Close { .. }));
         assert!(service.agent_execution_specs(&proof, &context).is_err());

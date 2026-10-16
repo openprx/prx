@@ -1144,9 +1144,6 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
-    #[serde(default = "default_agent_tool_dispatcher")]
-    pub tool_dispatcher: String,
     /// Max concurrent read-only tool calls in an iteration batch.
     /// Defaults to 2 to preserve existing scheduler behavior.
     #[serde(default = "default_read_only_tool_concurrency_window")]
@@ -1480,10 +1477,6 @@ impl Default for SelfSystemConfig {
     }
 }
 
-fn default_agent_tool_dispatcher() -> String {
-    "auto".into()
-}
-
 const fn default_read_only_tool_concurrency_window() -> usize {
     2
 }
@@ -1516,7 +1509,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             compact_context: false,
-            tool_dispatcher: default_agent_tool_dispatcher(),
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
             priority_scheduling_enabled: false,
             low_priority_tools: default_agent_low_priority_tools(),
@@ -8744,7 +8736,6 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
         assert!(!cfg.priority_scheduling_enabled);
         assert_eq!(cfg.low_priority_tools, default_agent_low_priority_tools());
@@ -8908,14 +8899,12 @@ provider = "openrouter"
 default_temperature = 0.7
 [agent]
 compact_context = true
-tool_dispatcher = "xml"
 read_only_tool_concurrency_window = 4
 priority_scheduling_enabled = true
 low_priority_tools = ["sessions_spawn", "delegate"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
-        assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
         assert!(parsed.agent.priority_scheduling_enabled);
         assert_eq!(parsed.agent.low_priority_tools, vec!["sessions_spawn", "delegate"]);
@@ -12085,6 +12074,28 @@ classifier_timeout_secs = 8
         }
     }
 
+    /// `[agent] tool_dispatcher` never reached the runtime, which picks the
+    /// wire form from the provider's capabilities. A stored value loads with a
+    /// deprecation warning and is ignored.
+    #[test]
+    async fn a_stored_tool_dispatcher_setting_loads_with_a_deprecation_warning() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_temperature = 0.7\n\n[agent]\ncompact_context = true\ntool_dispatcher = \"xml\"\n",
+        )
+        .expect("test: write config");
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        let loaded = loaded.expect("test: a stored tool_dispatcher still loads");
+        assert!(loaded.agent.compact_context);
+        assert!(
+            logs.contains("agent.tool_dispatcher") && logs.contains("Ignoring removed configuration key"),
+            "tool_dispatcher must be reported as removed: {logs}"
+        );
+    }
+
     /// INT-2B CONSOLE-OBS-2 (D-056 DC-3), RED before: the default
     /// `auth.codex_auth_json_path` was the absolute home path, which a save
     /// wrote into `identity.toml` and the raw file API served. After: the
@@ -12317,6 +12328,23 @@ circuit_breaker_cooldown_secs = 60
         let (_dir, loaded) =
             load("default_temperature = 0.7\n\n[causal_tree.backend]\nkind = \"typesafe\"\nmodel = \"jev-1.13.0\"\n");
         loaded.expect("test: a pinned hosted model loads");
+    }
+
+    /// The decision log and metrics switches never had an effect; a versioned
+    /// file that stores them still loads, and a save does not write them back.
+    #[tokio::test]
+    async fn stored_observability_switches_load_and_are_not_written_back() {
+        let (dir, loaded) = load(
+            "default_temperature = 0.7\n\n[causal_tree]\nschema_version = 1\nenabled = true\n\n\
+             [causal_tree.observability]\ndecision_log = false\nmetrics = false\n",
+        );
+        let loaded = loaded.expect("test: a stored observability table still loads");
+        assert!(loaded.causal_tree.enabled);
+        crate::config::files::write_split_config(&loaded, false)
+            .await
+            .expect("test: save");
+        let saved = saved_text(dir.path());
+        assert!(!saved.contains("decision_log") && !saved.contains("metrics"), "{saved}");
     }
 
     #[tokio::test]

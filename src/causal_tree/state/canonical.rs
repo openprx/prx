@@ -54,7 +54,6 @@ struct CanonicalObserved<'a> {
 enum CanonicalApproval<'a> {
     None([&'static str; 1]),
     Required(&'static str, Vec<&'a str>),
-    Satisfied(&'static str, &'a str),
 }
 
 #[derive(Serialize)]
@@ -103,9 +102,6 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
                         ApprovalRequirement::None => CanonicalApproval::None(["none"]),
                         ApprovalRequirement::Required { op_ids } => {
                             CanonicalApproval::Required("required", borrowed_set(op_ids.iter().map(OpId::as_str)))
-                        }
-                        ApprovalRequirement::Satisfied { grant_id } => {
-                            CanonicalApproval::Satisfied("satisfied", grant_id.as_ref())
                         }
                     },
                     available: derived.available,

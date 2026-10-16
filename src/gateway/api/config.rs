@@ -216,14 +216,13 @@ pub async fn post_config(
             .into_response();
     }
 
-    // 4b. Every selection the change affects (the default, each model route,
-    // agent binding and embedding route) is an operator selection (D-034):
-    // the transaction refuses negative evidence before anything is written,
-    // and an unverified model is accepted with a warning in the response.
-
     // 5. Commit the complete effective tree as one transaction: it is
     // refused when the files changed since `desired` was read, and restored
-    // when the runtime refuses it.
+    // when the runtime refuses it. Every selection the change affects (the
+    // default, each model route, agent binding and embedding route) is an
+    // operator selection (D-034): the transaction refuses negative evidence
+    // before anything is written, and an unverified model is accepted with a
+    // warning in the response.
     let transactions = ConfigTransactions::new(Arc::clone(&state.config));
     let scrub = |message: &str| incoming_secrets.scrub(message);
     let plan = match transactions

@@ -156,9 +156,8 @@ impl CausalSelector {
                 || score.execution_utility
                     < effective_threshold(f64::from(policy.commit_threshold), candidate.side_effect())
                 || (candidate.action() == CausalActionKind::Answer
-                    && prediction.evidence_sufficient < EVIDENCE_THRESHOLD)
-                || (candidate.action() != CausalActionKind::Retrieve
-                    && prediction.needs_fresh_state > FRESHNESS_THRESHOLD)
+                    && evidence_insufficient(prediction.evidence_sufficient))
+                || (candidate.action() != CausalActionKind::Retrieve && evidence_stale(prediction.needs_fresh_state))
                 || !target_ok
                 || !exploration::eligible(
                     &CandidateFacts {
@@ -267,7 +266,7 @@ impl CausalSelector {
         }
         if passed.is_empty() || working_count == 0 {
             return Ok(
-                if let Some(approval) = available_approval(candidates, approval_scopes, pre_commit) {
+                if let Some(approval) = available_approval(candidates, approval_scopes, pre_commit, None) {
                     approval
                 } else {
                     terminal_abstain(candidates, pre_commit, context, "all_gated")?
@@ -287,6 +286,17 @@ impl CausalSelector {
         let Some(&(top, top_score, top_mass)) = passed.first() else {
             return Err(SelectError::CandidateMismatch);
         };
+        // An exactly named capability that needs approval, with an available
+        // verified approval scope, asks for approval; a plain Answer must not
+        // silently replace the action the operator named. Intent comes from the
+        // exact mention plus the bound call fingerprint (a scope exists only
+        // for a fingerprinted call), not from the prediction, so this runs
+        // before the choice_outside_legal_set / Clarify routing below.
+        if top.action() == CausalActionKind::Answer
+            && let Some(approval) = available_approval(candidates, approval_scopes, pre_commit, Some(exact_mentions))
+        {
+            return Ok(approval);
+        }
         // A uniquely selected exact action remains model-selected even when
         // the distribution across generic action/target options has low
         // entropy confidence. It still needs an authenticated current direct
@@ -311,8 +321,8 @@ impl CausalSelector {
             // post-rehearsal and pre-commit gates still apply to Discover.
             .find(|(candidate, _, _)| candidate.action() == CausalActionKind::Discover)
             .map(|(candidate, _, _)| *candidate);
-        let insufficient = prediction.evidence_sufficient < EVIDENCE_THRESHOLD;
-        let stale = prediction.needs_fresh_state > FRESHNESS_THRESHOLD;
+        let insufficient = evidence_insufficient(prediction.evidence_sufficient);
+        let stale = evidence_stale(prediction.needs_fresh_state);
         let no_choice_mass = passed.iter().all(|(_, _, probability)| *probability <= 0.0);
         let other_action = matches!(prediction.chosen_action.as_str(), "other" | "none");
         let other_target = prediction.chosen_target == "other"
@@ -393,15 +403,33 @@ impl CausalSelector {
         {
             return Ok(Selection::Commit {
                 candidate_id: top.candidate_id().clone(),
-                propensity: 1.0,
+                propensity: DETERMINISTIC_PROPENSITY,
             });
         }
         terminal_abstain(candidates, pre_commit, context, "commit_threshold_or_margin")
     }
 }
 
+/// Evidence at or above this probability is sufficient to answer; below it the
+/// selector recovers (retrieve, discover) or abstains. The boundary is
+/// inclusive: a plain conversational turn is reported by the builtin model at
+/// exactly `weights::PLAIN_TURN_EVIDENCE`, which equals this value and must
+/// therefore count as sufficient (pinned by a test below).
 const EVIDENCE_THRESHOLD: f64 = 0.5;
+/// A need-fresh-state probability above this marks observed artifacts stale.
 const FRESHNESS_THRESHOLD: f64 = 0.5;
+/// Propensity of a deterministic selection. Only exploration replaces it.
+const DETERMINISTIC_PROPENSITY: f64 = 1.0;
+
+/// Whether `evidence_sufficient` is below the answer threshold.
+fn evidence_insufficient(evidence_sufficient: f64) -> bool {
+    evidence_sufficient < EVIDENCE_THRESHOLD
+}
+
+/// Whether `needs_fresh_state` marks the evidence stale.
+fn evidence_stale(needs_fresh_state: f64) -> bool {
+    needs_fresh_state > FRESHNESS_THRESHOLD
+}
 
 const fn is_terminal(action: CausalActionKind) -> bool {
     matches!(
@@ -440,6 +468,7 @@ fn available_approval(
     candidates: &[CausalCandidate],
     scopes: &BTreeMap<CandidateId, Vec<PendingApproval>>,
     gates: &GateReport,
+    only_exact: Option<&BTreeSet<CandidateId>>,
 ) -> Option<Selection> {
     candidates
         .iter()
@@ -453,7 +482,9 @@ fn available_approval(
                 .into_iter()
                 .flatten()
                 .filter(move |pending| {
-                    pending.candidate.target() == terminal.target() && approval_verified(pending, gates)
+                    pending.candidate.target() == terminal.target()
+                        && approval_verified(pending, gates)
+                        && only_exact.is_none_or(|exact| exact.contains(pending.candidate.candidate_id()))
                 })
                 .map(move |pending| approval_selection(terminal.candidate_id(), pending))
         })
@@ -514,6 +545,17 @@ fn terminal_abstain(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plain_turn_evidence_value_counts_as_sufficient() {
+        assert!(crate::decision::builtin::weights::PLAIN_TURN_EVIDENCE >= super::EVIDENCE_THRESHOLD);
+        assert!(!super::evidence_insufficient(
+            crate::decision::builtin::weights::PLAIN_TURN_EVIDENCE
+        ));
+        assert!(super::evidence_insufficient(0.499_999));
+        assert!(!super::evidence_stale(super::FRESHNESS_THRESHOLD));
+        assert!(super::evidence_stale(0.500_001));
+    }
+
     use super::*;
     use crate::causal_tree::branch::{ApprovalRequirement, CandidateSpec, CostEstimate, OpId};
     use crate::causal_tree::candidate_generator::{NoLegalReason, PendingApproval};
