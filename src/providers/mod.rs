@@ -7004,6 +7004,7 @@ mod fallback_zero_price_tests {
         let mut config = crate::config::Config::default();
         config.default_provider = Some("ollama".to_string());
         config.api_url = api_url.map(str::to_string);
+        config.api_key = Some("test-ollama-root-key".to_string());
         let catalog = catalog::CatalogView::from_config(&config);
         let resolved = resolve(
             &Selection {
