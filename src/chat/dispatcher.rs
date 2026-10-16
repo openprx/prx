@@ -890,7 +890,7 @@ pub struct EffectDeps {
     /// Provider task lifecycle event bridge back to chat::run. This is separate
     /// from action_tx because it is orchestration metadata, not reducer state.
     ///
-    /// Bounded at [`crate::chat::PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY`]; a
+    /// Bounded at [`crate::chat::provider_turns::PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY`]; a
     /// full queue parks the emitting turn rather than growing without bound.
     pub provider_turn_lifecycle_tx: Option<mpsc::Sender<ProviderTurnLifecycleEvent>>,
     /// dual-write suppression guard (set before persistence effects in Both/Redux mode)

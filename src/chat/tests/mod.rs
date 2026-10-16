@@ -1,6 +1,44 @@
 #![cfg(test)]
 
+use super::active_turn::*;
+use super::bootstrap::*;
+use super::chat_events::*;
+use super::compaction::*;
+use super::copy_select::*;
+#[cfg(feature = "terminal-tui")]
+use super::external_editor::*;
+use super::file_mention::*;
+use super::input_queue::*;
+use super::output::*;
+use super::provider_turns::*;
+use super::session_glue::*;
+use super::session_store::*;
+use super::session_switch::*;
+use super::terminal::*;
+use super::tui_loop::*;
+use super::views::*;
 use super::*;
+use crate::config::Config;
+use crate::llm::route_decision::ProviderExecutionOutcome;
+use crate::llm::route_decision::RouteDecision;
+use crate::llm::route_decision::route_event_scope;
+use crate::memory::Memory;
+use crate::memory::MemoryCategory;
+use crate::memory::MemoryFabric;
+#[cfg(test)]
+use crate::memory::MemoryPrincipal;
+use crate::providers::ChatMessage;
+use crate::providers::Provider;
+use crate::runtime::envelope::RuntimeEnvelope;
+use crate::tools::Tool;
+use anyhow::Result;
+use std::io::Write as _;
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(feature = "terminal-tui")]
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 mod session_cleanup_tests;
