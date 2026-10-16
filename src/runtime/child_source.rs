@@ -1531,8 +1531,8 @@ mod pinned_reliability_tests {
             ..crate::config::ReliabilityConfig::default()
         };
         let pinned = pinned_provider_reliability(&base);
-        assert!(pinned.fallback_providers.is_empty());
-        assert!(pinned.api_keys.is_empty());
+        assert_eq!(pinned.fallback_providers, Vec::<String>::new());
+        assert_eq!(pinned.api_keys, Vec::<String>::new());
         assert_eq!(pinned.provider_retries, 7);
         assert_eq!(pinned.model_fallbacks, base.model_fallbacks);
     }

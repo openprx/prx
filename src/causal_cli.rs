@@ -1590,7 +1590,7 @@ mod tests {
             .to_string();
         assert!(error.contains("--decision-model"), "{error}");
         let references = CredentialReferences::for_config(&config).expect("test: store");
-        assert!(references.list().expect("test: list").is_empty());
+        assert_eq!(references.list().expect("test: list").len(), 0);
     }
 
     /// D-105 K-1: setup confirms a loopback decision endpoint itself, and
