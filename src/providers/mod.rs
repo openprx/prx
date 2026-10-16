@@ -3289,7 +3289,9 @@ pub(crate) fn fallback_admission_for(
             let cost_admitted =
                 match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
                     crate::llm::route_decision::UsagePrice::Priced(_) => true,
-                    crate::llm::route_decision::UsagePrice::Missing => provider_id.catalog_name() == Some("ollama"),
+                    crate::llm::route_decision::UsagePrice::Missing => {
+                        crate::runtime::turn_cost::provider_is_zero_price_exempt(&provider_id)
+                    }
                     crate::llm::route_decision::UsagePrice::Invalid => false,
                 };
             admission.insert(

@@ -129,7 +129,14 @@ fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usiz
 }
 
 fn zero_price_exempt(model: &ResolvedModel) -> bool {
-    model.provider().catalog_name() == Some("ollama") || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
+    provider_is_zero_price_exempt(model.provider()) || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
+}
+
+/// The one provider rule for "no price row means no money": a local Ollama
+/// model is free unless it has an explicit price. G6 estimates, fallback
+/// admission and decision-attempt reservation/settlement all use it.
+pub(crate) fn provider_is_zero_price_exempt(provider: &crate::providers::ProviderId) -> bool {
+    provider.catalog_name() == Some("ollama")
 }
 
 fn estimate_cost_with_validity(

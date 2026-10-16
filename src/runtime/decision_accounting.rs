@@ -20,6 +20,7 @@ use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, D
 use crate::decision::protocol::DecisionUsage;
 use crate::decision::{DecisionError, DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
+use crate::providers::ProviderId;
 
 #[cfg(test)]
 pub(crate) mod timing;
@@ -95,9 +96,10 @@ fn estimated_cost(
         (tokens, 0, tokens, 0),
         (tokens, 0, 0, tokens),
     ] {
-        let UsagePrice::Priced(cost) = usage_cost_resolution(provider, model, input, output, write, read, config)
-        else {
-            return Err(DecisionError::BudgetExceeded);
+        let cost = match usage_cost_resolution(provider, model, input, output, write, read, config) {
+            UsagePrice::Priced(cost) => cost,
+            UsagePrice::Missing if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider)) => 0.0,
+            UsagePrice::Missing | UsagePrice::Invalid => return Err(DecisionError::BudgetExceeded),
         };
         maximum = maximum.max(cost);
     }
@@ -504,7 +506,7 @@ impl OwnedReceipt {
                 let output = u64::from(output);
                 let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
                 let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-                let UsagePrice::Priced(cost) = usage_cost_resolution(
+                let cost = match usage_cost_resolution(
                     &self.provider,
                     &self.model,
                     input,
@@ -512,8 +514,16 @@ impl OwnedReceipt {
                     cache_write,
                     cache_read,
                     &self.config.cost,
-                ) else {
-                    anyhow::bail!("decision usage has no valid pinned PMM price");
+                ) {
+                    UsagePrice::Priced(cost) => cost,
+                    UsagePrice::Missing
+                        if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(&self.provider)) =>
+                    {
+                        0.0
+                    }
+                    UsagePrice::Missing | UsagePrice::Invalid => {
+                        anyhow::bail!("decision usage has no valid pinned PMM price")
+                    }
                 };
                 let total = input + output;
                 let record = MeteredTokenUsageRecord {
@@ -584,6 +594,17 @@ mod tranche_tests {
         let remaining = AtomicU64::new(2048);
         reconcile_token_allowance(&remaining, 2048, 5000);
         assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_unpriced_ollama_model_reserves_zero_money_like_g6_and_an_unpriced_cloud_model_is_refused() {
+        let config = crate::config::schema::CostConfig::default();
+        assert!(config.prices.is_empty() || !config.prices.contains_key("ollama/prx-local-model"));
+        assert_eq!(estimated_cost(&config, "ollama", "prx-local-model", 1000).ok(), Some(0));
+        assert!(matches!(
+            estimated_cost(&config, "acme-unpriced", "no-price-model", 1000),
+            Err(DecisionError::BudgetExceeded)
+        ));
     }
 
     #[test]
