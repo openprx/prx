@@ -146,7 +146,8 @@ built independently, so a refused route is retained as that hint's refusal and
 does not disable the default provider or another route.
 
 For the configured default provider the credential is chosen in this order:
-the inline root `api_key`, then the credential reference `cred-<provider>` that
+any root connection material (the inline `api_key`, rotation keys, or an
+`api_url`), then the credential reference `cred-<provider>` that
 `prx providers credential set <provider>` stores under its default name (it
 must be owned by that provider), then the provider's own credential store. An
 unreadable credential store is logged as a warning and the provider's own store

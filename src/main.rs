@@ -1782,6 +1782,7 @@ async fn async_main() -> Result<()> {
             if let Some(decision) = &decision {
                 if hosted {
                     decision.check_hosted()?;
+                    decision.ensure_hosted_credential_free(&onboard::wizard::quick_setup_config_path(config_dir)?)?;
                     anyhow::ensure!(
                         decision_secret
                             .as_ref()

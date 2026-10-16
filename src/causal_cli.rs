@@ -422,6 +422,53 @@ impl DecisionSetup {
         Ok(())
     }
 
+    fn ensure_hosted_credential_free_in(
+        &self,
+        references: &crate::config::manage::credentials::CredentialReferences,
+    ) -> Result<String> {
+        use crate::config::manage::credentials::CredentialReferences;
+        let id = CredentialReferences::id_for(&format!("decision-{}", self.kind.as_str()))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // `set` creates or replaces. Setup must never overwrite (and, on a
+        // refusal, then delete) a credential an operator already stored under
+        // the documented name, so an existing one stops setup.
+        if references
+            .status(&id)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .is_some()
+        {
+            anyhow::bail!(
+                "the credential reference {id} already exists and setup never replaces it: keep it with `prx causal \
+                 config set backend --kind {kind} --model {model} --reference {id}`, rotate it with `prx causal \
+                 config set secret`, or remove it first with `prx providers credential remove {id}`",
+                kind = self.kind.as_str(),
+                model = self.model.as_deref().unwrap_or("<exact version>"),
+            );
+        }
+        Ok(id)
+    }
+
+    /// Refuse a hosted setup whose credential reference already exists in the
+    /// store next to `config_path`, before the base configuration is written.
+    ///
+    /// # Errors
+    ///
+    /// A kind that is not hosted, an unreadable store, or an existing reference.
+    pub fn ensure_hosted_credential_free(&self, config_path: &std::path::Path) -> Result<()> {
+        anyhow::ensure!(
+            hosted_owner(self.kind).is_some(),
+            "the decision backend `{}` is not a hosted service",
+            self.kind.as_str()
+        );
+        let config = Config {
+            config_path: config_path.to_path_buf(),
+            ..Config::default()
+        };
+        let references = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.ensure_hosted_credential_free_in(&references).map(|_| ())
+    }
+
     /// Check a hosted choice before anything is written: the kind is hosted, a
     /// model is given, and the section rules accept the backend with a
     /// credential reference (an openrouter model absent from the release
@@ -535,22 +582,7 @@ impl DecisionSetup {
         );
         let references = CredentialReferences::for_config(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
         let name = format!("decision-{}", self.kind.as_str());
-        let id = CredentialReferences::id_for(&name).map_err(|error| anyhow::anyhow!("{error}"))?;
-        // `set` creates or replaces. Setup must never overwrite (and, on a
-        // refusal, then delete) a credential an operator already stored under
-        // the documented name, so an existing one stops setup here.
-        if references
-            .status(&id)
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-            .is_some()
-        {
-            anyhow::bail!(
-                "the credential reference {id} already exists and setup never replaces it: keep it with `prx causal \
-                 config set backend --kind {kind} --model {model} --reference {id}`, rotate it with `prx causal \
-                 config set secret`, or remove it first with `prx providers credential remove {id}`",
-                kind = self.kind.as_str()
-            );
-        }
+        let id = self.ensure_hosted_credential_free_in(&references)?;
         references
             .set(owner, &name, secret.expose())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -1649,6 +1681,18 @@ mod tests {
                 .is_ok()
         );
 
+        // The existing reference is found before any base configuration is written.
+        assert!(
+            setup
+                .ensure_hosted_credential_free(&config.config_path)
+                .expect_err("test: existing reference")
+                .to_string()
+                .contains("already exists")
+        );
+        let fresh = tempfile::TempDir::new().expect("test: temp");
+        setup
+            .ensure_hosted_credential_free(&fresh.path().join("config.toml"))
+            .expect("test: nothing stored yet");
         // A second run never replaces the stored credential, and says how to keep it.
         let before = references.status("cred-decision-openrouter").expect("test: status");
         let error = setup

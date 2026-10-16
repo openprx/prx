@@ -234,6 +234,10 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         style(spec.name()).cyan()
     );
 
+    if let Some((decision, Some(_))) = &decision {
+        decision.ensure_hosted_credential_free(&config.config_path)?;
+    }
+
     // The chosen default is an operator selection (D-034): a model the
     // evidence rules out is refused before anything is written; an
     // unverified one is accepted with a warning.
@@ -1511,6 +1515,18 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     Ok((workspace_dir, config_path))
 }
 
+/// The `config.toml` path quick setup writes for `config_dir`.
+///
+/// # Errors
+///
+/// When no home directory can be found.
+pub fn quick_setup_config_path(config_dir: Option<&str>) -> Result<PathBuf> {
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
+    Ok(config_dir
+        .map_or_else(|| default_user_config_dir(&home), PathBuf::from)
+        .join("config.toml"))
+}
+
 fn default_user_config_dir(home: &Path) -> PathBuf {
     home.join(".openprx")
 }
@@ -2487,6 +2503,7 @@ fn setup_decision_plane() -> Result<
                 model: Some(model.trim().to_string()),
                 enable,
             };
+            setup.check_hosted()?;
             Ok(Some((setup, Some(secret))))
         }
         _ => Ok(None),
