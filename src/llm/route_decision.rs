@@ -306,10 +306,32 @@ pub(crate) fn usage_cost_resolution(
              charging the highest. Validation refuses such a configuration; keep one key per endpoint and model."
         );
     }
-    costs
-        .into_iter()
-        .reduce(f64::max)
-        .map_or(UsagePrice::Missing, UsagePrice::Priced)
+    if let Some(cost) = costs.into_iter().reduce(f64::max) {
+        return UsagePrice::Priced(cost);
+    }
+
+    let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
+        return UsagePrice::Missing;
+    };
+    let provider_id = crate::providers::ProviderId::of(provider);
+    let Some(pricing) = catalog
+        .model(&provider_id, model)
+        .and_then(|entry| entry.pricing.as_ref())
+    else {
+        return UsagePrice::Missing;
+    };
+    let tier = pricing
+        .tiers
+        .iter()
+        .filter(|tier| prompt_tokens > tier.above_input_tokens)
+        .max_by_key(|tier| tier.above_input_tokens);
+    let catalog_pricing = crate::config::schema::ModelPricing {
+        input: tier.map_or(pricing.input, |tier| tier.input),
+        output: tier.map_or(pricing.output, |tier| tier.output),
+        cache_write: pricing.cache_write,
+        cache_read: pricing.cache_read,
+    };
+    turn_cost(&catalog_pricing).map_or(UsagePrice::Invalid, UsagePrice::Priced)
 }
 
 pub(crate) fn usage_cost_usd(

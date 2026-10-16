@@ -194,6 +194,40 @@ pub(crate) struct TurnDecisionService {
     durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
+impl TurnDecisionService {
+    /// Bind runtime adapter ceilings to the provider catalog pinned by this
+    /// exact configuration generation.
+    pub(crate) fn effective_provider_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        adapter: crate::providers::ProviderCapabilities,
+    ) -> crate::providers::ProviderCapabilities {
+        self.provider_catalog
+            .effective_provider_capabilities(provider, model, adapter)
+    }
+
+    /// Resolve model limits against the provider catalog pinned to this
+    /// configuration generation. Runtime surfaces must not reconstruct a
+    /// release-only view after admission has already selected stronger
+    /// operator or discovery evidence.
+    pub(crate) fn effective_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::router::context::EffectiveCompactionConfig {
+        let config = &self.generation.effective;
+        crate::router::context::resolve_effective_compaction_config_with_catalog(
+            &config.agent.compaction,
+            provider,
+            model,
+            &config.router,
+            &config.model_routes,
+            &self.provider_catalog,
+        )
+    }
+}
+
 /// Read-only status of the exact generation attached to a runtime surface.
 /// The factory's configured slots are distinct from the catalog and store
 /// attachment. `backend.enabled` reports configuration, not remote admission;
@@ -3102,13 +3136,7 @@ impl TurnDecisionService {
     ) -> Result<AgentDecisionBudget, AgentDecisionBudgetError> {
         let _model = self.resolve_agent_model(proof)?;
         let config = &self.generation.effective;
-        let effective = crate::router::resolve_effective_compaction_config(
-            &config.agent.compaction,
-            proof.provider_name(),
-            proof.model_name(),
-            &config.router,
-            &config.model_routes,
-        );
+        let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
         let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
         let reservation =
             DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;

@@ -1385,11 +1385,14 @@ fn register_gateway_turn_tools(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
+        .with_compaction_resolver(
+            crate::router::CompactionResolver::new(
+                config.agent.compaction.clone(),
+                config.router.clone(),
+                config.model_routes.clone(),
+            )
+            .with_model_catalog(providers::selection::catalog_for(config)),
+        )
         .with_reliability(config.reliability.clone())
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
@@ -2632,16 +2635,9 @@ async fn run_gateway_chat_with_multimodal(
             // other execution surface — pre-turn flush/paging, the preflight before
             // each provider call (with the published tool schemas reserved) and the
             // reserved mid-turn trim. The window is the *effective* one, which applies
-            // the `[[router.models]]` / built-in `max_context` and
-            // `reserved_output_tokens` of the model this turn actually serves, as the
+            // the operator/discovery/catalog limits of the model this turn actually serves, as the
             // CLI and TUI do.
-            let mut effective_compaction = crate::router::resolve_effective_compaction_config(
-                &config_snapshot.agent.compaction,
-                provider_label,
-                &turn_runtime.model,
-                &config_snapshot.router,
-                &config_snapshot.model_routes,
-            );
+            let mut effective_compaction = service.effective_compaction(provider_label, &turn_runtime.model);
             effective_compaction.config = context.main_compaction().clone();
             crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
 

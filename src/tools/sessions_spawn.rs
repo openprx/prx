@@ -4704,12 +4704,13 @@ impl SessionsSpawnTool {
                     )
             },
         );
-        let resolved_compaction = crate::router::context::resolve_effective_compaction_config(
+        let resolved_compaction = crate::router::context::resolve_effective_compaction_config_with_catalog(
             &child_model_config.agent.compaction,
             &resolved_provider_name,
             &resolved_model,
             &child_model_config.router,
             &child_model_config.model_routes,
+            child_model_catalog,
         );
         tracing::debug!(
             mode = mode.as_str(),

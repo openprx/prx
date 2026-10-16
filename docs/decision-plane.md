@@ -202,6 +202,23 @@ backends remain remote even when an endpoint override is supplied. OpenRouter
 requires an exact pinned snapshot. Hosted snapshot values must satisfy the
 configuration validator rather than name a floating alias.
 
+For a hosted model present in the embedded release catalog, store a provider
+owned credential and select the exact catalog model through the managed flow:
+
+```bash
+prx providers credential set openrouter --name decision-openrouter --from-stdin
+prx causal config set backend --kind openrouter --model typesafe/jev-1.13 \
+  --reference cred-decision-openrouter --apply
+prx causal config enable-remote --apply
+```
+
+The backend transaction fills the catalog's pinned snapshot, transport timeout,
+latency budget, and built-in price. A model absent from the release catalog
+still needs an explicit pinned snapshot, timeout, and `[cost.prices]` override.
+Use the plan's revision and the normal high-risk confirmation flags when the
+command asks for them. `prx causal status`, `prx causal test`, and `prx doctor`
+show the resulting configured values before a live test is attempted.
+
 Plain HTTP is permitted only for accepted loopback spelling: canonical decimal
 127/8 addresses accepted by the validator, `[::1]`, or `localhost`
 (case-insensitive, transport-pinned to `127.0.0.1` without DNS). Abbreviated or

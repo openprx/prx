@@ -15,13 +15,15 @@ for integration, validation and rollback limits.
 
 ### Changed
 
-- Provider defaults, onboarding choices, model listings, and baseline
-  capability descriptors now read the validated `catalog/models.json` embedded
-  in the binary. The release catalog has a versioned JSON schema, typed model
-  facts and `low`/`medium`/`high` model levels; live discovery and
-  `[[providers.models]]` keep their documented precedence. Child process
-  snapshots pin the embedded catalog revision and refuse a mixed-version
-  mismatch. See [the model catalog contract](docs/model-catalog.md).
+- Provider defaults, onboarding choices, model listings, prices, context
+  windows, Router candidates, model tool/vision features, and hosted decision
+  transport defaults now read the validated `catalog/models.json` embedded in
+  the binary. `[cost.prices]` remains an operator override. The release catalog
+  has a versioned JSON schema, typed model facts and `low`/`medium`/`high` model
+  levels; live discovery and `[[providers.models]]` keep their documented
+  precedence. Child process snapshots pin the embedded catalog revision and
+  refuse a mixed-version mismatch. See
+  [the model catalog contract](docs/model-catalog.md).
 
 - Matrix channel support is now opt-in with the `channel-matrix` Cargo feature.
   Default and release binaries omit Matrix; source builds can enable it with

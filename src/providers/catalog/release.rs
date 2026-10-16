@@ -17,6 +17,7 @@ use super::{DescriptorSource, FeatureSet, ModelDescriptor, ModelOperation, Suppo
 use crate::providers::ProviderId;
 
 const EMBEDDED_CATALOG_JSON: &str = include_str!("../../../catalog/models.json");
+static EMBEDDED_CATALOG: OnceLock<Result<Arc<ReleaseCatalog>, ReleaseCatalogError>> = OnceLock::new();
 #[cfg(test)]
 const EMBEDDED_CATALOG_SCHEMA: &str = include_str!("../../../catalog/models.schema.json");
 const SUPPORTED_SCHEMA_MAJOR: u64 = 1;
@@ -375,8 +376,7 @@ impl ReleaseCatalog {
     /// The shipped document is invalid. Release CI treats that as a build
     /// defect; callers receive the typed failure instead of using partial data.
     pub fn embedded() -> Result<Arc<Self>, ReleaseCatalogError> {
-        static CATALOG: OnceLock<Result<Arc<ReleaseCatalog>, ReleaseCatalogError>> = OnceLock::new();
-        CATALOG
+        EMBEDDED_CATALOG
             .get_or_init(|| {
                 Self::from_json(EMBEDDED_CATALOG_JSON).map(|catalog| {
                     for warning in catalog.warnings() {
@@ -386,6 +386,23 @@ impl ReleaseCatalog {
                 })
             })
             .clone()
+    }
+
+    /// The one catalog compiled into this binary, borrowed for process-wide
+    /// default and policy lookups that must not copy model facts into Rust.
+    pub fn embedded_ref() -> Result<&'static Self, ReleaseCatalogError> {
+        EMBEDDED_CATALOG
+            .get_or_init(|| {
+                Self::from_json(EMBEDDED_CATALOG_JSON).map(|catalog| {
+                    for warning in catalog.warnings() {
+                        tracing::warn!(warning, "embedded model catalog warning");
+                    }
+                    Arc::new(catalog)
+                })
+            })
+            .as_ref()
+            .map(Arc::as_ref)
+            .map_err(Clone::clone)
     }
 
     /// Forward-compatibility warnings collected while loading.
@@ -405,12 +422,19 @@ impl ReleaseCatalog {
     pub fn model(&self, provider: &ProviderId, selected: &str) -> Option<&ReleaseModel> {
         let provider = provider.catalog_name()?;
         let selected = selected.trim();
-        self.models.iter().find(|model| {
-            model.provider.eq_ignore_ascii_case(provider)
-                && (model.api_model.eq_ignore_ascii_case(selected)
-                    || model.id.eq_ignore_ascii_case(selected)
-                    || model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(selected)))
-        })
+        self.models
+            .iter()
+            .find(|model| {
+                model.provider.eq_ignore_ascii_case(provider)
+                    && (model.api_model.eq_ignore_ascii_case(selected)
+                        || model.id.eq_ignore_ascii_case(selected)
+                        || model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(selected)))
+            })
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|model| model.provider.eq_ignore_ascii_case(provider) && model.api_model == "*")
+            })
     }
 
     /// Active chat models offered for one provider, with its release default first.
@@ -448,6 +472,21 @@ impl ReleaseCatalog {
         self.models
             .iter()
             .find(|model| model.id.eq_ignore_ascii_case(default))
+            .map(|model| model.api_model.as_str())
+    }
+
+    /// The release-wide default provider.
+    #[must_use]
+    pub fn default_provider(&self) -> &str {
+        &self.defaults.provider
+    }
+
+    /// The release-wide default in the API-model spelling used by config.
+    #[must_use]
+    pub fn global_default_model(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|model| model.id.eq_ignore_ascii_case(&self.defaults.model))
             .map(|model| model.api_model.as_str())
     }
 
@@ -867,7 +906,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-16.2");
+        assert_eq!(catalog.revision, "2026-10-16.3");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);

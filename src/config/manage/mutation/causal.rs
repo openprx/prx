@@ -415,6 +415,28 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             }
             if let Some(selection) = crate::decision::factory::configured_selection(section) {
                 let model = section.backend.model.trim().to_string();
+                if let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                    && let Some(entry) = catalog.model(&crate::providers::ProviderId::of(&selection.provider), &model)
+                {
+                    if pinned_snapshot.is_none()
+                        && matches!(kind, BackendKind::TypeSafe | BackendKind::OpenRouter)
+                        && let Some(snapshot) = &entry.pinned_snapshot
+                    {
+                        section.backend.pinned_snapshot.clone_from(snapshot);
+                    }
+                    if timeout_ms.is_none()
+                        && let Some(recommended) = entry.transport.recommended_timeout_ms
+                        && let Ok(recommended) = u32::try_from(recommended)
+                    {
+                        section.backend.timeout_ms = recommended;
+                    }
+                    if section.policy.extra_latency_budget_ms
+                        == crate::causal_tree::config::CausalPolicy::default().extra_latency_budget_ms
+                        && let Some(recommended) = entry.transport.extra_latency_budget_ms
+                    {
+                        section.policy.extra_latency_budget_ms = recommended;
+                    }
+                }
                 declare_decision_model(config, &selection.provider, &model);
             }
         }
@@ -658,6 +680,51 @@ mod tests {
             declarations(&again),
             "a switch never removes a declaration"
         );
+    }
+
+    #[test]
+    fn set_backend_applies_hosted_transport_defaults_from_release_catalog() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let entry = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
+            .expect("hosted decision entry");
+        let next = CausalConfigService::mutate(
+            &Config::default(),
+            &[CausalMutation::SetBackend {
+                kind: BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some(entry.api_model.clone()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            }],
+        )
+        .expect("catalog defaults produce a valid hosted backend");
+
+        assert_eq!(
+            next.causal_tree.backend.pinned_snapshot,
+            entry.pinned_snapshot.as_deref().expect("catalog snapshot")
+        );
+        assert_eq!(
+            u64::from(next.causal_tree.backend.timeout_ms),
+            entry.transport.recommended_timeout_ms.expect("catalog timeout")
+        );
+        assert_eq!(
+            next.causal_tree.policy.extra_latency_budget_ms,
+            entry.transport.extra_latency_budget_ms.expect("catalog latency budget")
+        );
+        assert!(next.cost.prices.is_empty(), "built-in prices stay in the catalog");
+        assert!(matches!(
+            crate::llm::route_decision::usage_cost_resolution(
+                "openrouter",
+                &entry.api_model,
+                1,
+                1,
+                0,
+                0,
+                &next.cost,
+            ),
+            crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+        ));
     }
 
     /// D-094 C-2: a model-scoped entry without its own list (here one

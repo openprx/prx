@@ -1794,183 +1794,11 @@ impl Default for CostConfig {
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
             allow_override: false,
-            prices: get_default_pricing(),
+            // Operator overrides only. Built-in prices come from the embedded
+            // release catalog at the point of use.
+            prices: std::collections::HashMap::new(),
         }
     }
-}
-
-/// Default pricing for popular models (USD per 1M tokens)
-fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
-    let mut prices = std::collections::HashMap::new();
-
-    // Anthropic models
-    prices.insert(
-        "anthropic/claude-sonnet-5".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-8".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 25.0,
-            cache_write: 6.25,
-            cache_read: 0.50,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-haiku-4-5-20251001".into(),
-        ModelPricing {
-            input: 1.0,
-            output: 5.0,
-            cache_write: 1.25,
-            cache_read: 0.10,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-sonnet-4-20250514".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-20250514".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.50,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3.5-sonnet".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3-haiku".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.25,
-            cache_write: 0.3125,
-            cache_read: 0.03,
-        },
-    );
-
-    // OpenAI models
-    for (model, input, output) in [
-        ("gpt-5.6", 5.0, 30.0),
-        ("gpt-5.6-sol", 5.0, 30.0),
-        ("gpt-5.6-terra", 2.5, 15.0),
-        ("gpt-5.6-luna", 1.0, 6.0),
-    ] {
-        prices.insert(
-            format!("openai/{model}"),
-            ModelPricing {
-                input,
-                output,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-        );
-    }
-    prices.insert(
-        "openai/gpt-4o".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 15.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "openai/gpt-4o-mini".into(),
-        ModelPricing {
-            input: 0.15,
-            output: 0.60,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "openai/o1-preview".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 60.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-
-    // Google models
-    prices.insert(
-        "google/gemini-3.1-pro-preview".into(),
-        ModelPricing {
-            input: 2.0,
-            output: 12.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-3.1-flash-lite".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.50,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-2.0-flash".into(),
-        ModelPricing {
-            input: 0.10,
-            output: 0.40,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-1.5-pro".into(),
-        ModelPricing {
-            input: 1.25,
-            output: 5.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-
-    // Kimi API Platform models. Kimi publishes a cache-hit input price, but no
-    // separate cache-write tier; treat cache writes as ordinary cache-miss input.
-    let mut insert_kimi = |provider: &str, model: &str, input: f64, output: f64, cache_read: f64| {
-        prices.insert(
-            format!("{provider}/{model}"),
-            ModelPricing {
-                input,
-                output,
-                cache_write: input,
-                cache_read,
-            },
-        );
-    };
-    // Kimi Code is subscription/quota billed. Do not synthesize token prices
-    // for the coding endpoint aliases; Moonshot API-platform prices remain
-    // separate below.
-    insert_kimi("moonshot", "kimi-k2.6", 0.95, 4.0, 0.16);
-    insert_kimi("moonshot", "kimi-k2.5", 0.60, 3.0, 0.10);
-
-    prices
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -6055,14 +5883,17 @@ impl Default for Config {
     fn default() -> Self {
         let home = user_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let openprx_dir = preferred_user_config_dir(&home);
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().ok();
 
         Self {
             workspace_dir: openprx_dir.join("workspace"),
             config_path: openprx_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            default_provider: release.map(|catalog| catalog.default_provider().to_string()),
+            default_model: release
+                .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
+                .map(str::to_string),
             default_temperature: 0.7,
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),

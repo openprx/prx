@@ -7,10 +7,12 @@ not download or overlay catalog files at runtime. Catalog changes therefore
 arrive with a PRX release and use the normal binary rollback path.
 
 The catalog supplies the offline baseline for provider defaults, onboarding,
-`prx models list`, Ollama Cloud's offline fallback list, and provider/model
-descriptors. A live provider catalog is separate discovery evidence. User and
-operator choices stay in TOML, including `[[providers.models]]` declarations;
-they are never written back into the release JSON.
+`prx models list`, Ollama Cloud's offline fallback list, provider/model
+descriptors, prices, context windows, Router candidates, model features, and
+hosted decision transport advice. A live provider catalog is separate discovery
+evidence. User and operator choices stay in TOML, including
+`[[providers.models]]` declarations; they are never written back into the
+release JSON.
 
 ## Format and validation
 
@@ -59,6 +61,35 @@ is its evidence. A child process snapshot records both the revision and SHA-256
 digest of the embedded JSON and refuses to restore under a binary with a
 different revision or content.
 
+## Runtime consumers and overrides
+
+The embedded catalog is the sole built-in source for the unset provider/model,
+model prices, context windows, Router hints, and model-level tool and vision
+features. Adapter capabilities remain an upper bound: a positive catalog fact
+cannot enable a feature the adapter cannot send. Negative operator or discovery
+evidence continues to outrank a positive release fact.
+
+`[cost.prices]` contains operator overrides only. An exact or redacted endpoint
+override wins; otherwise usage accounting and the G6 admission gate read the
+release price. A missing catalog and override price remains unpriced, with the
+existing Ollama-only zero-price exemption. Compaction reads the effective
+descriptor's context window after explicit agent and `[[router.models]]`
+overrides. The default Router candidate list is derived from rows that carry
+both `router` hints and pricing.
+
+Image admission intersects the concrete adapter ceiling with the effective
+model descriptor before provider transport. The same intersection controls
+native-tool publication on the turn path. Compatible endpoints no longer infer
+vision from model-name or URL substrings; declare a custom endpoint's facts in
+`[[providers.models]]` when discovery cannot prove them.
+
+When `prx causal config set backend` selects a release-catalog decision model
+without explicit transport arguments, the transaction writes the catalog's
+pinned snapshot and recommended timeout and, while the policy still has its
+default latency budget, the catalog's recommended budget. Explicit command or
+policy values remain TOML choices. Rollback uses the normal configuration
+history; reverting the PRX binary reverts the embedded catalog.
+
 ## Maintaining the release file
 
 Edit `catalog/models.json`; do not add a second built-in model table in Rust.
@@ -74,6 +105,8 @@ Run the semantic and real-path checks through the repository guard:
 ```bash
 ./scripts/ci/test_home_guard.sh --locked --all-features --no-fail-fast providers::catalog
 ./scripts/ci/test_home_guard.sh --locked --all-features --no-fail-fast models_list_by_operation_and_show_use_the_service_read_model
+./scripts/ci/test_home_guard.sh --locked --all-features --no-fail-fast g6_admits_release_catalog_price_without_a_config_override
+./scripts/ci/test_home_guard.sh --locked --all-features --no-fail-fast image_turn_is_gated_by_catalog_vision_input_before_provider_transport
 ```
 
 The first command validates the embedded document, common levels, aliases,

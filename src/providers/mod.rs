@@ -64,7 +64,7 @@ pub(crate) use identity::{
     ByoDialect, ProviderConnection, ProviderIdentity, byo_dialect_of, canonical_provider_key, classify_provider,
     configured_connection_for, credential_for_provider_identity, scoped_reliability,
 };
-pub use identity::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId, ProviderNamespace};
+pub use identity::{ProviderId, ProviderNamespace, default_provider_for_unset};
 
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
@@ -2482,7 +2482,10 @@ impl ConfiguredProviders {
     /// Every provider the operator configured in `config`.
     #[must_use]
     pub fn from_config(config: &crate::config::Config) -> Self {
-        let default_provider = config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET);
+        let default_provider = config
+            .default_provider
+            .as_deref()
+            .unwrap_or_else(default_provider_for_unset);
         Self::default()
             .with_providers(std::iter::once(default_provider))
             .with_providers(config.reliability.fallback_providers.iter().map(String::as_str))

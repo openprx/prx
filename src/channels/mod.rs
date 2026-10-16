@@ -1039,10 +1039,7 @@ fn resolved_default_provider(config: &Config) -> String {
 }
 
 fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    providers::selection::default_model(config).to_string()
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -5814,11 +5811,14 @@ pub async fn start_channels_with_config(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
+        .with_compaction_resolver(
+            crate::router::CompactionResolver::new(
+                config.agent.compaction.clone(),
+                config.router.clone(),
+                config.model_routes.clone(),
+            )
+            .with_model_catalog(providers::selection::catalog_for(&config)),
+        )
         .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))

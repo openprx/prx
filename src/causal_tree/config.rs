@@ -183,10 +183,9 @@ pub struct DecisionBackendConfig {
     /// service.
     pub model: String,
     /// The exact model snapshot a hosted service must answer with (D-043
-    /// C-8). OpenRouter answers with a dated snapshot of the model sent
-    /// (`typesafe/jev-1.13` -> `typesafe/jev-1.13-20260917`), so it is
-    /// required there; for TypeSafe it defaults to `model`. Refused for
-    /// the other kinds.
+    /// C-8). OpenRouter requires the exact dated snapshot returned for the
+    /// configured model; for TypeSafe it defaults to `model`. Refused for the
+    /// other kinds.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub pinned_snapshot: String,
     /// The credential reference: `""`, `"none"` or `cred-<name>`.
@@ -609,8 +608,7 @@ pub enum CausalConfigError {
     HostedModelNotPinned(&'static str),
     #[error(
         "causal_tree.backend.kind = \"openrouter\" needs causal_tree.backend.pinned_snapshot: the exact dated \
-         snapshot OpenRouter answers with for causal_tree.backend.model (for example `typesafe/jev-1.13-20260917` \
-         for `typesafe/jev-1.13`)"
+         snapshot OpenRouter answers with for causal_tree.backend.model"
     )]
     SnapshotRequired,
     #[error(

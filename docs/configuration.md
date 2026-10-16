@@ -1992,8 +1992,13 @@ backend's provider. The hosted services (`kind = "typesafe"` or
 `"openrouter"`) take only a `cred-` reference owned by the service
 (`decision:typesafe` or `openrouter`, never the root key), one exact
 `model` version, and for OpenRouter the exact dated snapshot it answers
-with in `pinned_snapshot` (for example `typesafe/jev-1.13-20260917` for
-`typesafe/jev-1.13`); any other answering model falls back to the builtin.
+with in `pinned_snapshot`; any other answering model falls back to the builtin.
+When a managed backend change selects a release-catalog decision model and
+omits the snapshot or timeout, the same transaction writes the catalog's pinned
+snapshot and recommended timeout. It also writes the catalog's recommended
+extra-latency budget when the policy still has its default value. Explicit
+command and policy values remain operator choices. Built-in decision-model
+pricing comes from the catalog; `[cost.prices]` is only an override.
 An `endpoint` replaces a hosted service's base URL, and the backend stays
 remote, so it is used only with `remote_enabled`. The hosted credential
 belongs to the service, not to the URL: re-pointing the override sends that

@@ -4303,11 +4303,14 @@ pub async fn run(
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
+    .with_compaction_resolver(
+        crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        )
+        .with_model_catalog(providers::selection::catalog_for(&config)),
+    )
     .with_cost_config(config.cost.clone())
     .with_reliability(config.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
@@ -6249,13 +6252,10 @@ Retry with a compatible model: /provider {shown} <model>",
         // Prefer the provider-backed summary patch used by the Redux driver; if
         // the summary call fails or times out, fall back to deterministic trim.
         if matches!(user_input.as_str(), "/compact") {
-            let compact_context = crate::router::resolve_effective_compaction_config(
-                &config.agent.compaction,
-                provider_name,
-                model_name,
-                &config.router,
-                &config.model_routes,
-            );
+            let compact_context = provider_binding
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))?
+                .effective_compaction();
             if manual_compact_below_trigger_threshold(&history, &compact_context.config) {
                 emit_chat_output(&format_nothing_to_compact_feedback(&history, &compact_context.config));
                 continue;
@@ -7891,13 +7891,7 @@ Retry with a compatible model: /provider {shown} <model>",
             config_source_revision: runtime_envelope.config_source_revision.as_deref(),
         };
 
-        let mut effective_compaction = crate::router::resolve_effective_compaction_config(
-            &config.agent.compaction,
-            provider_name,
-            model_name,
-            &config.router,
-            &config.model_routes,
-        );
+        let mut effective_compaction = admitted_binding.effective_compaction()?;
         effective_compaction.config = admitted_binding.main_compaction()
             .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);

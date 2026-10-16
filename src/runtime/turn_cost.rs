@@ -297,8 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn known_price_uses_pmm_model_and_unknown_price_stays_unestimated() {
+    fn g6_admits_release_catalog_price_without_a_config_override() {
         let config = crate::config::Config::default();
+        assert!(config.cost.prices.is_empty(), "cost.prices is override-only");
         let model = model(&config, "openai", "gpt-4o");
         let catalog = empty_catalog();
         let view = catalog.view(&Default::default());
@@ -310,18 +311,10 @@ mod tests {
         assert_eq!(cost.tokens, 128);
         assert!(cost.micro_usd > 0);
         assert_eq!(latency, default_latency_ms(CapabilityTarget::None));
-
-        let mut unknown = config;
-        unknown.cost.prices.clear();
-        let unpriced = build_cost_model(&view, &model, &unknown.cost, &BTreeMap::new());
         assert!(
-            unpriced.estimates.is_empty(),
-            "an unknown price cannot become a free candidate"
-        );
-        assert!(
-            RuntimeCostModel::new(&model, &unknown, &BTreeMap::new())
+            RuntimeCostModel::new(&model, &config, &BTreeMap::new())
                 .estimate_terminal()
-                .is_none()
+                .is_some()
         );
     }
 

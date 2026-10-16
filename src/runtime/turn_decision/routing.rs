@@ -657,12 +657,13 @@ impl TurnDecisionService {
             parts.budgets.tokens = parts.budgets.tokens.min(remaining.tokens);
             parts.budgets.micro_usd = parts.budgets.micro_usd.min(remaining.micro_usd);
             parts.budgets.latency_ms = parts.budgets.latency_ms.min(remaining.latency_ms);
-            let effective = crate::router::resolve_effective_compaction_config(
+            let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(
                 &config.agent.compaction,
                 admitted.provider_name(),
                 admitted.model_name(),
                 &config.router,
                 &config.model_routes,
+                &self.provider_catalog,
             );
             let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
             let reservation =

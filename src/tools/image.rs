@@ -64,6 +64,14 @@ impl ImageTool {
         self.pinned_provider_name = Some(provider_name.into());
         self
     }
+
+    /// Bind model capabilities when this runtime already owns an immutable
+    /// provider/model selection but does not perform generation reloads.
+    #[must_use]
+    pub(crate) fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        self.pinned_provider_name = Some(provider_name.into());
+        self
+    }
 }
 
 #[async_trait]
@@ -196,16 +204,25 @@ impl Tool for ImageTool {
         }
 
         // Check that the provider supports vision
-        if !provider
-            .capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-            .vision
-        {
+        let adapter_capabilities =
+            provider.capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+        let capabilities = self.pinned_provider_name.as_deref().map_or_else(
+            || adapter_capabilities.clone(),
+            |name| {
+                crate::providers::catalog::release_provider_capabilities(
+                    name,
+                    &self.model,
+                    adapter_capabilities.clone(),
+                )
+            },
+        );
+        if !capabilities.vision {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(
                     "Current model does not support vision. \
-                     Switch to a vision-capable model (e.g. gpt-4o, grok-4, claude-3-*)."
+                     Switch to a model whose catalog entry declares vision input."
                         .into(),
                 ),
             });
@@ -294,6 +311,7 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -419,6 +437,66 @@ mod tests {
             .unwrap();
         // Will fail at vision check OR at image prep if remote fetch disabled — either is ok
         assert!(!result.success);
+    }
+
+    struct CatalogVisionProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::providers::Provider for CatalogVisionProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected".to_string())
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                vision: true,
+                native_tool_calling: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_execution_is_gated_by_catalog_vision_input_before_transport() {
+        let provider = Arc::new(CatalogVisionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let tool = ImageTool::new(
+            provider_dyn,
+            "codellama",
+            0.0,
+            test_security(),
+            MultimodalConfig::default(),
+        )
+        .with_provider_name("ollama");
+
+        let result = tool
+            .execute(json!({
+                "image": "data:image/png;base64,iVBORw0KGgo=",
+                "prompt": "describe"
+            }))
+            .await
+            .expect("catalog refusal is a structured tool result");
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Current model does not support vision. Switch to a model whose catalog entry declares vision input.")
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "catalog refusal precedes transport"
+        );
     }
 
     #[tokio::test]

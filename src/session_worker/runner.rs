@@ -268,11 +268,14 @@ fn worker_spawn_tool(
         config.sessions_spawn.clone(),
         active_runs,
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
+    .with_compaction_resolver(
+        crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        )
+        .with_model_catalog(crate::providers::selection::catalog_for(config)),
+    )
     .with_cost_config(config.cost.clone())
     .with_reliability(credentials.reliability.as_ref().clone())
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
@@ -1898,13 +1901,16 @@ async fn run_owned_manifest(
         &config,
         Arc::clone(&security),
     )));
-    full_tools.push(Box::new(crate::tools::ImageTool::new(
-        Arc::clone(&provider),
-        &manifest.model,
-        manifest.temperature,
-        Arc::clone(&security),
-        config.multimodal.clone(),
-    )));
+    full_tools.push(Box::new(
+        crate::tools::ImageTool::new(
+            Arc::clone(&provider),
+            &manifest.model,
+            manifest.temperature,
+            Arc::clone(&security),
+            config.multimodal.clone(),
+        )
+        .with_provider_name(&manifest.provider_name),
+    ));
     full_tools.push(Box::new(crate::tools::ConfigReloadTool::with_security(
         shared_config.clone(),
         Arc::clone(&security),

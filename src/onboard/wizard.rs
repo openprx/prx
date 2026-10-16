@@ -706,11 +706,11 @@ fn default_model_for_provider(provider: &str) -> String {
                     .find(|model| model.id == catalog.defaults.model)
                     .map(|model| model.api_model.as_str())
             })
-            .unwrap_or(crate::providers::selection::DEFAULT_MODEL_FOR_UNSET)
-            .to_string(),
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_string()),
         Err(error) => {
             tracing::error!(error = %error, "embedded model catalog is invalid");
-            crate::providers::selection::DEFAULT_MODEL_FOR_UNSET.to_string()
+            crate::providers::selection::default_model_for_unset().to_string()
         }
     }
 }
@@ -1044,7 +1044,7 @@ struct DiscoveryConnection<'a> {
 /// probed with its own auth profile (or its own environment variable, read by
 /// the fetcher), or without a credential.
 fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
-    let configured_provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let configured_provider = crate::providers::selection::default_provider(config);
     let root = crate::providers::configured_connection_for(
         provider_name,
         configured_provider,
@@ -2052,7 +2052,7 @@ fn quick_summary_provider_line(config: &Config) -> String {
     format!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
+        crate::providers::redact_endpoint_userinfo(crate::providers::selection::default_provider(config))
     )
 }
 
@@ -4360,7 +4360,7 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = crate::providers::selection::default_provider(config);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if provider == "openai-codex" {
             println!(

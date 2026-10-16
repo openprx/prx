@@ -1,195 +1,34 @@
 use crate::config::RouterModelConfig;
 
-const MODERN_LONG_CONTEXT_TOKENS: usize = 1_000_000;
-const ANTHROPIC_HAIKU_CONTEXT_TOKENS: usize = 200_000;
-const GPT_4O_CONTEXT_TOKENS: usize = 128_000;
-const KIMI_K2_5_CONTEXT_TOKENS: usize = 262_144;
-const AGGREGATOR_STANDARD_CONTEXT_TOKENS: usize = 128_000;
-const LEGACY_LOCAL_CONTEXT_TOKENS: usize = 32_000;
-
-fn model(
-    provider: &str,
-    model_id: &str,
-    cost_per_million_tokens: f32,
-    max_context: usize,
-    latency_ms: u32,
-    categories: &[&str],
-) -> RouterModelConfig {
-    RouterModelConfig {
-        model_id: model_id.to_string(),
-        provider: provider.to_string(),
-        cost_per_million_tokens,
-        max_context,
-        reserved_output_tokens: None,
-        latency_ms,
-        categories: categories.iter().map(|value| (*value).to_string()).collect(),
-        elo_rating: 1_000.0,
-    }
-}
-
+/// Router candidates derived entirely from the embedded release catalog.
+/// The operator's explicit `[[router.models]]` entries still replace this
+/// list at the router boundary.
 pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
-    vec![
-        model(
-            "anthropic",
-            "claude-fable-5",
-            10.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_500,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-8",
-            5.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-7",
-            5.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-6",
-            15.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-sonnet-4-6",
-            3.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code", "summary"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-4-5-20251001",
-            1.0,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-4-5",
-            1.0,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-3",
-            0.25,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openai-codex",
-            "gpt-code5.3",
-            2.0,
-            GPT_4O_CONTEXT_TOKENS,
-            1_500,
-            &["code", "debug", "refactor", "analysis"],
-        ),
-        model(
-            "openai",
-            "gpt-4o",
-            5.0,
-            GPT_4O_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "openai",
-            "gpt-4o-mini",
-            0.15,
-            GPT_4O_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openrouter",
-            "moonshotai/kimi-k2.5",
-            0.6,
-            KIMI_K2_5_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "long_doc"],
-        ),
-        model(
-            "openrouter",
-            "qwen/qwen3.5-plus",
-            0.5,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_500,
-            &["conversation", "code", "summary"],
-        ),
-        model(
-            "openrouter",
-            "thudm/glm-5",
-            0.3,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_500,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openrouter",
-            "google/gemini-3-flash",
-            0.1,
-            MODERN_LONG_CONTEXT_TOKENS,
-            1_000,
-            &["conversation", "summary", "long_doc"],
-        ),
-        model(
-            "openrouter",
-            "x-ai/grok-4.1-fast",
-            1.0,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_200,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "xai",
-            "grok-3",
-            3.0,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "gemini",
-            "gemini-2.5-pro",
-            1.25,
-            MODERN_LONG_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "gemini",
-            "gemini-2.0-flash",
-            0.1,
-            MODERN_LONG_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "long_doc"],
-        ),
-        model(
-            "ollama",
-            "*",
-            0.0,
-            LEGACY_LOCAL_CONTEXT_TOKENS,
-            500,
-            &["conversation", "code"],
-        ),
-    ]
+    let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
+        return Vec::new();
+    };
+    catalog
+        .models
+        .iter()
+        .filter_map(|model| {
+            let router = model.router.as_ref()?;
+            let context = model.limits.context_window?;
+            let pricing = model.pricing.as_ref()?;
+            Some(RouterModelConfig {
+                model_id: model.api_model.clone(),
+                provider: model.provider.clone(),
+                cost_per_million_tokens: pricing.input as f32,
+                max_context: usize::try_from(context).unwrap_or(usize::MAX),
+                reserved_output_tokens: model
+                    .limits
+                    .max_output_tokens
+                    .and_then(|tokens| usize::try_from(tokens).ok()),
+                latency_ms: router.latency_ms,
+                categories: router.categories.clone(),
+                elo_rating: router.quality_rank as f32,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
