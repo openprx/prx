@@ -537,14 +537,13 @@ for line in sys.stdin:
 #[tokio::test]
 async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
-    if !std::process::Command::new("python3")
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        tracing::warn!("skipping MCP collection test: python3 is unavailable");
-        return;
-    }
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success()),
+        "test: python3 runs the stdio MCP fixture"
+    );
     let workspace = tempfile::tempdir().unwrap();
     let marker = workspace.path().join("mcp-executed.marker");
     let tool_name = "mcp__prx_server__write";

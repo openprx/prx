@@ -376,10 +376,14 @@ impl CausalCandidateGenerator {
                                 selected = Some(candidate);
                                 break;
                             }
-                            GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
-                                approval_only = Some(candidate);
-                                approval_only_unbound =
-                                    collectable_approval_entry(entry) && names_entry(&folded_input, entry);
+                            GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() => {
+                                // A full-named collectable entry outranks an
+                                // earlier bare-alias match in the same family.
+                                let unbound = collectable_approval_entry(entry) && names_entry(&folded_input, entry);
+                                if approval_only.is_none() || (unbound && !approval_only_unbound) {
+                                    approval_only = Some(candidate);
+                                    approval_only_unbound = unbound;
+                                }
                             }
                             GateOutcome::ApprovalDeferred | GateOutcome::Blocked { gate: 4 | 7 | 9, .. } => {
                                 // An exact action that lacks approval scope,

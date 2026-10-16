@@ -417,14 +417,13 @@ for line in sys.stdin:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
 "#;
-    if !std::process::Command::new("python3")
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        tracing::warn!("skipping MCP close test: python3 is unavailable");
-        return;
-    }
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success()),
+        "test: python3 runs the stdio MCP fixture"
+    );
     let tmp = TempDir::new().unwrap();
     let marker = tmp.path().join("mcp-executed.marker");
     let mut config = crate::config::Config::default();
@@ -497,6 +496,13 @@ for line in sys.stdin:
     );
     assert_eq!(
         crate::causal_tree::directive::render_terminal_directive(directive).expect("test: terminal text"),
+        "This action needs owner approval, which this surface cannot collect; nothing was run."
+    );
+    // A bare alias match earlier in the family must not hide the full name.
+    let mixed = admit("call mcp__prx_server__write with path remote.txt then search the result").await;
+    assert_eq!(
+        crate::causal_tree::directive::render_terminal_directive(mixed.decision().context.directive())
+            .expect("test: mixed prompt closes with a terminal text"),
         "This action needs owner approval, which this surface cannot collect; nothing was run."
     );
     // Bare server-side tool names are ordinary words: prose still answers.
