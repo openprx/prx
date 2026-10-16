@@ -59,10 +59,17 @@ fn a_catalog_override_without_its_own_credential_is_refused() {
     let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"))
         .and_then(|choice| agent_provider_selection(&choice).build_provider(&config, &options));
 
-    let error = match outcome {
+    let typed = match outcome {
         Ok(_) => panic!("a catalog override must not build on the default provider's key"),
-        Err(error) => format!("{error:#}"),
+        Err(error) => error,
     };
+    assert!(
+        typed
+            .downcast_ref::<crate::providers::MissingProviderCredential>()
+            .is_some(),
+        "the refusal must be the typed missing-credential error: {typed:#}"
+    );
+    let error = format!("{typed:#}");
     assert!(error.contains("missing credential/api key"), "{error}");
     assert!(!error.contains(ROOT_SENTINEL), "{error}");
 }
