@@ -680,7 +680,10 @@ mod tests {
         assert_eq!(credential_for(&config, "anthropic"), CredentialRef::ProviderStore);
         // An inline root key keeps winning over the store.
         config.api_key = Some("PMMC-SELECTION-ROOT".to_string());
-        assert_eq!(credential_for(&config, "openai"), CredentialRef::LegacyInline(LegacySlot::Root));
+        assert_eq!(
+            credential_for(&config, "openai"),
+            CredentialRef::LegacyInline(LegacySlot::Root)
+        );
     }
 
     #[test]
