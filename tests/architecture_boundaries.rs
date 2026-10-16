@@ -2747,7 +2747,16 @@ fn runtime_prompt_has_no_parallel_tool_description_catalog() {
         "src/chat/mod.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/mod.rs",
+        "src/session_worker/runner/capability.rs",
+        "src/session_worker/runner/context.rs",
+        "src/session_worker/runner/paths.rs",
+        "src/session_worker/runner/prompt.rs",
+        "src/session_worker/runner/provider.rs",
+        "src/session_worker/runner/run.rs",
+        "src/session_worker/runner/steering.rs",
+        "src/session_worker/runner/tools.rs",
+        "src/session_worker/runner/validate.rs",
     ];
     let mut scanned = Vec::new();
     for path in rust_source_files() {
@@ -2848,7 +2857,16 @@ fn production_tool_loop_memory_is_wired_to_request_context_events() {
         "src/chat/mod.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/mod.rs",
+        "src/session_worker/runner/capability.rs",
+        "src/session_worker/runner/context.rs",
+        "src/session_worker/runner/paths.rs",
+        "src/session_worker/runner/prompt.rs",
+        "src/session_worker/runner/provider.rs",
+        "src/session_worker/runner/run.rs",
+        "src/session_worker/runner/steering.rs",
+        "src/session_worker/runner/tools.rs",
+        "src/session_worker/runner/validate.rs",
         "src/tools/delegate.rs",
         "src/tools/sessions_spawn.rs",
     ] {
@@ -2910,7 +2928,7 @@ const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         1,
         "crate::agent::turn_request::TurnDecision{service,context:&context,proof:&gateway_proof,}",
     ),
-    ("src/session_worker/runner.rs", 1, "admitted_turn.routing()"),
+    ("src/session_worker/runner/run.rs", 1, "admitted_turn.routing()"),
     ("src/tools/delegate.rs", 1, "child_turn.routing()"),
     ("src/tools/sessions_spawn.rs", 1, "child_turn.routing()"),
 ];
@@ -3496,7 +3514,7 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
     // Workers prefer admitted child context, retaining the signed manifest fallback.
-    "src/session_worker/runner.rs::run_owned_manifest",
+    "src/session_worker/runner/run.rs::run_owned_manifest",
     "src/tools/delegate.rs::execute_tool_loop",
     "src/tools/sessions_spawn.rs::run_sub_agent_task",
 ];
@@ -3754,7 +3772,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
             "src/channels/mod.rs::start_channels_with_config",
             "src/chat/mod.rs::run",
             "src/gateway/mod.rs::register_gateway_turn_tools",
-            "src/session_worker/runner.rs::worker_spawn_tool",
+            "src/session_worker/runner/provider.rs::worker_spawn_tool",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
         ],
     );
@@ -3963,7 +3981,7 @@ fn production_turns_budget_on_the_effective_context_window() {
                         "src/agent/entry.rs::run_with_runtime_envelope" => "Some(decision_context.main_compaction())",
                         "src/channels/mod.rs::run_channel_turn" => "Some(decision_turn.compaction())",
                         "src/chat/dispatcher.rs::drive_start_turn_stream" => "compaction_config.as_ref()",
-                        "src/session_worker/runner.rs::run_owned_manifest" => {
+                        "src/session_worker/runner/run.rs::run_owned_manifest" => {
                             "child_turn.as_ref().map(|turn|turn.compaction()).or(compaction_config_ref)"
                         }
                         "src/tools/delegate.rs::execute_tool_loop"
@@ -4058,7 +4076,7 @@ fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
 
     for relative in [
         "src/agent/turn_engine.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/tests/tool_selection.rs",
         "src/tools/delegate.rs",
         "src/tools/sessions_spawn.rs",
     ] {
@@ -4417,7 +4435,7 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // operator]` and so can never open with a reserved marker.
     "src/tools/sessions_spawn.rs::run_sub_agent_task",
     // The session worker's steering turn, the same wrapper.
-    "src/session_worker/runner.rs::run_segments_with_steering",
+    "src/session_worker/runner/steering.rs::run_segments_with_steering",
 ];
 
 /// The names the loop-note guards scan for cannot be hidden (R-LOOPD5 F-1).
@@ -5305,9 +5323,27 @@ fn terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys
 #[test]
 fn a_session_worker_selects_its_tools_through_its_manifest() {
     let root = repository_root();
-    let source =
-        fs::read_to_string(root.join("src/session_worker/runner.rs")).expect("read src/session_worker/runner.rs");
-    let production = strip_cfg_test_items(&source);
+    let production: String = [
+        "mod",
+        "capability",
+        "context",
+        "paths",
+        "prompt",
+        "provider",
+        "run",
+        "steering",
+        "tools",
+        "validate",
+    ]
+    .iter()
+    .map(|name| {
+        let relative = format!("src/session_worker/runner/{name}.rs");
+        let source =
+            fs::read_to_string(root.join(&relative)).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        strip_cfg_test_items(&source)
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
 
     let entry = function_body(&production, "run_owned_manifest");
     assert!(
@@ -8002,7 +8038,7 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for".to_string()],
+        vec!["src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for".to_string()],
         "a session worker builds its provider only through `worker_provider`"
     );
 }
@@ -8123,7 +8159,7 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/runtime/child_source.rs:from_selection:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
-        "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
+        "src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for",
         "src/tools/sessions_spawn.rs:build_override_provider:create_provider_for",
         "src/tools/sessions_spawn.rs:execute_spawn_with_id:create_provider_for",
     ]
