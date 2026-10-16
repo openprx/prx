@@ -39,6 +39,12 @@ llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
 discovery. Kimi Code rejects model strings outside its three documented IDs
 because that endpoint can silently accept or remap a mistyped model.
 
+Catalog lifecycle controls new selections: active and deprecated chat rows are
+listed, with deprecated rows labeled with their replacement when one exists;
+retired rows stay hidden. Ollama Cloud has no live model-list endpoint, so an
+authenticated onboarding fallback uses the release rows and places `:cloud`
+models before local-only ids.
+
 ## Capability contracts
 
 - OpenAI-compatible providers support non-streaming and streaming text and
@@ -378,7 +384,10 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
   was shown.
 - **Hot reload.** The declarations are part of the configuration generation
   providers are rebuilt from, so an edited entry applies to providers built
-  after the reload, like every other provider setting.
+  after the reload, like every other provider setting. Long-lived channel
+  `image` and `sessions_spawn` tools resolve each invocation from its pinned
+  generation: provider, model, temperature, credential and model-capability
+  declaration therefore move together after a reload.
 - **Consequence of `no_root_combinators`.** Tools whose published contract uses
   a conditional or alternative root combinator are refused on that endpoint,
   and a request that includes any of them fails before transport, naming every

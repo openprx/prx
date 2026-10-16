@@ -546,6 +546,7 @@ pub(crate) struct ChildGrantRuntime {
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
 }
 
+#[derive(Clone)]
 struct ParentModelSelection {
     provider: String,
     model: String,
@@ -814,6 +815,44 @@ impl IssuedChildGrant {
 
     pub(crate) fn scope(&self) -> &Arc<crate::tools::capability::child::VerifiedChildScope> {
         &self.0.scope
+    }
+
+    /// A process worker cannot own tools whose backend lives only in the
+    /// interactive parent's event loop. Re-derive a sibling child scope from
+    /// the same authenticated parent so the transport carries only executable
+    /// worker capabilities, without consuming another delegation depth.
+    pub(crate) fn for_process_worker(&self) -> anyhow::Result<Self> {
+        let (manifest, parent) = self.scope().gate_inputs();
+        let catalog = self.catalog().view(&Default::default());
+        let requested = manifest
+            .allowed
+            .iter()
+            .filter(|reference| {
+                catalog
+                    .entry_any(&reference.id)
+                    .is_none_or(|entry| entry.public_name != "chat_schedule")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if requested.len() == manifest.allowed.len() {
+            return Ok(self.clone());
+        }
+        let narrowed =
+            crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(parent, &requested)?;
+        let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
+            narrowed, parent,
+        )?);
+        Ok(Self(Arc::new(ChildGrantData {
+            parent_model: self.0.parent_model.clone(),
+            source_fabric: self.0.source_fabric.clone(),
+            security: Arc::clone(&self.0.security),
+            parent_record_binding: self.0.parent_record_binding.clone(),
+            provider_catalog: Arc::clone(&self.0.provider_catalog),
+            catalog: Arc::clone(&self.0.catalog),
+            generation: Arc::clone(&self.0.generation),
+            scope,
+            parent: self.0.parent.clone(),
+        })))
     }
 
     pub(crate) fn source_fabric(&self) -> &MemoryFabric {

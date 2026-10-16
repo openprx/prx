@@ -721,7 +721,13 @@ fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         Ok(catalog) => catalog
             .listed_models(provider)
             .into_iter()
-            .map(|model| (model.api_model.clone(), model.display_name.clone()))
+            .map(|model| {
+                let label = model.selection_warning().map_or_else(
+                    || model.display_name.clone(),
+                    |warning| format!("{} ({warning})", model.display_name),
+                );
+                (model.api_model.clone(), label)
+            })
             .collect(),
         Err(error) => {
             tracing::error!(error = %error, "embedded model catalog is invalid");
@@ -987,12 +993,17 @@ fn fetch_live_models_for_provider(
                 // Ollama Cloud does not expose a model-list endpoint. Its
                 // release-owned fallback comes from the same catalog as every
                 // other offline model surface.
-                crate::providers::catalog::ReleaseCatalog::embedded()
+                let mut models = crate::providers::catalog::ReleaseCatalog::embedded()
                     .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?
                     .listed_models("ollama")
                     .into_iter()
                     .map(|model| DiscoveredModel::id_only(&model.api_model))
-                    .collect()
+                    .collect::<Vec<_>>();
+                // The credential means this is Ollama Cloud discovery. Keep
+                // the release catalog as the source, but offer hosted ids
+                // before local-only defaults.
+                models.sort_by_key(|model| !model.id.ends_with(":cloud"));
+                models
             }
         }
         _ => {
@@ -5480,7 +5491,7 @@ mod tests {
         let discovered = fetch_live_models_for_provider("ollama", "fixture-key", None)
             .expect("test: embedded Ollama fallback must load");
         let ids: Vec<_> = discovered.iter().map(|model| model.id.as_str()).collect();
-        assert_eq!(ids.first().copied(), Some("llama3.2"));
+        assert!(ids.first().is_some_and(|model| model.ends_with(":cloud")));
         assert!(ids.contains(&"glm-5:cloud"));
         assert!(ids.contains(&"qwen2.5-coder:3b"));
         assert!(!ids.contains(&"*"));

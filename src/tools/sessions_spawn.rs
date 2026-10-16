@@ -4838,6 +4838,11 @@ impl SessionsSpawnTool {
         .await?;
 
         if mode == "process" {
+            let process_child_grant = child_grant
+                .as_deref()
+                .map(crate::runtime::child_source::IssuedChildGrant::for_process_worker)
+                .transpose()?
+                .map(Arc::new);
             let (process_config_dir, process_config_generation) =
                 process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
             let process_provider_selection = if child_grant.is_some() || ordinary_publication.is_some() {
@@ -4982,7 +4987,7 @@ impl SessionsSpawnTool {
             let process_execution_ctx = SpawnExecutionContext {
                 operator_authority: None,
                 ordinary_authority: None,
-                incoming_grant: child_grant.clone(),
+                incoming_grant: process_child_grant.clone(),
                 provider_binding: None,
                 terminal_usage: None,
                 input_receipt: source_receipt.clone(),
@@ -5027,7 +5032,7 @@ impl SessionsSpawnTool {
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
             sub_agent_work.require_cleanup_acknowledgement();
             let process_work_id = sub_agent_work.id();
-            let process_recovery = child_grant.as_ref().map(|grant| {
+            let process_recovery = process_child_grant.as_ref().map(|grant| {
                 Arc::new(process_terminal::ProcessRecovery::new(
                     process_memory_fabric.clone(),
                     Arc::clone(grant),
@@ -5508,13 +5513,13 @@ impl SessionsSpawnTool {
                 .or_else(|| operator_source.as_ref().map(|source| source.generation().id.0))
                 .context("gateway child provider generation missing")
         };
-        let provider_result = if matches!(&task_provider_plan, ChildProvider::Gateway)
+        let provider_result = if let Some(binding) = child_provider_binding.as_ref() {
+            Ok(binding.provider())
+        } else if matches!(&task_provider_plan, ChildProvider::Gateway)
             && operator_source.is_none()
             && let Some(resolver) = &self.pinned_provider_resolver
         {
             resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
-        } else if let Some(binding) = child_provider_binding.as_ref() {
-            Ok(binding.provider())
         } else if let Some(resolved) = selected_hint.as_ref() {
             let reliability = crate::config::ReliabilityConfig {
                 fallback_providers: Vec::new(),
@@ -10589,6 +10594,21 @@ mod tests {
         tool: &SessionsSpawnTool,
         arguments: serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
+        execute_admitted_spawn_with_plane(tool, arguments, false).await
+    }
+
+    async fn execute_enabled_admitted_spawn(
+        tool: &SessionsSpawnTool,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        execute_admitted_spawn_with_plane(tool, arguments, true).await
+    }
+
+    async fn execute_admitted_spawn_with_plane(
+        tool: &SessionsSpawnTool,
+        arguments: serde_json::Value,
+        decision_enabled: bool,
+    ) -> anyhow::Result<ToolResult> {
         fn fixture_price() -> crate::config::schema::ModelPricing {
             crate::config::schema::ModelPricing {
                 input: 1.0,
@@ -10636,7 +10656,7 @@ mod tests {
         config.config_path = workspace.join("config.toml");
         config.default_provider = Some(tool.provider_name.clone());
         config.default_model = Some(tool.model.clone());
-        config.causal_tree.enabled = false;
+        config.causal_tree.enabled = decision_enabled;
         config.autonomy.level = tool.security.autonomy;
         config.autonomy.workspace_only = tool.security.workspace_only;
         config
@@ -10739,7 +10759,15 @@ mod tests {
                 .to_owned(),
             sender: field("sender").unwrap_or("prx_user").to_owned(),
             reply_target: field("chat_id").unwrap_or_default().to_owned(),
-            content: "sessions_spawn admitted fixture".to_owned(),
+            content: if decision_enabled {
+                arguments
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("complete the requested child task")
+                    .to_owned()
+            } else {
+                "sessions_spawn admitted fixture".to_owned()
+            },
             channel: field("channel").unwrap_or("wacli").to_owned(),
             timestamp: 0,
             chat_kind,
@@ -10754,14 +10782,25 @@ mod tests {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
         cleanup
             .run(Box::pin(async move {
-                let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
-                    config,
-                    message,
-                    registry,
-                    admission_memory,
-                    (&provider_name, &model_name),
-                )
-                .await;
+                let admitted = if decision_enabled {
+                    crate::agent::test_admission::AdmittedTurn::enabled_builtin_channel_with_memory(
+                        config,
+                        message,
+                        registry,
+                        admission_memory,
+                        (&provider_name, &model_name),
+                    )
+                    .await
+                } else {
+                    crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                        config,
+                        message,
+                        registry,
+                        admission_memory,
+                        (&provider_name, &model_name),
+                    )
+                    .await
+                };
                 crate::runtime::child_source::scope_ordinary_provider_fixture(
                     provider,
                     provider_name.clone(),
@@ -11807,12 +11846,12 @@ mod tests {
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         // No grant injected → Medium-risk gate denies under supervised autonomy.
-        let denied = execute_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
+        let denied = execute_enabled_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
             .await
             .expect_err("an unapproved side-effect tool must not be offered for execution");
         assert_eq!(
             denied.to_string(),
-            "decision has no executable selection",
+            "admitted fixture did not select tool 'sessions_spawn'",
             "the admitted surface must exclude the unapproved tool"
         );
 
@@ -12712,12 +12751,12 @@ mod tests {
             crate::config::SessionsSpawnConfig::default(),
         );
 
-        let error = execute_admitted_spawn(&tool, json!({"task": "blocked"}))
+        let error = execute_enabled_admitted_spawn(&tool, json!({"task": "blocked"}))
             .await
             .expect_err("a side-effect tool must not be offered on a read-only surface");
         assert_eq!(
             error.to_string(),
-            "decision has no executable selection",
+            "admitted fixture did not select tool 'sessions_spawn'",
             "a read-only turn must close before publishing an executable spawn selection"
         );
         assert!(tool.active_runs_snapshot().await.is_empty());

@@ -1162,6 +1162,18 @@ mod tests {
     }
 
     #[test]
+    fn unset_model_default_is_owned_by_the_release_catalog() {
+        let catalog =
+            crate::providers::catalog::ReleaseCatalog::embedded().expect("test: embedded model catalog validates");
+        assert_eq!(
+            default_model_for_unset(),
+            catalog
+                .global_default_model()
+                .expect("test: release-wide model default")
+        );
+    }
+
+    #[test]
     fn a_hint_spelled_with_whitespace_is_refused() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut spaced = config_in(&temp, "openai", "gpt-4o");

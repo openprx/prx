@@ -5876,7 +5876,7 @@ pub async fn start_channels_with_config(
                 security.clone(),
                 config.multimodal.clone(),
             )
-            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver), &turn_provider_name),
+            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver)),
         ));
 
         tools_list.push(Box::new(spawn_tool));

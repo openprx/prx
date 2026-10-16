@@ -306,6 +306,30 @@ fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
     config
 }
 
+fn enabled_builtin_admission_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut config = admission_config(workspace);
+    config.causal_tree.enabled = true;
+    config
+}
+
+fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDecision<'_>) {
+    assert!(
+        decision.service.status().backend.enabled,
+        "step 7.1 decision service must keep the causal tree enabled"
+    );
+    let prediction = decision
+        .context
+        .engine()
+        .prediction
+        .as_ref()
+        .expect("step 7.1 must execute the enabled decision plane");
+    assert_eq!(prediction.served_by, crate::decision::factory::ServedBy::Builtin);
+    assert_eq!(
+        prediction.reason, None,
+        "step 7.1 must use the enabled builtin path, not disabled-mode fallback"
+    );
+}
+
 fn fixture_tool(calls: Arc<AtomicUsize>, arguments: Arc<Mutex<Vec<serde_json::Value>>>) -> Box<dyn Tool> {
     Box::new(FixtureTool { calls, arguments })
 }
@@ -349,16 +373,18 @@ pub(super) async fn admit_chat_fixture(
     action_tx: mpsc::Sender<Action>,
     cancellation: CancellationToken,
 ) -> ChatFixtureAdmission {
-    admit_chat_fixture_with_config(
+    let admitted = admit_chat_fixture_with_config(
         provider,
         registry,
-        admission_config(workspace),
+        enabled_builtin_admission_config(workspace),
         selection,
         source_input,
         action_tx,
         cancellation,
     )
-    .await
+    .await;
+    assert_enabled_builtin_selection(admitted.binding.decision_routing().expect("chat decision routing"));
+    admitted
 }
 
 pub(super) async fn admit_chat_fixture_with_config(
@@ -695,8 +721,8 @@ async fn run_agent_fixture_with_history(
         Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
     let mut history = history;
     let tools = crate::agent::test_admission::registry_with_search(tools);
-    let admission = crate::agent::test_admission::AdmittedTurn::with_model(
-        admission_config(temp.path()),
+    let admission = crate::agent::test_admission::AdmittedTurn::with_enabled_builtin_model(
+        enabled_builtin_admission_config(temp.path()),
         &history
             .iter()
             .rev()
@@ -708,6 +734,7 @@ async fn run_agent_fixture_with_history(
         (FIXTURE_PROVIDER, FIXTURE_MODEL),
     )
     .await;
+    assert_enabled_builtin_selection(admission.decision());
     let result = crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {

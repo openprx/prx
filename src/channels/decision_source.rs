@@ -346,29 +346,7 @@ impl ChannelSourceReceipt {
         run_id: &str,
         recorded: Option<&MessageEvent>,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !message.channel.is_empty() && !message.sender.is_empty() && !run_id.is_empty(),
-            "channel source has incomplete transport identity"
-        );
-        let key = super::ConversationKey::from_message(message);
-        let mut envelope = RuntimeEnvelope::channel_with_session(
-            generation.effective.workspace_dir.to_string_lossy().to_string(),
-            key.legacy,
-            message.channel.clone(),
-            message.sender.clone(),
-            message.reply_target.clone(),
-            super::channel_message_visibility(message),
-        )
-        .with_run_id(run_id)
-        .with_config_generation(generation);
-        if let Some(topic_id) = message
-            .thread_ts
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            envelope = envelope.with_topic_id(topic_id);
-        }
+        let mut envelope = Self::source_envelope(generation, message, run_id)?;
         if let Some(recorded) = recorded.filter(|event| event.id > 0 && !event.event_id.is_empty()) {
             let scope = envelope.message_scope();
             anyhow::ensure!(
@@ -420,6 +398,37 @@ impl ChannelSourceReceipt {
             generation: Arc::clone(generation),
             chat_type: super::chat_kind_from_message(message).scope_chat_type().to_owned(),
         })
+    }
+
+    fn source_envelope(
+        generation: &Arc<ConfigGeneration>,
+        message: &super::traits::ChannelMessage,
+        run_id: &str,
+    ) -> anyhow::Result<RuntimeEnvelope> {
+        anyhow::ensure!(
+            !message.channel.is_empty() && !message.sender.is_empty() && !run_id.is_empty(),
+            "channel source has incomplete transport identity"
+        );
+        let key = super::ConversationKey::from_message(message);
+        let mut envelope = RuntimeEnvelope::channel_with_session(
+            generation.effective.workspace_dir.to_string_lossy().to_string(),
+            key.legacy,
+            message.channel.clone(),
+            message.sender.clone(),
+            message.reply_target.clone(),
+            super::channel_message_visibility(message),
+        )
+        .with_run_id(run_id)
+        .with_config_generation(generation);
+        if let Some(topic_id) = message
+            .thread_ts
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            envelope = envelope.with_topic_id(topic_id);
+        }
+        Ok(envelope)
     }
 
     pub(super) const fn envelope(&self) -> &RuntimeEnvelope {
@@ -527,14 +536,42 @@ pub(crate) async fn recorded_fixture_source(
         !generation.effective.causal_tree.enabled,
         "fixture requires disabled plane"
     );
-    let pending = ChannelSourceReceipt::issue(memory.as_ref(), generation, message, run_id, None).await?;
+    recorded_fixture_source_inner(generation, memory, message, run_id, selection).await
+}
+
+/// The same recorded channel source for tests of the default enabled builtin
+/// path. Keeping a separate constructor preserves the disabled-fixture guard.
+#[cfg(test)]
+pub(crate) async fn recorded_enabled_fixture_source(
+    generation: &Arc<ConfigGeneration>,
+    memory: Arc<dyn Memory>,
+    message: &super::traits::ChannelMessage,
+    run_id: &str,
+    selection: (&str, &str),
+) -> anyhow::Result<(ChannelTurnProof, RuntimeEnvelope)> {
+    anyhow::ensure!(
+        generation.effective.causal_tree.enabled,
+        "fixture requires enabled plane"
+    );
+    recorded_fixture_source_inner(generation, memory, message, run_id, selection).await
+}
+
+#[cfg(test)]
+async fn recorded_fixture_source_inner(
+    generation: &Arc<ConfigGeneration>,
+    memory: Arc<dyn Memory>,
+    message: &super::traits::ChannelMessage,
+    run_id: &str,
+    selection: (&str, &str),
+) -> anyhow::Result<(ChannelTurnProof, RuntimeEnvelope)> {
+    let envelope = ChannelSourceReceipt::source_envelope(generation, message, run_id)?;
     let fabric = crate::memory::MemoryFabric::new(
         Arc::clone(&memory),
         generation.effective.workspace_dir.to_string_lossy(),
     )
     .with_event_recording(generation.effective.memory.event_recording_config());
     let event = fabric
-        .record_inbound_user_message(pending.envelope().message_scope(), &message.content, None, None)
+        .record_inbound_user_message(envelope.message_scope(), &message.content, None, None)
         .await?;
     let source = ChannelSourceReceipt::issue(memory.as_ref(), generation, message, run_id, Some(&event)).await?;
     Ok((source.bind_model(selection.0, selection.1)?, source.envelope().clone()))

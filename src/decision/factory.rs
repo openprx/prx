@@ -276,6 +276,39 @@ pub struct PredictionResult {
     pub reason: Option<FallbackReason>,
 }
 
+impl PredictionResult {
+    /// True only when every configured backend reached response validation and
+    /// every such response failed it. Transport, service, circuit and budget
+    /// failures keep the deterministic builtin eligible.
+    pub(crate) fn all_configured_attempts_failed_semantic_validation(&self) -> bool {
+        self.reason == Some(FallbackReason::AllFailed)
+            && !self.attempts.is_empty()
+            && self.attempts.iter().all(|attempt| {
+                matches!(
+                    &attempt.outcome,
+                    AttemptOutcome::Failed(error) if error.is_semantic_validation_failure()
+                )
+            })
+    }
+
+    /// The serving result can authorize terminal continuation. A builtin
+    /// shadow remains usable after infrastructure fallback, but not after all
+    /// configured responses failed semantic validation.
+    pub(crate) fn served_attempt_succeeded(&self) -> bool {
+        match self.served_by {
+            ServedBy::Builtin => !self.all_configured_attempts_failed_semantic_validation(),
+            ServedBy::Primary | ServedBy::Fallback => self
+                .attempts
+                .iter()
+                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Served)),
+            ServedBy::Cache => self
+                .attempts
+                .iter()
+                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Cached)),
+        }
+    }
+}
+
 impl std::fmt::Debug for PredictionResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PredictionResult")
@@ -359,7 +392,10 @@ impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction
     ) -> Option<crate::causal_tree::decision_engine::FallbackCause> {
         use crate::causal_tree::decision_engine::FallbackCause;
         match result.reason {
-            Some(FallbackReason::AllFailed) => Some(FallbackCause::DecisionFailed),
+            Some(FallbackReason::AllFailed) if result.all_configured_attempts_failed_semantic_validation() => {
+                Some(FallbackCause::DecisionFailed)
+            }
+            Some(FallbackReason::AllFailed) => None,
             Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
             Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
         }
@@ -2396,6 +2432,144 @@ mod tests {
         let question = QuestionId::global(GlobalQuestion::EvidenceSufficient);
         assert_eq!(result.served.answer(&question), result.builtin_shadow.answer(&question));
         assert_eq!(request.state().as_json(), &state_before);
+    }
+
+    #[tokio::test]
+    async fn only_all_semantic_validation_failures_close_the_configured_decision_path() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let key = key(&temp);
+
+        for error in [
+            DecisionError::Transport,
+            DecisionError::Unavailable,
+            DecisionError::BudgetExceeded,
+        ] {
+            let request = request(&key);
+            let (backend, _) = scripted(&key, "fallback", vec![MockStep::now(MockOutcome::Fail(error.clone()))]);
+            let factory = DecisionBackendFactory::from_slots(
+                vec![backend],
+                Arc::clone(&key),
+                OutboundSecrets::default(),
+                SlotLimits::default(),
+            );
+            let result = factory
+                .decide(&request, &CausalLineage::default())
+                .await
+                .expect("builtin fallback");
+            assert_eq!(result.served_by, ServedBy::Builtin);
+            assert!(result.served_attempt_succeeded());
+            assert!(!result.all_configured_attempts_failed_semantic_validation());
+            assert_eq!(
+                crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                    &factory.prediction_port(None),
+                    &result,
+                ),
+                None,
+                "{error:?} must fall back to the builtin"
+            );
+        }
+
+        let semantic_request = request(&key);
+        let mut invalid = answer_as(&semantic_request, "semantic");
+        invalid.answers.clear();
+        let (backend, _) = scripted(&key, "semantic", vec![MockStep::now(MockOutcome::Respond(invalid))]);
+        let factory = DecisionBackendFactory::from_slots(
+            vec![backend],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let result = factory
+            .decide(&semantic_request, &CausalLineage::default())
+            .await
+            .expect("semantic failure record");
+        assert!(result.all_configured_attempts_failed_semantic_validation());
+        assert!(
+            !result.served_attempt_succeeded(),
+            "the builtin shadow cannot turn an all-semantic rejection into a served decision"
+        );
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            Some(crate::causal_tree::decision_engine::FallbackCause::DecisionFailed)
+        );
+
+        let served_request = request(&key);
+        let (first, _) = scripted(
+            &key,
+            "first",
+            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
+        );
+        let (second, _) = scripted(
+            &key,
+            "second",
+            vec![MockStep::now(MockOutcome::Respond(answer_as(
+                &served_request,
+                "second",
+            )))],
+        );
+        let factory = DecisionBackendFactory::from_slots(
+            vec![first, second],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let result = factory
+            .decide(&served_request, &CausalLineage::default())
+            .await
+            .expect("second backend serves");
+        assert_eq!(result.served_by, ServedBy::Fallback);
+        assert!(matches!(
+            &result.attempts[0].outcome,
+            AttemptOutcome::Failed(DecisionError::Transport)
+        ));
+        assert!(matches!(&result.attempts[1].outcome, AttemptOutcome::Served));
+        assert!(result.served_attempt_succeeded());
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            None
+        );
+
+        let circuit_request = request(&key);
+        let (backend, _) = scripted(
+            &key,
+            "circuit",
+            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
+        );
+        let factory = DecisionBackendFactory::from_slots(
+            vec![backend],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits {
+                failure_threshold: 1,
+                ..SlotLimits::default()
+            },
+        );
+        factory
+            .decide(&circuit_request, &CausalLineage::default())
+            .await
+            .expect("circuit-opening fallback");
+        let result = factory
+            .decide(&circuit_request, &CausalLineage::default())
+            .await
+            .expect("open-circuit fallback");
+        assert!(matches!(
+            &result.attempts[0].outcome,
+            AttemptOutcome::Skipped(DecisionError::CircuitOpen)
+        ));
+        assert!(result.served_attempt_succeeded());
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            None
+        );
     }
 
     /// Invariant 16.2: a request whose state carries a configured secret is

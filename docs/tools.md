@@ -234,8 +234,12 @@ completion to the original authenticated spawn input, preserving its source,
 owner, visibility and complete lineage. Worker model segments and worker-result
 events retain their separate worker scope. Logical terminal issuance and the
 final draft use the same original task identity; receipt, backend, signature and
-scope checks remain mandatory. This does not create a new grant or accept an
-unsigned completion. For a native issued child grant, a new child session is
+scope checks remain mandatory. Before transport, the runtime derives a strict
+sibling subset that omits `chat_schedule`, whose backend exists only in the
+interactive parent loop. The subset keeps the same authenticated parent,
+delegation depth, model binding and source proof; it does not mint another
+delegation. This does not create a new grant or accept an unsigned completion.
+For a native issued child grant, a new child session is
 derived from the authenticated parent session and the runtime-reserved child run
 ID before recording the input. The original parent session remains separate
 lineage. Ordinary and operator spawning retain their existing session behavior;

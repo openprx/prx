@@ -58,10 +58,8 @@ impl ImageTool {
     pub(crate) fn with_pinned_provider_resolver(
         mut self,
         resolver: Arc<dyn crate::providers::generation::PinnedProviderResolver>,
-        provider_name: impl Into<String>,
     ) -> Self {
         self.pinned_provider_resolver = Some(resolver);
-        self.pinned_provider_name = Some(provider_name.into());
         self
     }
 
@@ -115,7 +113,7 @@ impl Tool for ImageTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let provider = if let Some(resolver) = &self.pinned_provider_resolver {
+        let (provider, model, temperature, capabilities) = if let Some(resolver) = &self.pinned_provider_resolver {
             let generation_id = crate::tools::execution::current_child_call_context()
                 .and_then(|caller| caller.context().envelope.config_generation_id)
                 .or_else(|| {
@@ -126,13 +124,22 @@ impl Tool for ImageTool {
                         .and_then(serde_json::Value::as_u64)
                 })
                 .ok_or_else(|| anyhow::anyhow!("image execution is missing its pinned configuration generation"))?;
-            let provider_name = self
-                .pinned_provider_name
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("image provider resolver has no pinned provider name"))?;
-            resolver.resolve(generation_id, provider_name, &self.model).await?
+            let resolved = resolver.resolve_default(generation_id).await?;
+            (
+                resolved.provider,
+                resolved.model_name,
+                resolved.temperature,
+                resolved.capabilities,
+            )
         } else {
-            Arc::clone(&self.provider)
+            let provider = Arc::clone(&self.provider);
+            let adapter =
+                provider.capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = self.pinned_provider_name.as_deref().map_or_else(
+                || adapter.clone(),
+                |name| crate::providers::catalog::release_provider_capabilities(name, &self.model, adapter.clone()),
+            );
+            (provider, self.model.clone(), self.temperature, capabilities)
         };
         // Collect image references from 'image' and/or 'images' parameters
         let mut image_refs: Vec<String> = Vec::new();
@@ -203,19 +210,9 @@ impl Tool for ImageTool {
             }
         }
 
-        // Check that the provider supports vision
-        let adapter_capabilities =
-            provider.capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming);
-        let capabilities = self.pinned_provider_name.as_deref().map_or_else(
-            || adapter_capabilities.clone(),
-            |name| {
-                crate::providers::catalog::release_provider_capabilities(
-                    name,
-                    &self.model,
-                    adapter_capabilities.clone(),
-                )
-            },
-        );
+        // Check that the provider supports vision. Reloadable tools use the
+        // generation catalog so an operator declaration can refine the
+        // adapter and release-catalog facts for this exact provider/model.
         if !capabilities.vision {
             return Ok(ToolResult {
                 success: false,
@@ -274,7 +271,7 @@ impl Tool for ImageTool {
         };
 
         let response = provider
-            .chat(request, &self.model, self.temperature)
+            .chat(request, &model, temperature)
             .await
             .map_err(|e| anyhow::anyhow!("Vision model call failed: {e}"))?;
 

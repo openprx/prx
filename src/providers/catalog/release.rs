@@ -303,7 +303,18 @@ impl ReleaseModel {
     /// Whether this row can be offered for a new selection.
     #[must_use]
     pub fn is_listed(&self) -> bool {
-        self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
+        self.lifecycle.status != ModelLifecycleStatus::Retired && self.api_model != "*"
+    }
+
+    /// A lifecycle warning shown beside a still-selectable deprecated row.
+    #[must_use]
+    pub fn selection_warning(&self) -> Option<String> {
+        (self.lifecycle.status == ModelLifecycleStatus::Deprecated).then(|| {
+            self.lifecycle.replacement.as_deref().map_or_else(
+                || "deprecated; select an active model when possible".to_owned(),
+                |replacement| format!("deprecated; use {replacement}"),
+            )
+        })
     }
 
     /// Whether this model performs the requested operation.
@@ -437,7 +448,8 @@ impl ReleaseCatalog {
             })
     }
 
-    /// Active chat models offered for one provider, with its release default first.
+    /// Active and deprecated chat models offered for one provider, with its
+    /// release default first. Retired rows remain hidden.
     #[must_use]
     pub fn listed_models(&self, provider: &str) -> Vec<&ReleaseModel> {
         let Some(provider) = self.provider_name(provider) else {
@@ -992,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn listed_models_are_active_chat_rows_with_the_provider_default_first() {
+    fn listed_models_are_selectable_chat_rows_with_the_provider_default_first() {
         let catalog = ReleaseCatalog::embedded().expect("test: embedded catalog validates");
         let anthropic = catalog.listed_models("anthropic");
         assert_eq!(
@@ -1007,7 +1019,7 @@ mod tests {
         assert!(
             anthropic
                 .iter()
-                .all(|model| model.lifecycle.status == ModelLifecycleStatus::Active)
+                .all(|model| model.lifecycle.status != ModelLifecycleStatus::Retired)
         );
         assert!(anthropic.iter().all(|model| model.supports(ModelOperation::Chat)));
 
@@ -1019,6 +1031,28 @@ mod tests {
         assert!(
             openrouter.iter().all(|model| model.api_model != "typesafe/jev-1.13"),
             "a decision-only model must not be offered as a chat selection"
+        );
+    }
+
+    #[test]
+    fn deprecated_chat_models_remain_selectable_with_a_replacement_warning() {
+        let document = minimal_catalog("gpt-fixture");
+        let mut value: Value = serde_json::from_str(&document).expect("test: catalog fixture JSON");
+        let lifecycle = value
+            .pointer_mut("/models/0/lifecycle")
+            .expect("test: fixture lifecycle");
+        *lifecycle = serde_json::json!({
+            "status": "deprecated",
+            "deprecated_at": "2026-10-16T00:00:00Z",
+            "replacement": "openai/gpt-fixture"
+        });
+        let catalog = ReleaseCatalog::from_json(&value.to_string()).expect("test: deprecated row validates");
+        let listed = catalog.listed_models("openai");
+        let model = listed.first().expect("test: deprecated row stays listed");
+        assert_eq!(model.lifecycle.status, ModelLifecycleStatus::Deprecated);
+        assert_eq!(
+            model.selection_warning().as_deref(),
+            Some("deprecated; use openai/gpt-fixture")
         );
     }
 

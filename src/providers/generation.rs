@@ -11,6 +11,16 @@ use std::sync::Arc;
 pub(crate) type GenerationProviderCacheKey = (u64, String, String);
 pub(crate) type GenerationProviderCache = Arc<Mutex<HashMap<GenerationProviderCacheKey, Arc<dyn Provider>>>>;
 
+/// The default provider request facts owned by one immutable configuration
+/// generation. Long-lived tools must use these together rather than combining
+/// a reloaded connection with startup model settings.
+pub(crate) struct PinnedDefaultProvider {
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) model_name: String,
+    pub(crate) temperature: f64,
+    pub(crate) capabilities: crate::providers::ProviderCapabilities,
+}
+
 /// Narrow port used by tools that outlive the configuration generation of the
 /// turn currently invoking them.
 #[async_trait]
@@ -21,6 +31,8 @@ pub(crate) trait PinnedProviderResolver: Send + Sync {
         provider_name: &str,
         model_name: &str,
     ) -> anyhow::Result<Arc<dyn Provider>>;
+
+    async fn resolve_default(&self, generation_id: u64) -> anyhow::Result<PinnedDefaultProvider>;
 }
 
 /// Resolve and cache providers by the generation that owns their connection.
@@ -70,6 +82,35 @@ impl PinnedProviderResolver for ConfigGenerationProviderResolver {
             &generation,
         )
         .await
+    }
+
+    async fn resolve_default(&self, generation_id: u64) -> anyhow::Result<PinnedDefaultProvider> {
+        let generation = self
+            .config
+            .pin_generation(ConfigGenerationId(generation_id))
+            .with_context(|| format!("configuration generation {generation_id} is no longer pinned"))?;
+        let config = &generation.effective;
+        let provider_name = super::selection::default_provider(config).to_owned();
+        let model_name = super::selection::default_model(config).to_owned();
+        let provider = get_or_create_provider_for_generation(
+            &self.config,
+            &self.cache,
+            &self.options,
+            &provider_name,
+            &model_name,
+            &generation,
+        )
+        .await?;
+        let adapter =
+            provider.capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::NonStreaming);
+        let capabilities =
+            super::selection::catalog_for(config).effective_provider_capabilities(&provider_name, &model_name, adapter);
+        Ok(PinnedDefaultProvider {
+            provider,
+            model_name,
+            temperature: config.default_temperature,
+            capabilities,
+        })
     }
 }
 
