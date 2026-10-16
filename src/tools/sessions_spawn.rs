@@ -17471,7 +17471,7 @@ mod tests {
         for file in [
             "chat/mod.rs",
             "gateway/mod.rs",
-            "channels/mod.rs",
+            "channels/startup.rs",
             "session_worker/runner.rs",
         ] {
             let text = std::fs::read_to_string(root.join(file)).expect("test: read source");

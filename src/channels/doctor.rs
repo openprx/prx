@@ -1,10 +1,14 @@
 //! Channel status, channel CLI commands and health checks.
 
+#[cfg(feature = "channel-matrix")]
+use super::MatrixChannel;
+#[cfg(feature = "whatsapp-web")]
+use super::WhatsAppWebChannel;
 use super::service::bind_telegram_identity;
 use super::{
     Arc, Channel, Config, DingTalkChannel, DiscordChannel, Duration, EmailChannel, IMessageChannel, IrcChannel,
-    LarkChannel, LinqChannel, MatrixChannel, NextcloudTalkChannel, QQChannel, Result, SignalChannel,
-    SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, WhatsAppWebChannel, irc, wacli,
+    LarkChannel, LinqChannel, NextcloudTalkChannel, QQChannel, Result, SignalChannel, SignalNativeChannel,
+    SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, irc, wacli,
 };
 
 /// Return the configured state of every real-time channel supported by this build.

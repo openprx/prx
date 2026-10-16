@@ -1,7 +1,11 @@
 //! Channel runtime start-up.
 
+#[cfg(feature = "channel-matrix")]
+use super::MatrixChannel;
 #[cfg(test)]
 use super::SecurityGen;
+#[cfg(feature = "whatsapp-web")]
+use super::WhatsAppWebChannel;
 use super::dispatch::run_message_dispatch_loop_with_cleanup;
 use super::history::load_persisted_histories;
 use super::inbound_policy::{
@@ -14,10 +18,10 @@ use super::{
     Arc, CHANNEL_INBOUND_QUEUE_CAPACITY, CancellationToken, Channel, ChannelRuntimeContext, Config,
     DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS, DEFAULT_CHANNEL_MAX_BACKOFF_SECS, DingTalkChannel, DiscordChannel,
     EmailChannel, HashMap, HookManager, IMessageChannel, InboundPolicyConfig, IrcChannel, LarkChannel, LinqChannel,
-    MatrixChannel, MattermostChannel, Memory, Mutex, NextcloudTalkChannel, Observer, Provider, ProviderCacheKey,
-    ProviderCacheMap, QQChannel, Result, SignalChannel, SignalNativeChannel, SlackChannel, TelegramChannel,
-    WacliChannel, WhatsAppChannel, WhatsAppWebChannel, decision_runtime, irc, memory, observability, outbound_registry,
-    providers, runtime, tools, traits, wacli,
+    MattermostChannel, Memory, Mutex, NextcloudTalkChannel, Observer, Provider, ProviderCacheKey, ProviderCacheMap,
+    QQChannel, Result, SignalChannel, SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel,
+    WhatsAppChannel, decision_runtime, irc, memory, observability, outbound_registry, providers, runtime, tools,
+    traits, wacli,
 };
 
 /// Resolve the channel runtime's default provider and model for chat before

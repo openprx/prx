@@ -24,7 +24,7 @@
 //!
 //! - The pre-gate is **only** reached for smart-mode group messages with NO
 //!   explicit @-mention. The caller guarantees @-mentions / DMs / non-smart
-//!   modes never enter here (see `channels/mod.rs`).
+//!   modes never enter here (see `channels/turn.rs`).
 //! - **Fail-open / err-toward-entering**: when the heuristic is uncertain and
 //!   the classifier is disabled, errors, times out, or returns an unparseable
 //!   answer, the decision is *always* [`PreGateDecision::EnterLoop`]. A pre-gate
