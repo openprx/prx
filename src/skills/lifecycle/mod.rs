@@ -16,11 +16,14 @@ macro_rules! crash_point {
 mod binding;
 mod bundle;
 mod capture;
+mod consolidate;
 mod generation;
 mod journal;
+mod knowledge;
 mod manifest;
 mod migrate;
 mod publish;
+mod rejection;
 mod store;
 mod types;
 
@@ -40,11 +43,18 @@ pub use capture::{
     MAX_HYDRATION_RECEIPTS, MAX_SELECTION_RECEIPTS, SelectionReceipt, SkillExperience, TaskTerminal, TerminalJoin,
     TerminalJoinOutcome, experience_id, on_task_terminal, task_key,
 };
+pub use consolidate::{ConsolidationOutcome, ConsolidationRequest};
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
+pub use knowledge::{
+    ConfidenceBasis, FailureClass, FailureFacts, KnowledgePattern, MAX_PATTERN_EVIDENCE,
+    MIN_DISTINCT_TASKS_FOR_PROPOSAL, PatternId, PatternIndex, PatternIndexEntry, PatternKind, PatternScope,
+    classify_failure,
+};
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
+pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use types::{
     LifecycleError, NewRevision, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision,

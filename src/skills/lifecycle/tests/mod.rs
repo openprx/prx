@@ -3,6 +3,7 @@
 mod binding;
 mod bundle;
 mod capture;
+mod knowledge;
 mod manifest;
 mod migrate;
 mod publish;

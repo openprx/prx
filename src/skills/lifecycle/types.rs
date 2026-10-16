@@ -42,6 +42,10 @@ pub enum LifecycleError {
     PinTableFull(usize),
     #[error("legacy import of skill {skill_id} ended aborted in all {attempts} attempts")]
     ImportAttemptsExhausted { skill_id: String, attempts: u32 },
+    #[error("evidence {id} is not usable: {reason}")]
+    EvidenceNotUsable { id: String, reason: String },
+    #[error("invalid knowledge record: {0}")]
+    InvalidKnowledge(String),
     #[error("task {task_id} already has a different terminal joined")]
     TerminalConflict { task_id: String },
     #[error("skill name {0:?} is bound to more than one skill id")]
