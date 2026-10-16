@@ -35,7 +35,7 @@ pub(crate) struct SpawnOutcome {
 impl SpawnOutcome {
     /// The request never became a run (bad argument, denied gate, unusable
     /// agent/provider). There is nothing to join.
-    pub(super) const fn rejected(error: String) -> Self {
+    const fn rejected(error: String) -> Self {
         Self {
             result: ToolResult {
                 success: false,
@@ -47,7 +47,7 @@ impl SpawnOutcome {
     }
 
     /// A run is registered and its driver task is live.
-    pub(super) const fn started(run_id: String, output: String) -> Self {
+    const fn started(run_id: String, output: String) -> Self {
         Self {
             result: ToolResult {
                 success: true,
