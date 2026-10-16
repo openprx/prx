@@ -6,7 +6,9 @@
 //! revision is a new pattern that `supersedes` the old one. Contradicting
 //! evidence is kept in `counterevidence_ids`, never dropped.
 //!
-//! Layout inside the owner store: `patterns/<pattern-id>.json` and the derived
+//! Layout inside the owner store: `patterns/<pattern-id>.json` for active
+//! patterns (and crash leftovers), `patterns/history/` for superseded ones,
+//! `patterns/quarantine/` for unreadable or forged files, and the derived
 //! `patterns/index.json` (rebuildable from the pattern files).
 
 use super::types::{LifecycleError, OwnerScope, SCHEMA_VERSION, SkillId};
@@ -22,9 +24,6 @@ pub const MAX_PATTERN_EVIDENCE: usize = 256;
 pub const MIN_DISTINCT_TASKS_FOR_PROPOSAL: usize = 2;
 /// Withdrawn evidence ids a pattern lists; the rest is only counted.
 pub(super) const MAX_WITHDRAWN_KEPT: usize = 64;
-/// Superseded or losing pattern ids the index remembers so that steady-state
-/// consolidation never re-reads history. Pattern retention (SL09) frees room.
-pub(super) const MAX_HISTORY_IDS: usize = 2048;
 pub(super) const MAX_STATEMENT_BYTES: usize = 2000;
 pub(super) const MAX_LIST_ITEMS: usize = 16;
 pub(super) const MAX_ITEM_BYTES: usize = 500;
@@ -238,18 +237,39 @@ pub struct KnowledgePattern {
     pub withdrawn_count: usize,
     /// Patterns this one replaces.
     pub supersedes: Vec<PatternId>,
+    /// Position in the lineage: 1 for a first pattern, predecessor + 1 for a
+    /// successor. The higher generation is the active one of a fork.
+    pub generation: u64,
     pub confidence_basis: ConfidenceBasis,
     pub created_at: DateTime<Utc>,
 }
 
 impl KnowledgePattern {
-    /// Digest of everything that defines the pattern except its own identity,
-    /// predecessor link and creation time. The pattern id is derived from it
-    /// and re-derived on every read.
+    /// Digest of the pattern's identity: its payload, its lineage position and
+    /// the pattern it supersedes. The pattern id is derived from it and
+    /// re-derived on every read.
     #[must_use]
     pub fn content_digest(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"prx-knowledge-pattern-v2\0");
+        hasher.update(b"prx-knowledge-pattern-v3\0");
+        let payload = self.payload_digest();
+        let generation = self.generation.to_string();
+        for part in [payload.as_str(), generation.as_str()]
+            .into_iter()
+            .chain(self.supersedes.iter().map(PatternId::as_str))
+        {
+            hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Digest of what the pattern says (statement, scope, evidence, ...),
+    /// without lineage. Equal payloads mean a request changed nothing.
+    #[must_use]
+    pub fn payload_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"prx-knowledge-payload\0");
         let class = format!("{:?}", self.failure_class);
         let basis = [
             self.confidence_basis.evidence_count,
@@ -366,10 +386,6 @@ pub struct PatternIndex {
     pub schema_version: u32,
     pub owner_scope: OwnerScope,
     pub entries: Vec<PatternIndexEntry>,
-    /// Ids of patterns known not to be active (superseded or lost a fork),
-    /// sorted. Files not listed here or in `entries` are the only ones a
-    /// consolidation reads.
-    pub history: Vec<PatternId>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -379,7 +395,6 @@ impl PatternIndex {
             schema_version: SCHEMA_VERSION,
             owner_scope: owner.clone(),
             entries: Vec::new(),
-            history: Vec::new(),
             updated_at: Utc::now(),
         }
     }

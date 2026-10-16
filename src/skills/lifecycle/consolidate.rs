@@ -23,19 +23,19 @@
 //! successors of one predecessor to a single active pattern (the later
 //! `created_at`, ties by pattern id).
 
-use super::capture::{ExperienceOutcome, is_experience_id};
+use super::capture::{ExperienceOutcome, experience_id, is_experience_id};
 use super::generation::ensure_dir_synced;
 use super::knowledge::{
-    ConfidenceBasis, FailureClass, KnowledgePattern, MAX_CAPABILITIES, MAX_HISTORY_IDS, MAX_ITEM_BYTES, MAX_LIST_ITEMS,
-    MAX_NAME_BYTES, MAX_PATTERN_EVIDENCE, MAX_STATEMENT_BYTES, MAX_WITHDRAWN_KEPT, PatternId, PatternIndex,
-    PatternIndexEntry, PatternScope,
+    ConfidenceBasis, FailureClass, KnowledgePattern, MAX_CAPABILITIES, MAX_ITEM_BYTES, MAX_LIST_ITEMS, MAX_NAME_BYTES,
+    MAX_PATTERN_EVIDENCE, MAX_STATEMENT_BYTES, MAX_WITHDRAWN_KEPT, PatternId, PatternIndex, PatternIndexEntry,
+    PatternScope,
 };
-use super::store::{MAX_RECORD_BYTES, SkillLifecycleStore, check_private, read_record, record_bytes};
+use super::store::{MAX_RECORD_BYTES, SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
 use super::types::{LifecycleError, SCHEMA_VERSION, SkillId};
 use chrono::Utc;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(super) const PATTERNS_DIR: &str = "patterns";
@@ -43,11 +43,13 @@ const INDEX_FILE: &str = "index.json";
 /// Reserved lock identity (see `SkillId::reserved`): no skill id can equal it.
 const KNOWLEDGE_LOCK_ID: &str = "_knowledge-patterns";
 const KNOWLEDGE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pattern files (history included) a directory listing may hold. Steady-state
-/// consolidation reads none of the listed history (the index remembers it);
-/// only a rebuild reads every file. Retention (SL09) keeps the directory
-/// under this; past it a typed error asks for retention.
-const MAX_PATTERN_FILES: usize = MAX_HISTORY_IDS + 2048;
+/// Top-level pattern files (active heads and crash leftovers) one listing may
+/// hold; superseded patterns live in `history/` and never count here.
+const MAX_ACTIVE_PATTERN_FILES: usize = 4096;
+/// Files a rebuild will read across `patterns/` and `patterns/history/`.
+const MAX_REBUILD_FILES: usize = 65_536;
+const HISTORY_DIR: &str = "history";
+const QUARANTINE_DIR: &str = "quarantine";
 /// Depth walked up the parent links of an experience to find its root task.
 const MAX_ROOT_DEPTH: usize = 8;
 
@@ -189,7 +191,7 @@ pub(super) struct EvidenceUse<'a> {
 }
 
 /// Identities of an evidence experience, used to find the root task it belongs to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct EvidenceFacts {
     task_id: String,
     run_id: Option<String>,
@@ -209,31 +211,52 @@ impl EvidenceFacts {
     }
 }
 
-/// The root task `fact` belongs to: its parent links are followed (up to
-/// [`MAX_ROOT_DEPTH`]) through the experiences in `pool`; a parent that is not
-/// in the pool is itself the root. Grandchildren, children and the root run
-/// therefore count as one task.
-fn root_key(fact: &EvidenceFacts, pool: &[EvidenceFacts]) -> String {
-    let mut current = fact;
-    for _ in 0..MAX_ROOT_DEPTH {
-        let Some(parent) = current.parent_run.as_deref() else {
-            break;
-        };
-        match pool.iter().find(|candidate| candidate.is_named(parent)) {
-            Some(next) if !std::ptr::eq(next, current) => current = next,
-            Some(_) => break,
-            None => return format!("run:{parent}"),
+impl From<super::capture::SkillExperience> for EvidenceFacts {
+    fn from(experience: super::capture::SkillExperience) -> Self {
+        Self {
+            task_id: experience.task_id,
+            run_id: experience.correlation.run_id,
+            correlation_task: experience.correlation.task_id,
+            parent_run: experience.correlation.parent_run_id,
         }
     }
-    current.own_key()
 }
 
-fn distinct_roots(facts: &[EvidenceFacts], pool: &[EvidenceFacts]) -> usize {
-    facts
-        .iter()
-        .map(|fact| root_key(fact, pool))
-        .collect::<BTreeSet<_>>()
-        .len()
+impl SkillLifecycleStore {
+    /// The root task `fact` belongs to. Parent links are followed up to
+    /// [`MAX_ROOT_DEPTH`] hops: a parent is looked up among the cited
+    /// evidence (`pool`) and otherwise read directly from the stored
+    /// experiences by task id, so the answer does not depend on which
+    /// evidence was cited. A parent that cannot be found is itself the root.
+    fn root_key(&self, fact: &EvidenceFacts, pool: &[EvidenceFacts]) -> Result<String, LifecycleError> {
+        let mut current = fact.clone();
+        for _ in 0..MAX_ROOT_DEPTH {
+            let Some(parent) = current.parent_run.clone() else {
+                break;
+            };
+            if let Some(next) = pool.iter().find(|candidate| candidate.is_named(&parent)) {
+                if *next == current {
+                    break;
+                }
+                current = next.clone();
+                continue;
+            }
+            let id = experience_id(self.owner_scope(), &parent);
+            match self.read_experience_by_id(&id)? {
+                Some(experience) => current = experience.into(),
+                None => return Ok(format!("run:{parent}")),
+            }
+        }
+        Ok(current.own_key())
+    }
+
+    fn distinct_roots(&self, facts: &[EvidenceFacts], pool: &[EvidenceFacts]) -> Result<usize, LifecycleError> {
+        let mut roots = BTreeSet::new();
+        for fact in facts {
+            roots.insert(self.root_key(fact, pool)?);
+        }
+        Ok(roots.len())
+    }
 }
 
 /// Outcome of [`SkillLifecycleStore::adopt_unindexed`].
@@ -316,6 +339,9 @@ fn verify_content(pattern: &KnowledgePattern) -> Result<(), LifecycleError> {
     if pattern.supersedes.len() > 1 {
         return Err(invalid("a pattern supersedes at most one pattern"));
     }
+    if (pattern.generation == 1) != pattern.supersedes.is_empty() || pattern.generation == 0 {
+        return Err(invalid("pattern generation does not match its lineage"));
+    }
     let basis = &pattern.confidence_basis;
     if basis.evidence_count != pattern.evidence_ids.len()
         || basis.counterevidence_count != pattern.counterevidence_ids.len()
@@ -337,18 +363,35 @@ impl SkillLifecycleStore {
         self.patterns_dir().join(format!("{id}.json"))
     }
 
-    /// Reads and verifies one pattern; `None` when it does not exist. The
-    /// content must be within bounds, internally consistent, and hash to the
-    /// pattern id (a forged or hand-edited file fails closed).
+    fn history_dir(&self) -> PathBuf {
+        self.patterns_dir().join(HISTORY_DIR)
+    }
+
+    /// Reads and verifies one pattern (active or superseded); `None` when it
+    /// does not exist. The content must be within bounds, internally
+    /// consistent, and hash to the pattern id (a forged or hand-edited file
+    /// fails closed).
     pub fn read_pattern(&self, id: &PatternId) -> Result<Option<KnowledgePattern>, LifecycleError> {
-        let path = self.pattern_path(id);
-        match fs::symlink_metadata(&path) {
+        Ok(self.read_pattern_located(id)?.map(|(pattern, _)| pattern))
+    }
+
+    /// Like [`Self::read_pattern`], also telling whether the file sits in `history/`.
+    fn read_pattern_located(&self, id: &PatternId) -> Result<Option<(KnowledgePattern, bool)>, LifecycleError> {
+        if let Some(pattern) = self.read_pattern_file(&self.pattern_path(id), id)? {
+            return Ok(Some((pattern, false)));
+        }
+        let archived = self.history_dir().join(format!("{id}.json"));
+        Ok(self.read_pattern_file(&archived, id)?.map(|pattern| (pattern, true)))
+    }
+
+    fn read_pattern_file(&self, path: &Path, id: &PatternId) -> Result<Option<KnowledgePattern>, LifecycleError> {
+        match fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(LifecycleError::io(&path, e)),
+            Err(e) => return Err(LifecycleError::io(path, e)),
         }
-        check_private(&path)?;
-        let pattern: KnowledgePattern = read_record(&path)?;
+        check_private(path)?;
+        let pattern: KnowledgePattern = read_record(path)?;
         if pattern.schema_version != SCHEMA_VERSION {
             return Err(LifecycleError::UnsupportedSchema {
                 what: "pattern",
@@ -357,7 +400,7 @@ impl SkillLifecycleStore {
         }
         self.check_owner_scope(&pattern.owner_scope)?;
         let tampered = |reason: String| LifecycleError::Tampered {
-            path: path.clone(),
+            path: path.to_path_buf(),
             reason,
         };
         if pattern.pattern_id != *id || pattern.record_id != id.as_str() {
@@ -368,6 +411,43 @@ impl SkillLifecycleStore {
             return Err(tampered("pattern content does not match its id".to_string()));
         }
         Ok(Some(pattern))
+    }
+
+    /// Moves a pattern file to `history/` or `quarantine/` (atomic rename,
+    /// durable). A file that is not at `from` is left alone.
+    fn move_pattern(&self, id: &PatternId, from_history: bool, to: &str) -> Result<(), LifecycleError> {
+        let patterns = self.patterns_dir();
+        let source_dir = if from_history {
+            self.history_dir()
+        } else {
+            patterns.clone()
+        };
+        let target_dir = patterns.join(to);
+        ensure_dir_synced(&patterns, &target_dir)?;
+        let source = source_dir.join(format!("{id}.json"));
+        let target = target_dir.join(format!("{id}.json"));
+        match fs::rename(&source, &target) {
+            Ok(()) => {
+                sync_dir(&target_dir)?;
+                sync_dir(&source_dir)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LifecycleError::io(&source, e)),
+        }
+    }
+
+    /// Moves an archived pattern back to the top level (it is the active one).
+    fn restore_pattern(&self, id: &PatternId) -> Result<(), LifecycleError> {
+        let source = self.history_dir().join(format!("{id}.json"));
+        let target = self.pattern_path(id);
+        match fs::rename(&source, &target) {
+            Ok(()) => {
+                sync_dir(&self.patterns_dir())?;
+                sync_dir(&self.history_dir())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LifecycleError::io(&source, e)),
+        }
     }
 
     /// The derived index; an empty one when no pattern was recorded yet.
@@ -444,6 +524,15 @@ impl SkillLifecycleStore {
     /// new evidence by writing a superseding one. Idempotent for an identical
     /// request. Blocking (file locks); async callers use `spawn_blocking`.
     pub fn consolidate_pattern(&self, request: &ConsolidationRequest) -> Result<ConsolidationOutcome, LifecycleError> {
+        self.consolidate_pattern_within(request, KNOWLEDGE_LOCK_TIMEOUT)
+    }
+
+    /// [`Self::consolidate_pattern`] with an explicit lock timeout.
+    pub(super) fn consolidate_pattern_within(
+        &self,
+        request: &ConsolidationRequest,
+        lock_timeout: Duration,
+    ) -> Result<ConsolidationOutcome, LifecycleError> {
         request.validate()?;
         let request = request.normalised();
         if request.evidence.iter().any(|id| request.counterevidence.contains(id)) {
@@ -452,11 +541,11 @@ impl SkillLifecycleStore {
         let dir = self.patterns_dir();
         ensure_dir_synced(self.root(), &dir)?;
         let lock_id = reserved_lock(KNOWLEDGE_LOCK_ID)?;
-        let _store_lock = self.lock_store(true, KNOWLEDGE_LOCK_TIMEOUT)?;
-        let _lock = self.lock_skill(&lock_id, KNOWLEDGE_LOCK_TIMEOUT)?;
+        let _store_lock = self.lock_store(true, lock_timeout)?;
+        let _lock = self.lock_skill(&lock_id, lock_timeout)?;
 
         let mut index = self.pattern_index()?;
-        let adoption = self.adopt_unindexed(&mut index)?;
+        let adoption = self.adopt_unindexed(&mut index, false)?;
         if adoption.files_read > 0 {
             tracing::debug!(files_read = adoption.files_read, "adopted unindexed pattern files");
         }
@@ -559,7 +648,16 @@ impl SkillLifecycleStore {
             .map(|p| p.withdrawn_evidence.iter().collect())
             .unwrap_or_default();
         let newly: Vec<String> = withdrawn.iter().filter(|id| !earlier.contains(id)).cloned().collect();
-        let withdrawn_count = previous.as_ref().map_or(0, |p| p.withdrawn_count) + newly.len();
+        // Distinct ids: reinstated ones leave the count, newly withdrawn join it.
+        let reinstated = earlier
+            .iter()
+            .filter(|id| evidence.contains(**id) || counter.contains(**id))
+            .count();
+        let withdrawn_count = previous
+            .as_ref()
+            .map_or(0, |p| p.withdrawn_count)
+            .saturating_sub(reinstated)
+            + newly.len();
         let mut kept: Vec<String> = withdrawn.iter().filter(|id| earlier.contains(id)).cloned().collect();
         kept.extend(newly);
         if kept.len() > MAX_WITHDRAWN_KEPT {
@@ -597,6 +695,8 @@ impl SkillLifecycleStore {
 
         let evidence: Vec<String> = evidence.into_iter().collect();
         let counter: Vec<String> = counter.into_iter().collect();
+        let distinct_tasks = self.distinct_roots(&facts, &pool)?;
+        let counter_distinct_tasks = self.distinct_roots(&counter_facts, &pool)?;
         let mut pattern = KnowledgePattern {
             schema_version: SCHEMA_VERSION,
             record_id: String::new(),
@@ -617,14 +717,15 @@ impl SkillLifecycleStore {
             confidence_basis: ConfidenceBasis {
                 evidence_count: evidence.len(),
                 counterevidence_count: counter.len(),
-                distinct_tasks: distinct_roots(&facts, &pool),
-                counter_distinct_tasks: distinct_roots(&counter_facts, &pool),
+                distinct_tasks,
+                counter_distinct_tasks,
             },
             evidence_ids: evidence,
             counterevidence_ids: counter,
             withdrawn_evidence: kept,
             withdrawn_count,
             supersedes: previous.iter().map(|p| p.pattern_id.clone()).collect(),
+            generation: previous.as_ref().map_or(1, |p| p.generation + 1),
             created_at: Utc::now(),
         };
         let pattern_id = PatternId::from_digest(&pattern.content_digest());
@@ -632,7 +733,10 @@ impl SkillLifecycleStore {
         pattern.pattern_id = pattern_id.clone();
 
         // Unchanged content: the active pattern already is this pattern.
-        if previous.as_ref().is_some_and(|p| p.pattern_id == pattern_id) {
+        if previous
+            .as_ref()
+            .is_some_and(|p| p.payload_digest() == pattern.payload_digest())
+        {
             if dirty {
                 self.write_pattern_index(&lock_id, &mut index)?;
             }
@@ -646,18 +750,6 @@ impl SkillLifecycleStore {
         let mut next = index.clone();
         next.entries.retain(|entry| !entry.same_group(&group));
         next.entries.push(PatternIndexEntry::of(&pattern));
-        next.history.retain(|id| *id != pattern_id);
-        if let Some(previous) = &previous {
-            next.history.push(previous.pattern_id.clone());
-            next.history.sort();
-            next.history.dedup();
-        }
-        if next.history.len() > MAX_HISTORY_IDS {
-            return Err(LifecycleError::KnowledgeLimit {
-                what: "superseded pattern ids the index remembers (pattern retention is required)",
-                limit: MAX_HISTORY_IDS,
-            });
-        }
         let index_file = self.index_bytes(&mut next)?;
         let created = match self.read_pattern(&pattern_id)? {
             Some(_) => false,
@@ -668,6 +760,11 @@ impl SkillLifecycleStore {
             }
         };
         self.write_atomic(&lock_id, &self.patterns_dir().join(INDEX_FILE), &index_file)?;
+        // Only now is the predecessor history. A crash before this move
+        // leaves it at the top level; the next call finishes the move.
+        if let Some(previous) = &previous {
+            self.move_pattern(&previous.pattern_id, false, HISTORY_DIR)?;
+        }
         Ok(ConsolidationOutcome { pattern, created })
     }
 
@@ -691,59 +788,92 @@ impl SkillLifecycleStore {
         self.write_atomic(lock_id, &self.patterns_dir().join(INDEX_FILE), &bytes)
     }
 
-    /// Adopts pattern files the index neither lists nor remembers as history
-    /// (left by a crash between the pattern write and the index write, or by a
-    /// lost index) and resolves them so each group has exactly one active
-    /// pattern. The rule does not use clocks: a pattern that any pattern
-    /// supersedes is history; of several unsuperseded patterns of one group
-    /// (a fork) the greatest pattern id wins; losers and ancestors are
-    /// remembered in `index.history`. Steady state lists the directory only;
-    /// just the unseen files (and the current head of their groups) are read.
-    /// Unreadable or forged files are skipped with a warning.
-    pub(super) fn adopt_unindexed(&self, index: &mut PatternIndex) -> Result<Adoption, LifecycleError> {
-        let dir = self.patterns_dir();
-        let known: BTreeSet<&PatternId> = index
-            .entries
-            .iter()
-            .map(|entry| &entry.pattern_id)
-            .chain(&index.history)
-            .collect();
-        let mut unseen = BTreeSet::new();
-        let mut listed = 0usize;
-        for item in fs::read_dir(&dir).map_err(|e| LifecycleError::io(&dir, e))? {
-            let item = item.map_err(|e| LifecycleError::io(&dir, e))?;
+    /// Lists pattern ids in `dir` (missing directory: none), at most `limit`.
+    fn list_pattern_ids(dir: &Path, limit: usize, what: &'static str) -> Result<Vec<PatternId>, LifecycleError> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(LifecycleError::io(dir, e)),
+        };
+        let mut ids = Vec::new();
+        for item in entries {
+            let item = item.map_err(|e| LifecycleError::io(dir, e))?;
             let name = item.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_suffix(".json").filter(|id| id.starts_with("pat-")) else {
                 continue;
             };
-            listed += 1;
-            if listed > MAX_PATTERN_FILES {
-                return Err(LifecycleError::KnowledgeLimit {
-                    what: "pattern files (retention is required)",
-                    limit: MAX_PATTERN_FILES,
-                });
+            if ids.len() >= limit {
+                return Err(LifecycleError::KnowledgeLimit { what, limit });
             }
-            if let Ok(id) = PatternId::parse(id)
-                && !known.contains(&id)
-            {
-                unseen.insert(id);
+            if let Ok(id) = PatternId::parse(id) {
+                ids.push(id);
             }
+        }
+        Ok(ids)
+    }
+
+    /// Reads a candidate file. A forged or undecodable one is moved to
+    /// `quarantine/` (so it is not read again) and skipped; any other error,
+    /// I/O included, propagates.
+    fn read_candidate(&self, id: &PatternId, in_history: bool) -> Result<Option<KnowledgePattern>, LifecycleError> {
+        let path = if in_history {
+            self.history_dir().join(format!("{id}.json"))
+        } else {
+            self.pattern_path(id)
+        };
+        match self.read_pattern_file(&path, id) {
+            Ok(pattern) => Ok(pattern),
+            Err(e @ (LifecycleError::Tampered { .. } | LifecycleError::InvalidRecord { .. })) => {
+                tracing::warn!(pattern = %id, error = %e, "quarantining unreadable pattern file");
+                self.move_pattern(id, in_history, QUARANTINE_DIR)?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Adopts pattern files the index does not list (left by a crash between
+    /// the pattern write and the index write, or by a lost index) and resolves
+    /// them so each group has exactly one active pattern. The rule uses no
+    /// clock: a pattern that any pattern supersedes is history; among several
+    /// unsuperseded patterns of one group (a fork, logged) the higher
+    /// `generation` wins and the greater id breaks a tie. History is moved to
+    /// `history/`, so the top-level directory holds only heads and leftovers
+    /// and steady state reads nothing. Forged files are quarantined.
+    /// With `scan_history` (rebuild) the history directory takes part too.
+    pub(super) fn adopt_unindexed(
+        &self,
+        index: &mut PatternIndex,
+        scan_history: bool,
+    ) -> Result<Adoption, LifecycleError> {
+        let indexed: BTreeSet<PatternId> = index.entries.iter().map(|entry| entry.pattern_id.clone()).collect();
+        let mut unseen: Vec<(PatternId, bool)> =
+            Self::list_pattern_ids(&self.patterns_dir(), MAX_ACTIVE_PATTERN_FILES, "active pattern files")?
+                .into_iter()
+                .filter(|id| !indexed.contains(id))
+                .map(|id| (id, false))
+                .collect();
+        if scan_history {
+            unseen.extend(
+                Self::list_pattern_ids(&self.history_dir(), MAX_REBUILD_FILES, "history pattern files")?
+                    .into_iter()
+                    .map(|id| (id, true)),
+            );
         }
         if unseen.is_empty() {
             return Ok(Adoption::default());
         }
         let mut files_read = 0usize;
-        let mut pool: Vec<KnowledgePattern> = Vec::new();
-        for id in &unseen {
+        // (pattern, in_history)
+        let mut pool: Vec<(KnowledgePattern, bool)> = Vec::new();
+        for (id, in_history) in &unseen {
             files_read += 1;
-            match self.read_pattern(id) {
-                Ok(Some(pattern)) => pool.push(pattern),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(pattern = %id, error = %e, "skipping unreadable pattern file"),
+            if let Some(pattern) = self.read_candidate(id, *in_history)? {
+                pool.push((pattern, *in_history));
             }
         }
         // The current head of every touched group takes part in the contest.
-        let touched: Vec<PatternIndexEntry> = pool.iter().map(PatternIndexEntry::of).collect();
+        let touched: Vec<PatternIndexEntry> = pool.iter().map(|(p, _)| PatternIndexEntry::of(p)).collect();
         let incumbents: Vec<PatternId> = index
             .entries
             .iter()
@@ -752,59 +882,49 @@ impl SkillLifecycleStore {
             .collect();
         for id in incumbents {
             files_read += 1;
-            pool.push(
-                self.read_pattern(&id)?
-                    .ok_or_else(|| invalid(format!("indexed pattern {id} is missing; rebuild the index")))?,
-            );
+            let located = self
+                .read_pattern_located(&id)?
+                .ok_or_else(|| invalid(format!("indexed pattern {id} is missing; rebuild the index")))?;
+            pool.push(located);
         }
-        let superseded: BTreeSet<PatternId> = pool.iter().flat_map(|p| p.supersedes.iter().cloned()).collect();
-        let mut dead: BTreeSet<PatternId> = superseded.clone();
-        let mut heads: Vec<&KnowledgePattern> = Vec::new();
-        for pattern in &pool {
-            if !superseded.contains(&pattern.pattern_id) {
-                heads.push(pattern);
-            }
-        }
-        heads.sort_by(|a, b| b.pattern_id.cmp(&a.pattern_id));
-        let mut winners: Vec<PatternIndexEntry> = Vec::new();
-        for head in heads {
+        let superseded: BTreeSet<PatternId> = pool.iter().flat_map(|(p, _)| p.supersedes.iter().cloned()).collect();
+        let mut heads: Vec<&(KnowledgePattern, bool)> = pool
+            .iter()
+            .filter(|(p, _)| !superseded.contains(&p.pattern_id))
+            .collect();
+        heads.sort_by(|a, b| (b.0.generation, &b.0.pattern_id).cmp(&(a.0.generation, &a.0.pattern_id)));
+        let mut winners: Vec<(PatternIndexEntry, bool)> = Vec::new();
+        for (head, in_history) in heads {
             let entry = PatternIndexEntry::of(head);
-            if winners.iter().any(|w| w.same_group(&entry)) {
-                dead.insert(head.pattern_id.clone());
+            if winners.iter().any(|(w, _)| w.same_group(&entry)) {
+                tracing::warn!(pattern = %head.pattern_id, "pattern lineage forked; the higher generation stays active");
             } else {
-                winners.push(entry);
+                winners.push((entry, *in_history));
             }
         }
-        let before: BTreeSet<PatternId> = index.entries.iter().map(|e| e.pattern_id.clone()).collect();
+        let before = index.entries.clone();
         index
             .entries
-            .retain(|entry| !dead.contains(&entry.pattern_id) && !winners.iter().any(|w| w.same_group(entry)));
-        index.entries.extend(winners);
-        let after: BTreeSet<PatternId> = index.entries.iter().map(|e| e.pattern_id.clone()).collect();
-        let mut history: BTreeSet<PatternId> = index.history.iter().cloned().collect();
-        history.extend(dead);
-        history.retain(|id| !after.contains(id));
-        // Every listed-but-unseen file is now either active or history.
-        history.extend(
-            pool.iter()
-                .map(|p| p.pattern_id.clone())
-                .filter(|id| !after.contains(id)),
-        );
-        if history.len() > MAX_HISTORY_IDS {
-            return Err(LifecycleError::KnowledgeLimit {
-                what: "superseded pattern ids the index remembers (pattern retention is required)",
-                limit: MAX_HISTORY_IDS,
-            });
+            .retain(|entry| !winners.iter().any(|(w, _)| w.same_group(entry)));
+        for (entry, in_history) in &winners {
+            if *in_history {
+                self.restore_pattern(&entry.pattern_id)?;
+            }
+            index.entries.push(entry.clone());
         }
-        let history: Vec<PatternId> = history.into_iter().collect();
-        let changed = before != after || history != index.history;
-        index.history = history;
+        let active: BTreeSet<&PatternId> = winners.iter().map(|(w, _)| &w.pattern_id).collect();
+        for (pattern, in_history) in &pool {
+            if !in_history && !active.contains(&pattern.pattern_id) {
+                self.move_pattern(&pattern.pattern_id, false, HISTORY_DIR)?;
+            }
+        }
+        let changed = before != index.entries;
         Ok(Adoption { changed, files_read })
     }
 
-    /// Rebuilds `patterns/index.json` from the pattern files (the index is only
-    /// a derived listing of the active pattern of each group). Returns the
-    /// number of active patterns indexed.
+    /// Rebuilds `patterns/index.json` from the pattern files, including
+    /// `patterns/history/` (the index is only a derived listing of the active
+    /// pattern of each group). Returns the number of active patterns indexed.
     pub fn rebuild_pattern_index(&self) -> Result<usize, LifecycleError> {
         let dir = self.patterns_dir();
         ensure_dir_synced(self.root(), &dir)?;
@@ -812,7 +932,7 @@ impl SkillLifecycleStore {
         let _store_lock = self.lock_store(true, KNOWLEDGE_LOCK_TIMEOUT)?;
         let _lock = self.lock_skill(&lock_id, KNOWLEDGE_LOCK_TIMEOUT)?;
         let mut index = PatternIndex::empty(self.owner_scope());
-        self.adopt_unindexed(&mut index)?;
+        self.adopt_unindexed(&mut index, true)?;
         self.write_pattern_index(&lock_id, &mut index)?;
         Ok(index.entries.len())
     }

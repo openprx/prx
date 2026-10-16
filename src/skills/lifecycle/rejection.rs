@@ -379,9 +379,9 @@ impl SkillLifecycleStore {
     /// one: same skill, operation, material fingerprint (derived here from
     /// `material`) and environment, and no new evidence. Evidence counts as new
     /// only when it exists, is this owner's, is eligible, did not end in
-    /// success, hydrated this skill (or is evidence of one of the rejected
-    /// attempt's own patterns) and no earlier rejection already had it;
-    /// made-up, unrelated or ineligible ids are ignored.
+    /// success, hydrated this skill, and neither the earlier rejections nor
+    /// the patterns they cite already had it; made-up, unrelated or ineligible
+    /// ids are ignored.
     /// Returns the rejection that suppresses the attempt.
     pub fn suppressing_rejection(
         &self,
@@ -402,30 +402,26 @@ impl SkillLifecycleStore {
         if matching.is_empty() {
             return Ok(None);
         }
-        let known: BTreeSet<&String> = matching.iter().flat_map(|r| r.evidence_ids.iter()).collect();
-        // Evidence the rejected attempt's own patterns rest on also counts.
-        let mut related: BTreeSet<String> = BTreeSet::new();
+        let mut known: BTreeSet<String> = matching.iter().flat_map(|r| r.evidence_ids.iter().cloned()).collect();
+        // Evidence the rejected attempt's own patterns rest on is known too.
         for pattern_id in matching.iter().flat_map(|r| r.pattern_ids.iter()) {
             if let Some(pattern) = self.read_pattern(pattern_id)? {
-                related.extend(pattern.evidence_ids);
+                known.extend(pattern.evidence_ids);
+                known.extend(pattern.counterevidence_ids);
             }
         }
+        // Anything beyond that lifts suppression only if it hydrated this
+        // skill, did not end in success, and is eligible.
         let same_skill = EvidenceUse {
             skill: Some(skill),
             requires_hydration: true,
-            rejects_success: true,
-        };
-        let by_pattern = EvidenceUse {
-            skill: None,
-            requires_hydration: false,
             rejects_success: true,
         };
         for id in evidence_ids {
             if known.contains(id) {
                 continue;
             }
-            let usage = if related.contains(id) { &by_pattern } else { &same_skill };
-            match self.usable_evidence(id, usage) {
+            match self.usable_evidence(id, &same_skill) {
                 Ok(_) => return Ok(None),
                 Err(e) if is_unusable(&e) => {}
                 Err(e) => return Err(e),
