@@ -98,6 +98,34 @@ for integration, validation and rollback limits.
   additional send. Full behavior, restart, performance and independent acceptance
   remain pending.
 
+- `[agent] tool_dispatcher` is removed because it was never read: the tool-call
+  wire form follows the provider's capabilities. A file that still carries it
+  loads with a deprecation warning and the value is ignored. Likewise
+  `[causal_tree.observability]` (`decision_log`, `metrics`, and the earlier
+  `write_decision_log` / `write_metrics`) is removed; a file that carries it
+  still loads, the keys are dropped and the load logs which. Decision events
+  follow the configured `[observability]` backend. See the
+  [upgrade actions](docs/migration-unreleased.md).
+
+- Skill lifecycle groundwork: immutable owner-scoped skill revisions, a
+  publication journal with generation compare-and-swap and rollback, and a
+  replay-safe import of existing skill directories. `skill_read` serves a
+  managed revision only for a caller that has a managed
+  binding; otherwise it reads the existing skill files exactly as before. No
+  command creates managed revisions in this candidate and nothing rewrites an
+  existing skill directory.
+
+### Fixed
+
+- A tool the user names exactly in a message (for example an MCP tool that
+  needs approval) now produces an approval request instead of a plain answer
+  when a verified approval scope exists. The override applies only to exact
+  mentions and still needs the bound call fingerprint, an approval channel and
+  a non-read-only turn; an unnamed tool never triggers it.
+- The PostgreSQL memory backend now counts useful recalls
+  (`increment_useful_count` incremented nothing before). An unknown id updates
+  nothing and is not an error, as in SQLite.
+
 ## [0.8.162] - 19 September 2026
 
 ### Fixed
