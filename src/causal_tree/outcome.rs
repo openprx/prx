@@ -800,15 +800,15 @@ fn usage_settlements_agree(
     marker: Option<&MeteredTokenUsageRecord>,
     receipt: Option<&MeteredTokenUsageRecord>,
 ) -> bool {
-    let identity = |usage: &MeteredTokenUsageRecord| {
+    fn identity(usage: &MeteredTokenUsageRecord) -> (Option<&str>, u64, u64, u64, Option<f64>) {
         (
-            usage.settlement_id.clone(),
+            usage.settlement_id.as_deref(),
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.total_tokens,
             usage.cost_usd,
         )
-    };
+    }
     marker.map(identity) == receipt.map(identity)
 }
 
