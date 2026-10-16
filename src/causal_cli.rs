@@ -515,7 +515,7 @@ impl DecisionSetup {
             if self.enable {
                 mutations.push(CausalMutation::SetEnabled(true));
             }
-            self.apply_mutations(config, mutations).await
+            self.apply_mutations(config, mutations, true).await
         }
         .await;
         match applied {
@@ -534,10 +534,10 @@ impl DecisionSetup {
 
     async fn apply_written(&self, config: Config) -> Result<String> {
         let mutations = self.mutations()?;
-        self.apply_mutations(config, mutations).await
+        self.apply_mutations(config, mutations, false).await
     }
 
-    async fn apply_mutations(&self, config: Config, mutations: Vec<CausalMutation>) -> Result<String> {
+    async fn apply_mutations(&self, config: Config, mutations: Vec<CausalMutation>, hosted: bool) -> Result<String> {
         let service = crate::config::manage::ManagementService::deferred(crate::config::new_shared(config));
         let plan = service
             .plan_causal(&mutations, crate::config::manage::ConfigActor::Cli)
@@ -545,7 +545,7 @@ impl DecisionSetup {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let text = plan.text();
         let revision = plan.revision().map(str::to_string);
-        if !self.confirms(&plan.summary().risk_reasons) {
+        if !self.confirms(&plan.summary().risk_reasons, hosted) {
             anyhow::bail!(
                 "the change is high risk beyond a local decision endpoint ({}), and setup never confirms it: review \
                  it with `prx causal config set backend --kind {}{}{}` and apply it with `--yes \
@@ -580,8 +580,9 @@ impl DecisionSetup {
 
     /// Whether setup may confirm `reasons` itself: none, or only the new
     /// decision endpoint (and the model declaration naming it) when that
-    /// endpoint is a literal loopback address.
-    fn confirms(&self, reasons: &[crate::config::manage::RiskReason]) -> bool {
+    /// endpoint is a literal loopback address, plus (hosted setup only) the
+    /// reference to the credential setup just stored.
+    fn confirms(&self, reasons: &[crate::config::manage::RiskReason], hosted: bool) -> bool {
         let loopback = self
             .endpoint
             .as_deref()
@@ -591,6 +592,10 @@ impl DecisionSetup {
                 loopback
                     && (path == "causal_tree.backend.endpoint"
                         || (path.starts_with("providers.models[") && path.ends_with("].provider")))
+            }
+            // The hosted flow stored this credential itself, one step before.
+            crate::config::manage::RiskReason::CredentialChanged { path } => {
+                hosted && path == "causal_tree.backend.credential_ref"
             }
             _ => false,
         })
