@@ -181,6 +181,13 @@ pub struct TerminalJoinOutcome {
     pub replayed: bool,
 }
 
+/// Whether `id` has the shape of an experience id: `exp-` + 32 lowercase hex digits.
+pub(super) fn is_experience_id(id: &str) -> bool {
+    id.strip_prefix("exp-").is_some_and(|digest| {
+        digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Deterministic experience id of `(owner, task)`.
 #[must_use]
 pub fn experience_id(owner: &OwnerScope, task_id: &str) -> String {
@@ -257,10 +264,7 @@ impl SkillLifecycleStore {
     /// does not exist. The record must belong to this owner and its id must be
     /// the one derived from its owner and task.
     pub fn read_experience_by_id(&self, id: &str) -> Result<Option<SkillExperience>, LifecycleError> {
-        let valid = id.strip_prefix("exp-").is_some_and(|digest| {
-            digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        });
-        if !valid {
+        if !is_experience_id(id) {
             return Err(LifecycleError::InvalidId {
                 kind: "experience id",
                 reason: "must be exp- followed by 32 lowercase hex digits".to_string(),

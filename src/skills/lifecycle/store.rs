@@ -29,7 +29,7 @@ const REVISIONS_DIR: &str = "revisions";
 pub(super) const STAGING_DIR: &str = "staging";
 const REVISION_FILE: &str = "revision.json";
 const BUNDLE_DIR: &str = "bundle";
-const MAX_RECORD_BYTES: u64 = 256 * 1024;
+pub(super) const MAX_RECORD_BYTES: u64 = 256 * 1024;
 
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;

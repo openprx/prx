@@ -12,7 +12,9 @@
 use super::types::{LifecycleError, OwnerScope, SCHEMA_VERSION, SkillId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
+use unicode_normalization::UnicodeNormalization;
 
 /// Evidence references kept per pattern (evidence and counterevidence each).
 pub const MAX_PATTERN_EVIDENCE: usize = 256;
@@ -217,8 +219,14 @@ pub struct KnowledgePattern {
     pub exceptions: Vec<String>,
     /// Experience ids that support the statement.
     pub evidence_ids: Vec<String>,
-    /// Experience ids that contradict it. Never removed by consolidation.
+    /// Experience ids that contradict it. Only removed by consolidation when
+    /// the experience stopped being eligible; then it moves to
+    /// `withdrawn_evidence`.
     pub counterevidence_ids: Vec<String>,
+    /// Evidence (either side) carried over from an earlier pattern that later
+    /// became ineligible (dropped, deleted by retention). Kept for audit,
+    /// cumulative, sorted and de-duplicated; it never counts as support.
+    pub withdrawn_evidence: Vec<String>,
     /// Patterns this one replaces.
     pub supersedes: Vec<PatternId>,
     pub confidence_basis: ConfidenceBasis,
@@ -226,6 +234,55 @@ pub struct KnowledgePattern {
 }
 
 impl KnowledgePattern {
+    /// Digest of everything that defines the pattern except its own identity,
+    /// predecessor link and creation time. The pattern id is derived from it
+    /// and re-derived on every read.
+    #[must_use]
+    pub fn content_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"prx-knowledge-pattern-v2\0");
+        let class = format!("{:?}", self.failure_class);
+        let basis = [
+            self.confidence_basis.evidence_count,
+            self.confidence_basis.counterevidence_count,
+            self.confidence_basis.distinct_tasks,
+            self.confidence_basis.counter_distinct_tasks,
+        ]
+        .map(|n| n.to_string());
+        let lists: [(&str, &[String]); 7] = [
+            ("capabilities", &self.scope.capabilities),
+            ("applicability", &self.applicability),
+            ("exceptions", &self.exceptions),
+            ("evidence", &self.evidence_ids),
+            ("counter", &self.counterevidence_ids),
+            ("withdrawn", &self.withdrawn_evidence),
+            ("basis", &basis),
+        ];
+        let skill = self.skill_id.as_ref().map(SkillId::as_str).unwrap_or_default();
+        let mut feed = |part: &str| {
+            hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(part.as_bytes());
+        };
+        for part in [
+            self.owner_scope.as_str(),
+            &self.task_family,
+            &class,
+            skill,
+            &self.scope.environment,
+            &self.statement,
+        ] {
+            feed(part);
+        }
+        for (name, items) in lists {
+            feed(name);
+            feed(&items.len().to_string());
+            for item in items {
+                feed(item);
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+
     /// Whether the pattern may back a skill revision proposal: it is guidance
     /// about a skill, supported by enough distinct tasks, and the contradicting
     /// evidence does not reach the supporting evidence. A one-off incident, a
@@ -248,11 +305,50 @@ pub struct PatternIndexEntry {
     pub failure_class: FailureClass,
     pub skill_id: Option<SkillId>,
     pub scope: PatternScope,
-    /// Set when a later pattern superseded this one.
-    pub superseded_by: Option<PatternId>,
+    /// Digest of the normalised statement: two patterns of one group are
+    /// revisions of the same lesson; different lessons are different groups.
+    pub statement_key: String,
 }
 
-/// Derived listing of patterns; rebuildable from the pattern files.
+impl PatternIndexEntry {
+    pub(super) fn of(pattern: &KnowledgePattern) -> Self {
+        Self {
+            pattern_id: pattern.pattern_id.clone(),
+            task_family: pattern.task_family.clone(),
+            failure_class: pattern.failure_class,
+            skill_id: pattern.skill_id.clone(),
+            scope: pattern.scope.clone(),
+            statement_key: statement_key(&pattern.statement),
+        }
+    }
+
+    /// Whether both describe the same lesson in the same place.
+    pub(super) fn same_group(&self, other: &Self) -> bool {
+        self.task_family == other.task_family
+            && self.failure_class == other.failure_class
+            && self.skill_id == other.skill_id
+            && self.scope == other.scope
+            && self.statement_key == other.statement_key
+    }
+}
+
+/// Group identity of a statement: NFC, lowercase, whitespace collapsed.
+/// Punctuation and wording stay, so a different lesson is a different group.
+#[must_use]
+pub(super) fn statement_key(statement: &str) -> String {
+    let normalised: String = statement
+        .nfc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let digest = hex::encode(Sha256::digest(normalised.as_bytes()));
+    digest.get(..32).unwrap_or(&digest).to_string()
+}
+
+/// Derived listing of the active patterns (one per group); rebuildable from
+/// the pattern files. History is not listed: it is reached through `supersedes`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternIndex {

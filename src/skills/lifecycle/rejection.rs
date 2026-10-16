@@ -6,7 +6,9 @@
 //! publication, rollback or disable touches them: a rejected proposal's history
 //! survives every later change of the active revision.
 
-use super::consolidate::check_field;
+use super::consolidate::{
+    EvidenceUse, check_evidence_id, check_ident, check_text, is_unusable, reserved_lock, sorted_unique,
+};
 use super::generation::ensure_dir_synced;
 use super::knowledge::{MAX_ITEM_BYTES, MAX_LIST_ITEMS, MAX_NAME_BYTES, MAX_PATTERN_EVIDENCE, PatternId};
 use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes};
@@ -21,8 +23,19 @@ use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
 pub(super) const REJECTIONS_DIR: &str = "rejections";
-const REJECTION_LOCK_ID: &str = "knowledge-rejections";
+/// Reserved lock identity (see `SkillId::reserved`): no skill id can equal it.
+const REJECTION_LOCK_ID: &str = "_knowledge-rejections";
+/// Rejection files one listing will read; past this a typed error.
+const MAX_REJECTION_FILES: usize = 1024;
+const MAX_MATERIAL_TEXTS: usize = 16;
+const MAX_MATERIAL_BYTES: usize = 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+const NO_REQUIREMENTS: EvidenceUse<'static> = EvidenceUse {
+    skill: None,
+    requires_hydration: false,
+    rejects_success: false,
+};
 
 /// What a proposal would do to its skill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,24 +46,79 @@ pub enum ProposalOperation {
     Disable,
 }
 
-/// Digest of the material content of a proposal: the words of the given texts
-/// (the changed instruction text), ignoring case, whitespace, punctuation and
-/// markdown decoration, so a re-worded layout of the same change is the same
-/// proposal while a different instruction is not.
+/// Digest of the material content of a proposal: the tokens of the given
+/// texts (the changed instruction text). Only layout is normalised: case,
+/// whitespace, markdown markers (heading, list and quote prefixes, emphasis
+/// marks around a word) and sentence punctuation after a word. Punctuation
+/// inside a token and everything inside a code span is content (`x != y`,
+/// `1.5s`, `rm -rf ./build` stay distinct from `x == y`, `15s`, `rm rf build`).
 #[must_use]
 pub fn material_digest(texts: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"prx-proposal-material\0");
+    hasher.update(b"prx-proposal-material-v2\0");
     for text in texts {
-        let normalised: String = text
-            .nfc()
-            .flat_map(char::to_lowercase)
-            .filter(|c| c.is_alphanumeric())
-            .collect();
-        hasher.update(u64::try_from(normalised.len()).unwrap_or(u64::MAX).to_be_bytes());
-        hasher.update(normalised.as_bytes());
+        let tokens = material_tokens(text);
+        hasher.update(u64::try_from(tokens.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for token in tokens {
+            hasher.update(u64::try_from(token.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(token.as_bytes());
+        }
     }
     hex::encode(hasher.finalize())
+}
+
+fn is_line_marker(token: &str) -> bool {
+    matches!(token, "-" | "*" | "+" | ">")
+        || (!token.is_empty() && token.len() <= 6 && token.bytes().all(|b| b == b'#'))
+        || token
+            .strip_suffix(['.', ')'])
+            .is_some_and(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn material_tokens(text: &str) -> Vec<String> {
+    const MARKS: &[char] = &['*', '_', '~'];
+    const SENTENCE: &[char] = &['.', ',', ';', ':', '!', '?'];
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_is_code = false;
+    let mut in_code = false;
+    let mut first_on_line = true;
+    let mut flush = |current: &mut String, is_code: bool, first_on_line: &mut bool| {
+        if current.is_empty() {
+            return;
+        }
+        let raw = std::mem::take(current);
+        if is_code {
+            tokens.push(raw);
+        } else if !(*first_on_line && is_line_marker(&raw)) {
+            let trimmed = raw
+                .trim_start_matches(MARKS)
+                .trim_end_matches(|c| MARKS.contains(&c) || SENTENCE.contains(&c))
+                .trim_end_matches(MARKS);
+            if !trimmed.is_empty() {
+                tokens.push(trimmed.to_string());
+            }
+        }
+        *first_on_line = false;
+    };
+    for c in text.nfc().flat_map(char::to_lowercase) {
+        if c == '`' {
+            flush(&mut current, current_is_code, &mut first_on_line);
+            in_code = !in_code;
+        } else if c.is_whitespace() {
+            flush(&mut current, current_is_code, &mut first_on_line);
+            if c == '\n' && !in_code {
+                first_on_line = true;
+            }
+        } else {
+            if current.is_empty() {
+                current_is_code = in_code;
+            }
+            current.push(c);
+        }
+    }
+    flush(&mut current, current_is_code, &mut first_on_line);
+    tokens
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,11 +145,27 @@ pub struct NewRejection {
     pub proposal_id: String,
     pub operation: ProposalOperation,
     pub skill_id: SkillId,
-    pub fingerprint: String,
+    /// The changed instruction texts of the proposal. The store derives the
+    /// material fingerprint from them; callers do not supply one.
+    pub material: Vec<String>,
     pub pattern_ids: Vec<PatternId>,
     pub evidence_ids: Vec<String>,
     pub environment_binding: String,
     pub reasons: Vec<String>,
+}
+
+fn check_material(texts: &[&str]) -> Result<String, LifecycleError> {
+    if texts.is_empty() || texts.len() > MAX_MATERIAL_TEXTS || texts.iter().any(|t| t.len() > MAX_MATERIAL_BYTES) {
+        return Err(LifecycleError::InvalidKnowledge(format!(
+            "a proposal needs 1..={MAX_MATERIAL_TEXTS} material texts of at most {MAX_MATERIAL_BYTES} bytes"
+        )));
+    }
+    if texts.iter().all(|t| material_tokens(t).is_empty()) {
+        return Err(LifecycleError::InvalidKnowledge(
+            "the proposal material has no content".to_string(),
+        ));
+    }
+    Ok(material_digest(texts))
 }
 
 fn record_id_of(proposal_id: &str, owner: &OwnerScope) -> String {
@@ -97,9 +181,8 @@ fn record_id_of(proposal_id: &str, owner: &OwnerScope) -> String {
 
 impl NewRejection {
     fn validate(&self) -> Result<(), LifecycleError> {
-        check_field("proposal id", &self.proposal_id, MAX_NAME_BYTES)?;
-        check_field("fingerprint", &self.fingerprint, MAX_NAME_BYTES)?;
-        check_field("environment binding", &self.environment_binding, MAX_NAME_BYTES)?;
+        check_ident("proposal id", &self.proposal_id, MAX_NAME_BYTES)?;
+        check_ident("environment binding", &self.environment_binding, MAX_NAME_BYTES)?;
         if self.reasons.is_empty() || self.reasons.len() > MAX_LIST_ITEMS {
             return Err(LifecycleError::InvalidKnowledge(
                 "a rejection needs between 1 and 16 reasons".to_string(),
@@ -107,13 +190,11 @@ impl NewRejection {
         }
         self.reasons
             .iter()
-            .try_for_each(|reason| check_field("reason", reason, MAX_ITEM_BYTES))?;
+            .try_for_each(|reason| check_text("reason", reason, MAX_ITEM_BYTES))?;
         if self.evidence_ids.len() > MAX_PATTERN_EVIDENCE || self.pattern_ids.len() > MAX_PATTERN_EVIDENCE {
             return Err(LifecycleError::InvalidKnowledge("too many references".to_string()));
         }
-        self.evidence_ids
-            .iter()
-            .try_for_each(|id| check_field("evidence id", id, MAX_NAME_BYTES))
+        self.evidence_ids.iter().try_for_each(|id| check_evidence_id(id))
     }
 }
 
@@ -127,7 +208,18 @@ impl SkillLifecycleStore {
     /// record is never overwritten). Every referenced pattern must exist.
     pub fn record_rejection(&self, new: &NewRejection) -> Result<RejectionRecord, LifecycleError> {
         new.validate()?;
-        for pattern in &new.pattern_ids {
+        let material: Vec<&str> = new.material.iter().map(String::as_str).collect();
+        let fingerprint = check_material(&material)?;
+        let evidence = sorted_unique(&new.evidence_ids);
+        // Evidence that does not exist, is not this owner's, or is not
+        // eligible cannot be recorded: it would later pose as "already known".
+        for id in &evidence {
+            self.usable_evidence(id, &NO_REQUIREMENTS)?;
+        }
+        let mut pattern_ids = new.pattern_ids.clone();
+        pattern_ids.sort();
+        pattern_ids.dedup();
+        for pattern in &pattern_ids {
             if self.read_pattern(pattern)?.is_none() {
                 return Err(LifecycleError::InvalidKnowledge(format!(
                     "rejection references unknown pattern {pattern}"
@@ -136,14 +228,11 @@ impl SkillLifecycleStore {
         }
         let dir = self.rejections_dir();
         ensure_dir_synced(self.root(), &dir)?;
-        let lock_id = SkillId::parse(REJECTION_LOCK_ID)?;
+        let lock_id = reserved_lock(REJECTION_LOCK_ID)?;
         let _store_lock = self.lock_store(true, LOCK_TIMEOUT)?;
         let _lock = self.lock_skill(&lock_id, LOCK_TIMEOUT)?;
         let id = record_id_of(&new.proposal_id, self.owner_scope());
         let path = dir.join(format!("{id}.json"));
-        let mut evidence = new.evidence_ids.clone();
-        evidence.sort();
-        evidence.dedup();
         let record = RejectionRecord {
             schema_version: SCHEMA_VERSION,
             record_id: id.clone(),
@@ -151,11 +240,11 @@ impl SkillLifecycleStore {
             proposal_id: new.proposal_id.clone(),
             operation: new.operation,
             skill_id: new.skill_id.clone(),
-            fingerprint: new.fingerprint.clone(),
-            pattern_ids: new.pattern_ids.clone(),
+            fingerprint,
+            pattern_ids,
             evidence_ids: evidence,
             environment_binding: new.environment_binding.clone(),
-            reasons: new.reasons.clone(),
+            reasons: sorted_unique(&new.reasons),
             rejected_at: Utc::now(),
         };
         if let Some(existing) = self.read_rejection_file(&path, &id)? {
@@ -221,14 +310,24 @@ impl SkillLifecycleStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(LifecycleError::io(&dir, e)),
         };
-        let mut records = Vec::new();
+        let mut files = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_suffix(".json").filter(|id| id.starts_with("rej-")) else {
                 continue;
             };
-            if let Some(record) = self.read_rejection_file(&entry.path(), id)?
+            if files.len() >= MAX_REJECTION_FILES {
+                return Err(LifecycleError::KnowledgeLimit {
+                    what: "rejection files",
+                    limit: MAX_REJECTION_FILES,
+                });
+            }
+            files.push((entry.path(), id.to_string()));
+        }
+        let mut records = Vec::new();
+        for (path, id) in files {
+            if let Some(record) = self.read_rejection_file(&path, &id)?
                 && record.skill_id == *skill
             {
                 records.push(record);
@@ -243,17 +342,20 @@ impl SkillLifecycleStore {
     }
 
     /// Whether a new attempt is a materially equivalent repeat of a rejected
-    /// one: same skill, operation, fingerprint and environment, and no evidence
-    /// the earlier attempts did not already have. Returns the rejection that
-    /// suppresses it.
+    /// one: same skill, operation, material fingerprint (derived here from
+    /// `material`) and environment, and no new evidence. Evidence counts as new
+    /// only when it exists, is this owner's, is eligible and no earlier
+    /// rejection already had it; made-up or ineligible ids are ignored.
+    /// Returns the rejection that suppresses the attempt.
     pub fn suppressing_rejection(
         &self,
         skill: &SkillId,
         operation: ProposalOperation,
-        fingerprint: &str,
+        material: &[&str],
         evidence_ids: &[String],
         environment_binding: &str,
     ) -> Result<Option<RejectionRecord>, LifecycleError> {
+        let fingerprint = check_material(material)?;
         let matching: Vec<RejectionRecord> = self
             .rejections_for(skill)?
             .into_iter()
@@ -261,9 +363,19 @@ impl SkillLifecycleStore {
                 r.operation == operation && r.fingerprint == fingerprint && r.environment_binding == environment_binding
             })
             .collect();
-        let known: BTreeSet<&String> = matching.iter().flat_map(|r| r.evidence_ids.iter()).collect();
-        if matching.is_empty() || evidence_ids.iter().any(|id| !known.contains(id)) {
+        if matching.is_empty() {
             return Ok(None);
+        }
+        let known: BTreeSet<&String> = matching.iter().flat_map(|r| r.evidence_ids.iter()).collect();
+        for id in evidence_ids {
+            if known.contains(id) {
+                continue;
+            }
+            match self.usable_evidence(id, &NO_REQUIREMENTS) {
+                Ok(_) => return Ok(None),
+                Err(e) if is_unusable(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(matching.into_iter().next())
     }
