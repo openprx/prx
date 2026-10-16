@@ -92,8 +92,9 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
 /// The credential reference `prx providers credential set <provider>` stores
 /// under its default name (`cred-<catalog name>`), when the configured default
 /// provider has one and it was issued for that provider. Used only when the
-/// root holds nothing, so the precedence is: inline root key, then
-/// `cred-<name>`, then the provider's own store. A missing or foreign
+/// root holds no connection material, so the precedence is: any root
+/// `api_key`, rotation key or `api_url`, then `cred-<name>`, then the
+/// provider's own store. A missing or foreign
 /// reference means no reference. An unreadable store is reported with a
 /// warning (never the value) and falls back to the provider store. The store
 /// is read on each call, not cached, so a credential stored a moment ago is
