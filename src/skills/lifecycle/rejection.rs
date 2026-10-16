@@ -399,6 +399,44 @@ impl SkillLifecycleStore {
                 r.operation == operation && r.fingerprint == fingerprint && r.environment_binding == environment_binding
             })
             .collect();
+        self.first_unlifted(skill, matching, evidence_ids)
+    }
+
+    /// Like [`Self::suppressing_rejection`], for the moment before a proposal
+    /// is generated, when there is no material to fingerprint yet: an attempt
+    /// from the same patterns in the same environment as a rejected one, with
+    /// no new evidence, would be answered by the same model with the same
+    /// input and is suppressed before any model call is paid for. A pattern
+    /// that gained evidence is a new immutable pattern id, so it never matches.
+    pub(super) fn suppressing_attempt(
+        &self,
+        skill: &SkillId,
+        operation: ProposalOperation,
+        pattern_ids: &[PatternId],
+        evidence_ids: &[String],
+        environment_binding: &str,
+    ) -> Result<Option<RejectionRecord>, LifecycleError> {
+        let mut wanted = pattern_ids.to_vec();
+        wanted.sort();
+        wanted.dedup();
+        let matching: Vec<RejectionRecord> = self
+            .rejections_for(skill)?
+            .into_iter()
+            .filter(|r| {
+                r.operation == operation && r.environment_binding == environment_binding && r.pattern_ids == wanted
+            })
+            .collect();
+        self.first_unlifted(skill, matching, evidence_ids)
+    }
+
+    /// The first of `matching` when no evidence in `evidence_ids` lifts the
+    /// suppression, `None` when `matching` is empty or new evidence exists.
+    fn first_unlifted(
+        &self,
+        skill: &SkillId,
+        matching: Vec<RejectionRecord>,
+        evidence_ids: &[String],
+    ) -> Result<Option<RejectionRecord>, LifecycleError> {
         if matching.is_empty() {
             return Ok(None);
         }

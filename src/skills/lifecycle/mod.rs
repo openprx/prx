@@ -22,6 +22,9 @@ mod journal;
 mod knowledge;
 mod manifest;
 mod migrate;
+mod proposal;
+mod propose;
+mod proposer_model;
 mod publish;
 mod rejection;
 mod store;
@@ -53,6 +56,18 @@ pub use knowledge::{
 };
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
+pub use proposal::{
+    AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
+    MAX_PROPOSAL_ATTEMPTS, MAX_PROPOSAL_LISTING, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus,
+    SkillProposal,
+};
+pub use propose::{
+    MAX_EDIT_PERCENT, MAX_EDIT_TOKENS, MAX_EDITS, MAX_PROPOSAL_PATTERNS, ProposeOutcome, ProposeRequest,
+    ProposerBudget, SYSTEM_PROMPT_VERSION, SuppressionStage, propose_revision,
+};
+pub use proposer_model::{
+    ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage,
+};
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
