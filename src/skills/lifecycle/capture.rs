@@ -16,16 +16,23 @@
 //! receipt and are never forced equal or inferred from each other.
 //!
 //! Every update runs under the store's shared lock and the experience's own
-//! exclusive lock, and replaces the record atomically.
+//! exclusive lock, and replaces the record atomically. Locks are taken with a
+//! short bound ([`CAPTURE_LOCK_TIMEOUT`]) so capture can never stall a read or a
+//! task terminal for long; when an update cannot be written, the task is marked
+//! as having dropped evidence through a lock-free path (a marker file plus an
+//! in-process flag) that the terminal join consults.
 
 use super::generation::ensure_dir_synced;
-use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes};
+use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
 use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId};
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 pub(super) const EXPERIENCES_DIR: &str = "experiences";
@@ -33,7 +40,15 @@ pub(super) const EXPERIENCES_DIR: &str = "experiences";
 pub const MAX_SELECTION_RECEIPTS: usize = 64;
 /// Hydration receipts kept per experience; further ones are counted as dropped.
 pub const MAX_HYDRATION_RECEIPTS: usize = 256;
-const CAPTURE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on each of the two locks a capture update takes (so at most about a
+/// second in total).
+pub const CAPTURE_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+const DROPPED_MARKER_SUFFIX: &str = ".dropped";
+/// Tasks remembered as having dropped evidence in this process, as a fallback
+/// when even the marker file cannot be written.
+const MAX_REMEMBERED_DROPPED: usize = 1024;
+
+static DROPPED_TASKS: LazyLock<Mutex<VecDeque<String>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 const MAX_ID_BYTES: usize = 256;
 
 /// Outcome of a task as reported by its terminal.
@@ -54,8 +69,28 @@ pub enum ExperienceOutcome {
 #[serde(deny_unknown_fields)]
 pub struct Correlation {
     pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub parent_run_id: Option<String>,
     pub segment_id: Option<String>,
     pub child_id: Option<String>,
+}
+
+impl Correlation {
+    /// Fills identities this correlation does not have yet; an identity that
+    /// is already set is never overwritten.
+    fn fill_missing(&mut self, other: &Self) {
+        for (mine, theirs) in [
+            (&mut self.run_id, &other.run_id),
+            (&mut self.task_id, &other.task_id),
+            (&mut self.parent_run_id, &other.parent_run_id),
+            (&mut self.segment_id, &other.segment_id),
+            (&mut self.child_id, &other.child_id),
+        ] {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +136,10 @@ pub struct SkillExperience {
     pub record_id: String,
     pub owner_scope: OwnerScope,
     pub task_id: String,
+    /// Identities seen on the receipts, first value wins; each receipt keeps
+    /// its own too.
+    #[serde(default)]
+    pub correlation: Correlation,
     pub selection_receipts: Vec<SelectionReceipt>,
     pub hydration_receipts: Vec<HydrationReceipt>,
     pub terminal: Option<TerminalJoin>,
@@ -155,6 +194,10 @@ pub fn experience_id(owner: &OwnerScope, task_id: &str) -> String {
     format!("exp-{}", digest.get(..32).unwrap_or(&digest))
 }
 
+fn dropped_key(owner: &OwnerScope, task_id: &str) -> String {
+    experience_id(owner, task_id)
+}
+
 fn check_text(what: &'static str, value: &str) -> Result<(), LifecycleError> {
     if value.is_empty() || value.len() > MAX_ID_BYTES || value.chars().any(char::is_control) {
         return Err(LifecycleError::InvalidId {
@@ -168,6 +211,8 @@ fn check_text(what: &'static str, value: &str) -> Result<(), LifecycleError> {
 fn check_correlation(correlation: &Correlation) -> Result<(), LifecycleError> {
     for (what, value) in [
         ("run id", &correlation.run_id),
+        ("task id", &correlation.task_id),
+        ("parent run id", &correlation.parent_run_id),
         ("segment id", &correlation.segment_id),
         ("child id", &correlation.child_id),
     ] {
@@ -207,6 +252,10 @@ impl SkillLifecycleStore {
                 reason: "experience identity does not match its location".to_string(),
             });
         }
+        let mut record = record;
+        if record.dropped_evidence == 0 && self.evidence_marked_dropped(&record.record_id, task_id) {
+            record.dropped_evidence = 1;
+        }
         Ok(Some(record))
     }
 
@@ -228,6 +277,7 @@ impl SkillLifecycleStore {
             selected_at: Utc::now(),
         };
         self.update_experience(task_id, |record| {
+            record.correlation.fill_missing(correlation);
             if record.terminal.is_some() {
                 record.late_evidence = record.late_evidence.saturating_add(1);
             } else if record.selection_receipts.len() >= MAX_SELECTION_RECEIPTS {
@@ -262,6 +312,7 @@ impl SkillLifecycleStore {
             hydrated_at: Utc::now(),
         };
         self.update_experience(task_id, |record| {
+            record.correlation.fill_missing(correlation);
             if record.terminal.is_some() {
                 record.late_evidence = record.late_evidence.saturating_add(1);
             } else if record.hydration_receipts.len() >= MAX_HYDRATION_RECEIPTS {
@@ -274,14 +325,45 @@ impl SkillLifecycleStore {
         .map(|(record, _)| record)
     }
 
-    /// Notes that evidence for `task_id` could not be recorded (for example a
-    /// capture failure), so the experience cannot support a learning claim.
-    pub fn record_dropped_evidence(&self, task_id: &str) -> Result<SkillExperience, LifecycleError> {
-        self.update_experience(task_id, |record| {
-            record.dropped_evidence = record.dropped_evidence.saturating_add(1);
-            Ok(None)
-        })
-        .map(|(record, _)| record)
+    /// Notes that evidence for `task_id` could not be recorded (a failed or
+    /// timed-out capture), so the experience cannot support a learning claim.
+    ///
+    /// Takes no store or experience lock, so it works exactly when the locked
+    /// update path has failed: it writes a marker file next to the record and
+    /// remembers the task in this process. [`Self::read_experience`] and the
+    /// terminal join fold the mark into `dropped_evidence`.
+    pub fn mark_dropped_evidence(&self, task_id: &str) {
+        let key = dropped_key(self.owner_scope(), task_id);
+        {
+            let mut remembered = DROPPED_TASKS.lock();
+            if !remembered.contains(&key) {
+                if remembered.len() >= MAX_REMEMBERED_DROPPED {
+                    remembered.pop_front();
+                }
+                remembered.push_back(key);
+            }
+        }
+        let id = experience_id(self.owner_scope(), task_id);
+        let dir = self.root().join(EXPERIENCES_DIR);
+        let marker = dir.join(format!("{id}{DROPPED_MARKER_SUFFIX}"));
+        let written = ensure_dir_synced(self.root(), &dir).and_then(|()| {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(LifecycleError::io(&marker, e)),
+            }
+        });
+        if let Err(error) = written {
+            tracing::warn!(%error, task_id, "could not write the dropped-evidence marker; relying on the in-process flag");
+        }
+    }
+
+    fn evidence_marked_dropped(&self, id: &str, task_id: &str) -> bool {
+        let marker = self
+            .root()
+            .join(EXPERIENCES_DIR)
+            .join(format!("{id}{DROPPED_MARKER_SUFFIX}"));
+        fs::symlink_metadata(marker).is_ok() || DROPPED_TASKS.lock().contains(&dropped_key(self.owner_scope(), task_id))
     }
 
     /// Joins the task terminal. Idempotent for the identical terminal; any other
@@ -345,11 +427,12 @@ impl SkillLifecycleStore {
             record_id: id.clone(),
             owner_scope: self.owner_scope().clone(),
             task_id: task_id.to_string(),
+            correlation: Correlation::default(),
             selection_receipts: Vec::new(),
             hydration_receipts: Vec::new(),
             terminal: None,
             outcome: ExperienceOutcome::Incomplete,
-            dropped_evidence: 0,
+            dropped_evidence: u32::from(self.evidence_marked_dropped(&id, task_id)),
             late_evidence: 0,
             created_at: now,
             updated_at: now,
@@ -367,9 +450,22 @@ impl SkillLifecycleStore {
 
 /// Key an experience and its pins are filed under: the run id when there is
 /// one (a terminal belongs to a run; a recurring task reuses its task id across
-/// runs), else the task id. `None` when neither is present or usable.
+/// runs), else the task id. `None` when neither is present or usable. Values
+/// are trimmed.
+///
+/// This is the key contract every producer of experience evidence must use, so
+/// that selection, hydration, pins and the terminal agree: the key comes from
+/// this function, and the owner from the trusted owner id of the same scope
+/// through `OwnerScope::new`. A child (a scope with a parent run) is keyed by
+/// its own run, never by a task id it might share with the parent. The
+/// selection receipts of finding 84 must reuse both.
 #[must_use]
-pub fn task_key(task_id: Option<&str>, run_id: Option<&str>) -> Option<String> {
+pub fn task_key(task_id: Option<&str>, run_id: Option<&str>, parent_run_id: Option<&str>) -> Option<String> {
+    let task_id = if parent_run_id.is_some_and(|parent| !parent.trim().is_empty()) {
+        None
+    } else {
+        task_id
+    };
     [run_id, task_id]
         .into_iter()
         .flatten()
@@ -395,21 +491,98 @@ pub fn on_task_terminal(
     owner: &OwnerScope,
     terminal: &TaskTerminal<'_>,
 ) -> Result<Option<TerminalJoinOutcome>, LifecycleError> {
-    let joined = match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
+    // Pins first: whatever happens to the join, the task no longer needs them.
+    super::binding::release_task_pins(owner, terminal.task_id);
+    match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
         Ok(Some(store)) => {
             // A task that never touched a managed skill has no experience and
             // needs none; do not create an empty record for it.
-            match store.read_experience(terminal.task_id) {
-                Ok(Some(_)) => store
+            match store.read_experience(terminal.task_id)? {
+                Some(_) => store
                     .join_terminal(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome)
                     .map(Some),
-                Ok(None) => Ok(None),
-                Err(e) => Err(e),
+                None => Ok(None),
             }
         }
         Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) => Ok(None),
         Err(e) => Err(e),
-    };
-    super::binding::release_task_pins(owner, terminal.task_id);
-    joined
+    }
+}
+
+/// Retention of experiences, applied by [`SkillLifecycleStore::prune_experiences`].
+#[derive(Clone, Copy, Debug)]
+pub struct ExperienceRetention {
+    /// Age after which a joined (terminal) experience may be removed.
+    pub terminal_max_age: chrono::Duration,
+    /// Age after which an experience that never got a terminal may be removed.
+    pub incomplete_max_age: chrono::Duration,
+}
+
+impl SkillLifecycleStore {
+    /// Removes experiences past `retention`, together with their dropped-evidence
+    /// markers and lock files; returns how many experiences were removed.
+    ///
+    /// Takes the store lock exclusively, which excludes every capture update (they
+    /// hold it shared), so a lock file is never deleted while someone waits on it.
+    /// `keep` protects experiences that retained evidence still references (the
+    /// SL04 consolidation passes its references there). The retention values come
+    /// from the existing evolution retention settings; wiring them is SL04/SL09
+    /// (spec section 7, "Default proposals use existing evolution retention
+    /// settings for unreferenced experiences").
+    pub fn prune_experiences(
+        &self,
+        retention: &ExperienceRetention,
+        now: DateTime<Utc>,
+        keep: impl Fn(&SkillExperience) -> bool,
+    ) -> Result<usize, LifecycleError> {
+        let dir = self.root().join(EXPERIENCES_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(LifecycleError::io(&dir, e)),
+        };
+        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json").filter(|id| id.starts_with("exp-")) else {
+                continue;
+            };
+            let record: SkillExperience = match read_record(&entry.path()) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(%error, entry = %entry.path().display(), "skipping an unreadable experience during pruning");
+                    continue;
+                }
+            };
+            if record.record_id != id || record.owner_scope != *self.owner_scope() || keep(&record) {
+                continue;
+            }
+            let (since, max_age) = record
+                .terminal
+                .as_ref()
+                .map_or((record.updated_at, retention.incomplete_max_age), |terminal| {
+                    (terminal.joined_at, retention.terminal_max_age)
+                });
+            if now.signed_duration_since(since) < max_age {
+                continue;
+            }
+            for path in [
+                entry.path(),
+                dir.join(format!("{id}{DROPPED_MARKER_SUFFIX}")),
+                self.root().join("locks").join(format!("{id}.lock")),
+            ] {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(LifecycleError::io(&path, e)),
+                }
+            }
+            DROPPED_TASKS.lock().retain(|key| key != id);
+            removed += 1;
+        }
+        sync_dir(&dir)?;
+        Ok(removed)
+    }
 }

@@ -2,9 +2,9 @@
 
 use super::{activate, entry, md, owner};
 use crate::skills::lifecycle::{
-    Bundle, Correlation, ExperienceOutcome, LifecycleError, MAX_HYDRATION_RECEIPTS, MAX_SELECTION_RECEIPTS,
-    ManagedReadRequest, NewRevision, PinnedSkillRevision, SkillId, SkillLifecycleStore, SourceKind, TaskTerminal,
-    experience_id, on_task_terminal, read_managed_resource, task_pin,
+    Bundle, Correlation, ExperienceOutcome, ExperienceRetention, LifecycleError, MAX_HYDRATION_RECEIPTS,
+    MAX_SELECTION_RECEIPTS, ManagedReadRequest, NewRevision, PinnedSkillRevision, SkillId, SkillLifecycleStore,
+    SourceKind, TaskTerminal, experience_id, on_task_terminal, read_managed_resource, task_key, task_pin,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -42,6 +42,7 @@ fn corr(run: &str, segment: &str, child: &str) -> Correlation {
         run_id: Some(run.to_string()),
         segment_id: Some(segment.to_string()),
         child_id: Some(child.to_string()),
+        ..Correlation::default()
     }
 }
 
@@ -382,4 +383,153 @@ fn managed_reads_capture_hydration_for_the_trusted_task() {
     .expect("test: read");
     assert!(anonymous.is_some());
     assert!(store.read_experience("task-none").expect("test: read").is_none());
+}
+
+#[test]
+fn the_key_contract_is_run_first_trimmed_and_child_safe() {
+    assert_eq!(task_key(Some("task"), Some("run"), None).as_deref(), Some("run"));
+    assert_eq!(task_key(Some("task"), None, None).as_deref(), Some("task"));
+    assert_eq!(task_key(Some("task"), Some("  "), None).as_deref(), Some("task"));
+    assert_eq!(task_key(Some(" task "), None, None).as_deref(), Some("task"));
+    assert_eq!(task_key(None, None, None), None);
+    assert_eq!(task_key(Some(" "), Some(""), None), None);
+    // A child is keyed by its own run, never by a task id shared with its parent.
+    assert_eq!(
+        task_key(Some("task"), Some("child"), Some("parent")).as_deref(),
+        Some("child")
+    );
+    assert_eq!(task_key(Some("task"), None, Some("parent")), None);
+    // The owner is the trusted owner id through `OwnerScope::new`; the experience
+    // id depends on both.
+    let alice = owner(OWNER);
+    assert_ne!(
+        experience_id(&alice, "run-1"),
+        experience_id(&owner("owner:ws:cli:bob"), "run-1")
+    );
+    assert_ne!(experience_id(&alice, "run-1"), experience_id(&alice, "run-2"));
+    assert!(crate::skills::lifecycle::OwnerScope::new(" owner").is_err());
+}
+
+#[test]
+fn receipts_and_the_experience_keep_every_identity_as_authored() {
+    let (_tmp, store, pin) = setup();
+    let full = Correlation {
+        run_id: Some("run-1".into()),
+        task_id: Some("task-1".into()),
+        parent_run_id: Some("run-0".into()),
+        segment_id: Some("seg-1".into()),
+        child_id: Some("child-1".into()),
+    };
+    store
+        .record_hydration("run-1", &pin, "SKILL.md", b"x", &full)
+        .expect("test: hydrate");
+    let later = Correlation {
+        task_id: Some("other-task".into()),
+        ..Correlation::default()
+    };
+    let record = store.record_selection("run-1", &pin, &later).expect("test: select");
+    assert_eq!(
+        record.correlation, full,
+        "the first identities win and are never overwritten"
+    );
+    assert_eq!(record.hydration_receipts.first().map(|r| &r.correlation), Some(&full));
+    assert_eq!(
+        record
+            .selection_receipts
+            .first()
+            .and_then(|r| r.correlation.task_id.as_deref()),
+        Some("other-task"),
+        "each receipt keeps its own"
+    );
+}
+
+#[test]
+fn dropped_evidence_is_marked_even_when_the_capture_locks_cannot_be_taken() {
+    let (_tmp, store, pin) = setup();
+    store
+        .record_hydration("task-lock", &pin, "SKILL.md", b"x", &Correlation::default())
+        .expect("test: hydrate");
+    {
+        // An exclusive store lock (a prune in progress) makes capture time out.
+        let _held = store
+            .lock_store(false, std::time::Duration::from_secs(1))
+            .expect("test: lock");
+        let started = std::time::Instant::now();
+        let err = store
+            .record_hydration("task-lock", &pin, "references/guide.md", b"y", &Correlation::default())
+            .expect_err("test: capture must time out");
+        assert!(matches!(err, LifecycleError::LockTimeout { .. }), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "capture is bounded"
+        );
+        store.mark_dropped_evidence("task-lock");
+    }
+    let joined = store
+        .join_terminal("task-lock", "term", ExperienceOutcome::Success)
+        .expect("test: join");
+    assert_eq!(joined.experience.dropped_evidence, 1);
+    assert!(
+        !joined.experience.learning_eligible(),
+        "an under-credited experience is not eligible"
+    );
+}
+
+#[test]
+fn pruning_removes_old_experiences_with_their_markers_and_locks() {
+    let (_tmp, store, pin) = setup();
+    let keep_me = |record: &crate::skills::lifecycle::SkillExperience| record.task_id == "task-kept";
+    for task in ["task-old", "task-new", "task-open", "task-kept"] {
+        store
+            .record_hydration(task, &pin, "SKILL.md", b"x", &Correlation::default())
+            .expect("test: hydrate");
+    }
+    for task in ["task-old", "task-new", "task-kept"] {
+        store
+            .join_terminal(task, "term", ExperienceOutcome::Success)
+            .expect("test: join");
+    }
+    store.mark_dropped_evidence("task-old");
+    let id_old = experience_id(store.owner_scope(), "task-old");
+    let lock = store.root().join("locks").join(format!("{id_old}.lock"));
+    assert!(lock.exists());
+
+    let retention = ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(30),
+        incomplete_max_age: chrono::Duration::days(7),
+    };
+    // Nothing is old yet.
+    assert_eq!(
+        store
+            .prune_experiences(&retention, chrono::Utc::now(), keep_me)
+            .expect("test: prune"),
+        0
+    );
+    // 10 days on: the incomplete task expires, joined ones have not.
+    let later = chrono::Utc::now() + chrono::Duration::days(10);
+    assert_eq!(
+        store
+            .prune_experiences(&retention, later, keep_me)
+            .expect("test: prune"),
+        1
+    );
+    assert!(store.read_experience("task-open").expect("test: read").is_none());
+    // 40 days on: everything but the protected experience goes.
+    let much_later = chrono::Utc::now() + chrono::Duration::days(40);
+    assert_eq!(
+        store
+            .prune_experiences(&retention, much_later, keep_me)
+            .expect("test: prune"),
+        2
+    );
+    assert!(store.read_experience("task-old").expect("test: read").is_none());
+    assert!(!lock.exists(), "the lock file goes with its experience");
+    assert!(
+        !store
+            .root()
+            .join("experiences")
+            .join(format!("{id_old}.dropped"))
+            .exists()
+    );
+    assert!(store.read_experience("task-kept").expect("test: read").is_some());
 }

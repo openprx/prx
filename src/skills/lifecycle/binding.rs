@@ -18,12 +18,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Upper bound on bindings listed for one owner store.
 pub const MAX_ACTIVE_BINDINGS: usize = 512;
 /// Upper bound on concurrently remembered task pins in this process. When the
-/// table is full, new pins are refused with [`LifecycleError::PinTableFull`];
-/// a live pin is never evicted.
+/// table is full of pins younger than [`ORPHAN_PIN_AGE`], new pins are refused
+/// with [`LifecycleError::PinTableFull`]; a live pin is never evicted.
 pub const MAX_TASK_PINS: usize = 4096;
 const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
 
@@ -132,30 +133,52 @@ struct PinKey {
     skill: SkillId,
 }
 
-type PinEntries = VecDeque<(PinKey, Arc<PinnedSkillRevision>)>;
+type PinEntries = VecDeque<(PinKey, Arc<PinnedSkillRevision>, Instant)>;
+
+/// A pin older than this is considered orphaned (its task ended without
+/// reaching a terminal that releases pins, for example a turn that failed
+/// before finalization) and may be reclaimed, but only when the table is full.
+pub const ORPHAN_PIN_AGE: Duration = Duration::from_hours(24);
 
 /// Bounded table of the pins issued to tasks. A pin lives until
-/// [`release_task_pins`] removes it; SL03 calls that at the task terminal.
-/// Nothing is ever evicted: when the table is full a new pin is refused, so a
-/// running task never silently switches revision.
+/// [`release_task_pins`] removes it (the task terminal does, and so does every
+/// exit of `finalize_turn`). Live pins are never evicted: when the table is
+/// full, only pins older than `orphan_age` are reclaimed, and if none are the
+/// new pin is refused, so a running task never silently switches revision.
 pub(super) struct PinTable {
     cap: usize,
+    orphan_age: Duration,
     entries: Mutex<PinEntries>,
 }
 
 impl PinTable {
-    pub(super) const fn new(cap: usize) -> Self {
+    pub(super) const fn new(cap: usize, orphan_age: Duration) -> Self {
         Self {
             cap,
+            orphan_age,
             entries: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Makes room for one pin; `false` when the table is full of live pins.
+    fn make_room(&self, entries: &mut PinEntries) -> bool {
+        if entries.len() < self.cap {
+            return true;
+        }
+        let before = entries.len();
+        entries.retain(|(_, _, issued)| issued.elapsed() < self.orphan_age);
+        let reclaimed = before - entries.len();
+        if reclaimed > 0 {
+            tracing::warn!(reclaimed, "reclaimed orphaned task skill pins");
+        }
+        entries.len() < self.cap
     }
 
     fn lookup(entries: &PinEntries, key: &PinKey) -> Option<Arc<PinnedSkillRevision>> {
         entries
             .iter()
-            .find(|(existing, _)| existing == key)
-            .map(|(_, pin)| Arc::clone(pin))
+            .find(|(existing, _, _)| existing == key)
+            .map(|(_, pin, _)| Arc::clone(pin))
     }
 
     pub(super) fn pin(
@@ -174,9 +197,6 @@ impl PinTable {
         if let Some(pin) = existing {
             return Ok(Some(pin));
         }
-        if self.entries.lock().len() >= self.cap {
-            return Err(LifecycleError::PinTableFull(self.cap));
-        }
         let Some(issued) = issue()? else {
             return Ok(None);
         };
@@ -184,11 +204,11 @@ impl PinTable {
         if let Some(pin) = Self::lookup(&entries, &key) {
             return Ok(Some(pin));
         }
-        if entries.len() >= self.cap {
+        if !self.make_room(&mut entries) {
             return Err(LifecycleError::PinTableFull(self.cap));
         }
         let pin = Arc::new(issued);
-        entries.push_back((key, Arc::clone(&pin)));
+        entries.push_back((key, Arc::clone(&pin), Instant::now()));
         Ok(Some(pin))
     }
 
@@ -203,20 +223,20 @@ impl PinTable {
         self.entries
             .lock()
             .iter()
-            .find(|(key, pin)| {
+            .find(|(key, pin, _)| {
                 key.owner == *owner && key.task_id == task_id && pin.display_name.eq_ignore_ascii_case(name)
             })
-            .map(|(_, pin)| Arc::clone(pin))
+            .map(|(_, pin, _)| Arc::clone(pin))
     }
 
     pub(super) fn release(&self, owner: &OwnerScope, task_id: &str) {
         self.entries
             .lock()
-            .retain(|(key, _)| !(key.owner == *owner && key.task_id == task_id));
+            .retain(|(key, _, _)| !(key.owner == *owner && key.task_id == task_id));
     }
 }
 
-static TASK_PINS: PinTable = PinTable::new(MAX_TASK_PINS);
+static TASK_PINS: PinTable = PinTable::new(MAX_TASK_PINS, ORPHAN_PIN_AGE);
 
 /// Returns the pin of `task_id` for `skill`, issuing it with `issue` on first
 /// use. Later calls return the same pin even if the active binding moved.
@@ -357,9 +377,8 @@ fn capture_hydration(
 ) {
     if let Err(error) = store.record_hydration(task, pin, path, content, correlation) {
         tracing::warn!(%error, task, "failed to record a skill hydration receipt");
-        if let Err(error) = store.record_dropped_evidence(task) {
-            tracing::warn!(%error, task, "failed to mark dropped skill evidence");
-        }
+        // Lock-free, so it still works when the failure was a lock timeout.
+        store.mark_dropped_evidence(task);
     }
 }
 

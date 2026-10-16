@@ -228,7 +228,7 @@ fn a_full_pin_table_refuses_new_pins_and_never_evicts_live_ones() {
     let a = publish_rev(&store, &skill(), version("A"));
     activate(&store, &skill(), &a, 0, true);
     let who = owner(OWNER_A);
-    let table = PinTable::new(2);
+    let table = PinTable::new(2, std::time::Duration::from_secs(3600));
     let issue = || store.pin_active(&skill());
     for task in ["t1", "t2"] {
         table
@@ -440,4 +440,42 @@ fn stray_files_in_the_active_directory_do_not_break_listing() {
             .expect("test: find")
             .is_some()
     );
+}
+
+#[test]
+fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
+    let (_tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A"));
+    activate(&store, &skill(), &a, 0, true);
+    let who = owner(OWNER_A);
+    let issue = || store.pin_active(&skill());
+
+    let short = PinTable::new(1, std::time::Duration::from_millis(5));
+    short
+        .pin(&who, "old", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    // Young pins are never reclaimed.
+    assert!(matches!(
+        short.pin(&who, "new", &skill(), issue).expect_err("test: full"),
+        LifecycleError::PinTableFull(1)
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(
+        short
+            .pin(&who, "new", &skill(), issue)
+            .expect("test: reclaimed")
+            .is_some()
+    );
+    assert!(
+        short.find_by_name(&who, "old", "deploy helper").is_none(),
+        "the orphan was reclaimed"
+    );
+
+    let long = PinTable::new(1, std::time::Duration::from_secs(3600));
+    long.pin(&who, "a", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(long.pin(&who, "b", &skill(), issue).is_err());
 }

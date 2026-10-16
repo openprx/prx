@@ -515,23 +515,71 @@ where
 /// a parent run) is always keyed by its own run, never by a task id it might
 /// share with the parent, so its terminal cannot release the parent's pins.
 fn skill_task_key(scope: &MessageEventScope) -> Option<String> {
-    let task = match (&scope.subject, scope.parent_run_id.as_deref()) {
-        (Some(crate::memory::MessageEventSubject::Task(id)), None) => Some(id.as_str()),
+    let task = match &scope.subject {
+        Some(crate::memory::MessageEventSubject::Task(id)) => Some(id.as_str()),
         _ => None,
     };
-    crate::skills::lifecycle::task_key(task, scope.run_id.as_deref())
+    crate::skills::lifecycle::task_key(task, scope.run_id.as_deref(), scope.parent_run_id.as_deref())
+}
+
+/// Releases the run's skill revision pins when finalization ends by any path:
+/// success, an early error (lost authority, scope or replay conflicts, I/O) or
+/// the future being dropped. Releasing is in-memory and idempotent.
+struct SkillPinGuard {
+    owner: crate::skills::lifecycle::OwnerScope,
+    task: String,
+}
+
+impl SkillPinGuard {
+    fn new(scope: &MessageEventScope) -> Option<Self> {
+        let owner = crate::skills::lifecycle::OwnerScope::new(scope.owner_id.as_deref()?).ok()?;
+        Some(Self {
+            owner,
+            task: skill_task_key(scope)?,
+        })
+    }
+}
+
+impl Drop for SkillPinGuard {
+    fn drop(&mut self) {
+        crate::skills::lifecycle::release_task_pins(&self.owner, &self.task);
+    }
+}
+
+/// How long finalization waits for the skill lifecycle call-in (the capture
+/// locks are bounded to about a second on their own).
+const SKILL_TERMINAL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Whether the turn ended waiting for an approval rather than with an answer.
+/// Those turns are reported as `Completed` by their entrypoints, so the signal
+/// comes from the decision: an approval directive, an approval collection, or a
+/// tool attempt that is awaiting approval.
+fn skill_awaiting_approval(
+    decision: &DecisionSettlementRef,
+    trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+) -> bool {
+    use crate::causal_tree::directive::TurnExecutionDirective;
+    let context = &decision.context;
+    matches!(context.directive(), TurnExecutionDirective::RequestApproval { .. })
+        || context.approval_collection_proof().is_some()
+        || trace.map_or_else(
+            || context.terminal_execution_trace().awaiting_approval_attempts,
+            |trace| trace.awaiting_approval_attempts,
+        ) > 0
 }
 
 /// Task-terminal call-in of the skill lifecycle: joins the terminal to the
 /// task's skill experience and releases the task's revision pins. A silent turn
-/// is not credited: its pins are released and nothing is joined. Failures are
-/// logged and never fail finalization.
+/// is not credited (pins are released, nothing is joined) and a turn waiting
+/// for approval is `Blocked`, never `Success`. Failures and a missed time
+/// budget are logged and never fail finalization.
 async fn release_skill_lifecycle(
     workspace_dir: &Path,
     owner: Option<String>,
     task_key: Option<String>,
     terminal_id: &str,
     status: TurnTerminalStatus,
+    awaiting_approval: bool,
 ) {
     use crate::skills::lifecycle::{ExperienceOutcome, OwnerScope};
     let (Some(owner), Some(task)) = (owner, task_key) else {
@@ -545,6 +593,7 @@ async fn release_skill_lifecycle(
         }
     };
     let outcome = match status {
+        TurnTerminalStatus::Completed if awaiting_approval => Some(ExperienceOutcome::Blocked),
         TurnTerminalStatus::Completed => Some(ExperienceOutcome::Success),
         TurnTerminalStatus::Failed => Some(ExperienceOutcome::Failure),
         TurnTerminalStatus::Cancelled => Some(ExperienceOutcome::Cancelled),
@@ -552,7 +601,7 @@ async fn release_skill_lifecycle(
     };
     let workspace = workspace_dir.to_path_buf();
     let terminal_id = terminal_id.to_string();
-    let joined = tokio::task::spawn_blocking(move || {
+    let call_in = tokio::task::spawn_blocking(move || {
         let Some(outcome) = outcome else {
             crate::skills::lifecycle::release_task_pins(&owner, &task);
             return Ok(());
@@ -567,12 +616,12 @@ async fn release_skill_lifecycle(
             },
         )
         .map(|_| ())
-    })
-    .await;
-    match joined {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
-        Err(error) => tracing::warn!(%error, "skill lifecycle terminal task failed"),
+    });
+    match tokio::time::timeout(SKILL_TERMINAL_BUDGET, call_in).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
+        Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal task failed"),
+        Err(_) => tracing::warn!("skill lifecycle terminal join exceeded its time budget; continuing"),
     }
 }
 
@@ -584,6 +633,8 @@ async fn finalize_turn_impl(
     stop_after_marker: bool,
 ) -> anyhow::Result<TurnTerminalReceipt> {
     boxed_terminal_work(move || async move {
+        // Held for the whole finalization: every exit releases the run's pins.
+        let _skill_pins = SkillPinGuard::new(&commit.scope);
         anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
         ensure_runtime_authority(&commit.scope, "start").await?;
         let mut execution_trace = None;
@@ -924,14 +975,20 @@ async fn finalize_turn_impl(
             )
             .await?;
         }
-        // After the durable marker and before the early return, so a replayed
-        // finalization after a crash also joins the terminal and releases pins.
+        // After the durable marker and before the early return, so a retried
+        // finalization joins and releases as well. Restart recovery
+        // (`rejoin_terminal`, `rejoin_ingress_terminal`) does not reach this
+        // call-in and the lifecycle has no hook there: a run whose process died
+        // keeps its experience `incomplete` (its pins died with the process).
+        // Recorded as a known gap.
+        let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
         release_skill_lifecycle(
             workspace_dir,
             skill_owner,
             skill_task,
             &commit.terminal_id,
             commit.status,
+            awaiting_approval,
         )
         .await;
         let receipt = TurnTerminalReceipt {
@@ -2493,6 +2550,7 @@ mod tests {
             Some("silent-run".to_string()),
             "silent-term",
             TurnTerminalStatus::Silent,
+            false,
         )
         .await;
 
@@ -2530,6 +2588,7 @@ mod tests {
             skill_task_key(&child),
             "child-term",
             TurnTerminalStatus::Completed,
+            false,
         )
         .await;
 
@@ -2541,8 +2600,88 @@ mod tests {
             skill_task_key(&parent),
             "parent-term",
             TurnTerminalStatus::Failed,
+            false,
         )
         .await;
         assert!(!holds_pin(owner, "run-parent", &skill));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_turn_waiting_for_approval_is_blocked_not_success() {
+        use crate::skills::lifecycle::{Correlation, ExperienceOutcome};
+        let temp = tempfile::tempdir().unwrap();
+        let owner = "owner:ws:cli:alice";
+        let (store, skill, pin) = skill_fixture(temp.path(), owner);
+        store
+            .record_hydration("approval-run", &pin, "SKILL.md", b"x", &Correlation::default())
+            .unwrap();
+        pin_for(owner, "approval-run", &skill, &pin);
+
+        // Entrypoints report a turn that stopped for approval as Completed.
+        release_skill_lifecycle(
+            temp.path(),
+            Some(owner.to_string()),
+            Some("approval-run".to_string()),
+            "approval-term",
+            TurnTerminalStatus::Completed,
+            true,
+        )
+        .await;
+
+        let experience = store.read_experience("approval-run").unwrap().unwrap();
+        assert_eq!(experience.outcome, ExperienceOutcome::Blocked);
+        assert!(!holds_pin(owner, "approval-run", &skill));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_finalization_that_fails_early_still_releases_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fabric, cost_config, mut commit, service) =
+            terminal_fixture(temp.path(), "skill-lost-authority", TurnTerminalStatus::Completed).await;
+        let owner = commit.scope.owner_id.clone().unwrap();
+        let task = commit.scope.run_id.clone().unwrap();
+        let (_store, skill, pin) = skill_fixture(temp.path(), &owner);
+        pin_for(&owner, &task, &skill, &pin);
+        commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new("lost-authority", || {
+            Ok(false)
+        }));
+
+        let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("runtime execution authority was lost"));
+        assert!(
+            !holds_pin(&owner, &task, &skill),
+            "a failed finalization must not leak pins"
+        );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// The key contract the skill lifecycle depends on: the terminal derives the
+    /// same key as `skill_read` does from the same envelope.
+    #[test]
+    fn the_terminal_key_matches_the_key_skill_read_derives_from_the_same_envelope() {
+        use crate::runtime::envelope::RuntimeEnvelope;
+        let scope_key = |envelope: &RuntimeEnvelope| skill_task_key(&envelope.message_scope());
+        // What `skill_read` sees: the runtime-authored scope fields.
+        let read_key = |envelope: &RuntimeEnvelope| {
+            crate::skills::lifecycle::task_key(
+                envelope.task_id.as_deref(),
+                envelope.run_id.as_deref(),
+                envelope.parent_run_id.as_deref(),
+            )
+        };
+        let plain = RuntimeEnvelope::cron("ws", "job-1", "attempt-1");
+        assert_eq!(scope_key(&plain), read_key(&plain));
+        assert_eq!(scope_key(&plain).as_deref(), plain.run_id.as_deref());
+        let child = plain.with_parent_run_id("run-parent");
+        assert_eq!(scope_key(&child), read_key(&child));
+        assert_eq!(scope_key(&child).as_deref(), child.run_id.as_deref());
+        let task_only = RuntimeEnvelope::cron("ws", "job-2", "attempt-2");
+        let mut task_only = task_only;
+        task_only.run_id = None;
+        assert_eq!(scope_key(&task_only).as_deref(), Some("job-2"));
+        assert_eq!(scope_key(&task_only), read_key(&task_only));
     }
 }

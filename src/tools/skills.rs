@@ -230,11 +230,16 @@ impl SkillReadTool {
         let task_id = crate::skills::lifecycle::task_key(
             trusted_scope_field(args, &["task_id"]).as_deref(),
             trusted_scope_field(args, &["run_id"]).as_deref(),
+            trusted_scope_field(args, &["parent_run_id"]).as_deref(),
         );
+        // Each identity is recorded as the runtime authored it. The scope
+        // carries no segment or child id today; they are read if it ever does.
         let correlation = crate::skills::lifecycle::Correlation {
             run_id: trusted_scope_field(args, &["run_id"]),
-            segment_id: None,
-            child_id: None,
+            task_id: trusted_scope_field(args, &["task_id"]),
+            parent_run_id: trusted_scope_field(args, &["parent_run_id"]),
+            segment_id: trusted_scope_field(args, &["segment_id"]),
+            child_id: trusted_scope_field(args, &["child_id"]),
         };
         let pin_task = self.pin_tasks;
         let workspace = self.workspace_dir.clone();
@@ -1368,5 +1373,50 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains("escapes") || text.contains("relative"), "{bad}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn skill_read_records_every_trusted_scope_identity_on_its_receipt() {
+        use crate::skills::lifecycle::{Correlation, OwnerScope, SkillLifecycleStore, apply_migration, plan_migration};
+        let temp = TempDir::new().unwrap();
+        let skill_dir = temp.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md("body")).unwrap();
+        let owner = "owner:ws:cli:alice";
+        let store = SkillLifecycleStore::open(temp.path(), OwnerScope::new(owner).unwrap()).unwrap();
+        let plan = plan_migration(temp.path(), Some(&store)).unwrap();
+        let report = apply_migration(&store, temp.path(), &plan);
+        assert_eq!(report.failed, Vec::new());
+        let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
+
+        // The scope exactly as the execution service authors it (task, run and parent).
+        let args = json!({
+            "name": "demo",
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "owner_id": owner,
+                "task_id": "task-corr",
+                "run_id": "run-corr",
+                "parent_run_id": "run-parent"
+            }
+        });
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success);
+
+        // The experience is keyed by the run (a child is never keyed by the task).
+        let record = store.read_experience("run-corr").unwrap().unwrap();
+        let expected = Correlation {
+            run_id: Some("run-corr".into()),
+            task_id: Some("task-corr".into()),
+            parent_run_id: Some("run-parent".into()),
+            segment_id: None,
+            child_id: None,
+        };
+        assert_eq!(record.correlation, expected);
+        assert_eq!(
+            record.hydration_receipts.first().map(|receipt| &receipt.correlation),
+            Some(&expected)
+        );
+        crate::skills::lifecycle::release_task_pins(&OwnerScope::new(owner).unwrap(), "run-corr");
     }
 }
