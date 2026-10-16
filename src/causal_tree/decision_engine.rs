@@ -1541,6 +1541,7 @@ fn selector_context(
     SelectorContext {
         interactive,
         direct_candidates,
+        discovery_completed: discovered_refs.iter().next().is_some(),
     }
 }
 

@@ -56,6 +56,10 @@ pub(crate) struct SelectorContext {
     pub interactive: bool,
     /// Exact direct entries in the pinned catalog generation.
     pub direct_candidates: BTreeSet<CandidateId>,
+    /// A selected, final-gated search returned at least one current ref in
+    /// this turn. This can settle a targetless Answer; it never makes a tool
+    /// candidate direct or bypasses its gates.
+    pub discovery_completed: bool,
 }
 
 pub(crate) struct CausalSelector;
@@ -378,7 +382,12 @@ impl CausalSelector {
             .map_or(f64::NEG_INFINITY, |(_, score, _)| score.execution_utility);
         let margin = top_score.execution_utility - runner_up;
         let threshold = effective_threshold(f64::from(policy.commit_threshold), top.side_effect());
-        let enough_choice_confidence = exact_current_action
+        let completed_discovery_answer = context.discovery_completed
+            && top.action() == CausalActionKind::Answer
+            && prediction.chosen_action == CausalActionKind::Answer.as_str()
+            && prediction.chosen_target == CapabilityTarget::None.as_str();
+        let enough_choice_confidence = completed_discovery_answer
+            || exact_current_action
             || (prediction.action_confidence >= policy.minimum_choice_confidence
                 && prediction.target_confidence >= policy.minimum_choice_confidence);
         let evidence_ok = top.action() != CausalActionKind::Answer || !insufficient;
@@ -610,6 +619,7 @@ mod tests {
         let context = SelectorContext {
             interactive: true,
             direct_candidates,
+            discovery_completed: false,
         };
         (
             set,
@@ -828,6 +838,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn completed_discovery_settles_only_the_targetless_answer() {
+        let (set, scores, mut evidence, report, policy, mut context) = fixture(0.5);
+        evidence.action_confidence = 0.01;
+        evidence.target_confidence = 0.01;
+        context.discovery_completed = true;
+        let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let CandidateSet::Legal { candidates, .. } = &set else {
+            panic!("expected legal candidates");
+        };
+        let answer = candidates
+            .iter()
+            .find(|candidate| candidate.action() == CausalActionKind::Answer)
+            .unwrap_or_else(|| panic!("expected answer"));
+        assert_eq!(
+            selection,
+            Selection::Commit {
+                candidate_id: answer.candidate_id().clone(),
+                propensity: 1.0,
+            }
+        );
     }
 
     #[test]
