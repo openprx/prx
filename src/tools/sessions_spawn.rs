@@ -17469,7 +17469,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut missing = Vec::new();
         for file in [
-            "chat/mod.rs",
+            "chat/run.rs",
             "gateway/mod.rs",
             "channels/mod.rs",
             "session_worker/runner.rs",

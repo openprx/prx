@@ -1145,8 +1145,6 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/channels/wacli.rs::send_prepared_media::let mut cmd = tokio::process::Command::new(self.cli_binary());",
     "src/channels/wacli.rs::send_text::let mut cmd = tokio::process::Command::new(self.cli_binary());",
     "src/channels/wacli.rs::set_presence::let mut cmd = tokio::process::Command::new(self.cli_binary());",
-    // A `#[cfg(test)]` function outside a test module (the scan keeps it).
-    "src/chat/tests/iss_019_diff_apply_tests.rs::plain_apply_ignores_openprx_approval_override_and_leaves_file_unchanged::let status = std::process::Command::new(exe)",
     "src/chat/external_editor.rs::run_external_editor_command::std::process::Command::new(\"cmd\")",
     "src/chat/external_editor.rs::run_external_editor_command::std::process::Command::new(\"sh\")",
     "src/chat/sessions/shell.rs::spawn_shell_with_origin::let mut cmd = tokio::process::Command::new(\"sh\");",
@@ -2097,7 +2095,7 @@ planted_violation_probes! {
         "src/gateway/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub async fn d0_planted_call(tool: &dyn Tool) {\n    let _ = tool.execute(args).await;\n}\n";
     probe_direct_invocation_counts: direct_tool_invocation_allowlist_counts_match_the_tree,
-        "src/chat/mod.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/chat/file_mention.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub async fn enrich_file_mentions_for_prompt(tool: &dyn Tool) {\n    let _ = tool.execute(args).await;\n}\n";
     probe_non_tool_occurrences: non_tool_execute_call_sites_match_their_declared_occurrences,
         "src/agent/embedded_turn.rs", Planted::AppendedTo, Reads::ProductionText,
