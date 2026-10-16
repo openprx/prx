@@ -365,6 +365,19 @@ impl SkillLifecycleStore {
     }
 }
 
+/// Key an experience and its pins are filed under: the run id when there is
+/// one (a terminal belongs to a run; a recurring task reuses its task id across
+/// runs), else the task id. `None` when neither is present or usable.
+#[must_use]
+pub fn task_key(task_id: Option<&str>, run_id: Option<&str>) -> Option<String> {
+    [run_id, task_id]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// What the task terminal owner reports.
 #[derive(Clone, Debug)]
 pub struct TaskTerminal<'a> {

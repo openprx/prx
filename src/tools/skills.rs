@@ -150,10 +150,9 @@ fn trusted_scope_field(args: &serde_json::Value, keys: &[&str]) -> Option<String
 pub struct SkillReadTool {
     workspace_dir: PathBuf,
     config: Config,
-    /// Pin lifecycle-managed skills to the revision a task first read. Off in
-    /// production until the task terminal releases pins (SL03): a pin table
-    /// that is never drained would eventually refuse new pins. Without it,
-    /// every managed read resolves the active binding.
+    /// Pin lifecycle-managed skills to the revision a task first read. On by
+    /// default: `agent::terminal::finalize_turn` releases the task's pins at its
+    /// terminal.
     pin_tasks: bool,
 }
 
@@ -178,13 +177,13 @@ impl SkillReadTool {
         Self {
             workspace_dir,
             config,
-            pin_tasks: false,
+            pin_tasks: true,
         }
     }
 
-    /// Enables per-task revision pinning for managed skills. Test-only until
-    /// SL03 wires it together with `lifecycle::release_task_pins` at the task
-    /// terminal; the caller must release the pins there.
+    /// Turns per-task revision pinning on or off. The task terminal releases
+    /// pins (`agent::terminal`); turning pinning on elsewhere requires the same
+    /// release.
     #[must_use]
     pub const fn with_task_pinning(mut self, enabled: bool) -> Self {
         self.pin_tasks = enabled;
@@ -225,9 +224,13 @@ impl SkillReadTool {
         if !in_catalog {
             return Ok(None);
         }
-        // The task the trusted scope belongs to (`task_id`, else `run_id`);
+        // The unit the trusted scope belongs to (`run_id`, else `task_id`, the
+        // same key the terminal releases);
         // hydration is captured for it, and pinned when pinning is enabled.
-        let task_id = trusted_scope_field(args, &["task_id", "run_id"]);
+        let task_id = crate::skills::lifecycle::task_key(
+            trusted_scope_field(args, &["task_id"]).as_deref(),
+            trusted_scope_field(args, &["run_id"]).as_deref(),
+        );
         let correlation = crate::skills::lifecycle::Correlation {
             run_id: trusted_scope_field(args, &["run_id"]),
             segment_id: None,
@@ -1231,7 +1234,8 @@ mod tests {
         let report = apply_migration(&store, temp.path(), &plan);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         let tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path())).with_task_pinning(true);
-        let unpinned_tool = SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path()));
+        let unpinned_tool =
+            SkillReadTool::new(temp.path().to_path_buf(), test_config(temp.path())).with_task_pinning(false);
 
         let read = |args: serde_json::Value| {
             let tool = &tool;

@@ -37,7 +37,7 @@ pub use bundle::{
 };
 pub use capture::{
     Correlation, ExperienceOutcome, HydrationReceipt, MAX_HYDRATION_RECEIPTS, MAX_SELECTION_RECEIPTS, SelectionReceipt,
-    SkillExperience, TaskTerminal, TerminalJoin, TerminalJoinOutcome, experience_id, on_task_terminal,
+    SkillExperience, TaskTerminal, TerminalJoin, TerminalJoinOutcome, experience_id, on_task_terminal, task_key,
 };
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
