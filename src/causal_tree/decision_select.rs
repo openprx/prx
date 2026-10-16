@@ -328,10 +328,9 @@ impl CausalSelector {
             .map(|(candidate, _, _)| *candidate);
         // Finding 76: an exactly named approval-required tool with no bound
         // call (a fresh turn has no arguments yet, so no approval scope can
-        // exist) must not be replaced by a plain Answer. The execution approval
-        // gate owns the prompt: local discovery admits the tool as
-        // pending-approval, and its call is recorded durably without running.
-        // Without a discovery candidate the turn closes instead of answering.
+        // exist) must not be replaced by a plain Answer. Ingresses with an
+        // owner-review adapter never reach this point: the engine collects the
+        // call's arguments for review first. Everywhere else the turn closes.
         if top.action() == CausalActionKind::Answer
             && exact_mentions.iter().any(|id| {
                 matches!(
@@ -340,13 +339,7 @@ impl CausalSelector {
                 )
             })
         {
-            return match discover {
-                Some(candidate) => Ok(Selection::Recover {
-                    candidate_id: candidate.candidate_id().clone(),
-                    reason_code: "discover_capability",
-                }),
-                None => terminal_abstain(candidates, pre_commit, context, "approval_requires_call"),
-            };
+            return terminal_abstain(candidates, pre_commit, context, "approval_requires_call");
         }
         let insufficient = evidence_insufficient(prediction.evidence_sufficient);
         let stale = evidence_stale(prediction.needs_fresh_state);
