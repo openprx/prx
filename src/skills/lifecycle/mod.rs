@@ -1,7 +1,8 @@
 //! Skill lifecycle: immutable, content-addressed skill revisions in an
 //! owner-scoped store (SL01). Publication, runtime binding and evaluation
 //! are separate packages and are not part of this module yet. SL08 store level
-//! adds the publication journal, generation CAS, rollback and recovery.
+//! adds the publication journal, generation CAS, rollback and recovery. SL06
+//! adds frozen evaluation suites and the baseline-versus-candidate evaluator.
 
 /// Test-only crash injection point; expands to nothing outside `cfg(test)`.
 macro_rules! crash_point {
@@ -13,10 +14,13 @@ macro_rules! crash_point {
     };
 }
 
+mod agent_executor;
 mod binding;
 mod bundle;
 mod capture;
 mod consolidate;
+mod evaluate;
+mod evaluator;
 mod generation;
 mod journal;
 mod knowledge;
@@ -25,11 +29,13 @@ mod migrate;
 mod publish;
 mod rejection;
 mod store;
+mod suite;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+pub use agent_executor::AgentCaseExecutor;
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -44,6 +50,13 @@ pub use capture::{
     TerminalJoinOutcome, experience_id, on_task_terminal, task_key,
 };
 pub use consolidate::{ConsolidationOutcome, ConsolidationRequest};
+pub use evaluate::{
+    Arm, ArmBinding, ArtifactDigest, CaseExecutor, CaseReceipt, CaseVerdict, CleanupState, EVALUATION_SCHEMA_VERSION,
+    EvaluationError, EvaluationOutcome, EvaluationReceipt, EvaluationSummary, ExecutionRequest, ExperienceTerminalFact,
+    HydrationFact, IncompleteReason, InstallSkill, InstalledSkill, InvalidReason, RUNNER_IDENTITY, RunObservation,
+    RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
+};
+pub use evaluator::EvaluationRequest;
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
 pub use knowledge::{
@@ -56,6 +69,10 @@ pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationRepor
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
+pub use suite::{
+    EvalCase, EvalSplit, EvalSuite, FixtureFile, FrozenSuite, MAX_SUITE_CASES, MAX_TRIALS, SUITE_SCHEMA_VERSION,
+    SuiteBudget, Validator,
+};
 pub use types::{
     LifecycleError, NewRevision, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision,
     SourceKind,

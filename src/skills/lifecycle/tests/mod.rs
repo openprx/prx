@@ -3,6 +3,8 @@
 mod binding;
 mod bundle;
 mod capture;
+mod evaluate;
+mod evaluate_agent;
 mod knowledge;
 mod manifest;
 mod migrate;
