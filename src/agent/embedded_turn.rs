@@ -643,7 +643,7 @@ async fn run_work(
                         premium_route,
                         scope.scope_id(),
                     );
-                    guard = guard.with_auxiliary_call(Arc::clone(&call));
+                    guard.register_auxiliary_call(Arc::clone(&call))?;
                     let mut messages = agent.tool_dispatcher.to_provider_messages(&agent.history);
                     // Retry the existing user/tool context, not the cheap answer
                     // as a new user instruction. No tool capability is supplied.
