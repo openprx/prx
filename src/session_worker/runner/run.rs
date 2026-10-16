@@ -83,7 +83,7 @@ pub(super) async fn run_authenticated_manifest(
 
 struct PendingWorkerCompletion {
     fabric: MemoryFabric,
-    pub(super) scope: MessageEventScope,
+    scope: MessageEventScope,
     grant: Arc<crate::runtime::child_source::IssuedChildGrant>,
 }
 
@@ -164,10 +164,10 @@ enum WorkerSegmentSource {
 }
 
 struct WorkerChildSegments {
-    pub(super) source: WorkerSegmentSource,
+    source: WorkerSegmentSource,
     service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     fabric: MemoryFabric,
-    pub(super) owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+    owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
     usage: Arc<crate::runtime::turn_terminal::TerminalUsageCollector>,
 }
 
@@ -227,8 +227,8 @@ impl WorkerChildSegments {
 
 struct VerifiedWorkerParent {
     store: Arc<crate::causal_tree::store::CausalDecisionStore>,
-    pub(super) scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-    pub(super) catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
+    scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
+    catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
 }
 
 /// Reconstruct the signed scope and inherited catalog. Actual executor parity,
