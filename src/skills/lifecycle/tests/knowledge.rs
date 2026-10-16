@@ -10,6 +10,15 @@ use crate::skills::lifecycle::{
 use std::fs;
 use tempfile::TempDir;
 
+/// Writes a test fixture file with owner-only permissions. The store refuses
+/// group- or world-readable records, and `fs::write` would otherwise create new
+/// files with the process umask (0644 on a default macOS shell).
+fn write_private(path: impl AsRef<std::path::Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path.as_ref(), contents)?;
+    fs::set_permissions(path.as_ref(), fs::Permissions::from_mode(0o600))
+}
+
 const OWNER: &str = "owner:ws:cli:alice";
 
 fn skill() -> SkillId {
@@ -387,7 +396,7 @@ fn the_index_is_derived_and_repairable() {
     let index_text = fs::read_to_string(&index_path).expect("test: index");
     let mut index: crate::skills::lifecycle::PatternIndex = serde_json::from_str(&index_text).expect("test: parse");
     index.entries.retain(|entry| entry.pattern_id != latest.pattern_id);
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).expect("test: json")).expect("test: write");
+    write_private(&index_path, serde_json::to_vec_pretty(&index).expect("test: json")).expect("test: write");
     let repaired = store.consolidate_pattern(&request(&[&b], &[])).expect("test: repair");
     assert!(!repaired.created);
     assert_eq!(store.active_patterns().expect("test: active").len(), 1);
@@ -406,15 +415,15 @@ fn forged_or_foreign_patterns_are_refused() {
         .join("patterns")
         .join(format!("{}.json", pattern.pattern_id));
     let text = fs::read_to_string(&path).expect("test: pattern");
-    fs::write(&path, text.replace(OWNER, "owner:ws:cli:mallory")).expect("test: forge");
+    write_private(&path, text.replace(OWNER, "owner:ws:cli:mallory")).expect("test: forge");
     assert!(matches!(
         store.read_pattern(&pattern.pattern_id).expect_err("test: forged owner"),
         LifecycleError::OwnerMismatch { .. }
     ));
-    fs::write(&path, &text).expect("test: restore");
+    write_private(&path, &text).expect("test: restore");
     assert!(store.read_pattern(&pattern.pattern_id).expect("test: read").is_some());
     let other = PatternId::parse(&format!("pat-{}", "0".repeat(32))).expect("test: id");
-    fs::write(store.root().join("patterns").join(format!("{other}.json")), &text).expect("test: misplace");
+    write_private(store.root().join("patterns").join(format!("{other}.json")), &text).expect("test: misplace");
     assert!(matches!(
         store.read_pattern(&other).expect_err("test: misplaced"),
         LifecycleError::Tampered { .. } | LifecycleError::InvalidRecord { .. }
@@ -647,7 +656,7 @@ fn rejections_are_idempotent_immutable_and_validated() {
         .join("rejections")
         .join(format!("{}.json", first.record_id));
     let text = fs::read_to_string(&path).expect("test: record");
-    fs::write(&path, text.replace(OWNER, "owner:ws:cli:mallory")).expect("test: forge");
+    write_private(&path, text.replace(OWNER, "owner:ws:cli:mallory")).expect("test: forge");
     assert!(matches!(
         store.rejections_for(&skill()).expect_err("test: forged"),
         LifecycleError::OwnerMismatch { .. }
@@ -660,7 +669,7 @@ fn rejection_listing_is_bounded() {
     let dir = store.root().join("rejections");
     fs::create_dir_all(&dir).expect("test: dir");
     for i in 0..1025 {
-        fs::write(dir.join(format!("rej-{i:032x}.json")), b"{}").expect("test: file");
+        write_private(dir.join(format!("rej-{i:032x}.json")), b"{}").expect("test: file");
     }
     let err = store.rejections_for(&skill()).expect_err("test: too many");
     assert!(matches!(err, LifecycleError::KnowledgeLimit { .. }), "{err}");
@@ -816,7 +825,7 @@ fn a_crash_between_pattern_and_index_write_resolves_to_one_active_pattern() {
         .expect("test: second")
         .pattern;
     // The crash: the second pattern file is on disk, the index never learned of it.
-    fs::write(&index_path, &stale).expect("test: stale index");
+    write_private(&index_path, &stale).expect("test: stale index");
     let third = store
         .consolidate_pattern(&request(&[&ids[2]], &[]))
         .expect("test: third")
@@ -841,9 +850,7 @@ fn write_forged_pattern(store: &SkillLifecycleStore, pattern: &crate::skills::li
     } else {
         store.root().join("patterns").join(name)
     };
-    fs::write(&path, serde_json::to_vec_pretty(pattern).expect("test: json")).expect("test: write");
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("test: mode");
+    write_private(&path, serde_json::to_vec_pretty(pattern).expect("test: json")).expect("test: write");
 }
 
 #[test]
@@ -943,7 +950,7 @@ fn steady_state_consolidation_reads_no_history_and_rebuild_stays_possible() {
     assert_eq!(adoption.files_read, 0, "no pattern file is read in steady state");
     // Corrupting history changes nothing a steady-state call looks at.
     for item in fs::read_dir(patterns.join("history")).expect("test: history") {
-        fs::write(item.expect("test: entry").path(), b"garbage").expect("test: corrupt");
+        write_private(item.expect("test: entry").path(), b"garbage").expect("test: corrupt");
     }
     assert!(
         !store
@@ -976,7 +983,7 @@ fn a_lost_middle_of_the_lineage_cannot_resurrect_the_oldest() {
         );
     }
     assert_eq!(chain[2].generation, 3);
-    fs::write(
+    write_private(
         store
             .root()
             .join("patterns")
@@ -1008,11 +1015,7 @@ fn a_forged_leftover_is_quarantined_not_reread() {
     store.consolidate_pattern(&request(&[&id], &[])).expect("test: first");
     let bogus = format!("pat-{}", "a".repeat(32));
     let path = store.root().join("patterns").join(format!("{bogus}.json"));
-    fs::write(&path, b"{ not json").expect("test: forge");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("test: mode");
-    }
+    write_private(&path, b"{ not json").expect("test: forge");
     store
         .consolidate_pattern(&request(&[&id], &[]))
         .expect("test: a forged leftover does not block");
@@ -1051,7 +1054,7 @@ fn withdrawn_count_counts_distinct_ids() {
         .pattern;
     assert_eq!((p.withdrawn_count, p.withdrawn_evidence.len()), (1, 1));
     // The experience comes back and is cited again, then goes away again.
-    fs::write(&file, &saved).expect("test: restore");
+    write_private(&file, &saved).expect("test: restore");
     let back = store
         .consolidate_pattern(&request(&[&ids[1]], &[]))
         .expect("test: reinstate")
@@ -1237,11 +1240,11 @@ fn forged_pattern_content_fails_closed() {
     for (pointer, value) in edits {
         let mut doc: serde_json::Value = serde_json::from_str(&original).expect("test: json");
         *doc.pointer_mut(pointer).expect("test: pointer") = value;
-        fs::write(&path, serde_json::to_vec_pretty(&doc).expect("test: json")).expect("test: write");
+        write_private(&path, serde_json::to_vec_pretty(&doc).expect("test: json")).expect("test: write");
         let err = store.read_pattern(&pattern.pattern_id).expect_err(pointer);
         assert!(matches!(err, LifecycleError::Tampered { .. }), "{pointer}: {err}");
     }
-    fs::write(&path, &original).expect("test: restore");
+    write_private(&path, &original).expect("test: restore");
     assert!(store.read_pattern(&pattern.pattern_id).expect("test: read").is_some());
 }
 
@@ -1424,11 +1427,11 @@ fn a_forged_rejection_record_fails_closed() {
     for (pointer, value) in edits {
         let mut doc: serde_json::Value = serde_json::from_str(&original).expect("test: json");
         *doc.pointer_mut(pointer).expect("test: pointer") = value;
-        fs::write(&path, serde_json::to_vec_pretty(&doc).expect("test: json")).expect("test: write");
+        write_private(&path, serde_json::to_vec_pretty(&doc).expect("test: json")).expect("test: write");
         let err = store.rejections_for(&skill()).expect_err(pointer);
         assert!(matches!(err, LifecycleError::Tampered { .. }), "{pointer}: {err}");
     }
-    fs::write(&path, &original).expect("test: restore");
+    write_private(&path, &original).expect("test: restore");
     assert_eq!(store.rejections_for(&skill()).expect("test: read").len(), 1);
 }
 
