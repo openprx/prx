@@ -1,7 +1,7 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-16.3",
+  "revision": "2026-10-16.4",
   "published_at": "2026-10-16T00:00:00Z",
   "providers": {
     "anthropic": {
@@ -237,6 +237,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 10.0,
         "categories": [
           "conversation",
           "analysis",
@@ -245,13 +246,6 @@
         ],
         "latency_ms": 3500,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 10.0,
-        "output": 10.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -285,6 +279,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.25,
         "categories": [
           "conversation",
           "summary",
@@ -296,9 +291,9 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 0.25,
-        "output": 0.25,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "output": 1.25,
+        "cache_write": 0.3125,
+        "cache_read": 0.03
       }
     },
     {
@@ -332,6 +327,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 1.0,
         "categories": [
           "conversation",
           "summary",
@@ -343,9 +339,9 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 1.0,
-        "output": 1.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "output": 5.0,
+        "cache_write": 1.25,
+        "cache_read": 0.1
       }
     },
     {
@@ -383,6 +379,7 @@
         "cache_read": 0.1
       },
       "router": {
+        "cost_per_million_tokens": 1.0,
         "categories": [
           "conversation",
           "summary",
@@ -459,6 +456,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 15.0,
         "categories": [
           "conversation",
           "analysis",
@@ -471,9 +469,9 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 15.0,
-        "output": 15.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "output": 75.0,
+        "cache_write": 18.75,
+        "cache_read": 1.5
       }
     },
     {
@@ -507,6 +505,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 5.0,
         "categories": [
           "conversation",
           "analysis",
@@ -515,13 +514,6 @@
         ],
         "latency_ms": 3000,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 5.0,
-        "output": 5.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -559,6 +551,7 @@
         "cache_read": 0.5
       },
       "router": {
+        "cost_per_million_tokens": 5.0,
         "categories": [
           "conversation",
           "analysis",
@@ -636,6 +629,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 3.0,
         "categories": [
           "conversation",
           "analysis",
@@ -648,9 +642,9 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 3.0,
-        "output": 3.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "output": 15.0,
+        "cache_write": 3.75,
+        "cache_read": 0.3
       }
     },
     {
@@ -1254,6 +1248,7 @@
         "cache_read": 0.0
       },
       "router": {
+        "cost_per_million_tokens": 0.1,
         "categories": [
           "conversation",
           "summary",
@@ -1294,6 +1289,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 1.25,
         "categories": [
           "conversation",
           "analysis",
@@ -1306,7 +1302,7 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 1.25,
-        "output": 1.25,
+        "output": 10.0,
         "cache_write": 0.0,
         "cache_read": 0.0
       }
@@ -2202,6 +2198,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.0,
         "categories": [
           "conversation",
           "code"
@@ -2404,6 +2401,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 2.0,
         "categories": [
           "code",
           "debug",
@@ -2412,13 +2410,6 @@
         ],
         "latency_ms": 1500,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 2.0,
-        "output": 2.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -2485,6 +2476,7 @@
         "cache_read": 0.0
       },
       "router": {
+        "cost_per_million_tokens": 5.0,
         "categories": [
           "conversation",
           "analysis",
@@ -2532,6 +2524,7 @@
         "cache_read": 0.0
       },
       "router": {
+        "cost_per_million_tokens": 0.15,
         "categories": [
           "conversation",
           "summary",
@@ -2821,6 +2814,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.1,
         "categories": [
           "conversation",
           "summary",
@@ -2828,13 +2822,6 @@
         ],
         "latency_ms": 1000,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.1,
-        "output": 0.1,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -2920,6 +2907,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.6,
         "categories": [
           "conversation",
           "analysis",
@@ -2931,9 +2919,9 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 0.6,
-        "output": 0.6,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "output": 3.0,
+        "cache_write": 0.6,
+        "cache_read": 0.1
       }
     },
     {
@@ -3019,6 +3007,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.5,
         "categories": [
           "conversation",
           "code",
@@ -3026,13 +3015,6 @@
         ],
         "latency_ms": 1500,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.5,
-        "output": 0.5,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -3066,6 +3048,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 0.3,
         "categories": [
           "conversation",
           "summary",
@@ -3073,13 +3056,6 @@
         ],
         "latency_ms": 1500,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.3,
-        "output": 0.3,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -3146,6 +3122,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 1.0,
         "categories": [
           "conversation",
           "analysis",
@@ -3153,13 +3130,6 @@
         ],
         "latency_ms": 1200,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 1.0,
-        "output": 1.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
       }
     },
     {
@@ -3687,6 +3657,7 @@
       },
       "default_level": "medium",
       "router": {
+        "cost_per_million_tokens": 3.0,
         "categories": [
           "conversation",
           "analysis",
@@ -3698,7 +3669,7 @@
       "pricing": {
         "unit": "usd_per_1m_tokens",
         "input": 3.0,
-        "output": 3.0,
+        "output": 15.0,
         "cache_write": 0.0,
         "cache_read": 0.0
       }

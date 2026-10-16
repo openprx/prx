@@ -247,10 +247,14 @@ impl CatalogParameter {
 }
 
 /// Router hints associated with one model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogRouterHints {
     pub categories: Vec<String>,
+    /// Router ranking cost per million tokens. This is deliberately separate
+    /// from [`CatalogPricing`]: routing may use a stable comparative estimate,
+    /// while billing and G6 admission require the full input/output tariff.
+    pub cost_per_million_tokens: f64,
     pub latency_ms: u32,
     pub quality_rank: u32,
 }
@@ -326,6 +330,16 @@ impl ReleaseModel {
             .map(ModelOperation::from)
             .any(|item| item == operation)
     }
+}
+
+fn model_spelling_matches(catalog_model: &str, selected: &str) -> bool {
+    catalog_model.eq_ignore_ascii_case(selected)
+        || selected.get(..catalog_model.len()).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(catalog_model)
+                && selected
+                    .get(catalog_model.len()..)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        })
 }
 
 /// Provider display and default-selection metadata.
@@ -433,19 +447,15 @@ impl ReleaseCatalog {
     pub fn model(&self, provider: &ProviderId, selected: &str) -> Option<&ReleaseModel> {
         let provider = provider.catalog_name()?;
         let selected = selected.trim();
-        self.models
-            .iter()
-            .find(|model| {
-                model.provider.eq_ignore_ascii_case(provider)
-                    && (model.api_model.eq_ignore_ascii_case(selected)
-                        || model.id.eq_ignore_ascii_case(selected)
-                        || model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(selected)))
-            })
-            .or_else(|| {
-                self.models
-                    .iter()
-                    .find(|model| model.provider.eq_ignore_ascii_case(provider) && model.api_model == "*")
-            })
+        self.models.iter().find(|model| {
+            model.provider.eq_ignore_ascii_case(provider)
+                && (model_spelling_matches(&model.api_model, selected)
+                    || model_spelling_matches(&model.id, selected)
+                    || model
+                        .aliases
+                        .iter()
+                        .any(|alias| model_spelling_matches(alias, selected)))
+        })
     }
 
     /// Active and deprecated chat models offered for one provider, with its
@@ -784,7 +794,10 @@ fn validate_model_shape(model: &ReleaseModel) -> Result<(), ReleaseCatalogError>
         }
     }
     if let Some(router) = &model.router
-        && (router.categories.is_empty() || router.latency_ms == 0)
+        && (router.categories.is_empty()
+            || !router.cost_per_million_tokens.is_finite()
+            || router.cost_per_million_tokens < 0.0
+            || router.latency_ms == 0)
     {
         return Err(ReleaseCatalogError::new("catalog router hints are invalid"));
     }
@@ -918,7 +931,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-16.3");
+        assert_eq!(catalog.revision, "2026-10-16.4");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -1075,6 +1088,30 @@ mod tests {
             DescriptorSource::Catalog {
                 revision: Arc::from("fixture.1")
             }
+        );
+    }
+
+    #[test]
+    fn model_matching_accepts_vendor_and_variant_spellings_without_wildcard_verification() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded catalog validates");
+
+        assert!(
+            catalog
+                .model(&ProviderId::of("openrouter"), "moonshotai/kimi-k2.5:free")
+                .is_some(),
+            "an aggregator suffix keeps the base model's catalog facts"
+        );
+        assert!(
+            catalog
+                .model(&ProviderId::of("anthropic"), "anthropic/claude-sonnet-5")
+                .is_some(),
+            "a vendor/model spelling matches a direct-provider API model"
+        );
+        assert!(
+            catalog
+                .model(&ProviderId::of("ollama"), "prx-unknown-local-model")
+                .is_none(),
+            "the router-only Ollama wildcard must not verify every local model"
         );
     }
 

@@ -314,10 +314,18 @@ pub(crate) fn usage_cost_resolution(
         return UsagePrice::Missing;
     };
     let provider_id = crate::providers::ProviderId::of(provider);
-    let Some(pricing) = catalog
+    let direct_pricing = catalog
         .model(&provider_id, model)
-        .and_then(|entry| entry.pricing.as_ref())
-    else {
+        .and_then(|entry| entry.pricing.as_ref());
+    let upstream_pricing = (provider_id.catalog_name() == Some("openrouter"))
+        .then(|| openrouter_upstream_model(model))
+        .flatten()
+        .and_then(|(provider, upstream_model)| {
+            catalog
+                .model(&crate::providers::ProviderId::of(provider), upstream_model)
+                .and_then(|entry| entry.pricing.as_ref())
+        });
+    let Some(pricing) = direct_pricing.or(upstream_pricing) else {
         return UsagePrice::Missing;
     };
     let tier = pricing
@@ -332,6 +340,19 @@ pub(crate) fn usage_cost_resolution(
         cache_read: pricing.cache_read,
     };
     turn_cost(&catalog_pricing).map_or(UsagePrice::Invalid, UsagePrice::Priced)
+}
+
+fn openrouter_upstream_model(model: &str) -> Option<(&str, &str)> {
+    let (vendor, model) = model.trim().split_once('/')?;
+    let provider = match vendor.to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic",
+        "google" => "gemini",
+        "moonshotai" => "moonshot",
+        "openai" => "openai",
+        "x-ai" => "xai",
+        _ => return None,
+    };
+    Some((provider, model))
 }
 
 pub(crate) fn usage_cost_usd(
@@ -1524,6 +1545,29 @@ mod tests {
             usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
             UsagePrice::Missing
         );
+    }
+
+    #[test]
+    fn openrouter_uses_upstream_catalog_tariff_when_its_row_has_no_duplicate_price() {
+        let config = crate::config::schema::CostConfig::default();
+        assert!(config.prices.is_empty(), "operator price overrides start empty");
+
+        assert!(matches!(
+            usage_cost_resolution(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                64,
+                64,
+                0,
+                0,
+                &config,
+            ),
+            UsagePrice::Priced(cost) if cost > 0.0
+        ));
+        assert!(matches!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6:free", 64, 64, 0, 0, &config),
+            UsagePrice::Priced(cost) if cost > 0.0
+        ));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub struct ImageTool {
     provider: Arc<dyn Provider>,
     pinned_provider_resolver: Option<Arc<dyn crate::providers::generation::PinnedProviderResolver>>,
     pinned_provider_name: Option<String>,
+    model_catalog: crate::providers::catalog::CatalogView,
     model: String,
     temperature: f64,
     security: Arc<SecurityPolicy>,
@@ -40,6 +41,7 @@ impl ImageTool {
             provider,
             pinned_provider_resolver: None,
             pinned_provider_name: None,
+            model_catalog: crate::providers::catalog::CatalogView::release_only(),
             model: model.into(),
             temperature,
             security,
@@ -68,6 +70,14 @@ impl ImageTool {
     #[must_use]
     pub(crate) fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
         self.pinned_provider_name = Some(provider_name.into());
+        self
+    }
+
+    /// Bind the immutable operator/discovery/release model facts that own this
+    /// non-reloadable worker tool.
+    #[must_use]
+    pub(crate) fn with_model_catalog(mut self, catalog: crate::providers::catalog::CatalogView) -> Self {
+        self.model_catalog = catalog;
         self
     }
 }
@@ -137,7 +147,10 @@ impl Tool for ImageTool {
                 provider.capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming);
             let capabilities = self.pinned_provider_name.as_deref().map_or_else(
                 || adapter.clone(),
-                |name| crate::providers::catalog::release_provider_capabilities(name, &self.model, adapter.clone()),
+                |name| {
+                    self.model_catalog
+                        .effective_provider_capabilities(name, &self.model, adapter.clone())
+                },
             );
             (provider, self.model.clone(), self.temperature, capabilities)
         };
@@ -494,6 +507,41 @@ mod tests {
             0,
             "catalog refusal precedes transport"
         );
+    }
+
+    #[tokio::test]
+    async fn image_execution_uses_operator_vision_declaration_from_pinned_catalog() {
+        let provider = Arc::new(CatalogVisionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let mut config = crate::config::Config::default();
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"codellama\"\noperations = [\"chat\"]\nvision_input = true\n",
+            )
+            .expect("test: operator model declaration"),
+        );
+        let tool = ImageTool::new(
+            provider_dyn,
+            "codellama",
+            0.0,
+            test_security(),
+            MultimodalConfig::default(),
+        )
+        .with_provider_name("ollama")
+        .with_model_catalog(crate::providers::selection::catalog_for(&config));
+
+        let result = tool
+            .execute(json!({
+                "image": "data:image/png;base64,iVBORw0KGgo=",
+                "prompt": "describe"
+            }))
+            .await
+            .expect("operator-declared image request reaches the provider");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

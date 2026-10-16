@@ -28,6 +28,7 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
+#[cfg(test)]
 use crate::router::CompactionResolver;
 use crate::runtime::chat_sessions::{AssignPrincipal, Disposition};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -1316,6 +1317,7 @@ pub struct SessionsSpawnTool {
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
     /// Model-aware compaction resolver for sub-agent tool call loops.
+    #[cfg(test)]
     compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
@@ -1597,7 +1599,11 @@ impl SessionsSpawnTool {
         _spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
+        #[cfg(not(test))]
+        let _ = compaction_config;
+        #[cfg(test)]
         let compaction_resolver = CompactionResolver::from_base(compaction_config);
+        #[cfg(test)]
         tracing::debug!("sessions_spawn initialized child compaction resolver");
         let provider_name: String = provider_name.into();
         let configured_providers = providers::ConfiguredProviders::default()
@@ -1619,6 +1625,7 @@ impl SessionsSpawnTool {
             active_runs,
             tools: Arc::new(ParentToolRegistry::default()),
             workspace_dir,
+            #[cfg(test)]
             compaction_resolver,
             configured_providers,
             model_catalog: Arc::default(),
@@ -1718,6 +1725,7 @@ impl SessionsSpawnTool {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
         self.compaction_resolver = resolver;
         self

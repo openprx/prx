@@ -300,7 +300,11 @@ mod tests {
     fn g6_admits_release_catalog_price_without_a_config_override() {
         let config = crate::config::Config::default();
         assert!(config.cost.prices.is_empty(), "cost.prices is override-only");
-        let model = model(&config, "openai", "gpt-4o");
+        let provider = crate::providers::selection::default_provider(&config);
+        let selected = crate::providers::selection::default_model(&config);
+        assert_eq!(provider, "openrouter");
+        assert_eq!(selected, "anthropic/claude-sonnet-5");
+        let model = model(&config, provider, selected);
         let catalog = empty_catalog();
         let view = catalog.view(&Default::default());
         let priced = build_cost_model(&view, &model, &config.cost, &BTreeMap::new());
@@ -315,6 +319,25 @@ mod tests {
             RuntimeCostModel::new(&model, &config, &BTreeMap::new())
                 .estimate_terminal()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn an_unknown_price_cannot_become_a_free_candidate() {
+        let config = crate::config::Config::default();
+        let model = model(&config, "openai", "prx-unlisted-model");
+        let catalog = empty_catalog();
+        let view = catalog.view(&Default::default());
+        let unpriced = build_cost_model(&view, &model, &config.cost, &BTreeMap::new());
+
+        assert!(
+            unpriced.estimates.is_empty(),
+            "an unknown price cannot become a free candidate"
+        );
+        assert!(
+            RuntimeCostModel::new(&model, &config, &BTreeMap::new())
+                .estimate_terminal()
+                .is_none()
         );
     }
 

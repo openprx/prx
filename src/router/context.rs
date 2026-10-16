@@ -559,6 +559,29 @@ mod tests {
     }
 
     #[test]
+    fn catalog_context_matches_aggregator_suffix_without_matching_ollama_wildcard() {
+        let variant = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "openrouter",
+            "moonshotai/kimi-k2.5:free",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(variant.config.max_context_tokens, 262_144);
+        assert_eq!(variant.max_context_source, ContextWindowSource::Catalog);
+
+        let unknown_local = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "ollama",
+            "prx-unknown-local-model",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(unknown_local.config.max_context_tokens, 128_000);
+        assert_eq!(unknown_local.max_context_source, ContextWindowSource::FallbackDefault);
+    }
+
+    #[test]
     fn falls_back_when_no_model_metadata_matches() {
         let result = resolve_effective_compaction_config(
             &AgentCompactionConfig::default(),

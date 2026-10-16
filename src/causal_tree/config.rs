@@ -331,6 +331,12 @@ pub struct CausalPolicy {
     pub max_decision_hops: u8,
     /// The extra latency one turn may spend deciding (50 to 5000 ms).
     pub extra_latency_budget_ms: u64,
+    /// Internal presence bit populated by `Config::load_from_path`. A stored
+    /// value equal to the default is still an operator value and must not be
+    /// replaced by a catalog transport recommendation.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub extra_latency_budget_ms_explicit: bool,
     /// Minimum score to commit a candidate.
     pub commit_threshold: f32,
     /// Minimum confidence of a Choice answer.
@@ -350,6 +356,7 @@ impl Default for CausalPolicy {
             max_candidates: DEFAULT_MAX_CANDIDATES,
             max_decision_hops: DEFAULT_MAX_DECISION_HOPS,
             extra_latency_budget_ms: DEFAULT_EXTRA_LATENCY_BUDGET_MS,
+            extra_latency_budget_ms_explicit: false,
             commit_threshold: DEFAULT_COMMIT_THRESHOLD,
             minimum_choice_confidence: DEFAULT_MINIMUM_CHOICE_CONFIDENCE,
             minimum_top_margin: DEFAULT_MINIMUM_TOP_MARGIN,

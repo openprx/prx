@@ -665,13 +665,21 @@ profile unless the named delegate supplies an explicit `api_key`.
 Static prices are recorded in the embedded release catalog only when the
 provider publishes token prices for a stable model ID. Kimi Code is
 subscription/quota billed, so PRX deliberately does not invent a per-token cost
-for its coding aliases. OpenRouter and proxy pricing remains dynamic except for
-exact release rows with a published price.
+for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
+recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
+OpenRouter and proxy pricing remains dynamic except for exact release rows with
+a published price. Router ranking cost is a separate catalog hint and is never
+used as the input/output billing tariff.
 
 `[cost.prices]` is an operator-override table and wins over the release catalog.
 When neither source has a matching price, only `ollama` is treated as zero-cost.
 LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
 `cost.prices` entry before PRX can produce a cost estimate.
+
+The catalog's `ollama/*` entry seeds only the Router's conservative local
+candidate. It does not assert vision, context-window, or verification facts for
+an arbitrary local model; exact discovery or `[[providers.models]]` declarations
+remain authoritative for those models.
 
 The canonical routing, usage, and cost settlement boundary is described in
 [provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).

@@ -450,7 +450,7 @@ impl AgentBuilder {
             _config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+                .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_owned()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir,
             identity_config: self.identity_config.unwrap_or_default(),

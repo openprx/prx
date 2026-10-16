@@ -2186,6 +2186,7 @@ struct SignalVisionProvider<'a> {
     provider: &'a dyn Provider,
     model: &'a str,
     temperature: f64,
+    capabilities: crate::providers::ProviderCapabilities,
 }
 
 struct SignalVisionScope {
@@ -2205,6 +2206,7 @@ async fn run_signal_vision_preflight(
         provider,
         model,
         temperature,
+        capabilities,
     } = target;
     if !is_signal_image_message(msg) {
         return SignalVisionPreflightOutcome::NotRequired;
@@ -2217,10 +2219,7 @@ async fn run_signal_vision_preflight(
     else {
         return fallback("auxiliary vision source or accounting admission refused");
     };
-    if !provider
-        .capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-        .vision
-    {
+    if !capabilities.vision {
         return fallback("auxiliary vision unsupported by selected provider");
     }
     let deadline = tokio::time::Instant::from_std(accounting.deadline());
@@ -3378,11 +3377,16 @@ async fn run_channel_turn(
     let preflight = if vision_required {
         if let Some(scope) = vision_scope.as_ref() {
             let provider = scope.accounting.provider();
+            let model = scope.accounting.selected_model().model();
+            let adapter = provider.capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = providers::selection::catalog_for(&config_generation.effective)
+                .effective_provider_capabilities(scope.accounting.selected_model().provider_label(), model, adapter);
             run_signal_vision_preflight(
                 SignalVisionProvider {
                     provider: provider.as_ref(),
-                    model: scope.accounting.selected_model().model(),
+                    model,
                     temperature: runtime_defaults.temperature,
+                    capabilities,
                 },
                 &msg,
                 &message_runtime.multimodal,
@@ -5810,14 +5814,6 @@ pub async fn start_channels_with_config(
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
-        )
-        .with_compaction_resolver(
-            crate::router::CompactionResolver::new(
-                config.agent.compaction.clone(),
-                config.router.clone(),
-                config.model_routes.clone(),
-            )
-            .with_model_catalog(providers::selection::catalog_for(&config)),
         )
         .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))

@@ -430,8 +430,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
                     {
                         section.backend.timeout_ms = recommended;
                     }
-                    if section.policy.extra_latency_budget_ms
-                        == crate::causal_tree::config::CausalPolicy::default().extra_latency_budget_ms
+                    if !section.policy.extra_latency_budget_ms_explicit
                         && let Some(recommended) = entry.transport.extra_latency_budget_ms
                     {
                         section.policy.extra_latency_budget_ms = recommended;
@@ -450,6 +449,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             }
             if let Some(value) = patch.extra_latency_budget_ms {
                 policy.extra_latency_budget_ms = value;
+                policy.extra_latency_budget_ms_explicit = true;
             }
             if let Some(value) = patch.commit_threshold {
                 policy.commit_threshold = value;
@@ -725,6 +725,29 @@ mod tests {
             ),
             crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
         ));
+    }
+
+    #[test]
+    fn set_backend_preserves_an_explicit_latency_budget_equal_to_the_default() {
+        let mut config = Config::default();
+        let default_budget = CausalPolicy::default().extra_latency_budget_ms;
+        config.causal_tree.policy.extra_latency_budget_ms = default_budget;
+        config.causal_tree.policy.extra_latency_budget_ms_explicit = true;
+
+        let next = CausalConfigService::mutate(
+            &config,
+            &[CausalMutation::SetBackend {
+                kind: BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_string()),
+                pinned_snapshot: None,
+                timeout_ms: Some(default_budget as u32),
+            }],
+        )
+        .expect("explicit operator budget remains valid");
+
+        assert_eq!(next.causal_tree.policy.extra_latency_budget_ms, default_budget);
+        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
     }
 
     /// D-094 C-2: a model-scoped entry without its own list (here one

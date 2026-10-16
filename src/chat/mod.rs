@@ -4303,14 +4303,6 @@ pub async fn run(
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
     )
-    .with_compaction_resolver(
-        crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        )
-        .with_model_catalog(providers::selection::catalog_for(&config)),
-    )
     .with_cost_config(config.cost.clone())
     .with_reliability(config.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))

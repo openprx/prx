@@ -13,11 +13,10 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
         .filter_map(|model| {
             let router = model.router.as_ref()?;
             let context = model.limits.context_window?;
-            let pricing = model.pricing.as_ref()?;
             Some(RouterModelConfig {
                 model_id: model.api_model.clone(),
                 provider: model.provider.clone(),
-                cost_per_million_tokens: pricing.input as f32,
+                cost_per_million_tokens: router.cost_per_million_tokens as f32,
                 max_context: usize::try_from(context).unwrap_or(usize::MAX),
                 reserved_output_tokens: model
                     .limits

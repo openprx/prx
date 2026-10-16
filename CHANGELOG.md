@@ -15,6 +15,11 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Fresh configurations now select `openrouter` with
+  `anthropic/claude-sonnet-5`; `prx init` writes that pair, and the unset
+  `Config` default follows the release catalog. Stable direct Gemini tariffs
+  now come from the same catalog as other built-in prices.
+
 - Provider defaults, onboarding choices, model listings, prices, context
   windows, Router candidates, model tool/vision features, and hosted decision
   transport defaults now read the validated `catalog/models.json` embedded in
@@ -116,6 +121,12 @@ for integration, validation and rollback limits.
   existing skill directory.
 
 ### Fixed
+
+- OpenRouter's release default and recognized upstream models remain
+  cost-admissible when `[cost.prices]` is empty. Router ranking estimates are
+  no longer treated as input/output billing tariffs, and the Router-only
+  `ollama/*` row no longer marks every local model as non-vision, 32K-context,
+  or catalog-verified.
 
 - A tool the user names exactly in a message (for example an MCP tool that
   needs approval) now produces an approval request instead of a plain answer

@@ -1385,14 +1385,6 @@ fn register_gateway_turn_tools(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(
-            crate::router::CompactionResolver::new(
-                config.agent.compaction.clone(),
-                config.router.clone(),
-                config.model_routes.clone(),
-            )
-            .with_model_catalog(providers::selection::catalog_for(config)),
-        )
         .with_reliability(config.reliability.clone())
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
@@ -2560,10 +2552,12 @@ async fn run_gateway_chat_with_multimodal(
 
             let user_messages = vec![crate::agent::turn_contracts::inbound_user_message(&enriched_message)];
             let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-            let mode_capabilities = turn_runtime.provider.capabilities_for(
+            let adapter_capabilities = turn_runtime.provider.capabilities_for(
                 &turn_runtime.model,
                 crate::providers::traits::ProviderRequestMode::NonStreaming,
             );
+            let mode_capabilities = providers::selection::catalog_for(&config_snapshot)
+                .effective_provider_capabilities(provider_label, &turn_runtime.model, adapter_capabilities);
             if image_marker_count > 0 && !mode_capabilities.vision {
                 return Err(ProviderCapabilityError {
                     provider: providers::redact_endpoint_userinfo(provider_label).into_owned(),

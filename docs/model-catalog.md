@@ -72,10 +72,19 @@ evidence continues to outrank a positive release fact.
 `[cost.prices]` contains operator overrides only. An exact or redacted endpoint
 override wins; otherwise usage accounting and the G6 admission gate read the
 release price. A missing catalog and override price remains unpriced, with the
-existing Ollama-only zero-price exemption. Compaction reads the effective
+existing Ollama-only zero-price exemption. OpenRouter rows without a duplicated
+tariff resolve stable upstream Anthropic, Google/Gemini, Moonshot, OpenAI and
+xAI model prices from those providers' release rows; unknown or dynamic proxy
+models remain unpriced. Compaction reads the effective
 descriptor's context window after explicit agent and `[[router.models]]`
 overrides. The default Router candidate list is derived from rows that carry
-both `router` hints and pricing.
+`router` hints. `router.cost_per_million_tokens` is a comparative ranking input,
+not a billing tariff; billing always uses the separate `pricing` object.
+
+The `ollama/*` row exists only to seed the Router's conservative local fallback.
+It does not verify an arbitrary Ollama model, assign it a 32K context window, or
+deny its vision support. Exact release, discovery, or operator facts determine
+those properties; otherwise they stay unknown and adapter-bounded.
 
 Image admission intersects the concrete adapter ceiling with the effective
 model descriptor before provider transport. The same intersection controls
@@ -86,8 +95,9 @@ vision from model-name or URL substrings; declare a custom endpoint's facts in
 When `prx causal config set backend` selects a release-catalog decision model
 without explicit transport arguments, the transaction writes the catalog's
 pinned snapshot and recommended timeout and, while the policy still has its
-default latency budget, the catalog's recommended budget. Explicit command or
-policy values remain TOML choices. Rollback uses the normal configuration
+implicit latency budget, the catalog's recommended budget. A stored
+`extra_latency_budget_ms` remains explicit even when it equals the built-in
+default. Explicit command or policy values remain TOML choices. Rollback uses the normal configuration
 history; reverting the PRX binary reverts the embedded catalog.
 
 ## Maintaining the release file
