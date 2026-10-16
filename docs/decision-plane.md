@@ -66,8 +66,13 @@ does not make a later ordinary message require external evidence. Empty input
 and turns made undecidable by failed or repeated tool work still Clarify. Brief
 ordinary requests (builtin request weight at most two), continued conversation,
 and turns with no viable read/recovery candidate receive the direct-answer
-preference. Longer unrouted text may take one bounded discovery hop and then
-answer when discovery adds no capability.
+preference. Longer unrouted text may take one bounded discovery hop. After that
+gate-checked local read completes, the terminal fallback may answer even when
+the source contains a path, URL, code shape, or exact capability name. Any
+capability found by the read still needs a normal nonterminal selection and all
+execution gates; completion of discovery grants no execution authority. A
+rejected configured decision attempt remains fail closed even when its builtin
+fallback completes discovery.
 
 An exactly named, current Searchable tool, or an exactly named source-configured
 Delegate with a sealed child manifest, uses a narrower selection path. It may

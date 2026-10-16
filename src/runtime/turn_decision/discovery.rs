@@ -141,13 +141,20 @@ impl TurnDecisionService {
             "turn does not permit capability discovery"
         );
         self.agent_execution_specs(proof, context)?;
-        let CandidateSet::Legal {
-            discoverable_families, ..
-        } = &context.engine.candidates
-        else {
-            anyhow::bail!("turn has no admitted candidate set");
-        };
-        Ok(discoverable_families.iter().collect())
+        let mut families = Vec::new();
+        for decision in context.audit_hops() {
+            if let CandidateSet::Legal {
+                discoverable_families, ..
+            } = &decision.candidates
+            {
+                for family in discoverable_families.iter() {
+                    if !families.contains(&family) {
+                        families.push(family);
+                    }
+                }
+            }
+        }
+        Ok(families)
     }
 }
 

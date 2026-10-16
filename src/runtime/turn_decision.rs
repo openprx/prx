@@ -2752,22 +2752,6 @@ impl TurnDecisionService {
                     state = observed.state;
                 }
                 TurnExecutionDirective::Discover { .. } => {
-                    let signals =
-                        crate::decision::builtin::features::text_signals(decision.state.routing_input.as_str());
-                    let plain_turn_can_answer_after_discovery = signals.has_text
-                        && !signals.structural()
-                        && decision.state.observed.retry_count() == 0
-                        && decision.state.observed.artifacts().is_empty()
-                        && !decision.state.trusted.parts().approval_pending
-                        && decision.state.observed.completed_steps().iter().all(|step| {
-                            step.kind() == ObservedStepKind::RouterHistory || step.status() == ObservedStepStatus::Ok
-                        })
-                        && !decision
-                            .state
-                            .derived
-                            .candidates()
-                            .iter()
-                            .any(|candidate| candidate.exact_mention);
                     let hop = decision
                         .state
                         .lineage
@@ -2797,9 +2781,24 @@ impl TurnDecisionService {
                     };
                     let previous_refs = discovered_refs.clone();
                     let added_refs = discovered_refs.extend_selected(selected_refs);
-                    if plain_turn_can_answer_after_discovery {
-                        allow_terminal_answer = true;
-                    }
+                    // Discovery is a bounded, gate-checked local read. Once it
+                    // completes, its terminal fallback may answer from the
+                    // resulting surface regardless of whether the source text
+                    // contains a path, URL, code, or exact capability name.
+                    // A rejected configured decision attempt remains fail
+                    // closed: its builtin recovery may finish discovery, but
+                    // must not turn the rejected decision into an answer.
+                    // The discovered refs still pass the normal G1-G9 gates;
+                    // this changes only the terminal fallback after the read.
+                    allow_terminal_answer = decision.prediction.as_ref().is_none_or(|prediction| {
+                        prediction.attempts.iter().all(|attempt| {
+                            matches!(
+                                attempt.outcome,
+                                crate::decision::factory::AttemptOutcome::Served
+                                    | crate::decision::factory::AttemptOutcome::Cached
+                            )
+                        })
+                    });
                     discovery_change = Some((previous_refs, added_refs));
                     state = decision.state.clone();
                     let mut steps = state.observed.completed_steps().to_vec();

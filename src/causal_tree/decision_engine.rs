@@ -35,7 +35,7 @@ use crate::capability::CapabilityAvailabilityLevel;
 use crate::decision::DecisionError;
 #[cfg(test)]
 use crate::decision::factory::DecisionBackendFactory;
-use crate::decision::factory::PredictionResult;
+use crate::decision::factory::{FallbackReason, PredictionResult};
 use crate::decision::telemetry::CausalLineage;
 use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, RequestLimits, ValidatedDecision};
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -944,14 +944,34 @@ impl CausalDecisionEngine {
             .await;
             match outcome {
                 Ok(Ok(result)) if Instant::now() < inputs.deadline => {
-                    let extracted = PredictionEvidence::extract(&result.served, &compiled, &candidates)?;
-                    audit_trace = Some(PredictionAuditTrace::capture(
-                        &result.served,
-                        &compiled,
-                        inputs.config.store.record_redacted_projection,
-                    )?);
-                    prediction = Some(result);
-                    evidence = Some(extracted);
+                    let terminal_cause = match result.reason {
+                        Some(FallbackReason::AllFailed) => Some(FallbackCause::DecisionFailed),
+                        Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
+                        Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
+                    };
+                    if let Some(cause) = terminal_cause {
+                        // Keep the factory result for truthful attempt and
+                        // accounting records, but never score or execute the
+                        // builtin shadow after a configured decision attempt
+                        // failed or exhausted its deadline.
+                        audit_trace = Some(PredictionAuditTrace::capture(
+                            &result.served,
+                            &compiled,
+                            inputs.config.store.record_redacted_projection,
+                        )?);
+                        prediction = Some(result);
+                        fallback_cause = Some(cause);
+                        evidence = Some(terminal_evidence(&candidates));
+                    } else {
+                        let extracted = PredictionEvidence::extract(&result.served, &compiled, &candidates)?;
+                        audit_trace = Some(PredictionAuditTrace::capture(
+                            &result.served,
+                            &compiled,
+                            inputs.config.store.record_redacted_projection,
+                        )?);
+                        prediction = Some(result);
+                        evidence = Some(extracted);
+                    }
                 }
                 Ok(Ok(_)) | Err(_) => {
                     // A failed builtin or exhausted deadline has no trusted
@@ -992,7 +1012,7 @@ impl CausalDecisionEngine {
             stage_cap: Duration::from_millis(u64::from(inputs.config.rehearsal.timeout_ms)),
             deadline: tokio::time::Instant::from_std(inputs.deadline),
         };
-        let rehearsal = if prediction.is_some() && Instant::now() < inputs.deadline {
+        let rehearsal = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
             BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
         } else {
             BTreeMap::new()
@@ -1019,7 +1039,7 @@ impl CausalDecisionEngine {
         let mut scores = BTreeMap::new();
         let mut scored_count = 0usize;
         let (mut selection, mut exploration_propensities) = if let Some(evidence) = evidence.as_ref() {
-            let weights = if prediction.is_some() && Instant::now() < inputs.deadline {
+            let weights = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
                 Some(ScorerWeights::effective(&inputs.config.scoring)?)
             } else {
                 None
@@ -1072,7 +1092,7 @@ impl CausalDecisionEngine {
             } else {
                 evidence.clone()
             };
-            if prediction.is_some() && Instant::now() < inputs.deadline {
+            if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
                 CausalSelector::select_with_exploration(
                     &candidates,
                     &scores,

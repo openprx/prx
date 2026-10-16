@@ -10,7 +10,7 @@ use super::branch::{
     CausalCandidate, CostEstimate, Ns8, OpId, SideEffectClass,
 };
 use super::gates::{GateError, GateInputs, GateOutcome, GatePass, GateReport, HardGates};
-use super::state::{CausalState, SideEffectMode};
+use super::state::{CausalState, ObservedStepKind, ObservedStepStatus, SideEffectMode};
 use crate::decision::DecisionKey;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
 
@@ -458,7 +458,11 @@ impl CausalCandidateGenerator {
                 // A later capability_search call supplies its own bounded query.
                 // Only initial Discover hops require the raw source to fit that
                 // query contract; both paths use the same capability gates.
-                if !exact_capability_requires_close {
+                let discovery_completed =
+                    state.observed.completed_steps().iter().any(|step| {
+                        step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok
+                    });
+                if !exact_capability_requires_close && !discovery_completed {
                     let mut discovery_anchor = None;
                     for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
                         let searchable = catalog.iter_entries().filter(|entry| {
