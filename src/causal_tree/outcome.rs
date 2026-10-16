@@ -765,25 +765,8 @@ impl TerminalFacts {
         .map_err(|_| OutcomeCorrelationError::Marker)?;
         if marker.terminal_id != receipt.terminal_id
             || marker.decision_id.as_deref() != Some(context.decision_id().to_string().as_str())
-            || marker.usage_settlement.as_ref().map(|usage| {
-                (
-                    usage.settlement_id.as_deref(),
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cost_usd,
-                )
-            }) != receipt.usage_settlement.as_ref().map(|usage| {
-                (
-                    usage.settlement_id.as_deref(),
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cost_usd,
-                )
-            })
-            || marker.cost_settlement.as_ref().map(std::mem::discriminant)
-                != receipt.cost_settlement.as_ref().map(std::mem::discriminant)
+            || !usage_settlements_agree(marker.usage_settlement.as_ref(), receipt.usage_settlement.as_ref())
+            || !cost_settlements_agree(marker.cost_settlement.as_ref(), receipt.cost_settlement.as_ref())
             || marker
                 .usage_settlement
                 .as_ref()
@@ -807,6 +790,48 @@ impl TerminalFacts {
             execution_trace: marker.execution_trace,
             latency_ms,
         })
+    }
+}
+
+/// The usage identity a marker and a receipt must share: settlement id, token
+/// counts and priced amount. A replay that carries a different amount or id is
+/// a different settlement and is rejected here.
+fn usage_settlements_agree(
+    marker: Option<&MeteredTokenUsageRecord>,
+    receipt: Option<&MeteredTokenUsageRecord>,
+) -> bool {
+    let identity = |usage: &MeteredTokenUsageRecord| {
+        (
+            usage.settlement_id.clone(),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            usage.cost_usd,
+        )
+    };
+    marker.map(identity) == receipt.map(identity)
+}
+
+/// Whether a stored marker's cost settlement and a (re)finalized receipt's
+/// describe the same settlement outcome.
+///
+/// The first finalization stores `Recorded`; replaying the same settlement id
+/// over the committed marker returns `Replayed` because the ledger already holds
+/// it. Those two are one settlement seen at two times, so they agree. Every
+/// other pairing must match exactly in kind, so `UnknownPricing`, `Disabled`
+/// and `Failed` never pass for a recorded charge. The amount and id are pinned
+/// separately by [`usage_settlements_agree`] and, on replay, by the ledger's own
+/// `verify_replayed_settlement`.
+fn cost_settlements_agree(
+    marker: Option<&crate::cost::types::CostSettlement>,
+    receipt: Option<&crate::cost::types::CostSettlement>,
+) -> bool {
+    use crate::cost::types::CostSettlement::{Recorded, Replayed};
+    match (marker, receipt) {
+        (Some(Recorded { .. } | Replayed), Some(Recorded { .. } | Replayed)) => true,
+        (Some(left), Some(right)) => std::mem::discriminant(left) == std::mem::discriminant(right),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1079,6 +1104,65 @@ mod tests {
     use crate::causal_tree::state::fixtures;
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
+
+    fn priced_usage(id: &str, cost: f64) -> MeteredTokenUsageRecord {
+        MeteredTokenUsageRecord {
+            settlement_id: Some(id.to_owned()),
+            provider: "ollama".to_owned(),
+            model: "m".to_owned(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            source: crate::llm::route_decision::TokenUsageSource::Reported,
+            cost_usd: Some(cost),
+        }
+    }
+
+    fn recorded() -> crate::cost::types::CostSettlement {
+        crate::cost::types::CostSettlement::Recorded {
+            budget: crate::cost::types::BudgetCheck::Allowed,
+        }
+    }
+
+    #[test]
+    fn replayed_priced_settlement_agrees_with_the_stored_recorded_marker() {
+        use crate::cost::types::CostSettlement::Replayed;
+        let usage = priced_usage("terminal-1", 0.25);
+        assert!(usage_settlements_agree(Some(&usage), Some(&usage.clone())));
+        assert!(cost_settlements_agree(Some(&recorded()), Some(&Replayed)));
+        assert!(cost_settlements_agree(Some(&Replayed), Some(&recorded())));
+        assert!(cost_settlements_agree(Some(&recorded()), Some(&recorded())));
+        assert!(cost_settlements_agree(Some(&Replayed), Some(&Replayed)));
+        assert!(cost_settlements_agree(None, None));
+    }
+
+    #[test]
+    fn a_genuinely_different_settlement_is_still_rejected() {
+        use crate::cost::types::CostSettlement::{Disabled, Failed, Replayed, UnknownPricing};
+        let stored = priced_usage("terminal-1", 0.25);
+        let mut other_amount = stored.clone();
+        other_amount.cost_usd = Some(0.5);
+        let mut other_tokens = stored.clone();
+        other_tokens.total_tokens += 1;
+        let other_id = priced_usage("terminal-2", 0.25);
+        let mut unpriced = stored.clone();
+        unpriced.cost_usd = None;
+        for different in [&other_amount, &other_tokens, &other_id, &unpriced] {
+            assert!(!usage_settlements_agree(Some(&stored), Some(different)));
+        }
+        assert!(!usage_settlements_agree(Some(&stored), None));
+        assert!(!usage_settlements_agree(None, Some(&stored)));
+        // Replayed only stands in for Recorded, never for any other outcome.
+        for kind in [UnknownPricing, Disabled, Failed { error: "x".to_owned() }] {
+            assert!(!cost_settlements_agree(Some(&recorded()), Some(&kind)));
+            assert!(!cost_settlements_agree(Some(&Replayed), Some(&kind)));
+            assert!(!cost_settlements_agree(Some(&kind), Some(&Replayed)));
+        }
+        assert!(!cost_settlements_agree(Some(&recorded()), None));
+        assert!(!cost_settlements_agree(None, Some(&Replayed)));
+    }
 
     #[test]
     fn collected_pending_classifies_without_executed_effect_and_preserves_failure() {
