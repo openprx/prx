@@ -831,8 +831,18 @@ fn a_crash_between_pattern_and_index_write_resolves_to_one_active_pattern() {
     assert_ne!(first.pattern_id, second.pattern_id);
 }
 
+fn write_forged_pattern(store: &SkillLifecycleStore, pattern: &crate::skills::lifecycle::KnowledgePattern) {
+    let path = store
+        .root()
+        .join("patterns")
+        .join(format!("{}.json", pattern.pattern_id));
+    fs::write(&path, serde_json::to_vec_pretty(pattern).expect("test: json")).expect("test: write");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("test: mode");
+}
+
 #[test]
-fn rebuild_resolves_two_successors_of_one_predecessor_deterministically() {
+fn rebuild_resolves_a_fork_by_pattern_id_not_by_clock() {
     let (_tmp, store, pin) = setup();
     let (a, b) = (eligible(&store, &pin, "task-a"), eligible(&store, &pin, "task-b"));
     let first = store
@@ -843,30 +853,123 @@ fn rebuild_resolves_two_successors_of_one_predecessor_deterministically() {
         .consolidate_pattern(&request(&[&b], &[]))
         .expect("test: second")
         .pattern;
-    // A rival successor of the first pattern, written later.
+    // A rival successor of the first pattern; it is the EARLIER one by clock.
     let mut rival = second.clone();
     rival.applicability.push("zzz rival".to_string());
     rival.applicability.sort();
-    rival.created_at = second.created_at + chrono::Duration::seconds(5);
+    rival.created_at = second.created_at - chrono::Duration::seconds(500);
     rival.supersedes = vec![first.pattern_id];
     let rival_id = PatternId::from_digest(&rival.content_digest());
     rival.pattern_id = rival_id.clone();
     rival.record_id = rival_id.to_string();
-    let path = store.root().join("patterns").join(format!("{rival_id}.json"));
-    fs::write(&path, serde_json::to_vec_pretty(&rival).expect("test: json")).expect("test: write");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("test: mode");
-    }
+    write_forged_pattern(&store, &rival);
+    let expected = std::cmp::max(second.pattern_id, rival_id);
     for _ in 0..2 {
         assert_eq!(store.rebuild_pattern_index().expect("test: rebuild"), 1);
         let active = store.active_patterns().expect("test: active");
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].pattern_id, rival_id, "the later successor wins every time");
+        assert_eq!(active[0].pattern_id, expected, "the greater id wins every time");
     }
     fs::remove_file(store.root().join("patterns").join("index.json")).expect("test: drop index");
     assert_eq!(store.rebuild_pattern_index().expect("test: rebuild"), 1);
-    assert_eq!(store.active_patterns().expect("test: active")[0].pattern_id, rival_id);
+    assert_eq!(store.active_patterns().expect("test: active")[0].pattern_id, expected);
+}
+
+#[test]
+fn clock_skew_cannot_resurrect_superseded_history() {
+    let (_tmp, store, pin) = setup();
+    let ids: Vec<String> = (0..3).map(|i| eligible(&store, &pin, &format!("task-{i}"))).collect();
+    let p0 = store
+        .consolidate_pattern(&request(&[&ids[0]], &[]))
+        .expect("test: p0")
+        .pattern;
+    store.consolidate_pattern(&request(&[&ids[1]], &[])).expect("test: p1");
+    let p2 = store
+        .consolidate_pattern(&request(&[&ids[2]], &[]))
+        .expect("test: p2")
+        .pattern;
+    // The oldest pattern claims to be created far in the future.
+    let mut skewed = p0;
+    skewed.created_at = p2.created_at + chrono::Duration::days(30);
+    write_forged_pattern(&store, &skewed);
+    // Lose the index: both a rebuild and an adopting consolidation must keep P2.
+    let index_path = store.root().join("patterns").join("index.json");
+    fs::remove_file(&index_path).expect("test: drop index");
+    let again = store
+        .consolidate_pattern(&request(&[&ids[2]], &[]))
+        .expect("test: consolidate on a lost index");
+    assert!(!again.created);
+    assert_eq!(again.pattern.pattern_id, p2.pattern_id);
+    assert_eq!(store.rebuild_pattern_index().expect("test: rebuild"), 1);
+    let active = store.active_patterns().expect("test: active");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].pattern_id, p2.pattern_id);
+}
+
+#[test]
+fn steady_state_consolidation_reads_no_history_and_rebuild_stays_possible() {
+    let (_tmp, store, pin) = setup();
+    let ids: Vec<String> = (0..4).map(|i| eligible(&store, &pin, &format!("task-{i}"))).collect();
+    for id in &ids {
+        store.consolidate_pattern(&request(&[id], &[])).expect("test: extend");
+    }
+    let mut index = store.pattern_index().expect("test: index");
+    assert_eq!(index.history.len(), 3, "the three superseded patterns are remembered");
+    let adoption = store.adopt_unindexed(&mut index).expect("test: adopt");
+    assert!(!adoption.changed);
+    assert_eq!(adoption.files_read, 0, "no pattern file is read in steady state");
+    // Corrupting history files changes nothing a steady-state call looks at.
+    for id in &index.history {
+        fs::write(store.root().join("patterns").join(format!("{id}.json")), b"garbage").expect("test: corrupt");
+    }
+    assert!(
+        !store
+            .consolidate_pattern(&request(&[&ids[3]], &[]))
+            .expect("test: repeat")
+            .created
+    );
+    // A rebuild reads everything; the corrupt history files are skipped, the
+    // head is the only valid pattern left and stays active.
+    assert_eq!(store.rebuild_pattern_index().expect("test: rebuild"), 1);
+}
+
+#[test]
+fn withdrawn_evidence_is_capped_with_an_exact_count() {
+    let (_tmp, store, pin) = setup();
+    let ids: Vec<String> = (0..71).map(|i| eligible(&store, &pin, &format!("task-{i}"))).collect();
+    let refs: Vec<&String> = ids.iter().take(70).collect();
+    store
+        .consolidate_pattern(&request(&refs, &[]))
+        .expect("test: big pattern");
+    for id in ids.iter().take(70) {
+        fs::remove_file(store.root().join("experiences").join(format!("{id}.json"))).expect("test: retention");
+    }
+    let next = store
+        .consolidate_pattern(&request(&[&ids[70]], &[]))
+        .expect("test: the write is bounded")
+        .pattern;
+    assert_eq!(next.withdrawn_count, 70);
+    assert_eq!(next.withdrawn_evidence.len(), 64);
+    assert_eq!(next.evidence_ids, vec![ids[70].clone()]);
+    let active = store.active_patterns().expect("test: the store still reads back");
+    assert_eq!(active.len(), 1);
+}
+
+#[test]
+fn applicability_overflow_is_refused_with_a_typed_error() {
+    let (_tmp, store, pin) = setup();
+    let (a, b) = (eligible(&store, &pin, "task-a"), eligible(&store, &pin, "task-b"));
+    let mut first = request(&[&a], &[]);
+    first.applicability = (0..16).map(|i| format!("case {i:02}")).collect();
+    store.consolidate_pattern(&first).expect("test: full list");
+    let mut more = request(&[&b], &[]);
+    more.applicability = vec!["one more".to_string()];
+    let err = store.consolidate_pattern(&more).expect_err("test: overflow");
+    assert!(matches!(err, LifecycleError::KnowledgeLimit { limit: 16, .. }), "{err}");
+    assert_eq!(
+        store.active_patterns().expect("test: active")[0].applicability.len(),
+        16
+    );
 }
 
 #[test]
@@ -1021,4 +1124,140 @@ fn identifier_fields_reject_newlines_and_control_characters() {
     let mut text = request(&[&id], &[]);
     text.statement = "line one\nline two".to_string();
     assert!(store.consolidate_pattern(&text).is_ok(), "a statement may span lines");
+}
+
+#[test]
+fn unrelated_or_successful_experiences_do_not_lift_suppression() {
+    let (_tmp, store, pin) = setup();
+    let a = eligible(&store, &pin, "task-a");
+    store
+        .record_rejection(&rejection("prop-1", "Run the migration.", &[&a], "env"))
+        .expect("test: record");
+    // A real, eligible failure that never hydrated the skill.
+    store
+        .record_selection("selected-only", &pin, &Correlation::default())
+        .expect("test: select");
+    store
+        .join_terminal("selected-only", "term", ExperienceOutcome::Failure)
+        .expect("test: join");
+    let unrelated = crate::skills::lifecycle::experience_id(store.owner_scope(), "selected-only");
+    // A hydrated run that succeeded.
+    store
+        .record_hydration("won", &pin, "SKILL.md", b"x", &Correlation::default())
+        .expect("test: hydrate");
+    store
+        .join_terminal("won", "term", ExperienceOutcome::Success)
+        .expect("test: join");
+    let won = crate::skills::lifecycle::experience_id(store.owner_scope(), "won");
+    for other in [&unrelated, &won] {
+        assert!(
+            ask(
+                &store,
+                "Run the migration.",
+                &[&a, other],
+                "env",
+                ProposalOperation::Revise
+            )
+            .is_some(),
+            "{other} is not new evidence for this skill"
+        );
+    }
+    let fresh = eligible(&store, &pin, "fresh");
+    assert!(
+        ask(
+            &store,
+            "Run the migration.",
+            &[&fresh],
+            "env",
+            ProposalOperation::Revise
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn grandchildren_and_a_root_without_a_run_id_are_one_task() {
+    let (_tmp, store, pin) = setup();
+    let hydrate = |task: &str, run: Option<&str>, parent: Option<&str>| {
+        let correlation = Correlation {
+            run_id: run.map(ToString::to_string),
+            parent_run_id: parent.map(ToString::to_string),
+            ..Correlation::default()
+        };
+        store
+            .record_hydration(task, &pin, "SKILL.md", b"x", &correlation)
+            .expect("test: hydrate");
+        store
+            .join_terminal(task, "term", ExperienceOutcome::Failure)
+            .expect("test: join");
+        crate::skills::lifecycle::experience_id(store.owner_scope(), task)
+    };
+    let root = hydrate("root-task", None, None);
+    let child = hydrate("child", Some("run-c"), Some("root-task"));
+    let grandchild = hydrate("grandchild", Some("run-g"), Some("run-c"));
+    let pattern = store
+        .consolidate_pattern(&request(&[&root, &child, &grandchild], &[]))
+        .expect("test: consolidate")
+        .pattern;
+    assert_eq!(pattern.confidence_basis.evidence_count, 3);
+    assert_eq!(pattern.confidence_basis.distinct_tasks, 1);
+    let other = hydrate("other-root", Some("run-o"), None);
+    let two = store
+        .consolidate_pattern(&request(&[&other], &[]))
+        .expect("test: second root")
+        .pattern;
+    assert_eq!(two.confidence_basis.distinct_tasks, 2);
+}
+
+#[test]
+fn a_forged_rejection_record_fails_closed() {
+    let (_tmp, store, pin) = setup();
+    let a = eligible(&store, &pin, "task-a");
+    let mut new = rejection("prop-1", "text", &[&a], "env");
+    new.reasons = vec!["first".to_string(), "second".to_string()];
+    let record = store.record_rejection(&new).expect("test: record");
+    let path = store
+        .root()
+        .join("rejections")
+        .join(format!("{}.json", record.record_id));
+    let original = fs::read_to_string(&path).expect("test: record text");
+    let edits: [(&str, serde_json::Value); 4] = [
+        ("/fingerprint", serde_json::json!("x")),
+        ("/reasons", serde_json::json!(["second", "first"])),
+        ("/evidence_ids/0", serde_json::json!("not-an-id")),
+        ("/environment_binding", serde_json::json!("e\nnv")),
+    ];
+    for (pointer, value) in edits {
+        let mut doc: serde_json::Value = serde_json::from_str(&original).expect("test: json");
+        *doc.pointer_mut(pointer).expect("test: pointer") = value;
+        fs::write(&path, serde_json::to_vec_pretty(&doc).expect("test: json")).expect("test: write");
+        let err = store.rejections_for(&skill()).expect_err(pointer);
+        assert!(matches!(err, LifecycleError::Tampered { .. }), "{pointer}: {err}");
+    }
+    fs::write(&path, &original).expect("test: restore");
+    assert_eq!(store.rejections_for(&skill()).expect("test: read").len(), 1);
+}
+
+#[test]
+fn staging_sweep_respects_the_reserved_knowledge_locks() {
+    let (_tmp, store, _pin) = setup();
+    let lock_id = SkillId::reserved("_knowledge-patterns").expect("test: reserved");
+    let staged = store.stage_file(&lock_id, b"half written").expect("test: stage");
+    let name = staged
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(name.starts_with("atomic-_knowledge-patterns-"), "{name}");
+    {
+        let _held = store
+            .lock_skill(&lock_id, std::time::Duration::from_secs(1))
+            .expect("test: lock");
+        store.recover(std::time::Duration::ZERO).expect("test: recover");
+        assert!(
+            staged.exists(),
+            "a staged file under a held knowledge lock is not swept"
+        );
+    }
+    store.recover(std::time::Duration::ZERO).expect("test: recover");
+    assert!(!staged.exists(), "an abandoned one is");
 }

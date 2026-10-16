@@ -20,6 +20,11 @@ use unicode_normalization::UnicodeNormalization;
 pub const MAX_PATTERN_EVIDENCE: usize = 256;
 /// Distinct tasks a pattern needs before it may back a skill-revision proposal.
 pub const MIN_DISTINCT_TASKS_FOR_PROPOSAL: usize = 2;
+/// Withdrawn evidence ids a pattern lists; the rest is only counted.
+pub(super) const MAX_WITHDRAWN_KEPT: usize = 64;
+/// Superseded or losing pattern ids the index remembers so that steady-state
+/// consolidation never re-reads history. Pattern retention (SL09) frees room.
+pub(super) const MAX_HISTORY_IDS: usize = 2048;
 pub(super) const MAX_STATEMENT_BYTES: usize = 2000;
 pub(super) const MAX_LIST_ITEMS: usize = 16;
 pub(super) const MAX_ITEM_BYTES: usize = 500;
@@ -227,6 +232,10 @@ pub struct KnowledgePattern {
     /// became ineligible (dropped, deleted by retention). Kept for audit,
     /// cumulative, sorted and de-duplicated; it never counts as support.
     pub withdrawn_evidence: Vec<String>,
+    /// How many experiences were ever withdrawn from this pattern's lineage.
+    /// `withdrawn_evidence` keeps at most [`MAX_WITHDRAWN_KEPT`] of them; the
+    /// count stays exact.
+    pub withdrawn_count: usize,
     /// Patterns this one replaces.
     pub supersedes: Vec<PatternId>,
     pub confidence_basis: ConfidenceBasis,
@@ -249,7 +258,8 @@ impl KnowledgePattern {
             self.confidence_basis.counter_distinct_tasks,
         ]
         .map(|n| n.to_string());
-        let lists: [(&str, &[String]); 7] = [
+        let withdrawn_count = [self.withdrawn_count.to_string()];
+        let lists: [(&str, &[String]); 8] = [
             ("capabilities", &self.scope.capabilities),
             ("applicability", &self.applicability),
             ("exceptions", &self.exceptions),
@@ -257,6 +267,7 @@ impl KnowledgePattern {
             ("counter", &self.counterevidence_ids),
             ("withdrawn", &self.withdrawn_evidence),
             ("basis", &basis),
+            ("withdrawn-count", &withdrawn_count),
         ];
         let skill = self.skill_id.as_ref().map(SkillId::as_str).unwrap_or_default();
         let mut feed = |part: &str| {
@@ -355,6 +366,10 @@ pub struct PatternIndex {
     pub schema_version: u32,
     pub owner_scope: OwnerScope,
     pub entries: Vec<PatternIndexEntry>,
+    /// Ids of patterns known not to be active (superseded or lost a fork),
+    /// sorted. Files not listed here or in `entries` are the only ones a
+    /// consolidation reads.
+    pub history: Vec<PatternId>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -364,6 +379,7 @@ impl PatternIndex {
             schema_version: SCHEMA_VERSION,
             owner_scope: owner.clone(),
             entries: Vec::new(),
+            history: Vec::new(),
             updated_at: Utc::now(),
         }
     }

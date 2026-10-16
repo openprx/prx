@@ -7,7 +7,7 @@
 //! survives every later change of the active revision.
 
 use super::consolidate::{
-    EvidenceUse, check_evidence_id, check_ident, check_text, is_unusable, reserved_lock, sorted_unique,
+    EvidenceUse, check_evidence_id, check_ident, check_text, is_canonical, is_unusable, reserved_lock, sorted_unique,
 };
 use super::generation::ensure_dir_synced;
 use super::knowledge::{MAX_ITEM_BYTES, MAX_LIST_ITEMS, MAX_NAME_BYTES, MAX_PATTERN_EVIDENCE, PatternId};
@@ -198,6 +198,36 @@ impl NewRejection {
     }
 }
 
+/// Bounds and canonical form of a stored record, as `record_rejection` writes it.
+fn verify_record(record: &RejectionRecord) -> Result<(), LifecycleError> {
+    check_ident("proposal id", &record.proposal_id, MAX_NAME_BYTES)?;
+    check_ident("environment binding", &record.environment_binding, MAX_NAME_BYTES)?;
+    let invalid = |reason: &str| LifecycleError::InvalidKnowledge(reason.to_string());
+    if record.fingerprint.len() != 64
+        || !record
+            .fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("fingerprint must be 64 lowercase hex digits"));
+    }
+    if record.reasons.is_empty() || record.reasons.len() > MAX_LIST_ITEMS {
+        return Err(invalid("a rejection has between 1 and 16 reasons"));
+    }
+    record
+        .reasons
+        .iter()
+        .try_for_each(|reason| check_text("reason", reason, MAX_ITEM_BYTES))?;
+    if record.evidence_ids.len() > MAX_PATTERN_EVIDENCE || record.pattern_ids.len() > MAX_PATTERN_EVIDENCE {
+        return Err(invalid("too many references"));
+    }
+    record.evidence_ids.iter().try_for_each(|id| check_evidence_id(id))?;
+    if !is_canonical(&record.reasons) || !is_canonical(&record.evidence_ids) || !is_canonical(&record.pattern_ids) {
+        return Err(invalid("lists must be sorted and free of duplicates"));
+    }
+    Ok(())
+}
+
 impl SkillLifecycleStore {
     fn rejections_dir(&self) -> PathBuf {
         self.root().join(REJECTIONS_DIR)
@@ -299,6 +329,10 @@ impl SkillLifecycleStore {
                 reason: "rejection identity does not match its location".to_string(),
             });
         }
+        verify_record(&record).map_err(|e| LifecycleError::Tampered {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
         Ok(Some(record))
     }
 
@@ -344,8 +378,10 @@ impl SkillLifecycleStore {
     /// Whether a new attempt is a materially equivalent repeat of a rejected
     /// one: same skill, operation, material fingerprint (derived here from
     /// `material`) and environment, and no new evidence. Evidence counts as new
-    /// only when it exists, is this owner's, is eligible and no earlier
-    /// rejection already had it; made-up or ineligible ids are ignored.
+    /// only when it exists, is this owner's, is eligible, did not end in
+    /// success, hydrated this skill (or is evidence of one of the rejected
+    /// attempt's own patterns) and no earlier rejection already had it;
+    /// made-up, unrelated or ineligible ids are ignored.
     /// Returns the rejection that suppresses the attempt.
     pub fn suppressing_rejection(
         &self,
@@ -367,11 +403,29 @@ impl SkillLifecycleStore {
             return Ok(None);
         }
         let known: BTreeSet<&String> = matching.iter().flat_map(|r| r.evidence_ids.iter()).collect();
+        // Evidence the rejected attempt's own patterns rest on also counts.
+        let mut related: BTreeSet<String> = BTreeSet::new();
+        for pattern_id in matching.iter().flat_map(|r| r.pattern_ids.iter()) {
+            if let Some(pattern) = self.read_pattern(pattern_id)? {
+                related.extend(pattern.evidence_ids);
+            }
+        }
+        let same_skill = EvidenceUse {
+            skill: Some(skill),
+            requires_hydration: true,
+            rejects_success: true,
+        };
+        let by_pattern = EvidenceUse {
+            skill: None,
+            requires_hydration: false,
+            rejects_success: true,
+        };
         for id in evidence_ids {
             if known.contains(id) {
                 continue;
             }
-            match self.usable_evidence(id, &NO_REQUIREMENTS) {
+            let usage = if related.contains(id) { &by_pattern } else { &same_skill };
+            match self.usable_evidence(id, usage) {
                 Ok(_) => return Ok(None),
                 Err(e) if is_unusable(&e) => {}
                 Err(e) => return Err(e),
