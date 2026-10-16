@@ -533,3 +533,29 @@ fn pruning_removes_old_experiences_with_their_markers_and_locks() {
     );
     assert!(store.read_experience("task-kept").expect("test: read").is_some());
 }
+
+#[test]
+fn pruning_removes_orphan_dropped_markers_by_age() {
+    let (_tmp, store, _pin) = setup();
+    // No record ever existed for this task, only its dropped-evidence marker.
+    store.mark_dropped_evidence("task-orphan");
+    let id = experience_id(store.owner_scope(), "task-orphan");
+    let marker = store.root().join("experiences").join(format!("{id}.dropped"));
+    assert!(marker.exists());
+    let retention = ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(30),
+        incomplete_max_age: chrono::Duration::days(7),
+    };
+    assert_eq!(
+        store
+            .prune_experiences(&retention, chrono::Utc::now(), |_| false)
+            .expect("test: prune"),
+        0
+    );
+    assert!(marker.exists(), "a young marker stays");
+    let later = chrono::Utc::now() + chrono::Duration::days(10);
+    store
+        .prune_experiences(&retention, later, |_| false)
+        .expect("test: prune");
+    assert!(!marker.exists(), "an old orphan marker is removed");
+}

@@ -133,17 +133,20 @@ struct PinKey {
     skill: SkillId,
 }
 
+/// Key, pin and the time of its last access.
 type PinEntries = VecDeque<(PinKey, Arc<PinnedSkillRevision>, Instant)>;
 
-/// A pin older than this is considered orphaned (its task ended without
+/// A pin not read for this long is considered orphaned (its task ended without
 /// reaching a terminal that releases pins, for example a turn that failed
 /// before finalization) and may be reclaimed, but only when the table is full.
+/// Every pinned read refreshes the pin's last-access time, so a task that is
+/// still reading is never reclaimed.
 pub const ORPHAN_PIN_AGE: Duration = Duration::from_hours(24);
 
 /// Bounded table of the pins issued to tasks. A pin lives until
 /// [`release_task_pins`] removes it (the task terminal does, and so does every
 /// exit of `finalize_turn`). Live pins are never evicted: when the table is
-/// full, only pins older than `orphan_age` are reclaimed, and if none are the
+/// full, only pins not accessed for `orphan_age` are reclaimed, and if none are the
 /// new pin is refused, so a running task never silently switches revision.
 pub(super) struct PinTable {
     cap: usize,
@@ -166,7 +169,7 @@ impl PinTable {
             return true;
         }
         let before = entries.len();
-        entries.retain(|(_, _, issued)| issued.elapsed() < self.orphan_age);
+        entries.retain(|(_, _, accessed)| accessed.elapsed() < self.orphan_age);
         let reclaimed = before - entries.len();
         if reclaimed > 0 {
             tracing::warn!(reclaimed, "reclaimed orphaned task skill pins");
@@ -174,11 +177,15 @@ impl PinTable {
         entries.len() < self.cap
     }
 
-    fn lookup(entries: &PinEntries, key: &PinKey) -> Option<Arc<PinnedSkillRevision>> {
+    /// Finds the pin and refreshes its last-access time.
+    fn lookup(entries: &mut PinEntries, key: &PinKey) -> Option<Arc<PinnedSkillRevision>> {
         entries
-            .iter()
+            .iter_mut()
             .find(|(existing, _, _)| existing == key)
-            .map(|(_, pin, _)| Arc::clone(pin))
+            .map(|(_, pin, accessed)| {
+                *accessed = Instant::now();
+                Arc::clone(pin)
+            })
     }
 
     pub(super) fn pin(
@@ -193,7 +200,7 @@ impl PinTable {
             task_id: task_id.to_string(),
             skill: skill.clone(),
         };
-        let existing = Self::lookup(&self.entries.lock(), &key);
+        let existing = Self::lookup(&mut self.entries.lock(), &key);
         if let Some(pin) = existing {
             return Ok(Some(pin));
         }
@@ -201,7 +208,7 @@ impl PinTable {
             return Ok(None);
         };
         let mut entries = self.entries.lock();
-        if let Some(pin) = Self::lookup(&entries, &key) {
+        if let Some(pin) = Self::lookup(&mut entries, &key) {
             return Ok(Some(pin));
         }
         if !self.make_room(&mut entries) {
@@ -222,11 +229,14 @@ impl PinTable {
     ) -> Option<Arc<PinnedSkillRevision>> {
         self.entries
             .lock()
-            .iter()
+            .iter_mut()
             .find(|(key, pin, _)| {
                 key.owner == *owner && key.task_id == task_id && pin.display_name.eq_ignore_ascii_case(name)
             })
-            .map(|(_, pin, _)| Arc::clone(pin))
+            .map(|(_, pin, accessed)| {
+                *accessed = Instant::now();
+                Arc::clone(pin)
+            })
     }
 
     pub(super) fn release(&self, owner: &OwnerScope, task_id: &str) {

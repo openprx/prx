@@ -479,3 +479,38 @@ fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(long.pin(&who, "b", &skill(), issue).is_err());
 }
+
+#[test]
+fn a_pin_that_is_still_read_is_never_reclaimed() {
+    let (_tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A"));
+    activate(&store, &skill(), &a, 0, true);
+    let who = owner(OWNER_A);
+    let issue = || store.pin_active(&skill());
+    let table = PinTable::new(1, std::time::Duration::from_millis(120));
+    table
+        .pin(&who, "reader", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Each read refreshes the last-access time.
+        assert!(
+            table
+                .pin(&who, "reader", &skill(), issue)
+                .expect("test: read")
+                .is_some()
+        );
+    }
+    assert!(
+        table.pin(&who, "other", &skill(), issue).is_err(),
+        "a pin read within the orphan age is live, however old it is"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        table
+            .pin(&who, "other", &skill(), issue)
+            .expect("test: reclaimed")
+            .is_some()
+    );
+}

@@ -194,6 +194,17 @@ pub fn experience_id(owner: &OwnerScope, task_id: &str) -> String {
     format!("exp-{}", digest.get(..32).unwrap_or(&digest))
 }
 
+/// Age of a file at `now`; zero when its modification time is unknown.
+fn marker_age(path: &std::path::Path, now: DateTime<Utc>) -> chrono::Duration {
+    fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(DateTime::<Utc>::from)
+        .map_or_else(
+            |_| chrono::Duration::zero(),
+            |modified| now.signed_duration_since(modified),
+        )
+}
+
 fn dropped_key(owner: &OwnerScope, task_id: &str) -> String {
     experience_id(owner, task_id)
 }
@@ -524,6 +535,14 @@ impl SkillLifecycleStore {
     ///
     /// Takes the store lock exclusively, which excludes every capture update (they
     /// hold it shared), so a lock file is never deleted while someone waits on it.
+    /// Orphan dropped-evidence markers (no experience record) older than
+    /// `incomplete_max_age` are removed too, with their lock files.
+    ///
+    /// The SL04/SL09 wiring must exclude runs that still hold pins or are still
+    /// running (their experience may still receive evidence): an incomplete
+    /// experience is only as old as its last update, so a long idle run can
+    /// look expired.
+    ///
     /// `keep` protects experiences that retained evidence still references (the
     /// SL04 consolidation passes its references there). The retention values come
     /// from the existing evolution retention settings; wiring them is SL04/SL09
@@ -546,6 +565,25 @@ impl SkillLifecycleStore {
         for entry in entries {
             let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_suffix(DROPPED_MARKER_SUFFIX)
+                .filter(|id| id.starts_with("exp-"))
+            {
+                // A marker whose record never got written (or was removed).
+                if !dir.join(format!("{id}.json")).exists()
+                    && marker_age(&entry.path(), now) >= retention.incomplete_max_age
+                {
+                    for path in [entry.path(), self.root().join("locks").join(format!("{id}.lock"))] {
+                        match fs::remove_file(&path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(LifecycleError::io(&path, e)),
+                        }
+                    }
+                    DROPPED_TASKS.lock().retain(|key| key != id);
+                }
+                continue;
+            }
             let Some(id) = name.strip_suffix(".json").filter(|id| id.starts_with("exp-")) else {
                 continue;
             };
