@@ -706,9 +706,14 @@ mod auxiliary_registration_tests {
         let mut proposal = draft(scope);
         let (receipts, failures) = persist_auxiliary_events(&[broken, healthy], &fabric, &config, &mut proposal).await;
         assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(failures[0].contains("smart_group_classifier"), "{failures:?}");
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.contains("smart_group_classifier")),
+            "{failures:?}"
+        );
         assert_eq!(receipts.len(), 1, "the second call still persisted");
-        assert_eq!(receipts[0].0.purpose_label(), "signal_vision");
+        assert!(receipts.iter().all(|(call, _)| call.purpose_label() == "signal_vision"));
     }
 
     #[tokio::test]
@@ -742,7 +747,8 @@ mod auxiliary_registration_tests {
                 .iter()
                 .all(|event| event.event_type == "provider.auxiliary.settled")
         );
-        assert_ne!(events[0].event_id, events[1].event_id);
+        let ids: std::collections::HashSet<_> = events.iter().map(|event| &event.event_id).collect();
+        assert_eq!(ids.len(), 2, "distinct events");
     }
 
     #[test]
