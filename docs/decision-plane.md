@@ -123,9 +123,10 @@ Use `prx causal backends` to inspect the computed backend order and exclusion
 reasons; `prx causal status` also reports health and circuit state. Availability
 or configuration alone does not authorize a physical send. The builtin is the
 local fallback. Configured physical attempts require source-owned accounting:
-the runtime estimates the guarded request with its existing token estimator,
-reserves the remaining declared token allowance at the highest applicable PMM
-rate, and checks the original token, latency and monetary limits before dispatch.
+the runtime first applies a conservative byte/token upper bound and otherwise
+estimates the guarded request with its existing token estimator, reserves the
+remaining declared token allowance at the highest applicable PMM rate, and
+checks the original token, latency and monetary limits before dispatch.
 The estimate is not a vendor-enforced billing cap. Each retry has its own durable
 reservation; builtin and cache-only paths do not open the cost ledger.
 

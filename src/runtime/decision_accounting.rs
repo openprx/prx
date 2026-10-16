@@ -281,7 +281,7 @@ impl AccountingScope {
                 let token_timing = diagnostic_timing
                     .as_ref()
                     .map(|_| crate::agent::context_budget::token_timing::Scope::new());
-                let input_fits = input_token_preflight(text, tokens, auxiliary, || {
+                let input_fits = input_token_preflight(text, tokens, || {
                     let measured = crate::agent::context_budget::count_tokens_with_source(text);
                     let estimate = crate::agent::context_budget::estimate_request_tokens(
                         measured,
@@ -601,7 +601,7 @@ mod transport_tests;
 // or a vendor token cap. cl100k emits at most one token per nonempty byte
 // span; the fallback uses the existing scaled character heuristic. Keep the
 // full serialized body. An inconclusive upper bound MUST run the old proxy.
-fn auxiliary_input_upper_bound(text: &str) -> usize {
+fn input_token_upper_bound(text: &str) -> usize {
     use crate::agent::context_budget::{TokenMeasurement, TokenMeasurementSource, estimate_request_tokens};
     text.len().max(estimate_request_tokens(
         TokenMeasurement {
@@ -615,10 +615,9 @@ fn auxiliary_input_upper_bound(text: &str) -> usize {
 fn input_token_preflight(
     text: &str,
     allowance: u64,
-    auxiliary: bool,
     estimate: impl FnOnce() -> usize,
 ) -> Result<bool, std::num::TryFromIntError> {
-    if auxiliary && u64::try_from(auxiliary_input_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
+    if u64::try_from(input_token_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
         return Ok(true);
     }
     Ok(u64::try_from(estimate())? < allowance)
