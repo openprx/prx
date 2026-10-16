@@ -134,9 +134,12 @@ Actual usage above the estimate is recorded in full. Missing, partial or estimat
 usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
-fingerprinted request state. Administrative probes/tests use a separate owned
-scope under the existing live-test permission checks. An unfunded probe is
-reported as unprobed, not as successful health evidence.
+fingerprinted request state. A priced direct Answer has zero extra execution
+latency because the serving-model response is the turn's baseline path; its
+token and monetary estimate still pass G6. Retrieval and tool candidates keep
+their own execution-latency estimates. Administrative probes/tests use a
+separate owned scope under the existing live-test permission checks. An
+unfunded probe is reported as unprobed, not as successful health evidence.
 
 Supported auxiliary transports account for each actual send, including nested
 fallbacks. Unsupported transports refuse the additional call before dispatch.

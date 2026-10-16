@@ -776,10 +776,16 @@ fn terminal(action: CausalActionKind, policy: &CandidatePolicy<'_>) -> CausalCan
             } else {
                 estimate.map(|(cost, _)| cost)
             },
+            // Answer is the baseline serving path, so its normal model-response
+            // latency is not extra decision latency. Keep the estimate
+            // presence coupled to the pinned model price so an unpriced model
+            // still fails G6; the priced baseline contributes zero extra
+            // milliseconds. Tool and retrieval candidates retain their own
+            // execution-latency estimates.
             estimated_latency_ms: if action != CausalActionKind::Answer {
                 Some(0)
             } else {
-                estimate.map(|(_, latency)| latency)
+                estimate.map(|_| 0)
             },
         },
     )
@@ -884,6 +890,33 @@ mod tests {
             }
         }
         cost
+    }
+
+    #[test]
+    fn priced_answer_does_not_charge_baseline_serving_latency_to_the_decision_budget() {
+        let key = fixtures::key();
+        let estimate = CostEstimate {
+            tokens: 128,
+            micro_usd: 7,
+        };
+        let cost = CapabilityCostModel {
+            per_capability: BTreeMap::new(),
+            estimates: BTreeMap::from([(CapabilityTarget::None, (estimate, 250))]),
+        };
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 1,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+
+        let answer = terminal(CausalActionKind::Answer, &policy);
+
+        assert_eq!(answer.estimated_cost(), Some(estimate));
+        assert_eq!(answer.estimated_latency_ms(), Some(0));
     }
 
     #[test]
