@@ -10,24 +10,49 @@ const PROVIDER: &str = "openai";
 const MAIN_MODEL: &str = "prx-smart-main";
 const CLASSIFIER_MODEL: &str = "prx-smart-classifier";
 
+const MAIN_REPLY: &str = "prx smart main reply";
+
+/// What the loopback classifier endpoint answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    No,
+    Yes,
+    ClassifierFails,
+}
+
 #[derive(Clone)]
 struct WireState {
     requests: Arc<parking_lot::Mutex<Vec<Value>>>,
+    verdict: Verdict,
 }
 
-async fn respond(State(state): State<WireState>, Json(body): Json<Value>) -> Json<Value> {
+async fn respond(State(state): State<WireState>, Json(body): Json<Value>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let classifier = body.get("model").and_then(Value::as_str) == Some(CLASSIFIER_MODEL);
     state.requests.lock().push(body);
+    let (model, content) = if classifier {
+        match state.verdict {
+            Verdict::No => (CLASSIFIER_MODEL, "NO"),
+            Verdict::Yes => (CLASSIFIER_MODEL, "YES"),
+            Verdict::ClassifierFails => {
+                return (axum::http::StatusCode::BAD_REQUEST, "classifier refused").into_response();
+            }
+        }
+    } else {
+        (MAIN_MODEL, MAIN_REPLY)
+    };
     Json(json!({
-        "id": "prx-smart-classifier-response",
+        "id": "prx-smart-response",
         "object": "chat.completion",
-        "model": CLASSIFIER_MODEL,
+        "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": "NO"},
+            "message": {"role": "assistant", "content": content},
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10}
     }))
+    .into_response()
 }
 
 struct WireOwner {
@@ -69,7 +94,116 @@ fn channel_turn(
     Box::pin(run_owned_channel_probe(ctx, message, cancellation))
 }
 
-async fn exercise_accounted_classifier(content: &str) {
+/// A classifier YES, or a classifier failure that fails open, runs the full
+/// agent loop. The turn must complete once and persist the main reply plus the
+/// classifier's physical accounting beside the main call's.
+async fn assert_classifier_and_main_receipts(
+    verdict: Verdict,
+    content: &str,
+    requests: &Arc<parking_lot::Mutex<Vec<Value>>>,
+    workspace: &std::path::Path,
+    memory: &dyn Memory,
+    channel_impl: &RecordingChannel,
+) {
+    let models: Vec<String> = requests
+        .lock()
+        .iter()
+        .filter_map(|request| request.get("model").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert_eq!(
+        models.first().map(String::as_str),
+        Some(CLASSIFIER_MODEL),
+        "the classifier runs first: {models:?}"
+    );
+    assert!(
+        models.iter().any(|model| model == MAIN_MODEL),
+        "the full agent loop must reach the main model: {models:?}"
+    );
+    assert!(
+        format!("{:?}", response_messages(&channel_impl.sent_messages.lock().await)).contains(MAIN_REPLY),
+        "the main reply must be delivered"
+    );
+
+    let principal = crate::runtime::envelope::RuntimeEnvelope::channel_with_session(
+        workspace.to_string_lossy(),
+        "test-channel_prx_user",
+        "test-channel",
+        "prx_user",
+        "prx_group",
+        crate::memory::MemoryVisibility::Session,
+    )
+    .memory_principal();
+    let events = memory
+        .list_message_events_since(&principal, 0, 200)
+        .await
+        .expect("smart-group runtime events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.role == "user" && event.content == content)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.role == "assistant" && event.content.contains(MAIN_REPLY)),
+        "the main reply is durable history"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count(),
+        1,
+        "the turn finalizes exactly once"
+    );
+    let settled: Vec<Value> = events
+        .iter()
+        .filter(|event| event.event_type == "provider.auxiliary.settled")
+        .filter_map(|event| event.raw_payload_json.as_deref())
+        .filter_map(|payload| serde_json::from_str(payload).ok())
+        .collect();
+    let classifier_receipts = settled
+        .iter()
+        .filter(|payload| payload.get("purpose").and_then(Value::as_str) == Some("smart_group_classifier"))
+        .count();
+    assert_eq!(
+        classifier_receipts, 1,
+        "the classifier receipt persists on the Completed turn"
+    );
+    for main_receipt in ["usage.settled", "provider.final_outcome"] {
+        assert!(
+            events.iter().any(|event| event.event_type == main_receipt),
+            "the main call's {main_receipt} receipt persists beside the classifier's"
+        );
+    }
+
+    let rows: Vec<Value> = std::fs::read_to_string(workspace.join("state/costs.reservations.jsonl"))
+        .expect("physical accounting journal")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("accounting row"))
+        .collect();
+    let dispatched: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["event"] == "dispatched")
+        .filter_map(|row| row["attempt_id"].as_str())
+        .collect();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "the classifier reserves exactly once: {dispatched:?}"
+    );
+    assert!(dispatched[0].starts_with("smart_group_classifier:"));
+    let settled_in_ledger = rows
+        .iter()
+        .any(|row| row["event"] == "estimated_settled_v1" && row["attempt_id"] == dispatched[0]);
+    assert_eq!(
+        settled_in_ledger,
+        verdict == Verdict::Yes,
+        "a reported YES usage settles its reservation; a failed classifier call reports none"
+    );
+}
+
+async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
     let workspace = tempfile::tempdir().expect("smart-group workspace");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -81,6 +215,7 @@ async fn exercise_accounted_classifier(content: &str) {
         .route("/v1/chat/completions", post(respond))
         .with_state(WireState {
             requests: Arc::clone(&requests),
+            verdict,
         });
     let shutdown = stop.clone();
     let server = WireOwner {
@@ -159,6 +294,9 @@ async fn exercise_accounted_classifier(content: &str) {
         context.api_url = Some(endpoint);
         context.api_key = Some("prx-loopback-fixture-key".to_owned());
         context.memory = Arc::clone(&memory);
+        context.tools_registry = Arc::new(vec![
+            Box::new(crate::tools::stay_silent::StaySilentTool) as Box<dyn Tool>
+        ]);
         context.workspace_dir = Arc::new(workspace.path().to_owned());
         context.hooks = Arc::new(HookManager::new(workspace.path().to_owned()));
         context.channels_by_name = Arc::new(HashMap::from([(
@@ -188,6 +326,18 @@ async fn exercise_accounted_classifier(content: &str) {
             .await
             .expect("admitted smart-group turn must finish");
 
+        if verdict != Verdict::No {
+            assert_classifier_and_main_receipts(
+                verdict,
+                content,
+                &requests,
+                workspace.path(),
+                memory.as_ref(),
+                &channel_impl,
+            )
+            .await;
+            return;
+        }
         {
             let captured = requests.lock();
             assert_eq!(captured.len(), 1, "classifier NO must avoid the full agent loop");
@@ -319,10 +469,59 @@ async fn exercise_accounted_classifier(content: &str) {
 
 #[tokio::test]
 async fn smart_group_classifier_runs_after_decision_admission_with_typed_accounting() {
-    exercise_accounted_classifier("the deployment completed an hour ago across the project").await;
+    exercise_accounted_classifier("the deployment completed an hour ago across the project", Verdict::No).await;
 }
 
 #[tokio::test]
 async fn smart_group_heuristic_noise_requires_accounted_classifier_before_silence() {
-    exercise_accounted_classifier("lol").await;
+    exercise_accounted_classifier("lol", Verdict::No).await;
+}
+
+#[test]
+fn a_skip_without_a_settled_classifier_outcome_fails_open_into_the_loop() {
+    let now = chrono::Utc::now();
+    let settled = crate::llm::route_decision::ProviderExecutionOutcome {
+        decision_id: "prx_smart_fixture".to_owned(),
+        started_at: now,
+        finished_at: now,
+        attempts: Vec::new(),
+        final_provider: PROVIDER.to_owned(),
+        final_model: CLASSIFIER_MODEL.to_owned(),
+        status: crate::llm::route_decision::ExecutionStatus::Success,
+        fallback_reason: None,
+        tokens_used: Default::default(),
+    };
+    let gate = |outcome, provider_outcome| AdmittedSmartPreGate {
+        outcome,
+        provider_outcome,
+        started_at: now,
+    };
+    let skip = pre_gate::PreGateOutcome::skip(pre_gate::PreGatePath::ClassifierSkip);
+    let enter = pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierEnter);
+    assert!(
+        gate(skip, None).silence_provider_outcome().is_none(),
+        "a skip with no settled receipt must not silence the message"
+    );
+    assert_eq!(
+        gate(skip, Some(settled.clone())).silence_provider_outcome(),
+        Some(settled.clone())
+    );
+    assert!(
+        gate(enter, Some(settled)).silence_provider_outcome().is_none(),
+        "an enter outcome never silences"
+    );
+}
+
+#[tokio::test]
+async fn smart_group_classifier_yes_runs_the_full_loop_and_persists_both_receipts() {
+    exercise_accounted_classifier("the deployment completed an hour ago across the project", Verdict::Yes).await;
+}
+
+#[tokio::test]
+async fn smart_group_classifier_failure_fails_open_and_persists_both_receipts() {
+    exercise_accounted_classifier(
+        "the deployment completed an hour ago across the project",
+        Verdict::ClassifierFails,
+    )
+    .await;
 }
