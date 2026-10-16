@@ -2074,7 +2074,7 @@ mod tests {
             HardGates::check_one(
                 &state,
                 &view,
-                &from_entry(CausalActionKind::Discover, entry.family, entry, &policy, None),
+                &from_entry(CausalActionKind::UseTool, entry.family, entry, &policy, None),
                 &gates,
             ),
             GateOutcome::Blocked {
@@ -2084,7 +2084,7 @@ mod tests {
         );
         counting_cost.entries.store(0, Ordering::Relaxed);
         let skipped = select_family_candidate(
-            CausalActionKind::Discover,
+            CausalActionKind::UseTool,
             entry.family,
             [entry],
             false,
@@ -2100,7 +2100,7 @@ mod tests {
         trusted.side_effect_mode = SideEffectMode::GuardedWrite;
         state.trusted = TrustedState::from_runtime(trusted);
         let considered = select_family_candidate(
-            CausalActionKind::Discover,
+            CausalActionKind::UseTool,
             entry.family,
             [entry],
             false,
@@ -2882,7 +2882,7 @@ mod tests {
             state.trusted = TrustedState::from_runtime(trusted.clone());
             counting_cost.entries.store(0, Ordering::Relaxed);
             let expected = unfiltered_family_candidate(
-                CausalActionKind::Discover,
+                CausalActionKind::UseTool,
                 first.family,
                 [first, second, third],
                 &state,
@@ -2894,7 +2894,7 @@ mod tests {
             let reference_pricing = counting_cost.entries.load(Ordering::Relaxed);
             counting_cost.entries.store(0, Ordering::Relaxed);
             let actual = select_family_candidate(
-                CausalActionKind::Discover,
+                CausalActionKind::UseTool,
                 first.family,
                 [first, second, third],
                 false,
@@ -2930,7 +2930,7 @@ mod tests {
                     HardGates::check_one(
                         &state,
                         &view,
-                        &from_entry(CausalActionKind::Discover, first.family, first, &policy, None),
+                        &from_entry(CausalActionKind::UseTool, first.family, first, &policy, None),
                         &gates,
                     ),
                     GateOutcome::Blocked {

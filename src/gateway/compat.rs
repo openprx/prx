@@ -570,7 +570,7 @@ async fn execute_bound_mcp_tool_call(
     idempotency: Option<McpIdempotency>,
     execution_context: crate::tools::ToolExecutionContext,
 ) -> crate::tools::ToolExecutionOutcome {
-    let mut service = mcp_tool_execution_service(tools, config);
+    let mut service: crate::tools::ToolExecutionService = mcp_tool_execution_service(tools, config);
     // Runtime-only keys in the request body are dropped and re-authored by the
     // service from this context, so a forged `_zc_scope` / `_zc_approval_grant`
     // in the body cannot survive into execution.

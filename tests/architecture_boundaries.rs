@@ -4766,8 +4766,14 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 
     let execute = function_body(production, "execute");
     assert!(
-        compact_rust_tokens(&execute).contains("self.execute_inner(command,context,cancellation).await")
-            && execute.matches("execute_inner(").count() == 1
+        {
+            // The canonical pipeline is boxed so callers carry a pointer, not the
+            // whole state machine; the boxed and the bare await are both the one
+            // call into `execute_inner`.
+            let compact = compact_rust_tokens(&execute);
+            compact.contains("self.execute_inner(command,context,cancellation).await")
+                || compact.contains("Box::pin(self.execute_inner(command,context,cancellation)).await")
+        } && execute.matches("execute_inner(").count() == 1
             && function_body(production, "execute_inner")
                 .matches("enforce_command_contract(")
                 .count()
@@ -5673,8 +5679,11 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/tools/skills.rs::execute_named",
-        1,
-        "decorator: skill aliases forward to the skill runner",
+        3,
+        "decorator, three sites, each inside an already-gated ToolExecutionService call: \
+         `SkillReadTool::execute_named` re-enters its own `self.execute` twice (the exact name, \
+         and a catalog alias rewritten into its `name` argument), and \
+         `SkillExecuteTool::execute_named` forwards to `execute_named_with_cancellation`",
     ),
     (
         "src/tools/skills.rs::execute_resolved",
@@ -6546,6 +6555,15 @@ const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         evidence_file: "src/memory/postgres/ingress_recovery.rs",
         evidence: "client: Client,",
         reason: "private Session owns the actual tokio-postgres Client; three SQL executions persist backend identity and acquire or reclaim lifetime fencing",
+    },
+    NonToolCallSite {
+        entry: "src/agent/tool_scheduler.rs::spawn_delegation_tool",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/agent/tool_scheduler.rs",
+        evidence: "service: Arc<crate::tools::ToolExecutionService>,",
+        reason: "the parameter is the shared approved execution service; the delegation task \
+                 dispatches the already-built command through it on its own spawned task",
     },
     NonToolCallSite {
         entry: "src/agent/tool_scheduler.rs::execute_one_unrecorded",
