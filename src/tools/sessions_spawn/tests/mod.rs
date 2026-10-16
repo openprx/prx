@@ -28,13 +28,26 @@ mod tool_setup;
 
 use super::*;
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::{AgentCompactionConfig, MultimodalConfig};
+use crate::hooks::HookManager;
+use crate::memory::MessageEventScope;
 use crate::memory::{Memory, MemoryEventInput, MemoryPrincipal, MemoryVisibility, SqliteMemory};
+use crate::observability::NoopObserver;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ApprovalGrant;
+use crate::session_worker::protocol::{WorkerControlFrame, WorkerManifest};
+use crate::tools::traits::ToolResult;
 use anyhow::anyhow;
+use async_trait::async_trait;
+use futures_util::FutureExt;
+use serde_json::json;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 fn test_security() -> Arc<SecurityPolicy> {
     Arc::new(SecurityPolicy::default())
