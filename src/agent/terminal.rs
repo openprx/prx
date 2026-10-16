@@ -1734,6 +1734,103 @@ mod tests {
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
+    fn priced_cost_config() -> CostConfig {
+        let mut cost_config = CostConfig::default();
+        cost_config.prices.insert(
+            "ollama/prx-local-model".to_string(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        cost_config
+    }
+
+    fn ledger_lines_for(workspace: &Path, terminal_id: &str) -> usize {
+        std::fs::read_to_string(workspace.join("state").join("costs.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(terminal_id))
+            .count()
+    }
+
+    /// Finding 85: the first finalization stores `Recorded`; replaying the same
+    /// priced settlement over the committed marker yields `Replayed`. The replay
+    /// must succeed with the same receipt and must not charge a second time.
+    #[tokio::test]
+    async fn priced_completed_finalization_replays_over_its_committed_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+        let cost_config = priced_cost_config();
+        let terminal_id = "priced-replay-run";
+        let mut commit = completed_commit(terminal_id);
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+        assert!(commit.decision.as_ref().is_some_and(|decision| decision.is_recorded()));
+
+        let first = finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
+            .await
+            .unwrap();
+        assert!(matches!(first.cost_settlement, Some(CostSettlement::Recorded { .. })));
+        let charged = ledger_lines_for(temp.path(), terminal_id);
+        assert_eq!(charged, 1, "the first finalization charges exactly once");
+
+        let second = finalize_turn(&fabric, commit, &cost_config, temp.path())
+            .await
+            .expect("a priced replay over the committed marker must finalize");
+        assert!(matches!(second.cost_settlement, Some(CostSettlement::Replayed)));
+        assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
+        assert_eq!(first.usage_settlement, second.usage_settlement);
+        assert_eq!(ledger_lines_for(temp.path(), terminal_id), charged, "no second charge");
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// A replay that carries a genuinely different settlement (other token
+    /// counts, hence another amount) is rejected, leaving the ledger untouched.
+    /// The provider outcome is part of the terminal decision claim, so the
+    /// claim fingerprint refuses it before any cost-settlement comparison runs;
+    /// the settlement comparison itself is covered by the unit tests in
+    /// `causal_tree::outcome`.
+    #[tokio::test]
+    async fn priced_replay_with_a_different_settlement_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+        let cost_config = priced_cost_config();
+        let terminal_id = "priced-replay-mismatch-run";
+        let mut commit = completed_commit(terminal_id);
+        let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+
+        finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
+            .await
+            .unwrap();
+        let charged = ledger_lines_for(temp.path(), terminal_id);
+        assert_eq!(charged, 1);
+
+        let mut different = commit;
+        different.provider_outcome = Some(ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            different.telemetry.started_at,
+            crate::llm::route_decision::TokenUsage::reported(Some(1000), Some(500), Some(1500)),
+        ));
+        let error = finalize_turn(&fabric, different, &cost_config, temp.path()).await;
+        let error = error.expect_err("a different settlement must not replay over the marker");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal decision claim conflicts with the pinned decision or scope"),
+            "unexpected rejection: {error:#}"
+        );
+        assert_eq!(
+            ledger_lines_for(temp.path(), terminal_id),
+            charged,
+            "the ledger is unchanged"
+        );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unwritable_cost_ledger_is_recorded_in_terminal_projection() {
