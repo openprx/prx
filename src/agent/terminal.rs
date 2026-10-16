@@ -1788,8 +1788,11 @@ mod tests {
     }
 
     /// A replay that carries a genuinely different settlement (other token
-    /// counts, hence another amount) is not the committed settlement and must
-    /// still be rejected, leaving the ledger untouched.
+    /// counts, hence another amount) is rejected, leaving the ledger untouched.
+    /// The provider outcome is part of the terminal decision claim, so the
+    /// claim fingerprint refuses it before any cost-settlement comparison runs;
+    /// the settlement comparison itself is covered by the unit tests in
+    /// `causal_tree::outcome`.
     #[tokio::test]
     async fn priced_replay_with_a_different_settlement_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
@@ -1813,7 +1816,13 @@ mod tests {
             crate::llm::route_decision::TokenUsage::reported(Some(1000), Some(500), Some(1500)),
         ));
         let error = finalize_turn(&fabric, different, &cost_config, temp.path()).await;
-        assert!(error.is_err(), "a different settlement must not replay over the marker");
+        let error = error.expect_err("a different settlement must not replay over the marker");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal decision claim conflicts with the pinned decision or scope"),
+            "unexpected rejection: {error:#}"
+        );
         assert_eq!(
             ledger_lines_for(temp.path(), terminal_id),
             charged,
