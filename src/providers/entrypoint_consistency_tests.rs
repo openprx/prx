@@ -6,6 +6,7 @@ use crate::providers::traits::{ChatMessage, ChatRequest};
 
 pub(crate) const PRIMARY_MODEL: &str = "model-a";
 pub(crate) const FALLBACK_MODEL: &str = "model-b";
+pub(crate) const CROSS_DIALECT_PROVIDER: &str = "custom:http://127.0.0.1:9/v1";
 
 pub(crate) fn configure_cross_dialect(config: &mut Config, provider: &str) {
     config.default_provider = Some(provider.to_string());
@@ -37,7 +38,7 @@ pub(crate) fn assert_cross_dialect_refusal(surface: &str, refusal: &str) {
 }
 
 fn cross_dialect_config(temp: &tempfile::TempDir) -> Config {
-    let provider = "custom:http://127.0.0.1:9/v1";
+    let provider = CROSS_DIALECT_PROVIDER;
     let mut config = Config::default();
     config.workspace_dir = temp.path().to_path_buf();
     config.config_path = temp.path().join("config.toml");
