@@ -108,6 +108,15 @@ pub enum GateError {
     Tampered(String),
     #[error("gating was cancelled before a decision was made")]
     Cancelled,
+    #[error("proposal {proposal_id} is {status}; publication needs a proposal in the right authorization state")]
+    NotAuthorized { proposal_id: String, status: &'static str },
+    #[error(
+        "publication transaction {transaction_id} of proposal {proposal_id} aborted; the next attempt uses a new one"
+    )]
+    PublicationAborted {
+        proposal_id: String,
+        transaction_id: String,
+    },
 }
 
 /// The rules a gate decision is made under. There is no default: absent policy
@@ -423,7 +432,7 @@ pub struct GateOutcome {
     pub rejection: Option<RejectionRecord>,
 }
 
-fn gate_id_of(owner: &OwnerScope, proposal_id: &str, epoch: u32) -> String {
+pub(super) fn gate_id_of(owner: &OwnerScope, proposal_id: &str, epoch: u32) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"prx-skill-gate-v2\0");
     for part in [owner.as_str(), proposal_id] {
@@ -1126,6 +1135,19 @@ impl SkillLifecycleStore {
                 decision: verified.decision,
                 digest: verified.digest,
             };
+            if new_evidence
+                && recorded.decision.decision == GateDecision::Accept
+                && matches!(
+                    proposal.status,
+                    ProposalStatus::Eligible | ProposalStatus::PublicationAuthorized
+                )
+            {
+                // Already settled: the proposal cannot go back to evaluation,
+                // so the new evidence is a refusal, not a state change.
+                return Err(GateError::NewFailingEvidence(
+                    "another evaluation of the same subject was recorded or changed after the decision".to_string(),
+                ));
+            }
             if new_evidence && recorded.decision.decision == GateDecision::Accept {
                 // The accept no longer rests on all the evidence: it is not
                 // settled; the proposal goes back to be evaluated again.

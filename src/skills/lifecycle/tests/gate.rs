@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-fn policy() -> GatePolicy {
+pub(super) fn policy() -> GatePolicy {
     GatePolicy {
         version: 1,
         max_regressions: 0,
@@ -109,6 +109,8 @@ fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -
         required_suite: None,
         evaluation_epoch: 0,
         evaluating_since: None,
+        authorization: None,
+        publication: None,
         created_at: now,
         updated_at: now,
     };
@@ -133,13 +135,13 @@ fn mark_evaluated(fx: &Fixture, proposal: &SkillProposal) -> SkillProposal {
 }
 
 /// A proposal that was evaluated once with `exec` on the validation split.
-async fn evaluated(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> (SkillProposal, EvaluationPin) {
+pub(super) async fn evaluated(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> (SkillProposal, EvaluationPin) {
     let proposal = evaluating_proposal(fx, suite);
     let pin = evaluate(fx, suite, exec).await;
     (mark_evaluated(fx, &proposal), pin)
 }
 
-async fn evaluate(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> EvaluationPin {
+pub(super) async fn evaluate(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> EvaluationPin {
     let recorded = fx
         .store
         .evaluate(
@@ -156,12 +158,12 @@ async fn evaluate(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> Evaluat
 }
 
 /// The candidate answers the oracle on every case, the baseline on none.
-fn all_better() -> Scripted {
+pub(super) fn all_better() -> Scripted {
     Scripted::new(|r| Ok(good(r)))
 }
 
 /// Neither arm answers the oracle: a tie.
-fn tie() -> Scripted {
+pub(super) fn tie() -> Scripted {
     Scripted::new(|r| {
         let mut o = good(r);
         o.response = "notes: nothing useful".to_string();
@@ -169,7 +171,7 @@ fn tie() -> Scripted {
     })
 }
 
-async fn gate(
+pub(super) async fn gate(
     fx: &Fixture,
     proposal: &SkillProposal,
     suite: &FrozenSuite,
@@ -191,7 +193,7 @@ async fn gate(
         .await
 }
 
-fn status(fx: &Fixture, proposal: &SkillProposal) -> ProposalStatus {
+pub(super) fn status(fx: &Fixture, proposal: &SkillProposal) -> ProposalStatus {
     fx.store
         .read_proposal(&proposal.proposal_id)
         .expect("test: read")
@@ -835,7 +837,7 @@ async fn the_model_judge_reads_a_strict_verdict_and_fails_closed() {
 
 // ---- governing suite, selection, epochs, races ---------------------------------
 
-fn edit_proposal(fx: &Fixture, id: &str, edit: impl FnOnce(&mut SkillProposal)) {
+pub(super) fn edit_proposal(fx: &Fixture, id: &str, edit: impl FnOnce(&mut SkillProposal)) {
     let lock = fx.store.lock_proposals().expect("test: lock");
     let mut proposal = fx
         .store
@@ -1130,7 +1132,7 @@ async fn an_evaluation_of_other_revisions_is_unbound() {
     ));
 }
 
-fn force_status(fx: &Fixture, id: &str, status: ProposalStatus) {
+pub(super) fn force_status(fx: &Fixture, id: &str, status: ProposalStatus) {
     edit_proposal(fx, id, |p| p.status = status);
 }
 

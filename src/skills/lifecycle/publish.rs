@@ -323,6 +323,11 @@ impl SkillLifecycleStore {
     /// the binding carries the transaction, the mutation is live and the
     /// caller must be told so (spec 8.3 step 8).
     fn classify_failure(&self, skill: &SkillId, entry: &JournalEntry, source: LifecycleError) -> LifecycleError {
+        // The rename may be visible but not yet durable; read the binding only
+        // after the directory was flushed.
+        if let Err(e) = sync_dir(&self.root().join(super::generation::ACTIVE_DIR)) {
+            tracing::warn!(error = %e, "failed to sync the active binding directory before classifying a failure");
+        }
         match self.active_binding(skill) {
             Ok(Some(b)) if (&b.transaction_id, b.generation) == (&entry.transaction_id, entry.new_generation) => {
                 LifecycleError::CommittedRepairRequired {

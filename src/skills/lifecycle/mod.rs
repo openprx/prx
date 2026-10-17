@@ -16,6 +16,7 @@ macro_rules! crash_point {
 }
 
 mod agent_executor;
+mod authorize;
 mod binding;
 mod bundle;
 mod capture;
@@ -44,6 +45,7 @@ mod tests;
 #[cfg(test)]
 use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
+pub use authorize::{MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -85,7 +87,7 @@ pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationRepor
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
     MAX_PROPOSAL_ATTEMPTS, MAX_PROPOSAL_LISTING, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus,
-    SkillProposal,
+    PublicationAuthorization, PublicationRecord, SkillProposal,
 };
 pub use propose::{
     MAX_EDIT_PERCENT, MAX_EDIT_TOKENS, MAX_EDITS, MAX_PROPOSAL_PATTERNS, ProposeOutcome, ProposeRequest,
