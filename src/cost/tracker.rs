@@ -911,6 +911,41 @@ fn settlement_fingerprint(
     Ok(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)))
 }
 
+/// Whether a stored settlement row carries the fingerprint the ledger derives
+/// for it. The row keeps `"<provider>/<model>"` and no cache counts, so every
+/// split of the model string and both token sources are tried, with no cache
+/// tokens; a row that settled cache usage does not verify (fail closed).
+pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
+    use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
+    let (Some(settlement_id), Some(digest)) = (row.settlement_id.as_deref(), row.settlement_sha256.as_deref()) else {
+        return false;
+    };
+    if settlement_id.trim().is_empty() {
+        return false;
+    }
+    let usage = &row.usage;
+    usage.model.match_indices('/').any(|(at, _)| {
+        let (provider, model) = usage.model.split_at(at);
+        [TokenUsageSource::Reported, TokenUsageSource::Estimated]
+            .into_iter()
+            .any(|source| {
+                let record = MeteredTokenUsageRecord {
+                    settlement_id: Some(settlement_id.to_string()),
+                    provider: provider.to_string(),
+                    model: model.trim_start_matches('/').to_string(),
+                    prompt_tokens: usage.input_tokens,
+                    completion_tokens: usage.output_tokens,
+                    total_tokens: usage.total_tokens,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    source,
+                    cost_usd: Some(usage.cost_usd),
+                };
+                settlement_fingerprint(&record, usage.cost_usd).is_ok_and(|expected| expected == digest)
+            })
+    })
+}
+
 /// Persistent storage for cost records.
 struct CostStorage {
     path: PathBuf,

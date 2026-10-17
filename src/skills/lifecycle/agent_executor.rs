@@ -167,6 +167,18 @@ impl AgentCaseExecutor {
         if declared("web_search_tool") {
             config.web_search = template.web_search.clone();
         }
+        if declared("web_fetch") {
+            // An empty list would allow every public host.
+            if template.browser.allowed_domains.is_empty() {
+                return Err(EvaluationError::Executor(
+                    "web_fetch is declared but the template's browser.allowed_domains is empty".to_string(),
+                ));
+            }
+            config
+                .browser
+                .allowed_domains
+                .clone_from(&template.browser.allowed_domains);
+        }
         // A positive allowlist. The published surface is "every registered tool
         // that is not excluded", so the exclusion list is every public tool
         // except the ones this run may have.
@@ -284,29 +296,26 @@ pub(super) fn read_usage(workspace: &Path) -> LedgerUsage {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return unmeasured();
         };
-        let settled = value
-            .get("settlement_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| !id.trim().is_empty());
-        if !settled {
+        // Only rows the ledger itself would derive count: a settlement id and
+        // a fingerprint that verifies. A forged or unsettled row is ignored, so
+        // it cannot hide spend (and is never copied into the operator ledger).
+        let Ok(row) = serde_json::from_value::<crate::cost::types::CostRecord>(value) else {
+            return unmeasured();
+        };
+        if !crate::cost::tracker::settlement_row_is_authentic(&row) {
             continue;
         }
-        let Some(usage) = value.get("usage") else {
-            return unmeasured();
-        };
-        let number = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
-        let (Some(input_tokens), Some(output_tokens), Some(total_tokens)) =
-            (number("input_tokens"), number("output_tokens"), number("total_tokens"))
-        else {
-            return unmeasured();
-        };
-        let cost_usd = usage.get("cost_usd").and_then(serde_json::Value::as_f64);
-        let (Some(cost_usd), Some(model)) = (cost_usd, usage.get("model").and_then(serde_json::Value::as_str)) else {
-            return unmeasured();
-        };
-        if !cost_usd.is_finite() || cost_usd < 0.0 {
+        let usage = &row.usage;
+        if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
             return unmeasured();
         }
+        let (input_tokens, output_tokens, total_tokens, cost_usd) = (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.cost_usd,
+        );
+        let model = usage.model.as_str();
         records.push(LedgerRecord {
             model: model.to_string(),
             input_tokens,

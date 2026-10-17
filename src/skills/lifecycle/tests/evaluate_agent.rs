@@ -637,36 +637,57 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
             .is_none(),
         "no ledger means unmeasured, not free"
     );
-    std::fs::create_dir_all(tmp.path().join("state")).expect("test: state");
-    let line = |model: &str, tokens: u64, cost: f64| {
-        serde_json::json!({"id": "x", "settlement_id": "s-1", "usage": {"model": model, "input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens, "cost_usd": cost}}).to_string()
+    // Rows are written by the real ledger, so their settlement fingerprints verify.
+    let tracker = crate::cost::tracker::CostTracker::new(crate::config::schema::CostConfig::default(), tmp.path())
+        .expect("test: tracker");
+    let settle = |id: &str, model: &str, tokens: u64, cost: f64| {
+        tracker
+            .settle_metered(&crate::llm::route_decision::MeteredTokenUsageRecord {
+                settlement_id: Some(id.to_string()),
+                provider: "p".to_string(),
+                model: model.to_string(),
+                prompt_tokens: tokens,
+                completion_tokens: 0,
+                total_tokens: tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+                cost_usd: Some(cost),
+            })
+            .expect("test: settle");
     };
-    std::fs::write(
-        tmp.path().join("state/costs.jsonl"),
-        format!("{}\n{}\n", line("m-a", 7, 0.000_001), line("m-b", 5, 0.000_002_5)),
-    )
-    .expect("test: ledger");
+    settle("s-1", "m-a", 7, 0.000_001);
+    settle("s-2", "m-b", 5, 0.000_002_5);
     let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
     assert_eq!((usage.tokens, usage.cost_micros), (Some(12), Some(4)));
-    assert_eq!(usage.models, ["m-a", "m-b"]);
+    assert_eq!(usage.models, ["p/m-a", "p/m-b"]);
 
-    // Unsettled rows are not counted and a negative value voids the ledger.
-    let unsettled = serde_json::json!({"id": "y", "usage": {"model": "m-c", "input_tokens": 99, "output_tokens": 0, "total_tokens": 99, "cost_usd": 9.0}}).to_string();
-    std::fs::write(
-        tmp.path().join("state/costs.jsonl"),
-        format!("{}\n{unsettled}\n", line("m-a", 7, 0.000_001)),
-    )
-    .expect("test: ledger");
+    // A forged zero-cost row, an unsettled row and a row with a wrong fingerprint are ignored.
+    let ledger = tmp.path().join("state/costs.jsonl");
+    let forged = serde_json::json!({
+        "id": "f", "settlement_id": "x", "settlement_sha256": "0".repeat(64), "session_id": "s",
+        "usage": {"model": "p/m-a", "input_tokens": 900, "output_tokens": 0, "total_tokens": 900, "cost_usd": 0.0,
+                  "timestamp": "2026-10-17T00:00:00Z"}
+    });
+    let unsettled = serde_json::json!({
+        "id": "u", "session_id": "s",
+        "usage": {"model": "p/m-c", "input_tokens": 99, "output_tokens": 0, "total_tokens": 99, "cost_usd": 9.0,
+                  "timestamp": "2026-10-17T00:00:00Z"}
+    });
+    let mut text = std::fs::read_to_string(&ledger).expect("test: ledger");
+    text.push_str(&format!("{forged}\n{unsettled}\n"));
+    std::fs::write(&ledger, text).expect("test: ledger");
     let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
-    assert_eq!((usage.tokens, usage.models), (Some(7), vec!["m-a".to_string()]));
-    std::fs::write(
-        tmp.path().join("state/costs.jsonl"),
-        format!("{}\n", line("m-a", 7, -1.0)),
-    )
-    .expect("test: ledger");
+    assert_eq!(
+        (usage.tokens, usage.cost_micros),
+        (Some(12), Some(4)),
+        "forged rows add nothing"
+    );
+    // A ledger holding only forged rows measures nothing.
+    std::fs::write(&ledger, format!("{forged}\n")).expect("test: ledger");
     assert!(
         super::super::agent_executor_read_usage_for_test(tmp.path())
-            .cost_micros
+            .tokens
             .is_none()
     );
 
@@ -759,4 +780,84 @@ async fn a_run_is_refused_when_the_operators_cost_limit_is_already_exceeded() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn the_relative_paths_that_decide_the_ledger_and_the_skill_are_refused_to_the_file_tools() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let loopback = Loopback::start().await;
+    let executor = AgentCaseExecutor::new(
+        template(tmp.path(), &loopback),
+        tmp.path().join("scratch"),
+        0.0,
+        AccountingOwner::new(tmp.path().to_path_buf()),
+    );
+    let ws = tmp.path().join("run-ws").canonicalize().unwrap_or_else(|_| {
+        std::fs::create_dir_all(tmp.path().join("run-ws")).expect("test: ws");
+        tmp.path().join("run-ws").canonicalize().expect("test: canonical ws")
+    });
+    let denied: Vec<std::path::PathBuf> = Vec::new();
+    let tools = vec!["file_write".to_string()];
+    let config = executor
+        .run_config(&ws, &dummy_request(&denied, &tools, SideEffects::WorkspaceWrite))
+        .expect("test: config");
+    assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::Full);
+    let policy = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(&config.autonomy, &ws));
+    let writer = crate::tools::FileWriteTool::new(policy);
+    for path in [
+        "state/costs.jsonl",
+        "skills/release-notes/SKILL.md",
+        "config.toml",
+        "self/skill-lifecycle/x",
+        "memory/brain.db",
+    ] {
+        let result = crate::tools::Tool::execute(&writer, serde_json::json!({"path": path, "content": "FORGED"}))
+            .await
+            .expect("test: tool result");
+        assert!(!result.success, "{path} must be refused: {result:?}");
+        assert!(!ws.join(path).exists(), "{path} must not have been written");
+    }
+    // An ordinary workspace file is still writable under workspace_write.
+    let ok = crate::tools::Tool::execute(
+        &writer,
+        serde_json::json!({"path": "out/report.txt", "content": "fine"}),
+    )
+    .await
+    .expect("test: tool result");
+    assert!(ok.success, "{ok:?}");
+}
+
+#[tokio::test]
+async fn web_fetch_inherits_a_non_empty_domain_allowlist_or_the_run_is_refused() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let loopback = Loopback::start().await;
+    let mut with_domains = template(tmp.path(), &loopback);
+    with_domains.browser.allowed_domains = vec!["docs.example".to_string()];
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).expect("test: ws");
+    let denied: Vec<std::path::PathBuf> = Vec::new();
+    let tools = vec!["web_fetch".to_string()];
+    let executor = AgentCaseExecutor::new(
+        with_domains,
+        tmp.path().join("s"),
+        0.0,
+        AccountingOwner::new(ws.clone()),
+    );
+    let config = executor
+        .run_config(&ws, &dummy_request(&denied, &tools, SideEffects::None))
+        .expect("test: config");
+    assert_eq!(config.browser.allowed_domains, ["docs.example"]);
+
+    let open = AgentCaseExecutor::new(
+        template(tmp.path(), &loopback),
+        tmp.path().join("s"),
+        0.0,
+        AccountingOwner::new(ws.clone()),
+    );
+    let error = open
+        .run_config(&ws, &dummy_request(&denied, &tools, SideEffects::None))
+        .map(|_| ())
+        .expect_err("test: an empty allowlist is refused")
+        .to_string();
+    assert!(error.contains("allowed_domains"), "{error}");
 }

@@ -42,7 +42,12 @@ pub const MAX_REQUIRED_TOOLS: usize = 16;
 /// can run commands, install or execute skills, spawn work, schedule, reach
 /// MCP or plugins, or post arbitrary requests is never available to an
 /// evaluation run. The network reads are named explicitly so a suite that
-/// needs them says so.
+/// needs them says so. Both of them send data off the machine: `web_search_tool`
+/// sends the model's queries to the configured search provider, and `web_fetch`
+/// requests any host the template's `browser.allowed_domains` permits. A prompt
+/// the model writes into such a request can carry task content, so neither is
+/// allowed in a suite that has a holdout split, and `web_fetch` additionally
+/// needs a non-empty `browser.allowed_domains` in the template.
 pub const READ_ONLY_REQUIRED_TOOLS: [&str; 9] = [
     "file_read",
     "skills_list",
@@ -54,6 +59,8 @@ pub const READ_ONLY_REQUIRED_TOOLS: [&str; 9] = [
     "web_search_tool",
     "web_fetch",
 ];
+/// Tools that reach the network.
+pub(super) const NETWORK_TOOLS: [&str; 2] = ["web_search_tool", "web_fetch"];
 /// Additionally allowed when the suite declares workspace writes.
 pub const WRITE_REQUIRED_TOOLS: [&str; 2] = ["file_write", "file_edit"];
 /// Workspace paths the evaluator owns; a fixture may not occupy them.
@@ -496,6 +503,11 @@ impl EvalSuite {
             check_ident("required tool", tool)?;
             if tool == "skill_read" {
                 return Err(invalid("skill_read is always offered; do not list it"));
+            }
+            if NETWORK_TOOLS.contains(&tool.as_str()) && self.cases.iter().any(|c| c.split == EvalSplit::Holdout) {
+                return Err(invalid(format!(
+                    "tool {tool} sends task content off the machine and cannot be used in a suite with a holdout split"
+                )));
             }
             let allowed = READ_ONLY_REQUIRED_TOOLS.contains(&tool.as_str())
                 || (self.side_effects == SideEffects::WorkspaceWrite && WRITE_REQUIRED_TOOLS.contains(&tool.as_str()));
