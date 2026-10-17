@@ -1704,3 +1704,31 @@ async fn a_decision_cannot_settle_a_proposal_that_moved_to_another_epoch() {
     assert!(fx.store.settle_gate(outcome.gate).is_err());
     assert_eq!(status(&fx, &proposal), ProposalStatus::Evaluated);
 }
+
+#[tokio::test]
+async fn a_damaged_receipt_of_this_subject_is_never_adjudicated_away() {
+    for damage in ["garbage receipt", "tampered cases"] {
+        let fx = fixture();
+        let suite = validation_suite(2);
+        let proposal = evaluating_proposal(&fx, &suite);
+        let bad = evaluate(&fx, &suite, &tie()).await;
+        let clean = evaluate(&fx, &suite, &all_better()).await;
+        mark_evaluated(&fx, &proposal);
+        let dir = fx.store.root().join("evaluations").join(&bad.evaluation_id);
+        if damage == "garbage receipt" {
+            std::fs::write(dir.join("receipt.json"), b"not json").expect("test: damage");
+        } else {
+            let cases = std::fs::read_to_string(dir.join("cases.jsonl")).expect("test: read");
+            std::fs::write(
+                dir.join("cases.jsonl"),
+                cases.replacen("\"tokens\":10", "\"tokens\":11", 1),
+            )
+            .expect("test: damage");
+        }
+        let error = gate(&fx, &proposal, &suite, std::slice::from_ref(&clean), &policy(), None)
+            .await
+            .expect_err("test: damaged evidence");
+        assert!(matches!(error, GateError::Tampered(_)), "{damage}: {error}");
+        assert_eq!(status(&fx, &proposal), ProposalStatus::Evaluated);
+    }
+}

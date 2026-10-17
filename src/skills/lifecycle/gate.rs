@@ -357,7 +357,9 @@ pub struct SkillGateDecision {
     /// Other evaluations of the subject that had no verdict, were blocked by an
     /// earlier epoch's decision, and are not counted again here: that decision
     /// adjudicated them. If one later completes as a measured failure it counts
-    /// again, and a changed list makes `verify_gate` refuse.
+    /// again. Any change to the list (such a run failing, or passing) makes
+    /// `verify_gate` refuse, which is conservative: a valid accept may be
+    /// refused and decided again.
     #[serde(default)]
     pub adjudicated_pending: Vec<String>,
     pub decision: GateDecision,
@@ -952,20 +954,26 @@ impl SkillLifecycleStore {
                 }
                 continue;
             }
+            // A receipt of this subject that is present but unusable is never
+            // an in-flight run: it cannot be adjudicated away, so the gate
+            // refuses instead of treating it as pending.
+            if let Err(error) = &receipt
+                && !matches!(error, EvaluationError::NotFound(_))
+            {
+                return Err(GateError::Tampered(format!(
+                    "the receipt of evaluation {id} for this subject cannot be read: {error}"
+                )));
+            }
             let (split, measured) = match receipt {
                 Ok((receipt, _)) if receipt_subject == Some(true) => {
-                    let measured = match self.verify_evaluation(&id, None) {
-                        Ok(sibling) => {
-                            let reasons = evaluation_reasons(suite.suite(), policy, &sibling);
-                            if reasons.is_empty() {
-                                continue;
-                            }
-                            reasons.iter().any(GateReason::is_measured)
-                        }
-                        // A receipt of this subject that does not verify is
-                        // not evidence of a pass.
-                        Err(_) => false,
-                    };
+                    let sibling = self.verify_evaluation(&id, None).map_err(|error| {
+                        GateError::Tampered(format!("the evaluation {id} of this subject does not verify: {error}"))
+                    })?;
+                    let reasons = evaluation_reasons(suite.suite(), policy, &sibling);
+                    if reasons.is_empty() {
+                        continue;
+                    }
+                    let measured = reasons.iter().any(GateReason::is_measured);
                     (receipt.split, measured)
                 }
                 // No usable receipt of this subject: in flight, abandoned or
