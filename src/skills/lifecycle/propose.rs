@@ -1014,6 +1014,42 @@ fn rewrite_description(front: &str, new: &str) -> Result<String, Refusal> {
     }
 }
 
+/// Applies a recorded diff to a baseline `SKILL.md` exactly the way the
+/// proposer did and returns the resulting text. The source review uses it to
+/// prove that the staged candidate is what its recorded diff says it is.
+pub(super) fn reapply_diff(original: &str, diff: &BoundedDiff) -> Result<String, String> {
+    let (front, body) = split_frontmatter(original).ok_or_else(|| "the baseline has no frontmatter".to_string())?;
+    let mut new_body = body.to_string();
+    for edit in &diff.edits {
+        match edit.op {
+            EditOp::Replace => {
+                let old = edit
+                    .old
+                    .as_deref()
+                    .ok_or_else(|| "a replace edit has no replaced text".to_string())?;
+                if occurrences(&new_body, old) != 1 {
+                    return Err("a replaced text does not occur exactly once in the body".to_string());
+                }
+                new_body = new_body.replacen(old, &edit.new, 1);
+            }
+            EditOp::Append => {
+                if !new_body.ends_with('\n') {
+                    new_body.push('\n');
+                }
+                new_body.push_str(&edit.new);
+                if !new_body.ends_with('\n') {
+                    new_body.push('\n');
+                }
+            }
+        }
+    }
+    let new_front = match &diff.description_change {
+        Some(change) => rewrite_description(front, &change.new).map_err(|r| r.detail)?,
+        None => front.to_string(),
+    };
+    Ok(format!("{new_front}{new_body}"))
+}
+
 /// Parses and applies a model reply to the baseline. Every refusal is typed.
 fn build_candidate(baseline: &Bundle, reply: &str) -> Result<Candidate, Refusal> {
     let patch: ModelPatch = serde_json::from_str(strip_fence(reply)).map_err(|e| {

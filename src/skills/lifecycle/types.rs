@@ -58,6 +58,14 @@ pub enum LifecycleError {
         from: &'static str,
         to: &'static str,
     },
+    #[error("proposal {proposal_id} has the same candidate content as the live proposal {other}")]
+    DuplicateCandidate { proposal_id: String, other: String },
+    #[error("candidate revision {revision} cannot be installed for its proposal: {reason}")]
+    CandidateRevisionConflict { revision: String, reason: String },
+    #[error("proposal {proposal_id} has no passed source review: {reason}")]
+    SourceReviewRequired { proposal_id: String, reason: String },
+    #[error("proposal {proposal_id} would widen the capabilities of its skill: {reason}")]
+    CapabilityExpansion { proposal_id: String, reason: String },
     #[error("task {task_id} already has a different terminal joined")]
     TerminalConflict { task_id: String },
     #[error("skill name {0:?} is bound to more than one skill id")]

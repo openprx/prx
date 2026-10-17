@@ -642,19 +642,18 @@ impl SkillLifecycleStore {
     /// caller cannot make a proposal eligible by hand. A non-empty `reason`
     /// (the reviewer or the review note) is required and recorded.
     ///
-    /// Known gap, a hard gate for SL09: `source_reviewed` is only a recorded
-    /// state change here. A source review record (applicability, bounded
-    /// changes, content safety) must exist before SL09 moves a proposal there,
-    /// and the gate must check that record once it exists.
-    pub fn advance_proposal(
+    /// `source_reviewed` is not reachable here: it needs the recorded source
+    /// review (`review_source`), which the gate and the authorization check
+    /// again.
+    pub(in crate::skills) fn advance_proposal(
         &self,
         id: &str,
         next: ProposalStatus,
         reason: &str,
     ) -> Result<SkillProposal, LifecycleError> {
-        if !matches!(next, ProposalStatus::SourceReviewed | ProposalStatus::Evaluated) {
+        if next != ProposalStatus::Evaluated {
             return Err(LifecycleError::ProposalRefused(format!(
-                "{} is entered through begin_evaluation or decided by the gate or by publication, not by hand",
+                "{} is entered through the source review or begin_evaluation, or decided by the gate or by publication, not by hand",
                 next.as_str()
             )));
         }
@@ -675,7 +674,12 @@ impl SkillLifecycleStore {
     /// recorded new attempt with the same frozen bindings of spec 8.1. A
     /// proposal gets at most [`MAX_GATE_EPOCHS`] epochs, so an uncertain
     /// outcome (including an exhausted budget) cannot be retried forever.
-    pub fn begin_evaluation(&self, id: &str, suite_digest: &str, reason: &str) -> Result<SkillProposal, GateError> {
+    pub(in crate::skills) fn begin_evaluation(
+        &self,
+        id: &str,
+        suite_digest: &str,
+        reason: &str,
+    ) -> Result<SkillProposal, GateError> {
         if reason.trim().is_empty() {
             return Err(GateError::Unsupported(
                 "a reviewer or review note is required".to_string(),
@@ -686,6 +690,7 @@ impl SkillLifecycleStore {
         let mut proposal = self
             .read_proposal_record(id)?
             .ok_or_else(|| GateError::Unsupported(format!("no such proposal {id}")))?;
+        self.require_source_review(&proposal)?;
         if suite.suite().skill_id != proposal.skill_id {
             return Err(GateError::Unbound("the suite belongs to another skill".to_string()));
         }
@@ -1198,6 +1203,8 @@ impl SkillLifecycleStore {
                 request.evaluations,
             )
             .map_err(|e| self.stale_on(&proposal.proposal_id, e))?;
+        // The recorded source review is part of what a decision rests on.
+        self.require_source_review(&proposal)?;
         let entries: Vec<GateEvaluationEntry> = resolved.verified.iter().map(entry_of).collect();
         let deterministic = deterministic_reasons(&resolved, request.policy);
         let judge_record = match (deterministic.is_empty(), judge) {
@@ -1449,6 +1456,19 @@ impl SkillLifecycleStore {
                 digest,
             },
             new_evidence,
+        ))
+    }
+
+    /// The sealed gate decision of the proposal's current evaluation epoch, if
+    /// one was made. Its digest is what authorization pins.
+    pub(super) fn recorded_gate_for(&self, proposal: &SkillProposal) -> Result<Option<RecordedGate>, GateError> {
+        if proposal.evaluation_epoch == 0 {
+            return Ok(None);
+        }
+        self.read_gate(&gate_id_of(
+            self.owner_scope(),
+            &proposal.proposal_id,
+            proposal.evaluation_epoch,
         ))
     }
 

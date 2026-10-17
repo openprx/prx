@@ -130,6 +130,8 @@ struct Fingerprint<'a> {
     expected_generation: u64,
     /// `None` for rollbacks, whose enabled state comes from the target's anchor.
     enabled: Option<bool>,
+    /// The authorization pin of the request; an entry without one is legacy.
+    authorization_digest: Option<&'a str>,
 }
 
 impl Fingerprint<'_> {
@@ -142,6 +144,12 @@ impl Fingerprint<'_> {
         ) == (self.kind, self.skill, self.candidate, self.expected_generation)
             && self.digest.is_none_or(|d| entry.candidate_record_digest == d)
             && self.enabled.is_none_or(|e| entry.enabled == e)
+            && match (self.authorization_digest, entry.authorization_digest.as_deref()) {
+                (Some(requested), Some(pinned)) => requested == pinned,
+                // A legacy entry has no pin to disagree with; a request without
+                // a pin resumes whatever the entry pinned.
+                _ => true,
+            }
     }
 }
 
@@ -152,6 +160,18 @@ impl SkillLifecycleStore {
     /// Blocking: waits for locks and does file I/O; async callers must use
     /// `spawn_blocking`.
     pub fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
+        self.publish_pinned(request, None)
+    }
+
+    /// Like [`Self::publish`], with the digest of the publication
+    /// authorization pinned in the PREPARED journal entry. A retry of the same
+    /// transaction id must carry the same digest; an entry that has none
+    /// (legacy) is resumed as it is.
+    pub(super) fn publish_pinned(
+        &self,
+        request: &PublishRequest,
+        authorization_digest: Option<&str>,
+    ) -> Result<TransactionOutcome, LifecycleError> {
         self.ensure_publication_dirs()?;
         let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
@@ -162,6 +182,7 @@ impl SkillLifecycleStore {
             digest: Some(&request.candidate_record_digest),
             expected_generation: request.expected_generation,
             enabled: Some(request.enabled),
+            authorization_digest,
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -174,6 +195,7 @@ impl SkillLifecycleStore {
             &request.candidate_record_digest,
             request.expected_generation,
             request.enabled,
+            authorization_digest,
         )
     }
 
@@ -194,6 +216,7 @@ impl SkillLifecycleStore {
             digest: None,
             expected_generation: request.expected_generation,
             enabled: None,
+            authorization_digest: None,
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -215,6 +238,7 @@ impl SkillLifecycleStore {
             &anchor.candidate_record_digest,
             request.expected_generation,
             anchor.enabled,
+            None,
         )
     }
 
@@ -256,6 +280,7 @@ impl SkillLifecycleStore {
         candidate_digest: &str,
         expected_generation: u64,
         enabled: bool,
+        authorization_digest: Option<&str>,
     ) -> Result<TransactionOutcome, LifecycleError> {
         let skill = lock.skill();
         // A PREPARED entry of this skill whose swap went live must be settled
@@ -297,6 +322,7 @@ impl SkillLifecycleStore {
             expected_generation,
             new_generation,
             enabled,
+            authorization_digest: authorization_digest.map(str::to_string),
             state: TransactionState::Prepared,
             prepared_at: Utc::now(),
             finished_at: None,
