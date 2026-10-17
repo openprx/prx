@@ -3,7 +3,7 @@
 //! decision ask for approval, or does an ordinary answer win?
 
 use super::*;
-use crate::causal_tree::branch::Ns8;
+use crate::causal_tree::branch::{CapabilityTarget, Ns8};
 use crate::causal_tree::candidate_generator::{CapabilityCostModel, DiscoveredRefs};
 use crate::causal_tree::config::CausalTreeConfig;
 use crate::causal_tree::decision_rehearsal::RehearsalPorts;

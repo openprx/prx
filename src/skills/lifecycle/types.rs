@@ -173,7 +173,12 @@ pub struct SkillId(String);
 
 /// Lock names the knowledge store uses. They start with `_`, which
 /// [`SkillId::parse`] never accepts, so no skill can ever share their lock.
-pub(super) const RESERVED_LOCK_NAMES: [&str; 3] = ["_knowledge-patterns", "_knowledge-rejections", "_skill-proposals"];
+pub(super) const RESERVED_LOCK_NAMES: [&str; 4] = [
+    "_knowledge-patterns",
+    "_knowledge-rejections",
+    "_skill-proposals",
+    "_skill-gates",
+];
 
 impl SkillId {
     /// A reserved internal lock identity; `None` for any other name.

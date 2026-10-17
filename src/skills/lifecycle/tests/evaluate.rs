@@ -24,20 +24,20 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "owner:ws:cli:alice";
-const ORACLE: &str = "ORACLE-ANSWER-7731";
+pub(super) const ORACLE: &str = "ORACLE-ANSWER-7731";
 
-fn skill() -> SkillId {
+pub(super) fn skill() -> SkillId {
     SkillId::parse("release-notes").expect("test: skill id")
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    store: SkillLifecycleStore,
-    baseline: RevisionId,
-    candidate: RevisionId,
+pub(super) struct Fixture {
+    pub(super) tmp: TempDir,
+    pub(super) store: SkillLifecycleStore,
+    pub(super) baseline: RevisionId,
+    pub(super) candidate: RevisionId,
 }
 
-fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, String) {
+pub(super) fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, String) {
     let bundle = Bundle::from_entries(vec![entry(
         "SKILL.md",
         format!("---\nname: release-notes\ndescription: Writes release notes\n---\n\n{body}\n").as_bytes(),
@@ -51,14 +51,14 @@ fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, Strin
 
 /// A store whose skill is at generation 1 with revision A active, and an
 /// unpublished candidate revision B.
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
     let a = write_revision(&store, "ANSWER=draft");
     let b = write_revision(&store, "ANSWER=report-v2");
     activate(&store, &skill(), &a, 0, true);
     Fixture {
-        _tmp: tmp,
+        tmp,
         store,
         baseline: a.0,
         candidate: b.0,
@@ -72,14 +72,14 @@ fn fixture_unpublished() -> Fixture {
     let a = write_revision(&store, "ANSWER=draft");
     let b = write_revision(&store, "ANSWER=report-v2");
     Fixture {
-        _tmp: tmp,
+        tmp,
         store,
         baseline: a.0,
         candidate: b.0,
     }
 }
 
-fn case(id: &str, split: EvalSplit, prompt: &str) -> EvalCase {
+pub(super) fn case(id: &str, split: EvalSplit, prompt: &str) -> EvalCase {
     EvalCase {
         case_id: id.to_string(),
         split,
@@ -95,7 +95,7 @@ fn case(id: &str, split: EvalSplit, prompt: &str) -> EvalCase {
     }
 }
 
-fn suite_with(cases: Vec<EvalCase>) -> EvalSuite {
+pub(super) fn suite_with(cases: Vec<EvalCase>) -> EvalSuite {
     EvalSuite {
         schema_version: 1,
         suite_id: "notes-suite".to_string(),
@@ -120,7 +120,7 @@ fn suite_with(cases: Vec<EvalCase>) -> EvalSuite {
     }
 }
 
-fn validation_suite(count: usize) -> FrozenSuite {
+pub(super) fn validation_suite(count: usize) -> FrozenSuite {
     let cases = (0..count)
         .map(|i| {
             case(
@@ -133,17 +133,17 @@ fn validation_suite(count: usize) -> FrozenSuite {
     suite_with(cases).freeze().expect("test: freeze")
 }
 
-type Script = Box<dyn Fn(&ExecutionRequest<'_>) -> Result<RunObservation, EvaluationError> + Send + Sync>;
+pub(super) type Script = Box<dyn Fn(&ExecutionRequest<'_>) -> Result<RunObservation, EvaluationError> + Send + Sync>;
 
 /// Scripted executor; remembers every request it was handed.
-struct Scripted {
+pub(super) struct Scripted {
     script: Script,
     seen: Mutex<Vec<String>>,
     cancel_after: Option<(usize, CancellationToken)>,
 }
 
 impl Scripted {
-    fn new(
+    pub(super) fn new(
         script: impl Fn(&ExecutionRequest<'_>) -> Result<RunObservation, EvaluationError> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -198,7 +198,7 @@ impl CaseExecutor for Hanging {
     }
 }
 
-fn is_candidate(request: &ExecutionRequest<'_>) -> bool {
+pub(super) fn is_candidate(request: &ExecutionRequest<'_>) -> bool {
     request.skill.is_some_and(|skill| {
         skill
             .bundle
@@ -210,7 +210,7 @@ fn is_candidate(request: &ExecutionRequest<'_>) -> bool {
 
 /// A well-formed observation. The "model" answers with the oracle only when
 /// the installed skill is the candidate; it reads the skill when one exists.
-fn good(request: &ExecutionRequest<'_>) -> RunObservation {
+pub(super) fn good(request: &ExecutionRequest<'_>) -> RunObservation {
     let installed = request.skill.map(|skill| InstalledSkill {
         skill_id: skill.skill_id.clone(),
         revision_id: skill.bundle.revision_id().clone(),
@@ -256,7 +256,7 @@ fn good(request: &ExecutionRequest<'_>) -> RunObservation {
     }
 }
 
-fn request<'a>(fx: &Fixture, suite: &'a FrozenSuite, split: EvalSplit) -> EvaluationRequest<'a> {
+pub(super) fn request<'a>(fx: &Fixture, suite: &'a FrozenSuite, split: EvalSplit) -> EvaluationRequest<'a> {
     EvaluationRequest {
         suite,
         split,

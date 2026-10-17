@@ -178,6 +178,8 @@ pub enum ProposalFailureKind {
     InvalidCandidate,
     NoChange,
     SuppressedByRejection,
+    /// Every publication attempt of an authorized proposal aborted.
+    PublicationAborted,
     /// The attempt was in flight when the process died or an operator gave up
     /// on it; the model may have been called, so the liability is unknown.
     Interrupted,
@@ -262,6 +264,31 @@ pub struct BudgetRecord {
     pub call_timeout_ms: u64,
 }
 
+/// What a proposal was authorized for publication against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationAuthorization {
+    pub gate_id: String,
+    /// Digest of the sealed gate decision the authorization was verified against.
+    pub gate_digest: String,
+    /// Pinned record digest of the candidate revision to publish.
+    pub candidate_record_digest: String,
+    pub authorized_at: DateTime<Utc>,
+    /// Publication attempt; the transaction id derives from it. An attempt
+    /// whose transaction aborted is never re-run, the next one gets a new id.
+    pub attempt: u32,
+}
+
+/// The committed publication of a proposal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationRecord {
+    pub transaction_id: String,
+    pub revision_id: RevisionId,
+    pub generation: u64,
+    pub committed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillProposal {
@@ -296,6 +323,23 @@ pub struct SkillProposal {
     pub failure: Option<ProposalFailure>,
     pub diff: Option<BoundedDiff>,
     pub attempts: Vec<AttemptRecord>,
+    /// Digest of the suite that governs this proposal's evaluation, bound by
+    /// `begin_evaluation` (SL07); the gate never takes it from its caller.
+    #[serde(default)]
+    pub required_suite: Option<String>,
+    /// Evaluation epochs opened so far; each one is a recorded attempt.
+    #[serde(default)]
+    pub evaluation_epoch: u32,
+    /// When the proposal first entered evaluation; evaluations that began
+    /// earlier do not count for it.
+    #[serde(default)]
+    pub evaluating_since: Option<DateTime<Utc>>,
+    /// Set when the proposal became `PublicationAuthorized` (SL08).
+    #[serde(default)]
+    pub authorization: Option<PublicationAuthorization>,
+    /// Set when the authorized revision was published (SL08).
+    #[serde(default)]
+    pub publication: Option<PublicationRecord>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -666,6 +710,8 @@ impl SkillLifecycleStore {
         let mut proposal = self
             .read_proposal_record(id)?
             .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {id}")))?;
+        // A publication that is already live makes the proposal committed.
+        self.settle_publication(&lock, &mut proposal)?;
         if !proposal.status.can_become(ProposalStatus::Cancelled) {
             return Err(LifecycleError::InvalidProposalTransition {
                 proposal_id: proposal.proposal_id,

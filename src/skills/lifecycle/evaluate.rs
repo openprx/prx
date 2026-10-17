@@ -50,15 +50,24 @@ pub(super) const ATTEMPT_FILE: &str = "attempt.json";
 /// Durable reservation of one evaluation attempt, written before the first run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AttemptRecord {
-    schema_version: u32,
-    evaluation_id: String,
-    owner_scope: OwnerScope,
-    skill_id: SkillId,
-    suite_digest: String,
-    split: EvalSplit,
-    split_digest: String,
-    reserved_at: DateTime<Utc>,
+pub(super) struct AttemptRecord {
+    pub(super) schema_version: u32,
+    pub(super) evaluation_id: String,
+    pub(super) owner_scope: OwnerScope,
+    pub(super) skill_id: SkillId,
+    pub(super) suite_digest: String,
+    pub(super) split: EvalSplit,
+    pub(super) split_digest: String,
+    /// What the attempt evaluates, so a reservation that never produced a
+    /// receipt can still be attributed to its subject. Absent in reservations
+    /// written before SL07; those cannot be attributed without a receipt.
+    #[serde(default)]
+    pub(super) candidate_revision: Option<RevisionId>,
+    #[serde(default)]
+    pub(super) baseline_revision: Option<RevisionId>,
+    #[serde(default)]
+    pub(super) observed_generation: Option<u64>,
+    pub(super) reserved_at: DateTime<Utc>,
 }
 
 /// Failure to start, record or verify an evaluation. Every variant is a
@@ -1252,7 +1261,7 @@ impl SkillLifecycleStore {
         Ok(sha256_hex(&lines))
     }
 
-    fn read_sealed_receipt(&self, id: &str) -> Result<(EvaluationReceipt, String), EvaluationError> {
+    pub(super) fn read_sealed_receipt(&self, id: &str) -> Result<(EvaluationReceipt, String), EvaluationError> {
         if !is_evaluation_id(id) {
             return Err(EvaluationError::NotFound(format!("evaluation {id:?}")));
         }
@@ -1302,6 +1311,14 @@ impl SkillLifecycleStore {
         Ok(ids)
     }
 
+    /// The reservation of an evaluation, `None` when it is missing or cannot be
+    /// read (the caller then has to rely on the receipt).
+    pub(super) fn read_attempt(&self, id: &str) -> Option<AttemptRecord> {
+        let path = self.evaluation_dir(id).join(ATTEMPT_FILE);
+        check_private(&path).ok()?;
+        read_record::<AttemptRecord>(&path).ok()
+    }
+
     /// Reserves one attempt on `split` for a new evaluation before any run
     /// starts. The count, the limit check and the durable record happen under
     /// the store and skill locks, so concurrent evaluations cannot both take
@@ -1314,6 +1331,9 @@ impl SkillLifecycleStore {
         suite: &FrozenSuite,
         split: EvalSplit,
         evaluation_id: &str,
+        candidate: &RevisionId,
+        baseline: Option<&RevisionId>,
+        observed_generation: u64,
     ) -> Result<(), EvaluationError> {
         let skill = &suite.suite().skill_id;
         let split_digest = suite.split_digest(split);
@@ -1356,6 +1376,9 @@ impl SkillLifecycleStore {
             suite_digest: suite.digest().to_string(),
             split,
             split_digest,
+            candidate_revision: Some(candidate.clone()),
+            baseline_revision: baseline.cloned(),
+            observed_generation: Some(observed_generation),
             reserved_at: Utc::now(),
         };
         let path = dir.join(ATTEMPT_FILE);

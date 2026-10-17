@@ -2,7 +2,8 @@
 //! owner-scoped store (SL01). Publication, runtime binding and evaluation
 //! are separate packages and are not part of this module yet. SL08 store level
 //! adds the publication journal, generation CAS, rollback and recovery. SL06
-//! adds frozen evaluation suites and the baseline-versus-candidate evaluator.
+//! adds frozen evaluation suites and the baseline-versus-candidate evaluator. SL07
+//! adds the deterministic gate, its receipt and the optional judge.
 
 /// Test-only crash injection point; expands to nothing outside `cfg(test)`.
 macro_rules! crash_point {
@@ -15,12 +16,15 @@ macro_rules! crash_point {
 }
 
 mod agent_executor;
+mod authorize;
 mod binding;
 mod bundle;
 mod capture;
 mod consolidate;
 mod evaluate;
 mod evaluator;
+mod gate;
+mod gate_judge;
 mod generation;
 mod journal;
 mod knowledge;
@@ -41,6 +45,7 @@ mod tests;
 #[cfg(test)]
 use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
+pub use authorize::{MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -62,6 +67,14 @@ pub use evaluate::{
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
+pub use gate::{
+    EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
+    GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision, VerifiedGate,
+};
+pub use gate_judge::{
+    GateJudge, JUDGE_PROMPT_VERSION, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgedEvaluation,
+    MAX_JUDGE_REASON_BYTES, ModelJudge,
+};
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
 pub use knowledge::{
@@ -74,7 +87,7 @@ pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationRepor
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
     MAX_PROPOSAL_ATTEMPTS, MAX_PROPOSAL_LISTING, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus,
-    SkillProposal,
+    PublicationAuthorization, PublicationRecord, SkillProposal,
 };
 pub use propose::{
     MAX_EDIT_PERCENT, MAX_EDIT_TOKENS, MAX_EDITS, MAX_PROPOSAL_PATTERNS, ProposeOutcome, ProposeRequest,
