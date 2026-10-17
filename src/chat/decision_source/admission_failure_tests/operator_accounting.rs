@@ -140,7 +140,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             Arc::clone(&security),
             workspace.path().to_path_buf(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             None,
             crate::providers::provider_runtime_options_from_config(config),

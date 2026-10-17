@@ -46,7 +46,6 @@ where
                     Arc::clone(&security),
                     workspace.clone(),
                     config.multimodal.clone(),
-                    config.agent.compaction.clone(),
                     Default::default(),
                     None,
                     crate::providers::ProviderRuntimeOptions::default(),

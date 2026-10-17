@@ -170,13 +170,27 @@ cat >"$linux_inner" <<'INNER'
 set -euo pipefail
 ip link set lo up
 ip link add prx-guard0 type dummy
+# Avoid kernel-generated link-local DAD/router solicitations being counted as
+# test traffic; the explicit IPv6 source below already uses nodad.
+ip link set dev prx-guard0 addrgenmode none
 ip link set prx-guard0 up
 ip addr add 192.0.2.2/32 dev prx-guard0
 ip route add default dev prx-guard0
 if ! { ip -6 addr add 2001:db8::2/128 dev prx-guard0 nodad && ip -6 route add default dev prx-guard0; } 2>/dev/null; then
     echo "test_home_guard: no IPv6 route in the test namespace: an IPv6 attempt fails unrouted (it cannot leave) but is not counted" >&2
 fi
-sent() { cat /sys/class/net/prx-guard0/statistics/tx_packets; }
+sent() {
+    # /sys may still be mounted for the invoking network namespace after
+    # unshare --net. Query this namespace's interface over netlink instead.
+    LC_ALL=C ip -s link show dev prx-guard0 | awk '
+        /^[[:space:]]*TX:/ {
+            getline
+            if ($2 ~ /^[0-9]+$/) { print $2; found = 1 }
+            exit
+        }
+        END { if (!found) exit 1 }
+    '
+}
 before="$(sent)"
 timeout 2 bash -c "exec 3<>/dev/tcp/$PRX_GUARD_CANARY/9" 2>/dev/null || true
 if [ "$(sent)" -le "$before" ]; then
@@ -356,6 +370,15 @@ Linux)
         if [ -n "${CARGO_TARGET_DIR:-}" ]; then
             guard_env+=("CARGO_TARGET_DIR=$CARGO_TARGET_DIR")
         fi
+        # sudo removes TMPDIR even with -E. Keep the build wrapper's private,
+        # fresh test workspace instead of silently falling back to shared /tmp.
+        if [ -n "${TMPDIR:-}" ]; then
+            guard_env+=("TMPDIR=$TMPDIR")
+        fi
+        # Keep the invoking user's ownership under a private umask. The
+        # namespace-root writer truncates this file, then the outer guard must
+        # read it without broadening its permissions.
+        : >"$attempts_file"
         "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" "$(command -v cargo)" test "$@" ||
             status=$?
         if [ ! -s "$attempts_file" ]; then

@@ -1317,7 +1317,7 @@ fn register_gateway_turn_tools(
     config: &Config,
     shared_config: &crate::config::SharedConfig,
     security: &Arc<crate::security::SecurityPolicy>,
-    provider: &Arc<dyn Provider>,
+    #[cfg(test)] provider: &Arc<dyn Provider>,
     _model: &str,
     memory: &Arc<dyn Memory>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
@@ -1365,13 +1365,9 @@ fn register_gateway_turn_tools(
         let announce_channel =
             gateway_spawn_announce_channel(signal.map(|channel| Arc::clone(channel) as Arc<dyn Channel>));
         let provider_name = providers::selection::default_provider(config).to_string();
-        let pinned_provider_resolver: Arc<dyn providers::generation::PinnedProviderResolver> =
-            Arc::new(providers::generation::ConfigGenerationProviderResolver::new(
-                Arc::clone(shared_config),
-                provider_runtime_options.clone(),
-            ));
         let spawn_tool = tools::SessionsSpawnTool::new(
             announce_channel,
+            #[cfg(test)]
             Arc::clone(provider),
             provider_name,
             providers::selection::default_model(config).to_string(),
@@ -1379,17 +1375,14 @@ fn register_gateway_turn_tools(
             Arc::clone(security),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
         .with_hint_config(config)
-        .with_pinned_provider_resolver(pinned_provider_resolver)
         .with_channels(Arc::clone(&channels_registry))
         .with_shared_memory(Arc::clone(memory))
         .with_event_recording(config.memory.event_recording_config())
@@ -1488,6 +1481,7 @@ fn build_gateway_turn_runtime(
         config,
         &shared_config,
         &security,
+        #[cfg(test)]
         &provider,
         &model,
         &memory,
@@ -1755,6 +1749,7 @@ pub async fn run_gateway(
         &config,
         &shared_config_for_reload,
         &security,
+        #[cfg(test)]
         &provider,
         &model,
         &mem,

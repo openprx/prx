@@ -633,7 +633,6 @@ mod tests {
             Arc::new(crate::security::SecurityPolicy::default()),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             std::collections::HashMap::new(),
             None,
             crate::providers::ProviderRuntimeOptions::default(),

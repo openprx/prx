@@ -166,7 +166,7 @@
         "unit": "usd_per_1m_tokens",
         "input": 0.25,
         "output": 1.25,
-        "cache_write": 0.3125,
+        "cache_write": 0.3,
         "cache_read": 0.03
       }
     },
@@ -292,7 +292,7 @@
         "unit": "usd_per_1m_tokens",
         "input": 0.25,
         "output": 1.25,
-        "cache_write": 0.3125,
+        "cache_write": 0.3,
         "cache_read": 0.03
       }
     },
@@ -465,13 +465,6 @@
         ],
         "latency_ms": 3000,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 15.0,
-        "output": 75.0,
-        "cache_write": 18.75,
-        "cache_read": 1.5
       }
     },
     {
@@ -1304,7 +1297,15 @@
         "input": 1.25,
         "output": 10.0,
         "cache_write": 0.0,
-        "cache_read": 0.0
+        "cache_read": 0.125,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2.5,
+            "output": 15.0,
+            "cache_read": 0.25
+          }
+        ]
       }
     },
     {
@@ -3671,7 +3672,7 @@
         "input": 3.0,
         "output": 15.0,
         "cache_write": 0.0,
-        "cache_read": 0.0
+        "cache_read": 0.75
       }
     },
     {

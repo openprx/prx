@@ -830,7 +830,7 @@ impl IssuedChildGrant {
             .filter(|reference| {
                 catalog
                     .entry_any(&reference.id)
-                    .is_none_or(|entry| entry.public_name != "chat_schedule")
+                    .is_some_and(|entry| entry.process_worker_compatible)
             })
             .cloned()
             .collect::<Vec<_>>();

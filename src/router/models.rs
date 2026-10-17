@@ -11,6 +11,11 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
         .models
         .iter()
         .filter_map(|model| {
+            if model.lifecycle.status != crate::providers::catalog::ModelLifecycleStatus::Active
+                || model.pricing.is_none()
+            {
+                return None;
+            }
             let router = model.router.as_ref()?;
             let context = model.limits.context_window?;
             Some(RouterModelConfig {
@@ -68,13 +73,30 @@ mod tests {
     }
 
     #[test]
-    fn builtin_models_include_major_providers() {
+    fn builtin_models_exclude_retired_and_unpriced_catalog_rows() {
         let models = builtin_model_capabilities();
-        let providers: HashSet<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        for model in &models {
+            let release = catalog
+                .model(&crate::providers::ProviderId::of(&model.provider), &model.model_id)
+                .expect("every builtin router row comes from the release catalog");
+            assert_eq!(
+                release.lifecycle.status,
+                crate::providers::catalog::ModelLifecycleStatus::Active,
+                "non-active router candidate: {}",
+                release.id
+            );
+            assert!(release.pricing.is_some(), "unpriced router candidate: {}", release.id);
+        }
+        let providers: HashSet<&str> = models.iter().map(|model| model.provider.as_str()).collect();
         assert!(providers.contains("anthropic"));
-        assert!(providers.contains("openai"));
-        assert!(providers.contains("gemini"));
         assert!(providers.contains("ollama"));
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider == "gemini" || model.provider == "openai"),
+            "providers whose only router rows are retired must not remain candidates"
+        );
     }
 
     fn context_for(models: &[RouterModelConfig], provider: &str, model_id: &str) -> usize {
@@ -86,59 +108,49 @@ mod tests {
     }
 
     #[test]
-    fn builtin_context_windows_match_p4b_policy() {
+    fn builtin_context_windows_match_the_active_priced_router_rows() {
         let models = builtin_model_capabilities();
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
 
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-fable-5"),
-            1_000_000,
-            "Claude Fable 5 is a current 1M model and must not fall back to 128K"
-        );
+        for (provider, model_id, expected_context) in [
+            ("anthropic", "claude-fable-5", 1_000_000),
+            ("anthropic", "claude-opus-4-7", 1_000_000),
+            ("anthropic", "claude-opus-4-6", 1_000_000),
+            ("anthropic", "claude-sonnet-4-6", 1_000_000),
+            ("openrouter", "google/gemini-3-flash", 1_000_000),
+            ("gemini", "gemini-2.5-pro", 1_000_000),
+            ("gemini", "gemini-2.0-flash", 1_000_000),
+            ("anthropic", "claude-haiku-4-5", 200_000),
+            ("anthropic", "claude-haiku-3", 200_000),
+            ("openai", "gpt-4o", 128_000),
+            ("openai", "gpt-4o-mini", 128_000),
+            ("openrouter", "moonshotai/kimi-k2.5", 262_144),
+        ] {
+            let release = catalog
+                .model(&crate::providers::ProviderId::of(provider), model_id)
+                .unwrap_or_else(|| panic!("missing release model {provider}/{model_id}"));
+            assert_eq!(
+                release.limits.context_window,
+                Some(expected_context),
+                "release context changed for {provider}/{model_id}"
+            );
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model.provider == provider && model.model_id == model_id),
+                "retired or unpriced model remained an automatic candidate: {provider}/{model_id}"
+            );
+        }
+
         assert_eq!(
             context_for(&models, "anthropic", "claude-opus-4-8"),
             1_000_000,
             "Claude Opus 4.8 is a current 1M model and must not fall back to 128K"
         );
         assert_eq!(
-            context_for(&models, "anthropic", "claude-opus-4-7"),
-            1_000_000,
-            "Claude Opus 4.7 is a current 1M model and must not fall back to 128K"
-        );
-        assert_eq!(context_for(&models, "anthropic", "claude-opus-4-6"), 1_000_000);
-        assert_eq!(context_for(&models, "anthropic", "claude-sonnet-4-6"), 1_000_000);
-        assert_eq!(context_for(&models, "openrouter", "google/gemini-3-flash"), 1_000_000);
-        assert_eq!(context_for(&models, "gemini", "gemini-2.5-pro"), 1_000_000);
-        assert_eq!(context_for(&models, "gemini", "gemini-2.0-flash"), 1_000_000);
-
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-haiku-4-5"),
-            200_000,
-            "Haiku 4.5 is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
             context_for(&models, "anthropic", "claude-haiku-4-5-20251001"),
             200_000,
             "Haiku 4.5 dated ID is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-haiku-3"),
-            200_000,
-            "Haiku is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openai", "gpt-4o"),
-            128_000,
-            "gpt-4o is a known 128K model and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openai", "gpt-4o-mini"),
-            128_000,
-            "gpt-4o-mini is a known 128K model and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openrouter", "moonshotai/kimi-k2.5"),
-            262_144,
-            "Kimi K2.5 must match OpenRouter's published context length"
         );
         assert_eq!(
             context_for(&models, "ollama", "*"),

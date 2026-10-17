@@ -1755,11 +1755,24 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block forbidden paths using path-component-aware matching
+        // Block forbidden paths using path-component-aware matching. A relative
+        // path is also matched where it lands inside the workspace, so an absolute
+        // forbidden entry covers `state/x` the same as `<workspace>/state/x`
+        // (".." components were rejected above, so the join cannot leave it).
         let expanded_path = expanded.as_path();
+        let in_workspace = (!expanded.is_absolute()).then(|| self.workspace_dir.join(expanded_path));
         for forbidden in &self.forbidden_paths {
             let forbidden_expanded = crate::config::expand_home(Path::new(forbidden));
-            if expanded_path.starts_with(&forbidden_expanded) {
+            // Only entries that lie inside the workspace apply to the joined path:
+            // a workspace that itself sits below a forbidden prefix stays usable.
+            // Compared case-insensitively: on a case-insensitive filesystem
+            // `STATE/x` is `state/x`.
+            let fold = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+            let covers_relative = fold(&forbidden_expanded).starts_with(fold(&self.workspace_dir))
+                && in_workspace
+                    .as_ref()
+                    .is_some_and(|resolved| fold(resolved).starts_with(fold(&forbidden_expanded)));
+            if expanded_path.starts_with(&forbidden_expanded) || covers_relative {
                 return false;
             }
         }
@@ -4803,6 +4816,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn forbidden_paths_also_cover_relative_paths_inside_the_workspace() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/work/ws"),
+            workspace_only: true,
+            forbidden_paths: vec![
+                "/work/ws/state".to_string(),
+                "/work/ws/config.toml".to_string(),
+                "/work".to_string(),
+            ],
+            ..default_policy()
+        };
+        for blocked in [
+            "state/costs.jsonl",
+            "state",
+            "config.toml",
+            "./state/x",
+            "STATE/costs.jsonl",
+            "State/x",
+            "Config.TOML",
+        ] {
+            assert!(!policy.is_path_allowed(blocked), "{blocked}");
+        }
+        for allowed in ["notes/state.txt", "out/report.txt", "statement.md"] {
+            assert!(policy.is_path_allowed(allowed), "{allowed}");
+        }
     }
 
     #[test]
