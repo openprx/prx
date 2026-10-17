@@ -56,9 +56,9 @@
 //!
 //! Progress is *observable activity attributable to this turn*: provider stream
 //! chunks, a completed provider round-trip, a tool call starting or finishing,
-//! history compaction/paging, a durable write the turn owed coming back, and
-//! output emitted to a channel or event sink. Any single one of them resets the
-//! window; see [`ProgressKind`].
+//! completed serving-request preparation, history compaction/paging, a durable
+//! write the turn owed coming back, and output emitted to a channel or event sink.
+//! Any single one of them resets the window; see [`ProgressKind`].
 //!
 //! Two things this definition intentionally does **not** do:
 //!
@@ -278,6 +278,10 @@ pub enum ProgressKind {
     /// wedge `crate::runtime::blocking` documents — records nothing, so the
     /// window still runs out and the verdict is still reached.
     DurableWrite,
+    /// The serving request's context, tool surface and fingerprint have been
+    /// compiled. Recorded after that work, before awaiting its event write or
+    /// dispatch; preparing a request that never finishes records nothing.
+    RequestPrepared,
 }
 
 impl ProgressKind {
@@ -296,6 +300,7 @@ impl ProgressKind {
             Self::RuntimeSubtree => "runtime_subtree",
             Self::SubtaskAlive => "subtask_alive",
             Self::DurableWrite => "durable_write",
+            Self::RequestPrepared => "request_prepared",
         }
     }
 
@@ -312,6 +317,7 @@ impl ProgressKind {
             Self::RuntimeSubtree => 8,
             Self::SubtaskAlive => 9,
             Self::DurableWrite => 10,
+            Self::RequestPrepared => 11,
         }
     }
 
@@ -327,6 +333,7 @@ impl ProgressKind {
             8 => Self::RuntimeSubtree,
             9 => Self::SubtaskAlive,
             10 => Self::DurableWrite,
+            11 => Self::RequestPrepared,
             _ => Self::TurnStart,
         }
     }
@@ -780,6 +787,19 @@ fn subtree_fingerprint(root: Option<WorkId>) -> Option<u64> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_preparation_has_a_distinct_round_tripping_progress_kind() {
+        let beat = ProgressBeat::new(None);
+        assert_eq!(beat.events(), 0);
+        beat.record(ProgressKind::RequestPrepared);
+        assert_eq!(beat.events(), 1);
+        assert_eq!(beat.last_kind(), ProgressKind::RequestPrepared);
+        assert_eq!(ProgressKind::RequestPrepared.as_str(), "request_prepared");
+        assert_eq!(ProgressKind::RequestPrepared.as_u8(), 11);
+        assert_eq!(ProgressKind::from_u8(10), ProgressKind::DurableWrite);
+        assert_eq!(ProgressKind::from_u8(255), ProgressKind::TurnStart);
+    }
 
     fn guard_ms(idle_ms: u64) -> IdleGuard {
         IdleGuard {

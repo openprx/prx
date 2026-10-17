@@ -238,6 +238,10 @@ max_history = 200
 # defaults are deliberately different numbers (900 vs 1800) so an operator
 # always sees the warning well before anything is killed.
 #
+# Completed serving-request preparation counts as progress (`request_prepared`).
+# The event follows actual compilation; merely starting an iteration does not
+# report a provider response or repeatedly refresh a pending request's window.
+#
 # Termination goes through the normal cancellation path and the runtime
 # registry's kill path, so child process groups are cleaned up (`killpg`) and
 # the event is recorded in the registry. The error says explicitly that the turn
