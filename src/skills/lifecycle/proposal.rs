@@ -41,6 +41,10 @@ pub const MAX_PROPOSAL_LISTING: usize = 1024;
 pub const MAX_PROPOSAL_ATTEMPTS: usize = 8;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_DETAIL_BYTES: usize = 500;
+/// Time past an attempt's own call deadline before it counts as lost. It must
+/// cover the two lock waits (5 s each) and the blocking-pool hop between the
+/// record write and the call start, with room to spare.
+pub(super) const INTERRUPTED_GRACE: Duration = Duration::from_secs(60);
 
 /// Lifecycle state of a proposal (spec section 8.1). SL05 creates proposals in
 /// `Draft` and only ever moves them to `Cancelled`, `Stale` or `Failed`; the
@@ -645,7 +649,9 @@ impl SkillLifecycleStore {
         let lock = self.lock_proposals()?;
         let mut recovered = Vec::new();
         for mut proposal in self.list_proposals()? {
-            if self.settle_interrupted(&lock, &mut proposal, grace)? {
+            // Never earlier than the proposal's own call deadline plus the margin.
+            let own = Duration::from_millis(proposal.budget.call_timeout_ms) + INTERRUPTED_GRACE;
+            if self.settle_interrupted(&lock, &mut proposal, grace.max(own))? {
                 recovered.push(proposal.proposal_id);
             }
         }

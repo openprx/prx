@@ -110,6 +110,20 @@ impl ModelCallError {
 pub trait ProposerModel: Send + Sync {
     fn binding(&self) -> &ModelBinding;
     async fn complete(&self, system: &str, user: &str) -> Result<ModelReply, ModelCallError>;
+
+    /// The physical requests the last call reserved and settled so far. The
+    /// proposer reads it after dropping a call (deadline, cancellation), when
+    /// `complete` can no longer report it. The default knows of none.
+    fn physical_tally(&self) -> ReportedUsage {
+        ReportedUsage::default()
+    }
+}
+
+/// Counters shared between a managed model and the call in flight.
+#[derive(Debug, Default)]
+pub struct TallyCounters {
+    begun: AtomicU32,
+    settled: AtomicU32,
 }
 
 /// The production model: the managed provider path with attempt accounting.
@@ -124,6 +138,7 @@ pub struct ManagedProviderModel {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) binding: ModelBinding,
     pub(crate) accounting: Arc<dyn AttemptAccounting>,
+    pub(crate) counters: Arc<TallyCounters>,
 }
 
 fn bounded_detail(text: &str) -> String {
@@ -143,8 +158,7 @@ fn bounded_detail(text: &str) -> String {
 /// failure after one was sent, and can record every nested attempt.
 struct Tally {
     inner: Arc<dyn AttemptAccounting>,
-    begun: AtomicU32,
-    settled: Arc<AtomicU32>,
+    counters: Arc<TallyCounters>,
 }
 
 impl sealed::AccountingOwner for Tally {}
@@ -156,17 +170,17 @@ impl AttemptAccounting for Tally {
     }
     async fn begin(&self, request: PhysicalRequest<'_>) -> anyhow::Result<Box<dyn AttemptReceipt>> {
         let receipt = self.inner.begin(request).await?;
-        self.begun.fetch_add(1, Ordering::SeqCst);
+        self.counters.begun.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(TallyReceipt {
             inner: receipt,
-            settled: Arc::clone(&self.settled),
+            counters: Arc::clone(&self.counters),
         }))
     }
 }
 
 struct TallyReceipt {
     inner: Box<dyn AttemptReceipt>,
-    settled: Arc<AtomicU32>,
+    counters: Arc<TallyCounters>,
 }
 
 impl sealed::Receipt for TallyReceipt {}
@@ -177,9 +191,9 @@ impl AttemptReceipt for TallyReceipt {
         self.inner.deadline()
     }
     async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
-        let Self { inner, settled } = *self;
+        let Self { inner, counters } = *self;
         inner.settle(usage).await?;
-        settled.fetch_add(1, Ordering::SeqCst);
+        counters.settled.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -188,6 +202,14 @@ impl AttemptReceipt for TallyReceipt {
 impl ProposerModel for ManagedProviderModel {
     fn binding(&self) -> &ModelBinding {
         &self.binding
+    }
+
+    fn physical_tally(&self) -> ReportedUsage {
+        ReportedUsage {
+            physical_requests: self.counters.begun.load(Ordering::SeqCst),
+            settled_requests: self.counters.settled.load(Ordering::SeqCst),
+            ..ReportedUsage::default()
+        }
     }
 
     async fn complete(&self, system: &str, user: &str) -> Result<ModelReply, ModelCallError> {
@@ -199,13 +221,18 @@ impl ProposerModel for ManagedProviderModel {
             messages: &messages,
             tools: None,
         };
-        let settled = Arc::new(AtomicU32::new(0));
+        self.counters.begun.store(0, Ordering::SeqCst);
+        self.counters.settled.store(0, Ordering::SeqCst);
         let tally = Arc::new(Tally {
             inner: Arc::clone(&self.accounting),
-            begun: AtomicU32::new(0),
-            settled: Arc::clone(&settled),
+            counters: Arc::clone(&self.counters),
         });
-        let counts = |tally: &Tally| (tally.begun.load(Ordering::SeqCst), tally.settled.load(Ordering::SeqCst));
+        let counts = |tally: &Tally| {
+            (
+                tally.counters.begun.load(Ordering::SeqCst),
+                tally.counters.settled.load(Ordering::SeqCst),
+            )
+        };
         let result = attempt_accounting::chat_traced(
             self.provider.as_ref(),
             request,
@@ -226,7 +253,7 @@ impl ProposerModel for ManagedProviderModel {
                 }
                 let detail = if begun > 0 {
                     format!(
-                        "{} (a request was sent: {begun} reserved, {settled} settled; liability unknown)",
+                        "{} (a reservation was issued: {begun} reserved, {settled} settled; liability unknown)",
                         bounded_detail(&error.to_string())
                     )
                 } else {

@@ -177,6 +177,8 @@ enum Script {
     Denied,
     Fail(String),
     Hang,
+    /// Waits for the gate, then replies.
+    Gated(Arc<tokio::sync::Notify>, String),
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -242,6 +244,19 @@ impl ProposerModel for ScriptedModel {
             Some(Script::Hang) => {
                 let _guard = DropFlag(Arc::clone(&self.hung_dropped));
                 std::future::pending::<Result<ModelReply, ModelCallError>>().await
+            }
+            Some(Script::Gated(gate, text)) => {
+                gate.notified().await;
+                Ok(ModelReply {
+                    text,
+                    usage: ReportedUsage {
+                        reported: true,
+                        prompt_tokens: Some(100),
+                        completion_tokens: Some(40),
+                        total_tokens: Some(140),
+                        ..ReportedUsage::default()
+                    },
+                })
             }
             None => Err(ModelCallError::failed("script exhausted")),
         }
@@ -1182,11 +1197,16 @@ async fn a_proposal_in_flight_is_reused_and_a_crashed_one_is_settled_as_interrup
     );
     assert_eq!(model.calls(), 0);
 
-    let recovered = f
-        .store
-        .recover_interrupted_proposals(Duration::ZERO)
-        .expect("test: recover");
-    assert_eq!(recovered, vec![young.proposal_id.clone()]);
+    // Recovery never settles an attempt before its own call deadline plus the
+    // margin, however short the grace asked for.
+    assert_eq!(
+        f.store
+            .recover_interrupted_proposals(Duration::ZERO)
+            .expect("test: recover")
+            .len(),
+        0
+    );
+    force_interrupt(&f, &young.proposal_id);
     let settled = f
         .store
         .read_proposal(&young.proposal_id)
@@ -1232,6 +1252,68 @@ async fn a_proposal_in_flight_is_reused_and_a_crashed_one_is_settled_as_interrup
         .await,
         Err(LifecycleError::ProposalConflict { .. })
     ));
+}
+
+/// Settles the in-flight attempt of `id` as if its deadline were long past.
+fn force_interrupt(f: &Fixture, id: &str) {
+    let lock = f.store.lock_proposals().expect("test: lock");
+    let mut proposal = f.store.read_proposal(id).expect("test: read").expect("test: some");
+    assert!(
+        f.store
+            .settle_interrupted(&lock, &mut proposal, Duration::ZERO)
+            .expect("test: settle")
+    );
+}
+
+#[tokio::test]
+async fn a_late_reply_never_resurrects_an_interrupted_proposal() {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(ScriptedModel::new(vec![Script::Gated(Arc::clone(&gate), good_patch())]));
+    let task = {
+        let (store, model, req) = (Arc::clone(&f.store), Arc::clone(&model), request("late", &[&pattern]));
+        tokio::spawn(async move { propose_revision(store, req, model.as_ref(), &CancellationToken::new()).await })
+    };
+    while model.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let id = f.store.list_proposals().expect("test: list")[0].proposal_id.clone();
+    force_interrupt(&f, &id);
+    gate.notify_one();
+    let outcome = task.await.expect("test: join").expect("test: propose");
+    let ProposeOutcome::Failed(proposal) = outcome else {
+        panic!("test: the settled state stands, got {outcome:?}");
+    };
+    assert_eq!(proposal.status, Status::Failed);
+    assert!(proposal.candidate_revision.is_none() && proposal.diff.is_none());
+    assert_eq!(
+        proposal.failure.as_ref().map(|x| x.kind),
+        Some(ProposalFailureKind::Interrupted)
+    );
+    // The paid call is on record with what really happened.
+    assert_eq!(proposal.attempts[0].outcome, AttemptOutcome::Completed);
+    assert_eq!(proposal.attempts[0].usage.and_then(|u| u.prompt_tokens), Some(100));
+    let stored = f.store.read_proposal(&id).expect("test: read").expect("test: some");
+    assert_eq!(stored, proposal);
+    assert!(!proposal_dir(&f, &id).join("candidate").exists(), "nothing was staged");
+}
+
+#[tokio::test]
+async fn padding_that_the_token_cap_misses_is_stopped_by_the_byte_cap() {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    for (name, pad) in [("newlines", "\n"), ("tabs", "\t")] {
+        let text = format!("x{}", pad.repeat(1000));
+        let reply = patch(&json!([{"file": "SKILL.md", "op": "append", "new": text}]));
+        let outcome = run(&f, &ScriptedModel::replying(&reply), request(name, &[&pattern])).await;
+        let ProposeOutcome::Failed(proposal) = outcome else {
+            panic!("test: {name} must fail, got {outcome:?}");
+        };
+        let failure = proposal.failure.expect("test: failure");
+        assert_eq!(failure.kind, ProposalFailureKind::EditBudgetExceeded, "{name}");
+        assert!(failure.detail.contains("bytes"), "{name}: {}", failure.detail);
+    }
 }
 
 #[tokio::test]
@@ -1465,6 +1547,7 @@ mod managed {
             provider: Arc::new(LoopbackProvider { url: url.to_string() }),
             binding: binding(),
             accounting,
+            counters: Arc::default(),
         }
     }
 
@@ -1569,6 +1652,23 @@ mod managed {
     }
 
     #[tokio::test]
+    async fn a_managed_call_that_times_out_still_records_its_reservation() {
+        let f = fixture();
+        let pattern = usable_pattern(&f);
+        let server = serve(None).await;
+        let accounting = Arc::new(MockAccounting::default());
+        let model = managed(&server.url, Arc::clone(&accounting));
+        let mut short = request("managed-timeout", &[&pattern]);
+        short.budget = ProposerBudget::new(64 * 1024, 16 * 1024, Duration::from_millis(400)).expect("test: budget");
+        let ProposeOutcome::Failed(proposal) = run(&f, &model, short).await else {
+            panic!("test: failed");
+        };
+        assert_eq!(proposal.attempts[0].outcome, AttemptOutcome::TimedOut);
+        let usage = proposal.attempts[0].usage.expect("test: tally recorded");
+        assert_eq!((usage.physical_requests, usage.settled_requests), (1, 0));
+    }
+
+    #[tokio::test]
     async fn cancelling_a_managed_call_leaves_its_reservation_unsettled() {
         let f = fixture();
         let pattern = usable_pattern(&f);
@@ -1600,6 +1700,8 @@ mod managed {
         };
         assert_eq!(proposal.attempts[0].outcome, AttemptOutcome::Cancelled);
         assert_eq!(accounting.begun.load(Ordering::SeqCst), 1, "the request was reserved");
+        let usage = proposal.attempts[0].usage.expect("test: the tally survives the drop");
+        assert_eq!((usage.physical_requests, usage.settled_requests), (1, 0));
         assert!(
             accounting.settled.lock().is_empty(),
             "an unfinished call is never settled as free: the liability stays open"

@@ -44,8 +44,8 @@ use super::knowledge::{FailureClass, KnowledgePattern, MIN_DISTINCT_TASKS_FOR_PR
 use super::manifest::validate_manifest;
 use super::proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
-    ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus, SkillProposal, bounded, candidate_entries,
-    check_request_id, material_of, proposal_id_of,
+    INTERRUPTED_GRACE, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus, SkillProposal, bounded,
+    candidate_entries, check_request_id, material_of, proposal_id_of,
 };
 use super::proposer_model::{ModelCallError, ModelReply, ProposerModel, ReportedUsage};
 use super::rejection::{ProposalOperation, RejectionRecord};
@@ -70,7 +70,6 @@ pub const MAX_PROPOSAL_PATTERNS: usize = 8;
 pub const MAX_EDITS: usize = 8;
 
 /// Time past an attempt's own call deadline before it counts as lost.
-const INTERRUPTED_GRACE: Duration = Duration::from_secs(30);
 const SKILL_MD: &str = "SKILL.md";
 const MAX_EDIT_TEXT_BYTES: usize = 4096;
 const MAX_SUMMARY_BYTES: usize = 500;
@@ -179,8 +178,10 @@ pub(super) enum CallResult {
     Reply(ModelReply),
     Denied,
     Failed(String, ReportedUsage),
-    TimedOut,
-    Cancelled,
+    /// The call deadline passed; the usage is the physical tally so far.
+    TimedOut(ReportedUsage),
+    /// Cancelled; the usage is the physical tally so far.
+    Cancelled(ReportedUsage),
 }
 
 pub(super) struct Prepared {
@@ -222,18 +223,18 @@ pub async fn propose_revision(
         Prepare::Ready(prepared) => *prepared,
     };
     let call = if cancel.is_cancelled() {
-        CallResult::Cancelled
+        CallResult::Cancelled(ReportedUsage::default())
     } else {
         let timeout = prepared.budget.call_timeout;
         let call = tokio::time::timeout(timeout, model.complete(&prepared.system, &prepared.user));
         tokio::select! {
             biased;
-            () = cancel.cancelled() => CallResult::Cancelled,
+            () = cancel.cancelled() => CallResult::Cancelled(model.physical_tally()),
             result = call => match result {
                 Ok(Ok(reply)) => CallResult::Reply(reply),
                 Ok(Err(ModelCallError::BudgetDenied)) => CallResult::Denied,
                 Ok(Err(ModelCallError::Failed { detail, usage })) => CallResult::Failed(detail, usage),
-                Err(_) => CallResult::TimedOut,
+                Err(_) => CallResult::TimedOut(model.physical_tally()),
             },
         }
     };
@@ -608,12 +609,21 @@ impl SkillLifecycleStore {
         } = prepared;
         let lock = self.lock_proposals()?;
         let now = Utc::now();
-        // An operator may have cancelled the proposal while the model worked.
-        // The cancellation stands; the attempt still learns what really
-        // happened so its usage is on record.
-        if let Some(mut current) = self.read_proposal_record(&proposal.proposal_id)?
-            && current.status == ProposalStatus::Cancelled
+        // Only a record that is still a draft with this attempt in flight may
+        // be completed. If an operator cancelled it, or recovery settled it as
+        // interrupted while the model worked, that state stands (a terminal
+        // state never comes back); the attempt still learns what really
+        // happened so its usage and cost are on record, and nothing is staged.
+        let current = self
+            .read_proposal_record(&proposal.proposal_id)?
+            .ok_or_else(|| refuse(format!("proposal {} vanished", proposal.proposal_id)))?;
+        if current.status != ProposalStatus::Draft
+            || !current
+                .attempts
+                .iter()
+                .any(|attempt| attempt.outcome == AttemptOutcome::InFlight)
         {
+            let mut current = current;
             let (outcome, usage, detail) = attempt_result(&call);
             if let Some(attempt) = current
                 .attempts
@@ -627,14 +637,18 @@ impl SkillLifecycleStore {
             }
             current.updated_at = now;
             self.write_proposal(&lock, &current)?;
-            return Ok(ProposeOutcome::Cancelled(current));
+            return Ok(if current.status == ProposalStatus::Cancelled {
+                ProposeOutcome::Cancelled(current)
+            } else {
+                ProposeOutcome::Failed(current)
+            });
         }
         let (outcome, usage, detail) = attempt_result(&call);
         close_attempt(&mut proposal, outcome, usage, detail, now);
         proposal.updated_at = now;
 
         let failure = match call {
-            CallResult::Cancelled => {
+            CallResult::Cancelled(_) => {
                 proposal.status = ProposalStatus::Cancelled;
                 proposal.status_reason = Some("cancelled while the model call was pending".to_string());
                 self.write_proposal(&lock, &proposal)?;
@@ -648,7 +662,7 @@ impl SkillLifecycleStore {
                 kind: ProposalFailureKind::ProviderFailed,
                 detail: bounded(&detail),
             },
-            CallResult::TimedOut => ProposalFailure {
+            CallResult::TimedOut(_) => ProposalFailure {
                 kind: ProposalFailureKind::TimedOut,
                 detail: "the model did not answer before the call deadline".to_string(),
             },
@@ -753,13 +767,23 @@ fn attempt_result(call: &CallResult) -> (AttemptOutcome, Option<ReportedUsage>, 
             Some("budget reservation denied".to_string()),
         ),
         CallResult::Failed(detail, usage) => (AttemptOutcome::Failed, Some(*usage), Some(bounded(detail))),
-        CallResult::TimedOut => (
+        CallResult::TimedOut(usage) => (
             AttemptOutcome::TimedOut,
-            None,
+            tally_of(*usage),
             Some("the call deadline passed".to_string()),
         ),
-        CallResult::Cancelled => (AttemptOutcome::Cancelled, None, Some("cancelled".to_string())),
+        CallResult::Cancelled(usage) => (
+            AttemptOutcome::Cancelled,
+            tally_of(*usage),
+            Some("cancelled".to_string()),
+        ),
     }
+}
+
+/// The usage to record for a call that did not finish: only when a
+/// reservation was issued, so an unstarted call stays without usage.
+fn tally_of(usage: ReportedUsage) -> Option<ReportedUsage> {
+    (usage.physical_requests > 0).then_some(usage)
 }
 
 enum Accepted {

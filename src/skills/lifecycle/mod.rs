@@ -66,7 +66,7 @@ pub use propose::{
     ProposerBudget, SYSTEM_PROMPT_VERSION, SuppressionStage, propose_revision,
 };
 pub use proposer_model::{
-    ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage,
+    ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage, TallyCounters,
 };
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
