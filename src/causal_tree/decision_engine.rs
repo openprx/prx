@@ -12,7 +12,7 @@ pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
 
-use super::branch::{CandidateId, CapabilityRef, CapabilityTarget, CausalActionKind, CausalCandidate};
+use super::branch::{CandidateId, CapabilityRef, CausalActionKind, CausalCandidate};
 use super::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, is_retrieval_source,
 };
@@ -426,7 +426,7 @@ impl EngineDecision {
             return Err(RetrievalIssueError);
         }
         let (family, reference) = self.selected_retrieval(catalog, context, source_query)?;
-        if family != CapabilityTarget::Memory {
+        if family != super::branch::CapabilityTarget::Memory {
             return Err(RetrievalIssueError);
         }
         let parts = self.state.trusted.parts();
