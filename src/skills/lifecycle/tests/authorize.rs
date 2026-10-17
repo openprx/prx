@@ -607,3 +607,19 @@ async fn the_store_rejects_a_writer_whose_generation_moved_after_the_gate_rechec
     assert_eq!(generation(&fx), 2);
     assert_ne!(active_revision(&fx), fx.candidate);
 }
+
+#[tokio::test]
+async fn an_aborted_attempt_is_verified_again_on_authorize() {
+    let fx = fixture();
+    let e = eligible(&fx).await;
+    authorize(&fx, &e).expect("test: authorize");
+    crash_hooks::arm("after_prepared");
+    assert!(publish(&fx, &e).is_err());
+    crash_hooks::disarm();
+    // The attempt never swapped; new failing evidence arrives meanwhile.
+    evaluate(&fx, &e.suite, &tie()).await;
+    let result = authorize(&fx, &e);
+    assert!(matches!(result, Err(GateError::NewFailingEvidence(_))), "{result:?}");
+    assert_eq!(status(&fx, &e.proposal), ProposalStatus::Stale);
+    assert_eq!(generation(&fx), 1);
+}

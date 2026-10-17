@@ -27,12 +27,18 @@
 //! [`SkillLifecycleStore::finalize_published_proposals`] for a sweep to run
 //! with or after `recover()`).
 //!
-//! Provenance of the candidate revision: it must already exist (evaluation
-//! installs it and `verify_gate` re-reads it). It is accepted when it carries no
-//! proposal id or this proposal's id, and refused (`RevisionConflict`) when it
-//! names another proposal. This authorization's own provenance (gate id, gate
-//! digest, pinned record digest) lives on the proposal record, not on the
-//! shared, content-addressed revision.
+//! Provenance of the candidate revision: it must already be in the main store,
+//! and today nothing in production puts it there. `propose_revision` only stages
+//! the bundle under `proposals/<id>/candidate`; SL06 evaluation needs the
+//! candidate in the main store (`evaluator.rs` arm binding, `verify_evaluation`),
+//! and `AgentCaseExecutor::install_skill` writes only to a per-run workspace
+//! store. SL09 must add the single writer (proposal id = this proposal, parent
+//! = baseline, provenance Learned) and handle identical content across
+//! proposals before any evaluation spend. Here the revision is accepted when it
+//! carries no proposal id or this proposal's id, and refused
+//! (`RevisionConflict`) when it names another proposal. This authorization's own
+//! provenance (gate id, gate digest, pinned record digest) lives on the
+//! proposal record, not on the shared, content-addressed revision.
 //!
 //! Known limits, deferred (SL09 must account for them):
 //! - Failing evidence that lands between the final gate re-check and the
@@ -92,7 +98,8 @@ impl SkillLifecycleStore {
     /// and every other refusal leave an `Eligible` proposal untouched.
     /// Calling it again with the same digest on an authorized proposal
     /// re-verifies and returns it; when the proposal's publication already went
-    /// live it is finalized and returned as `Committed` without verifying.
+    /// live it is finalized and returned as `Committed` without verifying (an
+    /// aborted attempt is verified again like any other).
     ///
     /// Blocking: waits for locks and does file I/O.
     pub fn authorize_publication(
@@ -117,9 +124,10 @@ impl SkillLifecycleStore {
                 let mut current = self
                     .read_proposal_record(proposal_id)?
                     .ok_or_else(|| GateError::Unsupported(format!("no such proposal {proposal_id}")))?;
-                // An attempt with a journal entry is the publication's business;
-                // verifying the gate again would see its own binding as stale.
-                if self.settle_publication(&lock, &mut current)? != Settlement::NotPublished {
+                // A committed attempt is the publication's business; verifying
+                // the gate again would see its own binding as stale. An aborted
+                // or unpublished one is verified like any other authorization.
+                if self.settle_publication(&lock, &mut current)? == Settlement::Committed {
                     return Ok(current);
                 }
             }
@@ -357,10 +365,11 @@ impl SkillLifecycleStore {
     }
 
     /// Pinned record digest of the candidate revision, which must already be
-    /// in the store: evaluation installs the candidate and `verify_gate`
-    /// re-reads it, so a gated proposal whose revision is gone is refused
-    /// (`RevisionNotFound`), never rebuilt from the staged bundle. An existing
-    /// revision that names another proposal is refused (`RevisionConflict`).
+    /// in the main store. No production code writes it there yet (see the module
+    /// header: SL09 owns that writer); `verify_gate` re-reads it, so a gated
+    /// proposal whose revision is missing is refused (`RevisionNotFound`) and
+    /// never rebuilt from the staged bundle. An existing revision that names
+    /// another proposal is refused (`RevisionConflict`).
     fn candidate_record_digest(&self, proposal: &SkillProposal) -> Result<String, GateError> {
         let Some(candidate) = proposal.candidate_revision.as_ref() else {
             return Err(GateError::Unsupported(
