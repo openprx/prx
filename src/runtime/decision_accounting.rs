@@ -261,6 +261,8 @@ impl AccountingScope {
         if let Some(timing) = &mut diagnostic_timing {
             timing.mark("spawn_submitted");
         }
+        let runtime = tokio::runtime::Handle::current();
+        let claim_cancel = cancel.clone();
         let work = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(timing) = &mut diagnostic_timing {
@@ -344,7 +346,9 @@ impl AccountingScope {
                         timing.mark("reserve");
                     }
                 }
-                let receipt = match tracker.reserve_dispatched_estimated_attempt(request) {
+                let receipt = match tracker.reserve_dispatched_estimated_attempt(request, || {
+                    !cancel.is_cancelled() && Instant::now() < deadline
+                }) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -394,7 +398,12 @@ impl AccountingScope {
                     format_args!("prx_accounting_failure stage={diagnostic_stage} allowance_tokens={tokens}\n"),
                 );
             }
-            result.map_err(|_| DecisionError::BudgetExceeded)
+            result
+                .map(|receipt| UnclaimedReceipt {
+                    receipt: Some(receipt),
+                    runtime,
+                })
+                .map_err(|_| DecisionError::BudgetExceeded)
         });
         let receipt = tokio::time::timeout_at(deadline.into(), work)
             .await
@@ -408,7 +417,51 @@ impl AccountingScope {
                 accounting_diagnostic_failure("blocking_join");
                 DecisionError::BudgetExceeded
             })??;
-        Ok(receipt)
+        if claim_cancel.is_cancelled() || Instant::now() >= deadline {
+            return Err(DecisionError::BudgetExceeded);
+        }
+        // No await separates receipt delivery from ownership transfer. Dropping
+        // the join result before here releases an attempt that cannot be sent.
+        receipt.claim()
+    }
+}
+
+struct UnclaimedReceipt {
+    receipt: Option<OwnedReceipt>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl UnclaimedReceipt {
+    fn claim(mut self) -> Result<OwnedReceipt, DecisionError> {
+        self.receipt.take().ok_or(DecisionError::BudgetExceeded)
+    }
+}
+
+impl Drop for UnclaimedReceipt {
+    fn drop(&mut self) {
+        let Some(mut receipt) = self.receipt.take() else {
+            return;
+        };
+        // The cleanup ticket stays owned until the compensating journal write
+        // finishes, including when the caller timed out during the first fsync.
+        self.runtime.spawn_blocking(move || {
+            let released = receipt.tracker.release_unclaimed_estimated_attempt(&receipt.receipt);
+            if released.is_ok() {
+                receipt
+                    .remaining
+                    .tokens
+                    .fetch_add(receipt.reserved_tokens, Ordering::AcqRel);
+                receipt
+                    .remaining
+                    .micro_usd
+                    .fetch_add(receipt.reserved_micro_usd, Ordering::AcqRel);
+            } else {
+                tracing::warn!("unclaimed decision reservation release was not confirmed");
+            }
+            if let Some(ticket) = receipt.ticket.take() {
+                ticket.finish(released.is_ok());
+            }
+        });
     }
 }
 

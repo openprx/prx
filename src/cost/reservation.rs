@@ -127,6 +127,9 @@ enum Event {
     Released {
         attempt_id: String,
     },
+    EstimatedUnsentV1 {
+        attempt_id: String,
+    },
     Settled {
         attempt_id: String,
         actual_micro_usd: String,
@@ -302,6 +305,15 @@ impl Reservations {
                 ensure!(*state == State::Reserved, "only an unsent reservation can be released");
                 *state = State::Released;
             }
+            Event::EstimatedUnsentV1 { attempt_id } => {
+                ensure!(
+                    self.estimates.contains_key(&attempt_id),
+                    "unsent receipt is not estimated"
+                );
+                let (_, state) = self.entries.get_mut(&attempt_id).context("unknown unsent attempt")?;
+                ensure!(*state == State::Dispatched, "unsent estimate was already consumed");
+                *state = State::Released;
+            }
         }
         Ok(())
     }
@@ -472,6 +484,33 @@ impl Reservations {
             request: request.reservation,
             workspace: canonical_workspace,
         })
+    }
+
+    /// Only the runtime's unclaimed receipt owner may call this: the durable
+    /// dispatch batch completed, but its receipt never reached the transport.
+    pub(super) fn release_unclaimed_estimated(&mut self, workspace: &Path, receipt: &ReservationReceipt) -> Result<()> {
+        ensure!(
+            workspace.canonicalize()? == receipt.workspace,
+            "unsent receipt belongs to another workspace"
+        );
+        let (request, state) = self
+            .entries
+            .get(receipt.attempt_id())
+            .context("unknown unsent receipt")?;
+        ensure!(
+            request == &receipt.request && *state == State::Dispatched,
+            "unsent receipt conflicts or was consumed"
+        );
+        ensure!(
+            self.estimates.contains_key(receipt.attempt_id()),
+            "unsent receipt is not estimated"
+        );
+        let event = Event::EstimatedUnsentV1 {
+            attempt_id: receipt.attempt_id().to_owned(),
+        };
+        append(workspace, &event)?;
+        self.apply(event)
+            .map_err(|error| ReservationWriteUnconfirmed(error).into())
     }
 
     pub(super) fn settle_estimated(

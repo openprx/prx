@@ -516,6 +516,7 @@ impl CostTracker {
     pub(crate) fn reserve_dispatched_estimated_attempt(
         &self,
         request: super::reservation::EstimatedReservationRequest,
+        may_dispatch: impl FnOnce() -> bool,
     ) -> Result<super::reservation::ReservationReceipt> {
         let config = self.config.lock().clone();
         let mut storage = self.lock_storage();
@@ -536,7 +537,22 @@ impl CostTracker {
             .saturating_sub(daily)
             .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
             .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
+        anyhow::ensure!(may_dispatch(), "attempt deadline elapsed before durable dispatch");
         reservations.reserve_dispatched_estimated(workspace, request, remaining)
+    }
+
+    /// Release a completed dispatch batch whose unique receipt has never been
+    /// handed to a transport. Dispatched/unknown transport receipts cannot use
+    /// this path; the runtime keeps them outside its unclaimed wrapper.
+    pub(crate) fn release_unclaimed_estimated_attempt(
+        &self,
+        receipt: &super::reservation::ReservationReceipt,
+    ) -> Result<()> {
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        let workspace = storage.workspace()?;
+        super::reservation::Reservations::load(workspace)?.release_unclaimed_estimated(workspace, receipt)
     }
 
     /// Persist before initiating a physical send. This transition is one-use;
@@ -1384,7 +1400,9 @@ mod tests {
         };
         let request = estimated("prx-batched-dispatch", 250_000, 30, 30);
         let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
-        let receipt = tracker.reserve_dispatched_estimated_attempt(request.clone()).unwrap();
+        let receipt = tracker
+            .reserve_dispatched_estimated_attempt(request.clone(), || true)
+            .unwrap();
         assert!(tracker.mark_attempt_dispatched(&receipt).is_err());
         assert!(tracker.release_unsent_attempt(&receipt).is_err());
         let rows: Vec<serde_json::Value> =
@@ -1418,7 +1436,50 @@ mod tests {
         drop(receipt);
         drop(tracker);
         let reopened = CostTracker::new(config, tmp.path()).unwrap();
-        assert!(reopened.reserve_dispatched_estimated_attempt(request).is_err());
+        assert!(reopened.reserve_dispatched_estimated_attempt(request, || true).is_err());
+    }
+
+    #[test]
+    fn expired_reservation_wait_never_marks_attempt_dispatched() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 1.0,
+            ..enabled_config()
+        };
+        let tracker = Arc::new(CostTracker::new(config, tmp.path()).unwrap());
+        let lock_path = tmp.path().join("state/costs.jsonl.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let blocked = {
+            let tracker = Arc::clone(&tracker);
+            std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                tracker.reserve_dispatched_estimated_attempt(
+                    estimated("prx-expired-before-dispatch", 250_000, 30, 30),
+                    || std::time::Instant::now() < deadline,
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        lock.unlock().unwrap();
+
+        let error = blocked.join().unwrap().expect_err("expired attempt must not dispatch");
+        assert!(error.to_string().contains("deadline elapsed"), "{error:#}");
+        let journal = tmp.path().join("state").join(super::super::reservation::JOURNAL);
+        assert!(
+            !journal.exists() || std::fs::read_to_string(journal).unwrap().is_empty(),
+            "an expired wait must not leave a reservation or dispatched hold"
+        );
     }
 
     #[test]

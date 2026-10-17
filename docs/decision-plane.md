@@ -146,6 +146,12 @@ remaining declared token allowance at the highest applicable PMM rate, and
 checks the original token, latency and monetary limits before dispatch.
 The estimate is not a vendor-enforced billing cap. Each retry has its own durable
 reservation; builtin and cache-only paths do not open the cost ledger.
+If cancellation or a deadline prevents a completed reservation from reaching
+the transport, its unique unclaimed owner releases that unsent estimate and
+restores the local allowance before cleanup completes. The journal records this
+as `estimated_unsent_v1`; older builds that do not recognize that event fail
+closed on that workspace ledger. Once the transport receives the receipt,
+missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Missing, partial or estimated
