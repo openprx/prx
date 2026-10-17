@@ -494,5 +494,5 @@ fn staged_file_skill(name: &str) -> Option<SkillId> {
     const UUID_LEN: usize = 36;
     let middle = name.strip_prefix(ATOMIC_PREFIX)?.strip_suffix(ATOMIC_SUFFIX)?;
     let skill = middle.get(..middle.len().checked_sub(UUID_LEN + 1)?)?;
-    SkillId::parse(skill).ok()
+    SkillId::parse(skill).ok().or_else(|| SkillId::reserved(skill))
 }
