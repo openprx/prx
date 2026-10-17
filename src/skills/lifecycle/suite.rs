@@ -38,6 +38,24 @@ pub const MAX_ALLOWED_REGRESSIONS: u32 = 3;
 pub const MAX_VALIDATION_ATTEMPTS: u32 = 10;
 pub const MAX_HOLDOUT_ATTEMPTS: u32 = 3;
 pub const MAX_REQUIRED_TOOLS: usize = 16;
+/// The only tools a suite may declare besides `skill_read`. Everything that
+/// can run commands, install or execute skills, spawn work, schedule, reach
+/// MCP or plugins, or post arbitrary requests is never available to an
+/// evaluation run. The network reads are named explicitly so a suite that
+/// needs them says so.
+pub const READ_ONLY_REQUIRED_TOOLS: [&str; 9] = [
+    "file_read",
+    "skills_list",
+    "memory_search",
+    "memory_get",
+    "memory_recall",
+    "document_search",
+    "document_get_chunk",
+    "web_search_tool",
+    "web_fetch",
+];
+/// Additionally allowed when the suite declares workspace writes.
+pub const WRITE_REQUIRED_TOOLS: [&str; 2] = ["file_write", "file_edit"];
 /// Workspace paths the evaluator owns; a fixture may not occupy them.
 const RESERVED_FIXTURE_ROOTS: [&str; 10] = [
     "skills",
@@ -149,6 +167,20 @@ pub struct EvalCase {
     pub max_elapsed_ms: u64,
 }
 
+impl SuiteBudget {
+    /// What an unmeasured run is charged: its even share of the token ceiling.
+    #[must_use]
+    pub fn unmeasured_tokens(&self) -> u64 {
+        (self.max_total_tokens / u64::from(self.max_runs.max(1))).max(1)
+    }
+
+    /// What an unmeasured run is charged: its even share of the cost ceiling.
+    #[must_use]
+    pub fn unmeasured_cost_micros(&self) -> u64 {
+        (self.max_total_cost_micros / u64::from(self.max_runs.max(1))).max(1)
+    }
+}
+
 /// What a task may change in its fresh workspace. Nothing outside the task
 /// workspace is ever writable, whatever is declared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,16 +266,27 @@ impl FrozenSuite {
         self.suite.cases.iter().find(|case| case.case_id == case_id)
     }
 
-    /// Digest of the cases of one split (and the skill they judge). Attempt
-    /// limits key on it, so renaming the suite or editing other splits does not
-    /// reopen a reserved split.
+    /// Digest of the held-out tasks of one split: the skill and the sorted,
+    /// normalized prompts. Attempt limits key on it, so renaming the suite or a
+    /// case, editing other splits, or changing validators does not reopen a
+    /// reserved split; only different tasks do.
     #[must_use]
     pub fn split_digest(&self, split: EvalSplit) -> String {
-        let cases: Vec<&EvalCase> = self.cases_of(split).collect();
-        let bytes = serde_json::to_vec(&(split, self.suite.skill_id.as_str(), cases)).unwrap_or_default();
+        let mut prompts: Vec<String> = self
+            .cases_of(split)
+            .map(|case| normalized_prompt(&case.prompt))
+            .collect();
+        prompts.sort();
+        prompts.dedup();
         let mut hasher = Sha256::new();
-        hasher.update(b"prx-skill-split\0");
-        hasher.update(bytes);
+        hasher.update(b"prx-skill-split-v2\0");
+        hasher.update(self.suite.skill_id.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{split:?}").as_bytes());
+        for prompt in prompts {
+            hasher.update(u64::try_from(prompt.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(prompt.as_bytes());
+        }
         hex::encode(hasher.finalize())
     }
 
@@ -369,8 +412,8 @@ fn validate_case(case: &EvalCase) -> Result<(), EvaluationError> {
     let mut paths = BTreeSet::new();
     for fixture in &case.fixtures {
         check_relative_path("fixture path", &fixture.path)?;
-        let root = fixture.path.split('/').next().unwrap_or_default();
-        if RESERVED_FIXTURE_ROOTS.contains(&root) {
+        let root = fixture.path.split('/').next().unwrap_or_default().to_ascii_lowercase();
+        if RESERVED_FIXTURE_ROOTS.contains(&root.as_str()) {
             return Err(invalid(format!(
                 "fixture path {} is reserved for the evaluator",
                 fixture.path
@@ -453,6 +496,14 @@ impl EvalSuite {
             check_ident("required tool", tool)?;
             if tool == "skill_read" {
                 return Err(invalid("skill_read is always offered; do not list it"));
+            }
+            let allowed = READ_ONLY_REQUIRED_TOOLS.contains(&tool.as_str())
+                || (self.side_effects == SideEffects::WorkspaceWrite && WRITE_REQUIRED_TOOLS.contains(&tool.as_str()));
+            if !allowed {
+                return Err(invalid(format!(
+                    "tool {tool} cannot be offered to an evaluation run with side effects {:?}",
+                    self.side_effects
+                )));
             }
         }
         self.cases.sort_by(|a, b| a.case_id.cmp(&b.case_id));

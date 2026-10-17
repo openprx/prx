@@ -8,9 +8,9 @@
 use super::{activate, entry, owner};
 use crate::config::Config;
 use crate::skills::lifecycle::{
-    AgentCaseExecutor, Arm, Bundle, CaseVerdict, EvalCase, EvalSplit, EvalSuite, EvaluationOutcome, EvaluationRequest,
-    InvalidReason, NewRevision, RevisionId, SideEffects, SkillId, SkillLifecycleStore, SourceKind, SuiteBudget,
-    Validator,
+    AccountingOwner, AgentCaseExecutor, Arm, Bundle, CaseVerdict, EvalCase, EvalSplit, EvalSuite, EvaluationOutcome,
+    EvaluationRequest, InvalidReason, NewRevision, RevisionId, SideEffects, SkillId, SkillLifecycleStore, SourceKind,
+    SuiteBudget, Validator,
 };
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -274,7 +274,14 @@ async fn the_real_agent_entry_separates_a_better_skill_revision_from_the_baselin
         2,
     );
     let scratch = tmp.path().join("scratch");
-    let executor = AgentCaseExecutor::new(template(tmp.path(), &loopback), scratch.clone(), 0.0);
+    let accounting_dir = tmp.path().join("operator-ws");
+    std::fs::create_dir_all(&accounting_dir).expect("test: operator ws");
+    let executor = AgentCaseExecutor::new(
+        template(tmp.path(), &loopback),
+        scratch.clone(),
+        0.0,
+        AccountingOwner::new(accounting_dir.clone()),
+    );
     let receipt = store
         .evaluate(
             &EvaluationRequest {
@@ -329,6 +336,57 @@ async fn the_real_agent_entry_separates_a_better_skill_revision_from_the_baselin
         "the expected answer never reached the model"
     );
     drop(bodies);
+    // The surface the model was actually offered on the wire.
+    let forbidden = [
+        "web_search_tool",
+        "skills_manage",
+        "skill_execute",
+        "shell",
+        "mcp_call",
+        "cron",
+        "delegate",
+        "sessions_spawn",
+        "http_request",
+        "file_write",
+        "file_edit",
+        "file_read",
+        "xin",
+        "pushover",
+        "proxy_config",
+        "document_ingest",
+        "message_send",
+    ];
+    let mut offered_somewhere = false;
+    for body in loopback.bodies.lock().iter() {
+        let json: serde_json::Value = serde_json::from_str(body).expect("test: request json");
+        let names: Vec<String> = json
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t.pointer("/function/name").or_else(|| t.get("name")))
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if names.iter().any(|n| n == "skill_read") {
+            offered_somewhere = true;
+        }
+        for name in forbidden {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "{name} was offered on the wire: {names:?}"
+            );
+        }
+    }
+    assert!(
+        offered_somewhere,
+        "skill_read must be offered through the explicit allowlist"
+    );
+    // The run was charged to the operator's ledger, not only to its scratch one.
+    let ledger = std::fs::read_to_string(accounting_dir.join("state/costs.jsonl")).unwrap_or_default();
+    assert!(ledger.lines().count() >= 6, "{ledger}");
     let leftovers: Vec<_> = std::fs::read_dir(&scratch)
         .map(|d| d.flatten().collect())
         .unwrap_or_default();
@@ -361,7 +419,14 @@ async fn an_empty_model_reply_through_the_real_entry_can_never_pass() {
             .collect(),
         2,
     );
-    let executor = AgentCaseExecutor::new(template(tmp.path(), &loopback), tmp.path().join("scratch"), 0.0);
+    let accounting_dir = tmp.path().join("operator-ws");
+    std::fs::create_dir_all(&accounting_dir).expect("test: operator ws");
+    let executor = AgentCaseExecutor::new(
+        template(tmp.path(), &loopback),
+        tmp.path().join("scratch"),
+        0.0,
+        AccountingOwner::new(accounting_dir),
+    );
     let receipt = store
         .evaluate(
             &EvaluationRequest {
@@ -425,7 +490,12 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     hostile.http_request.timeout_secs = 1;
     hostile.web_search.max_results = 99;
     hostile.browser.allowed_domains.push("evil.example".to_string());
-    let executor = AgentCaseExecutor::new(hostile, tmp.path().join("scratch"), 0.0);
+    let executor = AgentCaseExecutor::new(
+        hostile,
+        tmp.path().join("scratch"),
+        0.0,
+        AccountingOwner::new(tmp.path().to_path_buf()),
+    );
     let ws = tmp.path().join("run-ws");
     std::fs::create_dir_all(&ws).expect("test: ws");
     let store_dir = tmp.path().join("owner-ws");
@@ -455,13 +525,21 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     for name in [
         "shell",
         "http_request",
-        "web_search",
-        "browser",
-        "message_send",
-        "sessions_spawn",
+        "web_search_tool",
+        "skills_manage",
+        "skill_execute",
+        "mcp_call",
+        "cron",
         "delegate",
-        "cron_add",
-        "mcp",
+        "sessions_spawn",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "xin",
+        "pushover",
+        "proxy_config",
+        "document_ingest",
+        "message_send",
     ] {
         assert!(
             config.tool_tiering.always_exclude.iter().any(|n| n == name),
@@ -471,6 +549,23 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     assert_eq!(json(&config.http_request), json(&default.http_request));
     assert_eq!(json(&config.web_search), json(&default.web_search));
     assert_eq!(json(&config.browser), json(&default.browser));
+    // The tool surface the turn publishes: nothing outside the allowlist is direct or discoverable.
+    let policy = crate::runtime::turn_publication::surface_policy(
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        &config.tool_tiering,
+    );
+    assert!(policy.direct_names.contains("skill_read"));
+    for name in crate::tools::STATIC_PUBLIC_TOOL_NAMES {
+        if matches!(*name, "skill_read" | "capability_search") {
+            assert!(!policy.excluded_names.contains(*name), "{name}");
+        } else {
+            assert!(
+                policy.excluded_names.contains(*name),
+                "{name} must be excluded from the surface"
+            );
+            assert!(!policy.direct_names.contains(*name), "{name} must not be a direct tool");
+        }
+    }
     assert_eq!(json(&config.mcp), json(&default.mcp));
     assert_eq!(json(&config.channels_config), json(&default.channels_config));
     assert_eq!(json(&config.agents), json(&default.agents));
@@ -483,6 +578,10 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     std::fs::write(&secret, b"ORACLE").expect("test: oracle");
     let policy = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(&config.autonomy, &ws));
     assert!(!policy.is_path_allowed(&secret.to_string_lossy()));
+    assert!(
+        !policy.is_path_allowed(&ws.join("state/costs.jsonl").to_string_lossy()),
+        "the run ledger is not writable"
+    );
     let reader = crate::tools::FileReadTool::new(policy, false);
     let read = crate::tools::Tool::execute(&reader, serde_json::json!({"path": secret.to_string_lossy()}))
         .await
@@ -490,13 +589,29 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     assert!(!read.success && !read.output.contains("ORACLE"), "{read:?}");
 
     // Declared tools are offered, and only those take settings from the template.
-    let tools = vec!["http_request".to_string()];
+    let tools = vec!["web_search_tool".to_string(), "file_write".to_string()];
     let config = executor
         .run_config(&ws, &dummy_request(&denied, &tools, SideEffects::WorkspaceWrite))
         .expect("test: config");
-    assert_eq!(config.tool_tiering.always_include, ["skill_read", "http_request"]);
-    assert!(!config.tool_tiering.always_exclude.iter().any(|n| n == "http_request"));
-    assert_eq!(config.http_request.timeout_secs, 1);
+    assert_eq!(
+        config.tool_tiering.always_include,
+        ["skill_read", "web_search_tool", "file_write"]
+    );
+    assert!(
+        !config
+            .tool_tiering
+            .always_exclude
+            .iter()
+            .any(|n| n == "web_search_tool" || n == "file_write")
+    );
+    assert!(
+        config
+            .tool_tiering
+            .always_exclude
+            .iter()
+            .any(|n| n == "shell" || n == "skill_execute")
+    );
+    assert_eq!(config.web_search.max_results, 99);
     assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::Full);
     assert!(config.autonomy.workspace_only, "writes stay inside the task workspace");
 }
@@ -524,7 +639,7 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
     );
     std::fs::create_dir_all(tmp.path().join("state")).expect("test: state");
     let line = |model: &str, tokens: u64, cost: f64| {
-        serde_json::json!({"id": "x", "usage": {"model": model, "total_tokens": tokens, "cost_usd": cost}}).to_string()
+        serde_json::json!({"id": "x", "settlement_id": "s-1", "usage": {"model": model, "input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens, "cost_usd": cost}}).to_string()
     };
     std::fs::write(
         tmp.path().join("state/costs.jsonl"),
@@ -534,6 +649,26 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
     let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
     assert_eq!((usage.tokens, usage.cost_micros), (Some(12), Some(4)));
     assert_eq!(usage.models, ["m-a", "m-b"]);
+
+    // Unsettled rows are not counted and a negative value voids the ledger.
+    let unsettled = serde_json::json!({"id": "y", "usage": {"model": "m-c", "input_tokens": 99, "output_tokens": 0, "total_tokens": 99, "cost_usd": 9.0}}).to_string();
+    std::fs::write(
+        tmp.path().join("state/costs.jsonl"),
+        format!("{}\n{unsettled}\n", line("m-a", 7, 0.000_001)),
+    )
+    .expect("test: ledger");
+    let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
+    assert_eq!((usage.tokens, usage.models), (Some(7), vec!["m-a".to_string()]));
+    std::fs::write(
+        tmp.path().join("state/costs.jsonl"),
+        format!("{}\n", line("m-a", 7, -1.0)),
+    )
+    .expect("test: ledger");
+    assert!(
+        super::super::agent_executor_read_usage_for_test(tmp.path())
+            .cost_micros
+            .is_none()
+    );
 
     let tools: Vec<String> = Vec::new();
     let denied: Vec<std::path::PathBuf> = Vec::new();
@@ -549,4 +684,79 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
         one,
         AgentCaseExecutor::environment_hash_for_test(&config, &request, &["m-a".to_string()])
     );
+}
+
+#[tokio::test]
+async fn a_run_is_refused_when_the_operators_cost_limit_is_already_exceeded() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let loopback = Loopback::start().await;
+    std::fs::create_dir_all(tmp.path().join("owner-ws")).expect("test: owner workspace");
+    let store = SkillLifecycleStore::open(&tmp.path().join("owner-ws"), owner(OWNER)).expect("test: store");
+    let a = write_revision(&store, "ANSWER=draft");
+    let b = write_revision(&store, "ANSWER=report-v2");
+    activate(&store, &skill(), &a, 0, true);
+
+    let mut config = template(tmp.path(), &loopback);
+    config.cost.daily_limit_usd = 0.5;
+    let operator = tmp.path().join("operator-ws");
+    std::fs::create_dir_all(&operator).expect("test: operator ws");
+    // The operator already spent past the daily limit through the real ledger.
+    let tracker =
+        crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), &operator).expect("test: tracker");
+    tracker
+        .record_usage(crate::cost::types::TokenUsage {
+            model: "earlier".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 5.0,
+            timestamp: chrono::Utc::now(),
+        })
+        .expect("test: spend");
+    let suite = suite(
+        ["neg-a", "neg-b"]
+            .into_iter()
+            .map(|id| {
+                case(
+                    id,
+                    &format!("What is two plus {id}?"),
+                    Validator::ResponseContains {
+                        text: "plain answer".to_string(),
+                    },
+                    false,
+                )
+            })
+            .collect(),
+        2,
+    );
+    let executor = AgentCaseExecutor::new(config, tmp.path().join("scratch"), 0.0, AccountingOwner::new(operator));
+    let receipt = store
+        .evaluate(
+            &EvaluationRequest {
+                suite: &suite,
+                split: EvalSplit::Validation,
+                baseline: Some(a.0),
+                candidate: b.0,
+                observed_generation: 1,
+            },
+            &executor,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("test: evaluate");
+    assert!(!receipt.outcome.is_pass(), "{:?}", receipt.outcome);
+    assert!(
+        loopback.bodies.lock().is_empty(),
+        "no provider call was made past the limit"
+    );
+    let verified = store
+        .verify_evaluation(&receipt.record_id, Some(&receipt.receipt_digest))
+        .expect("test: verify");
+    assert!(verified.cases.iter().all(|c| matches!(
+        &c.verdict,
+        CaseVerdict::Invalid {
+            reason: InvalidReason::ExecutorError,
+            ..
+        }
+    )));
 }

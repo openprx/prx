@@ -34,11 +34,34 @@ const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024;
 const MAX_EXPERIENCES: usize = 16;
 
+/// The workspace whose cost ledger and limits the evaluation spends against.
+///
+/// Each run settles into its own scratch ledger, which is discarded with the
+/// workspace, so on its own the operator's daily and monthly limits would be
+/// checked against an empty ledger. The executor therefore takes the owner of
+/// the real ledger: before a run it checks the owner's budget through the
+/// existing `CostTracker` (the template's `[cost]` limits), refusing the run
+/// when the limit is already exceeded, and after a run it records the run's
+/// settled usage into the owner's ledger through the same tracker. There is
+/// no constructor that omits it.
+#[derive(Clone, Debug)]
+pub struct AccountingOwner {
+    workspace_dir: PathBuf,
+}
+
+impl AccountingOwner {
+    #[must_use]
+    pub const fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir }
+    }
+}
+
 /// Runs cases through `crate::agent::run` with a template configuration.
 pub struct AgentCaseExecutor {
     template: Config,
     scratch_root: PathBuf,
     temperature: f64,
+    accounting: AccountingOwner,
 }
 
 impl AgentCaseExecutor {
@@ -46,12 +69,50 @@ impl AgentCaseExecutor {
     /// run would; its workspace and skill directories are replaced per run.
     /// `scratch_root` is where fresh task workspaces are created.
     #[must_use]
-    pub const fn new(template: Config, scratch_root: PathBuf, temperature: f64) -> Self {
+    pub const fn new(template: Config, scratch_root: PathBuf, temperature: f64, accounting: AccountingOwner) -> Self {
         Self {
             template,
             scratch_root,
             temperature,
+            accounting,
         }
+    }
+
+    fn tracker(&self) -> Result<std::sync::Arc<crate::cost::tracker::CostTracker>, EvaluationError> {
+        crate::cost::tracker::CostTracker::for_workspace(self.template.cost.clone(), &self.accounting.workspace_dir)
+            .map_err(|e| EvaluationError::Executor(format!("accounting owner: {e}")))
+    }
+
+    /// Refuses a run when the owner's ledger is already over its limit.
+    fn admit_spend(&self) -> Result<(), EvaluationError> {
+        let check = self
+            .tracker()?
+            .check_budget(0.0)
+            .map_err(|e| EvaluationError::Executor(format!("accounting owner: {e}")))?;
+        if let crate::cost::types::BudgetCheck::Exceeded { period, .. } = check {
+            return Err(EvaluationError::Executor(format!(
+                "the operator's {period:?} cost limit is already exceeded; the run was not started"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Charges the run's settled usage to the owner's ledger.
+    fn charge_spend(&self, usage: &LedgerUsage) -> Result<(), EvaluationError> {
+        let tracker = self.tracker()?;
+        for record in &usage.records {
+            tracker
+                .record_usage(crate::cost::types::TokenUsage {
+                    model: record.model.clone(),
+                    input_tokens: record.input_tokens,
+                    output_tokens: record.output_tokens,
+                    total_tokens: record.total_tokens,
+                    cost_usd: record.cost_usd,
+                    timestamp: chrono::Utc::now(),
+                })
+                .map_err(|e| EvaluationError::Executor(format!("accounting owner: {e}")))?;
+        }
+        Ok(())
     }
 
     /// The evaluation configuration, built from an allowlist. Only the managed
@@ -91,30 +152,37 @@ impl AgentCaseExecutor {
             SideEffects::WorkspaceWrite => crate::security::AutonomyLevel::Full,
         };
         config.autonomy.workspace_only = true;
-        config.autonomy.forbidden_paths.extend(
-            request
-                .denied_paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned()),
-        );
-        let declared = |name: &str| request.required_tools.iter().any(|tool| tool == name);
-        if declared("http_request") {
-            config.http_request = template.http_request.clone();
+        // The run may not touch its own evaluator state through the file tools:
+        // the cost ledger, memory, lifecycle store, installed skill and config.
+        let mut forbidden: Vec<String> = request
+            .denied_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for name in ["state", "memory", "self", "skills", "plugins", "config.toml"] {
+            forbidden.push(workspace.join(name).to_string_lossy().into_owned());
         }
-        if declared("web_search") {
+        config.autonomy.forbidden_paths.extend(forbidden);
+        let declared = |name: &str| request.required_tools.iter().any(|tool| tool == name);
+        if declared("web_search_tool") {
             config.web_search = template.web_search.clone();
         }
-        if declared("browser") {
-            config.browser = template.browser.clone();
-        }
+        // A positive allowlist. The published surface is "every registered tool
+        // that is not excluded", so the exclusion list is every public tool
+        // except the ones this run may have.
         let mut offered = vec!["skill_read".to_string()];
         offered.extend(request.required_tools.iter().cloned());
-        config.tool_tiering.always_include = offered;
-        config.tool_tiering.always_exclude = WITHHELD_TOOLS
+        let allowed: std::collections::BTreeSet<&str> = offered
             .iter()
-            .filter(|name| !declared(name))
+            .map(String::as_str)
+            .chain(std::iter::once("capability_search"))
+            .collect();
+        config.tool_tiering.always_exclude = crate::tools::STATIC_PUBLIC_TOOL_NAMES
+            .iter()
+            .filter(|name| !allowed.contains(**name))
             .map(|name| (*name).to_string())
             .collect();
+        config.tool_tiering.always_include = offered;
         Ok(config)
     }
 
@@ -127,7 +195,10 @@ impl AgentCaseExecutor {
         let mut exclude = config.tool_tiering.always_exclude.clone();
         exclude.sort();
         let routes = serde_json::to_string(&config.model_routes).unwrap_or_default();
-        let policy = serde_json::to_string(&config.autonomy).unwrap_or_default();
+        // The policy names the run's own workspace; the binding must not.
+        let policy = serde_json::to_string(&config.autonomy)
+            .unwrap_or_default()
+            .replace(config.workspace_dir.to_string_lossy().as_ref(), "<workspace>");
         let binding = serde_json::json!({
             "provider": config.default_provider,
             "model": config.default_model,
@@ -175,80 +246,89 @@ fn provider_sections(template: &Config) -> Result<Config, EvaluationError> {
     serde_json::from_value(base).map_err(invalid)
 }
 
-/// Tools an evaluation run never has unless the suite declares them.
-pub(super) const WITHHELD_TOOLS: [&str; 18] = [
-    "shell",
-    "http_request",
-    "web_search",
-    "web_fetch",
-    "browser",
-    "browser_open",
-    "message_send",
-    "sessions_spawn",
-    "sessions_send",
-    "delegate",
-    "agent_delegate",
-    "cron_add",
-    "cron_remove",
-    "cron_run",
-    "mcp",
-    "composio",
-    "nodes",
-    "git_operations",
-];
+/// One settled record of the run's cost ledger.
+#[derive(Clone, Debug)]
+pub(super) struct LedgerRecord {
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+}
 
 /// Usage of one run read from the run's own cost ledger.
 pub(super) struct LedgerUsage {
     pub tokens: Option<u64>,
     pub cost_micros: Option<u64>,
     pub models: Vec<String>,
+    records: Vec<LedgerRecord>,
 }
 
-/// Sums the run's cost ledger. `None` fields mean the ledger could not be read
-/// or recorded nothing, which makes the run invalid rather than free.
+/// Sums the run's cost ledger. Only settled records (those with a settlement
+/// id) count, and a malformed, negative or non-finite value makes the whole
+/// ledger unmeasured. `None` fields mean the ledger could not be read or held
+/// nothing, which makes the run invalid rather than free.
 pub(super) fn read_usage(workspace: &Path) -> LedgerUsage {
     let path = workspace.join("state").join("costs.jsonl");
-    let unmeasured = LedgerUsage {
+    let unmeasured = || LedgerUsage {
         tokens: None,
         cost_micros: None,
         models: Vec::new(),
+        records: Vec::new(),
     };
     let Ok(text) = fs::read_to_string(&path) else {
-        return unmeasured;
+        return unmeasured();
     };
-    let mut tokens = 0_u64;
-    let mut cost = 0.0_f64;
-    let mut models = std::collections::BTreeSet::new();
-    let mut records = 0_u32;
+    let mut records: Vec<LedgerRecord> = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return unmeasured;
+            return unmeasured();
         };
-        let Some(usage) = value.get("usage") else {
+        let settled = value
+            .get("settlement_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty());
+        if !settled {
             continue;
-        };
-        tokens = tokens.saturating_add(
-            usage
-                .get("total_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-        );
-        cost += usage.get("cost_usd").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-        if let Some(model) = usage.get("model").and_then(serde_json::Value::as_str) {
-            models.insert(model.to_string());
         }
-        records += 1;
+        let Some(usage) = value.get("usage") else {
+            return unmeasured();
+        };
+        let number = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+        let (Some(input_tokens), Some(output_tokens), Some(total_tokens)) =
+            (number("input_tokens"), number("output_tokens"), number("total_tokens"))
+        else {
+            return unmeasured();
+        };
+        let cost_usd = usage.get("cost_usd").and_then(serde_json::Value::as_f64);
+        let (Some(cost_usd), Some(model)) = (cost_usd, usage.get("model").and_then(serde_json::Value::as_str)) else {
+            return unmeasured();
+        };
+        if !cost_usd.is_finite() || cost_usd < 0.0 {
+            return unmeasured();
+        }
+        records.push(LedgerRecord {
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_usd,
+        });
     }
-    if records == 0 {
-        return unmeasured;
+    if records.is_empty() {
+        return unmeasured();
     }
+    let tokens = records.iter().fold(0_u64, |sum, r| sum.saturating_add(r.total_tokens));
+    let cost: f64 = records.iter().map(|r| r.cost_usd).sum();
+    let models: std::collections::BTreeSet<String> = records.iter().map(|r| r.model.clone()).collect();
     // Micro-dollars, rounded up so a nonzero cost is never recorded as zero.
-    let rounded = (cost.max(0.0) * 1_000_000.0).ceil();
+    let rounded = (cost * 1_000_000.0).ceil();
     let cost_micros = format!("{rounded:.0}").parse::<u64>().unwrap_or(u64::MAX);
     LedgerUsage {
         tokens: Some(tokens),
         cost_micros: Some(cost_micros),
         models: models.into_iter().collect(),
+        records,
     }
 }
 
@@ -377,6 +457,7 @@ impl CaseExecutor for AgentCaseExecutor {
         request: &ExecutionRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<RunObservation, EvaluationError> {
+        self.admit_spend()?;
         let started = Instant::now();
         fs::create_dir_all(&self.scratch_root).map_err(|e| io_error(&self.scratch_root, e))?;
         let scratch = tempfile::Builder::new()
@@ -455,6 +536,7 @@ impl CaseExecutor for AgentCaseExecutor {
         };
         let artifacts = collect_artifacts(&workspace, request.collect_artifacts);
         let usage = read_usage(&workspace);
+        self.charge_spend(&usage)?;
         let cleanup = match scratch.close() {
             Ok(()) => CleanupState::Removed,
             Err(error) => {

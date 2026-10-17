@@ -35,9 +35,9 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use agent_executor::AgentCaseExecutor;
 #[cfg(test)]
 use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
+pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -58,7 +58,7 @@ pub use evaluate::{
     HydrationFact, IncompleteReason, InstallSkill, InstalledSkill, InvalidReason, RUNNER_IDENTITY, RunObservation,
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
-pub use evaluator::EvaluationRequest;
+pub use evaluator::{EvaluationRequest, RecordedEvaluation};
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
 pub use knowledge::{
@@ -73,8 +73,8 @@ pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_d
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use suite::{
     EvalCase, EvalSplit, EvalSuite, FixtureFile, FrozenSuite, MAX_ALLOWED_REGRESSIONS, MAX_HOLDOUT_ATTEMPTS,
-    MAX_SUITE_CASES, MAX_TRIALS, MAX_VALIDATION_ATTEMPTS, MIN_SAMPLE_CASES, SUITE_SCHEMA_VERSION, SideEffects,
-    SuiteBudget, Validator,
+    MAX_SUITE_CASES, MAX_TRIALS, MAX_VALIDATION_ATTEMPTS, MIN_SAMPLE_CASES, READ_ONLY_REQUIRED_TOOLS,
+    SUITE_SCHEMA_VERSION, SideEffects, SuiteBudget, Validator, WRITE_REQUIRED_TOOLS,
 };
 pub use types::{
     LifecycleError, NewRevision, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision,

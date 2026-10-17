@@ -952,13 +952,19 @@ pub(super) fn assess(
     resources: &ArmResources,
 ) -> (EvaluationOutcome, EvaluationSummary) {
     let spec = suite.suite();
-    let sum =
-        |value: fn(&RunReceipt) -> Option<u64>| cases.iter().map(|case| value(&case.run).unwrap_or(0)).sum::<u64>();
+    // A run whose usage was not measured is charged its share of the ceiling,
+    // never nothing.
+    let token_charge = spec.budget.unmeasured_tokens();
+    let cost_charge = spec.budget.unmeasured_cost_micros();
     let mut summary = EvaluationSummary {
         trials: spec.trials,
         total_elapsed_ms: cases.iter().map(|case| case.run.elapsed_ms).sum(),
-        total_tokens: sum(|run| run.tokens),
-        total_cost_micros: sum(|run| run.cost_micros),
+        total_tokens: cases.iter().fold(0_u64, |sum, case| {
+            sum.saturating_add(case.run.tokens.unwrap_or(token_charge))
+        }),
+        total_cost_micros: cases.iter().fold(0_u64, |sum, case| {
+            sum.saturating_add(case.run.cost_micros.unwrap_or(cost_charge))
+        }),
         ..EvaluationSummary::default()
     };
     let split_cases: Vec<&EvalCase> = suite.cases_of(receipt.split).collect();
@@ -972,6 +978,18 @@ pub(super) fn assess(
         });
     let mut ordered: Vec<&CaseReceipt> = cases.iter().collect();
     ordered.sort_by_key(|case| case.order);
+    // The evaluation's environment is the first one observed; observed runs
+    // without one are a defect, so the environment check cannot be skipped.
+    let first_environment = ordered
+        .iter()
+        .map(|case| case.run.environment_hash.as_str())
+        .find(|hash| !hash.is_empty());
+    if first_environment != receipt.environment_hash.as_deref() {
+        defect.get_or_insert_with(|| IncompleteReason::Unbound {
+            case_id: "<evaluation>".to_string(),
+            detail: "the evaluation's environment binding differs from its observed runs".to_string(),
+        });
+    }
     let mut recorded: BTreeMap<CaseKey, (&CaseReceipt, CaseVerdict)> = BTreeMap::new();
     let mut run_ids: BTreeSet<&str> = BTreeSet::new();
     for case in ordered {

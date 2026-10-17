@@ -275,6 +275,7 @@ async fn run(fx: &Fixture, suite: &FrozenSuite, exec: &Scripted) -> EvaluationRe
         )
         .await
         .expect("test: evaluate")
+        .receipt
 }
 
 // ---- suites ---------------------------------------------------------------
@@ -1497,8 +1498,8 @@ async fn a_dropped_evaluation_still_spends_its_attempt_and_the_split_key_ignores
     let mut other = suite_with(vec![
         case("v-9", EvalSplit::Validation, "a different validation task"),
         case("v-8", EvalSplit::Validation, "another validation task"),
-        case("h-0", EvalSplit::Holdout, "holdout task zero"),
-        case("h-1", EvalSplit::Holdout, "holdout task one"),
+        case("x-0", EvalSplit::Holdout, "Holdout task   ZERO"),
+        case("x-1", EvalSplit::Holdout, "holdout task one"),
     ]);
     other.suite_id = "renamed-suite".to_string();
     let other = other.freeze().expect("test: freeze");
@@ -1553,6 +1554,15 @@ fn spec_minimums_and_bounds_are_enforced() {
     reject(
         |s| {
             s.cases[0].fixtures = vec![FixtureFile {
+                path: "Skills/evil/SKILL.md".to_string(),
+                content: "x".to_string(),
+            }];
+        },
+        "reserved",
+    );
+    reject(
+        |s| {
+            s.cases[0].fixtures = vec![FixtureFile {
                 path: "config.toml".to_string(),
                 content: "x".to_string(),
             }];
@@ -1572,4 +1582,130 @@ fn a_full_evaluation_history_is_a_typed_error_with_guidance() {
     let error = fx.store.list_evaluation_ids().expect_err("test: full");
     assert!(matches!(error, EvaluationError::HistoryFull { .. }), "{error}");
     assert!(error.to_string().contains("archive or remove"), "{error}");
+}
+
+#[test]
+fn only_declared_read_tools_and_declared_writes_can_be_required() {
+    let ok = |tools: &[&str], effects: SideEffects| {
+        let mut s = suite_with(vec![
+            case("a", EvalSplit::Validation, "prompt one"),
+            case("b", EvalSplit::Validation, "prompt two"),
+        ]);
+        s.required_tools = tools.iter().map(|t| (*t).to_string()).collect();
+        s.side_effects = effects;
+        s.freeze()
+    };
+    assert!(ok(&["file_read", "web_search_tool"], SideEffects::None).is_ok());
+    assert!(ok(&["file_write", "file_edit"], SideEffects::WorkspaceWrite).is_ok());
+    for tool in [
+        "shell",
+        "skill_execute",
+        "skills_manage",
+        "http_request",
+        "mcp_call",
+        "cron",
+        "delegate",
+        "sessions_spawn",
+        "xin",
+        "pushover",
+        "proxy_config",
+        "document_ingest",
+        "composio",
+        "git_operations",
+    ] {
+        assert!(ok(&[tool], SideEffects::WorkspaceWrite).is_err(), "{tool}");
+    }
+    assert!(
+        ok(&["file_write"], SideEffects::None).is_err(),
+        "writes need the declared side effect"
+    );
+}
+
+#[tokio::test]
+async fn the_pinned_digest_catches_a_forged_substring_validator() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    // The candidate gives the wrong answer: honestly NotImproved.
+    let exec = Scripted::new(|r| {
+        let mut o = good(r);
+        o.response = "notes: nothing useful".to_string();
+        Ok(o)
+    });
+    let recorded = fx
+        .store
+        .evaluate(
+            &request(&fx, &suite, EvalSplit::Validation),
+            &exec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("test: evaluate");
+    assert_eq!(recorded.receipt.outcome, EvaluationOutcome::NotImproved);
+    assert!(
+        fx.store
+            .verify_evaluation(&recorded.receipt.record_id, Some(&recorded.receipt_digest))
+            .is_ok()
+    );
+
+    // A writer marks the substring validators as passed, flips the verdicts and re-seals.
+    rewrite_evaluation_for_test(&fx.store, &recorded.receipt.record_id, |r, cases| {
+        for case in cases.iter_mut().filter(|c| c.arm == Arm::Candidate) {
+            for v in &mut case.validators {
+                v.passed = true;
+            }
+            case.verdict = CaseVerdict::Pass;
+        }
+        r.outcome = EvaluationOutcome::Improved;
+    });
+    // Substring validators cannot be rechecked from digests, so the forgery is self-consistent ...
+    assert!(fx.store.verify_evaluation(&recorded.receipt.record_id, None).is_ok());
+    // ... but it cannot match the digest pinned when the evaluation was created.
+    let error = fx
+        .store
+        .verify_evaluation(&recorded.receipt.record_id, Some(&recorded.receipt_digest))
+        .expect_err("test: pinned digest");
+    assert!(error.to_string().contains("pinned"), "{error}");
+}
+
+#[tokio::test]
+async fn unmeasured_runs_are_charged_their_share_of_the_ceiling() {
+    let fx = fixture();
+    let mut s = suite_with(vec![
+        case("a", EvalSplit::Validation, "prompt one"),
+        case("b", EvalSplit::Validation, "prompt two"),
+    ]);
+    s.budget.max_runs = 4;
+    s.budget.max_total_tokens = 40;
+    let suite = s.freeze().expect("test: freeze");
+    let exec = Scripted::new(|r| {
+        let mut o = good(r);
+        o.tokens = None;
+        o.cost_micros = None;
+        Ok(o)
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(!receipt.outcome.is_pass());
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert_eq!(
+        verified.summary.total_tokens, 40,
+        "4 unmeasured runs at 10 tokens each, not 0"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_environment_binding_is_a_defect() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(receipt.outcome.is_pass());
+    rewrite_evaluation_for_test(&fx.store, &receipt.record_id, |r, _| r.environment_hash = None);
+    let error = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect_err("test: env removed");
+    assert!(error.to_string().contains("recomputed"), "{error}");
 }

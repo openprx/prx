@@ -25,6 +25,24 @@ use tokio_util::sync::CancellationToken;
 /// the evaluator gives up on it.
 const EXECUTOR_GRACE: Duration = Duration::from_secs(30);
 
+/// A written evaluation and the digest of its sealed receipt. A caller or a
+/// publication journal pins `receipt_digest` at creation and passes it to
+/// [`SkillLifecycleStore::verify_evaluation`]; a receipt rewritten later, even
+/// consistently, then no longer verifies.
+#[derive(Clone, Debug)]
+pub struct RecordedEvaluation {
+    pub receipt: EvaluationReceipt,
+    pub receipt_digest: String,
+}
+
+impl std::ops::Deref for RecordedEvaluation {
+    type Target = EvaluationReceipt;
+
+    fn deref(&self) -> &EvaluationReceipt {
+        &self.receipt
+    }
+}
+
 /// What to evaluate.
 #[derive(Clone, Debug)]
 pub struct EvaluationRequest<'a> {
@@ -84,7 +102,7 @@ impl SkillLifecycleStore {
         request: &EvaluationRequest<'_>,
         executor: &dyn CaseExecutor,
         cancel: &CancellationToken,
-    ) -> Result<EvaluationReceipt, EvaluationError> {
+    ) -> Result<RecordedEvaluation, EvaluationError> {
         // Re-read the suite through the store: only a frozen, stored suite
         // whose digest verifies can be evaluated.
         self.write_suite(request.suite)?;
@@ -228,14 +246,21 @@ impl SkillLifecycleStore {
                         Ok(mut observation) => {
                             observation.elapsed_ms = observation.elapsed_ms.max(wall_ms);
                             total_elapsed_ms = total_elapsed_ms.saturating_add(observation.elapsed_ms);
-                            total_tokens = total_tokens.saturating_add(observation.tokens.unwrap_or(0));
-                            total_cost_micros = total_cost_micros.saturating_add(observation.cost_micros.unwrap_or(0));
+                            total_tokens = total_tokens
+                                .saturating_add(observation.tokens.unwrap_or_else(|| spec.budget.unmeasured_tokens()));
+                            total_cost_micros = total_cost_micros.saturating_add(
+                                observation
+                                    .cost_micros
+                                    .unwrap_or_else(|| spec.budget.unmeasured_cost_micros()),
+                            );
                             let forced = evaluator_invalidity(&observation, &mut run_ids, &mut environment_hash);
                             (Some(observation), forced)
                         }
                         Err(error) => {
                             tracing::warn!(case = %case.case_id, "evaluation case executor failed: {error}");
                             total_elapsed_ms = total_elapsed_ms.saturating_add(wall_ms);
+                            total_tokens = total_tokens.saturating_add(spec.budget.unmeasured_tokens());
+                            total_cost_micros = total_cost_micros.saturating_add(spec.budget.unmeasured_cost_micros());
                             (None, None)
                         }
                     };
@@ -292,8 +317,11 @@ impl SkillLifecycleStore {
             finished_at: Utc::now(),
         };
         receipt.outcome = assess(&suite, &receipt, &receipts, &resources).0;
-        self.write_evaluation(&receipt, &receipts)?;
-        Ok(receipt)
+        let receipt_digest = self.write_evaluation(&receipt, &receipts)?;
+        Ok(RecordedEvaluation {
+            receipt,
+            receipt_digest,
+        })
     }
 }
 
