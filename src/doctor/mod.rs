@@ -1374,6 +1374,9 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
 /// The decision plane reports refused backends and orphaned references.
 fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "decision";
+    if let Some(warning) = config.decision_latency_budget_warning() {
+        items.push(DiagItem::warn(cat, warning));
+    }
     if let Some(warning) = crate::config::manage::validate::decision_startup_check(config) {
         items.push(DiagItem::warn(cat, warning));
     }
@@ -2562,6 +2565,27 @@ mod tests {
             items.is_empty(),
             "the published OpenRouter candidate must actually be reachable"
         );
+    }
+
+    #[test]
+    fn doctor_reports_a_below_catalog_hosted_latency_budget() {
+        let temp = TempDir::new().expect("test: private doctor configuration");
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let mut items = Vec::new();
+        check_decision_plane(&config, &mut items);
+        assert!(items.iter().any(|item| {
+            item.message.contains("below the catalog recommendation")
+                && item.message.contains("500")
+                && item.message.contains("3000")
+        }));
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     }
 
     /// D-094 C-1, C-5: the doctor names a refused decision backend (which

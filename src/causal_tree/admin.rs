@@ -268,6 +268,8 @@ pub(crate) struct StatusView {
     pub(crate) enabled: bool,
     pub(crate) remote_enabled: bool,
     pub(crate) backend_timeout_ms: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latency_budget_warning: Option<String>,
     pub(crate) policy: PolicyView,
     pub(crate) key_available: bool,
     /// The order the factory tries; the builtin always ends it.
@@ -777,6 +779,7 @@ impl DecisionAdmin {
             enabled: self.config.causal_tree.enabled,
             remote_enabled: self.config.causal_tree.backend.remote_enabled,
             backend_timeout_ms: self.config.causal_tree.backend.timeout_ms,
+            latency_budget_warning: self.config.decision_latency_budget_warning(),
             policy: PolicyView::from(&self.config.causal_tree.policy),
             key_available,
             order,
@@ -1363,6 +1366,23 @@ mod tests {
         fn build(&self, _: &Config, _: Option<Arc<DecisionKey>>) -> Result<DecisionBackendFactory, FactoryBuildError> {
             Err(FactoryBuildError::Transport(DecisionError::UnsupportedOperation))
         }
+    }
+
+    #[tokio::test]
+    async fn status_exposes_the_hosted_latency_warning_without_changing_the_ceiling() {
+        let temp = tempfile::TempDir::new().expect("test: private status workspace");
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_owned();
+        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let admin = DecisionAdmin::new(config, Arc::new(RefusedPlane), Arc::new(RecordingSink::default()));
+        let status = admin.status().await;
+        assert_eq!(status.policy.extra_latency_budget_ms, 500);
+        let warning = status.latency_budget_warning.as_deref().expect("test: status warning");
+        assert!(warning.contains("500") && warning.contains("3000"), "{warning}");
+        let encoded = serde_json::to_value(&status).expect("test: JSON status");
+        assert_eq!(encoded["latency_budget_warning"].as_str(), Some(warning));
+        admin.close().await;
     }
 
     /// D-094 C-1: a refused backend leaves the builtin order, next to the

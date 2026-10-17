@@ -847,6 +847,9 @@ async fn execute(admin: &DecisionAdmin, json: bool, command: CausalReadCommands,
                         "unavailable"
                     }
                 )?;
+                if let Some(warning) = &status.latency_budget_warning {
+                    writeln!(out, "warning: {warning}")?;
+                }
                 writeln!(out, "Order:")?;
                 for (position, backend) in status.order.iter().enumerate() {
                     writeln!(

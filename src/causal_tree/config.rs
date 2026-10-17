@@ -1132,7 +1132,8 @@ fn full_path<'p>(path: &[&'p str]) -> Vec<&'p str> {
 /// `schema_version`, which predates the 1.7 schema. Schema 1 later serialized
 /// the 500 ms default into every saved file before transport-specific catalog
 /// budgets existed, so that exact value is dropped while upgrading to schema
-/// 2. A 500 ms value written in schema 2 is an operator value (D-073).
+/// 2. A 500 ms value written in schema 2 or an unversioned pre-1.7 file is
+/// an operator value (D-073); the unversioned default was 300 ms.
 ///
 /// # Errors
 ///
@@ -1156,7 +1157,7 @@ pub fn migrate_legacy(root: &mut toml::Value, locate: KeyLocator<'_>) -> Result<
         .and_then(toml::Value::as_integer)
         .and_then(|version| u32::try_from(version).ok());
     let upgrades_to_current = stored_schema_version == Some(1) || !versioned;
-    if upgrades_to_current
+    if stored_schema_version == Some(1)
         && get(table, &["policy", "extra_latency_budget_ms"]).and_then(toml::Value::as_integer)
             == i64::try_from(DEFAULT_EXTRA_LATENCY_BUDGET_MS).ok()
     {
@@ -1322,6 +1323,20 @@ mod tests {
 
     fn causal(text: &str) -> toml::Value {
         toml::from_str(text).expect("test: toml")
+    }
+
+    #[test]
+    fn unversioned_500_ms_is_explicit_but_schema_one_500_ms_is_a_serialized_default() {
+        for (version, explicit) in [("", true), ("schema_version = 1\n", false)] {
+            let mut root = causal(&format!(
+                "[causal_tree]\n{version}enabled = true\n[causal_tree.policy]\nextra_latency_budget_ms = 500\n"
+            ));
+            migrate_legacy(&mut root, &nowhere).expect("test: legacy migration");
+            let config: CausalTreeConfig = root["causal_tree"].clone().try_into().expect("test: migrated section");
+            assert_eq!(config.policy.extra_latency_budget_ms, 500);
+            assert_eq!(config.policy.extra_latency_budget_ms_explicit, explicit);
+            assert_eq!(config.schema_version, CAUSAL_CONFIG_SCHEMA_VERSION);
+        }
     }
 
     fn valid() -> CausalTreeConfig {
