@@ -48,6 +48,16 @@ pub enum LifecycleError {
     InvalidKnowledge(String),
     #[error("{what} exceeds its limit of {limit}")]
     KnowledgeLimit { what: &'static str, limit: usize },
+    #[error("proposal refused: {0}")]
+    ProposalRefused(String),
+    #[error("proposal {proposal_id} conflicts with an earlier request that used the same request id")]
+    ProposalConflict { proposal_id: String },
+    #[error("proposal {proposal_id} cannot move from {from} to {to}")]
+    InvalidProposalTransition {
+        proposal_id: String,
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("task {task_id} already has a different terminal joined")]
     TerminalConflict { task_id: String },
     #[error("skill name {0:?} is bound to more than one skill id")]
@@ -163,7 +173,7 @@ pub struct SkillId(String);
 
 /// Lock names the knowledge store uses. They start with `_`, which
 /// [`SkillId::parse`] never accepts, so no skill can ever share their lock.
-pub(super) const RESERVED_LOCK_NAMES: [&str; 2] = ["_knowledge-patterns", "_knowledge-rejections"];
+pub(super) const RESERVED_LOCK_NAMES: [&str; 3] = ["_knowledge-patterns", "_knowledge-rejections", "_skill-proposals"];
 
 impl SkillId {
     /// A reserved internal lock identity; `None` for any other name.

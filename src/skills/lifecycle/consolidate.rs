@@ -256,7 +256,11 @@ impl SkillLifecycleStore {
         Ok(current.own_key())
     }
 
-    fn distinct_roots(&self, facts: &[EvidenceFacts], pool: &[EvidenceFacts]) -> Result<usize, LifecycleError> {
+    pub(super) fn distinct_roots(
+        &self,
+        facts: &[EvidenceFacts],
+        pool: &[EvidenceFacts],
+    ) -> Result<usize, LifecycleError> {
         let mut roots = BTreeSet::new();
         for fact in facts {
             roots.insert(self.root_key(fact, pool)?);

@@ -8,6 +8,7 @@ mod evaluate_agent;
 mod knowledge;
 mod manifest;
 mod migrate;
+mod propose;
 mod publish;
 mod store;
 
