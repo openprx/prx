@@ -674,16 +674,18 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
         "usage": {"model": "p/m-c", "input_tokens": 99, "output_tokens": 0, "total_tokens": 99, "cost_usd": 9.0,
                   "timestamp": "2026-10-17T00:00:00Z"}
     });
-    let mut text = std::fs::read_to_string(&ledger).expect("test: ledger");
-    text.push_str(&format!("{forged}\n{unsettled}\n"));
-    std::fs::write(&ledger, text).expect("test: ledger");
+    // An unsettled row (no settlement id) is not a settlement and adds nothing.
+    let authentic = std::fs::read_to_string(&ledger).expect("test: ledger");
+    std::fs::write(&ledger, format!("{authentic}{unsettled}\n")).expect("test: ledger");
     let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
-    assert_eq!(
-        (usage.tokens, usage.cost_micros),
-        (Some(12), Some(4)),
-        "forged rows add nothing"
+    assert_eq!((usage.tokens, usage.cost_micros), (Some(12), Some(4)));
+    // A forged settled row voids the whole ledger instead of being skipped.
+    std::fs::write(&ledger, format!("{authentic}{forged}\n")).expect("test: ledger");
+    assert!(
+        super::super::agent_executor_read_usage_for_test(tmp.path())
+            .tokens
+            .is_none()
     );
-    // A ledger holding only forged rows measures nothing.
     std::fs::write(&ledger, format!("{forged}\n")).expect("test: ledger");
     assert!(
         super::super::agent_executor_read_usage_for_test(tmp.path())
@@ -860,4 +862,54 @@ async fn web_fetch_inherits_a_non_empty_domain_allowlist_or_the_run_is_refused()
         .expect_err("test: an empty allowlist is refused")
         .to_string();
     assert!(error.contains("allowed_domains"), "{error}");
+}
+
+#[test]
+fn rows_with_cache_tokens_verify_and_count_and_a_tampered_row_voids_the_ledger() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let tracker = crate::cost::tracker::CostTracker::new(crate::config::schema::CostConfig::default(), tmp.path())
+        .expect("test: tracker");
+    for (id, source) in [
+        ("c-1", crate::llm::route_decision::TokenUsageSource::Reported),
+        ("c-2", crate::llm::route_decision::TokenUsageSource::Estimated),
+    ] {
+        tracker
+            .settle_metered(&crate::llm::route_decision::MeteredTokenUsageRecord {
+                settlement_id: Some(id.to_string()),
+                provider: "custom:http://127.0.0.1:9/v1".to_string(),
+                model: "cached-model".to_string(),
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+                cache_creation_input_tokens: 11,
+                cache_read_input_tokens: 13,
+                source,
+                cost_usd: Some(0.000_5),
+            })
+            .expect("test: settle");
+    }
+    let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
+    assert_eq!(
+        (usage.tokens, usage.cost_micros),
+        (Some(240), Some(1000)),
+        "cache rows count, none are dropped"
+    );
+    assert_eq!(usage.models, ["custom:http://127.0.0.1:9/v1/cached-model"]);
+
+    let ledger = tmp.path().join("state/costs.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("test: ledger");
+    for (from, to) in [
+        ("\"cache_read_input_tokens\":13", "\"cache_read_input_tokens\":0"),
+        ("\"total_tokens\":120", "\"total_tokens\":1"),
+        ("\"cost_usd\":0.0005", "\"cost_usd\":0.0"),
+    ] {
+        assert!(text.contains(from), "{from} in {text}");
+        std::fs::write(&ledger, text.replacen(from, to, 1)).expect("test: tamper");
+        assert!(
+            super::super::agent_executor_read_usage_for_test(tmp.path())
+                .tokens
+                .is_none(),
+            "tampering with {from} must void the ledger"
+        );
+    }
 }

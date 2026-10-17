@@ -296,14 +296,18 @@ pub(super) fn read_usage(workspace: &Path) -> LedgerUsage {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return unmeasured();
         };
-        // Only rows the ledger itself would derive count: a settlement id and
-        // a fingerprint that verifies. A forged or unsettled row is ignored, so
-        // it cannot hide spend (and is never copied into the operator ledger).
+        // Settled rows must be exactly what the ledger derives. One that is not
+        // (forged, edited, or unverifiable) voids the whole ledger rather than
+        // being skipped, so the spend can neither shrink nor be copied onward.
+        // A row without a settlement id is not a settlement and adds nothing.
         let Ok(row) = serde_json::from_value::<crate::cost::types::CostRecord>(value) else {
             return unmeasured();
         };
-        if !crate::cost::tracker::settlement_row_is_authentic(&row) {
+        if row.settlement_id.is_none() {
             continue;
+        }
+        if !crate::cost::tracker::settlement_row_is_authentic(&row) {
+            return unmeasured();
         }
         let usage = &row.usage;
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {

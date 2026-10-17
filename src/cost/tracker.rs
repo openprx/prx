@@ -717,6 +717,10 @@ impl CostTracker {
         };
         let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
         cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
+        cost_record.settlement_provider = Some(record.provider.clone());
+        cost_record.settlement_source = Some(record.source);
+        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
+        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
         storage.add_record(cost_record.clone())?;
         drop(storage);
         self.lock_session_costs().push(cost_record);
@@ -912,9 +916,10 @@ fn settlement_fingerprint(
 }
 
 /// Whether a stored settlement row carries the fingerprint the ledger derives
-/// for it. The row keeps `"<provider>/<model>"` and no cache counts, so every
-/// split of the model string and both token sources are tried, with no cache
-/// tokens; a row that settled cache usage does not verify (fail closed).
+/// for it. A row written with its settlement inputs (provider, source and cache
+/// counts) is checked exactly. An older row lacks them, so every split of the
+/// model string and both sources are tried with no cache tokens; a legacy row
+/// that settled cache usage does not verify (fail closed).
 pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
     use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
     let (Some(settlement_id), Some(digest)) = (row.settlement_id.as_deref(), row.settlement_sha256.as_deref()) else {
@@ -924,25 +929,33 @@ pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
         return false;
     }
     let usage = &row.usage;
+    let matches = |provider: &str, model: &str, source: TokenUsageSource| {
+        let record = MeteredTokenUsageRecord {
+            settlement_id: Some(settlement_id.to_string()),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cache_creation_input_tokens: row.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: row.cache_read_input_tokens.unwrap_or(0),
+            source,
+            cost_usd: Some(usage.cost_usd),
+        };
+        settlement_fingerprint(&record, usage.cost_usd).is_ok_and(|expected| expected == digest)
+    };
+    if let (Some(provider), Some(source)) = (row.settlement_provider.as_deref(), row.settlement_source) {
+        return usage
+            .model
+            .strip_prefix(provider)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|model| matches(provider, model, source));
+    }
     usage.model.match_indices('/').any(|(at, _)| {
         let (provider, model) = usage.model.split_at(at);
         [TokenUsageSource::Reported, TokenUsageSource::Estimated]
             .into_iter()
-            .any(|source| {
-                let record = MeteredTokenUsageRecord {
-                    settlement_id: Some(settlement_id.to_string()),
-                    provider: provider.to_string(),
-                    model: model.trim_start_matches('/').to_string(),
-                    prompt_tokens: usage.input_tokens,
-                    completion_tokens: usage.output_tokens,
-                    total_tokens: usage.total_tokens,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    source,
-                    cost_usd: Some(usage.cost_usd),
-                };
-                settlement_fingerprint(&record, usage.cost_usd).is_ok_and(|expected| expected == digest)
-            })
+            .any(|source| matches(provider, model.trim_start_matches('/'), source))
     })
 }
 

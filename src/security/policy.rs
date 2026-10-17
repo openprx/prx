@@ -1765,10 +1765,13 @@ impl SecurityPolicy {
             let forbidden_expanded = crate::config::expand_home(Path::new(forbidden));
             // Only entries that lie inside the workspace apply to the joined path:
             // a workspace that itself sits below a forbidden prefix stays usable.
-            let covers_relative = forbidden_expanded.starts_with(&self.workspace_dir)
+            // Compared case-insensitively: on a case-insensitive filesystem
+            // `STATE/x` is `state/x`.
+            let fold = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+            let covers_relative = fold(&forbidden_expanded).starts_with(fold(&self.workspace_dir))
                 && in_workspace
                     .as_ref()
-                    .is_some_and(|resolved| resolved.starts_with(&forbidden_expanded));
+                    .is_some_and(|resolved| fold(resolved).starts_with(fold(&forbidden_expanded)));
             if expanded_path.starts_with(&forbidden_expanded) || covers_relative {
                 return false;
             }
@@ -4827,7 +4830,15 @@ mod tests {
             ],
             ..default_policy()
         };
-        for blocked in ["state/costs.jsonl", "state", "config.toml", "./state/x"] {
+        for blocked in [
+            "state/costs.jsonl",
+            "state",
+            "config.toml",
+            "./state/x",
+            "STATE/costs.jsonl",
+            "State/x",
+            "Config.TOML",
+        ] {
             assert!(!policy.is_path_allowed(blocked), "{blocked}");
         }
         for allowed in ["notes/state.txt", "out/report.txt", "statement.md"] {
