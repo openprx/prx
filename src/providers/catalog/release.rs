@@ -943,7 +943,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-16.4");
+        assert_eq!(catalog.revision, "2026-10-17.1");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -960,6 +960,109 @@ mod tests {
             assert!(model.levels.contains_key("low"), "{} lacks low", model.id);
             assert!(model.levels.contains_key("medium"), "{} lacks medium", model.id);
             assert!(model.levels.contains_key("high"), "{} lacks high", model.id);
+        }
+    }
+
+    #[test]
+    fn openai_release_tariffs_include_published_cached_and_long_context_rates() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        let provider = ProviderId::of("openai");
+        for (model, input, output, write, read) in [
+            ("gpt-4o", 2.5_f64, 10.0, 0.0, 1.25),
+            ("gpt-4o-mini", 0.15, 0.6, 0.0, 0.075),
+            ("gpt-5.2-codex", 1.75, 14.0, 0.0, 0.175),
+            ("gpt-5.6", 4.0, 20.0, 5.0, 0.4),
+            ("gpt-5.6-sol", 4.0, 20.0, 5.0, 0.4),
+            ("gpt-5.6-luna", 0.2, 1.2, 0.25, 0.02),
+            ("gpt-5.6-terra", 2.0, 12.0, 2.5, 0.2),
+            ("o1-preview", 15.0, 60.0, 0.0, 7.5),
+        ] {
+            let pricing = catalog
+                .model(&provider, model)
+                .expect("test: published OpenAI model")
+                .pricing
+                .as_ref()
+                .expect("test: published OpenAI tariff");
+            for (actual, expected) in [
+                (pricing.input, input),
+                (pricing.output, output),
+                (pricing.cache_write, write),
+                (pricing.cache_read, read),
+            ] {
+                assert!((actual - expected).abs() < 1e-9, "{model}: {actual} != {expected}");
+            }
+            if model.starts_with("gpt-5.6") {
+                assert_eq!(pricing.tiers.len(), 1);
+                let tier = pricing.tiers.first().expect("test: published long-context tier");
+                assert_eq!(tier.above_input_tokens, 272_000);
+                for (actual, expected) in [
+                    (tier.input, input * 2.0),
+                    (tier.output, output * 1.5),
+                    (
+                        tier.cache_write.expect("test: long-context cache-write rate"),
+                        write * 2.0,
+                    ),
+                    (
+                        tier.cache_read.expect("test: long-context cached-input rate"),
+                        read * 2.0,
+                    ),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "{model} long context: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_release_tariffs_pin_cached_input_and_the_long_context_threshold() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        let provider = ProviderId::of("gemini");
+        let lite = catalog
+            .model(&provider, "gemini-3.1-flash-lite")
+            .and_then(|model| model.pricing.as_ref())
+            .expect("test: published Flash-Lite tariff");
+        assert!((lite.input - 0.25).abs() < 1e-9);
+        assert!((lite.output - 1.5).abs() < 1e-9);
+        assert!((lite.cache_read - 0.025).abs() < 1e-9);
+        let pro = catalog
+            .model(&provider, "gemini-3.1-pro-preview")
+            .and_then(|model| model.pricing.as_ref())
+            .expect("test: published Pro tariff");
+        assert!((pro.input - 2.0).abs() < 1e-9);
+        assert!((pro.output - 12.0).abs() < 1e-9);
+        assert!((pro.cache_read - 0.2).abs() < 1e-9);
+        assert_eq!(pro.tiers.len(), 1);
+        let long = pro.tiers.first().expect("test: published long-context tariff");
+        assert_eq!(long.above_input_tokens, 200_000);
+        assert!((long.input - 4.0).abs() < 1e-9);
+        assert!((long.output - 18.0).abs() < 1e-9);
+        assert!((long.cache_read.expect("test: long-context cached input") - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unverified_legacy_tariffs_are_not_replaced_with_other_models_prices() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        for (provider, model) in [
+            ("anthropic", "claude-3-haiku"),
+            ("anthropic", "claude-3.5-sonnet"),
+            ("anthropic", "claude-haiku-3"),
+            ("gemini", "gemini-1.5-pro"),
+            ("gemini", "gemini-2.0-flash"),
+            ("moonshot", "kimi-k2.5"),
+            ("openrouter", "moonshotai/kimi-k2.5"),
+            ("xai", "grok-3"),
+        ] {
+            assert!(
+                catalog
+                    .model(&ProviderId::of(provider), model)
+                    .expect("test: retained model identity")
+                    .pricing
+                    .is_none(),
+                "{provider}/{model}: unverified tariff must remain absent"
+            );
         }
     }
 

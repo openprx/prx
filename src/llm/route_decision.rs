@@ -1565,6 +1565,18 @@ mod tests {
         let config = crate::config::schema::CostConfig::default();
         assert!(config.prices.is_empty(), "operator price overrides start empty");
 
+        // Sonnet has an independently published OpenRouter tariff. Keep a
+        // separate own-price-absent witness for the upstream fallback itself.
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("test: release catalog");
+        let upstream = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "openai/gpt-5.6")
+            .expect("test: retained upstream-priced OpenRouter identity");
+        assert!(upstream.pricing.is_none(), "test: must exercise the upstream tariff");
+        assert!(matches!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6", 64, 64, 0, 0, &config),
+            UsagePrice::Priced(cost) if (cost - 0.001_536).abs() < 1e-12
+        ));
+
         assert!(matches!(
             usage_cost_resolution(
                 "openrouter",
@@ -1611,6 +1623,38 @@ mod tests {
             &crate::config::schema::CostConfig::default(),
         );
         assert_eq!(resolved, UsagePrice::Priced(pricing.input + pricing.output));
+    }
+
+    #[test]
+    fn release_tariffs_bill_published_cache_and_long_context_rates() {
+        let config = crate::config::schema::CostConfig::default();
+        for (provider, model, prompt, cached, expected) in [
+            ("openai", "gpt-4o", 1_000_000, 1_000_000, 11.25_f64),
+            ("openai", "gpt-5.6", 272_000, 272_000, 20.1088),
+            ("openai", "gpt-5.6", 272_001, 272_001, 30.217_600_8),
+            ("gemini", "gemini-3.1-flash-lite", 1_000_000, 1_000_000, 1.525),
+            ("gemini", "gemini-3.1-pro-preview", 200_000, 200_000, 12.04),
+            ("gemini", "gemini-3.1-pro-preview", 200_001, 200_001, 18.080_000_4),
+            ("openrouter", "anthropic/claude-sonnet-5", 1_000_000, 0, 12.0),
+            ("openrouter", "typesafe/jev-1.13", 1_000_000, 0, 0.042),
+        ] {
+            let actual = usage_cost_resolution(provider, model, prompt, 1_000_000, 0, cached, &config);
+            assert!(
+                matches!(actual, UsagePrice::Priced(cost) if (cost - expected).abs() < 1e-12),
+                "{provider}/{model}: {actual:?}, expected {expected}"
+            );
+        }
+        for (provider, model) in [
+            ("moonshot", "kimi-k2.5"),
+            ("openrouter", "moonshotai/kimi-k2.5"),
+            ("xai", "grok-3"),
+        ] {
+            assert_eq!(
+                usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+                UsagePrice::Missing,
+                "unverified prices must not settle as free usage"
+            );
+        }
     }
 
     #[test]

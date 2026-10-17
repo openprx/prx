@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-16.4",
-  "published_at": "2026-10-16T00:00:00Z",
+  "revision": "2026-10-17.1",
+  "published_at": "2026-10-17T00:00:00Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -161,14 +161,7 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium",
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.25,
-        "output": 1.25,
-        "cache_write": 0.3,
-        "cache_read": 0.03
-      }
+      "default_level": "medium"
     },
     {
       "id": "anthropic/claude-3.5-sonnet",
@@ -197,14 +190,7 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium",
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 3.0,
-        "output": 15.0,
-        "cache_write": 3.75,
-        "cache_read": 0.3
-      }
+      "default_level": "medium"
     },
     {
       "id": "anthropic/claude-fable-5",
@@ -287,13 +273,6 @@
         ],
         "latency_ms": 800,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.25,
-        "output": 1.25,
-        "cache_write": 0.3,
-        "cache_read": 0.03
       }
     },
     {
@@ -667,10 +646,10 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 3.0,
-        "output": 15.0,
-        "cache_write": 3.75,
-        "cache_read": 0.3
+        "input": 2,
+        "output": 10,
+        "cache_write": 2.5,
+        "cache_read": 0.2
       }
     },
     {
@@ -1194,14 +1173,7 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium",
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 1.25,
-        "output": 5.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
-      }
+      "default_level": "medium"
     },
     {
       "id": "gemini/gemini-2.0-flash",
@@ -1233,13 +1205,6 @@
         "high": {}
       },
       "default_level": "medium",
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.1,
-        "output": 0.4,
-        "cache_write": 0.0,
-        "cache_read": 0.0
-      },
       "router": {
         "cost_per_million_tokens": 0.1,
         "categories": [
@@ -1325,7 +1290,20 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "router": {
+        "cost_per_million_tokens": 0.25,
+        "categories": [
+          "conversation",
+          "summary",
+          "translation"
+        ],
+        "latency_ms": 800,
+        "quality_rank": 1000
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -1337,8 +1315,8 @@
         "unit": "usd_per_1m_tokens",
         "input": 0.25,
         "output": 1.5,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "cache_write": 0,
+        "cache_read": 0.025
       }
     },
     {
@@ -1358,7 +1336,19 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "router": {
+        "cost_per_million_tokens": 2,
+        "categories": [
+          "code",
+          "reasoning"
+        ],
+        "latency_ms": 2000,
+        "quality_rank": 1000
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -1368,10 +1358,19 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 2.0,
-        "output": 12.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 2,
+        "output": 12,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 4,
+            "output": 18,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
       }
     },
     {
@@ -2022,14 +2021,7 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium",
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.6,
-        "output": 3.0,
-        "cache_write": 0.6,
-        "cache_read": 0.1
-      }
+      "default_level": "medium"
     },
     {
       "id": "moonshot/kimi-k2.6",
@@ -2471,10 +2463,10 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 5.0,
-        "output": 15.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 2.5,
+        "output": 10,
+        "cache_write": 0,
+        "cache_read": 1.25
       },
       "router": {
         "cost_per_million_tokens": 5.0,
@@ -2521,8 +2513,8 @@
         "unit": "usd_per_1m_tokens",
         "input": 0.15,
         "output": 0.6,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "cache_write": 0,
+        "cache_read": 0.075
       },
       "router": {
         "cost_per_million_tokens": 0.15,
@@ -2552,14 +2544,24 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 400000,
+        "max_output_tokens": 128000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.75,
+        "output": 14,
+        "cache_write": 0,
+        "cache_read": 0.175
+      }
     },
     {
       "id": "openai/gpt-5.6",
@@ -2578,7 +2580,10 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -2588,10 +2593,19 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 5.0,
-        "output": 30.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 4,
+        "output": 20,
+        "cache_write": 5,
+        "cache_read": 0.4,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 8,
+            "output": 30,
+            "cache_write": 10,
+            "cache_read": 0.8
+          }
+        ]
       }
     },
     {
@@ -2611,7 +2625,10 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -2621,10 +2638,19 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 1.0,
-        "output": 6.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 0.2,
+        "output": 1.2,
+        "cache_write": 0.25,
+        "cache_read": 0.02,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 0.4,
+            "output": 1.8,
+            "cache_write": 0.5,
+            "cache_read": 0.04
+          }
+        ]
       }
     },
     {
@@ -2657,10 +2683,19 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 5.0,
-        "output": 30.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 4,
+        "output": 20,
+        "cache_write": 5,
+        "cache_read": 0.4,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 8,
+            "output": 30,
+            "cache_write": 10,
+            "cache_read": 0.8
+          }
+        ]
       }
     },
     {
@@ -2680,7 +2715,10 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -2690,10 +2728,19 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 2.5,
-        "output": 15.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 2,
+        "output": 12,
+        "cache_write": 2.5,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 4,
+            "output": 18,
+            "cache_write": 5,
+            "cache_read": 0.4
+          }
+        ]
       }
     },
     {
@@ -2726,10 +2773,10 @@
       "default_level": "medium",
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 15.0,
-        "output": 60.0,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 15,
+        "output": 60,
+        "cache_write": 0,
+        "cache_read": 7.5
       }
     },
     {
@@ -2749,14 +2796,34 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "router": {
+        "cost_per_million_tokens": 3,
+        "categories": [
+          "code",
+          "reasoning",
+          "conversation"
+        ],
+        "latency_ms": 1500,
+        "quality_rank": 1000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 2.5,
+        "cache_read": 0.2
+      }
     },
     {
       "id": "openrouter/deepseek/deepseek-v3.2",
@@ -2916,13 +2983,6 @@
         ],
         "latency_ms": 2000,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 0.6,
-        "output": 3.0,
-        "cache_write": 0.6,
-        "cache_read": 0.1
       }
     },
     {
@@ -3079,10 +3139,10 @@
       "limits": {},
       "pricing": {
         "unit": "usd_per_1m_tokens",
-        "input": 0.05,
-        "output": 0.05,
-        "cache_write": 0.0,
-        "cache_read": 0.0
+        "input": 0.042,
+        "output": 0,
+        "cache_write": 0,
+        "cache_read": 0
       },
       "parameters": {},
       "levels": {},
@@ -3666,13 +3726,6 @@
         ],
         "latency_ms": 2000,
         "quality_rank": 1000
-      },
-      "pricing": {
-        "unit": "usd_per_1m_tokens",
-        "input": 3.0,
-        "output": 15.0,
-        "cache_write": 0.0,
-        "cache_read": 0.75
       }
     },
     {
