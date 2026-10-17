@@ -94,7 +94,7 @@ pub enum GateError {
     MissingEvaluation { split: EvalSplit },
     #[error("the governing suite is below the policy's floor: {0}")]
     SuiteBelowFloor(String),
-    #[error("new failing or pending evidence appeared after the decision: {0}")]
+    #[error("new or changed evidence appeared after the decision: {0}")]
     NewFailingEvidence(String),
     #[error("not an accepting gate decision: {0}")]
     NotAccepted(String),
@@ -245,8 +245,6 @@ pub enum GateReason {
 }
 
 impl GateReason {
-    /// Whether the reason is a measured defect of the change (as opposed to
-    /// evidence too thin or too broken to measure anything).
     /// Whether the reason comes from another recorded evaluation rather than
     /// from the pinned ones.
     #[must_use]
@@ -254,6 +252,8 @@ impl GateReason {
         matches!(self, Self::UnpinnedFailure { .. } | Self::UnpinnedPending { .. })
     }
 
+    /// Whether the reason is a measured defect of the change (as opposed to
+    /// evidence too thin or too broken to measure anything).
     #[must_use]
     pub const fn is_measured(&self) -> bool {
         matches!(
@@ -354,6 +354,12 @@ pub struct SkillGateDecision {
     /// checks passed.
     pub deterministic_reasons: Vec<GateReason>,
     pub judge: Option<JudgeRecord>,
+    /// Other evaluations of the subject that had no verdict, were blocked by an
+    /// earlier epoch's decision, and are not counted again here: that decision
+    /// adjudicated them. If one later completes as a measured failure it counts
+    /// again, and a changed list makes `verify_gate` refuse.
+    #[serde(default)]
+    pub adjudicated_pending: Vec<String>,
     pub decision: GateDecision,
     /// Every reason behind `decision`, deterministic and judge.
     pub reasons: Vec<GateReason>,
@@ -608,6 +614,9 @@ struct Resolved {
     verified: Vec<VerifiedEvaluation>,
     /// Other recorded evaluations of the same subject that do not pass.
     unpinned: Vec<Sibling>,
+    /// Siblings without a verdict that an earlier epoch's decision already
+    /// adjudicated; they do not block, and are recorded in the decision.
+    adjudicated: Vec<String>,
     spec: EvalSuite,
 }
 impl SkillLifecycleStore {
@@ -764,14 +773,18 @@ impl SkillLifecycleStore {
     }
 
     /// Verifies the pinned evaluations and binds them to the proposal's
-    /// governing suite, window and epoch. Staleness of the skill is returned as
-    /// [`GateError::Stale`], a different suite as [`GateError::SuiteChanged`].
+    /// governing suite, evaluation window and epoch. Staleness of the skill is
+    /// returned as [`GateError::Stale`], a different suite as
+    /// [`GateError::SuiteChanged`].
     ///
-    /// Every other evaluation recorded for the same skill, baseline, candidate,
-    /// generation and suite since the evaluation window opened is read too, and
-    /// the ones that do not pass are reported: pinning only the passing run of
-    /// several is not a way to pass. (An attempt that was reserved but never
-    /// produced a receipt has nothing to read and is not seen here.)
+    /// Every other evaluation of the same skill, baseline, candidate,
+    /// generation and suite counts, whenever it started, so a pass cannot be
+    /// picked out of several runs. A measured failure counts forever. One
+    /// without a verdict (no receipt, or an uncertain outcome) blocks once: an
+    /// earlier epoch's decision of this proposal that pinned it or recorded it
+    /// as pending adjudicated it, and from then on it no longer blocks (if it
+    /// later completes as a measured failure it counts again). A reservation
+    /// attributes an evaluation that has no receipt.
     fn resolve_evaluations(
         &self,
         proposal: &SkillProposal,
@@ -873,6 +886,8 @@ impl SkillLifecycleStore {
         verified.sort_by_key(|evaluation| split_order(evaluation.receipt.split));
         let pinned: BTreeSet<&str> = pins.iter().map(|pin| pin.evaluation_id.as_str()).collect();
         let mut unpinned = Vec::new();
+        let mut adjudicated: Vec<String> = Vec::new();
+        let adjudicated_before = self.adjudicated_before(proposal)?;
         let is_subject = |skill: &SkillId,
                           suite_digest: &str,
                           split: EvalSplit,
@@ -886,11 +901,9 @@ impl SkillLifecycleStore {
                 && baseline == Some(&proposal.baseline_revision)
                 && generation == proposal.expected_generation
         };
-        // Every evaluation of the subject counts, whenever it started: a new
-        // proposal with identical content does not get a fresh start. The
-        // reservation (written before the first run) attributes an evaluation
-        // that has no receipt; a receipt of another subject, readable or not,
-        // never fails this gate.
+        // The reservation (written before the first run) attributes an
+        // evaluation that has no receipt. It is not sealed, so a receipt that
+        // matches this subject overrides a reservation that names another one.
         for id in self.list_evaluation_ids()? {
             if pinned.contains(id.as_str()) {
                 continue;
@@ -906,23 +919,41 @@ impl SkillLifecycleStore {
                     a.observed_generation?,
                 ))
             });
-            if attributed == Some(false) {
+            let receipt = self.read_sealed_receipt(&id);
+            let receipt_subject = receipt.as_ref().ok().map(|(r, _)| {
+                is_subject(
+                    &r.skill_id,
+                    &r.suite_digest,
+                    r.split,
+                    &r.candidate.revision_id,
+                    r.baseline.as_ref().map(|arm| &arm.revision_id),
+                    r.observed_generation,
+                )
+            });
+            if attributed == Some(false) && receipt_subject == Some(true) {
+                tracing::warn!(
+                    evaluation = %id,
+                    "an evaluation reservation names another subject than its receipt; the receipt is used"
+                );
+            }
+            if attributed == Some(true) && receipt_subject == Some(false) {
+                tracing::warn!(
+                    evaluation = %id,
+                    "an evaluation reservation names this subject but its receipt names another; counted as pending"
+                );
+            }
+            let ours = receipt_subject == Some(true) || attributed == Some(true);
+            if !ours {
+                if attributed.is_none() && receipt.is_err() {
+                    tracing::warn!(
+                        evaluation = %id,
+                        "an evaluation reservation without a subject and without a readable receipt is ignored"
+                    );
+                }
                 continue;
             }
-            match self.read_sealed_receipt(&id) {
-                Ok((receipt, _)) => {
-                    if attributed.is_none()
-                        && !is_subject(
-                            &receipt.skill_id,
-                            &receipt.suite_digest,
-                            receipt.split,
-                            &receipt.candidate.revision_id,
-                            receipt.baseline.as_ref().map(|arm| &arm.revision_id),
-                            receipt.observed_generation,
-                        )
-                    {
-                        continue;
-                    }
+            let (split, measured) = match receipt {
+                Ok((receipt, _)) if receipt_subject == Some(true) => {
                     let measured = match self.verify_evaluation(&id, None) {
                         Ok(sibling) => {
                             let reasons = evaluation_reasons(suite.suite(), policy, &sibling);
@@ -935,23 +966,23 @@ impl SkillLifecycleStore {
                         // not evidence of a pass.
                         Err(_) => false,
                     };
-                    unpinned.push(Sibling {
-                        split: receipt.split,
-                        evaluation_id: id,
-                        measured,
-                    });
+                    (receipt.split, measured)
                 }
-                // No readable receipt: in flight, abandoned or damaged. It only
-                // counts when the reservation attributes it to this subject.
-                Err(_) => {
-                    if let (Some(true), Some(attempt)) = (attributed, attempt) {
-                        unpinned.push(Sibling {
-                            split: attempt.split,
-                            evaluation_id: id,
-                            measured: false,
-                        });
-                    }
-                }
+                // No usable receipt of this subject: in flight, abandoned or
+                // damaged, attributed by its reservation.
+                _ => match attempt {
+                    Some(attempt) => (attempt.split, false),
+                    None => continue,
+                },
+            };
+            if measured || !adjudicated_before.contains(&id) {
+                unpinned.push(Sibling {
+                    split,
+                    evaluation_id: id,
+                    measured,
+                });
+            } else {
+                adjudicated.push(id);
             }
         }
         // The skill must still be where the proposal found it.
@@ -969,8 +1000,34 @@ impl SkillLifecycleStore {
         Ok(Resolved {
             verified,
             unpinned,
+            adjudicated,
             spec: suite.suite().clone(),
         })
+    }
+
+    /// Evaluations that earlier epochs of this proposal already decided on:
+    /// the ones they pinned or recorded as pending.
+    fn adjudicated_before(&self, proposal: &SkillProposal) -> Result<BTreeSet<String>, GateError> {
+        let mut ids = BTreeSet::new();
+        for epoch in 1..proposal.evaluation_epoch {
+            let id = gate_id_of(self.owner_scope(), &proposal.proposal_id, epoch);
+            let Some(earlier) = self.read_gate(&id)? else {
+                continue;
+            };
+            let decision = earlier.decision;
+            ids.extend(decision.evaluations.iter().map(|entry| entry.evaluation_id.clone()));
+            ids.extend(decision.adjudicated_pending);
+            ids.extend(
+                decision
+                    .deterministic_reasons
+                    .into_iter()
+                    .filter_map(|reason| match reason {
+                        GateReason::UnpinnedPending { evaluation_id, .. } => Some(evaluation_id),
+                        _ => None,
+                    }),
+            );
+        }
+        Ok(ids)
     }
 
     /// Gates an `Evaluated` proposal.
@@ -1037,7 +1094,7 @@ impl SkillLifecycleStore {
                     "a gate decision for this evaluation epoch exists and rests on other evaluations".to_string(),
                 ));
             }
-            let verified = self
+            let (verified, new_evidence) = self
                 .verify_gate_inner(
                     &existing.decision,
                     &existing.digest,
@@ -1057,10 +1114,27 @@ impl SkillLifecycleStore {
                 }
                 return Err(GateError::Expired(verified.decision.expires_at));
             }
-            return self.settle_gate(RecordedGate {
+            let recorded = RecordedGate {
                 decision: verified.decision,
                 digest: verified.digest,
-            });
+            };
+            if new_evidence && recorded.decision.decision == GateDecision::Accept {
+                // The accept no longer rests on all the evidence: it is not
+                // settled; the proposal goes back to be evaluated again.
+                let proposal = self.transition_proposal_in(
+                    &proposal.proposal_id,
+                    ProposalStatus::Inconclusive,
+                    "new or changed evidence appeared before the accept was settled",
+                    &[],
+                    Some(recorded.decision.epoch),
+                )?;
+                return Ok(GateOutcome {
+                    gate: recorded,
+                    proposal,
+                    rejection: None,
+                });
+            }
+            return self.settle_gate(recorded);
         }
         if proposal.status != ProposalStatus::Evaluated {
             return Err(GateError::NotGateable {
@@ -1123,6 +1197,7 @@ impl SkillLifecycleStore {
             policy: request.policy.clone(),
             deterministic_reasons: deterministic,
             judge: judge_record,
+            adjudicated_pending: resolved.adjudicated.clone(),
             decision,
             reasons,
             review_identity: GATE_IDENTITY.to_string(),
@@ -1207,7 +1282,7 @@ impl SkillLifecycleStore {
         let stored = self
             .read_gate(gate_id)?
             .ok_or_else(|| GateError::Tampered(format!("no gate receipt {gate_id}")))?;
-        let verified = self.verify_gate_inner(
+        let (verified, _) = self.verify_gate_inner(
             &stored.decision,
             expected_digest,
             policy,
@@ -1229,7 +1304,7 @@ impl SkillLifecycleStore {
         policy: &GatePolicy,
         suite_digest: &str,
         mode: VerifyMode,
-    ) -> Result<VerifiedGate, GateError> {
+    ) -> Result<(VerifiedGate, bool), GateError> {
         policy.validate()?;
         let tampered = |reason: &str| Err(GateError::Tampered(reason.to_string()));
         let digest = seal_digest(decision)?;
@@ -1288,22 +1363,32 @@ impl SkillLifecycleStore {
         if recomputed != decision.evaluations {
             return tampered("the recorded metrics differ from the ones recomputed from the receipts");
         }
+        // Evidence about other evaluations that changed since the decision.
         let deterministic = deterministic_reasons(&resolved, policy);
-        if deterministic != decision.deterministic_reasons {
+        let mut new_evidence = false;
+        if deterministic != decision.deterministic_reasons || resolved.adjudicated != decision.adjudicated_pending {
             let stored_pinned: Vec<GateReason> = decision
                 .deterministic_reasons
                 .iter()
                 .filter(|reason| !reason.is_sibling())
                 .cloned()
                 .collect();
-            if stored_pinned == pinned_reasons(&resolved, policy) {
-                return Err(GateError::NewFailingEvidence(
-                    "another evaluation of the same subject was recorded after the decision".to_string(),
-                ));
+            if stored_pinned != pinned_reasons(&resolved, policy) {
+                return tampered("the recorded reasons differ from the ones recomputed from the receipts");
             }
-            return tampered("the recorded reasons differ from the ones recomputed from the receipts");
+            match mode {
+                VerifyMode::Publication => {
+                    return Err(GateError::NewFailingEvidence(
+                        "another evaluation of the same subject was recorded or changed after the decision".to_string(),
+                    ));
+                }
+                // A stored non-accept is settled as it was decided; only an
+                // accept has to answer to the new evidence.
+                VerifyMode::Resume => new_evidence = true,
+            }
         }
-        let (expected_decision, expected_reasons) = final_decision(&deterministic, decision.judge.as_ref(), policy)?;
+        let (expected_decision, expected_reasons) =
+            final_decision(&decision.deterministic_reasons, decision.judge.as_ref(), policy)?;
         if expected_decision != decision.decision || expected_reasons != decision.reasons {
             return tampered("the recorded decision differs from the one recomputed");
         }
@@ -1318,10 +1403,13 @@ impl SkillLifecycleStore {
         if mode == VerifyMode::Publication && Utc::now() > decision.expires_at {
             return Err(GateError::Expired(decision.expires_at));
         }
-        Ok(VerifiedGate {
-            decision: decision.clone(),
-            digest,
-        })
+        Ok((
+            VerifiedGate {
+                decision: decision.clone(),
+                digest,
+            },
+            new_evidence,
+        ))
     }
 
     fn read_gate(&self, id: &str) -> Result<Option<RecordedGate>, GateError> {

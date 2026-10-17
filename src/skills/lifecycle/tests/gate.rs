@@ -14,10 +14,11 @@ use crate::skills::lifecycle::gate::rewrite_gate_for_test;
 use crate::skills::lifecycle::proposal::proposal_id_of;
 use crate::skills::lifecycle::proposer_model::TallyCounters;
 use crate::skills::lifecycle::{
-    AppliedEdit, AuthorBinding, BoundedDiff, BudgetRecord, EditOp, EvalSplit, EvaluationPin, EvaluationRequest,
-    FrozenSuite, GateDecision, GateError, GateJudge, GatePolicy, GateReason, GateRequest, JudgeBrief, JudgeError,
-    JudgeOpinion, JudgeReply, JudgeResult, MAX_GATE_EPOCHS, ModelBinding, ModelCallError, ModelJudge, ModelReply,
-    ProposalBasis, ProposalOperation, ProposalStatus, ProposerModel, RejectionRecord, ReportedUsage, SkillProposal,
+    AppliedEdit, AuthorBinding, BoundedDiff, BudgetRecord, CaseExecutor, EditOp, EvalSplit, EvaluationError,
+    EvaluationPin, EvaluationRequest, ExecutionRequest, FrozenSuite, GateDecision, GateError, GateJudge, GatePolicy,
+    GateReason, GateRequest, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgeResult, MAX_GATE_EPOCHS,
+    ModelBinding, ModelCallError, ModelJudge, ModelReply, ProposalBasis, ProposalOperation, ProposalStatus,
+    ProposerModel, RejectionRecord, ReportedUsage, RunObservation, SkillProposal,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1449,7 +1450,7 @@ async fn evaluations_of_other_subjects_never_block_or_break_a_gate() {
 }
 
 #[tokio::test]
-async fn a_retry_with_a_new_evaluation_after_an_uncertain_one_is_uncertain_not_a_rejection() {
+async fn a_retry_with_a_clean_evaluation_after_an_uncertain_one_can_be_accepted() {
     let fx = fixture();
     let suite = validation_suite(2);
     let proposal = evaluating_proposal(&fx, &suite);
@@ -1462,12 +1463,11 @@ async fn a_retry_with_a_new_evaluation_after_an_uncertain_one_is_uncertain_not_a
     });
     let first = evaluate(&fx, &suite, &broken).await;
     mark_evaluated(&fx, &proposal);
-    let one = gate(&fx, &proposal, &suite, &[first], &policy(), None)
+    let one = gate(&fx, &proposal, &suite, std::slice::from_ref(&first), &policy(), None)
         .await
         .expect("test: first gate");
     assert_eq!(one.proposal.status, ProposalStatus::Inconclusive);
-    // A new epoch with a fresh evaluation: the uncertain one still counts, so
-    // the retry cannot accept, and it is not a measured rejection either.
+    // Epoch 2 with a new clean evaluation: the uncertain one was adjudicated.
     fx.store
         .begin_evaluation(&proposal.proposal_id, suite.digest(), "retry")
         .expect("test: new epoch");
@@ -1476,20 +1476,164 @@ async fn a_retry_with_a_new_evaluation_after_an_uncertain_one_is_uncertain_not_a
     let two = gate(&fx, &proposal, &suite, &[second], &policy(), None)
         .await
         .expect("test: second gate");
-    assert_eq!(two.gate.decision.decision, GateDecision::Reject);
-    assert!(
-        two.gate
-            .decision
-            .reasons
-            .iter()
-            .any(|r| matches!(r, GateReason::UnpinnedPending { .. }))
-    );
-    assert_eq!(two.proposal.status, ProposalStatus::Inconclusive);
-    assert!(two.rejection.is_none());
-    assert_eq!(
-        fx.store.rejections_for(&skill()).expect("test: rejections"),
-        Vec::<RejectionRecord>::new()
-    );
+    assert_eq!(two.gate.decision.decision, GateDecision::Accept);
+    assert_eq!(two.proposal.status, ProposalStatus::Eligible);
+    assert_eq!(two.gate.decision.adjudicated_pending, vec![first.evaluation_id]);
+    fx.store
+        .verify_gate(
+            &two.gate.decision.record_id,
+            &two.gate.digest,
+            &policy(),
+            suite.digest(),
+        )
+        .expect("test: verifies");
+}
+
+/// Executor whose first run waits until it is released, so an evaluation can be
+/// in flight (reserved, no receipt) while other things happen; it then fails
+/// the task.
+struct Gated {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    entered: AtomicBool,
+}
+
+impl Gated {
+    fn new() -> Self {
+        Self {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            entered: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl CaseExecutor for Gated {
+    fn identity(&self) -> String {
+        "gated".to_string()
+    }
+
+    async fn run_case(
+        &self,
+        request: &ExecutionRequest<'_>,
+        _cancel: &CancellationToken,
+    ) -> Result<RunObservation, EvaluationError> {
+        if !self.entered.swap(true, Ordering::SeqCst) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        let mut observation = good(request);
+        observation.response = "notes: nothing useful".to_string();
+        Ok(observation)
+    }
+}
+
+#[tokio::test]
+async fn an_adjudicated_pending_run_that_later_fails_makes_verification_refuse() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    let slow = Gated::new();
+    let run = async {
+        fx.store
+            .evaluate(
+                &super::evaluate::request(&fx, &suite, EvalSplit::Validation),
+                &slow,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("test: slow evaluation")
+    };
+    let choreography = async {
+        slow.started.notified().await;
+        // Epoch 1 meets the run in flight: blocked once, inconclusive.
+        let one = gate(&fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
+            .await
+            .expect("test: first gate");
+        assert_eq!(one.proposal.status, ProposalStatus::Inconclusive);
+        assert!(
+            one.gate
+                .decision
+                .reasons
+                .iter()
+                .any(|r| matches!(r, GateReason::UnpinnedPending { .. }))
+        );
+        assert!(one.rejection.is_none());
+        // Epoch 2: it was adjudicated, so it no longer blocks.
+        fx.store
+            .begin_evaluation(&proposal.proposal_id, suite.digest(), "retry")
+            .expect("test: new epoch");
+        mark_evaluated(&fx, &proposal);
+        let two = gate(&fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
+            .await
+            .expect("test: second gate");
+        assert_eq!(two.gate.decision.decision, GateDecision::Accept);
+        assert_eq!(two.gate.decision.adjudicated_pending.len(), 1);
+        slow.release.notify_one();
+        two
+    };
+    let (_finished, two) = tokio::join!(run, choreography);
+    // The run finished as a measured failure after the accept.
+    assert!(matches!(
+        fx.store.verify_gate(
+            &two.gate.decision.record_id,
+            &two.gate.digest,
+            &policy(),
+            suite.digest()
+        ),
+        Err(GateError::NewFailingEvidence(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_stored_non_accept_is_settled_even_when_its_pending_run_has_since_finished() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    let slow = Gated::new();
+    let run = async {
+        fx.store
+            .evaluate(
+                &super::evaluate::request(&fx, &suite, EvalSplit::Validation),
+                &slow,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("test: slow evaluation")
+    };
+    let choreography = async {
+        slow.started.notified().await;
+        let one = gate(&fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
+            .await
+            .expect("test: gate");
+        assert_eq!(one.proposal.status, ProposalStatus::Inconclusive);
+        // The process dies before the settlement.
+        force_status(&fx, &proposal.proposal_id, ProposalStatus::Evaluated);
+        slow.release.notify_one();
+    };
+    tokio::join!(run, choreography);
+    let resumed = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: resume is not stuck");
+    assert_eq!(resumed.proposal.status, ProposalStatus::Inconclusive);
+}
+
+#[tokio::test]
+async fn an_accept_that_meets_new_evidence_on_resume_settles_inconclusive() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    let accepted = gate(&fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
+        .await
+        .expect("test: gate");
+    assert_eq!(accepted.gate.decision.decision, GateDecision::Accept);
+    force_status(&fx, &proposal.proposal_id, ProposalStatus::Evaluated);
+    evaluate(&fx, &suite, &tie()).await;
+    let resumed = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: resume");
+    assert_eq!(resumed.proposal.status, ProposalStatus::Inconclusive);
 }
 
 #[tokio::test]
