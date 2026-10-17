@@ -9544,11 +9544,15 @@ mod tests {
     /// observe many simultaneously live runs rather than a fast serial trickle.
     struct GatedProvider {
         gate: Arc<tokio::sync::Semaphore>,
+        entered: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl GatedProvider {
         /// Park until the test releases this run.
         async fn wait_for_release(&self) {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
             if let Ok(permit) = self.gate.acquire().await {
                 drop(permit);
             }
@@ -11955,6 +11959,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
@@ -12018,6 +12023,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
@@ -14594,6 +14600,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
@@ -14692,10 +14699,12 @@ mod tests {
     async fn a_spawned_run_row_tracks_its_own_real_progress() {
         let (ch, _) = RecordingChannel::new();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
         let tool = make_tool(
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: Some(Arc::clone(&entered)),
             }),
         );
 
@@ -14704,6 +14713,9 @@ mod tests {
             .expect("spawn tool call");
         assert!(spawned.success, "{spawned:?}");
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the real provider must be parked before measuring silence");
         // While parked in the provider the run really has made no progress, and
         // the row must say so instead of inventing activity.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -14715,7 +14727,7 @@ mod tests {
         };
         assert_eq!(
             events_before, 1,
-            "only the admitted turn start may precede provider output"
+            "only completed request preparation may precede provider output"
         );
         assert!(
             idle_before >= std::time::Duration::from_millis(150),
@@ -14729,7 +14741,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let runs = tool.active_runs_snapshot().await;
             let Some(run) = runs.first() else { continue };
-            if run.progress.events() > 0 {
+            if run.progress.events() > events_before {
                 observed = Some((run.progress.events(), run.idle_for(), run.last_progress_at()));
                 break;
             }
@@ -14737,6 +14749,10 @@ mod tests {
         let (events_after, idle_after, stamp_after) =
             observed.expect("a released run must record progress on its own row");
         assert!(events_after >= 1);
+        assert!(
+            events_after > events_before,
+            "provider release must produce a new progress event"
+        );
         assert!(
             idle_after < idle_before,
             "real progress must reset the run's silence: {idle_after:?} vs {idle_before:?}"
@@ -14958,6 +14974,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
@@ -15394,6 +15411,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
