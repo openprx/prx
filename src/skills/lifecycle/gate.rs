@@ -94,6 +94,8 @@ pub enum GateError {
     MissingEvaluation { split: EvalSplit },
     #[error("the governing suite is below the policy's floor: {0}")]
     SuiteBelowFloor(String),
+    #[error("new failing or pending evidence appeared after the decision: {0}")]
+    NewFailingEvidence(String),
     #[error("not an accepting gate decision: {0}")]
     NotAccepted(String),
     #[error("evaluation is stale: {0}")]
@@ -170,9 +172,9 @@ pub struct EvaluationPin {
 #[derive(Clone, Copy, Debug)]
 pub struct GateRequest<'a> {
     pub proposal_id: &'a str,
-    /// Digest of the suite that governs the proposal. It is not a choice: the
-    /// governing suite is bound to the proposal by `begin_evaluation`, and this
-    /// argument only has to equal it.
+    /// Confirmation field, not an input: the governing suite is bound to the
+    /// proposal by `begin_evaluation`, and this argument only has to equal it
+    /// (it catches a caller that believes another suite governs).
     pub suite_digest: &'a str,
     pub evaluations: &'a [EvaluationPin],
     pub policy: &'a GatePolicy,
@@ -226,6 +228,13 @@ pub enum GateReason {
         split: EvalSplit,
         evaluation_id: String,
     },
+    /// Another recorded evaluation of the same subject has no receipt (still
+    /// running, or abandoned) or did not reach a verdict. It blocks an accept
+    /// but is not a measured failure, so it suppresses nothing.
+    UnpinnedPending {
+        split: EvalSplit,
+        evaluation_id: String,
+    },
     JudgeConcern {
         reason: String,
     },
@@ -238,6 +247,13 @@ pub enum GateReason {
 impl GateReason {
     /// Whether the reason is a measured defect of the change (as opposed to
     /// evidence too thin or too broken to measure anything).
+    /// Whether the reason comes from another recorded evaluation rather than
+    /// from the pinned ones.
+    #[must_use]
+    pub const fn is_sibling(&self) -> bool {
+        matches!(self, Self::UnpinnedFailure { .. } | Self::UnpinnedPending { .. })
+    }
+
     #[must_use]
     pub const fn is_measured(&self) -> bool {
         matches!(
@@ -273,6 +289,9 @@ impl GateReason {
             Self::Incomplete { split, detail } => format!("incomplete evaluation on {split:?}: {detail}"),
             Self::UnpinnedFailure { split, evaluation_id } => {
                 format!("another recorded {split:?} evaluation does not pass: {evaluation_id}")
+            }
+            Self::UnpinnedPending { split, evaluation_id } => {
+                format!("another recorded {split:?} evaluation has no verdict yet: {evaluation_id}")
             }
             Self::JudgeConcern { reason } => format!("judge concern: {reason}"),
             Self::JudgeUnavailable { detail } => format!("judge did not give a usable answer: {detail}"),
@@ -575,11 +594,20 @@ enum VerifyMode {
     Resume,
 }
 
+/// Another recorded evaluation of the same subject that does not pass.
+struct Sibling {
+    split: EvalSplit,
+    evaluation_id: String,
+    /// A measured failure; otherwise it has no verdict (no receipt, or an
+    /// uncertain outcome).
+    measured: bool,
+}
+
 /// Everything resolved from the pinned evaluations.
 struct Resolved {
     verified: Vec<VerifiedEvaluation>,
     /// Other recorded evaluations of the same subject that do not pass.
-    unpinned: Vec<(EvalSplit, String)>,
+    unpinned: Vec<Sibling>,
     spec: EvalSuite,
 }
 impl SkillLifecycleStore {
@@ -684,10 +712,29 @@ impl SkillLifecycleStore {
         reason: &str,
         also_ok: &[ProposalStatus],
     ) -> Result<SkillProposal, LifecycleError> {
+        self.transition_proposal_in(id, next, reason, also_ok, None)
+    }
+
+    /// Like [`Self::transition_proposal`]; with `epoch` the proposal must still
+    /// be in that evaluation epoch, checked under the lock.
+    fn transition_proposal_in(
+        &self,
+        id: &str,
+        next: ProposalStatus,
+        reason: &str,
+        also_ok: &[ProposalStatus],
+        epoch: Option<u32>,
+    ) -> Result<SkillProposal, LifecycleError> {
         let lock = self.lock_proposals()?;
         let mut proposal = self
             .read_proposal_record(id)?
             .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {id}")))?;
+        if epoch.is_some_and(|epoch| proposal.evaluation_epoch != epoch) {
+            return Err(LifecycleError::ProposalRefused(format!(
+                "proposal {id} moved to evaluation epoch {}; the decision belongs to an earlier one",
+                proposal.evaluation_epoch
+            )));
+        }
         if proposal.status == next || also_ok.contains(&proposal.status) {
             return Ok(proposal);
         }
@@ -826,28 +873,85 @@ impl SkillLifecycleStore {
         verified.sort_by_key(|evaluation| split_order(evaluation.receipt.split));
         let pinned: BTreeSet<&str> = pins.iter().map(|pin| pin.evaluation_id.as_str()).collect();
         let mut unpinned = Vec::new();
+        let is_subject = |skill: &SkillId,
+                          suite_digest: &str,
+                          split: EvalSplit,
+                          candidate_revision: &RevisionId,
+                          baseline: Option<&RevisionId>,
+                          generation: u64| {
+            *skill == proposal.skill_id
+                && suite_digest == governing
+                && split != EvalSplit::Development
+                && candidate_revision == candidate
+                && baseline == Some(&proposal.baseline_revision)
+                && generation == proposal.expected_generation
+        };
+        // Every evaluation of the subject counts, whenever it started: a new
+        // proposal with identical content does not get a fresh start. The
+        // reservation (written before the first run) attributes an evaluation
+        // that has no receipt; a receipt of another subject, readable or not,
+        // never fails this gate.
         for id in self.list_evaluation_ids()? {
             if pinned.contains(id.as_str()) {
                 continue;
             }
-            let receipt = match self.read_sealed_receipt(&id) {
-                Ok((receipt, _)) => receipt,
-                Err(EvaluationError::NotFound(_)) => continue,
-                Err(other) => return Err(other.into()),
-            };
-            let same_subject = receipt.skill_id == proposal.skill_id
-                && receipt.suite_digest == governing
-                && receipt.split != EvalSplit::Development
-                && receipt.candidate.revision_id == *candidate
-                && receipt.baseline.as_ref().map(|arm| &arm.revision_id) == Some(&proposal.baseline_revision)
-                && receipt.observed_generation == proposal.expected_generation
-                && receipt.started_at >= since;
-            if !same_subject {
+            let attempt = self.read_attempt(&id);
+            let attributed = attempt.as_ref().and_then(|a| {
+                Some(is_subject(
+                    &a.skill_id,
+                    &a.suite_digest,
+                    a.split,
+                    a.candidate_revision.as_ref()?,
+                    a.baseline_revision.as_ref(),
+                    a.observed_generation?,
+                ))
+            });
+            if attributed == Some(false) {
                 continue;
             }
-            let sibling = self.verify_evaluation(&id, None)?;
-            if !evaluation_reasons(suite.suite(), policy, &sibling).is_empty() {
-                unpinned.push((receipt.split, id));
+            match self.read_sealed_receipt(&id) {
+                Ok((receipt, _)) => {
+                    if attributed.is_none()
+                        && !is_subject(
+                            &receipt.skill_id,
+                            &receipt.suite_digest,
+                            receipt.split,
+                            &receipt.candidate.revision_id,
+                            receipt.baseline.as_ref().map(|arm| &arm.revision_id),
+                            receipt.observed_generation,
+                        )
+                    {
+                        continue;
+                    }
+                    let measured = match self.verify_evaluation(&id, None) {
+                        Ok(sibling) => {
+                            let reasons = evaluation_reasons(suite.suite(), policy, &sibling);
+                            if reasons.is_empty() {
+                                continue;
+                            }
+                            reasons.iter().any(GateReason::is_measured)
+                        }
+                        // A receipt of this subject that does not verify is
+                        // not evidence of a pass.
+                        Err(_) => false,
+                    };
+                    unpinned.push(Sibling {
+                        split: receipt.split,
+                        evaluation_id: id,
+                        measured,
+                    });
+                }
+                // No readable receipt: in flight, abandoned or damaged. It only
+                // counts when the reservation attributes it to this subject.
+                Err(_) => {
+                    if let (Some(true), Some(attempt)) = (attributed, attempt) {
+                        unpinned.push(Sibling {
+                            split: attempt.split,
+                            evaluation_id: id,
+                            measured: false,
+                        });
+                    }
+                }
             }
         }
         // The skill must still be where the proposal found it.
@@ -1034,12 +1138,17 @@ impl SkillLifecycleStore {
     /// Enters a measured rejection in the rejection history and moves the
     /// proposal to the state the stored decision leads to. Both steps are
     /// idempotent.
-    fn settle_gate(&self, gate: RecordedGate) -> Result<GateOutcome, GateError> {
+    pub(super) fn settle_gate(&self, gate: RecordedGate) -> Result<GateOutcome, GateError> {
         let decision = &gate.decision;
         let target = status_for(decision.decision, &decision.reasons);
         let proposal = self
             .read_proposal(&decision.proposal_id)?
             .ok_or_else(|| GateError::Tampered("the gated proposal no longer exists".to_string()))?;
+        if proposal.evaluation_epoch != decision.epoch {
+            return Err(GateError::Unsupported(
+                "the gate decision belongs to an earlier evaluation epoch of the proposal".to_string(),
+            ));
+        }
         let rejection = if target == ProposalStatus::Rejected {
             Some(self.record_rejection(&NewRejection {
                 proposal_id: proposal.proposal_id.clone(),
@@ -1063,7 +1172,8 @@ impl SkillLifecycleStore {
         } else {
             &[]
         };
-        let proposal = self.transition_proposal(&proposal.proposal_id, target, &reason, also_ok)?;
+        let proposal =
+            self.transition_proposal_in(&proposal.proposal_id, target, &reason, also_ok, Some(decision.epoch))?;
         Ok(GateOutcome {
             gate,
             proposal,
@@ -1180,6 +1290,17 @@ impl SkillLifecycleStore {
         }
         let deterministic = deterministic_reasons(&resolved, policy);
         if deterministic != decision.deterministic_reasons {
+            let stored_pinned: Vec<GateReason> = decision
+                .deterministic_reasons
+                .iter()
+                .filter(|reason| !reason.is_sibling())
+                .cloned()
+                .collect();
+            if stored_pinned == pinned_reasons(&resolved, policy) {
+                return Err(GateError::NewFailingEvidence(
+                    "another evaluation of the same subject was recorded after the decision".to_string(),
+                ));
+            }
             return tampered("the recorded reasons differ from the ones recomputed from the receipts");
         }
         let (expected_decision, expected_reasons) = final_decision(&deterministic, decision.judge.as_ref(), policy)?;
@@ -1262,18 +1383,41 @@ fn expiry_of(decided_at: DateTime<Utc>, policy: &GatePolicy) -> DateTime<Utc> {
     decided_at.checked_add_signed(valid_for).unwrap_or(decided_at)
 }
 
-/// All deterministic reasons: the pinned evaluations' own, plus one for every
-/// other recorded evaluation of the same subject that does not pass.
-fn deterministic_reasons(resolved: &Resolved, policy: &GatePolicy) -> Vec<GateReason> {
-    let mut reasons: Vec<GateReason> = resolved
+/// Reasons of the pinned evaluations themselves.
+fn pinned_reasons(resolved: &Resolved, policy: &GatePolicy) -> Vec<GateReason> {
+    resolved
         .verified
         .iter()
         .flat_map(|evaluation| evaluation_reasons(&resolved.spec, policy, evaluation))
-        .collect();
-    reasons.extend(resolved.unpinned.iter().map(|(split, id)| GateReason::UnpinnedFailure {
-        split: *split,
-        evaluation_id: id.clone(),
-    }));
+        .collect()
+}
+
+/// One reason for every other recorded evaluation of the same subject that does
+/// not pass: a measured failure rejects, one without a verdict is uncertain.
+fn sibling_reasons(resolved: &Resolved) -> Vec<GateReason> {
+    resolved
+        .unpinned
+        .iter()
+        .map(|sibling| {
+            if sibling.measured {
+                GateReason::UnpinnedFailure {
+                    split: sibling.split,
+                    evaluation_id: sibling.evaluation_id.clone(),
+                }
+            } else {
+                GateReason::UnpinnedPending {
+                    split: sibling.split,
+                    evaluation_id: sibling.evaluation_id.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// All deterministic reasons.
+fn deterministic_reasons(resolved: &Resolved, policy: &GatePolicy) -> Vec<GateReason> {
+    let mut reasons = pinned_reasons(resolved, policy);
+    reasons.extend(sibling_reasons(resolved));
     reasons
 }
 

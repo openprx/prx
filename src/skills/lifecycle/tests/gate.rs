@@ -43,8 +43,12 @@ fn policy() -> GatePolicy {
 /// Stores a proposal for the fixture's candidate, staged and `Evaluating`
 /// under `suite`.
 fn evaluating_proposal(fx: &Fixture, suite: &FrozenSuite) -> SkillProposal {
+    evaluating_proposal_as(fx, suite, "request-1")
+}
+
+fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -> SkillProposal {
     let owner = fx.store.owner_scope().clone();
-    let id = proposal_id_of(&owner, "request-1");
+    let id = proposal_id_of(&owner, request_id);
     let bundle = fx
         .store
         .read_revision(&skill(), &fx.candidate, None)
@@ -56,7 +60,7 @@ fn evaluating_proposal(fx: &Fixture, suite: &FrozenSuite) -> SkillProposal {
         record_id: id.clone(),
         owner_scope: owner,
         proposal_id: id.clone(),
-        request_id: "request-1".to_string(),
+        request_id: request_id.to_string(),
         operation: ProposalOperation::Revise,
         skill_id: skill(),
         requested_patterns: Vec::new(),
@@ -1390,4 +1394,169 @@ async fn publication_verification_refuses_a_reject_and_the_policy_pins_the_judge
         .await
         .expect("test: gate");
     assert_eq!(outcome.gate.decision.decision, GateDecision::Accept);
+}
+
+// ---- evaluations without a verdict, windows, epochs ---------------------------
+
+fn reserve_for(fx: &Fixture, suite: &FrozenSuite, candidate: &crate::skills::lifecycle::RevisionId) -> String {
+    let id = super::super::evaluate::new_evaluation_id();
+    fx.store
+        .reserve_attempt(suite, EvalSplit::Validation, &id, candidate, Some(&fx.baseline), 1)
+        .expect("test: reserve");
+    id
+}
+
+#[tokio::test]
+async fn an_evaluation_without_a_receipt_blocks_an_accept_but_suppresses_nothing() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    // A second run was started (or abandoned) and never wrote a receipt.
+    let pending = reserve_for(&fx, &suite, &fx.candidate);
+    let outcome = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: gate");
+    assert_eq!(outcome.gate.decision.decision, GateDecision::Reject);
+    assert!(
+        outcome.gate.decision.reasons.iter().any(|r| matches!(
+            r,
+            GateReason::UnpinnedPending { evaluation_id, .. } if *evaluation_id == pending
+        )),
+        "{:?}",
+        outcome.gate.decision.reasons
+    );
+    assert_eq!(outcome.proposal.status, ProposalStatus::Inconclusive);
+    assert!(outcome.rejection.is_none());
+}
+
+#[tokio::test]
+async fn evaluations_of_other_subjects_never_block_or_break_a_gate() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    let other = write_revision(&fx.store, "ANSWER=other");
+    let foreign = reserve_for(&fx, &suite, &other.0);
+    // Its receipt is garbage; it belongs to another candidate, so it is not read.
+    std::fs::write(
+        fx.store.root().join("evaluations").join(&foreign).join("receipt.json"),
+        b"not json",
+    )
+    .expect("test: corrupt receipt");
+    let outcome = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: gate");
+    assert_eq!(outcome.gate.decision.decision, GateDecision::Accept);
+}
+
+#[tokio::test]
+async fn a_retry_with_a_new_evaluation_after_an_uncertain_one_is_uncertain_not_a_rejection() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let proposal = evaluating_proposal(&fx, &suite);
+    let broken = Scripted::new(|r| {
+        let mut o = good(r);
+        if r.prompt.contains("number 1") {
+            o.response = String::new();
+        }
+        Ok(o)
+    });
+    let first = evaluate(&fx, &suite, &broken).await;
+    mark_evaluated(&fx, &proposal);
+    let one = gate(&fx, &proposal, &suite, &[first], &policy(), None)
+        .await
+        .expect("test: first gate");
+    assert_eq!(one.proposal.status, ProposalStatus::Inconclusive);
+    // A new epoch with a fresh evaluation: the uncertain one still counts, so
+    // the retry cannot accept, and it is not a measured rejection either.
+    fx.store
+        .begin_evaluation(&proposal.proposal_id, suite.digest(), "retry")
+        .expect("test: new epoch");
+    let second = evaluate(&fx, &suite, &all_better()).await;
+    mark_evaluated(&fx, &proposal);
+    let two = gate(&fx, &proposal, &suite, &[second], &policy(), None)
+        .await
+        .expect("test: second gate");
+    assert_eq!(two.gate.decision.decision, GateDecision::Reject);
+    assert!(
+        two.gate
+            .decision
+            .reasons
+            .iter()
+            .any(|r| matches!(r, GateReason::UnpinnedPending { .. }))
+    );
+    assert_eq!(two.proposal.status, ProposalStatus::Inconclusive);
+    assert!(two.rejection.is_none());
+    assert_eq!(
+        fx.store.rejections_for(&skill()).expect("test: rejections"),
+        Vec::<RejectionRecord>::new()
+    );
+}
+
+#[tokio::test]
+async fn a_new_proposal_with_the_same_content_does_not_get_a_fresh_start() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    // The first proposal evaluates the candidate, fails, and is never gated.
+    let _first = evaluating_proposal_as(&fx, &suite, "request-1");
+    let failing = evaluate(&fx, &suite, &tie()).await;
+    // A second proposal with the identical bundle evaluates it again and passes.
+    let second = evaluating_proposal_as(&fx, &suite, "request-2");
+    let passing = evaluate(&fx, &suite, &all_better()).await;
+    mark_evaluated(&fx, &second);
+    let outcome = gate(&fx, &second, &suite, &[passing], &policy(), None)
+        .await
+        .expect("test: gate");
+    assert_eq!(outcome.gate.decision.decision, GateDecision::Reject);
+    assert!(
+        outcome.gate.decision.reasons.iter().any(|r| matches!(
+            r,
+            GateReason::UnpinnedFailure { evaluation_id, .. } if *evaluation_id == failing.evaluation_id
+        )),
+        "{:?}",
+        outcome.gate.decision.reasons
+    );
+}
+
+#[tokio::test]
+async fn new_failing_evidence_after_an_accept_has_its_own_error() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
+    let outcome = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: gate");
+    fx.store
+        .verify_gate(
+            &outcome.gate.decision.record_id,
+            &outcome.gate.digest,
+            &policy(),
+            suite.digest(),
+        )
+        .expect("test: verifies before");
+    evaluate(&fx, &suite, &tie()).await;
+    assert!(matches!(
+        fx.store.verify_gate(
+            &outcome.gate.decision.record_id,
+            &outcome.gate.digest,
+            &policy(),
+            suite.digest()
+        ),
+        Err(GateError::NewFailingEvidence(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_decision_cannot_settle_a_proposal_that_moved_to_another_epoch() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let (proposal, pin) = evaluated(&fx, &suite, &tie()).await;
+    let outcome = gate(&fx, &proposal, &suite, &[pin], &policy(), None)
+        .await
+        .expect("test: gate");
+    edit_proposal(&fx, &proposal.proposal_id, |p| {
+        p.status = ProposalStatus::Evaluated;
+        p.evaluation_epoch = 2;
+    });
+    assert!(fx.store.settle_gate(outcome.gate).is_err());
+    assert_eq!(status(&fx, &proposal), ProposalStatus::Evaluated);
 }

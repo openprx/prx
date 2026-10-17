@@ -172,7 +172,14 @@ impl SkillLifecycleStore {
         let evaluation_id = new_evaluation_id();
         // Everything that can be refused has been; from here the attempt is
         // spent whatever happens (see `reserve_attempt`).
-        self.reserve_attempt(&suite, request.split, &evaluation_id)?;
+        self.reserve_attempt(
+            &suite,
+            request.split,
+            &evaluation_id,
+            &request.candidate,
+            request.baseline.as_ref(),
+            request.observed_generation,
+        )?;
         let denied_paths = [self.root().to_path_buf()];
         let context = CaseContext {
             owner: self.owner_scope(),
