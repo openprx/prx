@@ -1231,7 +1231,7 @@ impl TurnDecisionContext {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
-                if !self.execution_closed.load(Ordering::Acquire) && Instant::now() < self.engine.deadline =>
+                if !self.execution_closed.load(Ordering::Acquire) =>
             {
                 Ok(TurnDisposition::Run)
             }
@@ -4188,6 +4188,8 @@ mod tests {
                 .expect("unshared returned context")
                 .engine
                 .deadline = Instant::now();
+            assert!(matches!(expired.disposition(), Ok(TurnDisposition::Run)));
+            let _ = expired.terminal_execution_trace();
             assert!(matches!(expired.disposition(), Err(DirectiveError::NotAdmitted)));
         }
     }

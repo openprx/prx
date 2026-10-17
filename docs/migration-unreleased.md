@@ -11,7 +11,8 @@ live in the linked pages and in the `[Unreleased]` section of the
 | Change | Action | Required |
 | --- | --- | --- |
 | Matrix is opt-in (`channel-matrix` Cargo feature) | Source builders that use a `[channels_config.matrix]` channel must build with `--features channel-matrix`. Prebuilt default and release binaries omit Matrix. | Only with Matrix configured |
-| `[causal_tree]` schema (decision plane) and new default `enabled = true` | An old file is mapped on load and rewritten on the next save. **The decision plane turns on after upgrade** when the file has no `schema_version` and its `enabled = false` is the old default (the merged `[causal_tree]` table holds nothing but `enabled = false`, as the old `prx init` template wrote, or it also holds a legacy-only key: `w_confidence`, `write_decision_log`, `write_metrics`, or `policy.max_branches` / `rehearsal_timeout_ms` / `default_side_effect_mode` / `circuit_breaker_threshold` / `circuit_breaker_cooldown_secs`): that false is dropped as unset. An unversioned `enabled = false` alongside other `causal_tree` keys (including in a `config.d` fragment) stays off. To keep it off, set `schema_version = 1` and `enabled = false` (example below). Fix any file refused with a file/key error as listed in the changelog. | Only to keep it off, or if the load is refused |
+| `[causal_tree]` schema (decision plane) and new default `enabled = true` | An old file is mapped on load and rewritten on the next save. **The decision plane turns on after upgrade** when the file has no `schema_version` and its `enabled = false` is the old default (the merged `[causal_tree]` table holds nothing but `enabled = false`, as the old `prx init` template wrote, or it also holds a legacy-only key: `w_confidence`, `write_decision_log`, `write_metrics`, or `policy.max_branches` / `rehearsal_timeout_ms` / `default_side_effect_mode` / `circuit_breaker_threshold` / `circuit_breaker_cooldown_secs`): that false is dropped as unset. An unversioned `enabled = false` alongside other `causal_tree` keys (including in a `config.d` fragment) stays off. To keep it off, set the current `schema_version = 2` and `enabled = false` (example below). Fix any file refused with a file/key error as listed in the changelog. | Only to keep it off, or if the load is refused |
+| Serialized 500 ms decision latency budget | Schema 1 saves wrote `causal_tree.policy.extra_latency_budget_ms = 500` even when the operator never set it. The one-time schema 1 to 2 migration treats that exact value as unset, and a hosted decision backend adopts its catalog recommendation on the next backend change. Reapply 500 under schema 2 only if that lower budget is intentional; it then remains explicit, and PRX warns when it is below the selected backend's recommendation. | Only to retain an intentional 500 ms override |
 | `agent.tool_dispatcher` is never read | Delete the key. It still loads and logs a deprecation warning. | No |
 | `causal_tree.observability.*` removed | Delete the section. A file that carries it still loads; the keys are dropped and the load logs which. Choose the `[observability]` backend to control where decision events go. | No |
 
@@ -54,7 +55,7 @@ rehearsal_timeout_ms = 300
 
 # after
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = true
 
 [causal_tree.policy]
@@ -73,7 +74,7 @@ enabled = false
 
 # after (explicit, stays off)
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = false
 ```
 

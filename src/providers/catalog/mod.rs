@@ -451,16 +451,6 @@ impl CatalogView {
     }
 }
 
-/// Apply embedded release facts at a runtime seam that has no full config.
-#[must_use]
-pub fn release_provider_capabilities(
-    provider: &str,
-    model: &str,
-    adapter: crate::providers::ProviderCapabilities,
-) -> crate::providers::ProviderCapabilities {
-    CatalogView::release_only().effective_provider_capabilities(provider, model, adapter)
-}
-
 /// Apply the catalog evidence precedence for one operation or feature.
 fn choose_capability(catalog: Support, discovered: Support, declared: Support) -> Support {
     match discovered {

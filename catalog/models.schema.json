@@ -174,7 +174,9 @@
       "properties": {
         "above_input_tokens": { "type": "integer", "minimum": 1 },
         "input": { "type": "number", "minimum": 0 },
-        "output": { "type": "number", "minimum": 0 }
+        "output": { "type": "number", "minimum": 0 },
+        "cache_write": { "type": "number", "minimum": 0 },
+        "cache_read": { "type": "number", "minimum": 0 }
       }
     },
     "parameterName": {

@@ -10,7 +10,7 @@ See [configuration](configuration.md), [tools](tools.md),
 ## Enable, disable and rollback
 
 This staged candidate defaults `[causal_tree].enabled` to `true`; the full init
-template writes `schema_version = 1` and `enabled = true` together. Adoption and
+template writes `schema_version = 2` and `enabled = true` together. Adoption and
 acceptance remain pending. Remote processing still defaults to disabled, and
 configured transports require source-owned estimated budget admission and actual
 per-attempt accounting, as described below.
@@ -19,7 +19,7 @@ An explicit disable must retain the version marker:
 
 ```toml
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = false
 ```
 
@@ -97,11 +97,17 @@ the builtin brief-request bound. If the runtime has no current
 `capability_search` backend, it omits that control instead of failing the Answer.
 An Answer that follows a successful selected Memory, Document or Session read
 consumes the admitted evidence and keeps the bounded Direct core, so the serving
-model can perform a subsequent ordinary operation. The read does not reopen
-Searchable tools or discovery. An Answer turn may also publish an exactly named
-`delegate` or `sessions_spawn` on any surface that admits delegation, even when
-that delegator is Searchable rather than configured as Direct, but only when the
-same decision carries a sealed child manifest.
+model can perform a subsequent ordinary operation. The read does not itself
+authorize a Searchable tool. The generic `capability_search` control can remain
+published when the original input independently meets the normal structural or
+length criteria; a search result still needs a fresh nonterminal selection and
+all execution gates. When `[causal_tree].enabled = false`, there is no discovery
+hop, so one exactly named, current Searchable capability is published directly
+for legacy compatibility; exclusions, freshness, model and execution gates
+still apply, and no peer capability is widened. An Answer turn may also publish
+an exactly named `delegate` or `sessions_spawn` on any surface that admits
+delegation, even when that delegator is Searchable rather than configured as
+Direct, but only when the same decision carries a sealed child manifest.
 Interactive Chat additionally places `sessions_spawn` in its Direct core.
 Exclusions, tools-off, read-only and plan interception still remove entries, and
 publication alone never executes one. Channel and gateway turns use these shared
@@ -142,6 +148,12 @@ remaining declared token allowance at the highest applicable PMM rate, and
 checks the original token, latency and monetary limits before dispatch.
 The estimate is not a vendor-enforced billing cap. Each retry has its own durable
 reservation; builtin and cache-only paths do not open the cost ledger.
+If cancellation or a deadline prevents a completed reservation from reaching
+the transport, its unique unclaimed owner releases that unsent estimate and
+restores the local allowance before cleanup completes. The journal records this
+as `estimated_unsent_v1`; older builds that do not recognize that event fail
+closed on that workspace ledger. Once the transport receives the receipt,
+missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Missing, partial or estimated

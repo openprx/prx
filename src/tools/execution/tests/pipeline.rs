@@ -70,6 +70,7 @@ fn parity_availability_fact_preserves_live_state_and_adapter_reasons() {
                 adapter.categories(),
                 |name| adapter.adapter_kind(name),
                 availability,
+                adapter.process_worker_compatible(),
             );
             assert_eq!(
                 descriptor.availability.level,

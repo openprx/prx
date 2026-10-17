@@ -310,10 +310,23 @@ pub(crate) fn usage_cost_resolution(
         return UsagePrice::Priced(cost);
     }
 
+    let provider_id = crate::providers::ProviderId::of(provider);
+    if provider_id.catalog_name() == Some("openrouter") {
+        // Operator overrides above remain authoritative. Without one, the
+        // free variant has no token charge, while the deprecated online
+        // variant adds separately billed search that this token-only tariff
+        // cannot represent safely.
+        if model.trim().ends_with(":free") {
+            return UsagePrice::Priced(0.0);
+        }
+        if model.trim().ends_with(":online") {
+            return UsagePrice::Missing;
+        }
+    }
+
     let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
         return UsagePrice::Missing;
     };
-    let provider_id = crate::providers::ProviderId::of(provider);
     let direct_pricing = catalog
         .model(&provider_id, model)
         .and_then(|entry| entry.pricing.as_ref());
@@ -336,8 +349,8 @@ pub(crate) fn usage_cost_resolution(
     let catalog_pricing = crate::config::schema::ModelPricing {
         input: tier.map_or(pricing.input, |tier| tier.input),
         output: tier.map_or(pricing.output, |tier| tier.output),
-        cache_write: pricing.cache_write,
-        cache_read: pricing.cache_read,
+        cache_write: tier.and_then(|tier| tier.cache_write).unwrap_or(pricing.cache_write),
+        cache_read: tier.and_then(|tier| tier.cache_read).unwrap_or(pricing.cache_read),
     };
     turn_cost(&catalog_pricing).map_or(UsagePrice::Invalid, UsagePrice::Priced)
 }
@@ -1548,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_uses_upstream_catalog_tariff_when_its_row_has_no_duplicate_price() {
+    fn openrouter_uses_upstream_catalog_tariff_but_keeps_variant_charges_distinct() {
         let config = crate::config::schema::CostConfig::default();
         assert!(config.prices.is_empty(), "operator price overrides start empty");
 
@@ -1566,8 +1579,47 @@ mod tests {
         ));
         assert!(matches!(
             usage_cost_resolution("openrouter", "openai/gpt-5.6:free", 64, 64, 0, 0, &config),
-            UsagePrice::Priced(cost) if cost > 0.0
+            UsagePrice::Priced(0.0)
         ));
+        assert_eq!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6:online", 64, 64, 0, 0, &config),
+            UsagePrice::Missing
+        );
+    }
+
+    #[test]
+    fn release_billing_uses_published_input_and_output_not_router_ranking_cost() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let model = catalog
+            .model(&crate::providers::ProviderId::of("anthropic"), "claude-opus-4-8")
+            .expect("published priced model");
+        let pricing = model.pricing.as_ref().expect("published tariff");
+        let ranking_cost = model.router.as_ref().expect("router hint").cost_per_million_tokens;
+        assert_ne!(pricing.input, pricing.output, "fixture needs a distinct output tariff");
+        assert_eq!(
+            ranking_cost, pricing.input,
+            "fixture makes accidental ranking reuse observable"
+        );
+
+        let resolved = usage_cost_resolution(
+            "anthropic",
+            "claude-opus-4-8",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            &crate::config::schema::CostConfig::default(),
+        );
+        assert_eq!(resolved, UsagePrice::Priced(pricing.input + pricing.output));
+    }
+
+    #[test]
+    fn gemini_long_context_tier_prices_output_and_cached_input() {
+        let config = crate::config::schema::CostConfig::default();
+        let short = usage_cost_resolution("gemini", "gemini-2.5-pro", 200_000, 1_000_000, 0, 200_000, &config);
+        let long = usage_cost_resolution("gemini", "gemini-2.5-pro", 1_000_000, 1_000_000, 0, 1_000_000, &config);
+        assert!(matches!(short, UsagePrice::Priced(cost) if (cost - 10.025).abs() < 1e-12));
+        assert!(matches!(long, UsagePrice::Priced(cost) if (cost - 15.25).abs() < 1e-12));
     }
 
     #[test]

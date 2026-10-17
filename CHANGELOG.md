@@ -50,11 +50,11 @@ for integration, validation and rollback limits.
 
 - `[causal_tree]` has a new schema (the decision plane). A configuration
   written by an earlier release is mapped on load and written in the new form
-  on the next save, with `schema_version = 1`. Keys left at their old default
+  on the next save, currently with `schema_version = 2`. Keys left at their old default
   take the new default. Other values move to their new home, for example
   `policy.max_branches` to `policy.max_candidates` and
   `policy.rehearsal_timeout_ms` to `rehearsal.timeout_ms`. Under D-073/D-074,
-  versioned `schema_version = 1` plus `enabled = false` stays disabled, including
+  versioned schema 1 or current schema 2 plus `enabled = false` stays disabled, including
   an init-default sidecar that also records false. Only recognized unversioned
   legacy-default signatures, including the old bare false template, treat that
   false as unset; unversioned false with modern non-legacy settings stays
@@ -125,6 +125,13 @@ for integration, validation and rollback limits.
   existing skill directory.
 
 ### Fixed
+
+- Existing configurations no longer mistake the previously serialized 500 ms
+  decision latency default for an operator override when selecting a hosted
+  decision backend. Published cache and long-context tariffs are retained in
+  billing, OpenRouter `:free` is zero-cost while `:online` remains explicitly
+  unpriced, automatic Router candidates exclude retired or unpriced rows, and
+  onboarding marks selections that need a `[cost.prices]` override.
 
 - OpenRouter's release default and recognized upstream models remain
   cost-admissible when `[cost.prices]` is empty. Router ranking estimates are

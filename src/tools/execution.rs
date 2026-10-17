@@ -61,6 +61,9 @@ pub trait ToolBackend: Send + Sync {
     fn supports_owner_filesystem(&self) -> bool {
         false
     }
+    fn process_worker_compatible(&self) -> bool {
+        true
+    }
     fn root_name(&self) -> &str;
     fn specs(&self) -> Vec<ToolSpec>;
     fn catalog_specs(&self) -> Vec<ToolSpec> {
@@ -126,6 +129,9 @@ impl SharedRegistryToolAdapter {
 impl ToolBackend for SharedRegistryToolAdapter {
     fn supports_owner_filesystem(&self) -> bool {
         self.tool().is_some_and(Tool::supports_owner_filesystem)
+    }
+    fn process_worker_compatible(&self) -> bool {
+        self.tool().is_some_and(Tool::process_worker_compatible)
     }
     async fn resolve_approval_operation(
         &self,
@@ -228,6 +234,9 @@ impl ToolBackend for LegacyToolAdapter {
     fn supports_owner_filesystem(&self) -> bool {
         self.tool.supports_owner_filesystem()
     }
+    fn process_worker_compatible(&self) -> bool {
+        self.tool.process_worker_compatible()
+    }
     async fn resolve_approval_operation(
         &self,
         public_name: &str,
@@ -321,9 +330,15 @@ pub struct ToolDescriptor {
     pub categories: Vec<ToolCategory>,
     pub effect: ToolEffect,
     pub adapter: ToolAdapterKind,
+    #[serde(default = "process_worker_compatible_by_default")]
+    pub process_worker_compatible: bool,
     /// Evidence-backed runtime availability. Registered executable tools are
     /// `Ready`; `Healthy` is reserved for a positive runtime probe.
     pub availability: CapabilityAvailability,
+}
+
+const fn process_worker_compatible_by_default() -> bool {
+    true
 }
 
 /// Fresh executable spec for one parity pass. The backend identity is borrowed
@@ -1293,6 +1308,7 @@ impl ToolCatalog {
                         backend.categories(),
                         |public_name| backend.adapter_kind(public_name),
                         backend.availability(),
+                        backend.process_worker_compatible(),
                     )
                 })
             })
@@ -1334,6 +1350,7 @@ impl ToolCatalog {
                             }
                         },
                         tool.availability(),
+                        tool.process_worker_compatible(),
                     )
                 })
             })
@@ -1395,6 +1412,7 @@ fn tool_descriptor(
     categories: Vec<ToolCategory>,
     adapter_kind: impl FnOnce(&str) -> ToolAdapterKind,
     availability: CapabilityAvailability,
+    process_worker_compatible: bool,
 ) -> ToolDescriptor {
     let adapter = adapter_kind(&spec.name);
     let effect = if backend_name == "skill_read" || crate::security::policy::is_read_only_tool(&spec.name) {
@@ -1424,6 +1442,7 @@ fn tool_descriptor(
         categories,
         effect,
         adapter,
+        process_worker_compatible,
         availability: if availability.reason.trim().is_empty() {
             CapabilityAvailability::ready(format!(
                 "executable {adapter_label} backend '{backend_name}' is registered"
@@ -1601,6 +1620,7 @@ impl ToolExecutionService {
                 backend.categories(),
                 |name| backend.adapter_kind(name),
                 backend.availability(),
+                backend.process_worker_compatible(),
             );
             if resolved.is_some() {
                 // A dynamic name with more than one live owner is ambiguous.
@@ -1681,6 +1701,7 @@ impl ToolExecutionService {
                         backend.categories(),
                         |name| backend.adapter_kind(name),
                         backend.availability(),
+                        backend.process_worker_compatible(),
                     )
                 })
             })

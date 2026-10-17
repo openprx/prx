@@ -1675,7 +1675,7 @@ mod tests {
 
         for config in [manager.load_full(), Arc::clone(&manager.desired().config)] {
             let causal = &config.causal_tree;
-            assert_eq!(causal.schema_version, 1);
+            assert_eq!(causal.schema_version, 2);
             assert_eq!(causal.policy.max_candidates, 5);
             assert_eq!(causal.rehearsal.timeout_ms, 80);
             assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
