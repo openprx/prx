@@ -3425,8 +3425,8 @@ fn production_turns_pass_a_context_budget_to_the_loop_engine() {
 /// source text shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionSource {
-    /// The call reaches `resolve_effective_compaction_config` or a
-    /// `CompactionResolver`: the served model's effective window.
+    /// The call reaches a reviewed effective-window resolver or owner:
+    /// the served model's effective window.
     Effective,
     /// The call reaches the raw `[agent.compaction]` table (or a default one)
     /// without passing through a resolver: the base window.
@@ -3445,7 +3445,6 @@ const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &[
     "decided.service.effective_compaction(",
     "decision.service.effective_compaction(",
     "service.effective_compaction(",
-    "compaction_resolver.resolve(",
 ];
 
 /// Text that names the base window directly.
@@ -10178,6 +10177,7 @@ fn mutation_proof_compaction_producer_guard() {
     for expression in [
         "unreviewed.effective_compaction()",
         "unreviewed.admitted_binding.effective_compaction()",
+        "compaction_resolver.resolve(provider, model)",
     ] {
         assert_eq!(
             classify_compaction_argument("", expression, 0),
