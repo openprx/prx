@@ -430,11 +430,19 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
                     {
                         section.backend.timeout_ms = recommended;
                     }
-                    if !section.policy.extra_latency_budget_ms_explicit
-                        && let Some(recommended) = entry.transport.extra_latency_budget_ms
-                    {
-                        section.policy.extra_latency_budget_ms = recommended;
-                        section.policy.extra_latency_budget_ms_explicit = true;
+                    if let Some(recommended) = entry.transport.extra_latency_budget_ms {
+                        if !section.policy.extra_latency_budget_ms_explicit {
+                            section.policy.extra_latency_budget_ms = recommended;
+                            section.policy.extra_latency_budget_ms_explicit = true;
+                        } else if section.policy.extra_latency_budget_ms < recommended {
+                            tracing::warn!(
+                                configured_ms = section.policy.extra_latency_budget_ms,
+                                recommended_ms = recommended,
+                                provider = %selection.provider,
+                                model = %model,
+                                "the configured decision latency budget is below the release catalog recommendation"
+                            );
+                        }
                     }
                 }
                 declare_decision_model(config, &selection.provider, &model);

@@ -179,6 +179,10 @@ pub struct CatalogPriceTier {
     pub above_input_tokens: u64,
     pub input: f64,
     pub output: f64,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
 }
 
 /// Per-million-token prices shipped by a release.
@@ -794,6 +798,8 @@ fn validate_model_shape(model: &ReleaseModel) -> Result<(), ReleaseCatalogError>
                     || tier.input < 0.0
                     || !tier.output.is_finite()
                     || tier.output < 0.0
+                    || tier.cache_write.is_some_and(|price| !price.is_finite() || price < 0.0)
+                    || tier.cache_read.is_some_and(|price| !price.is_finite() || price < 0.0)
             })
         {
             return Err(ReleaseCatalogError::new("catalog pricing is invalid"));

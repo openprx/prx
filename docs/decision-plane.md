@@ -10,7 +10,7 @@ See [configuration](configuration.md), [tools](tools.md),
 ## Enable, disable and rollback
 
 This staged candidate defaults `[causal_tree].enabled` to `true`; the full init
-template writes `schema_version = 1` and `enabled = true` together. Adoption and
+template writes `schema_version = 2` and `enabled = true` together. Adoption and
 acceptance remain pending. Remote processing still defaults to disabled, and
 configured transports require source-owned estimated budget admission and actual
 per-attempt accounting, as described below.
@@ -19,7 +19,7 @@ An explicit disable must retain the version marker:
 
 ```toml
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = false
 ```
 

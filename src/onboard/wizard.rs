@@ -687,9 +687,45 @@ fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> R
                     unproven.join(", ")
                 );
             }
+            if let Ok(release) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                && let Some(model) = release.model(
+                    &crate::providers::ProviderId::of(resolved.provider_label()),
+                    resolved.model(),
+                )
+                && model_has_no_billing_tariff(resolved.provider_label(), model, &config.cost)
+            {
+                println!(
+                    "  {} model '{}' has no published token tariff; add an exact `[cost.prices]` entry before \
+                     cost-admitted use.",
+                    style("!").yellow().bold(),
+                    resolved.model()
+                );
+            }
             Ok(())
         }
         Err(refusal) => bail!("{refusal}. Nothing was written."),
+    }
+}
+
+fn model_has_no_billing_tariff(
+    provider: &str,
+    model: &crate::providers::catalog::ReleaseModel,
+    cost: &crate::config::schema::CostConfig,
+) -> bool {
+    matches!(
+        crate::llm::route_decision::usage_cost_resolution(provider, &model.api_model, 1, 1, 0, 0, cost,),
+        crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid
+    )
+}
+
+fn onboarding_model_warning(provider: &str, model: &crate::providers::catalog::ReleaseModel) -> Option<String> {
+    let lifecycle = model.selection_warning();
+    let pricing = model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
+        .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned());
+    match (lifecycle, pricing) {
+        (Some(lifecycle), Some(pricing)) => Some(format!("{lifecycle}; {pricing}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
     }
 }
 
@@ -722,7 +758,7 @@ fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             .listed_models(provider)
             .into_iter()
             .map(|model| {
-                let label = model.selection_warning().map_or_else(
+                let label = onboarding_model_warning(provider, model).map_or_else(
                     || model.display_name.clone(),
                     |warning| format!("{} ({warning})", model.display_name),
                 );
@@ -1169,13 +1205,14 @@ fn humanize_age(age_secs: u64) -> String {
 }
 
 fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
-    let provider = crate::providers::ProviderId::of(canonical_provider_name(provider_name));
+    let provider_name = canonical_provider_name(provider_name);
+    let provider = crate::providers::ProviderId::of(provider_name);
     let release = crate::providers::catalog::ReleaseCatalog::embedded().ok();
     build_model_options_with_warnings(model_ids, source, |model_id| {
         release
             .as_ref()
             .and_then(|catalog| catalog.model(&provider, model_id))
-            .and_then(crate::providers::catalog::ReleaseModel::selection_warning)
+            .and_then(|model| onboarding_model_warning(provider_name, model))
     })
 }
 
@@ -5535,6 +5572,55 @@ mod tests {
                     "prx-legacy (live; deprecated; use ollama/prx-current)".to_owned(),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn onboarding_labels_catalog_rows_that_have_no_billing_tariff() {
+        for (provider, model) in [
+            ("openrouter", "deepseek/deepseek-v3.2"),
+            ("openrouter", "google/gemini-3.5-flash"),
+            ("openrouter", "meta-llama/llama-4-maverick"),
+            ("openrouter", "openai/gpt-5-mini"),
+            ("openrouter", "x-ai/grok-4.20"),
+            ("gemini", "gemini-3.5-flash"),
+            ("xai", "grok-4.20"),
+        ] {
+            let option = catalog_models_for_provider(provider)
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing onboarding row {provider}/{model}"));
+            assert!(option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        for model in ["anthropic/claude-sonnet-5", "openai/gpt-5.6"] {
+            let option = catalog_models_for_provider("openrouter")
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing priced upstream row {model}"));
+            assert!(!option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let row = release
+            .model(
+                &crate::providers::ProviderId::of("openrouter"),
+                "deepseek/deepseek-v3.2",
+            )
+            .expect("unpriced onboarding row");
+        let mut cost = crate::config::schema::CostConfig::default();
+        cost.prices.insert(
+            "deepseek/deepseek-v3.2".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 0.1,
+                output: 0.2,
+                cache_write: 0.1,
+                cache_read: 0.01,
+            },
+        );
+        assert!(
+            !model_has_no_billing_tariff("openrouter", row, &cost),
+            "an exact operator override must clear the selected-model warning"
         );
     }
 

@@ -1374,7 +1374,6 @@ fn register_gateway_turn_tools(
             Arc::clone(security),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),

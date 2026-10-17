@@ -6,8 +6,6 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
-#[cfg(test)]
-use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -93,9 +91,6 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
-    /// Model-aware compaction resolver inherited from root config.
-    #[cfg(test)]
-    compaction_resolver: Arc<CompactionResolver>,
     /// Shared memory fabric backend for normalized delegation events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -264,10 +259,6 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            #[cfg(test)]
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -297,10 +288,6 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            #[cfg(test)]
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -399,22 +386,6 @@ impl DelegateTool {
     pub const fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
-    }
-
-    /// Attach model-aware compaction resolution for agentic sub-agent loops.
-    #[cfg(test)]
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = Arc::new(resolver);
-        self
-    }
-
-    #[cfg(test)]
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach shared memory so delegate requests/results join the live fabric.
@@ -2147,14 +2118,6 @@ mod tests {
         }
     }
 
-    fn compaction_resolver_with_models(
-        models: Vec<crate::config::RouterModelConfig>,
-    ) -> crate::router::CompactionResolver {
-        let mut router = crate::config::RouterConfig::default();
-        router.models = models;
-        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
-    }
-
     #[test]
     fn name_and_schema() {
         let tool = DelegateTool::new(sample_agents(), test_security());
@@ -3352,13 +3315,13 @@ mod tests {
 
     #[test]
     fn delegate_inline_model_override_drives_child_compaction_resolution() {
-        let tool = DelegateTool::new(single_agent("tester", "openrouter", "config-model"), test_security())
-            .with_compaction_resolver(compaction_resolver_with_models(vec![
-                router_model("openrouter", "config-model", 1_000_000),
-                router_model("openrouter", "inline-small", 200_000),
-            ]));
+        let mut config = crate::config::Config::default();
+        config.router.models = vec![
+            router_model("openrouter", "config-model", 1_000_000),
+            router_model("openrouter", "inline-small", 200_000),
+        ];
 
-        let resolved = tool.resolve_child_compaction("openrouter", "inline-small");
+        let resolved = resolve_pinned_child_compaction(&config, "openrouter", "inline-small");
 
         assert_eq!(resolved.config.max_context_tokens, 200_000);
         assert_eq!(resolved.selected_model, "inline-small");

@@ -8634,7 +8634,7 @@ max_context = 1000000
     }
 
     #[test]
-    async fn load_path_marks_causal_latency_budget_presence_even_at_default_value() {
+    async fn load_path_treats_the_pre_catalog_serialized_latency_default_as_unset() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -8668,8 +8668,22 @@ extra_latency_budget_ms = 500
         .unwrap();
 
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
-        assert!(loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
         assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
+
+        let upgraded = crate::config::manage::mutation::causal::CausalConfigService::mutate(
+            &loaded,
+            &[crate::config::manage::mutation::causal::CausalMutation::SetBackend {
+                kind: crate::decision::BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_owned()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            }],
+        )
+        .expect("a stored old default adopts the hosted catalog budget");
+        assert_eq!(upgraded.causal_tree.policy.extra_latency_budget_ms, 3_000);
+        assert!(upgraded.causal_tree.policy.extra_latency_budget_ms_explicit);
     }
 
     #[test]
@@ -12243,7 +12257,7 @@ circuit_breaker_cooldown_secs = 60
         assert!(saved.contains("enabled = true"), "`enabled` is always written: {saved}");
 
         assert!(
-            saved.contains("schema_version = 1"),
+            saved.contains("schema_version = 2"),
             "the version is always written: {saved}"
         );
 
@@ -12332,7 +12346,7 @@ circuit_breaker_cooldown_secs = 60
             .expect("test: save");
         let saved = saved_text(dir.path());
         assert!(
-            saved.contains("schema_version = 1") && saved.contains("enabled = true"),
+            saved.contains("schema_version = 2") && saved.contains("enabled = true"),
             "{saved}"
         );
     }

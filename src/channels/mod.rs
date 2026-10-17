@@ -5809,7 +5809,6 @@ pub async fn start_channels_with_config(
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),

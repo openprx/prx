@@ -669,13 +669,30 @@ subscription/quota billed, so PRX deliberately does not invent a per-token cost
 for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
 recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
 OpenRouter and proxy pricing remains dynamic except for exact release rows with
-a published price. Router ranking cost is a separate catalog hint and is never
-used as the input/output billing tariff.
+a published price. The release values are checked against the providers'
+published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
+[xAI model metadata](https://docs.x.ai/developers/rest-api-reference/management/auth).
+An uncertain model-specific price is omitted instead of inferred from another
+generation. Router ranking cost is a separate catalog hint and is never used as
+the input/output billing tariff.
+
+OpenRouter `:free` variants settle at zero token cost unless an operator override
+is present. The deprecated `:online` variant stays unpriced because its
+separately billed web-search component is not representable by PRX's token-only
+catalog tariff; use an exact `[cost.prices]` override or migrate to OpenRouter's
+server web-search tool. The variant and its extra search pricing are documented
+by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-search).
 
 `[cost.prices]` is an operator-override table and wins over the release catalog.
 When neither source has a matching price, only `ollama` is treated as zero-cost.
 LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
 `cost.prices` entry before PRX can produce a cost estimate.
+
+The Router's built-in candidates are limited to active release rows with a
+published billing tariff. Retired or unpriced rows remain available only through
+an explicit operator route; they are never automatic candidates. Onboarding
+labels a selectable catalog row when its effective token tariff is unavailable.
 
 The catalog's `ollama/*` entry seeds only the Router's conservative local
 candidate. It does not assert vision, context-window, or verification facts for

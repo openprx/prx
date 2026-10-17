@@ -235,7 +235,6 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         Arc::clone(&security),
         workspace.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         Default::default(),
         None,
         crate::providers::ProviderRuntimeOptions::default(),

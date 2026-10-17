@@ -261,7 +261,6 @@ fn worker_spawn_tool(
         security,
         manifest.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         credentials.spawn_fallback.map(str::to_string),
         options.clone(),

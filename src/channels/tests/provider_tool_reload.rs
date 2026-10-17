@@ -390,7 +390,6 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         security,
         workspace.path().to_owned(),
         generation.effective.multimodal.clone(),
-        generation.effective.agent.compaction.clone(),
         generation.effective.agents_with_references().into_owned(),
         generation.effective.api_key.clone(),
         providers::provider_runtime_options_from_config(&generation.effective),

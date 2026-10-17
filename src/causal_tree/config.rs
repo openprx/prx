@@ -40,9 +40,10 @@ const DEFAULT_MINIMUM_CHOICE_CONFIDENCE: f64 = 0.55;
 const DEFAULT_MINIMUM_TOP_MARGIN: f64 = 0.10;
 const DEFAULT_EXTRA_TOKEN_RATIO_LIMIT: f32 = 0.35;
 const DEFAULT_REHEARSAL_TIMEOUT_MS: u32 = 100;
-/// The `[causal_tree]` schema version this release reads and writes: 1 is
-/// the CDP-PLAN 1.7 schema (D-073). A pre-1.7 file carries no version.
-pub const CAUSAL_CONFIG_SCHEMA_VERSION: u32 = 1;
+/// The `[causal_tree]` schema version this release reads and writes. Version 1
+/// is the CDP-PLAN 1.7 schema (D-073); version 2 marks the one-time migration
+/// of its serialized 500 ms latency default. A pre-1.7 file carries no version.
+pub const CAUSAL_CONFIG_SCHEMA_VERSION: u32 = 2;
 /// The accepted request and response body limits.
 const BODY_BYTES: std::ops::RangeInclusive<u32> = 4 * 1024..=1024 * 1024;
 
@@ -331,12 +332,12 @@ pub struct CausalPolicy {
     pub max_decision_hops: u8,
     /// The extra latency one turn may spend deciding (50 to 5000 ms).
     pub extra_latency_budget_ms: u64,
-    /// Internal presence bit populated while deserializing the policy. A
-    /// stored value equal to the default is still an operator value and must
-    /// not be replaced by a catalog transport recommendation.
+    /// Internal presence bit populated while deserializing the policy. The
+    /// loader removes schema 1's serialized 500 ms default before this point;
+    /// a value present in the current schema, including 500, is operator-owned.
     #[serde(skip)]
     #[schemars(skip)]
-    pub extra_latency_budget_ms_explicit: bool,
+    pub(crate) extra_latency_budget_ms_explicit: bool,
     /// Minimum score to commit a candidate.
     pub commit_threshold: f32,
     /// Minimum confidence of a Choice answer.
@@ -1126,11 +1127,12 @@ fn full_path<'p>(path: &[&'p str]) -> Vec<&'p str> {
 ///   `Config::save`) or nothing but `enabled` (the `prx init` template
 ///   before CDP-03). Otherwise it is an operator's explicit disable.
 ///
-/// The rules that reinterpret a value where it stands, X-3 and the legacy
-/// default of a key that kept its name (`policy.extra_latency_budget_ms =
-/// 300`), apply only to a table without `schema_version`, which predates the
-/// 1.7 schema. In a versioned table every such value is the operator's and
-/// is never rewritten (D-073); CDP-31's default flip reads the same marker.
+/// The X-3 rule and the original legacy default of a key that kept its name
+/// (`policy.extra_latency_budget_ms = 300`) apply only to a table without
+/// `schema_version`, which predates the 1.7 schema. Schema 1 later serialized
+/// the 500 ms default into every saved file before transport-specific catalog
+/// budgets existed, so that exact value is dropped while upgrading to schema
+/// 2. A 500 ms value written in schema 2 is an operator value (D-073).
 ///
 /// # Errors
 ///
@@ -1148,7 +1150,19 @@ pub fn migrate_legacy(root: &mut toml::Value, locate: KeyLocator<'_>) -> Result<
         )
     };
 
-    let versioned = get(table, &["schema_version"]).is_some();
+    let schema_version_value = get(table, &["schema_version"]);
+    let versioned = schema_version_value.is_some();
+    let stored_schema_version = schema_version_value
+        .and_then(toml::Value::as_integer)
+        .and_then(|version| u32::try_from(version).ok());
+    let upgrades_to_current = stored_schema_version == Some(1) || !versioned;
+    if upgrades_to_current
+        && get(table, &["policy", "extra_latency_budget_ms"]).and_then(toml::Value::as_integer)
+            == i64::try_from(DEFAULT_EXTRA_LATENCY_BUDGET_MS).ok()
+    {
+        take(table, &["policy", "extra_latency_budget_ms"]);
+        report.dropped.push("policy.extra_latency_budget_ms");
+    }
     if !versioned && get(table, &["enabled"]).and_then(toml::Value::as_bool) == Some(false) {
         let legacy_save = LEGACY_ONLY_KEYS.iter().any(|path| get(table, path).is_some());
         let bare = table.as_table().is_some_and(|keys| keys.len() == 1);
@@ -1221,6 +1235,13 @@ pub fn migrate_legacy(root: &mut toml::Value, locate: KeyLocator<'_>) -> Result<
             report.dropped.push(name);
         }
     }
+    if upgrades_to_current {
+        insert(
+            table,
+            &["schema_version"],
+            toml::Value::Integer(i64::from(CAUSAL_CONFIG_SCHEMA_VERSION)),
+        );
+    }
     Ok(report)
 }
 
@@ -1236,6 +1257,13 @@ pub(crate) fn normalize_regeneration_document(
         return Ok(());
     };
     let mut changed = false;
+    if get(table, &["schema_version"]).and_then(toml::Value::as_integer) == Some(1) {
+        changed |= insert(
+            table,
+            &["schema_version"],
+            toml::Value::Integer(i64::from(CAUSAL_CONFIG_SCHEMA_VERSION)),
+        );
+    }
     for name in &report.dropped {
         let path = name.split('.').collect::<Vec<_>>();
         changed |= take(table, &path).is_some();
@@ -1334,7 +1362,7 @@ mod tests {
     #[test]
     fn saving_the_defaults_writes_only_the_version_and_enabled() {
         let text = toml::to_string(&valid()).expect("test: serialize");
-        assert_eq!(text.trim(), "schema_version = 1\nenabled = true");
+        assert_eq!(text.trim(), "schema_version = 2\nenabled = true");
 
         let mut config = valid();
         config.rehearsal.timeout_ms = 80;
@@ -1355,7 +1383,7 @@ mod tests {
             0)));
         assert!(range("causal_tree.schema_version")(&broken(|config| config
             .schema_version =
-            2)));
+            3)));
 
         // 1. The endpoint, without echoing it.
         let error = broken(|config| config.backend.endpoint = "https://user:hunter2pw@decisions.example.com/v1".into());
@@ -1755,9 +1783,9 @@ circuit_breaker_cooldown_secs = 60
         assert_eq!(root["causal_tree"].get("enabled"), Some(&toml::Value::Boolean(true)));
     }
 
-    /// D-073: the budget reset and the X-3 rule reinterpret a value, so they
-    /// apply only to a table without `schema_version` (pre-1.7); in a
-    /// versioned table the operator's 300 and `enabled = false` stay.
+    /// D-073: the original 300 ms budget reset and the X-3 rule apply only to
+    /// a pre-versioned file. Schema 1's serialized 500 ms default is unset
+    /// during the schema-2 upgrade; schema-2 values stay explicit.
     #[test]
     fn value_rewrites_apply_only_to_files_before_the_versioned_schema() {
         let mut unversioned = causal(
@@ -1794,6 +1822,34 @@ circuit_breaker_cooldown_secs = 60
         );
         assert!(!config.enabled);
         config.validate().expect("test: 300 is a valid budget");
+
+        let mut serialized_default = causal(
+            "[causal_tree]\nschema_version = 1\nenabled = true\n\
+             [causal_tree.policy]\nextra_latency_budget_ms = 500\n",
+        );
+        let report = migrate_legacy(&mut serialized_default, &nowhere).expect("test: migrates");
+        assert_eq!(report.dropped, ["policy.extra_latency_budget_ms"]);
+        let config: CausalTreeConfig = serialized_default["causal_tree"]
+            .clone()
+            .try_into()
+            .expect("test: loads");
+        assert_eq!(config.policy.extra_latency_budget_ms, DEFAULT_EXTRA_LATENCY_BUDGET_MS);
+        assert!(!config.policy.extra_latency_budget_ms_explicit);
+        assert_eq!(config.schema_version, CAUSAL_CONFIG_SCHEMA_VERSION);
+
+        let mut explicit_current = causal(
+            "[causal_tree]\nschema_version = 2\nenabled = true\n\
+             [causal_tree.policy]\nextra_latency_budget_ms = 500\n",
+        );
+        let report = migrate_legacy(&mut explicit_current, &nowhere).expect("test: current schema stays");
+        assert!(!report.found_legacy_keys(), "{report:?}");
+        let config: CausalTreeConfig = explicit_current["causal_tree"].clone().try_into().expect("test: loads");
+        assert_eq!(config.policy.extra_latency_budget_ms, DEFAULT_EXTRA_LATENCY_BUDGET_MS);
+        assert!(config.policy.extra_latency_budget_ms_explicit);
+
+        let mut invalid_version = causal("[causal_tree]\nschema_version = 0\nenabled = true\n");
+        migrate_legacy(&mut invalid_version, &nowhere).expect("test: migration leaves invalid schema for validation");
+        assert_eq!(invalid_version["causal_tree"]["schema_version"].as_integer(), Some(0));
     }
 
     #[test]
@@ -1947,7 +2003,7 @@ circuit_breaker_cooldown_secs = 120
         };
         config.scoring.weights.w_cost = Some(0.4);
         let json = serde_json::to_value(&config).expect("test: json");
-        assert_eq!(json["schema_version"], serde_json::json!(1));
+        assert_eq!(json["schema_version"], serde_json::json!(2));
         assert!(
             json["policy"].get("extra_latency_budget_ms").is_none(),
             "an implicit default must stay absent"

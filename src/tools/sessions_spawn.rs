@@ -28,8 +28,6 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
-#[cfg(test)]
-use crate::router::CompactionResolver;
 use crate::runtime::chat_sessions::{AssignPrincipal, Disposition};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -1316,9 +1314,6 @@ pub struct SessionsSpawnTool {
     tools: Arc<ParentToolRegistry>,
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
-    /// Model-aware compaction resolver for sub-agent tool call loops.
-    #[cfg(test)]
-    compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     /// Credential issued for `provider_name` (the gateway provider): released
@@ -1491,6 +1486,22 @@ struct BatchRoster {
 /// this field replaced — the pre-existing behaviour, not a new failure.
 const MAX_TRACKED_BATCH_ROSTERS: usize = 256;
 
+fn resolve_pinned_child_compaction(
+    config: &crate::config::Config,
+    catalog: &providers::catalog::CatalogView,
+    provider: &str,
+    model: &str,
+) -> crate::router::context::EffectiveCompactionConfig {
+    crate::router::context::resolve_effective_compaction_config_with_catalog(
+        &config.agent.compaction,
+        provider,
+        model,
+        &config.router,
+        &config.model_routes,
+        catalog,
+    )
+}
+
 impl SessionsSpawnTool {
     fn resolved_process_config_source(
         options: &providers::ProviderRuntimeOptions,
@@ -1532,7 +1543,6 @@ impl SessionsSpawnTool {
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
@@ -1547,7 +1557,6 @@ impl SessionsSpawnTool {
             security,
             workspace_dir,
             multimodal_config,
-            compaction_config,
             agents,
             fallback_api_key,
             provider_runtime_options,
@@ -1574,7 +1583,6 @@ impl SessionsSpawnTool {
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         _multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         _provider_runtime_options: providers::ProviderRuntimeOptions,
@@ -1582,11 +1590,7 @@ impl SessionsSpawnTool {
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
         #[cfg(not(test))]
-        let _ = (provider, compaction_config);
-        #[cfg(test)]
-        let compaction_resolver = CompactionResolver::from_base(compaction_config);
-        #[cfg(test)]
-        tracing::debug!("sessions_spawn initialized child compaction resolver");
+        let _ = provider;
         let provider_name: String = provider_name.into();
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(std::iter::once(provider_name.as_str()))
@@ -1607,8 +1611,6 @@ impl SessionsSpawnTool {
             active_runs,
             tools: Arc::new(ParentToolRegistry::default()),
             workspace_dir,
-            #[cfg(test)]
-            compaction_resolver,
             configured_providers,
             model_catalog: Arc::default(),
             hint_config: None,
@@ -1697,12 +1699,6 @@ impl SessionsSpawnTool {
         Ok(self)
     }
 
-    #[cfg(test)]
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = resolver;
-        self
-    }
-
     #[must_use]
     pub fn with_cost_config(mut self, cost_config: crate::config::schema::CostConfig) -> Self {
         self.cost_config = cost_config;
@@ -1771,15 +1767,6 @@ impl SessionsSpawnTool {
         }
         providers::canonical_provider_key(child_provider) == providers::canonical_provider_key(&self.provider_name)
             && !self.model.trim().starts_with("hint:")
-    }
-
-    #[cfg(test)]
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach a `SpawnEventSink` so task-mode sub-agents spawned by this tool
@@ -4627,13 +4614,11 @@ impl SessionsSpawnTool {
                     )
             },
         );
-        let resolved_compaction = crate::router::context::resolve_effective_compaction_config_with_catalog(
-            &child_model_config.agent.compaction,
+        let resolved_compaction = resolve_pinned_child_compaction(
+            child_model_config,
+            child_model_catalog,
             &resolved_provider_name,
             &resolved_model,
-            &child_model_config.router,
-            &child_model_config.model_routes,
-            child_model_catalog,
         );
         tracing::debug!(
             mode = mode.as_str(),
@@ -9946,7 +9931,6 @@ mod tests {
             security,
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             HashMap::new(),
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -10010,25 +9994,21 @@ mod tests {
         }
     }
 
-    fn compaction_resolver_with_models(
-        models: Vec<crate::config::RouterModelConfig>,
-    ) -> crate::router::CompactionResolver {
-        let mut router = crate::config::RouterConfig::default();
-        router.models = models;
-        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
+    fn child_compaction_config(models: Vec<crate::config::RouterModelConfig>) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.router.models = models;
+        config
     }
 
     #[test]
     fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-            compaction_resolver_with_models(vec![
-                router_model("anthropic", "claude-opus-4-8", 1_000_000),
-                router_model("openrouter", "small-child", 200_000),
-            ]),
-        );
+        let config = child_compaction_config(vec![
+            router_model("anthropic", "claude-opus-4-8", 1_000_000),
+            router_model("openrouter", "small-child", 200_000),
+        ]);
+        let catalog = providers::selection::catalog_for(&config);
 
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
 
         assert_eq!(resolved.config.max_context_tokens, 200_000);
         assert_eq!(
@@ -10039,14 +10019,12 @@ mod tests {
 
     #[test]
     fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-            compaction_resolver_with_models(vec![
-                router_model("anthropic", "claude-opus-4-8", 1_000_000),
-                router_model("openrouter", "small-child", 200_000),
-            ]),
-        );
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let config = child_compaction_config(vec![
+            router_model("anthropic", "claude-opus-4-8", 1_000_000),
+            router_model("openrouter", "small-child", 200_000),
+        ]);
+        let catalog = providers::selection::catalog_for(&config);
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
@@ -10130,9 +10108,9 @@ mod tests {
         // boundary: the manifest had no field for it, so the worker started
         // with the whole operations surface back. The list travels in the
         // manifest now, and the manifest is what the capability seals.
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let config = crate::config::Config::default();
+        let catalog = providers::selection::catalog_for(&config);
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
@@ -10265,7 +10243,6 @@ mod tests {
             active_runs: Arc::clone(&tool.active_runs),
             tools: Arc::clone(&tool.tools),
             workspace_dir: tool.workspace_dir.clone(),
-            compaction_resolver: tool.compaction_resolver.clone(),
             agents: Arc::clone(&tool.agents),
             fallback_api_key: tool.fallback_api_key.clone(),
             configured_providers: tool.configured_providers.clone(),
@@ -12270,7 +12247,6 @@ mod tests {
                     Arc::clone(&security),
                     workspace.path().to_path_buf(),
                     config.multimodal.clone(),
-                    config.agent.compaction.clone(),
                     config.agents_with_references().into_owned(),
                     None,
                     crate::providers::provider_runtime_options_from_config(config),
@@ -12373,7 +12349,6 @@ mod tests {
                     Arc::clone(&security),
                     workspace.path().to_path_buf(),
                     config.multimodal.clone(),
-                    config.agent.compaction.clone(),
                     config.agents_with_references().into_owned(),
                     None,
                     crate::providers::provider_runtime_options_from_config(config),
@@ -12445,7 +12420,6 @@ mod tests {
             readonly_security,
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             HashMap::new(),
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -13324,7 +13298,6 @@ mod tests {
                     Arc::clone(&security),
                     std::path::PathBuf::from("/tmp"),
                     crate::config::MultimodalConfig::default(),
-                    crate::config::AgentCompactionConfig::default(),
                     agents,
                     None,
                     crate::providers::ProviderRuntimeOptions::default(),
@@ -13374,7 +13347,6 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -13418,7 +13390,6 @@ mod tests {
             test_security(),
             ws.path().to_path_buf(),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -14958,7 +14929,6 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -17141,7 +17111,6 @@ mod tests {
             }),
             temp.path().to_path_buf(),
             MultimodalConfig::default(),
-            AgentCompactionConfig::default(),
             agents,
             fallback_api_key.map(str::to_string),
             providers::ProviderRuntimeOptions {
@@ -17287,10 +17256,16 @@ mod tests {
         let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
         // The value the compaction line prints, checked directly
         // (deterministic); the log capture is checked for absence only.
-        let shown = tool
-            .resolve_child_compaction("custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1", "m")
-            .shown_provider()
-            .into_owned();
+        let config = crate::config::Config::default();
+        let catalog = providers::selection::catalog_for(&config);
+        let shown = resolve_pinned_child_compaction(
+            &config,
+            &catalog,
+            "custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1",
+            "m",
+        )
+        .shown_provider()
+        .into_owned();
         assert_eq!(shown, "custom:http://[redacted]@127.0.0.1:99999/v1");
         assert!(!logs.contains("SPAWN-SECRET-pw"), "{logs}");
     }

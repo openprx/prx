@@ -4293,7 +4293,6 @@ pub async fn run(
         security.clone(),
         config.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         // The spawn fallback is paired with `provider_name` (the `-p` override
         // when one is given), so it must be the credential released to that
