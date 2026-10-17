@@ -1109,6 +1109,11 @@ link-local, multicast, reserved, and legacy numeric-IP forms; applies
 reading the response body at `http_request.max_response_size` rather than
 buffering an unlimited body before truncation.
 
+`web_fetch` rejects a hostname outside `browser.allowed_domains` before DNS
+resolution, so denied names do not cause resolver traffic. Local/private
+address literals remain blocked before the allowlist, and permitted names
+still undergo the private-address/DNS-rebinding check (including redirects).
+
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
 
 `xin` task actions are `list`, `get`, `add`, `update`, `remove`, `pause`,

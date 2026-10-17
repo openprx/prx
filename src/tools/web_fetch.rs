@@ -89,7 +89,7 @@ impl WebFetchTool {
             anyhow::bail!("URL must start with http:// or https://");
         }
         let host = extract_host(url)?;
-        if is_private_or_local_host(&host) {
+        if is_private_or_local_address(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
@@ -102,6 +102,12 @@ impl WebFetchTool {
             );
         } else if !host_matches_allowlist(&host, &self.allowed_domains) {
             anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
+        }
+
+        // Reject unauthorized names before DNS can disclose them. Permitted
+        // hosts still undergo the same private-address/rebinding check.
+        if is_private_or_local_host(&host) {
+            anyhow::bail!("Blocked local/private host: {host}");
         }
 
         Ok(url.to_string())
@@ -357,7 +363,7 @@ pub(crate) fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> 
         .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
+fn is_private_or_local_address(host: &str) -> bool {
     let bare = host
         .strip_prefix('[')
         .and_then(|candidate| candidate.strip_suffix(']'))
@@ -376,6 +382,13 @@ fn is_private_or_local_host(host: &str) -> bool {
         };
     }
 
+    false
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    if is_private_or_local_address(host) {
+        return true;
+    }
     // DNS rebinding defense: resolve the hostname and check if any resolved
     // IP is private/local (one resolver for both tools; under test it never
     // touches the network).
@@ -516,6 +529,15 @@ mod tests {
             .validate_url("https://evil.com/")
             .expect_err("unexpected allowlist bypass");
         assert!(err.to_string().contains("not in browser.allowed_domains"));
+    }
+
+    #[test]
+    fn validate_url_keeps_rebinding_checks_for_allowlisted_hosts() {
+        let tool = WebFetchTool::new(vec!["rebind.test".into()], 10000, 15);
+        let err = tool
+            .validate_url("https://rebind.test/internal")
+            .expect_err("allowlisted hostname resolving privately must be rejected");
+        assert!(err.to_string().contains("Blocked local/private host"));
     }
 
     #[test]
