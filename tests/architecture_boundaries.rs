@@ -4411,8 +4411,6 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/plugins/capabilities/provider.rs::chat_with_system",
     "src/plugins/runtime.rs::chat_provider",
     "src/tools/image.rs::execute",
-    // The skill proposer's single prompt to the managed provider (system + user), no loop history.
-    "src/skills/lifecycle/proposer_model.rs::complete",
     // `run_sub_agent_task`: the operator steering turn, which opens with `[Steering instruction from
     // operator]` and so can never open with a reserved marker.
     "src/tools/sessions_spawn.rs::run_sub_agent_task",

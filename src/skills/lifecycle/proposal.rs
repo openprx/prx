@@ -174,6 +174,9 @@ pub enum ProposalFailureKind {
     InvalidCandidate,
     NoChange,
     SuppressedByRejection,
+    /// The attempt was in flight when the process died or an operator gave up
+    /// on it; the model may have been called, so the liability is unknown.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +270,9 @@ pub struct SkillProposal {
     pub request_id: String,
     pub operation: ProposalOperation,
     pub skill_id: SkillId,
+    /// The pattern ids the caller asked for, sorted. The idempotency check
+    /// compares these, not `pattern_ids` (which are the refreshed heads).
+    pub requested_patterns: Vec<PatternId>,
     /// Active generation the proposal was prepared against; publication must
     /// recheck it.
     pub expected_generation: u64,
@@ -304,6 +310,7 @@ impl SkillProposal {
     pub(super) fn same_request(&self, other: &Self) -> bool {
         self.operation == other.operation
             && self.skill_id == other.skill_id
+            && self.requested_patterns == other.requested_patterns
             && self.baseline_revision == other.baseline_revision
             && self.expected_generation == other.expected_generation
             && self.pattern_ids == other.pattern_ids
@@ -591,6 +598,58 @@ impl SkillLifecycleStore {
             });
         }
         Ok(())
+    }
+
+    /// Marks a proposal whose attempt was left in flight as failed. Only an
+    /// attempt older than `grace` (counted from its start) is touched; a
+    /// younger one may still be running in another process. The model may have
+    /// been called, so the attempt is recorded as abandoned with unknown
+    /// liability.
+    pub(super) fn settle_interrupted(
+        &self,
+        lock: &ProposalLock,
+        proposal: &mut SkillProposal,
+        grace: Duration,
+    ) -> Result<bool, LifecycleError> {
+        let now = Utc::now();
+        let limit = chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX);
+        if proposal.status != ProposalStatus::Draft
+            || !proposal
+                .attempts
+                .iter()
+                .any(|a| a.outcome == AttemptOutcome::InFlight && now.signed_duration_since(a.started_at) >= limit)
+        {
+            return Ok(false);
+        }
+        for attempt in &mut proposal.attempts {
+            if attempt.outcome == AttemptOutcome::InFlight {
+                attempt.outcome = AttemptOutcome::Abandoned;
+                attempt.finished_at = Some(now);
+                attempt.detail = Some("interrupted while in flight; liability unknown".to_string());
+            }
+        }
+        proposal.status = ProposalStatus::Failed;
+        proposal.failure = Some(ProposalFailure {
+            kind: ProposalFailureKind::Interrupted,
+            detail: "the attempt never finished; the model may have been called and its cost is unknown".to_string(),
+        });
+        proposal.updated_at = now;
+        self.write_proposal(lock, proposal)?;
+        Ok(true)
+    }
+
+    /// Recovers proposals whose attempt has been in flight for at least `grace`
+    /// (a process died mid-call): each becomes `Failed` with an abandoned
+    /// attempt. Returns the recovered proposal ids.
+    pub fn recover_interrupted_proposals(&self, grace: Duration) -> Result<Vec<String>, LifecycleError> {
+        let lock = self.lock_proposals()?;
+        let mut recovered = Vec::new();
+        for mut proposal in self.list_proposals()? {
+            if self.settle_interrupted(&lock, &mut proposal, grace)? {
+                recovered.push(proposal.proposal_id);
+            }
+        }
+        Ok(recovered)
     }
 
     /// Moves a pre-commit proposal to `Cancelled`. In-flight attempts are

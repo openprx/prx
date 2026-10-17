@@ -9,12 +9,14 @@
 //! network.
 
 use crate::providers::Provider;
-use crate::providers::attempt_accounting::{self, AttemptAccounting};
+use crate::providers::attempt_accounting::{self, AttemptAccounting, AttemptReceipt, PhysicalRequest, sealed};
 use crate::providers::traits::{ChatMessage, ChatRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 use thiserror::Error;
 
 /// Longest provider error text kept in a proposal record.
@@ -58,6 +60,14 @@ impl ModelBinding {
 #[serde(deny_unknown_fields)]
 pub struct ReportedUsage {
     pub reported: bool,
+    /// Physical requests the accounting owner reserved for this call (a retry
+    /// or fallback inside the provider chain makes more than one).
+    #[serde(default)]
+    pub physical_requests: u32,
+    /// How many of them were settled. `physical_requests - settled_requests`
+    /// requests keep an open liability.
+    #[serde(default)]
+    pub settled_requests: u32,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
@@ -74,8 +84,22 @@ pub enum ModelCallError {
     /// No budget reservation could be issued: nothing was sent.
     #[error("budget reservation was denied; the model was not called")]
     BudgetDenied,
-    #[error("model call failed: {0}")]
-    Failed(String),
+    /// The call failed or its answer was unusable. `usage` carries what is
+    /// known about the physical requests; when requests were reserved and not
+    /// all settled, the liability is unknown, not zero.
+    #[error("model call failed: {detail}")]
+    Failed { detail: String, usage: ReportedUsage },
+}
+
+impl ModelCallError {
+    /// A failure with no physical request behind it.
+    #[must_use]
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+            usage: ReportedUsage::default(),
+        }
+    }
 }
 
 /// A model that can answer one proposal prompt. Cancellation and the call
@@ -90,7 +114,10 @@ pub trait ProposerModel: Send + Sync {
 
 /// The production model: the managed provider path with attempt accounting.
 ///
-/// Fields are crate-visible so the runtime wires it with the objects its own
+/// Fields are crate-visible and there is deliberately no constructor: a
+/// `pub(crate)` one would be dead code until the proposal-purpose accounting
+/// owner exists, and a public one would expose a crate-private type. The
+/// runtime wires it with the objects its own
 /// provider construction and decision service already issued; the proposer
 /// owns no provider registry and reads no credential.
 pub struct ManagedProviderModel {
@@ -111,6 +138,52 @@ fn bounded_detail(text: &str) -> String {
     sanitized.get(..end).unwrap_or_default().to_string()
 }
 
+/// Counts the reservations an accounting owner issues and settles during one
+/// call, so the proposer can tell a refusal before any request left from a
+/// failure after one was sent, and can record every nested attempt.
+struct Tally {
+    inner: Arc<dyn AttemptAccounting>,
+    begun: AtomicU32,
+    settled: Arc<AtomicU32>,
+}
+
+impl sealed::AccountingOwner for Tally {}
+
+#[async_trait]
+impl AttemptAccounting for Tally {
+    fn deadline(&self) -> Instant {
+        self.inner.deadline()
+    }
+    async fn begin(&self, request: PhysicalRequest<'_>) -> anyhow::Result<Box<dyn AttemptReceipt>> {
+        let receipt = self.inner.begin(request).await?;
+        self.begun.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TallyReceipt {
+            inner: receipt,
+            settled: Arc::clone(&self.settled),
+        }))
+    }
+}
+
+struct TallyReceipt {
+    inner: Box<dyn AttemptReceipt>,
+    settled: Arc<AtomicU32>,
+}
+
+impl sealed::Receipt for TallyReceipt {}
+
+#[async_trait]
+impl AttemptReceipt for TallyReceipt {
+    fn deadline(&self) -> Instant {
+        self.inner.deadline()
+    }
+    async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
+        let Self { inner, settled } = *self;
+        inner.settle(usage).await?;
+        settled.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ProposerModel for ManagedProviderModel {
     fn binding(&self) -> &ModelBinding {
@@ -118,40 +191,76 @@ impl ProposerModel for ManagedProviderModel {
     }
 
     async fn complete(&self, system: &str, user: &str) -> Result<ModelReply, ModelCallError> {
-        let messages = [ChatMessage::system(system), ChatMessage::user(user)];
+        let messages = [
+            ChatMessage::system(system),
+            crate::agent::turn_contracts::inbound_user_message(user),
+        ];
         let request = ChatRequest {
             messages: &messages,
             tools: None,
         };
-        let trace = attempt_accounting::chat_traced(
+        let settled = Arc::new(AtomicU32::new(0));
+        let tally = Arc::new(Tally {
+            inner: Arc::clone(&self.accounting),
+            begun: AtomicU32::new(0),
+            settled: Arc::clone(&settled),
+        });
+        let counts = |tally: &Tally| (tally.begun.load(Ordering::SeqCst), tally.settled.load(Ordering::SeqCst));
+        let result = attempt_accounting::chat_traced(
             self.provider.as_ref(),
             request,
             &self.binding.model,
             self.binding.temperature(),
-            Arc::clone(&self.accounting),
+            Arc::clone(&tally) as Arc<dyn AttemptAccounting>,
         )
-        .await
-        .map_err(|error| {
-            if attempt_accounting::is_local_refusal(&error) {
-                ModelCallError::BudgetDenied
-            } else {
-                ModelCallError::Failed(bounded_detail(&error.to_string()))
+        .await;
+        let (begun, settled) = counts(&tally);
+        let trace = match result {
+            Ok(trace) => trace,
+            Err(error) => {
+                // A refusal is "nothing was sent" only if no reservation was
+                // ever issued. The same local refusal after a request left
+                // (deadline, failed settlement) leaves a liability open.
+                if begun == 0 && attempt_accounting::is_local_refusal(&error) {
+                    return Err(ModelCallError::BudgetDenied);
+                }
+                let detail = if begun > 0 {
+                    format!(
+                        "{} (a request was sent: {begun} reserved, {settled} settled; liability unknown)",
+                        bounded_detail(&error.to_string())
+                    )
+                } else {
+                    bounded_detail(&error.to_string())
+                };
+                return Err(ModelCallError::Failed {
+                    detail,
+                    usage: ReportedUsage {
+                        reported: false,
+                        physical_requests: begun,
+                        settled_requests: settled,
+                        ..ReportedUsage::default()
+                    },
+                });
             }
-        })?;
+        };
+        // A successful chain may have retried or fallen back; every physical
+        // request it made is counted, the token figures are the serving one's.
         let usage = &trace.tokens_used;
-        let reported = usage.is_reported() && usage.prompt_tokens.is_some() && usage.completion_tokens.is_some();
+        let usage = ReportedUsage {
+            reported: usage.is_reported() && usage.prompt_tokens.is_some() && usage.completion_tokens.is_some(),
+            physical_requests: begun,
+            settled_requests: settled,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        };
         let text = trace.response.text_or_empty().to_string();
         if text.trim().is_empty() {
-            return Err(ModelCallError::Failed("the model returned an empty body".to_string()));
+            return Err(ModelCallError::Failed {
+                detail: "the model returned an empty body".to_string(),
+                usage,
+            });
         }
-        Ok(ModelReply {
-            text,
-            usage: ReportedUsage {
-                reported,
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-            },
-        })
+        Ok(ModelReply { text, usage })
     }
 }
