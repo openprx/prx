@@ -31,6 +31,26 @@ pub const MAX_FIXTURE_BYTES: usize = 4096;
 pub const MAX_VALIDATOR_TEXT_BYTES: usize = 1024;
 pub const MAX_TRIALS: u32 = 5;
 pub const MAX_SUITE_RUNS: u32 = 1024;
+/// Smallest sample a split must declare (spec 11.3: small noisy samples are
+/// inconclusive, so a suite may not declare a smaller minimum).
+pub const MIN_SAMPLE_CASES: u32 = 2;
+pub const MAX_ALLOWED_REGRESSIONS: u32 = 3;
+pub const MAX_VALIDATION_ATTEMPTS: u32 = 10;
+pub const MAX_HOLDOUT_ATTEMPTS: u32 = 3;
+pub const MAX_REQUIRED_TOOLS: usize = 16;
+/// Workspace paths the evaluator owns; a fixture may not occupy them.
+const RESERVED_FIXTURE_ROOTS: [&str; 10] = [
+    "skills",
+    "self",
+    "state",
+    "memory",
+    "plugins",
+    ".openprx",
+    "config.toml",
+    "hooks.json",
+    "no-open-skills",
+    "no-openclaw-skills",
+];
 const MAX_IDENT_BYTES: usize = 64;
 const MAX_PATH_BYTES: usize = 128;
 const MAX_SUITE_RECORD_BYTES: usize = 200 * 1024;
@@ -129,13 +149,29 @@ pub struct EvalCase {
     pub max_elapsed_ms: u64,
 }
 
-/// Ceilings on one evaluation. Tokens and money are accounted by the managed
-/// provider path (SL05/SL07); the evaluator itself bounds runs and time.
+/// What a task may change in its fresh workspace. Nothing outside the task
+/// workspace is ever writable, whatever is declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffects {
+    /// Read-only tools; the workspace cannot be modified.
+    None,
+    /// Files below the task workspace may be written.
+    WorkspaceWrite,
+}
+
+/// Ceilings on one evaluation. Every ceiling is mandatory (spec 14): a suite
+/// without a budget is a configuration error. Tokens and money are measured
+/// from the run's own cost ledger; a run whose usage cannot be measured is
+/// invalid, never free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuiteBudget {
     pub max_runs: u32,
     pub max_total_elapsed_ms: u64,
+    pub max_total_tokens: u64,
+    /// Millionths of a US dollar, as the cost ledger prices it.
+    pub max_total_cost_micros: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,9 +188,19 @@ pub struct EvalSuite {
     pub min_cases: u32,
     /// Non-critical regressions tolerated next to an improvement (default 0).
     pub allowed_regressions: u32,
+    /// Comparison rule: exact paired case outcomes, which is only sound for a
+    /// deterministic suite. A stochastic suite needs a documented interval
+    /// rule first, so `false` is refused.
+    pub deterministic: bool,
+    /// Prespecified minimum practical gain: the candidate must pass at least
+    /// this many more cases than the baseline. A tie is never a gain.
+    pub min_gain_cases: u32,
     /// Evaluations allowed on the validation and holdout splits.
     pub validation_attempts: u32,
     pub holdout_attempts: u32,
+    /// Tools offered to the task besides `skill_read`. Nothing else is.
+    pub required_tools: Vec<String>,
+    pub side_effects: SideEffects,
     pub budget: SuiteBudget,
     pub cases: Vec<EvalCase>,
 }
@@ -186,6 +232,19 @@ impl FrozenSuite {
     #[must_use]
     pub fn case(&self, case_id: &str) -> Option<&EvalCase> {
         self.suite.cases.iter().find(|case| case.case_id == case_id)
+    }
+
+    /// Digest of the cases of one split (and the skill they judge). Attempt
+    /// limits key on it, so renaming the suite or editing other splits does not
+    /// reopen a reserved split.
+    #[must_use]
+    pub fn split_digest(&self, split: EvalSplit) -> String {
+        let cases: Vec<&EvalCase> = self.cases_of(split).collect();
+        let bytes = serde_json::to_vec(&(split, self.suite.skill_id.as_str(), cases)).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(b"prx-skill-split\0");
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
     }
 
     #[must_use]
@@ -310,6 +369,13 @@ fn validate_case(case: &EvalCase) -> Result<(), EvaluationError> {
     let mut paths = BTreeSet::new();
     for fixture in &case.fixtures {
         check_relative_path("fixture path", &fixture.path)?;
+        let root = fixture.path.split('/').next().unwrap_or_default();
+        if RESERVED_FIXTURE_ROOTS.contains(&root) {
+            return Err(invalid(format!(
+                "fixture path {} is reserved for the evaluator",
+                fixture.path
+            )));
+        }
         if fixture.content.len() > MAX_FIXTURE_BYTES {
             return Err(invalid(format!("fixture {} is too large", fixture.path)));
         }
@@ -345,15 +411,49 @@ impl EvalSuite {
         if self.trials == 0 || self.trials > MAX_TRIALS {
             return Err(invalid(format!("trials must be 1..={MAX_TRIALS}")));
         }
-        if self.min_cases == 0 {
+        if self.min_cases < MIN_SAMPLE_CASES {
+            return Err(invalid(format!(
+                "min_cases must be at least {MIN_SAMPLE_CASES}: a suite declares its minimum sample"
+            )));
+        }
+        if !self.deterministic {
             return Err(invalid(
-                "min_cases must be at least 1: a suite declares its minimum sample",
+                "stochastic suites are not supported: exact paired outcomes are only sound for a deterministic suite",
             ));
         }
-        if self.budget.max_runs == 0 || self.budget.max_runs > MAX_SUITE_RUNS || self.budget.max_total_elapsed_ms == 0 {
+        if self.min_gain_cases == 0 {
+            return Err(invalid(
+                "min_gain_cases must be at least 1: a tie is not an improvement",
+            ));
+        }
+        if self.allowed_regressions > MAX_ALLOWED_REGRESSIONS
+            || !(1..=MAX_VALIDATION_ATTEMPTS).contains(&self.validation_attempts)
+            || !(1..=MAX_HOLDOUT_ATTEMPTS).contains(&self.holdout_attempts)
+        {
             return Err(invalid(format!(
-                "budget needs max_runs 1..={MAX_SUITE_RUNS} and a positive elapsed ceiling"
+                "allowed_regressions must be at most {MAX_ALLOWED_REGRESSIONS}, validation_attempts 1..={MAX_VALIDATION_ATTEMPTS} and holdout_attempts 1..={MAX_HOLDOUT_ATTEMPTS}"
             )));
+        }
+        if self.budget.max_runs == 0
+            || self.budget.max_runs > MAX_SUITE_RUNS
+            || self.budget.max_total_elapsed_ms == 0
+            || self.budget.max_total_tokens == 0
+            || self.budget.max_total_cost_micros == 0
+        {
+            return Err(invalid(format!(
+                "budget needs max_runs 1..={MAX_SUITE_RUNS} and positive elapsed, token and cost ceilings"
+            )));
+        }
+        if self.required_tools.len() > MAX_REQUIRED_TOOLS {
+            return Err(invalid(format!("at most {MAX_REQUIRED_TOOLS} required tools")));
+        }
+        self.required_tools.sort();
+        self.required_tools.dedup();
+        for tool in &self.required_tools {
+            check_ident("required tool", tool)?;
+            if tool == "skill_read" {
+                return Err(invalid("skill_read is always offered; do not list it"));
+            }
         }
         self.cases.sort_by(|a, b| a.case_id.cmp(&b.case_id));
         let mut ids = BTreeSet::new();

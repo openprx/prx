@@ -18,7 +18,7 @@ use super::evaluate::{
 use super::journal::TransactionId;
 use super::publish::PublishRequest;
 use super::store::SkillLifecycleStore;
-use super::suite::{FixtureFile, check_relative_path};
+use super::suite::{FixtureFile, SideEffects, check_relative_path};
 use super::types::{LifecycleError, NewRevision, OwnerScope, SkillId, SourceKind};
 use crate::config::Config;
 use sha2::{Digest, Sha256};
@@ -54,34 +54,201 @@ impl AgentCaseExecutor {
         }
     }
 
-    fn environment_hash(&self) -> String {
-        let config = &self.template;
+    /// The evaluation configuration, built from an allowlist. Only the managed
+    /// provider path (provider, model, credentials, reliability, pricing,
+    /// routes, decision backend) is taken from the caller's template; every
+    /// other section starts from the default, so no hook, MCP server, channel,
+    /// plugin, scheduled job, delegate, outbound network tool, embedder,
+    /// exporter or caller memory can be reached from an evaluation run. The
+    /// tools offered are `skill_read` plus the suite's declared tools; a
+    /// declared network tool takes its settings from the template. The security
+    /// policy is workspace-only at a fixed autonomy level and denies the
+    /// lifecycle store, which holds the suite oracle.
+    pub(super) fn run_config(
+        &self,
+        workspace: &Path,
+        request: &ExecutionRequest<'_>,
+    ) -> Result<Config, EvaluationError> {
+        let template = &self.template;
+        let mut config = provider_sections(template)?;
+        config.workspace_dir = workspace.to_path_buf();
+        config.config_path = workspace.join("config.toml");
+        config.api_key.clone_from(&template.api_key);
+        config.api_url.clone_from(&template.api_url);
+        config.default_provider.clone_from(&template.default_provider);
+        config.default_model.clone_from(&template.default_model);
+        config.default_temperature = self.temperature;
+        // Memory lives in the run workspace and nothing is saved from the turn.
+        config.memory.backend = "sqlite".to_string();
+        config.memory.auto_save = false;
+        config.memory.embedding_provider = "none".to_string();
+        config.memory.embedding_provider_explicit = true;
+        // Only the installed revision may be discoverable: no ambient skills.
+        config.skills.open_skills_dir = Some(workspace.join("no-open-skills").to_string_lossy().into_owned());
+        config.skills.openclaw_skills_dir = Some(workspace.join("no-openclaw-skills").to_string_lossy().into_owned());
+        config.autonomy.level = match request.side_effects {
+            SideEffects::None => crate::security::AutonomyLevel::ReadOnly,
+            SideEffects::WorkspaceWrite => crate::security::AutonomyLevel::Full,
+        };
+        config.autonomy.workspace_only = true;
+        config.autonomy.forbidden_paths.extend(
+            request
+                .denied_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+        let declared = |name: &str| request.required_tools.iter().any(|tool| tool == name);
+        if declared("http_request") {
+            config.http_request = template.http_request.clone();
+        }
+        if declared("web_search") {
+            config.web_search = template.web_search.clone();
+        }
+        if declared("browser") {
+            config.browser = template.browser.clone();
+        }
+        let mut offered = vec!["skill_read".to_string()];
+        offered.extend(request.required_tools.iter().cloned());
+        config.tool_tiering.always_include = offered;
+        config.tool_tiering.always_exclude = WITHHELD_TOOLS
+            .iter()
+            .filter(|name| !declared(name))
+            .map(|name| (*name).to_string())
+            .collect();
+        Ok(config)
+    }
+
+    /// Binding of what the run was configured with and what actually served
+    /// it. The models come from the run's own cost ledger, so a fallback or
+    /// route that served a different model changes the binding.
+    pub(super) fn environment_hash(config: &Config, request: &ExecutionRequest<'_>, models_used: &[String]) -> String {
         let mut include = config.tool_tiering.always_include.clone();
         include.sort();
         let mut exclude = config.tool_tiering.always_exclude.clone();
         exclude.sort();
+        let routes = serde_json::to_string(&config.model_routes).unwrap_or_default();
+        let policy = serde_json::to_string(&config.autonomy).unwrap_or_default();
         let binding = serde_json::json!({
             "provider": config.default_provider,
             "model": config.default_model,
-            "temperature": self.temperature,
-            "autonomy": format!("{:?}", config.autonomy.level),
-            "tools_included": include,
-            "tools_excluded": exclude,
+            "temperature": config.default_temperature,
+            "routes": routes,
+            "fallback_providers": config.reliability.fallback_providers,
+            "security_policy": policy,
+            "side_effects": request.side_effects,
+            "tools_offered": include,
+            "tools_withheld": exclude,
+            "models_used": models_used,
         });
         let mut hasher = Sha256::new();
         hasher.update(b"prx-skill-eval-environment\0");
         hasher.update(binding.to_string().as_bytes());
         hex::encode(hasher.finalize())
     }
+}
 
-    fn run_config(&self, workspace: &Path) -> Config {
-        let mut config = self.template.clone();
-        config.workspace_dir = workspace.to_path_buf();
-        config.config_path = workspace.join("config.toml");
-        // Only the installed revision may be discoverable: no ambient skills.
-        config.skills.open_skills_dir = Some(workspace.join("no-open-skills").to_string_lossy().into_owned());
-        config.skills.openclaw_skills_dir = Some(workspace.join("no-openclaw-skills").to_string_lossy().into_owned());
-        config
+/// Sections of the template that make up the managed provider path. Everything
+/// else in the evaluation config starts from the default.
+const PROVIDER_SECTIONS: [&str; 8] = [
+    "providers",
+    "reliability",
+    "auth",
+    "cost",
+    "secrets",
+    "proxy",
+    "model_routes",
+    "causal_tree",
+];
+
+/// A default configuration carrying only the template's provider sections.
+fn provider_sections(template: &Config) -> Result<Config, EvaluationError> {
+    let invalid = |e: serde_json::Error| EvaluationError::Executor(format!("evaluation config: {e}"));
+    let mut base = serde_json::to_value(Config::default()).map_err(invalid)?;
+    let source = serde_json::to_value(template).map_err(invalid)?;
+    if let Some(target) = base.as_object_mut() {
+        for key in PROVIDER_SECTIONS {
+            if let Some(value) = source.get(key) {
+                target.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::from_value(base).map_err(invalid)
+}
+
+/// Tools an evaluation run never has unless the suite declares them.
+pub(super) const WITHHELD_TOOLS: [&str; 18] = [
+    "shell",
+    "http_request",
+    "web_search",
+    "web_fetch",
+    "browser",
+    "browser_open",
+    "message_send",
+    "sessions_spawn",
+    "sessions_send",
+    "delegate",
+    "agent_delegate",
+    "cron_add",
+    "cron_remove",
+    "cron_run",
+    "mcp",
+    "composio",
+    "nodes",
+    "git_operations",
+];
+
+/// Usage of one run read from the run's own cost ledger.
+pub(super) struct LedgerUsage {
+    pub tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub models: Vec<String>,
+}
+
+/// Sums the run's cost ledger. `None` fields mean the ledger could not be read
+/// or recorded nothing, which makes the run invalid rather than free.
+pub(super) fn read_usage(workspace: &Path) -> LedgerUsage {
+    let path = workspace.join("state").join("costs.jsonl");
+    let unmeasured = LedgerUsage {
+        tokens: None,
+        cost_micros: None,
+        models: Vec::new(),
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return unmeasured;
+    };
+    let mut tokens = 0_u64;
+    let mut cost = 0.0_f64;
+    let mut models = std::collections::BTreeSet::new();
+    let mut records = 0_u32;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return unmeasured;
+        };
+        let Some(usage) = value.get("usage") else {
+            continue;
+        };
+        tokens = tokens.saturating_add(
+            usage
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        cost += usage.get("cost_usd").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        if let Some(model) = usage.get("model").and_then(serde_json::Value::as_str) {
+            models.insert(model.to_string());
+        }
+        records += 1;
+    }
+    if records == 0 {
+        return unmeasured;
+    }
+    // Micro-dollars, rounded up so a nonzero cost is never recorded as zero.
+    let rounded = (cost.max(0.0) * 1_000_000.0).ceil();
+    let cost_micros = format!("{rounded:.0}").parse::<u64>().unwrap_or(u64::MAX);
+    LedgerUsage {
+        tokens: Some(tokens),
+        cost_micros: Some(cost_micros),
+        models: models.into_iter().collect(),
     }
 }
 
@@ -157,6 +324,7 @@ fn read_experiences(
             skill_id: receipt.skill_id.clone(),
             revision_id: receipt.revision_id.clone(),
             generation: receipt.generation,
+            resource_path: receipt.resource_path.clone(),
             resource_sha256: receipt.resource_sha256.clone(),
         }));
         if terminal.is_none() {
@@ -201,7 +369,7 @@ fn collect_artifacts(workspace: &Path, paths: &[String]) -> BTreeMap<String, Opt
 #[async_trait::async_trait]
 impl CaseExecutor for AgentCaseExecutor {
     fn identity(&self) -> String {
-        format!("prx-agent-entry/1 env={}", self.environment_hash())
+        "prx-agent-entry/1".to_string()
     }
 
     async fn run_case(
@@ -217,10 +385,12 @@ impl CaseExecutor for AgentCaseExecutor {
             .map_err(|e| io_error(&self.scratch_root, e))?;
         let workspace = scratch.path().canonicalize().map_err(|e| io_error(scratch.path(), e))?;
         write_fixtures(&workspace, request.fixtures)?;
-        let config = self.run_config(&workspace);
-        let owner_id =
-            crate::runtime::envelope::RuntimeEnvelope::agent(config.workspace_dir.to_string_lossy(), request.run_id)
-                .resolved_owner_id();
+        let run_config = self.run_config(&workspace, request)?;
+        let owner_id = crate::runtime::envelope::RuntimeEnvelope::agent(
+            run_config.workspace_dir.to_string_lossy(),
+            request.run_id,
+        )
+        .resolved_owner_id();
         let owner = OwnerScope::new(&owner_id)?;
 
         let installed = match request.skill {
@@ -238,7 +408,7 @@ impl CaseExecutor for AgentCaseExecutor {
 
         let token = cancel.child_token();
         let mut run = Box::pin(crate::agent::run(
-            config,
+            run_config.clone(),
             Some(request.prompt.to_string()),
             None,
             None,
@@ -284,6 +454,7 @@ impl CaseExecutor for AgentCaseExecutor {
                 .map_err(|e| EvaluationError::Executor(format!("experience read task failed: {e}")))??
         };
         let artifacts = collect_artifacts(&workspace, request.collect_artifacts);
+        let usage = read_usage(&workspace);
         let cleanup = match scratch.close() {
             Ok(()) => CleanupState::Removed,
             Err(error) => {
@@ -296,12 +467,15 @@ impl CaseExecutor for AgentCaseExecutor {
             terminal,
             response,
             elapsed_ms,
-            environment_hash: self.environment_hash(),
+            environment_hash: Self::environment_hash(&run_config, request, &usage.models),
             installed,
             hydrations,
             experience_terminal,
             artifacts,
             cleanup,
+            tokens: usage.tokens,
+            cost_micros: usage.cost_micros,
+            models_used: usage.models,
         })
     }
 }
@@ -343,4 +517,20 @@ impl SkillLifecycleStore {
         ids.sort();
         Ok(ids)
     }
+}
+
+#[cfg(test)]
+impl AgentCaseExecutor {
+    pub(super) fn environment_hash_for_test(
+        config: &Config,
+        request: &ExecutionRequest<'_>,
+        models: &[String],
+    ) -> String {
+        Self::environment_hash(config, request, models)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn read_usage_for_test(workspace: &Path) -> LedgerUsage {
+    read_usage(workspace)
 }

@@ -23,7 +23,7 @@
 use super::bundle::Bundle;
 use super::capture::ExperienceOutcome;
 use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes};
-use super::suite::{EvalCase, EvalSplit, FixtureFile, FrozenSuite, Validator};
+use super::suite::{EvalCase, EvalSplit, FixtureFile, FrozenSuite, SideEffects, Validator};
 use super::types::{LifecycleError, OwnerScope, RevisionId, SkillId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,21 @@ const MAX_CASES_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EVALUATION_ENTRIES: usize = 4096;
 const MAX_DETAIL_BYTES: usize = 240;
 const EVALUATION_ID_PREFIX: &str = "eval-";
+pub(super) const ATTEMPT_FILE: &str = "attempt.json";
+
+/// Durable reservation of one evaluation attempt, written before the first run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptRecord {
+    schema_version: u32,
+    evaluation_id: String,
+    owner_scope: OwnerScope,
+    skill_id: SkillId,
+    suite_digest: String,
+    split: EvalSplit,
+    split_digest: String,
+    reserved_at: DateTime<Utc>,
+}
 
 /// Failure to start, record or verify an evaluation. Every variant is a
 /// refusal; none of them can be read as a pass.
@@ -66,6 +81,10 @@ pub enum EvaluationError {
     NothingToCompare,
     #[error("{0} not found")]
     NotFound(String),
+    #[error(
+        "the evaluation history holds {limit} entries; archive or remove finished evaluations of this store before starting another"
+    )]
+    HistoryFull { limit: usize },
     #[error("case executor failed: {0}")]
     Executor(String),
 }
@@ -114,6 +133,8 @@ pub struct HydrationFact {
     pub skill_id: SkillId,
     pub revision_id: RevisionId,
     pub generation: u64,
+    /// Bundle-relative path the runtime served.
+    pub resource_path: String,
     pub resource_sha256: String,
 }
 
@@ -140,6 +161,12 @@ pub struct RunObservation {
     /// Requested artifact paths mapped to their content, `None` when absent.
     pub artifacts: BTreeMap<String, Option<Vec<u8>>>,
     pub cleanup: CleanupState,
+    /// Measured usage of the run from its own cost ledger; `None` when the
+    /// ledger could not be read (the run is then invalid, never free).
+    pub tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    /// Models that actually served the run, from the ledger.
+    pub models_used: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +191,10 @@ pub struct RunReceipt {
     pub experience_terminal: Option<ExperienceTerminalFact>,
     pub artifacts: BTreeMap<String, Option<ArtifactDigest>>,
     pub cleanup: CleanupState,
+    pub response_blank: bool,
+    pub tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub models_used: Vec<String>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -196,23 +227,31 @@ impl RunReceipt {
                 })
                 .collect(),
             cleanup: observation.cleanup,
+            response_blank: observation.response.trim().is_empty(),
+            tokens: observation.tokens,
+            cost_micros: observation.cost_micros,
+            models_used: observation.models_used.clone(),
         }
     }
 
     /// Receipt of a run that produced no observation (the executor failed).
-    fn unobserved(run_id: &str) -> Self {
+    fn unobserved(run_id: &str, elapsed_ms: u64) -> Self {
         Self {
             run_id: run_id.to_string(),
             terminal: RunTerminal::Failed,
             response_sha256: sha256_hex(b""),
             response_bytes: 0,
-            elapsed_ms: 0,
+            elapsed_ms,
             environment_hash: String::new(),
             installed: None,
             hydrations: Vec::new(),
             experience_terminal: None,
             artifacts: BTreeMap::new(),
             cleanup: CleanupState::Removed,
+            response_blank: true,
+            tokens: None,
+            cost_micros: None,
+            models_used: Vec::new(),
         }
     }
 }
@@ -231,6 +270,7 @@ pub enum InvalidReason {
     DuplicateRun,
     CleanupFailed,
     MissingTerminal,
+    UsageUnmeasured,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +404,8 @@ pub struct EvaluationSummary {
     pub critical_failures: u32,
     pub invalid_runs: u32,
     pub total_elapsed_ms: u64,
+    pub total_tokens: u64,
+    pub total_cost_micros: u64,
     pub failure_categories: BTreeMap<String, u32>,
 }
 
@@ -386,6 +428,8 @@ pub struct EvaluationReceipt {
     pub environment_hash: Option<String>,
     pub runner: String,
     pub executor: String,
+    /// How the run's randomness was controlled ("unsupported" when it cannot be).
+    pub seed_control: String,
     pub trials: u32,
     pub planned_cases: Vec<String>,
     pub planned_runs: u32,
@@ -445,6 +489,12 @@ pub struct ExecutionRequest<'a> {
     pub collect_artifacts: &'a [String],
     pub skill: Option<InstallSkill<'a>>,
     pub deadline: Duration,
+    /// The only tools offered besides `skill_read`.
+    pub required_tools: &'a [String],
+    pub side_effects: SideEffects,
+    /// Paths the task must not be able to reach (the lifecycle store, which
+    /// holds the oracle).
+    pub denied_paths: &'a [std::path::PathBuf],
 }
 
 /// Runs one case in a fresh owned workspace through the real agent path.
@@ -452,6 +502,11 @@ pub struct ExecutionRequest<'a> {
 pub trait CaseExecutor: Send + Sync {
     /// Stable description of the executor stamped on the evaluation receipt.
     fn identity(&self) -> String;
+
+    /// How randomness is controlled for the runs (recorded on the receipt).
+    fn seed_control(&self) -> String {
+        "unsupported: the provider path exposes no seed".to_string()
+    }
 
     async fn run_case(
         &self,
@@ -493,39 +548,77 @@ fn run_validators(
         .collect()
 }
 
-/// Binding of a run to the arm it was supposed to exercise.
-fn check_binding(
-    observation: &RunObservation,
-    expected_run_id: &str,
-    skill_id: &SkillId,
-    arm: Option<&ArmBinding>,
-) -> Result<(), String> {
-    if observation.run_id != expected_run_id {
-        return Err("the run receipt names a different run id than the one issued".to_string());
+/// Digest of each file of an arm's bundle by path: what a hydration receipt
+/// must match.
+pub(super) type ResourceDigests = BTreeMap<String, String>;
+
+pub(super) fn resource_digests(bundle: &Bundle) -> ResourceDigests {
+    bundle
+        .files()
+        .iter()
+        .map(|file| (file.path().to_string(), sha256_hex(file.bytes())))
+        .collect()
+}
+
+/// Both arms' resource digests.
+pub(super) struct ArmResources {
+    pub baseline: Option<ResourceDigests>,
+    pub candidate: ResourceDigests,
+}
+
+/// What decides a case. It is built from stored data only (the run receipt,
+/// the recorded validator outcomes and the suite case), so the live path and
+/// the verification path derive a verdict from exactly the same facts.
+pub(super) struct DeriveInput<'a> {
+    pub case: &'a EvalCase,
+    pub run: &'a RunReceipt,
+    pub validators: &'a [ValidatorOutcome],
+    pub skill_id: &'a SkillId,
+    pub arm: Option<&'a ArmBinding>,
+    pub resources: Option<&'a ResourceDigests>,
+    pub expected_run_id: Option<&'a str>,
+    pub evaluation_env: Option<&'a str>,
+}
+
+fn unbound(detail: &str) -> CaseVerdict {
+    CaseVerdict::invalid(InvalidReason::Unbound, detail)
+}
+
+fn check_binding(input: &DeriveInput<'_>) -> Result<(), CaseVerdict> {
+    let run = input.run;
+    if input.expected_run_id.is_some_and(|id| run.run_id != id) {
+        return Err(unbound("the run receipt names a different run id than the one issued"));
     }
-    match (arm, &observation.installed) {
+    match (input.arm, &run.installed) {
         (None, None) => {
-            if observation.hydrations.is_empty() {
+            if run.hydrations.is_empty() {
                 Ok(())
             } else {
-                Err("a skill was read in an arm that has no skill".to_string())
+                Err(unbound("a skill was read in an arm that has no skill"))
             }
         }
-        (None, Some(_)) => Err("a skill was installed in an arm that has no skill".to_string()),
-        (Some(_), None) => Err("the arm's skill revision was not installed".to_string()),
+        (None, Some(_)) => Err(unbound("a skill was installed in an arm that has no skill")),
+        (Some(_), None) => Err(unbound("the arm's skill revision was not installed")),
         (Some(binding), Some(installed)) => {
-            if installed.skill_id != *skill_id
+            if installed.skill_id != *input.skill_id
                 || installed.revision_id != binding.revision_id
                 || installed.bundle_manifest_hash != binding.bundle_manifest_hash
             {
-                return Err("the installed skill is not the arm's revision".to_string());
+                return Err(unbound("the installed skill is not the arm's revision"));
             }
-            for hydration in &observation.hydrations {
-                if hydration.skill_id != *skill_id
+            for hydration in &run.hydrations {
+                if hydration.skill_id != *input.skill_id
                     || hydration.revision_id != binding.revision_id
                     || hydration.generation != installed.generation
                 {
-                    return Err("a skill read does not belong to the arm's revision".to_string());
+                    return Err(unbound("a skill read does not belong to the arm's revision"));
+                }
+                let matches_bundle = input
+                    .resources
+                    .and_then(|resources| resources.get(&hydration.resource_path))
+                    .is_some_and(|digest| *digest == hydration.resource_sha256);
+                if !matches_bundle {
+                    return Err(unbound("the bytes the runtime served are not the arm's bundle content"));
                 }
             }
             Ok(())
@@ -533,46 +626,97 @@ fn check_binding(
     }
 }
 
+/// Checks the recorded validator outcomes against the suite case and, where the
+/// run receipt carries enough (response and artifact digests, absence), against
+/// the run itself. Substring validators cannot be rechecked from digests; their
+/// recorded outcome stands and relies on the seal and the store's permissions.
+fn effective_validators(input: &DeriveInput<'_>) -> Result<Vec<bool>, CaseVerdict> {
+    if input.validators.len() != input.case.validators.len() {
+        return Err(unbound("the recorded validators do not match the suite case"));
+    }
+    let mut passed = Vec::with_capacity(input.validators.len());
+    for (validator, outcome) in input.case.validators.iter().zip(input.validators) {
+        if outcome.kind != validator.kind() {
+            return Err(unbound("the recorded validators do not match the suite case"));
+        }
+        let artifact = validator.artifact_path().map(|path| input.run.artifacts.get(path));
+        passed.push(match validator {
+            Validator::ResponseSha256 { sha256 } => input.run.response_sha256 == *sha256,
+            Validator::ArtifactSha256 { sha256, .. } => matches!(
+                artifact,
+                Some(Some(Some(digest))) if digest.sha256 == *sha256
+            ),
+            Validator::ArtifactAbsent { .. } => matches!(artifact, Some(Some(None))),
+            _ => outcome.passed,
+        });
+    }
+    Ok(passed)
+}
+
 /// Derives the verdict of one run. Order matters: unusable evidence is
 /// reported as invalid before any validator can make it look like a pass.
-pub(super) fn judge_run(
-    case: &EvalCase,
-    observation: &RunObservation,
-    expected_run_id: &str,
-    skill_id: &SkillId,
-    arm: Option<&ArmBinding>,
-) -> (CaseVerdict, Vec<ValidatorOutcome>) {
-    if let Err(detail) = check_binding(observation, expected_run_id, skill_id, arm) {
-        return (CaseVerdict::invalid(InvalidReason::Unbound, detail), Vec::new());
+pub(super) fn derive_verdict(input: &DeriveInput<'_>) -> CaseVerdict {
+    if let Err(verdict) = check_binding(input) {
+        return verdict;
     }
-    let invalid = |reason, detail: &str| (CaseVerdict::invalid(reason, detail), Vec::new());
-    match observation.terminal {
+    let run = input.run;
+    let invalid = |reason, detail: &str| CaseVerdict::invalid(reason, detail);
+    match run.terminal {
         RunTerminal::Completed => {}
         RunTerminal::Failed => return invalid(InvalidReason::Partial, "the run did not reach a completed terminal"),
         RunTerminal::TimedOut => return invalid(InvalidReason::TimedOut, "the run exceeded its elapsed ceiling"),
         RunTerminal::Cancelled => return invalid(InvalidReason::Cancelled, "the run was cancelled"),
     }
-    if observation.cleanup != CleanupState::Removed {
+    if run.cleanup != CleanupState::Removed {
         return invalid(InvalidReason::CleanupFailed, "the task workspace was not removed");
     }
-    if observation.response.trim().is_empty() {
+    if run.response_bytes == 0 || run.response_blank {
         return invalid(InvalidReason::ZeroBody, "the run returned no response body");
     }
-    if !observation.hydrations.is_empty() && observation.experience_terminal.is_none() {
+    if input.evaluation_env.is_some_and(|env| env != run.environment_hash) {
         return invalid(
-            InvalidReason::MissingTerminal,
-            "the skill was read but no terminal was joined to the task",
+            InvalidReason::EnvironmentMismatch,
+            "the run environment differs from the evaluation's",
         );
     }
-    let validators = run_validators(case, &observation.response, &observation.artifacts);
-    let mut reasons: Vec<String> = validators
-        .iter()
-        .filter(|outcome| !outcome.passed)
-        .map(|outcome| format!("validator:{}", outcome.kind))
-        .collect();
-    if arm.is_some() {
-        let read = !observation.hydrations.is_empty();
-        if read != case.expect_skill_read {
+    if run.tokens.is_none() || run.cost_micros.is_none() {
+        return invalid(
+            InvalidReason::UsageUnmeasured,
+            "the run's tokens and cost were not measured",
+        );
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if !run.hydrations.is_empty() {
+        match &run.experience_terminal {
+            None => {
+                return invalid(
+                    InvalidReason::MissingTerminal,
+                    "the skill was read but no terminal was joined to the task",
+                );
+            }
+            Some(terminal) => match terminal.outcome {
+                ExperienceOutcome::Success => {}
+                ExperienceOutcome::Failure => reasons.push("terminal_failure".to_string()),
+                ExperienceOutcome::Blocked => reasons.push("terminal_blocked".to_string()),
+                ExperienceOutcome::Cancelled => return invalid(InvalidReason::Cancelled, "the task was cancelled"),
+                ExperienceOutcome::Incomplete => {
+                    return invalid(InvalidReason::MissingTerminal, "the task terminal is incomplete");
+                }
+            },
+        }
+    }
+    let passed = match effective_validators(input) {
+        Ok(passed) => passed,
+        Err(verdict) => return verdict,
+    };
+    for (validator, ok) in input.case.validators.iter().zip(passed) {
+        if !ok {
+            reasons.push(format!("validator:{}", validator.kind()));
+        }
+    }
+    if input.arm.is_some() {
+        let read = !run.hydrations.is_empty();
+        if read != input.case.expect_skill_read {
             reasons.push(
                 if read {
                     "skill_read_unexpected"
@@ -584,9 +728,9 @@ pub(super) fn judge_run(
         }
     }
     if reasons.is_empty() {
-        (CaseVerdict::Pass, validators)
+        CaseVerdict::Pass
     } else {
-        (CaseVerdict::Fail { reasons }, validators)
+        CaseVerdict::Fail { reasons }
     }
 }
 
@@ -597,6 +741,7 @@ pub(super) struct CaseContext<'a> {
     pub evaluation_id: &'a str,
     pub suite: &'a FrozenSuite,
     pub observed_generation: u64,
+    pub resources: &'a ArmResources,
 }
 
 /// One planned run.
@@ -617,6 +762,7 @@ pub(super) fn build_case_receipt(
     plan: &RunPlan<'_>,
     run_id: &str,
     observation: Option<&RunObservation>,
+    unobserved_elapsed_ms: u64,
     forced: Option<CaseVerdict>,
 ) -> Result<CaseReceipt, EvaluationError> {
     let CaseContext {
@@ -624,6 +770,7 @@ pub(super) fn build_case_receipt(
         evaluation_id,
         suite,
         observed_generation,
+        ..
     } = *context;
     let RunPlan {
         case,
@@ -638,12 +785,27 @@ pub(super) fn build_case_receipt(
             (
                 CaseVerdict::invalid(InvalidReason::ExecutorError, "the executor produced no observation"),
                 Vec::new(),
-                RunReceipt::unobserved(run_id),
+                RunReceipt::unobserved(run_id, unobserved_elapsed_ms),
             )
         },
         |observation| {
-            let (verdict, validators) = judge_run(case, observation, run_id, &skill_id, arm_binding);
-            (verdict, validators, RunReceipt::from_observation(observation))
+            let run = RunReceipt::from_observation(observation);
+            let validators = run_validators(case, &observation.response, &observation.artifacts);
+            let resources = match arm {
+                Arm::Baseline => context.resources.baseline.as_ref(),
+                Arm::Candidate => Some(&context.resources.candidate),
+            };
+            let verdict = derive_verdict(&DeriveInput {
+                case,
+                run: &run,
+                validators: &validators,
+                skill_id: &skill_id,
+                arm: arm_binding,
+                resources,
+                expected_run_id: Some(run_id),
+                evaluation_env: None,
+            });
+            (verdict, validators, run)
         },
     );
     if let Some(forced) = forced {
@@ -718,47 +880,112 @@ fn binding_defect(receipt: &EvaluationReceipt, case: &CaseReceipt) -> Option<Str
     if !revision_matches {
         return Some("the case receipt names a different revision than its arm".to_string());
     }
-    if !matches!(case.verdict, CaseVerdict::Invalid { .. })
-        && receipt
-            .environment_hash
-            .as_deref()
-            .is_none_or(|hash| hash != case.run.environment_hash)
-    {
-        return Some("the run environment differs from the evaluation's".to_string());
-    }
     match seal_digest(&case.run) {
         Ok(digest) if digest == case.run_receipt_digest => None,
         _ => Some("the run receipt digest does not match".to_string()),
     }
 }
 
-/// Recomputes the outcome and summary from the stored receipts.
+const fn verdict_class(verdict: &CaseVerdict) -> u8 {
+    match verdict {
+        CaseVerdict::Pass => 0,
+        CaseVerdict::Fail { .. } => 1,
+        CaseVerdict::Invalid { .. } => 2,
+    }
+}
+
+/// The run sequence the evaluator plans: cases in canonical order, trials,
+/// and the arm that goes first alternating.
+fn planned_sequence(suite: &FrozenSuite, split: EvalSplit) -> Vec<CaseKey> {
+    let mut sequence = Vec::new();
+    for (case_index, case) in suite.cases_of(split).enumerate() {
+        for trial in 0..suite.suite().trials {
+            let arms = if (case_index + usize::try_from(trial).unwrap_or(0)) % 2 == 0 {
+                [Arm::Baseline, Arm::Candidate]
+            } else {
+                [Arm::Candidate, Arm::Baseline]
+            };
+            for arm in arms {
+                sequence.push((case.case_id.clone(), trial, arm));
+            }
+        }
+    }
+    sequence
+}
+
+/// Whether the evaluation-level fields agree with the suite and the case
+/// receipts. Anything a store writer could adjust to move the outcome has to
+/// agree with data it cannot move consistently.
+fn receipt_defect(
+    suite: &FrozenSuite,
+    receipt: &EvaluationReceipt,
+    cases: &[CaseReceipt],
+    planned: usize,
+) -> Option<String> {
+    let spec = suite.suite();
+    let split_ids: Vec<String> = suite.cases_of(receipt.split).map(|case| case.case_id.clone()).collect();
+    if receipt.trials != spec.trials || receipt.planned_cases != split_ids {
+        return Some("the evaluation's trials or planned cases differ from the suite".to_string());
+    }
+    if usize::try_from(receipt.planned_runs).ok() != Some(planned)
+        || usize::try_from(receipt.recorded_runs).ok() != Some(cases.len())
+    {
+        return Some("the evaluation's run counts differ from its receipts".to_string());
+    }
+    if receipt.total_elapsed_ms != cases.iter().map(|case| case.run.elapsed_ms).sum::<u64>() {
+        return Some("the evaluation's elapsed total differs from its receipts".to_string());
+    }
+    if receipt.stale != (receipt.end_generation != receipt.observed_generation) {
+        return Some("the stale flag disagrees with the recorded generations".to_string());
+    }
+    None
+}
+
+/// Recomputes the outcome and summary from the stored receipts. Verdicts are
+/// never taken from storage: each is re-derived from the run receipt and the
+/// suite case, and a stored verdict that disagrees makes the evaluation
+/// incomplete.
 pub(super) fn assess(
     suite: &FrozenSuite,
     receipt: &EvaluationReceipt,
     cases: &[CaseReceipt],
+    resources: &ArmResources,
 ) -> (EvaluationOutcome, EvaluationSummary) {
+    let spec = suite.suite();
+    let sum =
+        |value: fn(&RunReceipt) -> Option<u64>| cases.iter().map(|case| value(&case.run).unwrap_or(0)).sum::<u64>();
     let mut summary = EvaluationSummary {
-        trials: suite.suite().trials,
+        trials: spec.trials,
         total_elapsed_ms: cases.iter().map(|case| case.run.elapsed_ms).sum(),
+        total_tokens: sum(|run| run.tokens),
+        total_cost_micros: sum(|run| run.cost_micros),
         ..EvaluationSummary::default()
     };
     let split_cases: Vec<&EvalCase> = suite.cases_of(receipt.split).collect();
     summary.cases = u32::try_from(split_cases.len()).unwrap_or(u32::MAX);
-    let mut expected: BTreeSet<CaseKey> = BTreeSet::new();
-    for case in &split_cases {
-        for trial in 0..suite.suite().trials {
-            expected.insert((case.case_id.clone(), trial, Arm::Baseline));
-            expected.insert((case.case_id.clone(), trial, Arm::Candidate));
-        }
-    }
-    let mut recorded: BTreeMap<CaseKey, &CaseReceipt> = BTreeMap::new();
-    let mut defect: Option<IncompleteReason> = None;
-    for case in cases {
+    let sequence = planned_sequence(suite, receipt.split);
+    let expected: BTreeSet<&CaseKey> = sequence.iter().collect();
+    let mut defect: Option<IncompleteReason> =
+        receipt_defect(suite, receipt, cases, sequence.len()).map(|detail| IncompleteReason::Unbound {
+            case_id: "<evaluation>".to_string(),
+            detail,
+        });
+    let mut ordered: Vec<&CaseReceipt> = cases.iter().collect();
+    ordered.sort_by_key(|case| case.order);
+    let mut recorded: BTreeMap<CaseKey, (&CaseReceipt, CaseVerdict)> = BTreeMap::new();
+    let mut run_ids: BTreeSet<&str> = BTreeSet::new();
+    for case in ordered {
         let key = (case.case_id.clone(), case.trial, case.arm);
         if !expected.contains(&key) {
             defect.get_or_insert_with(|| IncompleteReason::UnexpectedCase {
                 case_id: case.case_id.clone(),
+            });
+            continue;
+        }
+        if sequence.get(usize::try_from(case.order).unwrap_or(usize::MAX)) != Some(&key) {
+            defect.get_or_insert_with(|| IncompleteReason::Unbound {
+                case_id: case.case_id.clone(),
+                detail: "the run order differs from the counterbalanced plan".to_string(),
             });
             continue;
         }
@@ -769,29 +996,64 @@ pub(super) fn assess(
             });
             continue;
         }
-        if recorded.insert(key, case).is_some() {
+        let Some(suite_case) = suite.case(&case.case_id) else {
+            continue;
+        };
+        let arm_binding = match case.arm {
+            Arm::Baseline => receipt.baseline.as_ref(),
+            Arm::Candidate => Some(&receipt.candidate),
+        };
+        let arm_resources = match case.arm {
+            Arm::Baseline => resources.baseline.as_ref(),
+            Arm::Candidate => Some(&resources.candidate),
+        };
+        let derived = if run_ids.insert(case.run.run_id.as_str()) {
+            derive_verdict(&DeriveInput {
+                case: suite_case,
+                run: &case.run,
+                validators: &case.validators,
+                skill_id: &receipt.skill_id,
+                arm: arm_binding,
+                resources: arm_resources,
+                expected_run_id: None,
+                evaluation_env: receipt.environment_hash.as_deref(),
+            })
+        } else {
+            CaseVerdict::invalid(
+                InvalidReason::DuplicateRun,
+                "the run id was already used by another run of this evaluation",
+            )
+        };
+        if verdict_class(&derived) != verdict_class(&case.verdict) {
+            defect.get_or_insert_with(|| IncompleteReason::Unbound {
+                case_id: case.case_id.clone(),
+                detail: "the stored verdict differs from the one re-derived from the run receipt".to_string(),
+            });
+        }
+        if recorded.insert(key, (case, derived)).is_some() {
             defect.get_or_insert_with(|| IncompleteReason::DuplicateReceipt {
                 case_id: case.case_id.clone(),
             });
         }
     }
-    for case in recorded.values() {
-        if let CaseVerdict::Fail { reasons } = &case.verdict {
-            for reason in reasons {
-                *summary.failure_categories.entry(reason.clone()).or_insert(0) += 1;
+    for (_, verdict) in recorded.values() {
+        match verdict {
+            CaseVerdict::Fail { reasons } => {
+                for reason in reasons {
+                    *summary.failure_categories.entry(reason.clone()).or_insert(0) += 1;
+                }
             }
-        }
-        if matches!(case.verdict, CaseVerdict::Invalid { .. }) {
-            summary.invalid_runs += 1;
+            CaseVerdict::Invalid { .. } => summary.invalid_runs += 1,
+            CaseVerdict::Pass => {}
         }
     }
-    let missing = expected.iter().filter(|key| !recorded.contains_key(*key)).count();
+    let missing = expected.iter().filter(|key| !recorded.contains_key(**key)).count();
     // A case passes in an arm only when every trial of it passed.
     let arm_passes = |case_id: &str, arm: Arm| {
-        (0..suite.suite().trials).all(|trial| {
+        (0..spec.trials).all(|trial| {
             recorded
                 .get(&(case_id.to_string(), trial, arm))
-                .is_some_and(|case| case.verdict.is_pass())
+                .is_some_and(|(_, verdict)| verdict.is_pass())
         })
     };
     for case in &split_cases {
@@ -803,6 +1065,18 @@ pub(super) fn assess(
         summary.regressed += u32::from(baseline && !candidate);
         summary.critical_regressions += u32::from(case.critical && baseline && !candidate);
         summary.critical_failures += u32::from(case.critical && !candidate);
+    }
+    let over_budget = summary.total_elapsed_ms > spec.budget.max_total_elapsed_ms
+        || summary.total_tokens > spec.budget.max_total_tokens
+        || summary.total_cost_micros > spec.budget.max_total_cost_micros;
+    let budget_claim_holds = summary.total_elapsed_ms >= spec.budget.max_total_elapsed_ms
+        || summary.total_tokens >= spec.budget.max_total_tokens
+        || summary.total_cost_micros >= spec.budget.max_total_cost_micros;
+    if receipt.budget_exhausted && !budget_claim_holds {
+        defect.get_or_insert_with(|| IncompleteReason::Unbound {
+            case_id: "<evaluation>".to_string(),
+            detail: "the evaluation claims an exhausted budget its receipts do not show".to_string(),
+        });
     }
     let outcome = if receipt.stale {
         EvaluationOutcome::Stale
@@ -816,28 +1090,30 @@ pub(super) fn assess(
         EvaluationOutcome::Incomplete {
             reason: IncompleteReason::Cancelled,
         }
-    } else if missing > 0 {
+    } else if missing > 0 && !receipt.budget_exhausted {
         EvaluationOutcome::Incomplete {
             reason: IncompleteReason::MissingCases {
                 count: u32::try_from(missing).unwrap_or(u32::MAX),
             },
         }
+    } else if receipt.budget_exhausted || over_budget {
+        EvaluationOutcome::BudgetExceeded
     } else if summary.invalid_runs > 0 {
         EvaluationOutcome::Incomplete {
             reason: IncompleteReason::InvalidRuns {
                 count: summary.invalid_runs,
             },
         }
-    } else if receipt.budget_exhausted || summary.total_elapsed_ms > suite.suite().budget.max_total_elapsed_ms {
-        EvaluationOutcome::BudgetExceeded
-    } else if summary.cases < suite.suite().min_cases {
+    } else if summary.cases < spec.min_cases {
         EvaluationOutcome::Inconclusive {
             cases: summary.cases,
-            required: suite.suite().min_cases,
+            required: spec.min_cases,
         }
-    } else if summary.critical_regressions > 0 || summary.regressed > suite.suite().allowed_regressions {
+    } else if summary.critical_regressions > 0 || summary.regressed > spec.allowed_regressions {
         EvaluationOutcome::Regressed
-    } else if summary.critical_failures > 0 || summary.candidate_passed <= summary.baseline_passed {
+    } else if summary.critical_failures > 0
+        || summary.candidate_passed < summary.baseline_passed.saturating_add(spec.min_gain_cases)
+    {
         EvaluationOutcome::NotImproved
     } else {
         EvaluationOutcome::Improved
@@ -911,16 +1187,12 @@ impl SkillLifecycleStore {
         receipt: &EvaluationReceipt,
         cases: &[CaseReceipt],
     ) -> Result<String, EvaluationError> {
+        // The directory was created by the attempt reservation.
         let dir = self.evaluation_dir(&receipt.record_id);
-        let parent = self.root().join(EVALUATIONS_DIR);
-        super::generation::ensure_dir_synced(self.root(), &parent)?;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+        check_private(&dir)?;
+        if fs::symlink_metadata(dir.join(RECEIPT_FILE)).is_ok() {
+            return Err(tampered(&dir, "an evaluation is immutable once its receipt is written"));
         }
-        builder.create(&dir).map_err(|e| LifecycleError::io(&dir, e))?;
         let mut lines = Vec::new();
         for case in cases {
             let sealed = Sealed {
@@ -1002,11 +1274,9 @@ impl SkillLifecycleStore {
                 continue;
             }
             if ids.len() >= MAX_EVALUATION_ENTRIES {
-                return Err(LifecycleError::KnowledgeLimit {
-                    what: "evaluation directories",
+                return Err(EvaluationError::HistoryFull {
                     limit: MAX_EVALUATION_ENTRIES,
-                }
-                .into());
+                });
             }
             ids.push(name);
         }
@@ -1014,18 +1284,66 @@ impl SkillLifecycleStore {
         Ok(ids)
     }
 
-    /// Evaluations already made on `split` of the suite with `digest`.
-    pub(super) fn evaluation_attempts(&self, digest: &str, split: EvalSplit) -> Result<u32, EvaluationError> {
-        let mut used = 0_u32;
-        for id in self.list_evaluation_ids()? {
-            match self.read_sealed_receipt(&id) {
-                Ok((receipt, _)) => used += u32::from(receipt.suite_digest == digest && receipt.split == split),
-                // An unreadable record still counts against a limited split:
-                // unreadable history must not reopen the holdout.
-                Err(_) => used += 1,
+    /// Reserves one attempt on `split` for a new evaluation before any run
+    /// starts. The count, the limit check and the durable record happen under
+    /// the store and skill locks, so concurrent evaluations cannot both take
+    /// the last attempt, and a crash, drop or panic after this point cannot give
+    /// the attempt back: a reserved attempt without a receipt is a spent one.
+    /// The split is keyed by the digest of its own cases, so renaming the suite
+    /// or editing other splits does not reopen a reserved split.
+    pub(super) fn reserve_attempt(
+        &self,
+        suite: &FrozenSuite,
+        split: EvalSplit,
+        evaluation_id: &str,
+    ) -> Result<(), EvaluationError> {
+        let skill = &suite.suite().skill_id;
+        let split_digest = suite.split_digest(split);
+        let _store = self.lock_store(true, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
+        let _skill = self.lock_skill(skill, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
+        if let Some(limit) = suite.attempt_limit(split) {
+            let mut used = 0_u32;
+            for id in self.list_evaluation_ids()? {
+                let path = self.evaluation_dir(&id).join(ATTEMPT_FILE);
+                let counts = match fs::symlink_metadata(&path) {
+                    Ok(_) => match check_private(&path).and_then(|()| read_record::<AttemptRecord>(&path)) {
+                        Ok(record) => record.split == split && record.split_digest == split_digest,
+                        // Unreadable history still counts: it must not reopen a reserved split.
+                        Err(_) => true,
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
+                used += u32::from(counts);
+            }
+            if used >= limit {
+                return Err(EvaluationError::AttemptsExhausted { split, limit, used });
             }
         }
-        Ok(used)
+        let parent = self.root().join(EVALUATIONS_DIR);
+        super::generation::ensure_dir_synced(self.root(), &parent)?;
+        let dir = self.evaluation_dir(evaluation_id);
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir).map_err(|e| LifecycleError::io(&dir, e))?;
+        let record = AttemptRecord {
+            schema_version: EVALUATION_SCHEMA_VERSION,
+            evaluation_id: evaluation_id.to_string(),
+            owner_scope: self.owner_scope().clone(),
+            skill_id: skill.clone(),
+            suite_digest: suite.digest().to_string(),
+            split,
+            split_digest,
+            reserved_at: Utc::now(),
+        };
+        let path = dir.join(ATTEMPT_FILE);
+        self.write_atomic(skill, &path, &record_bytes(&record, &path)?)?;
+        super::store::sync_dir(&parent)?;
+        Ok(())
     }
 
     /// Reads an evaluation, verifies every binding and recomputes the outcome
@@ -1066,7 +1384,9 @@ impl SkillLifecycleStore {
             }
             cases.push(sealed.receipt);
         }
-        // The arms must still resolve to exactly the recorded bundles.
+        // The arms must still resolve to exactly the recorded bundles, whose
+        // file digests the hydration receipts are checked against.
+        let mut arm_digests: Vec<ResourceDigests> = Vec::new();
         for arm in receipt.baseline.iter().chain(std::iter::once(&receipt.candidate)) {
             let revision = self.read_revision(&receipt.skill_id, &arm.revision_id, None)?;
             if revision.revision.bundle_manifest_hash != arm.bundle_manifest_hash {
@@ -1075,8 +1395,14 @@ impl SkillLifecycleStore {
                     "a revision no longer matches the bundle hash the evaluation recorded",
                 ));
             }
+            arm_digests.push(resource_digests(&revision.bundle));
         }
-        let (outcome, summary) = assess(&suite, &receipt, &cases);
+        let candidate_digests = arm_digests.pop().unwrap_or_default();
+        let resources = ArmResources {
+            baseline: arm_digests.pop(),
+            candidate: candidate_digests,
+        };
+        let (outcome, summary) = assess(&suite, &receipt, &cases, &resources);
         if outcome != receipt.outcome {
             return Err(tampered(
                 &dir,
@@ -1100,4 +1426,51 @@ impl SkillLifecycleStore {
             .map_or(0, |b| b.generation);
         Ok(generation == evaluation.receipt.observed_generation)
     }
+}
+
+/// Test support: rewrites an evaluation's stored receipts the way a writer with
+/// access to the store could, re-sealing every digest (the seal is a plain
+/// SHA-256, so this is possible) and the case file digest.
+#[cfg(test)]
+pub(super) fn rewrite_evaluation_for_test(
+    store: &SkillLifecycleStore,
+    id: &str,
+    mutate: impl FnOnce(&mut EvaluationReceipt, &mut Vec<CaseReceipt>),
+) {
+    let (mut receipt, _) = store.read_sealed_receipt(id).expect("test: receipt");
+    let dir = store.evaluation_dir(id);
+    let bytes = fs::read(dir.join(CASES_FILE)).expect("test: cases");
+    let mut cases: Vec<CaseReceipt> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<Sealed<CaseReceipt>>(line)
+                .expect("test: case")
+                .receipt
+        })
+        .collect();
+    mutate(&mut receipt, &mut cases);
+    for case in &mut cases {
+        case.run_receipt_digest = seal_digest(&case.run).expect("test: seal run");
+    }
+    let mut lines = Vec::new();
+    for case in &cases {
+        let sealed = Sealed {
+            digest: seal_digest(case).expect("test: seal"),
+            receipt: case,
+        };
+        serde_json::to_writer(&mut lines, &sealed).expect("test: json");
+        lines.push(b'\n');
+    }
+    fs::write(dir.join(CASES_FILE), &lines).expect("test: write cases");
+    receipt.cases_digest = sha256_hex(&lines);
+    let sealed = Sealed {
+        digest: seal_digest(&receipt).expect("test: seal receipt"),
+        receipt: &receipt,
+    };
+    fs::write(
+        dir.join(RECEIPT_FILE),
+        serde_json::to_vec_pretty(&sealed).expect("test: json"),
+    )
+    .expect("test: write receipt");
 }

@@ -36,6 +36,8 @@ mod types;
 mod tests;
 
 pub use agent_executor::AgentCaseExecutor;
+#[cfg(test)]
+use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -70,7 +72,8 @@ pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, Roll
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use suite::{
-    EvalCase, EvalSplit, EvalSuite, FixtureFile, FrozenSuite, MAX_SUITE_CASES, MAX_TRIALS, SUITE_SCHEMA_VERSION,
+    EvalCase, EvalSplit, EvalSuite, FixtureFile, FrozenSuite, MAX_ALLOWED_REGRESSIONS, MAX_HOLDOUT_ATTEMPTS,
+    MAX_SUITE_CASES, MAX_TRIALS, MAX_VALIDATION_ATTEMPTS, MIN_SAMPLE_CASES, SUITE_SCHEMA_VERSION, SideEffects,
     SuiteBudget, Validator,
 };
 pub use types::{

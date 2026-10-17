@@ -6,13 +6,13 @@
 //! drive the real agent entry against a loopback model.
 
 use super::{activate, entry, owner};
-use crate::skills::lifecycle::evaluate::seal_digest;
+use crate::skills::lifecycle::evaluate::{CaseReceipt, rewrite_evaluation_for_test, seal_digest};
 use crate::skills::lifecycle::{
     Arm, Bundle, CaseExecutor, CaseVerdict, CleanupState, EvalCase, EvalSplit, EvalSuite, EvaluationError,
     EvaluationOutcome, EvaluationReceipt, EvaluationRequest, ExecutionRequest, ExperienceOutcome,
     ExperienceTerminalFact, FixtureFile, FrozenSuite, HydrationFact, IncompleteReason, InstalledSkill, InvalidReason,
-    LifecycleError, NewRevision, RevisionId, RunObservation, RunTerminal, SkillId, SkillLifecycleStore, SourceKind,
-    SuiteBudget, Validator,
+    LifecycleError, NewRevision, RevisionId, RunObservation, RunTerminal, SideEffects, SkillId, SkillLifecycleStore,
+    SourceKind, SuiteBudget, Validator,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -65,6 +65,20 @@ fn fixture() -> Fixture {
     }
 }
 
+/// Like [`fixture`] but nothing is published yet (generation 0): a new skill.
+fn fixture_unpublished() -> Fixture {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let a = write_revision(&store, "ANSWER=draft");
+    let b = write_revision(&store, "ANSWER=report-v2");
+    Fixture {
+        _tmp: tmp,
+        store,
+        baseline: a.0,
+        candidate: b.0,
+    }
+}
+
 fn case(id: &str, split: EvalSplit, prompt: &str) -> EvalCase {
     EvalCase {
         case_id: id.to_string(),
@@ -90,11 +104,17 @@ fn suite_with(cases: Vec<EvalCase>) -> EvalSuite {
         trials: 1,
         min_cases: 2,
         allowed_regressions: 0,
+        deterministic: true,
+        min_gain_cases: 1,
         validation_attempts: 3,
         holdout_attempts: 1,
+        required_tools: Vec::new(),
+        side_effects: SideEffects::None,
         budget: SuiteBudget {
             max_runs: 64,
             max_total_elapsed_ms: 600_000,
+            max_total_tokens: 1_000_000,
+            max_total_cost_micros: 1_000_000,
         },
         cases,
     }
@@ -159,6 +179,25 @@ impl CaseExecutor for Scripted {
     }
 }
 
+/// An executor that never finishes a run.
+struct Hanging;
+
+#[async_trait]
+impl CaseExecutor for Hanging {
+    fn identity(&self) -> String {
+        "hanging".to_string()
+    }
+
+    async fn run_case(
+        &self,
+        _request: &ExecutionRequest<'_>,
+        _cancel: &CancellationToken,
+    ) -> Result<RunObservation, EvaluationError> {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        Err(EvaluationError::Executor("never".to_string()))
+    }
+}
+
 fn is_candidate(request: &ExecutionRequest<'_>) -> bool {
     request.skill.is_some_and(|skill| {
         skill
@@ -184,7 +223,12 @@ fn good(request: &ExecutionRequest<'_>) -> RunObservation {
             skill_id: installed.skill_id.clone(),
             revision_id: installed.revision_id.clone(),
             generation: installed.generation,
-            resource_sha256: hex::encode(Sha256::digest(b"SKILL.md")),
+            resource_path: "SKILL.md".to_string(),
+            resource_sha256: request
+                .skill
+                .and_then(|skill| skill.bundle.file("SKILL.md"))
+                .map(|file| hex::encode(Sha256::digest(file.bytes())))
+                .unwrap_or_default(),
         })
         .collect();
     let experience_terminal = (!hydrations.is_empty()).then(|| ExperienceTerminalFact {
@@ -206,6 +250,9 @@ fn good(request: &ExecutionRequest<'_>) -> RunObservation {
         experience_terminal,
         artifacts: BTreeMap::new(),
         cleanup: CleanupState::Removed,
+        tokens: Some(10),
+        cost_micros: Some(5),
+        models_used: vec!["eval-model".to_string()],
     }
 }
 
@@ -601,7 +648,7 @@ async fn runs_not_bound_to_their_arm_are_invalid() {
 
 #[tokio::test]
 async fn a_skill_read_in_the_no_skill_baseline_is_unbound() {
-    let fx = fixture();
+    let fx = fixture_unpublished();
     let suite = validation_suite(2);
     let exec = Scripted::new(|r| {
         let mut o = good(r);
@@ -610,6 +657,7 @@ async fn a_skill_read_in_the_no_skill_baseline_is_unbound() {
                 skill_id: skill(),
                 revision_id: RevisionId::parse(&format!("r1-{}", "0".repeat(64))).expect("test: id"),
                 generation: 1,
+                resource_path: "SKILL.md".to_string(),
                 resource_sha256: "0".repeat(64),
             });
         }
@@ -617,6 +665,7 @@ async fn a_skill_read_in_the_no_skill_baseline_is_unbound() {
     });
     let mut req = request(&fx, &suite, EvalSplit::Validation);
     req.baseline = None;
+    req.observed_generation = 0;
     let receipt = fx
         .store
         .evaluate(&req, &exec, &CancellationToken::new())
@@ -628,11 +677,12 @@ async fn a_skill_read_in_the_no_skill_baseline_is_unbound() {
 
 #[tokio::test]
 async fn a_new_skill_is_compared_with_the_same_tasks_done_without_it() {
-    let fx = fixture();
+    let fx = fixture_unpublished();
     let suite = validation_suite(2);
     let exec = Scripted::new(|r| Ok(good(r)));
     let mut req = request(&fx, &suite, EvalSplit::Validation);
     req.baseline = None;
+    req.observed_generation = 0;
     let receipt = fx
         .store
         .evaluate(&req, &exec, &CancellationToken::new())
@@ -755,43 +805,6 @@ async fn a_cancelled_evaluation_is_partial_and_never_passes() {
     );
 }
 
-#[tokio::test]
-async fn a_missing_case_receipt_makes_the_evaluation_incomplete() {
-    let fx = fixture();
-    let suite = validation_suite(3);
-    let exec = Scripted::new(|r| Ok(good(r)));
-    let receipt = run(&fx, &suite, &exec).await;
-    assert!(receipt.outcome.is_pass());
-
-    // Drop one case receipt from the stored file and re-seal the evaluation
-    // with the digest of the shortened file: the coverage check still catches it.
-    let dir = fx.store.root().join("evaluations").join(&receipt.record_id);
-    let cases_text = fs::read_to_string(dir.join("cases.jsonl")).expect("test: read");
-    let kept: Vec<&str> = cases_text.lines().skip(1).collect();
-    let shortened = format!("{}\n", kept.join("\n"));
-    fs::write(dir.join("cases.jsonl"), &shortened).expect("test: write");
-    let mut forged = receipt.clone();
-    forged.cases_digest = hex::encode(Sha256::digest(shortened.as_bytes()));
-    forged.recorded_runs -= 1;
-    reseal(&dir, &forged);
-    let error = fx
-        .store
-        .verify_evaluation(&receipt.record_id, None)
-        .expect_err("test: outcome no longer matches");
-    assert!(error.to_string().contains("recomputed"), "{error}");
-
-    // Once the stored outcome says incomplete too, verification agrees: still not a pass.
-    forged.outcome = EvaluationOutcome::Incomplete {
-        reason: IncompleteReason::MissingCases { count: 1 },
-    };
-    reseal(&dir, &forged);
-    let verified = fx
-        .store
-        .verify_evaluation(&receipt.record_id, None)
-        .expect("test: verify");
-    assert!(!verified.outcome.is_pass());
-}
-
 fn reseal(dir: &std::path::Path, receipt: &EvaluationReceipt) {
     let digest = seal_digest(receipt).expect("test: seal");
     let body = serde_json::json!({ "receipt": receipt, "digest": digest });
@@ -800,6 +813,41 @@ fn reseal(dir: &std::path::Path, receipt: &EvaluationReceipt) {
         serde_json::to_vec_pretty(&body).expect("test: json"),
     )
     .expect("test: write");
+}
+
+#[tokio::test]
+async fn a_missing_case_receipt_makes_the_evaluation_incomplete() {
+    let fx = fixture();
+    let suite = validation_suite(3);
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(receipt.outcome.is_pass());
+
+    // Drop one case receipt and keep every count consistent; the stored
+    // "improved" is still refused, because the outcome is recomputed.
+    let drop_first = |r: &mut EvaluationReceipt, cases: &mut Vec<CaseReceipt>| {
+        let removed = cases.remove(0);
+        r.recorded_runs -= 1;
+        r.total_elapsed_ms -= removed.run.elapsed_ms;
+    };
+    rewrite_evaluation_for_test(&fx.store, &receipt.record_id, drop_first);
+    let error = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect_err("test: outcome no longer matches");
+    assert!(error.to_string().contains("recomputed"), "{error}");
+
+    // Once the stored outcome says incomplete too, verification agrees: still not a pass.
+    rewrite_evaluation_for_test(&fx.store, &receipt.record_id, |r, _| {
+        r.outcome = EvaluationOutcome::Incomplete {
+            reason: IncompleteReason::MissingCases { count: 1 },
+        };
+    });
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert!(!verified.outcome.is_pass());
 }
 
 #[tokio::test]
@@ -830,7 +878,7 @@ async fn forged_scores_and_edited_receipts_are_refused() {
     reseal(&dir, &receipt);
     let path = dir.join("cases.jsonl");
     let original = fs::read_to_string(&path).expect("test: read");
-    fs::write(&path, original.replacen("\"elapsed_ms\":10", "\"elapsed_ms\":11", 1)).expect("test: edit");
+    fs::write(&path, original.replacen("\"tokens\":10", "\"tokens\":11", 1)).expect("test: edit");
     let error = fx
         .store
         .verify_evaluation(&receipt.record_id, None)
@@ -861,23 +909,19 @@ async fn a_case_receipt_of_another_evaluation_or_suite_does_not_count() {
     let suite = validation_suite(2);
     let exec = Scripted::new(|r| Ok(good(r)));
     let first = run(&fx, &suite, &exec).await;
-    let second = run(&fx, &suite, &exec).await;
-    // Replace the first evaluation's cases with the second's: every receipt is
-    // individually sound but bound to the wrong evaluation.
-    let first_dir = fx.store.root().join("evaluations").join(&first.record_id);
-    let second_dir = fx.store.root().join("evaluations").join(&second.record_id);
-    let foreign = fs::read_to_string(second_dir.join("cases.jsonl")).expect("test: read");
-    fs::write(first_dir.join("cases.jsonl"), &foreign).expect("test: write");
-    let mut forged = first.clone();
-    forged.cases_digest = hex::encode(Sha256::digest(foreign.as_bytes()));
-    forged.outcome = EvaluationOutcome::Incomplete {
-        reason: IncompleteReason::Unbound {
-            case_id: "case-0".to_string(),
-            detail: "the case receipt is bound to a different evaluation, suite, owner, skill or generation"
-                .to_string(),
-        },
-    };
-    reseal(&first_dir, &forged);
+    // Every receipt is individually sound but bound to the wrong evaluation.
+    rewrite_evaluation_for_test(&fx.store, &first.record_id, |r, cases| {
+        for case in cases.iter_mut() {
+            case.evaluation_id = format!("eval-{}", "0".repeat(32));
+        }
+        r.outcome = EvaluationOutcome::Incomplete {
+            reason: IncompleteReason::Unbound {
+                case_id: "case-0".to_string(),
+                detail: "the case receipt is bound to a different evaluation, suite, owner, skill or generation"
+                    .to_string(),
+            },
+        };
+    });
     let verified = fx
         .store
         .verify_evaluation(&first.record_id, None)
@@ -1175,4 +1219,357 @@ async fn evaluations_are_owner_scoped() {
         owner("owner:ws:cli:mallory"),
     );
     assert!(foreign_error.is_err(), "the store itself refuses another owner");
+}
+
+// ---- review round: verdicts are re-derived, never trusted ------------------
+
+#[tokio::test]
+async fn a_flipped_and_resealed_verdict_cannot_turn_an_invalid_run_into_a_pass() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    // Every candidate run was cancelled and returned nothing: invalid, so incomplete.
+    let exec = Scripted::new(|r| {
+        let mut o = good(r);
+        if is_candidate(r) {
+            o.terminal = RunTerminal::Cancelled;
+            o.response = String::new();
+        }
+        Ok(o)
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(matches!(receipt.outcome, EvaluationOutcome::Incomplete { .. }));
+
+    // A writer flips every candidate verdict to Pass and the outcome to Improved,
+    // re-sealing every digest. The run receipts still say cancelled with no body.
+    rewrite_evaluation_for_test(&fx.store, &receipt.record_id, |r, cases| {
+        for case in cases.iter_mut().filter(|c| c.arm == Arm::Candidate) {
+            case.verdict = CaseVerdict::Pass;
+        }
+        r.outcome = EvaluationOutcome::Improved;
+    });
+    let error = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect_err("test: flipped");
+    assert!(error.to_string().contains("recomputed"), "{error}");
+
+    // Even with an honest-looking Incomplete outcome the flipped verdicts are named.
+    rewrite_evaluation_for_test(&fx.store, &receipt.record_id, |r, _| {
+        r.outcome = EvaluationOutcome::Incomplete {
+            reason: IncompleteReason::InvalidRuns { count: 2 },
+        };
+    });
+    let error = fx.store.verify_evaluation(&receipt.record_id, None);
+    let verified = match error {
+        Ok(v) => v,
+        Err(e) => {
+            assert!(e.to_string().contains("recomputed"), "{e}");
+            return;
+        }
+    };
+    assert!(!verified.outcome.is_pass());
+    assert!(matches!(
+        verified.outcome,
+        EvaluationOutcome::Incomplete {
+            reason: IncompleteReason::Unbound { .. }
+        }
+    ));
+}
+
+#[tokio::test]
+async fn evaluation_level_fields_must_agree_with_the_receipts() {
+    type Mutation = fn(&mut EvaluationReceipt, &mut Vec<CaseReceipt>);
+    let mutations: [(&str, Mutation); 7] = [
+        ("elapsed total", |r, _| r.total_elapsed_ms += 1),
+        ("run count", |r, _| r.recorded_runs += 1),
+        ("planned runs", |r, _| r.planned_runs += 1),
+        ("planned cases", |r, _| r.planned_cases.reverse()),
+        ("stale flag", |r, _| r.stale = true),
+        ("end generation", |r, _| r.end_generation += 1),
+        ("run order", |_, cases| {
+            let first = cases[0].order;
+            cases[0].order = cases[1].order;
+            cases[1].order = first;
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let fx = fixture();
+        let suite = validation_suite(2);
+        let exec = Scripted::new(|r| Ok(good(r)));
+        let receipt = run(&fx, &suite, &exec).await;
+        assert!(receipt.outcome.is_pass(), "{name}");
+        rewrite_evaluation_for_test(&fx.store, &receipt.record_id, |r, cases| mutate(r, cases));
+        // The stored outcome still says improved: verification must not agree.
+        assert!(fx.store.verify_evaluation(&receipt.record_id, None).is_err(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_that_is_not_a_success_cannot_pass() {
+    for (outcome, passes) in [
+        (ExperienceOutcome::Success, true),
+        (ExperienceOutcome::Failure, false),
+        (ExperienceOutcome::Blocked, false),
+        (ExperienceOutcome::Cancelled, false),
+        (ExperienceOutcome::Incomplete, false),
+    ] {
+        let fx = fixture();
+        let suite = validation_suite(2);
+        let exec = Scripted::new(move |r| {
+            let mut o = good(r);
+            if is_candidate(r) {
+                o.experience_terminal = Some(ExperienceTerminalFact {
+                    terminal_receipt_id: "t".to_string(),
+                    outcome,
+                });
+            }
+            Ok(o)
+        });
+        let receipt = run(&fx, &suite, &exec).await;
+        assert_eq!(receipt.outcome.is_pass(), passes, "{outcome:?}: {:?}", receipt.outcome);
+    }
+}
+
+#[tokio::test]
+async fn served_bytes_that_are_not_the_arms_bundle_are_unbound() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let exec = Scripted::new(|r| {
+        let mut o = good(r);
+        if is_candidate(r) {
+            for h in &mut o.hydrations {
+                h.resource_sha256 = "f".repeat(64);
+            }
+        }
+        Ok(o)
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(!receipt.outcome.is_pass());
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert!(verified.cases.iter().any(|c| matches!(
+        &c.verdict,
+        CaseVerdict::Invalid {
+            reason: InvalidReason::Unbound,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn usage_is_recorded_and_ceilings_are_enforced() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let receipt = run(&fx, &suite, &exec).await;
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert_eq!(verified.summary.total_tokens, 40);
+    assert_eq!(verified.summary.total_cost_micros, 20);
+    assert!(
+        verified
+            .cases
+            .iter()
+            .all(|c| c.run.tokens == Some(10) && c.run.models_used == ["eval-model"])
+    );
+    assert_ne!(receipt.seed_control, "");
+
+    // Unmeasured usage is invalid, never free.
+    let fx = fixture();
+    let exec = Scripted::new(|r| {
+        let mut o = good(r);
+        o.tokens = None;
+        Ok(o)
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(!receipt.outcome.is_pass());
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert!(verified.cases.iter().all(|c| matches!(
+        &c.verdict,
+        CaseVerdict::Invalid {
+            reason: InvalidReason::UsageUnmeasured,
+            ..
+        }
+    )));
+
+    // A token ceiling the runs overshoot cannot pass.
+    let fx = fixture();
+    let mut limited = suite_with(suite.suite().cases.clone());
+    limited.budget.max_total_tokens = 15;
+    let limited = limited.freeze().expect("test: freeze");
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let receipt = run(&fx, &limited, &exec).await;
+    assert_eq!(receipt.outcome, EvaluationOutcome::BudgetExceeded);
+}
+
+#[tokio::test]
+async fn an_executor_error_is_charged_the_time_it_took() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let exec = Scripted::new(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        Err(EvaluationError::Executor("boom".to_string()))
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(
+        receipt.total_elapsed_ms >= 40 * u64::from(receipt.recorded_runs),
+        "{}",
+        receipt.total_elapsed_ms
+    );
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert!(verified.cases.iter().all(|c| c.run.elapsed_ms >= 40));
+}
+
+#[tokio::test]
+async fn an_active_revision_must_be_the_baseline_not_no_skill() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let mut req = request(&fx, &suite, EvalSplit::Validation);
+    req.baseline = None;
+    let error = fx
+        .store
+        .evaluate(&req, &exec, &CancellationToken::new())
+        .await
+        .expect_err("test: no-skill baseline");
+    assert!(matches!(error, EvaluationError::Stale(_)), "{error}");
+    assert!(exec.seen.lock().is_empty());
+}
+
+// ---- attempts ---------------------------------------------------------------
+
+fn holdout_suite(id: &str) -> FrozenSuite {
+    let mut s = suite_with(vec![
+        case("v-0", EvalSplit::Validation, "validation task zero"),
+        case("v-1", EvalSplit::Validation, "validation task one"),
+        case("h-0", EvalSplit::Holdout, "holdout task zero"),
+        case("h-1", EvalSplit::Holdout, "holdout task one"),
+    ]);
+    s.suite_id = id.to_string();
+    s.freeze().expect("test: freeze")
+}
+
+#[tokio::test]
+async fn concurrent_evaluations_cannot_both_take_the_last_holdout_attempt() {
+    let fx = fixture();
+    let suite = holdout_suite("race-suite");
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let cancel = CancellationToken::new();
+    let req = request(&fx, &suite, EvalSplit::Holdout);
+    let (a, b) = tokio::join!(
+        fx.store.evaluate(&req, &exec, &cancel),
+        fx.store.evaluate(&req, &exec, &cancel)
+    );
+    let ok = [&a, &b].iter().filter(|r| r.is_ok()).count();
+    let exhausted = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Err(EvaluationError::AttemptsExhausted { .. })))
+        .count();
+    assert_eq!((ok, exhausted), (1, 1), "{a:?} {b:?}");
+}
+
+#[tokio::test]
+async fn a_dropped_evaluation_still_spends_its_attempt_and_the_split_key_ignores_the_suite_id() {
+    let fx = fixture();
+    let suite = holdout_suite("first-suite");
+    let hang = Hanging;
+    let cancel = CancellationToken::new();
+    let req = request(&fx, &suite, EvalSplit::Holdout);
+    // Drop the evaluation future partway: the attempt was reserved before the first run.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        fx.store.evaluate(&req, &hang, &cancel),
+    )
+    .await;
+    assert!(outcome.is_err(), "the evaluation was dropped mid-run");
+
+    // A renamed suite with the same holdout cases (and other splits changed) is the same split.
+    let mut other = suite_with(vec![
+        case("v-9", EvalSplit::Validation, "a different validation task"),
+        case("v-8", EvalSplit::Validation, "another validation task"),
+        case("h-0", EvalSplit::Holdout, "holdout task zero"),
+        case("h-1", EvalSplit::Holdout, "holdout task one"),
+    ]);
+    other.suite_id = "renamed-suite".to_string();
+    let other = other.freeze().expect("test: freeze");
+    let exec = Scripted::new(|r| Ok(good(r)));
+    let error = fx
+        .store
+        .evaluate(
+            &request(&fx, &other, EvalSplit::Holdout),
+            &exec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("test: attempt already spent");
+    assert!(matches!(error, EvaluationError::AttemptsExhausted { .. }), "{error}");
+}
+
+// ---- suite statistics and hygiene ------------------------------------------
+
+#[test]
+fn spec_minimums_and_bounds_are_enforced() {
+    let ok = || {
+        suite_with(vec![
+            case("a", EvalSplit::Validation, "prompt one"),
+            case("b", EvalSplit::Validation, "prompt two"),
+        ])
+    };
+    assert!(ok().freeze().is_ok());
+    let reject = |mutate: fn(&mut EvalSuite), needle: &str| {
+        let mut s = ok();
+        mutate(&mut s);
+        let error = s.freeze().expect_err("test: must be rejected").to_string();
+        assert!(error.contains(needle), "{error}");
+    };
+    reject(|s| s.min_cases = 1, "min_cases");
+    reject(|s| s.deterministic = false, "stochastic");
+    reject(|s| s.min_gain_cases = 0, "min_gain_cases");
+    reject(|s| s.allowed_regressions = 100, "allowed_regressions");
+    reject(|s| s.holdout_attempts = 0, "holdout_attempts");
+    reject(|s| s.validation_attempts = 1000, "validation_attempts");
+    reject(|s| s.budget.max_total_tokens = 0, "budget");
+    reject(|s| s.budget.max_total_cost_micros = 0, "budget");
+    reject(|s| s.required_tools = vec!["skill_read".to_string()], "always offered");
+    reject(
+        |s| {
+            s.cases[0].fixtures = vec![FixtureFile {
+                path: "skills/evil/SKILL.md".to_string(),
+                content: "x".to_string(),
+            }];
+        },
+        "reserved",
+    );
+    reject(
+        |s| {
+            s.cases[0].fixtures = vec![FixtureFile {
+                path: "config.toml".to_string(),
+                content: "x".to_string(),
+            }];
+        },
+        "reserved",
+    );
+}
+
+#[test]
+fn a_full_evaluation_history_is_a_typed_error_with_guidance() {
+    let fx = fixture();
+    let dir = fx.store.root().join("evaluations");
+    fs::create_dir_all(&dir).expect("test: dir");
+    for i in 0..4097_u32 {
+        fs::create_dir(dir.join(format!("eval-{i:032x}"))).expect("test: entry");
+    }
+    let error = fx.store.list_evaluation_ids().expect_err("test: full");
+    assert!(matches!(error, EvaluationError::HistoryFull { .. }), "{error}");
+    assert!(error.to_string().contains("archive or remove"), "{error}");
 }

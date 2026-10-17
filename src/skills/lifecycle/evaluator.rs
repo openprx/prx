@@ -9,16 +9,16 @@
 
 use super::bundle::Bundle;
 use super::evaluate::{
-    Arm, ArmBinding, CaseContext, CaseExecutor, CaseReceipt, CaseVerdict, EVALUATION_SCHEMA_VERSION, EvaluationError,
-    EvaluationOutcome, EvaluationReceipt, ExecutionRequest, InstallSkill, InvalidReason, RUNNER_IDENTITY,
-    RunObservation, RunPlan, assess, build_case_receipt, new_evaluation_id,
+    Arm, ArmBinding, ArmResources, CaseContext, CaseExecutor, CaseReceipt, CaseVerdict, EVALUATION_SCHEMA_VERSION,
+    EvaluationError, EvaluationOutcome, EvaluationReceipt, ExecutionRequest, InstallSkill, InvalidReason,
+    RUNNER_IDENTITY, RunObservation, RunPlan, assess, build_case_receipt, new_evaluation_id, resource_digests,
 };
 use super::store::SkillLifecycleStore;
 use super::suite::{EvalCase, EvalSplit, FrozenSuite};
 use super::types::RevisionId;
 use chrono::Utc;
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Extra time an executor gets past a case's own ceiling to clean up before
@@ -110,16 +110,6 @@ impl SkillLifecycleStore {
                 allowed: spec.budget.max_runs,
             });
         }
-        if let Some(limit) = suite.attempt_limit(request.split) {
-            let used = self.evaluation_attempts(suite.digest(), request.split)?;
-            if used >= limit {
-                return Err(EvaluationError::AttemptsExhausted {
-                    split: request.split,
-                    limit,
-                    used,
-                });
-            }
-        }
         if request.baseline.as_ref() == Some(&request.candidate) {
             return Err(EvaluationError::NothingToCompare);
         }
@@ -134,12 +124,21 @@ impl SkillLifecycleStore {
                 request.observed_generation
             )));
         }
-        if let Some(baseline) = &request.baseline
-            && binding.as_ref().is_none_or(|b| b.revision_id != *baseline)
-        {
-            return Err(EvaluationError::Stale(
-                "the baseline revision is not the active revision".to_string(),
-            ));
+        match (&request.baseline, &binding) {
+            (Some(baseline), Some(active)) if active.revision_id == *baseline => {}
+            (Some(_), _) => {
+                return Err(EvaluationError::Stale(
+                    "the baseline revision is not the active revision".to_string(),
+                ));
+            }
+            // A skill that is already published is compared with itself, not
+            // with doing the task without a skill.
+            (None, Some(_)) => {
+                return Err(EvaluationError::Stale(
+                    "a revision is active, so the baseline must be the active revision".to_string(),
+                ));
+            }
+            (None, None) => {}
         }
         let (candidate_binding, candidate_bundle) = arm_binding(self, &suite, &request.candidate)?;
         let baseline = request
@@ -148,18 +147,29 @@ impl SkillLifecycleStore {
             .map(|revision| arm_binding(self, &suite, revision))
             .transpose()?;
 
+        let resources = ArmResources {
+            baseline: baseline.as_ref().map(|(_, bundle)| resource_digests(bundle)),
+            candidate: resource_digests(&candidate_bundle),
+        };
         let evaluation_id = new_evaluation_id();
+        // Everything that can be refused has been; from here the attempt is
+        // spent whatever happens (see `reserve_attempt`).
+        self.reserve_attempt(&suite, request.split, &evaluation_id)?;
+        let denied_paths = [self.root().to_path_buf()];
         let context = CaseContext {
             owner: self.owner_scope(),
             evaluation_id: &evaluation_id,
             suite: &suite,
             observed_generation: request.observed_generation,
+            resources: &resources,
         };
         let started_at = Utc::now();
         let mut receipts: Vec<CaseReceipt> = Vec::new();
         let mut run_ids: BTreeSet<String> = BTreeSet::new();
         let mut environment_hash: Option<String> = None;
         let mut total_elapsed_ms: u64 = 0;
+        let mut total_tokens: u64 = 0;
+        let mut total_cost_micros: u64 = 0;
         let mut order: u32 = 0;
         let mut cancelled = false;
         let mut budget_exhausted = false;
@@ -178,7 +188,10 @@ impl SkillLifecycleStore {
                         cancelled = true;
                         break 'cases;
                     }
-                    if total_elapsed_ms >= spec.budget.max_total_elapsed_ms {
+                    if total_elapsed_ms >= spec.budget.max_total_elapsed_ms
+                        || total_tokens >= spec.budget.max_total_tokens
+                        || total_cost_micros >= spec.budget.max_total_cost_micros
+                    {
                         budget_exhausted = true;
                         break 'cases;
                     }
@@ -201,16 +214,28 @@ impl SkillLifecycleStore {
                             bundle,
                         }),
                         deadline,
+                        required_tools: &spec.required_tools,
+                        side_effects: spec.side_effects,
+                        denied_paths: &denied_paths,
                     };
+                    let started = Instant::now();
                     let observed = run_with_backstop(executor, &execution, cancel).await;
+                    // The evaluator's own clock is authoritative: a run is never
+                    // charged less than the time it actually took, also when the
+                    // executor failed or was cut off.
+                    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let (observation, forced) = match observed {
-                        Ok(observation) => {
-                            let forced = evaluator_invalidity(&observation, &mut run_ids, &mut environment_hash);
+                        Ok(mut observation) => {
+                            observation.elapsed_ms = observation.elapsed_ms.max(wall_ms);
                             total_elapsed_ms = total_elapsed_ms.saturating_add(observation.elapsed_ms);
+                            total_tokens = total_tokens.saturating_add(observation.tokens.unwrap_or(0));
+                            total_cost_micros = total_cost_micros.saturating_add(observation.cost_micros.unwrap_or(0));
+                            let forced = evaluator_invalidity(&observation, &mut run_ids, &mut environment_hash);
                             (Some(observation), forced)
                         }
                         Err(error) => {
                             tracing::warn!(case = %case.case_id, "evaluation case executor failed: {error}");
+                            total_elapsed_ms = total_elapsed_ms.saturating_add(wall_ms);
                             (None, None)
                         }
                     };
@@ -226,6 +251,7 @@ impl SkillLifecycleStore {
                         &plan,
                         &run_id,
                         observation.as_ref(),
+                        wall_ms,
                         forced,
                     )?);
                     order += 1;
@@ -251,6 +277,7 @@ impl SkillLifecycleStore {
             environment_hash,
             runner: RUNNER_IDENTITY.to_string(),
             executor: executor.identity(),
+            seed_control: executor.seed_control(),
             trials: spec.trials,
             planned_cases: cases.iter().map(|case| case.case_id.clone()).collect(),
             planned_runs: u32::try_from(planned_runs).unwrap_or(u32::MAX),
@@ -264,7 +291,7 @@ impl SkillLifecycleStore {
             started_at,
             finished_at: Utc::now(),
         };
-        receipt.outcome = assess(&suite, &receipt, &receipts).0;
+        receipt.outcome = assess(&suite, &receipt, &receipts, &resources).0;
         self.write_evaluation(&receipt, &receipts)?;
         Ok(receipt)
     }

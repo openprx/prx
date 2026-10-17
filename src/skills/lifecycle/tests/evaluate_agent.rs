@@ -9,7 +9,8 @@ use super::{activate, entry, owner};
 use crate::config::Config;
 use crate::skills::lifecycle::{
     AgentCaseExecutor, Arm, Bundle, CaseVerdict, EvalCase, EvalSplit, EvalSuite, EvaluationOutcome, EvaluationRequest,
-    InvalidReason, NewRevision, RevisionId, SkillId, SkillLifecycleStore, SourceKind, SuiteBudget, Validator,
+    InvalidReason, NewRevision, RevisionId, SideEffects, SkillId, SkillLifecycleStore, SourceKind, SuiteBudget,
+    Validator,
 };
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -164,9 +165,6 @@ fn template(root: &std::path::Path, loopback: &Loopback) -> Config {
     config.auth.codex_auth_json_auto_import = false;
     config.auth.codex_auth_json_path = root.join("no-codex-auth.json");
     config.memory.backend = "sqlite".to_string();
-    // The decision plane has no model backend here, so the skill reader is offered
-    // directly instead of through a discovery hop.
-    config.tool_tiering.always_include.push("skill_read".to_string());
     let provider = loopback.provider();
     config.cost.prices.insert(
         format!("{provider}/{MODEL}"),
@@ -221,11 +219,17 @@ fn suite(cases: Vec<EvalCase>, min_cases: u32) -> crate::skills::lifecycle::Froz
         trials: 1,
         min_cases,
         allowed_regressions: 0,
+        deterministic: true,
+        min_gain_cases: 1,
         validation_attempts: 3,
         holdout_attempts: 1,
+        required_tools: Vec::new(),
+        side_effects: SideEffects::None,
         budget: SuiteBudget {
             max_runs: 32,
             max_total_elapsed_ms: 900_000,
+            max_total_tokens: 1_000_000,
+            max_total_cost_micros: 1_000_000,
         },
         cases,
     }
@@ -299,6 +303,12 @@ async fn the_real_agent_entry_separates_a_better_skill_revision_from_the_baselin
         let arm_revision = if case.arm == Arm::Candidate { &b.0 } else { &a.0 };
         let installed = case.run.installed.as_ref().expect("test: a skill was installed");
         assert_eq!(&installed.revision_id, arm_revision);
+        assert!(
+            case.run.tokens.is_some_and(|t| t > 0),
+            "usage comes from the run's own ledger"
+        );
+        assert!(case.run.cost_micros.is_some_and(|c| c > 0));
+        assert_eq!(case.run.models_used.len(), 1, "{:?}", case.run.models_used);
         if case.case_id.starts_with("pos") {
             // The real runtime served the pinned revision of this arm and joined a terminal.
             assert_eq!(case.run.hydrations.len(), 1, "{}: {:?}", case.case_id, case.verdict);
@@ -336,15 +346,20 @@ async fn an_empty_model_reply_through_the_real_entry_can_never_pass() {
     activate(&store, &skill(), &a, 0, true);
     // Both arms get an empty reply, which also satisfies an "excludes" validator.
     let suite = suite(
-        vec![case(
-            "empty",
-            "ZEROBODY please answer.",
-            Validator::ResponseExcludes {
-                text: "NEVER-PRESENT".to_string(),
-            },
-            false,
-        )],
-        1,
+        ["empty-0", "empty-1"]
+            .into_iter()
+            .map(|id| {
+                case(
+                    id,
+                    &format!("ZEROBODY please answer {id}."),
+                    Validator::ResponseExcludes {
+                        text: "NEVER-PRESENT".to_string(),
+                    },
+                    false,
+                )
+            })
+            .collect(),
+        2,
     );
     let executor = AgentCaseExecutor::new(template(tmp.path(), &loopback), tmp.path().join("scratch"), 0.0);
     let receipt = store
@@ -375,4 +390,163 @@ async fn an_empty_model_reply_through_the_real_entry_can_never_pass() {
         verified.cases.iter().map(|c| &c.verdict).collect::<Vec<_>>()
     );
     assert!(matches!(verified.outcome, EvaluationOutcome::Incomplete { .. }));
+}
+
+fn dummy_request<'a>(
+    denied: &'a [std::path::PathBuf],
+    tools: &'a [String],
+    effects: SideEffects,
+) -> crate::skills::lifecycle::ExecutionRequest<'a> {
+    crate::skills::lifecycle::ExecutionRequest {
+        run_id: "evalrun-x",
+        prompt: "p",
+        fixtures: &[],
+        collect_artifacts: &[],
+        skill: None,
+        deadline: std::time::Duration::from_secs(1),
+        required_tools: tools,
+        side_effects: effects,
+        denied_paths: denied,
+    }
+}
+
+#[tokio::test]
+async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_store() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let loopback = Loopback::start().await;
+    let mut hostile = template(tmp.path(), &loopback);
+    hostile.memory.backend = "postgres".to_string();
+    hostile.memory.auto_save = true;
+    hostile.security.workspace_hooks = crate::config::schema::WorkspaceHooks::On;
+    hostile.observability.backend = "otel".to_string();
+    hostile.autonomy.level = crate::security::AutonomyLevel::Full;
+    hostile.autonomy.workspace_only = false;
+    hostile.tool_tiering.always_include = vec!["shell".to_string()];
+    hostile.http_request.timeout_secs = 1;
+    hostile.web_search.max_results = 99;
+    hostile.browser.allowed_domains.push("evil.example".to_string());
+    let executor = AgentCaseExecutor::new(hostile, tmp.path().join("scratch"), 0.0);
+    let ws = tmp.path().join("run-ws");
+    std::fs::create_dir_all(&ws).expect("test: ws");
+    let store_dir = tmp.path().join("owner-ws");
+    std::fs::create_dir_all(&store_dir).expect("test: owner ws");
+    let store = SkillLifecycleStore::open(&store_dir, owner(OWNER)).expect("test: store");
+    let denied = [store.root().to_path_buf()];
+
+    let none: Vec<String> = Vec::new();
+    let config = executor
+        .run_config(&ws, &dummy_request(&denied, &none, SideEffects::None))
+        .expect("test: config");
+    let default = Config::default();
+    let json = |value: &dyn erased::Ser| value.to_json();
+    assert_eq!(config.memory.backend, "sqlite");
+    assert!(!config.memory.auto_save);
+    assert_eq!(config.memory.embedding_provider, "none");
+    assert_eq!(
+        config.security.workspace_hooks,
+        crate::config::schema::WorkspaceHooks::Off
+    );
+    assert_eq!(config.observability.backend, "none");
+    assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::ReadOnly);
+    assert!(config.autonomy.workspace_only);
+    assert_eq!(config.workspace_dir, ws);
+    assert!(config.config_path.starts_with(&ws));
+    assert_eq!(config.tool_tiering.always_include, ["skill_read"]);
+    for name in [
+        "shell",
+        "http_request",
+        "web_search",
+        "browser",
+        "message_send",
+        "sessions_spawn",
+        "delegate",
+        "cron_add",
+        "mcp",
+    ] {
+        assert!(
+            config.tool_tiering.always_exclude.iter().any(|n| n == name),
+            "{name} must be withheld"
+        );
+    }
+    assert_eq!(json(&config.http_request), json(&default.http_request));
+    assert_eq!(json(&config.web_search), json(&default.web_search));
+    assert_eq!(json(&config.browser), json(&default.browser));
+    assert_eq!(json(&config.mcp), json(&default.mcp));
+    assert_eq!(json(&config.channels_config), json(&default.channels_config));
+    assert_eq!(json(&config.agents), json(&default.agents));
+    assert_eq!(json(&config.cron), json(&default.cron));
+    assert_eq!(json(&config.sessions_spawn), json(&default.sessions_spawn));
+
+    // The file tools run under this policy and cannot read the suite oracle.
+    let secret = store.root().join("suites").join("oracle.json");
+    std::fs::create_dir_all(secret.parent().expect("test: parent")).expect("test: suites dir");
+    std::fs::write(&secret, b"ORACLE").expect("test: oracle");
+    let policy = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(&config.autonomy, &ws));
+    assert!(!policy.is_path_allowed(&secret.to_string_lossy()));
+    let reader = crate::tools::FileReadTool::new(policy, false);
+    let read = crate::tools::Tool::execute(&reader, serde_json::json!({"path": secret.to_string_lossy()}))
+        .await
+        .expect("test: tool result");
+    assert!(!read.success && !read.output.contains("ORACLE"), "{read:?}");
+
+    // Declared tools are offered, and only those take settings from the template.
+    let tools = vec!["http_request".to_string()];
+    let config = executor
+        .run_config(&ws, &dummy_request(&denied, &tools, SideEffects::WorkspaceWrite))
+        .expect("test: config");
+    assert_eq!(config.tool_tiering.always_include, ["skill_read", "http_request"]);
+    assert!(!config.tool_tiering.always_exclude.iter().any(|n| n == "http_request"));
+    assert_eq!(config.http_request.timeout_secs, 1);
+    assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::Full);
+    assert!(config.autonomy.workspace_only, "writes stay inside the task workspace");
+}
+
+/// Tiny helper so sections of different types compare as JSON.
+mod erased {
+    pub trait Ser {
+        fn to_json(&self) -> serde_json::Value;
+    }
+    impl<T: serde::Serialize> Ser for T {
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        }
+    }
+}
+
+#[test]
+fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_served() {
+    let tmp = TempDir::new().expect("test: tempdir");
+    assert!(
+        super::super::agent_executor_read_usage_for_test(tmp.path())
+            .tokens
+            .is_none(),
+        "no ledger means unmeasured, not free"
+    );
+    std::fs::create_dir_all(tmp.path().join("state")).expect("test: state");
+    let line = |model: &str, tokens: u64, cost: f64| {
+        serde_json::json!({"id": "x", "usage": {"model": model, "total_tokens": tokens, "cost_usd": cost}}).to_string()
+    };
+    std::fs::write(
+        tmp.path().join("state/costs.jsonl"),
+        format!("{}\n{}\n", line("m-a", 7, 0.000_001), line("m-b", 5, 0.000_002_5)),
+    )
+    .expect("test: ledger");
+    let usage = super::super::agent_executor_read_usage_for_test(tmp.path());
+    assert_eq!((usage.tokens, usage.cost_micros), (Some(12), Some(4)));
+    assert_eq!(usage.models, ["m-a", "m-b"]);
+
+    let tools: Vec<String> = Vec::new();
+    let denied: Vec<std::path::PathBuf> = Vec::new();
+    let request = dummy_request(&denied, &tools, SideEffects::None);
+    let config = Config::default();
+    let one = AgentCaseExecutor::environment_hash_for_test(&config, &request, &["m-a".to_string()]);
+    let other = AgentCaseExecutor::environment_hash_for_test(&config, &request, &["m-b".to_string()]);
+    assert_ne!(
+        one, other,
+        "a run served by a fallback model has a different environment"
+    );
+    assert_eq!(
+        one,
+        AgentCaseExecutor::environment_hash_for_test(&config, &request, &["m-a".to_string()])
+    );
 }
