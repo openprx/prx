@@ -109,21 +109,40 @@ impl ModelCallError {
 #[async_trait]
 pub trait ProposerModel: Send + Sync {
     fn binding(&self) -> &ModelBinding;
-    async fn complete(&self, system: &str, user: &str) -> Result<ModelReply, ModelCallError>;
-
-    /// The physical requests the last call reserved and settled so far. The
-    /// proposer reads it after dropping a call (deadline, cancellation), when
-    /// `complete` can no longer report it. The default knows of none.
-    fn physical_tally(&self) -> ReportedUsage {
-        ReportedUsage::default()
-    }
+    /// Answers one prompt. `tally` belongs to this call alone: the proposer
+    /// allocates it per call and keeps a handle, so after dropping the call
+    /// (deadline, cancellation) it can still read how many physical requests
+    /// were reserved and settled. An implementation that makes physical
+    /// requests records them on it.
+    async fn complete(&self, system: &str, user: &str, tally: Arc<TallyCounters>)
+    -> Result<ModelReply, ModelCallError>;
 }
 
-/// Counters shared between a managed model and the call in flight.
+/// Physical requests reserved and settled by one model call.
 #[derive(Debug, Default)]
 pub struct TallyCounters {
     begun: AtomicU32,
     settled: AtomicU32,
+}
+
+impl TallyCounters {
+    pub fn record_reservation(&self) {
+        self.begun.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn record_settlement(&self) {
+        self.settled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// What is known so far, as an unreported usage.
+    #[must_use]
+    pub fn snapshot(&self) -> ReportedUsage {
+        ReportedUsage {
+            physical_requests: self.begun.load(Ordering::SeqCst),
+            settled_requests: self.settled.load(Ordering::SeqCst),
+            ..ReportedUsage::default()
+        }
+    }
 }
 
 /// The production model: the managed provider path with attempt accounting.
@@ -138,7 +157,6 @@ pub struct ManagedProviderModel {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) binding: ModelBinding,
     pub(crate) accounting: Arc<dyn AttemptAccounting>,
-    pub(crate) counters: Arc<TallyCounters>,
 }
 
 fn bounded_detail(text: &str) -> String {
@@ -170,7 +188,7 @@ impl AttemptAccounting for Tally {
     }
     async fn begin(&self, request: PhysicalRequest<'_>) -> anyhow::Result<Box<dyn AttemptReceipt>> {
         let receipt = self.inner.begin(request).await?;
-        self.counters.begun.fetch_add(1, Ordering::SeqCst);
+        self.counters.record_reservation();
         Ok(Box::new(TallyReceipt {
             inner: receipt,
             counters: Arc::clone(&self.counters),
@@ -193,7 +211,7 @@ impl AttemptReceipt for TallyReceipt {
     async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
         let Self { inner, counters } = *self;
         inner.settle(usage).await?;
-        counters.settled.fetch_add(1, Ordering::SeqCst);
+        counters.record_settlement();
         Ok(())
     }
 }
@@ -204,15 +222,12 @@ impl ProposerModel for ManagedProviderModel {
         &self.binding
     }
 
-    fn physical_tally(&self) -> ReportedUsage {
-        ReportedUsage {
-            physical_requests: self.counters.begun.load(Ordering::SeqCst),
-            settled_requests: self.counters.settled.load(Ordering::SeqCst),
-            ..ReportedUsage::default()
-        }
-    }
-
-    async fn complete(&self, system: &str, user: &str) -> Result<ModelReply, ModelCallError> {
+    async fn complete(
+        &self,
+        system: &str,
+        user: &str,
+        counters: Arc<TallyCounters>,
+    ) -> Result<ModelReply, ModelCallError> {
         let messages = [
             ChatMessage::system(system),
             crate::agent::turn_contracts::inbound_user_message(user),
@@ -221,17 +236,13 @@ impl ProposerModel for ManagedProviderModel {
             messages: &messages,
             tools: None,
         };
-        self.counters.begun.store(0, Ordering::SeqCst);
-        self.counters.settled.store(0, Ordering::SeqCst);
         let tally = Arc::new(Tally {
             inner: Arc::clone(&self.accounting),
-            counters: Arc::clone(&self.counters),
+            counters: Arc::clone(&counters),
         });
-        let counts = |tally: &Tally| {
-            (
-                tally.counters.begun.load(Ordering::SeqCst),
-                tally.counters.settled.load(Ordering::SeqCst),
-            )
+        let counts = |counters: &TallyCounters| {
+            let usage = counters.snapshot();
+            (usage.physical_requests, usage.settled_requests)
         };
         let result = attempt_accounting::chat_traced(
             self.provider.as_ref(),
@@ -241,7 +252,7 @@ impl ProposerModel for ManagedProviderModel {
             Arc::clone(&tally) as Arc<dyn AttemptAccounting>,
         )
         .await;
-        let (begun, settled) = counts(&tally);
+        let (begun, settled) = counts(&counters);
         let trace = match result {
             Ok(trace) => trace,
             Err(error) => {

@@ -4,6 +4,7 @@
 use super::{activate, entry, exec_entry, owner};
 use crate::skills::lifecycle::proposal::ProposalStatus as Status;
 use crate::skills::lifecycle::propose::{CallResult, Prepare};
+use crate::skills::lifecycle::proposer_model::TallyCounters;
 use crate::skills::lifecycle::{
     AttemptOutcome, Bundle, BundleEntry, ConsolidationRequest, Correlation, ExperienceOutcome, FailureClass,
     KnowledgePattern, LifecycleError, ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, NewRejection,
@@ -177,6 +178,8 @@ enum Script {
     Denied,
     Fail(String),
     Hang,
+    /// Records this many physical reservations on the call's tally, then hangs.
+    HangAfter(u32),
     /// Waits for the gate, then replies.
     Gated(Arc<tokio::sync::Notify>, String),
 }
@@ -221,7 +224,12 @@ impl ProposerModel for ScriptedModel {
     fn binding(&self) -> &ModelBinding {
         &self.binding
     }
-    async fn complete(&self, _system: &str, user: &str) -> Result<ModelReply, ModelCallError> {
+    async fn complete(
+        &self,
+        _system: &str,
+        user: &str,
+        tally: Arc<TallyCounters>,
+    ) -> Result<ModelReply, ModelCallError> {
         *self.last_user.lock() = user.to_string();
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(before) = &self.before {
@@ -242,6 +250,13 @@ impl ProposerModel for ScriptedModel {
             Some(Script::Denied) => Err(ModelCallError::BudgetDenied),
             Some(Script::Fail(message)) => Err(ModelCallError::failed(message)),
             Some(Script::Hang) => {
+                let _guard = DropFlag(Arc::clone(&self.hung_dropped));
+                std::future::pending::<Result<ModelReply, ModelCallError>>().await
+            }
+            Some(Script::HangAfter(requests)) => {
+                for _ in 0..requests {
+                    tally.record_reservation();
+                }
                 let _guard = DropFlag(Arc::clone(&self.hung_dropped));
                 std::future::pending::<Result<ModelReply, ModelCallError>>().await
             }
@@ -1317,6 +1332,94 @@ async fn padding_that_the_token_cap_misses_is_stopped_by_the_byte_cap() {
 }
 
 #[tokio::test]
+async fn concurrent_proposals_on_one_model_keep_separate_tallies() {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    // One shared model; the two calls reserve 1 and 3 physical requests and
+    // then run into their deadline. Which call gets which script is up to the
+    // scheduler, but each proposal must record exactly its own count.
+    let model = ScriptedModel::new(vec![Script::HangAfter(1), Script::HangAfter(3)]);
+    let short = |id: &str| {
+        let mut r = request(id, &[&pattern]);
+        r.budget = ProposerBudget::new(64 * 1024, 16 * 1024, Duration::from_millis(600)).expect("test: budget");
+        r
+    };
+    let (token_a, token_b) = (CancellationToken::new(), CancellationToken::new());
+    let pair = tokio::join!(
+        propose_revision(Arc::clone(&f.store), short("conc-a"), &model, &token_a),
+        propose_revision(Arc::clone(&f.store), short("conc-b"), &model, &token_b),
+    );
+    let mut counts: Vec<u32> = vec![pair.0, pair.1]
+        .into_iter()
+        .map(|outcome| {
+            let ProposeOutcome::Failed(p) = outcome.expect("test: propose") else {
+                panic!("test: expected a timed-out proposal");
+            };
+            assert_eq!(p.attempts[0].outcome, AttemptOutcome::TimedOut);
+            p.attempts[0].usage.expect("test: tally recorded").physical_requests
+        })
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![1, 3], "each call keeps its own count");
+    assert_eq!(model.calls(), 2);
+
+    // A call cancelled before it is polled has no stale counts from a neighbour.
+    let done = CancellationToken::new();
+    done.cancel();
+    let ProposeOutcome::Cancelled(p) =
+        propose_revision(Arc::clone(&f.store), request("pre", &[&pattern]), &model, &done)
+            .await
+            .expect("test: propose")
+    else {
+        panic!("test: cancelled");
+    };
+    assert!(p.attempts[0].usage.is_none());
+}
+
+#[tokio::test]
+async fn recovery_settles_once_the_call_deadline_and_margin_have_passed() {
+    use crate::skills::lifecycle::proposal::INTERRUPTED_GRACE;
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    let mut req = request("recover", &[&pattern]);
+    req.budget = ProposerBudget::new(64 * 1024, 16 * 1024, Duration::from_millis(50)).expect("test: budget");
+    let Prepare::Ready(_prepared) = f.store.prepare_proposal(&req, &binding()).expect("test: prepare") else {
+        panic!("test: ready");
+    };
+    let id = f.store.list_proposals().expect("test: list")[0].proposal_id.clone();
+    let backdate = |by: chrono::Duration| {
+        let lock = f.store.lock_proposals().expect("test: lock");
+        let mut proposal = f.store.read_proposal(&id).expect("test: read").expect("test: some");
+        proposal.attempts[0].started_at = chrono::Utc::now() - by;
+        f.store.write_proposal(&lock, &proposal).expect("test: write");
+    };
+    let margin = chrono::Duration::from_std(INTERRUPTED_GRACE).expect("test: margin");
+    // Past the call deadline but inside the margin: still possibly running.
+    backdate(margin / 2);
+    assert_eq!(
+        f.store
+            .recover_interrupted_proposals(Duration::ZERO)
+            .expect("test: recover")
+            .len(),
+        0
+    );
+    // Past deadline plus margin: lost.
+    backdate(margin + chrono::Duration::seconds(5));
+    assert_eq!(
+        f.store
+            .recover_interrupted_proposals(Duration::ZERO)
+            .expect("test: recover"),
+        vec![id.clone()]
+    );
+    let settled = f.store.read_proposal(&id).expect("test: read").expect("test: some");
+    assert_eq!(settled.status, Status::Failed);
+    assert_eq!(
+        settled.failure.as_ref().map(|x| x.kind),
+        Some(ProposalFailureKind::Interrupted)
+    );
+}
+
+#[tokio::test]
 async fn untrusted_text_is_fenced_with_a_marker_it_cannot_forge() {
     let f = fixture();
     let (a, b) = (failing(&f, "fence-1"), failing(&f, "fence-2"));
@@ -1547,7 +1650,6 @@ mod managed {
             provider: Arc::new(LoopbackProvider { url: url.to_string() }),
             binding: binding(),
             accounting,
-            counters: Arc::default(),
         }
     }
 

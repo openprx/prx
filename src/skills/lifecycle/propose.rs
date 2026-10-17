@@ -47,7 +47,7 @@ use super::proposal::{
     INTERRUPTED_GRACE, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus, SkillProposal, bounded,
     candidate_entries, check_request_id, material_of, proposal_id_of,
 };
-use super::proposer_model::{ModelCallError, ModelReply, ProposerModel, ReportedUsage};
+use super::proposer_model::{ModelCallError, ModelReply, ProposerModel, ReportedUsage, TallyCounters};
 use super::rejection::{ProposalOperation, RejectionRecord};
 use super::store::SkillLifecycleStore;
 use super::types::{LifecycleError, RevisionId, SCHEMA_VERSION, SkillId};
@@ -69,7 +69,6 @@ pub const MAX_PROPOSAL_PATTERNS: usize = 8;
 /// Edits one reply may carry.
 pub const MAX_EDITS: usize = 8;
 
-/// Time past an attempt's own call deadline before it counts as lost.
 const SKILL_MD: &str = "SKILL.md";
 const MAX_EDIT_TEXT_BYTES: usize = 4096;
 const MAX_SUMMARY_BYTES: usize = 500;
@@ -226,15 +225,20 @@ pub async fn propose_revision(
         CallResult::Cancelled(ReportedUsage::default())
     } else {
         let timeout = prepared.budget.call_timeout;
-        let call = tokio::time::timeout(timeout, model.complete(&prepared.system, &prepared.user));
+        // Counters of this call alone, read here after a drop.
+        let tally = Arc::new(TallyCounters::default());
+        let call = tokio::time::timeout(
+            timeout,
+            model.complete(&prepared.system, &prepared.user, Arc::clone(&tally)),
+        );
         tokio::select! {
             biased;
-            () = cancel.cancelled() => CallResult::Cancelled(model.physical_tally()),
+            () = cancel.cancelled() => CallResult::Cancelled(tally.snapshot()),
             result = call => match result {
                 Ok(Ok(reply)) => CallResult::Reply(reply),
                 Ok(Err(ModelCallError::BudgetDenied)) => CallResult::Denied,
                 Ok(Err(ModelCallError::Failed { detail, usage })) => CallResult::Failed(detail, usage),
-                Err(_) => CallResult::TimedOut(model.physical_tally()),
+                Err(_) => CallResult::TimedOut(tally.snapshot()),
             },
         }
     };
