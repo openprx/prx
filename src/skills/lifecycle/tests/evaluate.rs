@@ -37,7 +37,7 @@ pub(super) struct Fixture {
     pub(super) candidate: RevisionId,
 }
 
-fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, String) {
+pub(super) fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, String) {
     let bundle = Bundle::from_entries(vec![entry(
         "SKILL.md",
         format!("---\nname: release-notes\ndescription: Writes release notes\n---\n\n{body}\n").as_bytes(),

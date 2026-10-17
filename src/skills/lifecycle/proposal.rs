@@ -296,6 +296,17 @@ pub struct SkillProposal {
     pub failure: Option<ProposalFailure>,
     pub diff: Option<BoundedDiff>,
     pub attempts: Vec<AttemptRecord>,
+    /// Digest of the suite that governs this proposal's evaluation, bound by
+    /// `begin_evaluation` (SL07); the gate never takes it from its caller.
+    #[serde(default)]
+    pub required_suite: Option<String>,
+    /// Evaluation epochs opened so far; each one is a recorded attempt.
+    #[serde(default)]
+    pub evaluation_epoch: u32,
+    /// When the proposal first entered evaluation; evaluations that began
+    /// earlier do not count for it.
+    #[serde(default)]
+    pub evaluating_since: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

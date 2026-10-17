@@ -1252,7 +1252,7 @@ impl SkillLifecycleStore {
         Ok(sha256_hex(&lines))
     }
 
-    fn read_sealed_receipt(&self, id: &str) -> Result<(EvaluationReceipt, String), EvaluationError> {
+    pub(super) fn read_sealed_receipt(&self, id: &str) -> Result<(EvaluationReceipt, String), EvaluationError> {
         if !is_evaluation_id(id) {
             return Err(EvaluationError::NotFound(format!("evaluation {id:?}")));
         }

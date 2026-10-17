@@ -569,6 +569,9 @@ impl SkillLifecycleStore {
                 prompt_sha256,
                 detail: None,
             }],
+            required_suite: None,
+            evaluation_epoch: 0,
+            evaluating_since: None,
             created_at: now,
             updated_at: now,
         };

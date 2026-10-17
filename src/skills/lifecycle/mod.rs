@@ -67,7 +67,7 @@ pub use evaluate::{
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
 pub use gate::{
     EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
-    GateRequest, JudgeRecord, JudgeResult, RecordedGate, SkillGateDecision, VerifiedGate,
+    GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision, VerifiedGate,
 };
 pub use gate_judge::{
     GateJudge, JUDGE_PROMPT_VERSION, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgedEvaluation,
