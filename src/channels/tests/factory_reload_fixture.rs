@@ -590,22 +590,25 @@ pub(super) async fn run() {
             let user = users.first().expect("unique generation-owned input");
             assert_eq!(user.config_source_revision.as_deref(), Some(generation.source_revision.fingerprint_sha256.as_str()));
             assert!(user.owner_id.is_some()); assert!(user.run_id.is_some());
-            let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
-            let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
+            let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind, protocol_version, abstention_reason FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
+            let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, u32>(3)?, row.get::<_, Option<String>>(4)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
             assert!(!rows.is_empty() && rows.len() <= 32, "bounded complete per-input decision evidence");
             assert!(
-                rows.iter().all(|(_, _, backend)| matches!(backend.as_str(), "builtin" | "none")),
+                rows.iter().all(|(_, _, backend, protocol, abstention)| {
+                    backend == "builtin"
+                        || (backend == "none" && *protocol == 0 && abstention.as_deref() == Some("hop_stopped"))
+                }),
                 "generation {phase} persisted configured-backend decision rows: {rows:?}"
             );
             assert!(
-                rows.iter().any(|(_, _, backend)| backend == "builtin"),
+                rows.iter().any(|(_, _, backend, _, _)| backend == "builtin"),
                 "generation {phase} omitted its builtin decision row: {rows:?}"
             );
-            assert!(rows.iter().any(|(candidates, selected, _)| {
+            assert!(rows.iter().any(|(candidates, selected, _, _, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")
             }), "plain input must persist a selected direct answer");
-            assert!(rows.iter().all(|(candidates, selected, _)| {
+            assert!(rows.iter().all(|(candidates, selected, _, _, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().all(|candidate| Some(candidate.id.as_str()) != selected.as_deref() || candidate.action != "retrieve")
             }), "plain input must not select memory retrieval");
