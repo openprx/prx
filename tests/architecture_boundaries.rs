@@ -3733,7 +3733,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         admitted_resolution_sites,
         &[
             "src/tools/delegate.rs::resolve_pinned_child_compaction",
-            "src/tools/sessions_spawn.rs::execute_spawn_with_id",
+            "src/tools/sessions_spawn.rs::resolve_pinned_child_compaction",
         ],
     );
 }
