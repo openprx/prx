@@ -12,7 +12,7 @@ pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
 
-use super::branch::{CandidateId, CapabilityRef, CapabilityTarget, CausalActionKind, CausalCandidate};
+use super::branch::{CandidateId, CapabilityRef, CausalActionKind, CausalCandidate};
 use super::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, is_retrieval_source,
 };
@@ -427,7 +427,7 @@ impl EngineDecision {
             return Err(RetrievalIssueError);
         }
         let (family, reference) = self.selected_retrieval(catalog, context, source_query)?;
-        if family != CapabilityTarget::Memory {
+        if family != super::branch::CapabilityTarget::Memory {
             return Err(RetrievalIssueError);
         }
         let parts = self.state.trusted.parts();
@@ -2710,6 +2710,24 @@ mod tests {
                 .direct_candidates
                 .is_empty()
         );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.insert(use_id.clone());
+        }
+        assert!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), true,)
+                .direct_candidates
+                .is_empty(),
+            "an enabled decision plane must discover an exact discoverable-family tool"
+        );
+        assert_eq!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), false,)
+                .direct_candidates,
+            BTreeSet::from([use_id.clone()]),
+            "disabled mode preserves legacy exact-name publication without widening peers"
+        );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.clear();
+        }
         assert_eq!(
             selector_context(&available_set, &view, true, None, &selected_refs).direct_candidates,
             BTreeSet::from([use_id])

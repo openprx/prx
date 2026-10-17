@@ -1883,7 +1883,7 @@ min_coverage = 0.60
 # Keep schema_version when setting enabled = false for an explicit disable.
 # Applied directives emit causal.directive.applied events.
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = true
 
 # Delegate agents for multi-agent workflows

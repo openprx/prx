@@ -2792,8 +2792,15 @@ mod tests {
                     .unwrap();
                 assert!(user.content.contains("PRX_RECALLED_BROWSER_INSTRUCTION"));
                 assert!(user.content.ends_with("Find the archived project note."));
-                // A completed selected Memory read authorizes Answer, not another tool call.
-                assert!(request.tools.is_none(), "Answer must carry no executable capability");
+                // A completed selected Memory read keeps the bounded Direct
+                // core. The original input independently qualifies for the
+                // generic discovery control, but the selected Searchable
+                // memory tool and excluded peer must not reopen.
+                let tools = request.tools.expect("retrieval Answer keeps the Direct core");
+                assert_eq!(
+                    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+                    ["capability_search", "file_read"]
+                );
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(crate::providers::ChatResponse {
                     text: Some("done".to_owned()),
@@ -2817,6 +2824,10 @@ mod tests {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let memory_formats = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config.autonomy,
+            workspace.path(),
+        ));
         let mut agent = builder
             .provider(Box::new(SourceContextProvider(Arc::clone(&provider_calls))))
             .selected_memory_formatter(Box::new(ObservedMemoryFormatter(Arc::clone(&memory_formats))))
@@ -2827,6 +2838,7 @@ mod tests {
                     Arc::clone(&memory),
                     true,
                 )),
+                Box::new(crate::tools::file_read::FileReadTool::new(security, false)),
                 Box::new(RefreshCountingTool {
                     name: "mcp_probe",
                     category: ToolCategory::Automation,

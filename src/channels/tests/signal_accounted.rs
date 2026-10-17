@@ -84,6 +84,7 @@ enum ReportScenario {
     Uncertain,
     Empty,
     TextOnly,
+    UnsupportedVision,
 }
 
 fn exercise(confident: bool, priced: bool) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
@@ -103,12 +104,17 @@ pub(super) fn exercise_text() -> std::pin::Pin<Box<impl std::future::Future<Outp
     Box::pin(exercise_work(ReportScenario::TextOnly, true))
 }
 
+pub(super) fn exercise_unsupported_vision() -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+    Box::pin(exercise_work(ReportScenario::UnsupportedVision, true))
+}
+
 async fn exercise_work(scenario: ReportScenario, priced: bool) {
-    let (confident, empty_report, text_only) = match scenario {
-        ReportScenario::Confident => (true, false, false),
-        ReportScenario::Uncertain => (false, false, false),
-        ReportScenario::Empty => (false, true, false),
-        ReportScenario::TextOnly => (false, false, true),
+    let (confident, empty_report, text_only, vision_supported) = match scenario {
+        ReportScenario::Confident => (true, false, false, true),
+        ReportScenario::Uncertain => (false, false, false, true),
+        ReportScenario::Empty => (false, true, false, true),
+        ReportScenario::TextOnly => (false, false, true, true),
+        ReportScenario::UnsupportedVision => (false, false, false, false),
     };
     let workspace = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,7 +157,8 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         config.default_model = Some(MODEL.to_owned());
         config.providers.models.push(
             serde_json::from_value(json!({
-                "provider":PROVIDER,"model":MODEL,"operations":["chat"],"native_tools":true,"vision_input":true
+                "provider":PROVIDER,"model":MODEL,"operations":["chat"],"native_tools":true,
+                "vision_input":vision_supported
             }))
             .unwrap(),
         );
@@ -278,7 +285,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
             let captured = requests.lock();
             let expected = if text_only {
                 1
-            } else if !priced {
+            } else if !priced || !vision_supported {
                 0
             } else if confident {
                 2
@@ -312,7 +319,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         assert_eq!(replies.len(), 1);
         if text_only {
             assert!(replies.first().expect("one text reply").contains("signal text-only ok"));
-        } else if confident && priced {
+        } else if confident && priced && vision_supported {
             assert!(replies[0].contains("The admitted image was summarized."));
         } else if priced {
             assert!(replies[0].contains(SIGNAL_IMAGE_UNCERTAINTY_FALLBACK));
@@ -321,7 +328,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
             }
         }
         let journal = workspace.path().join("state/costs.reservations.jsonl");
-        if priced && !text_only {
+        if priced && !text_only && vision_supported {
             let rows: Vec<Value> = std::fs::read_to_string(journal)
                 .unwrap()
                 .lines()
@@ -453,4 +460,9 @@ async fn admitted_signal_uncertain_vision_settles_and_keeps_safe_fallback() {
 #[tokio::test]
 async fn signal_unpriced_answer_is_refused_by_g6_before_vision_admission() {
     exercise(true, false).await;
+}
+
+#[tokio::test]
+async fn signal_non_vision_catalog_model_falls_back_without_upstream_send() {
+    exercise_unsupported_vision().await;
 }

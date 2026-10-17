@@ -978,7 +978,7 @@ of what the templates themselves produced, so `prx init` writes one next to
 
 Without the sidecar, ordinary template-default refresh treats existing values
 as explicit. The decision-plane migration has its own versioned contract:
-`schema_version = 1` with `enabled = false` remains explicitly disabled, even
+Schema 1 or current schema 2 with `enabled = false` remains explicitly disabled, even
 when the sidecar also records false. Recognized unversioned legacy-default
 signatures, including the old bare `enabled = false` template, are treated as
 unset by the existing loader migration. An unversioned false alongside modern
@@ -996,7 +996,7 @@ The staged source default and full `prx init` template change together:
 
 ```toml
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = true
 ```
 
@@ -1014,7 +1014,7 @@ cap; the default change grants no provider or credential permission.
 | Unversioned bare `enabled = false` from the old template | Recognized legacy default becomes unset, then inherits true |
 | Unversioned false with legacy-only keys | Legacy classification removes the default false and migrates compatible settings |
 | Unversioned false alongside modern non-legacy settings | Explicit false remains false |
-| `schema_version = 1` and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |
+| Schema 1 or current schema 2 and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |
 | Explicit true | Remains true; backend and cost gates still apply |
 | Incompatible legacy value or conflicting old/new keys | Migration refuses; `init --force` must not install an enabled template as fallback |
 
@@ -1022,11 +1022,11 @@ The same loader migration handles the merged main file and supported managed
 fragments. Ordinary load normalizes in memory; saving or authorized regeneration
 writes canonical keys. `init --force` uses its existing consistent snapshot and
 revision-checked publication, and preserves recognized explicit disables before
-generic default refresh. The schema marker stays at 1; it is not a rollout date
+generic default refresh. The current schema marker is 2; it is not a rollout date
 or an expiry for development configurations. Existing policy-table serialization
 and explicit policy values are unchanged.
 
-To disable deliberately, retain `schema_version = 1` and set `enabled = false`
+To disable deliberately, retain the current schema version and set `enabled = false`
 through the existing management flow. Causal changes remain restart-required;
 the desired file revision and active runtime generation are separate. Preserve
 prior revisions, decision/source/terminal evidence, approval state and cost

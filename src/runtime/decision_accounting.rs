@@ -24,6 +24,9 @@ use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, Usag
 #[cfg(test)]
 pub(crate) mod timing;
 
+#[cfg(feature = "llm-router")]
+mod cl100k_prefix_bound;
+
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
 pub(crate) struct AccountingScope {
@@ -258,6 +261,8 @@ impl AccountingScope {
         if let Some(timing) = &mut diagnostic_timing {
             timing.mark("spawn_submitted");
         }
+        let runtime = tokio::runtime::Handle::current();
+        let claim_cancel = cancel.clone();
         let work = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(timing) = &mut diagnostic_timing {
@@ -341,7 +346,9 @@ impl AccountingScope {
                         timing.mark("reserve");
                     }
                 }
-                let receipt = match tracker.reserve_estimated_attempt(request) {
+                let receipt = match tracker.reserve_dispatched_estimated_attempt(request, || {
+                    !cancel.is_cancelled() && Instant::now() < deadline
+                }) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -351,41 +358,9 @@ impl AccountingScope {
                         return Err(error);
                     }
                 };
-                // From this point a durable liability exists. Only a confirmed
-                // unsent release can restore the prospective token allowance.
+                // From this point the reservation and its one-use dispatched
+                // state are durable. Unknown send/usage retains the liability.
                 restore_tokens = false;
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "deadline_before_dispatch";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("deadline_before_dispatch");
-                    }
-                }
-                if cancel.is_cancelled() || Instant::now() >= deadline {
-                    if let Err(error) = tracker.release_unsent_attempt(&receipt) {
-                        confirmed = false;
-                        return Err(error);
-                    }
-                    restore_tokens = true;
-                    anyhow::bail!("decision accounting deadline elapsed before dispatch");
-                }
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "mark_dispatched";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("mark_dispatched");
-                    }
-                }
-                if let Err(error) = tracker.mark_attempt_dispatched(&receipt) {
-                    if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
-                        confirmed = false;
-                    } else if tracker.release_unsent_attempt(&receipt).is_ok() {
-                        restore_tokens = true;
-                    } else {
-                        confirmed = false;
-                    }
-                    return Err(error);
-                }
                 Ok(OwnedReceipt {
                     tracker,
                     receipt,
@@ -423,7 +398,12 @@ impl AccountingScope {
                     format_args!("prx_accounting_failure stage={diagnostic_stage} allowance_tokens={tokens}\n"),
                 );
             }
-            result.map_err(|_| DecisionError::BudgetExceeded)
+            result
+                .map(|receipt| UnclaimedReceipt {
+                    receipt: Some(receipt),
+                    runtime,
+                })
+                .map_err(|_| DecisionError::BudgetExceeded)
         });
         let receipt = tokio::time::timeout_at(deadline.into(), work)
             .await
@@ -437,7 +417,51 @@ impl AccountingScope {
                 accounting_diagnostic_failure("blocking_join");
                 DecisionError::BudgetExceeded
             })??;
-        Ok(receipt)
+        if claim_cancel.is_cancelled() || Instant::now() >= deadline {
+            return Err(DecisionError::BudgetExceeded);
+        }
+        // No await separates receipt delivery from ownership transfer. Dropping
+        // the join result before here releases an attempt that cannot be sent.
+        receipt.claim()
+    }
+}
+
+struct UnclaimedReceipt {
+    receipt: Option<OwnedReceipt>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl UnclaimedReceipt {
+    fn claim(mut self) -> Result<OwnedReceipt, DecisionError> {
+        self.receipt.take().ok_or(DecisionError::BudgetExceeded)
+    }
+}
+
+impl Drop for UnclaimedReceipt {
+    fn drop(&mut self) {
+        let Some(mut receipt) = self.receipt.take() else {
+            return;
+        };
+        // The cleanup ticket stays owned until the compensating journal write
+        // finishes, including when the caller timed out during the first fsync.
+        self.runtime.spawn_blocking(move || {
+            let released = receipt.tracker.release_unclaimed_estimated_attempt(&receipt.receipt);
+            if released.is_ok() {
+                receipt
+                    .remaining
+                    .tokens
+                    .fetch_add(receipt.reserved_tokens, Ordering::AcqRel);
+                receipt
+                    .remaining
+                    .micro_usd
+                    .fetch_add(receipt.reserved_micro_usd, Ordering::AcqRel);
+            } else {
+                tracing::warn!("unclaimed decision reservation release was not confirmed");
+            }
+            if let Some(ticket) = receipt.ticket.take() {
+                ticket.finish(released.is_ok());
+            }
+        });
     }
 }
 
@@ -617,6 +641,13 @@ fn input_token_preflight(
     allowance: u64,
     estimate: impl FnOnce() -> usize,
 ) -> Result<bool, std::num::TryFromIntError> {
+    #[cfg(feature = "llm-router")]
+    if text.len() >= cl100k_prefix_bound::MIN_INPUT_BYTES
+        && u64::try_from(cl100k_prefix_bound::upper_bound(text).unwrap_or(usize::MAX))
+            .is_ok_and(|upper| upper < allowance)
+    {
+        return Ok(true);
+    }
     if u64::try_from(input_token_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
         return Ok(true);
     }

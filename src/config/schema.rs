@@ -6705,13 +6705,11 @@ impl Config {
 
     fn validate_stored_merged(merged: toml::Value, config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let causal_extra_latency_explicit = causal_extra_latency_budget_present(&merged);
         let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
-        config.causal_tree.policy.extra_latency_budget_ms_explicit = causal_extra_latency_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
         config.validate()
     }
@@ -6738,13 +6736,11 @@ impl Config {
         crate::config::secret_paths::warn_on_stored_masks(&merged);
 
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let causal_extra_latency_explicit = causal_extra_latency_budget_present(&merged);
         let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
-        config.causal_tree.policy.extra_latency_budget_ms_explicit = causal_extra_latency_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
         config.validate()?;
         Ok(config)
@@ -7576,14 +7572,6 @@ fn agent_compaction_max_context_tokens_present(config: &toml::Value) -> bool {
         .get("agent")
         .and_then(|agent| agent.get("compaction"))
         .and_then(|compaction| compaction.get("max_context_tokens"))
-        .is_some()
-}
-
-fn causal_extra_latency_budget_present(config: &toml::Value) -> bool {
-    config
-        .get("causal_tree")
-        .and_then(|causal| causal.get("policy"))
-        .and_then(|policy| policy.get("extra_latency_budget_ms"))
         .is_some()
 }
 
@@ -8646,7 +8634,7 @@ max_context = 1000000
     }
 
     #[test]
-    async fn load_path_marks_causal_latency_budget_presence_even_at_default_value() {
+    async fn load_path_treats_the_pre_catalog_serialized_latency_default_as_unset() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -8680,8 +8668,22 @@ extra_latency_budget_ms = 500
         .unwrap();
 
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
-        assert!(loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
         assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
+
+        let upgraded = crate::config::manage::mutation::causal::CausalConfigService::mutate(
+            &loaded,
+            &[crate::config::manage::mutation::causal::CausalMutation::SetBackend {
+                kind: crate::decision::BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_owned()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            }],
+        )
+        .expect("a stored old default adopts the hosted catalog budget");
+        assert_eq!(upgraded.causal_tree.policy.extra_latency_budget_ms, 3_000);
+        assert!(upgraded.causal_tree.policy.extra_latency_budget_ms_explicit);
     }
 
     #[test]
@@ -12255,7 +12257,7 @@ circuit_breaker_cooldown_secs = 60
         assert!(saved.contains("enabled = true"), "`enabled` is always written: {saved}");
 
         assert!(
-            saved.contains("schema_version = 1"),
+            saved.contains("schema_version = 2"),
             "the version is always written: {saved}"
         );
 
@@ -12344,7 +12346,7 @@ circuit_breaker_cooldown_secs = 60
             .expect("test: save");
         let saved = saved_text(dir.path());
         assert!(
-            saved.contains("schema_version = 1") && saved.contains("enabled = true"),
+            saved.contains("schema_version = 2") && saved.contains("enabled = true"),
             "{saved}"
         );
     }

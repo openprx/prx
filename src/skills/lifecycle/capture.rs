@@ -181,6 +181,13 @@ pub struct TerminalJoinOutcome {
     pub replayed: bool,
 }
 
+/// Whether `id` has the shape of an experience id: `exp-` + 32 lowercase hex digits.
+pub(super) fn is_experience_id(id: &str) -> bool {
+    id.strip_prefix("exp-").is_some_and(|digest| {
+        digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Deterministic experience id of `(owner, task)`.
 #[must_use]
 pub fn experience_id(owner: &OwnerScope, task_id: &str) -> String {
@@ -242,14 +249,35 @@ impl SkillLifecycleStore {
     /// Reads one experience; `None` when the task left no managed-skill evidence.
     pub fn read_experience(&self, task_id: &str) -> Result<Option<SkillExperience>, LifecycleError> {
         check_text("task id", task_id)?;
-        let path = self.experience_path(&experience_id(self.owner_scope(), task_id));
+        let id = experience_id(self.owner_scope(), task_id);
+        let record = self.read_experience_by_id(&id)?;
+        if record.as_ref().is_some_and(|record| record.task_id != task_id) {
+            return Err(LifecycleError::Tampered {
+                path: self.experience_path(&id),
+                reason: "experience identity does not match its location".to_string(),
+            });
+        }
+        Ok(record)
+    }
+
+    /// Reads one experience by its id (`exp-` + 32 hex digits); `None` when it
+    /// does not exist. The record must belong to this owner and its id must be
+    /// the one derived from its owner and task.
+    pub fn read_experience_by_id(&self, id: &str) -> Result<Option<SkillExperience>, LifecycleError> {
+        if !is_experience_id(id) {
+            return Err(LifecycleError::InvalidId {
+                kind: "experience id",
+                reason: "must be exp- followed by 32 lowercase hex digits".to_string(),
+            });
+        }
+        let path = self.experience_path(id);
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(LifecycleError::io(&path, e)),
         }
         check_private(&path)?;
-        let record: SkillExperience = read_record(&path)?;
+        let mut record: SkillExperience = read_record(&path)?;
         if record.schema_version != SCHEMA_VERSION {
             return Err(LifecycleError::UnsupportedSchema {
                 what: "experience",
@@ -257,14 +285,13 @@ impl SkillLifecycleStore {
             });
         }
         self.check_owner_scope(&record.owner_scope)?;
-        if record.task_id != task_id || record.record_id != experience_id(self.owner_scope(), task_id) {
+        if record.record_id != id || experience_id(self.owner_scope(), &record.task_id) != id {
             return Err(LifecycleError::Tampered {
                 path,
                 reason: "experience identity does not match its location".to_string(),
             });
         }
-        let mut record = record;
-        if record.dropped_evidence == 0 && self.evidence_marked_dropped(&record.record_id, task_id) {
+        if record.dropped_evidence == 0 && self.evidence_marked_dropped(id, &record.task_id) {
             record.dropped_evidence = 1;
         }
         Ok(Some(record))

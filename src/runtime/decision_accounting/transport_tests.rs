@@ -135,6 +135,127 @@ fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
         .collect()
 }
 
+#[tokio::test]
+async fn cancelled_reservation_handoff_releases_only_the_unclaimed_attempt() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config {
+        workspace_dir: workspace.path().to_path_buf(),
+        ..Config::default()
+    };
+    config.cost.prices.insert(
+        "openrouter/prx-unclaimed".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let config = Arc::new(config);
+    let cleanup = Arc::new(CleanupTracker::default());
+    let tracker = CostTracker::new(config.cost.clone(), workspace.path())?;
+    let initial_money = crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
+    let ledger_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(workspace.path().join("state/costs.jsonl.lock"))?;
+    ledger_lock.lock()?;
+    let budgets = TurnBudgets {
+        tokens: 1024,
+        micro_usd: 5000,
+        latency_ms: 500,
+    };
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::clone(&config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [1; 32],
+        budgets,
+        deadline,
+    );
+    let binding = [0; 32];
+    let estimate = || PhysicalEstimate {
+        purpose: "decision",
+        provider: "openrouter",
+        model: "prx-unclaimed",
+        body: b"{}",
+        transport_binding: &binding,
+        request_id: "prx-unclaimed",
+        deadline,
+        remaining_attempts: 1,
+    };
+    let mut work = Box::pin(scope.begin_physical(estimate()));
+    assert!(
+        futures::poll!(work.as_mut()).is_pending(),
+        "the real ledger lock must block reservation delivery"
+    );
+    ledger_lock.unlock()?;
+    // Deliberately do not poll the caller again: allow its real blocking
+    // reservation to persist, then cancel before it can claim the result.
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let request = loop {
+        if let Ok(rows) = journal(workspace.path())
+            && rows.iter().any(|row| row["event"] == "dispatched")
+        {
+            break serde_json::from_value::<EstimatedReservationRequest>(
+                rows.first().context("reservation row")?["request"].clone(),
+            )?;
+        }
+        anyhow::ensure!(
+            Instant::now() < wait_deadline,
+            "real reservation did not reach durable dispatch"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    drop(work);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?,
+        initial_money
+    );
+    assert_eq!(
+        journal(workspace.path())?.last().context("release row")?["event"],
+        "estimated_unsent_v1"
+    );
+    assert!(
+        tracker.reserve_dispatched_estimated_attempt(request, || true).is_err(),
+        "release must not authorize replay"
+    );
+
+    // An ordinary claimed receipt keeps its unknown liability on drop.
+    let cleanup = Arc::new(CleanupTracker::default());
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::clone(&config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [2; 32],
+        budgets,
+        deadline,
+    );
+    let claimed = scope
+        .begin_physical(PhysicalEstimate { deadline, ..estimate() })
+        .await?;
+    let claimed_money = claimed.reserved_micro_usd;
+    drop(claimed);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert_eq!(
+        journal(workspace.path())?.last().context("dispatch row")?["event"],
+        "dispatched"
+    );
+    assert_eq!(scope.remaining_budgets().tokens, 0, "claimed unknown usage stays held");
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?,
+        initial_money - claimed_money
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum Case {
     FullRetry,

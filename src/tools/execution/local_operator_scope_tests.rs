@@ -502,6 +502,7 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
         categories: Vec::new(),
         effect: ToolEffect::Act,
         adapter: ToolAdapterKind::Native,
+        process_worker_compatible: true,
         availability: CapabilityAvailability::ready("test"),
     };
     assert_eq!(

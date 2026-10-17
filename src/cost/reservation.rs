@@ -90,6 +90,7 @@ impl ReservationReceipt {
         &self.request.attempt_id
     }
 
+    #[cfg(test)]
     pub(super) const fn security_daily_micro_usd(&self) -> u64 {
         self.request.security_daily_micro_usd
     }
@@ -124,6 +125,9 @@ enum Event {
         attempt_id: String,
     },
     Released {
+        attempt_id: String,
+    },
+    EstimatedUnsentV1 {
         attempt_id: String,
     },
     Settled {
@@ -301,6 +305,15 @@ impl Reservations {
                 ensure!(*state == State::Reserved, "only an unsent reservation can be released");
                 *state = State::Released;
             }
+            Event::EstimatedUnsentV1 { attempt_id } => {
+                ensure!(
+                    self.estimates.contains_key(&attempt_id),
+                    "unsent receipt is not estimated"
+                );
+                let (_, state) = self.entries.get_mut(&attempt_id).context("unknown unsent attempt")?;
+                ensure!(*state == State::Dispatched, "unsent estimate was already consumed");
+                *state = State::Released;
+            }
         }
         Ok(())
     }
@@ -377,6 +390,7 @@ impl Reservations {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn reserve_estimated(
         &mut self,
         workspace: &Path,
@@ -416,6 +430,87 @@ impl Reservations {
             request: request.reservation,
             workspace: canonical_workspace,
         })
+    }
+
+    /// Persist the estimated reservation and its one-use dispatch transition
+    /// in one synced append before a transport can send. The two established
+    /// journal rows remain independently replayable, but do not pay two
+    /// durability barriers on the latency-bounded path.
+    pub(super) fn reserve_dispatched_estimated(
+        &mut self,
+        workspace: &Path,
+        request: EstimatedReservationRequest,
+        remaining: u128,
+    ) -> Result<ReservationReceipt> {
+        request.validate()?;
+        let canonical_workspace = workspace.canonicalize()?;
+        if let Some((previous, state)) = self.entries.get(&request.reservation.attempt_id) {
+            let estimate = self
+                .estimates
+                .get(&request.reservation.attempt_id)
+                .context("estimated dispatch conflicts with legacy")?;
+            ensure!(
+                previous == &request.reservation
+                    && estimate.reserved == request.reserved_tokens
+                    && estimate.limit == request.turn_token_limit,
+                "estimated dispatch replay conflicts"
+            );
+            ensure!(*state == State::Reserved, "estimated dispatch was consumed");
+            let event = Event::Dispatched {
+                attempt_id: request.reservation.attempt_id.clone(),
+            };
+            append(workspace, &event)?;
+            self.apply(event).map_err(ReservationWriteUnconfirmed)?;
+        } else {
+            self.check_turn(&request.reservation)?;
+            self.check_tokens(&request)?;
+            ensure!(
+                u128::from(request.reservation.maximum_micro_usd) <= remaining,
+                "workspace reservation allowance exhausted"
+            );
+            let attempt_id = request.reservation.attempt_id.clone();
+            let events = [
+                Event::EstimatedReservedV1 {
+                    request: request.clone(),
+                },
+                Event::Dispatched { attempt_id },
+            ];
+            append_batch(workspace, &events)?;
+            for event in events {
+                self.apply(event).map_err(ReservationWriteUnconfirmed)?;
+            }
+        }
+        Ok(ReservationReceipt {
+            request: request.reservation,
+            workspace: canonical_workspace,
+        })
+    }
+
+    /// Only the runtime's unclaimed receipt owner may call this: the durable
+    /// dispatch batch completed, but its receipt never reached the transport.
+    pub(super) fn release_unclaimed_estimated(&mut self, workspace: &Path, receipt: &ReservationReceipt) -> Result<()> {
+        ensure!(
+            workspace.canonicalize()? == receipt.workspace,
+            "unsent receipt belongs to another workspace"
+        );
+        let (request, state) = self
+            .entries
+            .get(receipt.attempt_id())
+            .context("unknown unsent receipt")?;
+        ensure!(
+            request == &receipt.request && *state == State::Dispatched,
+            "unsent receipt conflicts or was consumed"
+        );
+        ensure!(
+            self.estimates.contains_key(receipt.attempt_id()),
+            "unsent receipt is not estimated"
+        );
+        let event = Event::EstimatedUnsentV1 {
+            attempt_id: receipt.attempt_id().to_owned(),
+        };
+        append(workspace, &event)?;
+        self.apply(event)
+            .map_err(|error| ReservationWriteUnconfirmed(error).into())
     }
 
     pub(super) fn settle_estimated(
@@ -632,6 +727,7 @@ impl Reservations {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn transition(&mut self, workspace: &Path, receipt: &ReservationReceipt, dispatch: bool) -> Result<()> {
         ensure!(
             workspace.canonicalize()? == receipt.workspace,
@@ -671,7 +767,7 @@ pub(super) fn cost_row_sha256(record: &super::types::CostRecord) -> Result<Strin
 }
 
 #[cfg(unix)]
-fn append_inner(workspace: &Path, event: &Event) -> Result<()> {
+fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
     use rustix::fs::{FileType, Mode, OFlags};
     let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let root = rustix::fs::open(workspace, directory, Mode::empty())?;
@@ -693,8 +789,12 @@ fn append_inner(workspace: &Path, event: &Event) -> Result<()> {
             && stat.st_mode & 0o022 == 0,
         "reservation journal is not a private single-link regular file"
     );
-    let mut encoded = serde_json::to_vec(event)?;
-    encoded.push(b'\n');
+    ensure!(!events.is_empty(), "reservation append batch is empty");
+    let mut encoded = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut encoded, event)?;
+        encoded.push(b'\n');
+    }
     ensure!(
         stat.st_size >= 0 && (stat.st_size as u64).saturating_add(encoded.len() as u64) <= 8 * 1024 * 1024,
         "reservation journal exceeds its bound"
@@ -708,10 +808,14 @@ fn append_inner(workspace: &Path, event: &Event) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn append_inner(_workspace: &Path, _event: &Event) -> Result<()> {
+fn append_inner(_workspace: &Path, _events: &[Event]) -> Result<()> {
     anyhow::bail!("safe reservation persistence requires Unix file handles")
 }
 
 fn append(workspace: &Path, event: &Event) -> Result<()> {
-    append_inner(workspace, event).map_err(|error| ReservationWriteUnconfirmed(error).into())
+    append_inner(workspace, std::slice::from_ref(event)).map_err(|error| ReservationWriteUnconfirmed(error).into())
+}
+
+fn append_batch(workspace: &Path, events: &[Event]) -> Result<()> {
+    append_inner(workspace, events).map_err(|error| ReservationWriteUnconfirmed(error).into())
 }

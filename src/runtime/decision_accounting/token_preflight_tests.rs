@@ -102,3 +102,24 @@ fn large_compressible_body_keeps_original_estimator_acceptance() -> anyhow::Resu
     assert_eq!(calls.get(), 1);
     Ok(())
 }
+
+#[cfg(feature = "llm-router")]
+#[test]
+fn large_ascii_prefix_bound_skips_the_exact_tokenizer() -> anyhow::Result<()> {
+    let text = "the ".repeat(1024);
+    let prefix_upper = super::cl100k_prefix_bound::upper_bound(&text)
+        .ok_or_else(|| anyhow::anyhow!("ASCII fixture must have a prefix bound"))?;
+    let allowance = u64::try_from(prefix_upper.saturating_add(1))?;
+    assert!(
+        u64::try_from(input_token_upper_bound(&text))? >= allowance,
+        "fixture requires the byte bound to remain inconclusive"
+    );
+
+    let calls = std::cell::Cell::new(0);
+    assert!(input_token_preflight(&text, allowance, || {
+        calls.set(calls.get() + 1);
+        estimate(&text)
+    })?);
+    assert_eq!(calls.get(), 0, "the conservative prefix bound skips exact BPE");
+    Ok(())
+}

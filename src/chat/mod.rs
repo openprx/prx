@@ -4286,6 +4286,7 @@ pub async fn run(
     );
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
+        #[cfg(test)]
         Arc::clone(&provider),
         provider_name,
         model_name,
@@ -4293,7 +4294,6 @@ pub async fn run(
         security.clone(),
         config.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         // The spawn fallback is paired with `provider_name` (the `-p` override
         // when one is given), so it must be the credential released to that
@@ -4304,7 +4304,6 @@ pub async fn run(
         Arc::clone(&active_runs),
     )
     .with_cost_config(config.cost.clone())
-    .with_reliability(config.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
     .with_model_catalog(providers::selection::catalog_for(&config))
     .with_hint_config(&config)

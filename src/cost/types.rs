@@ -79,6 +79,16 @@ pub struct CostRecord {
     pub usage: TokenUsage,
     /// Session identifier (for grouping)
     pub session_id: String,
+    /// Settlement inputs the fingerprint covers that `usage` does not carry,
+    /// so a row can be verified exactly. Absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_source: Option<crate::llm::route_decision::TokenUsageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 impl CostRecord {
@@ -90,6 +100,10 @@ impl CostRecord {
             settlement_sha256: None,
             usage,
             session_id: session_id.into(),
+            settlement_provider: None,
+            settlement_source: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }
     }
 
@@ -101,6 +115,10 @@ impl CostRecord {
             settlement_sha256: None,
             usage,
             session_id: session_id.into(),
+            settlement_provider: None,
+            settlement_source: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }
     }
 }

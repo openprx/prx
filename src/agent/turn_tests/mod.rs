@@ -465,12 +465,19 @@ pub(super) fn business_tool_specs_of(tools: &[Box<dyn Tool>]) -> Vec<crate::tool
 /// in.
 pub(super) fn context_budget_fixture_history(target_tokens: usize) -> Vec<ChatMessage> {
     let mut history = vec![ChatMessage::system("stable base system prompt")];
+    let mut measurement = estimate_history_tokens_with_source(&history);
     let mut index = 0usize;
-    while budgeted_tokens(estimate_history_tokens_with_source(&history)) < target_tokens {
-        history.push(ChatMessage::user(format!(
-            "turn {index} {}",
-            "measured context ".repeat(40)
-        )));
+    while budgeted_tokens(measurement) < target_tokens {
+        let message = ChatMessage::user(format!("turn {index} {}", "measured context ".repeat(40)));
+        let added = estimate_history_tokens_with_source(std::slice::from_ref(&message));
+        measurement.tokens = measurement.tokens.saturating_add(added.tokens);
+        if matches!(
+            added.source,
+            crate::agent::context_budget::TokenMeasurementSource::Heuristic
+        ) {
+            measurement.source = crate::agent::context_budget::TokenMeasurementSource::Heuristic;
+        }
+        history.push(message);
         index = index.saturating_add(1);
     }
     history

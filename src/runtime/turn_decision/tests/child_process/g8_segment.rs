@@ -235,7 +235,6 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         Arc::clone(&security),
         workspace.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         Default::default(),
         None,
         crate::providers::ProviderRuntimeOptions::default(),
@@ -252,6 +251,9 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     let hidden_calls = Arc::new(AtomicUsize::new(0));
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
         Box::new(spawn),
+        Box::new(crate::chat::scheduled_input::ScheduledInputTool::new(
+            crate::chat::scheduled_input::ScheduledInputHandle::default(),
+        )),
         Box::new(CountedRead {
             inner: crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false),
             calls: Arc::clone(&physical_calls),
@@ -281,6 +283,7 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             surface_policy: SurfacePolicy {
                 direct_names: BTreeSet::from([
                     "sessions_spawn".into(),
+                    "chat_schedule".into(),
                     "file_read".into(),
                     HIDDEN_CHILD_CAPABILITY.into(),
                 ]),
@@ -309,7 +312,7 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
         &generation,
         Arc::clone(&memory),
-        "sessions_spawn: Read file_read project metadata.",
+        "sessions_spawn: Read file_read project metadata, then use chat_schedule.",
         "prx_parent_process_component",
     )
     .await;
@@ -327,17 +330,32 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         .catalog()
         .entry_for_public_name("file_read")
         .expect("registered read");
+    let schedule = grant
+        .catalog()
+        .entry_for_public_name("chat_schedule")
+        .expect("registered interactive-only scheduler");
     let hidden = grant
         .catalog()
         .entry_for_public_name(HIDDEN_CHILD_CAPABILITY)
         .expect("registered hidden child capability");
-    assert_eq!(issued.allowed.len(), 1, "grant narrows to the requested read");
+    assert_eq!(issued.allowed.len(), 2, "grant narrows to the two requested tools");
     assert!(issued.allowed.iter().any(|reference| {
         reference.id == read.id && reference.fingerprint == read.fingerprint && reference.generation == read.generation
     }));
     assert!(
         issued.allowed.iter().all(|reference| reference.id != hidden.id),
         "the sealed manifest must not inherit an unrequested registered capability"
+    );
+    assert!(issued.allowed.iter().any(|reference| reference.id == schedule.id));
+    let grant = Arc::new(grant.for_process_worker()?);
+    let (worker_issued, _) = grant.scope().gate_inputs();
+    assert_eq!(worker_issued.allowed.len(), 1);
+    assert!(worker_issued.allowed.iter().any(|reference| reference.id == read.id));
+    assert!(
+        worker_issued
+            .allowed
+            .iter()
+            .all(|reference| reference.id != schedule.id)
     );
     let binding = ChildProviderBinding::build(
         Arc::clone(&grant),
