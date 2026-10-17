@@ -3437,7 +3437,13 @@ enum CompactionSource {
 }
 
 /// Text that proves the value went through the effective-window resolution.
-const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &["resolve_effective_compaction_config(", "compaction_resolver.resolve("];
+const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &[
+    "resolve_effective_compaction_config(",
+    "resolve_effective_compaction_config_with_catalog(",
+    "admitted_binding.effective_compaction()",
+    ".effective_compaction(",
+    "compaction_resolver.resolve(",
+];
 
 /// Text that names the base window directly.
 const BASE_COMPACTION_MARKERS: &[&str] = &[
@@ -3803,29 +3809,30 @@ fn forwarded_compaction_values_are_produced_from_the_effective_window() {
     // Decision-owned windows have two concrete producers: initial admission
     // and the purpose-granted Router readmission. Neither may substitute base
     // configuration for the resolved model's window or omit its reservation.
-    for (relative, function, provider, model) in [
+    for (relative, function, resolver) in [
         (
             "src/runtime/turn_decision.rs",
             "agent_budget_snapshot",
-            "proof.provider_name()",
-            "proof.model_name()",
+            compact_rust_tokens(
+                "let effective = self.effective_compaction(proof.provider_name(), proof.model_name());",
+            ),
         ),
         (
             "src/runtime/turn_decision/routing.rs",
             "router_history_hop_inner",
-            "admitted.provider_name()",
-            "admitted.model_name()",
+            compact_rust_tokens(
+                "let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(\
+                    &config.agent.compaction, admitted.provider_name(), admitted.model_name(), &config.router, \
+                    &config.model_routes, &self.provider_catalog,);",
+            ),
         ),
     ] {
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
             &repository_root().join(relative),
         )));
         let body = compact_rust_tokens(&function_body(&production, function));
-        let resolver = format!(
-            "let effective=crate::router::resolve_effective_compaction_config(&config.agent.compaction,{provider},{model},&config.router,&config.model_routes,);"
-        );
         assert_eq!(
-            body.matches(&compact_rust_tokens(&resolver)).count(),
+            body.matches(&resolver).count(),
             1,
             "{relative}: resolved producer changed"
         );
@@ -5124,11 +5131,6 @@ fn provider_label_sinks_redact_url_userinfo() {
             "src/agent/embedded_source.rs",
             "pub(super) async fn record_automix_budget_refusal(",
             "redact_endpoint_userinfo(premium)",
-        ),
-        (
-            "src/tools/sessions_spawn.rs",
-            "async fn execute_spawn_with_id(",
-            "sanitize_api_error(",
         ),
         (
             "src/router/context.rs",
@@ -8096,8 +8098,6 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
         "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
-        "src/tools/sessions_spawn.rs:build_override_provider:create_provider_for",
-        "src/tools/sessions_spawn.rs:execute_spawn_with_id:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())

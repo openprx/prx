@@ -2768,8 +2768,6 @@ mod tests {
     }
 
     tokio::task_local! { static CONFIGURED_DELEGATE_ENDPOINT: String; }
-    static CONFIGURED_DELEGATE_FIXTURE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     async fn run_configured_delegate_fixture(
         allowed_tools: Vec<String>,
@@ -2781,7 +2779,6 @@ mod tests {
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
         use futures::FutureExt as _;
-        let _fixture = CONFIGURED_DELEGATE_FIXTURE.lock().await;
         let retained = tempfile::tempdir().expect("private decision evidence").keep();
         let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
             .await

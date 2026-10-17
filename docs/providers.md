@@ -384,10 +384,11 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
   was shown.
 - **Hot reload.** The declarations are part of the configuration generation
   providers are rebuilt from, so an edited entry applies to providers built
-  after the reload, like every other provider setting. Long-lived channel
-  `image` and `sessions_spawn` tools resolve each invocation from its pinned
-  generation: provider, model, temperature, credential and model-capability
-  declaration therefore move together after a reload.
+  after the reload, like every other provider setting. The long-lived channel
+  `image` tool resolves the provider and model catalog owned by the invoking
+  generation; `sessions_spawn` uses the child provider binding admitted for
+  that invocation. Provider, model, temperature, credential and capability
+  declarations therefore move together after a reload.
 - **Consequence of `no_root_combinators`.** Tools whose published contract uses
   a conditional or alternative root combinator are refused on that endpoint,
   and a request that includes any of them fails before transport, naming every

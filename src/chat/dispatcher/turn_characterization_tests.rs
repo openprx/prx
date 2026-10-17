@@ -328,6 +328,18 @@ fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDe
         prediction.reason, None,
         "step 7.1 must use the enabled builtin path, not disabled-mode fallback"
     );
+    assert_eq!(
+        decision.context.terminal_outcome_action(),
+        Some(crate::causal_tree::branch::CausalActionKind::Answer),
+        "step 7.1 must select the intended Answer action"
+    );
+    assert!(
+        matches!(
+            decision.context.directive(),
+            crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+        ),
+        "step 7.1 must issue the intended direct-answer directive"
+    );
 }
 
 fn fixture_tool(calls: Arc<AtomicUsize>, arguments: Arc<Mutex<Vec<serde_json::Value>>>) -> Box<dyn Tool> {

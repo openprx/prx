@@ -269,7 +269,6 @@ fn worker_spawn_tool(
         active_runs,
     )
     .with_cost_config(config.cost.clone())
-    .with_reliability(credentials.reliability.as_ref().clone())
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
     .with_model_catalog(crate::providers::selection::catalog_for(config))
     .with_hint_config(config)

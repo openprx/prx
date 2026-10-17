@@ -593,7 +593,14 @@ pub(super) async fn run() {
             let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
             let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
             assert!(!rows.is_empty() && rows.len() <= 32, "bounded complete per-input decision evidence");
-            assert!(rows.iter().all(|(_, _, backend)| backend == "builtin"));
+            assert!(
+                rows.iter().all(|(_, _, backend)| matches!(backend.as_str(), "builtin" | "none")),
+                "generation {phase} persisted configured-backend decision rows: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|(_, _, backend)| backend == "builtin"),
+                "generation {phase} omitted its builtin decision row: {rows:?}"
+            );
             assert!(rows.iter().any(|(candidates, selected, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")

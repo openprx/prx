@@ -95,6 +95,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool can be reconstructed and executed inside a process
+    /// worker. Tools backed by the interactive parent's event loop opt out.
+    fn process_worker_compatible(&self) -> bool {
+        true
+    }
+
     /// Resolve an exact approval operation using read-only runtime state.
     /// This must not execute, send, reserve, create files, or grant authority.
     /// Unsupported operations return None and cannot obtain a scoped grant.

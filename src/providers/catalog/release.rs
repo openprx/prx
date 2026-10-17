@@ -304,6 +304,12 @@ pub struct ReleaseModel {
 }
 
 impl ReleaseModel {
+    /// Whether this row is eligible to anchor a release default.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
+    }
+
     /// Whether this row can be offered for a new selection.
     #[must_use]
     pub fn is_listed(&self) -> bool {
@@ -637,7 +643,7 @@ impl ReleaseCatalog {
             if name.trim().is_empty()
                 || provider.display_name.trim().is_empty()
                 || default_model.is_none()
-                || default_model.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
+                || default_model.is_some_and(|model| !model.is_active() || !model.supports(ModelOperation::Chat))
                 || !provider.default_model.starts_with(&format!("{name}/"))
             {
                 return Err(ReleaseCatalogError::new(
@@ -651,7 +657,7 @@ impl ReleaseCatalog {
             .find(|model| model.id.eq_ignore_ascii_case(&self.defaults.model));
         if !self.providers.contains_key(&self.defaults.provider)
             || global_default.is_none()
-            || global_default.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
+            || global_default.is_some_and(|model| !model.is_active() || !model.supports(ModelOperation::Chat))
             || !self.defaults.model.starts_with(&format!("{}/", self.defaults.provider))
         {
             return Err(ReleaseCatalogError::new(
@@ -1051,22 +1057,80 @@ mod tests {
     fn deprecated_chat_models_remain_selectable_with_a_replacement_warning() {
         let document = minimal_catalog("gpt-fixture");
         let mut value: Value = serde_json::from_str(&document).expect("test: catalog fixture JSON");
-        let lifecycle = value
-            .pointer_mut("/models/0/lifecycle")
-            .expect("test: fixture lifecycle");
-        *lifecycle = serde_json::json!({
-            "status": "deprecated",
-            "deprecated_at": "2026-10-16T00:00:00Z",
-            "replacement": "openai/gpt-fixture"
-        });
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: models array");
+        let mut deprecated = models.first().cloned().expect("test: first model");
+        let fields = deprecated.as_object_mut().expect("test: model object");
+        fields.insert("id".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        fields.insert("api_model".to_owned(), Value::String("gpt-legacy".to_owned()));
+        fields.insert("display_name".to_owned(), Value::String("Legacy fixture".to_owned()));
+        fields.insert(
+            "lifecycle".to_owned(),
+            serde_json::json!({
+                "status": "deprecated",
+                "deprecated_at": "2026-10-16T00:00:00Z",
+                "replacement": "openai/gpt-fixture"
+            }),
+        );
+        models.push(deprecated);
         let catalog = ReleaseCatalog::from_json(&value.to_string()).expect("test: deprecated row validates");
         let listed = catalog.listed_models("openai");
-        let model = listed.first().expect("test: deprecated row stays listed");
+        let model = listed
+            .into_iter()
+            .find(|model| model.id == "openai/gpt-legacy")
+            .expect("test: deprecated row stays listed");
         assert_eq!(model.lifecycle.status, ModelLifecycleStatus::Deprecated);
         assert_eq!(
             model.selection_warning().as_deref(),
             Some("deprecated; use openai/gpt-fixture")
         );
+    }
+
+    #[test]
+    fn deprecated_models_cannot_anchor_provider_or_global_defaults() {
+        let document = minimal_catalog("gpt-fixture");
+        let mut value: Value = serde_json::from_str(&document).expect("test: catalog fixture JSON");
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: models array");
+        let mut deprecated = models.first().cloned().expect("test: first model");
+        let fields = deprecated.as_object_mut().expect("test: model object");
+        fields.insert("id".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        fields.insert("api_model".to_owned(), Value::String("gpt-legacy".to_owned()));
+        fields.insert(
+            "lifecycle".to_owned(),
+            serde_json::json!({
+                "status": "deprecated",
+                "deprecated_at": "2026-10-16T00:00:00Z"
+            }),
+        );
+        models.push(deprecated);
+
+        let mut provider_default = value.clone();
+        provider_default
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("openai"))
+            .and_then(Value::as_object_mut)
+            .expect("test: openai provider object")
+            .insert(
+                "default_model".to_owned(),
+                Value::String("openai/gpt-legacy".to_owned()),
+            );
+        let refusal =
+            ReleaseCatalog::from_json(&provider_default.to_string()).expect_err("provider default must be active");
+        assert!(refusal.to_string().contains("provider has an invalid default model"));
+
+        value
+            .get_mut("defaults")
+            .and_then(Value::as_object_mut)
+            .expect("test: defaults object")
+            .insert("model".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        let refusal = ReleaseCatalog::from_json(&value.to_string()).expect_err("global default must be active");
+        assert!(refusal.to_string().contains("catalog-wide provider/model default"));
     }
 
     #[test]

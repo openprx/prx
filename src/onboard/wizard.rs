@@ -1168,11 +1168,30 @@ fn humanize_age(age_secs: u64) -> String {
     }
 }
 
-fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+    let provider = crate::providers::ProviderId::of(canonical_provider_name(provider_name));
+    let release = crate::providers::catalog::ReleaseCatalog::embedded().ok();
+    build_model_options_with_warnings(model_ids, source, |model_id| {
+        release
+            .as_ref()
+            .and_then(|catalog| catalog.model(&provider, model_id))
+            .and_then(crate::providers::catalog::ReleaseModel::selection_warning)
+    })
+}
+
+fn build_model_options_with_warnings(
+    model_ids: Vec<String>,
+    source: &str,
+    mut warning_for: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     model_ids
         .into_iter()
         .map(|model_id| {
-            let label = format!("{model_id} ({source})");
+            let warning = warning_for(&model_id);
+            let label = warning.map_or_else(
+                || format!("{model_id} ({source})"),
+                |warning| format!("{model_id} ({source}; {warning})"),
+            );
             (model_id, label)
         })
         .collect()
@@ -1198,6 +1217,7 @@ fn apply_wizard_model_fetch(
             let fetched_count = live_model_ids.len();
             let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
             *live_options = Some(build_model_options(
+                provider_name,
                 live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                 "live",
             ));
@@ -1214,6 +1234,7 @@ fn apply_wizard_model_fetch(
             {
                 stale_age_secs = Some(stale.age_secs);
                 *live_options = Some(build_model_options(
+                    provider_name,
                     stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "stale-cache",
                 ));
@@ -1926,6 +1947,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 ));
 
                 live_options = Some(build_model_options(
+                    provider_name,
                     cached.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "cached",
                 ));
@@ -5495,6 +5517,25 @@ mod tests {
         assert!(ids.contains(&"glm-5:cloud"));
         assert!(ids.contains(&"qwen2.5-coder:3b"));
         assert!(!ids.contains(&"*"));
+    }
+
+    #[test]
+    fn model_options_label_deprecated_rows_without_hiding_them() {
+        let options = build_model_options_with_warnings(
+            vec!["prx-current".to_owned(), "prx-legacy".to_owned()],
+            "live",
+            |model| (model == "prx-legacy").then(|| "deprecated; use ollama/prx-current".to_owned()),
+        );
+        assert_eq!(
+            options,
+            vec![
+                ("prx-current".to_owned(), "prx-current (live)".to_owned()),
+                (
+                    "prx-legacy".to_owned(),
+                    "prx-legacy (live; deprecated; use ollama/prx-current)".to_owned(),
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -1365,11 +1365,6 @@ fn register_gateway_turn_tools(
         let announce_channel =
             gateway_spawn_announce_channel(signal.map(|channel| Arc::clone(channel) as Arc<dyn Channel>));
         let provider_name = providers::selection::default_provider(config).to_string();
-        let pinned_provider_resolver: Arc<dyn providers::generation::PinnedProviderResolver> =
-            Arc::new(providers::generation::ConfigGenerationProviderResolver::new(
-                Arc::clone(shared_config),
-                provider_runtime_options.clone(),
-            ));
         let spawn_tool = tools::SessionsSpawnTool::new(
             announce_channel,
             Arc::clone(provider),
@@ -1385,11 +1380,9 @@ fn register_gateway_turn_tools(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
         .with_hint_config(config)
-        .with_pinned_provider_resolver(pinned_provider_resolver)
         .with_channels(Arc::clone(&channels_registry))
         .with_shared_memory(Arc::clone(memory))
         .with_event_recording(config.memory.event_recording_config())

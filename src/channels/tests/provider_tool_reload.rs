@@ -346,13 +346,18 @@ async fn image_uses_the_provider_owned_by_the_reloaded_generation() {
     assert!(first.requests.lock().is_empty(), "startup image provider was reused");
     second.wait_for_request().await;
     let reloaded = second.requests.lock().clone();
-    let (_, authorization, body) = reloaded
+    let authenticated = reloaded
         .iter()
-        .find(|(path, _, body)| path.ends_with("/chat/completions") && body.get("model").is_some())
-        .expect("reloaded image chat request");
-    assert_eq!(authorization, "Bearer prx-image-key-one");
-    assert_eq!(body["model"], RELOADED_IMAGE_MODEL);
-    assert_eq!(body["temperature"], 0.37);
+        .filter(|(path, authorization, body)| {
+            path.ends_with("/chat/completions") && !authorization.is_empty() && body.get("model").is_some()
+        })
+        .collect::<Vec<_>>();
+    assert!(!authenticated.is_empty(), "reloaded image chat request missing");
+    assert!(authenticated.iter().all(|(_, authorization, body)| {
+        authorization == "Bearer prx-image-key-one"
+            && body["model"] == RELOADED_IMAGE_MODEL
+            && body["temperature"] == 0.37
+    }));
     drop(participant);
     first.close().await;
     second.close().await;
@@ -373,7 +378,6 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         &providers::provider_runtime_options_from_config(&initial_generation.effective),
     )
     .expect("startup spawn provider");
-    let resolver = provider_resolver(&shared, &initial_generation, Arc::clone(&startup_provider));
     let generation = apply_provider_reload(&shared, &second, "prx-spawn-key-one");
     let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("spawn reload memory"));
@@ -392,11 +396,9 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         providers::provider_runtime_options_from_config(&generation.effective),
         generation.effective.sessions_spawn.clone(),
     )
-    .with_reliability(generation.effective.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&generation.effective))
     .with_model_catalog(providers::selection::catalog_for(&generation.effective))
     .with_hint_config(&generation.effective)
-    .with_pinned_provider_resolver(resolver)
     .with_shared_memory(Arc::clone(&memory));
     let runs = spawn.active_runs_arc();
     let tools_handle = spawn.tools_handle();
@@ -437,11 +439,17 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
     assert!(first.requests.lock().is_empty(), "startup spawn provider was reused");
     second.wait_for_request().await;
     let reloaded = second.requests.lock().clone();
-    assert_ne!(reloaded, Vec::new());
+    let authenticated = reloaded
+        .iter()
+        .filter(|(path, header, body)| {
+            path.ends_with("/chat/completions") && !header.is_empty() && body.get("model").is_some()
+        })
+        .collect::<Vec<_>>();
+    assert!(!authenticated.is_empty(), "reloaded spawn chat request missing");
     assert!(
-        reloaded
+        authenticated
             .iter()
-            .any(|(path, header, _)| { path.ends_with("/chat/completions") && header == "Bearer prx-spawn-key-one" })
+            .all(|(_, header, body)| { header == "Bearer prx-spawn-key-one" && body["model"] == MODEL })
     );
     drop(participant);
     first.close().await;

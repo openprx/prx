@@ -4304,7 +4304,6 @@ pub async fn run(
         Arc::clone(&active_runs),
     )
     .with_cost_config(config.cost.clone())
-    .with_reliability(config.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
     .with_model_catalog(providers::selection::catalog_for(&config))
     .with_hint_config(&config)

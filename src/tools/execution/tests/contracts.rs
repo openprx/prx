@@ -647,6 +647,7 @@ fn security_policy_adapter_preserves_all_autonomy_modes() {
             ToolEffect::Act
         },
         adapter: ToolAdapterKind::Native,
+        process_worker_compatible: true,
         availability: CapabilityAvailability::ready("test backend is registered"),
     };
     let policy = |autonomy| {

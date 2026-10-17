@@ -24,6 +24,9 @@ use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, Usag
 #[cfg(test)]
 pub(crate) mod timing;
 
+#[cfg(feature = "llm-router")]
+mod cl100k_prefix_bound;
+
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
 pub(crate) struct AccountingScope {
@@ -341,7 +344,7 @@ impl AccountingScope {
                         timing.mark("reserve");
                     }
                 }
-                let receipt = match tracker.reserve_estimated_attempt(request) {
+                let receipt = match tracker.reserve_dispatched_estimated_attempt(request) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -351,41 +354,9 @@ impl AccountingScope {
                         return Err(error);
                     }
                 };
-                // From this point a durable liability exists. Only a confirmed
-                // unsent release can restore the prospective token allowance.
+                // From this point the reservation and its one-use dispatched
+                // state are durable. Unknown send/usage retains the liability.
                 restore_tokens = false;
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "deadline_before_dispatch";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("deadline_before_dispatch");
-                    }
-                }
-                if cancel.is_cancelled() || Instant::now() >= deadline {
-                    if let Err(error) = tracker.release_unsent_attempt(&receipt) {
-                        confirmed = false;
-                        return Err(error);
-                    }
-                    restore_tokens = true;
-                    anyhow::bail!("decision accounting deadline elapsed before dispatch");
-                }
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "mark_dispatched";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("mark_dispatched");
-                    }
-                }
-                if let Err(error) = tracker.mark_attempt_dispatched(&receipt) {
-                    if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
-                        confirmed = false;
-                    } else if tracker.release_unsent_attempt(&receipt).is_ok() {
-                        restore_tokens = true;
-                    } else {
-                        confirmed = false;
-                    }
-                    return Err(error);
-                }
                 Ok(OwnedReceipt {
                     tracker,
                     receipt,
@@ -617,6 +588,13 @@ fn input_token_preflight(
     allowance: u64,
     estimate: impl FnOnce() -> usize,
 ) -> Result<bool, std::num::TryFromIntError> {
+    #[cfg(feature = "llm-router")]
+    if text.len() >= cl100k_prefix_bound::MIN_INPUT_BYTES
+        && u64::try_from(cl100k_prefix_bound::upper_bound(text).unwrap_or(usize::MAX))
+            .is_ok_and(|upper| upper < allowance)
+    {
+        return Ok(true);
+    }
     if u64::try_from(input_token_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
         return Ok(true);
     }

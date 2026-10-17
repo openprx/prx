@@ -484,6 +484,7 @@ impl CostTracker {
     }
 
     /// Reserve the versioned local estimate under the actual ledger lock.
+    #[cfg(test)]
     pub(crate) fn reserve_estimated_attempt(
         &self,
         request: super::reservation::EstimatedReservationRequest,
@@ -510,18 +511,49 @@ impl CostTracker {
         reservations.reserve_estimated(workspace, request, remaining)
     }
 
+    /// Append an estimated reservation and its dispatched state in one synced
+    /// batch under the actual ledger lock before a latency-bounded physical send.
+    pub(crate) fn reserve_dispatched_estimated_attempt(
+        &self,
+        request: super::reservation::EstimatedReservationRequest,
+    ) -> Result<super::reservation::ReservationReceipt> {
+        let config = self.config.lock().clone();
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        let workspace = storage.workspace()?;
+        let mut reservations = super::reservation::Reservations::load(workspace)?;
+        let active = reservations.active_micro_usd()?;
+        let daily = storage
+            .daily_micro_usd
+            .checked_add(active)
+            .context("daily reserved cost overflows")?;
+        let monthly = storage
+            .monthly_micro_usd
+            .checked_add(active)
+            .context("monthly reserved cost overflows")?;
+        let remaining = floor_micro_usd(config.daily_limit_usd)?
+            .saturating_sub(daily)
+            .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
+            .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
+        reservations.reserve_dispatched_estimated(workspace, request, remaining)
+    }
+
     /// Persist before initiating a physical send. This transition is one-use;
     /// a repeated call cannot authorize another physical attempt.
+    #[cfg(test)]
     pub(crate) fn mark_attempt_dispatched(&self, receipt: &super::reservation::ReservationReceipt) -> Result<()> {
         self.transition_reservation(receipt, true)
     }
 
     /// Explicitly release only a reservation that has never been dispatched.
     /// Dropping a receipt never releases potentially chargeable liability.
+    #[cfg(test)]
     pub(crate) fn release_unsent_attempt(&self, receipt: &super::reservation::ReservationReceipt) -> Result<()> {
         self.transition_reservation(receipt, false)
     }
 
+    #[cfg(test)]
     fn transition_reservation(&self, receipt: &super::reservation::ReservationReceipt, dispatch: bool) -> Result<()> {
         let config = self.config.lock().clone();
         let mut storage = self.lock_storage();
@@ -1292,6 +1324,53 @@ mod tests {
                 .reserve_estimated_attempt(estimated("prx-no-token-reset", 1, 1, 30))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn estimated_dispatch_batches_existing_journal_rows_before_authority_returns() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 1.0,
+            ..enabled_config()
+        };
+        let request = estimated("prx-batched-dispatch", 250_000, 30, 30);
+        let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
+        let receipt = tracker.reserve_dispatched_estimated_attempt(request.clone()).unwrap();
+        assert!(tracker.mark_attempt_dispatched(&receipt).is_err());
+        assert!(tracker.release_unsent_attempt(&receipt).is_err());
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(tmp.path().join("state").join(super::super::reservation::JOURNAL))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get("event"))
+                .and_then(serde_json::Value::as_str),
+            Some("estimated_reserved_v1")
+        );
+        assert_eq!(
+            rows.get(1)
+                .and_then(|row| row.get("event"))
+                .and_then(serde_json::Value::as_str),
+            Some("dispatched")
+        );
+        let reserved_attempt_id = rows
+            .first()
+            .and_then(|row| row.get("request"))
+            .and_then(|request| request.get("reservation"))
+            .and_then(|reservation| reservation.get("attempt_id"));
+        let dispatched_attempt_id = rows.get(1).and_then(|row| row.get("attempt_id"));
+        assert!(reserved_attempt_id.is_some());
+        assert_eq!(reserved_attempt_id, dispatched_attempt_id);
+
+        drop(receipt);
+        drop(tracker);
+        let reopened = CostTracker::new(config, tmp.path()).unwrap();
+        assert!(reopened.reserve_dispatched_estimated_attempt(request).is_err());
     }
 
     #[test]

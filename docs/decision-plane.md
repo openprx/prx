@@ -97,11 +97,17 @@ the builtin brief-request bound. If the runtime has no current
 `capability_search` backend, it omits that control instead of failing the Answer.
 An Answer that follows a successful selected Memory, Document or Session read
 consumes the admitted evidence and keeps the bounded Direct core, so the serving
-model can perform a subsequent ordinary operation. The read does not reopen
-Searchable tools or discovery. An Answer turn may also publish an exactly named
-`delegate` or `sessions_spawn` on any surface that admits delegation, even when
-that delegator is Searchable rather than configured as Direct, but only when the
-same decision carries a sealed child manifest.
+model can perform a subsequent ordinary operation. The read does not itself
+authorize a Searchable tool. The generic `capability_search` control can remain
+published when the original input independently meets the normal structural or
+length criteria; a search result still needs a fresh nonterminal selection and
+all execution gates. When `[causal_tree].enabled = false`, there is no discovery
+hop, so one exactly named, current Searchable capability is published directly
+for legacy compatibility; exclusions, freshness, model and execution gates
+still apply, and no peer capability is widened. An Answer turn may also publish
+an exactly named `delegate` or `sessions_spawn` on any surface that admits
+delegation, even when that delegator is Searchable rather than configured as
+Direct, but only when the same decision carries a sealed child manifest.
 Interactive Chat additionally places `sessions_spawn` in its Direct core.
 Exclusions, tools-off, read-only and plan interception still remove entries, and
 publication alone never executes one. Channel and gateway turns use these shared

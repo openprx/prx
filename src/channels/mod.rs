@@ -5815,11 +5815,9 @@ pub async fn start_channels_with_config(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)
-        .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver))
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool
