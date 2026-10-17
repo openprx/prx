@@ -3441,7 +3441,10 @@ const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &[
     "resolve_effective_compaction_config(",
     "resolve_effective_compaction_config_with_catalog(",
     "admitted_binding.effective_compaction()",
-    ".effective_compaction(",
+    "self.effective_compaction(",
+    "decided.service.effective_compaction(",
+    "decision.service.effective_compaction(",
+    "service.effective_compaction(",
     "compaction_resolver.resolve(",
 ];
 
@@ -3458,7 +3461,19 @@ const BASE_COMPACTION_MARKERS: &[&str] = &[
 fn classify_compaction_argument(production: &str, expression: &str, call_start: usize) -> CompactionSource {
     let mut text = expression.to_string();
     for _ in 0..4 {
-        if EFFECTIVE_COMPACTION_MARKERS.iter().any(|marker| text.contains(marker)) {
+        let compact = compact_rust_tokens(&text);
+        let pinned_provider_binding = compact.starts_with("provider_binding.as_ref().ok_or_else(")
+            && compact.ends_with(")?.effective_compaction()");
+        if pinned_provider_binding
+            || EFFECTIVE_COMPACTION_MARKERS.iter().any(|marker| {
+                compact.match_indices(marker).any(|(start, _)| {
+                    compact[..start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|previous| !previous.is_alphanumeric() && previous != '_' && previous != '.')
+                })
+            })
+        {
             return CompactionSource::Effective;
         }
         if BASE_COMPACTION_MARKERS.iter().any(|marker| text.contains(marker)) {
@@ -10160,6 +10175,25 @@ fn mutation_proof_execution_binding_guard() {
     );
 }
 fn mutation_proof_compaction_producer_guard() {
+    for expression in [
+        "unreviewed.effective_compaction()",
+        "unreviewed.admitted_binding.effective_compaction()",
+    ] {
+        assert_eq!(
+            classify_compaction_argument("", expression, 0),
+            CompactionSource::Forwarded
+        );
+    }
+    for expression in [
+        "admitted_binding.effective_compaction()?",
+        "self.effective_compaction(provider, model)",
+        "decided.service.effective_compaction(provider, model)",
+    ] {
+        assert_eq!(
+            classify_compaction_argument("", expression, 0),
+            CompactionSource::Effective
+        );
+    }
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
         "src/runtime/turn_decision.rs",
