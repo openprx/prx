@@ -755,6 +755,11 @@ impl SkillLifecycleStore {
                 proposal.evaluation_epoch
             )));
         }
+        if proposal.status == ProposalStatus::PublicationAuthorized && next != ProposalStatus::Committed {
+            // A publication that went live (crash before the proposal was
+            // finalized) must not be stranded as stale, failed or cancelled.
+            self.settle_publication(&lock, &mut proposal)?;
+        }
         if proposal.status == next || also_ok.contains(&proposal.status) {
             return Ok(proposal);
         }
@@ -778,6 +783,11 @@ impl SkillLifecycleStore {
         if let GateError::Stale(reason) = &error
             && let Err(e) = self.transition_proposal(proposal_id, ProposalStatus::Stale, reason, &[])
         {
+            // A proposal whose publication is already live cannot go stale;
+            // the transition settled it as committed and the original error stands.
+            if matches!(e, LifecycleError::InvalidProposalTransition { .. }) {
+                return error;
+            }
             return e.into();
         }
         error

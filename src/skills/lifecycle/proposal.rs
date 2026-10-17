@@ -710,6 +710,8 @@ impl SkillLifecycleStore {
         let mut proposal = self
             .read_proposal_record(id)?
             .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {id}")))?;
+        // A publication that is already live makes the proposal committed.
+        self.settle_publication(&lock, &mut proposal)?;
         if !proposal.status.can_become(ProposalStatus::Cancelled) {
             return Err(LifecycleError::InvalidProposalTransition {
                 proposal_id: proposal.proposal_id,

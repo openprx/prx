@@ -47,7 +47,7 @@ fn evaluating_proposal(fx: &Fixture, suite: &FrozenSuite) -> SkillProposal {
     evaluating_proposal_as(fx, suite, "request-1")
 }
 
-fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -> SkillProposal {
+pub(super) fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -> SkillProposal {
     let owner = fx.store.owner_scope().clone();
     let id = proposal_id_of(&owner, request_id);
     let bundle = fx
@@ -128,7 +128,7 @@ fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -
         .expect("test: begin evaluation")
 }
 
-fn mark_evaluated(fx: &Fixture, proposal: &SkillProposal) -> SkillProposal {
+pub(super) fn mark_evaluated(fx: &Fixture, proposal: &SkillProposal) -> SkillProposal {
     fx.store
         .advance_proposal(&proposal.proposal_id, ProposalStatus::Evaluated, "evaluated test")
         .expect("test: evaluated")

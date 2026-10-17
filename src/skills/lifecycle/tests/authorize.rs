@@ -7,12 +7,14 @@
 
 use super::activate;
 use super::evaluate::{Fixture, fixture, skill, validation_suite};
-use super::gate::{all_better, edit_proposal, evaluate, evaluated, gate, policy, status, tie};
+use super::gate::{
+    all_better, edit_proposal, evaluate, evaluating_proposal_as, gate, mark_evaluated, policy, status, tie,
+};
 use crate::skills::lifecycle::gate::rewrite_gate_for_test;
 use crate::skills::lifecycle::publish::crash_hooks;
 use crate::skills::lifecycle::{
-    FrozenSuite, GateError, GatePolicy, LifecycleError, MAX_PUBLICATION_ATTEMPTS, ProposalFailureKind, ProposalStatus,
-    SkillProposal, TransactionState, release_task_pins, task_pin,
+    EvaluationPin, FrozenSuite, GateError, GatePolicy, LifecycleError, MAX_PUBLICATION_ATTEMPTS, NewRevision,
+    ProposalFailureKind, ProposalStatus, SkillProposal, SourceKind, TransactionState, release_task_pins, task_pin,
 };
 use chrono::Utc;
 use std::time::Duration;
@@ -22,18 +24,26 @@ struct Eligible {
     proposal: SkillProposal,
     digest: String,
     gate_id: String,
+    pin: EvaluationPin,
 }
 
 async fn eligible(fx: &Fixture) -> Eligible {
+    eligible_as(fx, "request-1").await
+}
+
+async fn eligible_as(fx: &Fixture, request_id: &str) -> Eligible {
     let suite = validation_suite(2);
-    let (proposal, pin) = evaluated(fx, &suite, &all_better()).await;
-    let outcome = gate(fx, &proposal, &suite, &[pin], &policy(), None)
+    let proposal = evaluating_proposal_as(fx, &suite, request_id);
+    let pin = evaluate(fx, &suite, &all_better()).await;
+    mark_evaluated(fx, &proposal);
+    let outcome = gate(fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
         .await
         .expect("test: gate");
     assert_eq!(outcome.proposal.status, ProposalStatus::Eligible);
     Eligible {
         suite,
         proposal,
+        pin,
         digest: outcome.gate.digest,
         gate_id: outcome.gate.decision.record_id,
     }
@@ -165,7 +175,8 @@ async fn new_failing_evidence_refuses_authorization_and_publication_without_stat
     authorize(&fx, &e).expect("test: authorize");
     evaluate(&fx, &e.suite, &tie()).await;
     assert!(matches!(publish(&fx, &e), Err(GateError::NewFailingEvidence(_))));
-    assert_eq!(status(&fx, &e.proposal), ProposalStatus::PublicationAuthorized);
+    // Nothing was journaled, so the proposal is not left authorized.
+    assert_eq!(status(&fx, &e.proposal), ProposalStatus::Stale);
     assert_eq!(generation(&fx), 1);
     assert!(
         fx.store
@@ -185,25 +196,19 @@ fn tx_of(proposal: &SkillProposal) -> crate::skills::lifecycle::TransactionId {
 async fn resuming_an_eligible_or_authorized_proposal_with_new_evidence_is_new_failing_evidence() {
     for authorize_first in [false, true] {
         let fx = fixture();
-        let suite = validation_suite(2);
-        let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
-        let outcome = gate(&fx, &proposal, &suite, std::slice::from_ref(&pin), &policy(), None)
-            .await
-            .expect("test: gate");
+        let e = eligible(&fx).await;
         if authorize_first {
-            fx.store
-                .authorize_publication(&proposal.proposal_id, &outcome.gate.digest, &policy(), suite.digest())
-                .expect("test: authorize");
+            authorize(&fx, &e).expect("test: authorize");
         }
-        evaluate(&fx, &suite, &tie()).await;
-        let resumed = gate(&fx, &proposal, &suite, &[pin], &policy(), None).await;
+        evaluate(&fx, &e.suite, &tie()).await;
+        let resumed = resume(&fx, &e).await;
         assert!(matches!(resumed, Err(GateError::NewFailingEvidence(_))), "{resumed:?}");
         let expected = if authorize_first {
             ProposalStatus::PublicationAuthorized
         } else {
             ProposalStatus::Eligible
         };
-        assert_eq!(status(&fx, &proposal), expected);
+        assert_eq!(status(&fx, &e.proposal), expected);
     }
 }
 
@@ -454,4 +459,151 @@ async fn a_tampered_authorization_record_cannot_publish_another_digest() {
         "{result:?}"
     );
     assert_eq!(generation(&fx), 1);
+}
+
+async fn resume(fx: &Fixture, e: &Eligible) -> Result<crate::skills::lifecycle::GateOutcome, GateError> {
+    gate(fx, &e.proposal, &e.suite, std::slice::from_ref(&e.pin), &policy(), None).await
+}
+
+#[tokio::test]
+async fn a_live_publication_is_never_stranded_as_stale_or_cancelled() {
+    for point in ["publish_before_finalize", "after_binding"] {
+        for action in ["authorize", "cancel", "gate_resume", "sweep"] {
+            let fx = fixture();
+            let e = eligible(&fx).await;
+            authorize(&fx, &e).expect("test: authorize");
+            crash_hooks::arm(point);
+            assert!(publish(&fx, &e).is_err(), "{point}");
+            crash_hooks::disarm();
+            // The revision is live, the proposal record is behind.
+            assert_eq!(generation(&fx), 2, "{point}/{action}");
+            assert_eq!(status(&fx, &e.proposal), ProposalStatus::PublicationAuthorized);
+            match action {
+                "authorize" => {
+                    let again = authorize(&fx, &e).expect("test: authorize after a live publication");
+                    assert_eq!(again.status, ProposalStatus::Committed, "{point}");
+                }
+                "cancel" => {
+                    let result = fx.store.cancel_proposal(&e.proposal.proposal_id, "operator");
+                    assert!(
+                        matches!(result, Err(LifecycleError::InvalidProposalTransition { .. })),
+                        "{result:?}"
+                    );
+                }
+                "gate_resume" => {
+                    assert!(resume(&fx, &e).await.is_err());
+                }
+                _ => {
+                    if point == "after_binding" {
+                        fx.store.recover(Duration::ZERO).expect("test: recover");
+                    }
+                    let done = fx.store.finalize_published_proposals().expect("test: sweep");
+                    assert_eq!(done, vec![e.proposal.proposal_id.clone()], "{point}");
+                }
+            }
+            let settled = record(&fx, &e);
+            assert_eq!(settled.status, ProposalStatus::Committed, "{point}/{action}");
+            assert_eq!(settled.publication.map(|p| p.generation), Some(2));
+            assert_eq!(generation(&fx), 2);
+            assert_eq!(active_revision(&fx), fx.candidate);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_authorization_naming_another_proposals_gate_is_refused() {
+    let fx = fixture();
+    let a = eligible_as(&fx, "request-1").await;
+    let b = eligible_as(&fx, "request-2").await;
+    authorize(&fx, &b).expect("test: authorize b");
+    edit_proposal(&fx, &b.proposal.proposal_id, |p| {
+        if let Some(auth) = p.authorization.as_mut() {
+            auth.gate_id = a.gate_id.clone();
+            auth.gate_digest = a.digest.clone();
+        }
+    });
+    let result = publish(&fx, &b);
+    assert!(matches!(result, Err(GateError::Tampered(_))), "{result:?}");
+    assert_eq!(generation(&fx), 1);
+    // A's digest does not authorize B either.
+    let result = fx
+        .store
+        .authorize_publication(&b.proposal.proposal_id, &a.digest, &policy(), b.suite.digest());
+    assert!(result.is_err(), "{result:?}");
+}
+
+fn drop_revision(fx: &Fixture, revision: &crate::skills::lifecycle::RevisionId) {
+    let dir = fx
+        .store
+        .root()
+        .join("revisions")
+        .join(skill().as_str())
+        .join(revision.as_str());
+    std::fs::remove_dir_all(dir).expect("test: remove revision");
+}
+
+#[tokio::test]
+async fn a_gated_candidate_whose_revision_is_gone_is_refused_not_rebuilt() {
+    let fx = fixture();
+    let e = eligible(&fx).await;
+    drop_revision(&fx, &fx.candidate);
+    let result = authorize(&fx, &e);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(status(&fx, &e.proposal), ProposalStatus::Eligible);
+    assert_eq!(generation(&fx), 1);
+}
+
+#[tokio::test]
+async fn a_candidate_revision_that_names_another_proposal_is_refused() {
+    let fx = fixture();
+    let e = eligible(&fx).await;
+    // Swap the evaluation-installed revision for one with foreign provenance.
+    let bundle = fx
+        .store
+        .read_revision(&skill(), &fx.candidate, None)
+        .expect("test: candidate")
+        .bundle;
+    drop_revision(&fx, &fx.candidate);
+    let mut new = NewRevision::new(skill(), SourceKind::Learned);
+    new.proposal_id = Some("prop-00000000000000000000000000000000".to_string());
+    fx.store.write_revision(&new, &bundle).expect("test: foreign revision");
+    let result = fx
+        .store
+        .authorize_publication(&e.proposal.proposal_id, &e.digest, &policy(), e.suite.digest());
+    assert!(
+        matches!(
+            result,
+            Err(GateError::Lifecycle(LifecycleError::RevisionConflict { .. }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(status(&fx, &e.proposal), ProposalStatus::Eligible);
+}
+
+#[tokio::test]
+async fn the_store_rejects_a_writer_whose_generation_moved_after_the_gate_recheck() {
+    let fx = fixture();
+    let e = eligible(&fx).await;
+    authorize(&fx, &e).expect("test: authorize");
+    let other = super::evaluate::write_revision(&fx.store, "ANSWER=someone-else");
+    let rival = crate::skills::lifecycle::SkillLifecycleStore::open(fx.tmp.path(), fx.store.owner_scope().clone())
+        .expect("test: second handle");
+    // Between the gate re-check and the store call another writer wins.
+    crash_hooks::run_at(
+        "publish_before_store",
+        Box::new(move || {
+            activate(&rival, &skill(), &other, 1, true);
+        }),
+    );
+    let result = publish(&fx, &e);
+    assert!(
+        matches!(
+            result,
+            Err(GateError::Lifecycle(LifecycleError::StaleGeneration { .. }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(status(&fx, &e.proposal), ProposalStatus::Stale);
+    assert_eq!(generation(&fx), 2);
+    assert_ne!(active_revision(&fx), fx.candidate);
 }

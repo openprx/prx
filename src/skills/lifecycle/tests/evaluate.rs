@@ -31,7 +31,7 @@ pub(super) fn skill() -> SkillId {
 }
 
 pub(super) struct Fixture {
-    pub(super) _tmp: TempDir,
+    pub(super) tmp: TempDir,
     pub(super) store: SkillLifecycleStore,
     pub(super) baseline: RevisionId,
     pub(super) candidate: RevisionId,
@@ -58,7 +58,7 @@ pub(super) fn fixture() -> Fixture {
     let b = write_revision(&store, "ANSWER=report-v2");
     activate(&store, &skill(), &a, 0, true);
     Fixture {
-        _tmp: tmp,
+        tmp,
         store,
         baseline: a.0,
         candidate: b.0,
@@ -72,7 +72,7 @@ fn fixture_unpublished() -> Fixture {
     let a = write_revision(&store, "ANSWER=draft");
     let b = write_revision(&store, "ANSWER=report-v2");
     Fixture {
-        _tmp: tmp,
+        tmp,
         store,
         baseline: a.0,
         candidate: b.0,
