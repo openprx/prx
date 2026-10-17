@@ -1294,9 +1294,10 @@ pub struct SessionsSpawnTool {
     /// processing (the channels JoinSet) would otherwise cause. Empty in unit
     /// tests / single-channel paths, where the shared `channel` fallback applies.
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
-    /// Provider for sub-agent LLM calls.
+    /// Test-only parent provider injected at the admitted-source seam. Child
+    /// providers always come from the production admitted binding.
     #[cfg(test)]
-    provider: Arc<dyn Provider>,
+    test_parent_provider: Arc<dyn Provider>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.
@@ -1527,7 +1528,8 @@ impl SessionsSpawnTool {
         Ok((config_dir, generation))
     }
 
-    /// Create a new `SessionsSpawnTool` with the given channel and provider.
+    /// Create a new `SessionsSpawnTool` with the given channel and provider
+    /// selection metadata. The admitted binding owns actual child providers.
     ///
     /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
     /// `active_runs` registry owned solely by this tool. Behaviour is identical to
@@ -1536,7 +1538,7 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         temperature: f64,
@@ -1550,6 +1552,7 @@ impl SessionsSpawnTool {
     ) -> Self {
         Self::new_with_registry(
             channel,
+            #[cfg(test)]
             provider,
             provider_name,
             model,
@@ -1576,7 +1579,7 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_registry(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         _temperature: f64,
@@ -1589,8 +1592,6 @@ impl SessionsSpawnTool {
         _spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
-        #[cfg(not(test))]
-        let _ = provider;
         let provider_name: String = provider_name.into();
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(std::iter::once(provider_name.as_str()))
@@ -1601,7 +1602,7 @@ impl SessionsSpawnTool {
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
             #[cfg(test)]
-            provider,
+            test_parent_provider: provider,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,
@@ -9870,7 +9871,7 @@ mod tests {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
         cleanup
             .run(Box::pin(async move {
-                let provider = Arc::clone(&tool.provider);
+                let provider = Arc::clone(&tool.test_parent_provider);
                 let security = Arc::clone(&tool.security);
                 let workspace = config.workspace_dir.clone();
                 // Q71 hybrid is deliberately invalid for persistence; publish the
@@ -10235,7 +10236,7 @@ mod tests {
             channel: Arc::clone(&tool.channel),
             test_worker_executable: tool.test_worker_executable.clone(),
             channels: Arc::clone(&tool.channels),
-            provider: Arc::clone(&tool.provider),
+            test_parent_provider: Arc::clone(&tool.test_parent_provider),
             provider_name: tool.provider_name.clone(),
             model: tool.model.clone(),
             security: Arc::clone(&tool.security),
@@ -10420,7 +10421,7 @@ mod tests {
             .entry("ollama/prx-local-model".to_owned())
             .or_insert_with(fixture_price);
         let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
-        let provider = Arc::clone(&tool.provider);
+        let provider = Arc::clone(&tool.test_parent_provider);
         let provider_name = tool.provider_name.clone();
         let model_name = tool.model.clone();
         let registry =
@@ -17264,6 +17265,144 @@ mod tests {
         );
     }
 
+    /// The admitted child binding, rather than the removed local reconstruction
+    /// shim, owns retries for a named provider override.
+    #[tokio::test]
+    async fn provider_override_goes_through_the_reliability_layer() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429, 429]).await;
+        let provider_name = probe.custom_provider();
+        let agents = HashMap::from([(
+            "prx_agent".to_string(),
+            containment_agent(&provider_name, Some("PRX-CHILD-RETRY-CREDENTIAL")),
+        )]);
+        let mut tool = containment_tool(&temp, agents, "ollama", None);
+        let mut config = preconstruction_parent_config(&tool, temp.path());
+        config.reliability.provider_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.push(
+            serde_json::from_value(json!({
+                "provider": provider_name, "model": PROBE_MODEL,
+                "operations": ["chat"], "native_tools": true
+            }))
+            .expect("test: child model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider_name}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let catalog = providers::selection::catalog_for(&config);
+        tool = tool
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        let runs = tool.active_runs_arc();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+        )
+        .await
+        .expect("test: admitted retry spawn");
+        assert!(result.success, "named child was not started: {:?}", result.error);
+        assert_eq!(probe.wait_for_requests(3, std::time::Duration::from_secs(10)).await, 3);
+        let run_id = runs.read().await.first().expect("test: child run").id.clone();
+        assert_eq!(
+            await_terminal_reason(&runs, &run_id).await,
+            crate::providers::credential_probe::PROBE_REPLY
+        );
+        assert!(probe.requests().iter().all(|request| {
+            request
+                .authorization()
+                .is_some_and(|value| value.contains("PRX-CHILD-RETRY-CREDENTIAL"))
+        }));
+    }
+
+    /// Provider fallbacks and root rotation keys belong to the parent chain;
+    /// an admitted named child keeps only its selected vendor and credential.
+    #[tokio::test]
+    async fn override_reliability_drops_chain_widening_knobs() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let selected = CredentialProbe::start_failing(429, "selected child refused").await;
+        let fallback = CredentialProbe::start().await;
+        let selected_provider = selected.custom_provider();
+        let fallback_provider = fallback.custom_provider();
+        let agents = HashMap::from([(
+            "prx_agent".to_string(),
+            containment_agent(&selected_provider, Some("PRX-CHILD-ONLY-CREDENTIAL")),
+        )]);
+        let mut tool = containment_tool(&temp, agents, "ollama", Some("PRX-PARENT-ROOT-CREDENTIAL"));
+        let mut config = preconstruction_parent_config(&tool, temp.path());
+        config.reliability.provider_retries = 0;
+        config.reliability.fallback_providers = vec![fallback_provider.clone()];
+        config.reliability.api_keys = vec!["PRX-PARENT-ROTATION-CREDENTIAL".to_string()];
+        for provider in [&selected_provider, &fallback_provider] {
+            config.providers.models.push(
+                serde_json::from_value(json!({
+                    "provider": provider, "model": PROBE_MODEL,
+                    "operations": ["chat"], "native_tools": true
+                }))
+                .expect("test: child model declaration"),
+            );
+            config.cost.prices.insert(
+                format!("{provider}/{PROBE_MODEL}"),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+        }
+        let catalog = providers::selection::catalog_for(&config);
+        tool = tool
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        let runs = tool.active_runs_arc();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+        )
+        .await
+        .expect("test: admitted contained spawn");
+        assert!(result.success, "named child was not started: {:?}", result.error);
+        assert_eq!(
+            selected.wait_for_requests(1, std::time::Duration::from_secs(10)).await,
+            1
+        );
+        let run_id = runs.read().await.first().expect("test: child run").id.clone();
+        let failure = await_terminal_reason(&runs, &run_id).await;
+        assert!(failure.contains("selected child refused"), "{failure}");
+        let requests = selected.requests();
+        assert_eq!(requests.len(), 1, "rotation credentials widened the child chain");
+        assert!(requests.first().is_some_and(|request| {
+            request
+                .authorization()
+                .is_some_and(|value| value.contains("PRX-CHILD-ONLY-CREDENTIAL"))
+        }));
+        assert!(!selected.saw("PRX-PARENT-ROOT-CREDENTIAL"));
+        assert!(!selected.saw("PRX-PARENT-ROTATION-CREDENTIAL"));
+        assert!(
+            fallback.requests().is_empty(),
+            "parent fallback provider received child traffic"
+        );
+    }
+
     /// R-PMMC F-5: every production construction of the spawn tool hands it
     /// the model evidence, so operator declarations are consulted on every
     /// surface (chat's `prx chat` registry included).
@@ -17458,7 +17597,10 @@ mod tests {
             ),
             ("b".to_string(), containment_agent(&other.custom_provider(), None)),
         ]);
-        let tool = containment_tool(&temp, agents, "ollama", None);
+        let mut tool = containment_tool(&temp, agents, &own.custom_provider(), Some(SPAWN_ROOT_SENTINEL));
+        let mut root_config = preconstruction_parent_config(&tool, temp.path());
+        root_config.api_key = Some(SPAWN_ROOT_SENTINEL.to_owned());
+        tool = tool.with_hint_config(&root_config);
 
         let result = execute_admitted_spawn(
             &tool,
@@ -17477,6 +17619,10 @@ mod tests {
             "agent a's key reached another provider"
         );
         assert!(other.requests().iter().all(|request| request.authorization().is_none()));
+        assert!(
+            !other.saw(SPAWN_ROOT_SENTINEL),
+            "root key reached an independently selected provider"
+        );
         assert!(own.requests().is_empty());
     }
 
@@ -17500,15 +17646,16 @@ mod tests {
             api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
             ..crate::config::Config::default()
         };
-        tool.provider = Arc::from(
+        tool.test_parent_provider = Arc::from(
             providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
                 .expect("test: gateway chain builds"),
         );
+        tool = tool.with_hint_config(&gateway_config);
 
-        let result = execute_admitted_spawn(
+        let result = execute_enabled_admitted_spawn(
             &tool,
             with_spawn_grant(json!({
-                "task": "probe", "provider": format!("{}/", gateway.custom_provider())
+                "task": "sessions_spawn: probe", "provider": format!("{}/", gateway.custom_provider())
             })),
         )
         .await
@@ -17572,7 +17719,7 @@ mod tests {
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
             .with_cost_config(config.cost.clone());
         tool.model = "hint:fast".to_string();
-        tool.provider = Arc::from(routed_provider);
+        tool.test_parent_provider = Arc::from(routed_provider);
         let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
             .await
             .expect("test: inherited spawn result");
@@ -17650,7 +17797,7 @@ mod tests {
             .with_model_catalog(catalog)
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
         tool.model = "hint:fast".to_string();
-        tool.provider = Arc::from(routed_provider);
+        tool.test_parent_provider = Arc::from(routed_provider);
         let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
             .await
             .expect("test: direct agent child result");
@@ -17719,20 +17866,29 @@ mod tests {
             },
         )
         .expect("test: litellm gateway builds");
-        let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-        tool.provider = Arc::from(gateway);
+        let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL))
+            .with_hint_config(&gateway_config);
+        tool.test_parent_provider = Arc::from(gateway);
 
-        let result = execute_admitted_spawn(
-            &tool,
-            with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})),
-        )
-        .await
-        .expect("test: spawn returns a tool result");
-        assert!(result.success, "{:?}", result.error);
-
-        let seen = root.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
-        let runs = tool.active_runs_snapshot().await;
-        assert_eq!(seen, 1, "gateway child did not reach root endpoint: {runs:?}");
+        for (index, spelling) in ["litellm", "lite-llm", "LiteLLM"].into_iter().enumerate() {
+            let result = execute_enabled_admitted_spawn(
+                &tool,
+                with_spawn_grant(json!({"task": "sessions_spawn: probe", "provider": spelling})),
+            )
+            .await
+            .expect("test: spawn returns a tool result");
+            assert!(result.success, "{spelling}: {:?}", result.error);
+            let seen = root
+                .wait_for_requests(index + 1, std::time::Duration::from_secs(10))
+                .await;
+            let runs = tool.active_runs_snapshot().await;
+            assert_eq!(seen, index + 1, "gateway child did not reach root endpoint: {runs:?}");
+        }
         assert!(root.saw(F1_SPAWN_ROOT_SENTINEL));
+        assert!(root.requests().iter().all(|request| {
+            request
+                .authorization()
+                .is_some_and(|header| header.contains(F1_SPAWN_ROOT_SENTINEL))
+        }));
     }
 }
