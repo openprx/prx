@@ -2742,11 +2742,11 @@ mod tests {
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
         use futures::FutureExt as _;
-        let retained = tempfile::tempdir().expect("private decision evidence").keep();
+        let retained = tempfile::tempdir().expect("private decision evidence");
         let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
             .await
             .expect("owned compatible decision listener")
-            .retain_evidence_at(retained);
+            .retain_evidence_at(retained.path().to_path_buf());
         let endpoint = driver.endpoint().to_owned();
         driver
             .run_factory(true, move || async move {
