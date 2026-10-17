@@ -2,7 +2,8 @@
 //! owner-scoped store (SL01). Publication, runtime binding and evaluation
 //! are separate packages and are not part of this module yet. SL08 store level
 //! adds the publication journal, generation CAS, rollback and recovery. SL06
-//! adds frozen evaluation suites and the baseline-versus-candidate evaluator.
+//! adds frozen evaluation suites and the baseline-versus-candidate evaluator. SL07
+//! adds the deterministic gate, its receipt and the optional judge.
 
 /// Test-only crash injection point; expands to nothing outside `cfg(test)`.
 macro_rules! crash_point {
@@ -21,6 +22,8 @@ mod capture;
 mod consolidate;
 mod evaluate;
 mod evaluator;
+mod gate;
+mod gate_judge;
 mod generation;
 mod journal;
 mod knowledge;
@@ -62,6 +65,14 @@ pub use evaluate::{
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
+pub use gate::{
+    EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
+    GateRequest, JudgeRecord, JudgeResult, RecordedGate, SkillGateDecision, VerifiedGate,
+};
+pub use gate_judge::{
+    GateJudge, JUDGE_PROMPT_VERSION, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgedEvaluation,
+    MAX_JUDGE_REASON_BYTES, ModelJudge,
+};
 pub use generation::ActiveBinding;
 pub use journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
 pub use knowledge::{
