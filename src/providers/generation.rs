@@ -103,6 +103,17 @@ pub(crate) async fn get_or_create_provider_for_generation(
     model_name: &str,
     generation: &Arc<ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
+    let cache_key = (generation.id.0, provider_name.to_string(), model_name.to_string());
+    let active_generation = config_owner.pin().id.0;
+    {
+        let mut cache = cache.lock();
+        cache.retain(|(generation, _, _), _| *generation == active_generation);
+        if generation.id.0 == active_generation
+            && let Some(existing) = cache.get(&cache_key).cloned()
+        {
+            return Ok(existing);
+        }
+    }
     let catalog = super::selection::catalog_for(&generation.effective);
     get_or_create_provider_for_generation_with_catalog(
         config_owner,
