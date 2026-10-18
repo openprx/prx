@@ -3289,7 +3289,17 @@ pub(crate) fn fallback_admission_for(
             let cost_admitted =
                 match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
                     crate::llm::route_decision::UsagePrice::Priced(_) => true,
-                    crate::llm::route_decision::UsagePrice::Missing => provider_id.catalog_name() == Some("ollama"),
+                    crate::llm::route_decision::UsagePrice::Missing => {
+                        crate::runtime::turn_cost::provider_is_zero_price_exempt(
+                            &provider_id,
+                            // Sibling models and a deduplicated fallback entry of the primary
+                            // provider run on the primary connection; other providers use
+                            // their own default endpoint.
+                            (provider_id == *resolved.provider())
+                                .then(|| resolved.credential().api_url())
+                                .flatten(),
+                        )
+                    }
                     crate::llm::route_decision::UsagePrice::Invalid => false,
                 };
             admission.insert(
@@ -6988,6 +6998,49 @@ Connection: close\r\n\
             .expect("test: a keyed endpoint receives an authorization header");
         assert_eq!(authorization, format!("Bearer {BYO_SENTINEL_KEY}"));
         endpoint.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod fallback_zero_price_tests {
+    use super::*;
+    use crate::providers::catalog::{Requirement, Selection, UnknownPolicy, resolve};
+    use crate::providers::credentials::{ConfigCredentialSource, CredentialRef, LegacySlot};
+
+    fn sibling_is_cost_admitted(api_url: Option<&str>) -> bool {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("ollama".to_string());
+        config.api_url = api_url.map(str::to_string);
+        config.api_key = Some("test-ollama-root-key".to_string());
+        let catalog = catalog::CatalogView::from_config(&config);
+        let resolved = resolve(
+            &Selection {
+                provider: "ollama",
+                model: "prx-local-model",
+                credential: CredentialRef::LegacyInline(LegacySlot::Root),
+            },
+            &Requirement::chat(),
+            &catalog,
+            &ConfigCredentialSource::new(&config),
+            UnknownPolicy::Invocation,
+        )
+        .expect("test: ollama primary resolves");
+        let mut reliability = config.reliability.clone();
+        reliability
+            .model_fallbacks
+            .insert("prx-local-model".to_string(), vec!["prx-unpriced-sibling".to_string()]);
+        let admission = fallback_admission_for(&resolved, &catalog, &reliability, &config.cost);
+        admission
+            .eligibility(&ProviderId::of("ollama"), "prx-unpriced-sibling")
+            .expect("test: sibling is described")
+            .cost_admitted
+    }
+
+    #[test]
+    fn an_unpriced_sibling_is_free_only_on_a_local_ollama_primary() {
+        assert!(sibling_is_cost_admitted(None));
+        assert!(sibling_is_cost_admitted(Some("http://localhost:11434")));
+        assert!(!sibling_is_cost_admitted(Some("https://ollama.com")));
     }
 }
 

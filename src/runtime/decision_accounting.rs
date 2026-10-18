@@ -20,6 +20,7 @@ use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, D
 use crate::decision::protocol::DecisionUsage;
 use crate::decision::{DecisionError, DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
+use crate::providers::ProviderId;
 
 #[cfg(test)]
 pub(crate) mod timing;
@@ -83,11 +84,21 @@ impl AccountingScope {
 
 impl budget::sealed::AccountingOwner for AccountingScope {}
 
+/// The base URL a provider is reached at: the root connection's `api_url`
+/// when `provider` is the configured default provider, otherwise unset (the
+/// provider's own default).
+fn effective_api_url<'a>(config: &'a Config, provider: &str) -> Option<&'a str> {
+    (ProviderId::of(provider) == ProviderId::of(crate::providers::selection::default_provider(config)))
+        .then_some(config.api_url.as_deref())
+        .flatten()
+}
+
 /// Reserve the declared available decision allowance at the highest applicable
 /// PMM rate. This is a versioned local estimate, never a vendor billing cap.
 fn estimated_cost(
     config: &crate::config::schema::CostConfig,
     provider: &str,
+    api_url: Option<&str>,
     model: &str,
     tokens: u64,
 ) -> Result<u64, DecisionError> {
@@ -98,9 +109,14 @@ fn estimated_cost(
         (tokens, 0, tokens, 0),
         (tokens, 0, 0, tokens),
     ] {
-        let UsagePrice::Priced(cost) = usage_cost_resolution(provider, model, input, output, write, read, config)
-        else {
-            return Err(DecisionError::BudgetExceeded);
+        let cost = match usage_cost_resolution(provider, model, input, output, write, read, config) {
+            UsagePrice::Priced(cost) => cost,
+            UsagePrice::Missing
+                if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
+            {
+                0.0
+            }
+            UsagePrice::Missing | UsagePrice::Invalid => return Err(DecisionError::BudgetExceeded),
         };
         maximum = maximum.max(cost);
     }
@@ -256,7 +272,13 @@ impl AccountingScope {
                         timing.mark("input_fit_finished");
                     }
                 }
-                maximum = estimated_cost(&config.cost, &provider, &model, tokens)?;
+                maximum = estimated_cost(
+                    &config.cost,
+                    &provider,
+                    effective_api_url(&config, &provider),
+                    &model,
+                    tokens,
+                )?;
                 anyhow::ensure!(
                     remaining
                         .micro_usd
@@ -487,7 +509,7 @@ impl OwnedReceipt {
                 let output = u64::from(output);
                 let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
                 let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-                let UsagePrice::Priced(cost) = usage_cost_resolution(
+                let cost = match usage_cost_resolution(
                     &self.provider,
                     &self.model,
                     input,
@@ -495,8 +517,19 @@ impl OwnedReceipt {
                     cache_write,
                     cache_read,
                     &self.config.cost,
-                ) else {
-                    anyhow::bail!("decision usage has no valid pinned PMM price");
+                ) {
+                    UsagePrice::Priced(cost) => cost,
+                    UsagePrice::Missing
+                        if super::turn_cost::provider_is_zero_price_exempt(
+                            &ProviderId::of(&self.provider),
+                            effective_api_url(&self.config, &self.provider),
+                        ) =>
+                    {
+                        0.0
+                    }
+                    UsagePrice::Missing | UsagePrice::Invalid => {
+                        anyhow::bail!("decision usage has no valid pinned PMM price")
+                    }
                 };
                 let total = input + output;
                 let record = MeteredTokenUsageRecord {
@@ -653,6 +686,49 @@ mod tranche_tests {
         let remaining = AtomicU64::new(2048);
         reconcile_token_allowance(&remaining, 2048, 5000);
         assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn only_a_local_unpriced_ollama_reserves_zero_money() {
+        let config = crate::config::schema::CostConfig::default();
+        let reserve =
+            |provider: &str, url: Option<&str>| estimated_cost(&config, provider, url, "prx-local-model", 1000);
+        assert_eq!(reserve("ollama", None).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://127.0.0.1:11434")).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://localhost:11434")).ok(), Some(0));
+        assert!(matches!(
+            reserve("ollama", Some("https://ollama.com")),
+            Err(DecisionError::BudgetExceeded)
+        ));
+        assert!(matches!(
+            reserve("ollama", Some("http://192.168.1.20:11434")),
+            Err(DecisionError::BudgetExceeded)
+        ));
+        assert!(matches!(
+            reserve("acme-unpriced", None),
+            Err(DecisionError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn the_settlement_exemption_follows_the_effective_endpoint() {
+        let mut config = Config::default();
+        config.default_provider = Some("ollama".to_string());
+        assert_eq!(effective_api_url(&config, "ollama"), None);
+        config.api_url = Some("https://ollama.com".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(!super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        config.api_url = Some("http://localhost:11434".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        // Another provider never inherits the root URL.
+        assert_eq!(effective_api_url(&config, "openai"), None);
     }
 
     #[test]

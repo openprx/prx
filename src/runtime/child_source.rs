@@ -950,6 +950,27 @@ tokio::task_local! {
     static OUTGOING_GRANT: Option<Arc<IssuedChildGrant>>;
 }
 
+/// Reliability settings for a child whose provider was pinned on purpose
+/// (an override, a model hint or a delegated selection). Every path that
+/// builds such a child uses this one policy.
+///
+/// Retry budget, backoff and per-model fallbacks carry over unchanged; the two
+/// chain-widening knobs are dropped:
+///
+/// * `fallback_providers` -- the caller named the provider, so serving the
+///   request from another vendor would defeat it while looking like success.
+/// * `api_keys` -- cleared defensively so no root rotation credential is
+///   visible to the child's settings. The provider factory takes the rotation
+///   keys from the resolved credential (`create_provider_for`) and overwrites
+///   this field either way, so this does not change what the factory builds.
+pub(crate) fn pinned_provider_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
+    crate::config::ReliabilityConfig {
+        fallback_providers: Vec::new(),
+        api_keys: Vec::new(),
+        ..base.clone()
+    }
+}
+
 #[cfg(test)]
 struct OrdinaryProviderFixture {
     provider: Arc<dyn crate::providers::Provider>,
@@ -1210,10 +1231,7 @@ impl ChildProviderBinding {
         let config = &generation.effective;
         // A delegated provider remains pinned to its selected vendor, matching
         // the existing child contract. The factory validates model fallbacks.
-        let reliability = crate::config::ReliabilityConfig {
-            fallback_providers: Vec::new(),
-            ..config.reliability.clone()
-        };
+        let reliability = pinned_provider_reliability(&config.reliability);
         let options = crate::providers::provider_runtime_options_from_config(config);
         let provider = Arc::from(crate::providers::create_provider_for(
             &resolved,
@@ -1498,5 +1516,26 @@ impl ChildProviderBinding {
             resolved: &self.resolved,
             route: self.route.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod pinned_reliability_tests {
+    use super::pinned_provider_reliability;
+
+    #[test]
+    fn pinned_child_reliability_clears_both_fields_and_keeps_the_rest() {
+        let base = crate::config::ReliabilityConfig {
+            fallback_providers: vec!["openai".to_string()],
+            api_keys: vec!["root-rotation-key".to_string()],
+            provider_retries: 7,
+            model_fallbacks: std::collections::HashMap::from([("k3".to_string(), vec!["k3-mini".to_string()])]),
+            ..crate::config::ReliabilityConfig::default()
+        };
+        let pinned = pinned_provider_reliability(&base);
+        assert_eq!(pinned.fallback_providers, Vec::<String>::new());
+        assert_eq!(pinned.api_keys, Vec::<String>::new());
+        assert_eq!(pinned.provider_retries, 7);
+        assert_eq!(pinned.model_fallbacks, base.model_fallbacks);
     }
 }

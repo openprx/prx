@@ -397,6 +397,9 @@ pub(super) enum MutationBody {
         #[serde(default)]
         timeout_ms: Option<u32>,
     },
+    /// Back to `kind = "auto"`: no endpoint, model, snapshot or credential
+    /// reference, and remote processing off.
+    ResetBackendToAuto,
     SetRemote {
         remote: bool,
     },
@@ -448,6 +451,7 @@ impl MutationBody {
                     timeout_ms,
                 }
             }
+            Self::ResetBackendToAuto => CausalMutation::ResetBackendToAuto,
             Self::SetRemote { remote } => CausalMutation::SetRemote(remote),
             Self::SetCredentialRef { reference } => {
                 CausalMutation::SetCredentialRef(CredentialRefSetting::try_from(reference)?)
@@ -622,6 +626,15 @@ pub(super) async fn put_credential(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    #[test]
+    fn reset_backend_to_auto_body_parses_and_maps() {
+        let body: MutationBody = serde_json::from_str(r#"{"op":"reset_backend_to_auto"}"#).expect("test: body parses");
+        assert!(matches!(
+            body.into_mutation().expect("test: maps"),
+            CausalMutation::ResetBackendToAuto
+        ));
+    }
+
     use super::super::test_support::{TOKEN, at, json, serve_config};
     use super::*;
     use reqwest::Method;

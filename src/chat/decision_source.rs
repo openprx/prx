@@ -9,6 +9,15 @@ use std::sync::Arc;
 
 /// Selection identity paired with the concrete provider instance. Only Chat's
 /// construction/switch path publishes it, before updating either UI slot.
+///
+/// Generation lifetime: an interactive chat process pins the configuration
+/// generation it started with (`ctx.config_generation`) for every turn and
+/// every `/model` switch; it is not re-pinned per turn. A configuration change
+/// made while the chat is open therefore applies to the next chat process (or
+/// to children/gateway work admitted under a newer generation), never
+/// half-way through a conversation, so a turn's provider, price and credential
+/// origin stay one coherent snapshot. `verify` refuses a binding whose
+/// generation differs from the one in use.
 #[derive(Clone)]
 pub(super) struct ChatProviderBinding {
     provider: Arc<dyn crate::providers::Provider>,

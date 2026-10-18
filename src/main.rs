@@ -399,7 +399,7 @@ enum Commands {
         #[arg(long)]
         memory: Option<String>,
         /// The decision backend (quick mode): builtin or compatible_http; a
-        /// hosted service is chosen with --interactive or `prx causal config`
+        /// hosted service also needs --decision-credential-stdin
         #[arg(long, value_enum)]
         decision_backend: Option<openprx::causal_cli::BackendKindArg>,
         /// The decision endpoint (quick mode, compatible_http)
@@ -411,6 +411,12 @@ enum Commands {
         /// Also turn the decision plane on (quick mode)
         #[arg(long, requires = "decision_backend")]
         decision_enable: bool,
+        /// Read the hosted decision backend's credential (typesafe or
+        /// openrouter) from standard input, store it as `cred-decision-<kind>`
+        /// and reference it (quick mode). Remote processing stays off until
+        /// `prx causal config enable-remote`
+        #[arg(long, requires = "decision_backend", conflicts_with = "from_stdin")]
+        decision_credential_stdin: bool,
     },
 
     /// Instant start: provide an API key and chat immediately. No config files written.
@@ -1707,6 +1713,7 @@ async fn async_main() -> Result<()> {
         decision_endpoint,
         decision_model,
         decision_enable,
+        decision_credential_stdin,
     } = &cli.command
     {
         let interactive = *interactive;
@@ -1721,6 +1728,26 @@ async fn async_main() -> Result<()> {
         if decision.is_some() && (interactive || *channels_only) {
             bail!("--decision-backend is a quick-setup flag; the interactive wizard asks for the decision backend");
         }
+        let hosted = decision
+            .as_ref()
+            .is_some_and(|decision| openprx::causal_cli::hosted_owner(decision.kind).is_some());
+        if hosted && !*decision_credential_stdin {
+            bail!(
+                "a hosted decision backend needs its credential: add --decision-credential-stdin (the value is read \
+                 from standard input and stored as a credential reference), or use `prx causal config`"
+            );
+        }
+        if *decision_credential_stdin && !hosted {
+            bail!("--decision-credential-stdin applies only to the hosted backends typesafe and openrouter");
+        }
+        let decision_secret = if *decision_credential_stdin {
+            manage_cli::secret_from(true, None, &mut std::io::stdin(), &|name: &str| {
+                std::env::var(name).ok()
+            })?
+            .map(openprx::config::manage::credentials::SecretString::new)
+        } else {
+            None
+        };
         let channels_only = *channels_only;
         if channels_only && (*from_stdin || from_env.is_some()) {
             bail!("--channels-only does not accept --from-stdin or --from-env");
@@ -1753,7 +1780,18 @@ async fn async_main() -> Result<()> {
             // Checked before anything is written; applied to the written
             // configuration as its own transaction.
             if let Some(decision) = &decision {
-                decision.check()?;
+                if hosted {
+                    decision.check_hosted()?;
+                    decision.ensure_hosted_credential_free(&onboard::wizard::quick_setup_config_path(config_dir)?)?;
+                    anyhow::ensure!(
+                        decision_secret
+                            .as_ref()
+                            .is_some_and(|secret| !secret.expose().trim().is_empty()),
+                        "the decision credential read from standard input is empty; nothing was written"
+                    );
+                } else {
+                    decision.check()?;
+                }
             }
             let config = onboard::wizard::run_quick_setup(
                 api_key.as_deref(),
@@ -1764,7 +1802,11 @@ async fn async_main() -> Result<()> {
             )
             .await?;
             if let Some(decision) = &decision {
-                print!("{}", decision.apply(config).await?);
+                let text = match decision_secret {
+                    Some(secret) => decision.apply_hosted(config, secret).await?,
+                    None => decision.apply(config).await?,
+                };
+                print!("{text}");
                 println!("Decision backend configured ({}).", decision.kind.as_str());
             }
             None
