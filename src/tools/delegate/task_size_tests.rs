@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::boxed_delegate_field;
 
 #[tokio::test]

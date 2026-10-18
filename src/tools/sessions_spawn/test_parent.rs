@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{Provider, SessionsSpawnTool};
 use std::sync::Arc;
 

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::super::*;
 use std::{task::Poll, time::Duration};
 

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use crate::decision::telemetry::{
     CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage, testing::RecordingSink,
 };

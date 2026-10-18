@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::super::{CausalDecisionStore, DecisionId, Retention, StoreMode, WriterSetup, now_ms, testing};
 use super::{DecisionScope, Instant, StoreError};
 use anyhow::Context;
