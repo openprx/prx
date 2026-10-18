@@ -818,7 +818,7 @@ impl CausalDecisionEngine {
         if ![&post_rehearsal, &pre_commit].iter().all(|report| {
             matches!(
                 report.outcomes.get(candidate.candidate_id()),
-                Some(GateOutcome::ApprovalDeferred)
+                Some(GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. })
             )
         }) {
             return Ok(None);

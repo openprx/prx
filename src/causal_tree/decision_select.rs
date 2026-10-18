@@ -206,6 +206,7 @@ impl CausalSelector {
             exact_mentions,
             discoverable_families,
             approval_scopes,
+            report: admitted_report,
             ..
         } = admitted
         else {
@@ -325,6 +326,21 @@ impl CausalSelector {
             // post-rehearsal and pre-commit gates still apply to Discover.
             .find(|(candidate, _, _)| candidate.action() == CausalActionKind::Discover)
             .map(|(candidate, _, _)| *candidate);
+        // Finding 76: an exactly named approval-required tool with no bound
+        // call (a fresh turn has no arguments yet, so no approval scope can
+        // exist) must not be replaced by a plain Answer. Ingresses with an
+        // owner-review adapter never reach this point: the engine collects the
+        // call's arguments for review first. Everywhere else the turn closes.
+        if top.action() == CausalActionKind::Answer
+            && exact_mentions.iter().any(|id| {
+                matches!(
+                    admitted_report.outcomes.get(id),
+                    Some(GateOutcome::ApprovalOnly { op_ids }) if !op_ids.is_empty()
+                )
+            })
+        {
+            return terminal_abstain(candidates, pre_commit, context, "approval_requires_call");
+        }
         let insufficient = evidence_insufficient(prediction.evidence_sufficient);
         let stale = evidence_stale(prediction.needs_fresh_state);
         let no_choice_mass = passed.iter().all(|(_, _, probability)| *probability <= 0.0);
