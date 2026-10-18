@@ -548,6 +548,13 @@ async fn evaluation_the_gate_and_authorization_require_the_recorded_source_revie
 
     // With the record back the gate decides, and authorization needs it too.
     std::fs::write(&review, &kept).expect("test: restore");
+    // `fs::write` creates the file with the process umask; the store refuses
+    // anything group- or other-readable, so restore the owner-only mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&review, std::fs::Permissions::from_mode(0o600)).expect("test: restore mode");
+    }
     let outcome = super::gate::gate(&fx, &proposal, &suite, &[pin], &policy(), None)
         .await
         .expect("test: gate");
