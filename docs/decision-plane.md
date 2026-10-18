@@ -585,3 +585,5 @@ closes locally without claiming a persisted failure event. Admission failure and
 decision issuance are serialized for the same input. These candidate paths still
 require the full behavioral, cancellation, privacy and performance gates; existing
 historical events are not rewritten by this change.
+
+SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
