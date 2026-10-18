@@ -1330,6 +1330,33 @@ mod tests {
         assert_eq!(report.status(), "restart_required");
     }
 
+    /// `[skills_lifecycle]` is read once at process start (the service, its
+    /// store and the registered tools are built from it), so a reload that
+    /// changes it reports `restart_required` and the effective configuration
+    /// keeps the old value, while the desired one records the edit.
+    #[test]
+    #[serial]
+    fn a_changed_skills_lifecycle_needs_a_restart_and_keeps_the_old_value() {
+        let manager = ConfigGenerationManager::new(Config::default());
+        let old_active = manager.load_full();
+        assert!(!old_active.skills_lifecycle.enabled);
+        let mut desired = (*old_active).clone();
+        desired.skills_lifecycle.enabled = true;
+        desired.skills_lifecycle.owner_scope = Some("owner:ws:cli:alice".to_string());
+        desired.skills_lifecycle.mode = crate::config::skills_lifecycle::SkillsLifecycleModeConfig::Auto;
+
+        let report = manager
+            .apply_runtime_config(desired.clone(), ConfigReloadTrigger::Test)
+            .expect("apply config");
+
+        assert_eq!(report.restart_required, vec!["skills_lifecycle"]);
+        assert_eq!(report.status(), "restart_required");
+        assert_eq!(manager.load_full().skills_lifecycle, old_active.skills_lifecycle);
+        assert!(!manager.load_full().skills_lifecycle.enabled);
+        assert_eq!(manager.desired().config.skills_lifecycle, desired.skills_lifecycle);
+        assert!(is_process_restart_only("skills_lifecycle"));
+    }
+
     #[test]
     #[serial]
     fn reload_report_classifies_runtime_changes() {

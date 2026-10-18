@@ -1121,11 +1121,18 @@ fn an_over_budget_edit_with_consistent_figures_fails_the_review() {
 
 // ---- operator repair: force close ----------------------------------------------------------
 
+/// Crash before the binding swap: the publication is not live.
+const NOT_LIVE: &str = "after_prepared";
+/// Crash after the committed swap: the candidate is the active revision.
+const LIVE: &str = "publish_before_finalize";
+
 /// An authorized proposal whose publication entry lost its pin: `publish` and
 /// `cancel` both stop on a transaction conflict and nothing else moves it.
+/// `crash` decides whether the publication behind the conflict is live.
 async fn stuck_on_a_transaction_conflict(
     mode: LifecycleMode,
     request: &str,
+    crash: &'static str,
 ) -> (Fixture, SkillsLifecycleService, String) {
     let (fx, bundle) = fixture_candidate_unwritten();
     let suite = governing_suite();
@@ -1135,7 +1142,7 @@ async fn stuck_on_a_transaction_conflict(
     let publisher = service_over(&fx, LifecycleMode::Auto, &suite);
     let id = draft.proposal_id.clone();
     to_eligible(&publisher, &suite, &id).await;
-    crash_hooks::arm("publish_before_finalize");
+    crash_hooks::arm(crash);
     assert!(publisher.publish(&id).is_err());
     crash_hooks::disarm();
     edit_journal(&journal_path(&fx, &id, 1), |entry| {
@@ -1153,7 +1160,7 @@ async fn force_close_resolves_a_conflict_stuck_proposal_without_publishing() {
         (ForceClose::Failed, ProposalStatus::Failed),
         (ForceClose::Stale, ProposalStatus::Stale),
     ] {
-        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force").await;
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force", NOT_LIVE).await;
         assert!(matches!(
             svc.publish(&id),
             Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
@@ -1167,6 +1174,7 @@ async fn force_close_resolves_a_conflict_stuck_proposal_without_publishing() {
         );
         assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
         let binding_before = active(&fx);
+        assert_eq!(binding_before.1, 1, "the candidate never became active");
 
         let closed = svc
             .force_close(&id, "  journal pin lost in a crash  ", outcome)
@@ -1195,17 +1203,59 @@ async fn force_close_resolves_a_conflict_stuck_proposal_without_publishing() {
     }
 }
 
+/// The conflict hides a publication that went live: the candidate is the
+/// active revision. Closing the proposal would strand it, so it is refused in
+/// every mode and for both outcomes, and nothing changes.
+#[tokio::test]
+async fn force_close_refuses_a_live_publication_behind_a_conflict() {
+    for outcome in [ForceClose::Failed, ForceClose::Stale] {
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-live-c", LIVE).await;
+        let live = active(&fx);
+        assert_eq!(live.1, 2, "the candidate is the active revision");
+        assert!(matches!(
+            svc.publish(&id),
+            Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
+        ));
+        let refused = svc.force_close(&id, "operator", outcome);
+        assert!(
+            matches!(&refused, Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(reason))) if reason.contains("is live")),
+            "{refused:?}"
+        );
+        assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+        assert_eq!(active(&fx), live);
+    }
+}
+
+/// A PREPARED entry whose swap did happen (crash right after the binding) is
+/// live too, though its state still reads prepared.
+#[tokio::test]
+async fn force_close_refuses_a_prepared_entry_whose_binding_swap_happened() {
+    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-live-p", "after_binding").await;
+    let live = active(&fx);
+    assert_eq!(live.1, 2);
+    let refused = svc.force_close(&id, "operator", ForceClose::Failed);
+    assert!(
+        matches!(
+            &refused,
+            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(active(&fx), live);
+    assert_ne!(stored(&fx, &id).status, ProposalStatus::Failed);
+}
+
 #[tokio::test]
 async fn force_close_is_allowed_in_every_mode_but_not_when_disabled() {
     for mode in [LifecycleMode::DraftOnly, LifecycleMode::Shadow] {
-        let (fx, svc, id) = stuck_on_a_transaction_conflict(mode, "req-force-mode").await;
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(mode, "req-force-mode", NOT_LIVE).await;
         let closed = svc
             .force_close(&id, "operator repair", ForceClose::Failed)
             .expect("test: a close needs no publication mode");
         assert_eq!(closed.status, ProposalStatus::Failed);
         assert_eq!(stored(&fx, &id).status, ProposalStatus::Failed);
     }
-    let (fx, _svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-off").await;
+    let (fx, _svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-off", NOT_LIVE).await;
     let suite = governing_suite();
     let disabled = service_with(&fx, LifecycleMode::Auto, &suite, |settings| settings.enabled = false);
     assert!(matches!(
@@ -1217,7 +1267,7 @@ async fn force_close_is_allowed_in_every_mode_but_not_when_disabled() {
 
 #[tokio::test]
 async fn force_close_refuses_what_is_not_a_stuck_authorized_proposal() {
-    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-refuse").await;
+    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-refuse", NOT_LIVE).await;
     // A reason is required.
     for reason in ["", "   "] {
         assert!(matches!(
@@ -1401,20 +1451,42 @@ async fn the_cli_publishes_through_the_service_in_auto_mode_and_can_roll_back() 
 }
 
 #[tokio::test]
-async fn the_cli_force_closes_a_stuck_proposal_and_status_surfaces_the_startup_skips() {
+async fn the_cli_status_surfaces_the_startup_skips_and_force_close_refuses_a_live_publication() {
     use crate::ForceCloseArg;
     use crate::SkillLifecycleCommands as Cmd;
-    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-cli-force").await;
+    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-cli-live", LIVE).await;
     let before = active(&fx);
 
-    // Startup recovery skips the stuck proposal; status says so.
+    // Startup recovery skips the stuck proposal; the CLI (a different service
+    // handle) reads that from the store.
     let report = svc.startup_recovery().expect("test: recovery");
     assert!(report.skipped.iter().any(|(skipped, _)| skipped == &id), "{report:?}");
     let status = cli(&fx, LifecycleMode::Auto, Cmd::Status).await.expect("test: status");
     assert!(status.contains(&format!("skipped {id}")), "{status}");
     assert!(status.contains("1 skipped"), "{status}");
 
-    // The reason is mandatory and the state must be an authorized one.
+    let refused = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::ForceClose {
+            proposal_id: id.clone(),
+            reason: "operator".into(),
+            outcome: ForceCloseArg::Failed,
+        },
+    )
+    .await;
+    assert!(format!("{:#}", refused.expect_err("test: a live publication is not closed")).contains("is live"));
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+    assert_eq!(active(&fx), before);
+}
+
+#[tokio::test]
+async fn the_cli_force_closes_a_stuck_proposal_that_is_not_live() {
+    use crate::ForceCloseArg;
+    use crate::SkillLifecycleCommands as Cmd;
+    let (fx, _svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-cli-force", NOT_LIVE).await;
+    let before = active(&fx);
+    // The reason is mandatory.
     let empty = cli(
         &fx,
         LifecycleMode::Auto,

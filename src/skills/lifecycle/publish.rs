@@ -293,6 +293,33 @@ impl SkillLifecycleStore {
         )
     }
 
+    /// Whether the publication `transaction` of `skill` is live: its entry is
+    /// (or, once a dead writer's PREPARED entry is reconciled by the same rule
+    /// recovery uses, becomes) COMMITTED, or the active binding carries it.
+    /// `false` for an ABORTED entry and for no entry. Read by the operator
+    /// repair path before it closes a proposal; takes the store and skill locks.
+    pub(super) fn publication_is_live(
+        &self,
+        skill: &SkillId,
+        transaction: &TransactionId,
+    ) -> Result<bool, LifecycleError> {
+        self.ensure_publication_dirs()?;
+        let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
+        let lock = self.lock_skill(skill, PUBLICATION_LOCK_TIMEOUT)?;
+        let Some(mut entry) = self.journal_entry(transaction)? else {
+            return Ok(false);
+        };
+        if entry.state == TransactionState::Prepared {
+            self.reconcile(&lock, &mut entry)?;
+        }
+        if entry.state == TransactionState::Committed {
+            return Ok(true);
+        }
+        Ok(self
+            .active_binding(skill)?
+            .is_some_and(|binding| &binding.transaction_id == transaction))
+    }
+
     /// Duplicate handling for a transaction id seen before. `None` means the
     /// id is new. Must run under the skill lock, so a PREPARED entry found
     /// here belongs to a dead writer and is reconciled first.

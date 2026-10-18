@@ -42,9 +42,20 @@ pub const STARTUP_BUSY_RETRY: BusyRetry = BusyRetry {
     base_delay: Duration::from_millis(250),
 };
 
-/// Builds the lifecycle service for an installation. `Ok(None)` when the
-/// lifecycle is disabled: nothing is built and no store is opened. The store
-/// is opened (and created) only when it is enabled.
+/// The services built so far, one per workspace and configuration, so every
+/// tool-registry build and the daemon hook of a process share one service.
+/// The key is the workspace plus the debug form of the section, so a different
+/// configuration (tests, a restart-free reload that was refused) never gets
+/// another one's service. Bounded by the handful of distinct keys a process has.
+type ServiceKey = (std::path::PathBuf, String);
+static SERVICES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<ServiceKey, Arc<SkillsLifecycleService>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Builds, or returns the process's shared, lifecycle service for an
+/// installation. `Ok(None)` when the lifecycle is disabled: nothing is built
+/// and no store is opened. The store is opened (and created) only when it is
+/// enabled.
 pub fn open_service(
     workspace_dir: &Path,
     config: &SkillsLifecycleConfig,
@@ -53,9 +64,16 @@ pub fn open_service(
     if !settings.enabled {
         return Ok(None);
     }
+    let key: ServiceKey = (workspace_dir.to_path_buf(), format!("{config:?}"));
+    if let Some(shared) = SERVICES.lock().get(&key) {
+        return Ok(Some(Arc::clone(shared)));
+    }
     let owner = config.owner()?.ok_or(SkillsLifecycleConfigError::OwnerScopeMissing)?;
     let store = SkillLifecycleStore::open(workspace_dir, owner)?;
-    Ok(Some(Arc::new(SkillsLifecycleService::new(Arc::new(store), settings)?)))
+    let service = Arc::new(SkillsLifecycleService::new(Arc::new(store), settings)?);
+    // A concurrent builder may have won; keep the first one.
+    let shared = Arc::clone(SERVICES.lock().entry(key).or_insert(service));
+    Ok(Some(shared))
 }
 
 /// Runs `call` again while it reports a store locked by another process
@@ -187,6 +205,12 @@ mod tests {
             .expect("test: a service");
         assert_eq!(service.owner_scope().as_str(), "owner:ws:cli:alice");
         assert!(store_exists(workspace.path()));
+
+        // The same installation gets the same service, not a reopened store.
+        let again = open_service(workspace.path(), &enabled_config())
+            .expect("test: enabled opens")
+            .expect("test: a service");
+        assert!(Arc::ptr_eq(&service, &again));
     }
 
     #[tokio::test]
@@ -203,6 +227,25 @@ mod tests {
         let status = service.status().expect("test: status");
         let startup = status.last_startup.expect("test: the startup summary is surfaced");
         assert_eq!(startup.skipped_total, 0);
+
+        // It is in the store, owner-only, so another process reads it too.
+        let store = SkillLifecycleStore::open(
+            workspace.path(),
+            crate::skills::lifecycle::OwnerScope::new("owner:ws:cli:alice").expect("test: owner"),
+        )
+        .expect("test: second handle");
+        let other =
+            SkillsLifecycleService::new(Arc::new(store), enabled_config().to_settings().expect("test: settings"))
+                .expect("test: second service");
+        assert_eq!(other.status().expect("test: status").last_startup, Some(startup));
+        let file = workspace.path().join("self/skill-lifecycle/status/last_startup.json");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file)
+            .expect("test: summary file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "the summary is owner-only: {mode:o}");
     }
 
     #[tokio::test]

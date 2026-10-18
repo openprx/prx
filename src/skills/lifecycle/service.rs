@@ -284,9 +284,11 @@ impl From<EvaluationError> for ServiceError {
 
 /// Most skipped proposals a [`StartupSummary`] lists; the rest are counted.
 const MAX_SUMMARY_SKIPPED: usize = 32;
+const STATUS_DIR: &str = "status";
+const STARTUP_SUMMARY_FILE: &str = "last_startup.json";
 
 /// A proposal startup recovery could not read or settle.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedProposal {
     pub proposal_id: String,
     pub reason: String,
@@ -294,7 +296,7 @@ pub struct SkippedProposal {
 
 /// The part of a [`StartupReport`] lifecycle status shows: what recovery
 /// settled and which proposals it had to skip.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupSummary {
     pub transactions_committed: usize,
     pub transactions_aborted: usize,
@@ -327,12 +329,6 @@ impl StartupSummary {
         }
     }
 }
-
-/// The last startup summary of this process per store root. A process-wide
-/// table, because the daemon runs recovery on one service handle and the
-/// agent tool and CLI report from others over the same store.
-static LAST_STARTUP: std::sync::LazyLock<parking_lot::Mutex<BTreeMap<std::path::PathBuf, StartupSummary>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
 
 /// What startup recovery did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -401,8 +397,8 @@ pub struct LifecycleStatus {
     pub proposals_by_status: BTreeMap<&'static str, usize>,
     pub unreadable_proposals: usize,
     pub limits: LifecycleLimits,
-    /// What the last startup recovery of this process did, `None` when none
-    /// ran in this process.
+    /// What the last startup recovery (of any process) did, `None` when none
+    /// ran or its record is unreadable.
     pub last_startup: Option<StartupSummary>,
 }
 
@@ -542,17 +538,59 @@ impl SkillsLifecycleService {
         for (proposal_id, reason) in &skipped {
             tracing::warn!(proposal_id = %proposal_id, reason = %reason, "startup recovery skipped a skill proposal");
         }
-        let report = StartupReport {
+        let mut report = StartupReport {
             recovery,
             finalized,
             skipped,
             interrupted,
             warnings,
         };
-        LAST_STARTUP
-            .lock()
-            .insert(self.store.root().to_path_buf(), StartupSummary::of(&report));
+        // Kept in the store so `status` from another process (the CLI) sees
+        // what the daemon's recovery skipped.
+        if let Err(error) = self.persist_startup_summary(&StartupSummary::of(&report)) {
+            tracing::warn!(%error, "could not record the startup recovery summary");
+            report
+                .warnings
+                .push(bounded(&format!("the startup summary was not recorded: {error}")));
+        }
         Ok(report)
+    }
+
+    fn startup_summary_path(&self) -> std::path::PathBuf {
+        self.store.root().join(STATUS_DIR).join(STARTUP_SUMMARY_FILE)
+    }
+
+    /// Writes the summary atomically with owner-only permissions.
+    fn persist_startup_summary(&self, summary: &StartupSummary) -> Result<(), LifecycleError> {
+        let path = self.startup_summary_path();
+        if let Some(dir) = path.parent() {
+            super::store::ensure_real_dir(dir, true)?;
+        }
+        let bytes = super::store::record_bytes(summary, &path)?;
+        let staging = SkillId::parse("startup-summary")?;
+        self.store.write_atomic(&staging, &path, &bytes)
+    }
+
+    /// The summary the last startup recovery of any process left in the
+    /// store; `None` when none ran or the record is unreadable (logged).
+    fn read_startup_summary(&self) -> Option<StartupSummary> {
+        let path = self.startup_summary_path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(%error, "could not look for the startup summary");
+                return None;
+            }
+        }
+        let read = super::store::check_private(&path).and_then(|()| super::store::read_record(&path));
+        match read {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                tracing::warn!(%error, "the startup summary is unreadable");
+                None
+            }
+        }
     }
 
     // ---- read-only ------------------------------------------------------------
@@ -572,7 +610,7 @@ impl SkillsLifecycleService {
             proposals_by_status,
             unreadable_proposals: unreadable.len(),
             limits: self.settings.limits,
-            last_startup: LAST_STARTUP.lock().get(self.store.root()).cloned(),
+            last_startup: self.read_startup_summary(),
         })
     }
 

@@ -510,8 +510,11 @@ impl SkillLifecycleStore {
     /// Closes a `PublicationAuthorized` proposal without publishing (see
     /// `SkillsLifecycleService::force_close`). The binding is never touched.
     /// A `TransactionConflict` while settling the publication is the case this
-    /// exists for and does not stop the close; a publication that settles as
-    /// committed does (the proposal is then recorded `Committed`).
+    /// exists for, but it closes only when the publication is provably not
+    /// live: the journal entry is aborted (or absent, or a PREPARED one that
+    /// reconciles to aborted) and the binding does not carry the transaction.
+    /// A publication that settles as committed, or that is live behind the
+    /// conflict, is refused.
     pub(in crate::skills) fn force_close_proposal(
         &self,
         id: &str,
@@ -542,10 +545,24 @@ impl SkillLifecycleStore {
             }
             Ok(Settlement::Aborted | Settlement::NotPublished) => {}
             Err(LifecycleError::TransactionConflict { transaction_id }) => {
+                // The conflict says nothing about the candidate. Read the
+                // journal entry and the binding: a live publication is never
+                // closed over, whatever its pin says.
+                let auth = proposal
+                    .authorization
+                    .as_ref()
+                    .ok_or_else(|| LifecycleError::ProposalRefused(format!("{id} carries no authorization record")))?;
+                let tx = publication_tx(&proposal.proposal_id, auth.attempt)?;
+                if self.publication_is_live(&proposal.skill_id, &tx)? {
+                    return Err(LifecycleError::ProposalRefused(format!(
+                        "the publication {transaction_id} of {id} is live (its journal entry is committed or the \
+                         active binding carries it); it was not closed. Roll back or repair the binding instead"
+                    )));
+                }
                 tracing::warn!(
                     proposal_id = %id,
                     transaction_id = %transaction_id,
-                    "force-closing a proposal stuck on a transaction conflict"
+                    "force-closing a proposal stuck on a transaction conflict whose publication is not live"
                 );
             }
             Err(error) => return Err(error),
