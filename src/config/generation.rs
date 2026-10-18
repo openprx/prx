@@ -1062,7 +1062,16 @@ fn adopt_live_pairing_tokens(active: &Config, desired: &Config, trigger: ConfigR
 pub(crate) fn is_process_restart_only(field: &str) -> bool {
     matches!(
         field,
-        "runtime" | "memory" | "storage" | "tunnel" | "gateway" | "modules" | "observability" | "mcp_server" | "a2a"
+        "runtime"
+            | "memory"
+            | "storage"
+            | "tunnel"
+            | "gateway"
+            | "modules"
+            | "observability"
+            | "mcp_server"
+            | "a2a"
+            | "skills_lifecycle"
     )
 }
 

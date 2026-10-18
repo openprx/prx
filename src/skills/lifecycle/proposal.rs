@@ -204,6 +204,8 @@ pub enum ProposalFailureKind {
     /// The attempt was in flight when the process died or an operator gave up
     /// on it; the model may have been called, so the liability is unknown.
     Interrupted,
+    /// An operator closed an authorized proposal that could not be published.
+    OperatorClosed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

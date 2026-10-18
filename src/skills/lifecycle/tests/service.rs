@@ -11,10 +11,10 @@ use super::evaluate::{
 use super::gate::{all_better, edit_proposal, mark_evaluated, policy, stage_draft};
 use crate::skills::lifecycle::publish::crash_hooks;
 use crate::skills::lifecycle::{
-    Bundle, BundleEntry, EvalSplit, EvaluationPin, FrozenSuite, GateError, LifecycleError, LifecycleMode, NewRevision,
-    ProposalFailureKind, ProposalStatus, PublicationAuthorization, ReviewCheck, ServiceError, SkillLifecycleStore,
-    SkillProposal, SkillsLifecycleService, SkillsLifecycleSettings, SourceKind, SuiteRegistry, TransactionId,
-    default_gate_policy,
+    Bundle, BundleEntry, EvalSplit, EvaluationPin, ForceClose, FrozenSuite, GateError, LifecycleError, LifecycleMode,
+    NewRevision, ProposalFailureKind, ProposalStatus, PublicationAuthorization, ReviewCheck, ServiceError,
+    SkillLifecycleStore, SkillProposal, SkillsLifecycleService, SkillsLifecycleSettings, SourceKind, SuiteRegistry,
+    TransactionId, default_gate_policy,
 };
 use chrono::Utc;
 use std::path::PathBuf;
@@ -60,6 +60,7 @@ fn service_with(
         mode,
         gate_policy: default_gate_policy(),
         suites: SuiteRegistry::new([(skill(), suite.digest().to_string())]).expect("test: registry"),
+        limits: crate::skills::lifecycle::LifecycleLimits::default(),
     };
     tweak(&mut settings);
     SkillsLifecycleService::new(Arc::new(store), settings).expect("test: service")
@@ -1116,4 +1117,360 @@ fn an_over_budget_edit_with_consistent_figures_fails_the_review() {
     assert!(bounded.detail.contains("are allowed"), "{}", bounded.detail);
     assert!(!bounded.detail.contains("disagree"), "{}", bounded.detail);
     assert_eq!(outcome.proposal.status, ProposalStatus::Failed);
+}
+
+// ---- operator repair: force close ----------------------------------------------------------
+
+/// An authorized proposal whose publication entry lost its pin: `publish` and
+/// `cancel` both stop on a transaction conflict and nothing else moves it.
+async fn stuck_on_a_transaction_conflict(
+    mode: LifecycleMode,
+    request: &str,
+) -> (Fixture, SkillsLifecycleService, String) {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, request, &bundle, "ANSWER=report-v2");
+    // Authorization needs publication to be possible; the mode under test is
+    // applied to a second service over the same store afterwards.
+    let publisher = service_over(&fx, LifecycleMode::Auto, &suite);
+    let id = draft.proposal_id.clone();
+    to_eligible(&publisher, &suite, &id).await;
+    crash_hooks::arm("publish_before_finalize");
+    assert!(publisher.publish(&id).is_err());
+    crash_hooks::disarm();
+    edit_journal(&journal_path(&fx, &id, 1), |entry| {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("authorization_digest");
+        }
+    });
+    let svc = service_over(&fx, mode, &suite);
+    (fx, svc, id)
+}
+
+#[tokio::test]
+async fn force_close_resolves_a_conflict_stuck_proposal_without_publishing() {
+    for (outcome, expected) in [
+        (ForceClose::Failed, ProposalStatus::Failed),
+        (ForceClose::Stale, ProposalStatus::Stale),
+    ] {
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force").await;
+        assert!(matches!(
+            svc.publish(&id),
+            Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
+        ));
+        assert!(
+            matches!(
+                svc.cancel(&id, "try"),
+                Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
+            ),
+            "the ordinary close is stuck too"
+        );
+        assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+        let binding_before = active(&fx);
+
+        let closed = svc
+            .force_close(&id, "  journal pin lost in a crash  ", outcome)
+            .expect("test: force close");
+        assert_eq!(closed.status, expected);
+        let failure = closed.failure.expect("test: the reason is recorded");
+        assert_eq!(failure.kind, ProposalFailureKind::OperatorClosed);
+        assert_eq!(failure.detail, "journal pin lost in a crash");
+        assert!(
+            closed
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("journal pin lost")
+        );
+        assert_eq!(stored(&fx, &id).status, expected);
+        assert_eq!(active(&fx), binding_before, "the binding is left as it was");
+
+        // It is closed for good: no publication, no second close.
+        assert!(svc.publish(&id).is_err());
+        assert!(matches!(
+            svc.force_close(&id, "again", outcome),
+            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+        ));
+        assert_eq!(active(&fx), binding_before);
+    }
+}
+
+#[tokio::test]
+async fn force_close_is_allowed_in_every_mode_but_not_when_disabled() {
+    for mode in [LifecycleMode::DraftOnly, LifecycleMode::Shadow] {
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(mode, "req-force-mode").await;
+        let closed = svc
+            .force_close(&id, "operator repair", ForceClose::Failed)
+            .expect("test: a close needs no publication mode");
+        assert_eq!(closed.status, ProposalStatus::Failed);
+        assert_eq!(stored(&fx, &id).status, ProposalStatus::Failed);
+    }
+    let (fx, _svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-off").await;
+    let suite = governing_suite();
+    let disabled = service_with(&fx, LifecycleMode::Auto, &suite, |settings| settings.enabled = false);
+    assert!(matches!(
+        disabled.force_close(&id, "x", ForceClose::Failed),
+        Err(ServiceError::Disabled)
+    ));
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+}
+
+#[tokio::test]
+async fn force_close_refuses_what_is_not_a_stuck_authorized_proposal() {
+    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-refuse").await;
+    // A reason is required.
+    for reason in ["", "   "] {
+        assert!(matches!(
+            svc.force_close(&id, reason, ForceClose::Failed),
+            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+        ));
+    }
+    assert!(matches!(
+        svc.force_close("prop-ffffffffffffffffffffffffffffffff", "x", ForceClose::Failed),
+        Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+    ));
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+
+    // A draft is not authorized: use cancel.
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-force-draft", &bundle, "ANSWER=report-v2");
+    let svc = service_over(&fx, LifecycleMode::Auto, &suite);
+    assert!(matches!(
+        svc.force_close(&draft.proposal_id, "x", ForceClose::Stale),
+        Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+    ));
+    assert_eq!(stored(&fx, &draft.proposal_id).status, ProposalStatus::Draft);
+}
+
+#[tokio::test]
+async fn force_close_never_discards_a_publication_that_is_live() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-force-live", &bundle, "ANSWER=report-v2");
+    let svc = service_over(&fx, LifecycleMode::Auto, &suite);
+    let id = &draft.proposal_id;
+    to_eligible(&svc, &suite, id).await;
+    crash_hooks::arm("publish_before_finalize");
+    assert!(svc.publish(id).is_err());
+    crash_hooks::disarm();
+    // The journal is intact: the publication went live before the crash.
+    let refused = svc.force_close(id, "operator", ForceClose::Failed);
+    assert!(
+        matches!(
+            refused,
+            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        stored(&fx, id).status,
+        ProposalStatus::Committed,
+        "recorded as published"
+    );
+}
+
+// ---- the operator CLI over the service -------------------------------------------------------
+
+/// Runs a CLI command against a service over the fixture's store in `mode`.
+async fn cli(fx: &Fixture, mode: LifecycleMode, command: crate::SkillLifecycleCommands) -> anyhow::Result<String> {
+    let service = service_over(fx, mode, &governing_suite());
+    crate::skills::lifecycle_cli::execute(command, Some(Arc::new(service)), &crate::config::Config::default()).await
+}
+
+#[tokio::test]
+async fn the_cli_never_publishes_in_draft_only_or_shadow() {
+    use crate::SkillLifecycleCommands as Cmd;
+    for mode in [LifecycleMode::DraftOnly, LifecycleMode::Shadow] {
+        let (fx, bundle) = fixture_candidate_unwritten();
+        let suite = governing_suite();
+        let draft = stage_draft(&fx, "req-cli-mode", &bundle, "ANSWER=report-v2");
+        let id = draft.proposal_id.clone();
+        // An Auto service takes the proposal to Eligible; the CLI then runs
+        // under the mode being tested.
+        to_eligible(&service_over(&fx, LifecycleMode::Auto, &suite), &suite, &id).await;
+        let before = active(&fx);
+
+        let publish = cli(
+            &fx,
+            mode,
+            Cmd::Publish {
+                proposal_id: id.clone(),
+            },
+        )
+        .await;
+        let error = format!("{:#}", publish.expect_err("test: publication must be refused"));
+        assert!(error.contains("does not allow"), "{mode}: {error}");
+        let rollback = cli(
+            &fx,
+            mode,
+            Cmd::Rollback {
+                skill: skill().to_string(),
+                revision: before.0.to_string(),
+                expected_generation: before.1,
+            },
+        )
+        .await;
+        assert!(rollback.is_err(), "{mode}: rollback is a publication too");
+        assert_eq!(active(&fx), before, "{mode}: the binding did not move");
+        assert_eq!(stored(&fx, &id).status, ProposalStatus::Eligible, "{mode}");
+
+        // The read commands work in every mode.
+        let status = cli(&fx, mode, Cmd::Status).await.expect("test: status");
+        assert!(status.contains(&format!("mode: {mode}")), "{status}");
+        assert!(status.contains("Publication: blocked"), "{status}");
+        let list = cli(&fx, mode, Cmd::List { skill: None }).await.expect("test: list");
+        assert!(list.contains(&id) && list.contains("eligible"), "{list}");
+        let inspect = cli(
+            &fx,
+            mode,
+            Cmd::Inspect {
+                proposal_id: id.clone(),
+            },
+        )
+        .await
+        .expect("test: inspect");
+        assert!(inspect.contains(&id), "{inspect}");
+
+        // Cancel is allowed everywhere: it only closes.
+        let cancelled = cli(
+            &fx,
+            mode,
+            Cmd::Cancel {
+                proposal_id: id.clone(),
+                reason: Some("no longer wanted".into()),
+            },
+        )
+        .await
+        .expect("test: cancel");
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        assert_eq!(active(&fx), before);
+    }
+}
+
+#[tokio::test]
+async fn the_cli_publishes_through_the_service_in_auto_mode_and_can_roll_back() {
+    use crate::SkillLifecycleCommands as Cmd;
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-cli-auto", &bundle, "ANSWER=report-v2");
+    let id = draft.proposal_id.clone();
+    to_eligible(&service_over(&fx, LifecycleMode::Auto, &suite), &suite, &id).await;
+    let (baseline, generation) = active(&fx);
+
+    let published = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::Publish {
+            proposal_id: id.clone(),
+        },
+    )
+    .await
+    .expect("test: publish");
+    assert!(published.contains("Published proposal"), "{published}");
+    let (revision, new_generation) = active(&fx);
+    assert_ne!(revision, baseline);
+    assert_eq!(new_generation, generation + 1);
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::Committed);
+
+    // A stale expected generation is refused; the right one rolls back.
+    let stale = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::Rollback {
+            skill: skill().to_string(),
+            revision: baseline.to_string(),
+            expected_generation: generation,
+        },
+    )
+    .await;
+    assert!(stale.is_err());
+    let rolled = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::Rollback {
+            skill: skill().to_string(),
+            revision: baseline.to_string(),
+            expected_generation: new_generation,
+        },
+    )
+    .await
+    .expect("test: rollback");
+    assert!(rolled.contains("Rolled"), "{rolled}");
+    assert_eq!(active(&fx).0, baseline);
+}
+
+#[tokio::test]
+async fn the_cli_force_closes_a_stuck_proposal_and_status_surfaces_the_startup_skips() {
+    use crate::ForceCloseArg;
+    use crate::SkillLifecycleCommands as Cmd;
+    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-cli-force").await;
+    let before = active(&fx);
+
+    // Startup recovery skips the stuck proposal; status says so.
+    let report = svc.startup_recovery().expect("test: recovery");
+    assert!(report.skipped.iter().any(|(skipped, _)| skipped == &id), "{report:?}");
+    let status = cli(&fx, LifecycleMode::Auto, Cmd::Status).await.expect("test: status");
+    assert!(status.contains(&format!("skipped {id}")), "{status}");
+    assert!(status.contains("1 skipped"), "{status}");
+
+    // The reason is mandatory and the state must be an authorized one.
+    let empty = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::ForceClose {
+            proposal_id: id.clone(),
+            reason: " ".into(),
+            outcome: ForceCloseArg::Failed,
+        },
+    )
+    .await;
+    assert!(empty.is_err());
+    let closed = cli(
+        &fx,
+        LifecycleMode::Auto,
+        Cmd::ForceClose {
+            proposal_id: id.clone(),
+            reason: "pin lost in a crash".into(),
+            outcome: ForceCloseArg::Stale,
+        },
+    )
+    .await
+    .expect("test: force close");
+    assert!(closed.contains("force-closed as stale"), "{closed}");
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::Stale);
+    assert_eq!(active(&fx), before, "the binding is untouched");
+}
+
+#[tokio::test]
+async fn the_cli_of_a_disabled_lifecycle_opens_nothing_and_refuses_everything_but_status() {
+    use crate::SkillLifecycleCommands as Cmd;
+    let config = crate::config::Config::default();
+    let status = crate::skills::lifecycle_cli::execute(Cmd::Status, None, &config)
+        .await
+        .expect("test: status of a disabled lifecycle");
+    assert!(status.contains("disabled"), "{status}");
+    for command in [
+        Cmd::List { skill: None },
+        Cmd::Inspect {
+            proposal_id: "x".into(),
+        },
+        Cmd::Publish {
+            proposal_id: "x".into(),
+        },
+        Cmd::Cancel {
+            proposal_id: "x".into(),
+            reason: None,
+        },
+        Cmd::ForceClose {
+            proposal_id: "x".into(),
+            reason: "r".into(),
+            outcome: crate::ForceCloseArg::Failed,
+        },
+    ] {
+        let error = crate::skills::lifecycle_cli::execute(command, None, &config)
+            .await
+            .expect_err("test: a disabled lifecycle refuses");
+        assert!(error.to_string().contains("disabled"), "{error}");
+    }
 }

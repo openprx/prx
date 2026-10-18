@@ -344,6 +344,10 @@ pub struct Config {
     #[serde(default)]
     pub skill_rag: SkillRagConfig,
 
+    /// Skill lifecycle (`[skills_lifecycle]`), off by default.
+    #[serde(default)]
+    pub skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -5907,6 +5911,7 @@ impl Default for Config {
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             task_routing: TaskRoutingConfig::default(),
@@ -7486,6 +7491,9 @@ impl Config {
         // Chat's link to the daemon it borrows channels from.
         self.chat.validate()?;
 
+        // Operator-owned skill lifecycle policy: a weak policy is refused.
+        self.skills_lifecycle.validate()?;
+
         // A stdio MCP server's `working_dir` is absolute (D-095 N-4); whether
         // it exists is checked when a change sets it (the configuration
         // transaction), not at every load.
@@ -8333,6 +8341,7 @@ min_chars = 12
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -8898,6 +8907,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),

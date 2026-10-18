@@ -503,7 +503,7 @@ pub fn all_tools_with_runtime_ext_and_extensions(
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),
-        Arc::new(SkillsManageTool::new(
+        Arc::new(SkillsManageTool::from_config(
             workspace_dir.to_path_buf(),
             root_config.clone(),
             security.clone(),

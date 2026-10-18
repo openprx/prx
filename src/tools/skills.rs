@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::runtime::RuntimeAdapter;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
-use crate::security::policy::{ApprovalGrant, RUNTIME_APPROVAL_GRANT_ARG, ResourceRiskLevel, SideEffectGate};
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -457,7 +457,8 @@ pub(crate) const LIFECYCLE_MUTATING_ACTIONS: [&str; 3] =
 /// proposal, or spend on evaluation, and belong to the operator and the
 /// scheduler only.
 #[cfg(test)]
-pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 7] = [
+pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 8] = [
+    "force_close",
     "write_suite",
     "install_suite",
     "begin_evaluation",
@@ -483,6 +484,23 @@ impl SkillsManageTool {
             config,
             security,
             lifecycle: None,
+        }
+    }
+
+    /// Builds the tool for an installation: the lifecycle actions are attached
+    /// only when `[skills_lifecycle]` is enabled and its store opens. A
+    /// disabled lifecycle opens nothing and offers nothing; a lifecycle that
+    /// cannot start is logged and not offered.
+    pub fn from_config(workspace_dir: PathBuf, config: Config, security: Arc<SecurityPolicy>) -> Self {
+        let service = crate::skills::lifecycle_runtime::open_service(&workspace_dir, &config.skills_lifecycle);
+        let tool = Self::new(workspace_dir, config, security);
+        match service {
+            Ok(Some(service)) => tool.with_lifecycle(service),
+            Ok(None) => tool,
+            Err(error) => {
+                tracing::error!(%error, "skill lifecycle is enabled but could not start; its actions are not offered");
+                tool
+            }
         }
     }
 
@@ -605,10 +623,10 @@ impl SkillsManageTool {
         })
     }
 
+    /// The grant the runtime attached, with the trusted caller principal bound
+    /// from the trusted scope (a signed v2 grant is honoured only for it).
     fn approval_grant(args: &serde_json::Value) -> Option<ApprovalGrant> {
-        args.get(RUNTIME_APPROVAL_GRANT_ARG)
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
+        ApprovalGrant::from_runtime_args("skills_manage", args)
     }
 
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), ToolResult> {
@@ -627,8 +645,14 @@ impl SkillsManageTool {
         // replayed against another.
         let target = match action {
             "lifecycle_publish" | "lifecycle_cancel" => arg("proposal_id").map(str::to_string),
-            "lifecycle_rollback" => match (arg("skill_id"), arg("revision_id")) {
-                (Some(skill), Some(revision)) => Some(format!("{skill}:{revision}")),
+            // The expected generation is part of the bound operation, so a
+            // grant for one observed state cannot roll back another.
+            "lifecycle_rollback" => match (
+                arg("skill_id"),
+                arg("revision_id"),
+                args.get("expected_generation").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(skill), Some(revision), Some(generation)) => Some(format!("{skill}:{revision}:{generation}")),
                 _ => None,
             },
             _ => None,
@@ -643,10 +667,12 @@ impl SkillsManageTool {
             // explicit grant bound to its target in every autonomy level, also
             // under full autonomy where the gate would otherwise let it pass.
             let now = chrono::Utc::now().timestamp();
+            // Only a signed one-shot (v2) grant qualifies: it expires and can be
+            // spent once, which a v1 hash grant cannot.
             let granted = target.is_some()
-                && grant
-                    .as_ref()
-                    .is_some_and(|grant| grant.permits_resource_operation(self.name(), &operation, risk, now));
+                && grant.as_ref().is_some_and(|grant| {
+                    grant.v2.is_some() && grant.permits_resource_operation(self.name(), &operation, risk, now)
+                });
             if !granted {
                 return Err(ToolResult {
                     success: false,
@@ -654,6 +680,18 @@ impl SkillsManageTool {
                     error: Some(format!(
                         "{action} requires an explicit approval grant bound to its target ({operation})"
                     )),
+                });
+            }
+            // Under `supervised` the gate below spends the grant. Under `full`
+            // it lets the call through without looking at it, so spend it
+            // here: a grant authorizes one publication or rollback, once.
+            if self.security.autonomy == crate::security::AutonomyLevel::Full
+                && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
+            {
+                return Err(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{action} approval grant was already used (replay refused)")),
                 });
             }
         }
@@ -786,6 +824,20 @@ impl Tool for SkillsManageTool {
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
                 anyhow::bail!("Unsupported skills_manage action: {action}");
+            }
+            // The store belongs to one owner scope: a caller the runtime
+            // knows to be another owner does not reach it, and does not spend
+            // a grant trying.
+            if let (Some(service), Some(caller)) = (
+                self.lifecycle.as_ref(),
+                super::sessions_read_model::effective_run_owner(&args),
+            ) && caller != service.owner_scope().as_str()
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("the skill lifecycle store belongs to another owner scope".to_string()),
+                });
             }
             if let Err(result) = self.authorize(action, &args) {
                 return Ok(result);
@@ -1802,24 +1854,48 @@ mod tests {
         }
     }
 
+    /// A signed one-shot grant for `operation`, as the agent loop issues it.
     fn grant_for(operation: &str) -> serde_json::Value {
-        serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
-            "skills_manage",
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+        let risk = if operation.contains(":lifecycle_cancel:") {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::High
+        };
+        let grant = ApprovalGrantV2::issue_one_shot(
+            WitnessKeyring::global_for_tests(),
+            Subject {
+                agent_id: "prx:test:agent".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:ws:cli:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("session".to_string()),
+            },
+            IssuerAuthority::HumanReview,
             operation,
+            risk,
+        )
+        .unwrap();
+        serde_json::to_value(crate::security::policy::ApprovalGrant::from_verified_v2(
+            "skills_manage",
             "test",
-            None,
+            grant,
         ))
         .unwrap()
     }
 
-    fn with_grant(mut args: serde_json::Value, operation: &str) -> serde_json::Value {
+    /// Attaches `grant` and the trusted caller principal it is bound to.
+    fn attach_grant(mut args: serde_json::Value, grant: serde_json::Value) -> serde_json::Value {
         if let Some(object) = args.as_object_mut() {
-            object.insert(
-                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
-                grant_for(operation),
-            );
+            object.insert(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(), grant);
+            object.insert("_zc_scope_trusted".to_string(), json!(true));
+            object.insert("_zc_scope".to_string(), json!({"principal_id": "telegram:alice"}));
         }
         args
+    }
+
+    fn with_grant(args: serde_json::Value, operation: &str) -> serde_json::Value {
+        attach_grant(args, grant_for(operation))
     }
 
     const PROPOSAL: &str = "prop-00000000000000000000000000000000";
@@ -1832,7 +1908,7 @@ mod tests {
         use crate::security::AutonomyLevel;
         let revision = format!("r1-{}", "0".repeat(64));
         let rollback_args = json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 1});
-        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}");
+        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}:1");
         let publish_args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
         let cancel_args = json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL});
         for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
@@ -1871,7 +1947,16 @@ mod tests {
                 (&publish_args, "skills_manage:lifecycle_publish".to_string()),
                 (
                     &rollback_args,
-                    "skills_manage:lifecycle_rollback:release-notes:r1-other".to_string(),
+                    "skills_manage:lifecycle_rollback:release-notes:r1-other:1".to_string(),
+                ),
+                // The grant binds the generation the caller observed.
+                (
+                    &rollback_args,
+                    format!("skills_manage:lifecycle_rollback:release-notes:{revision}:2"),
+                ),
+                (
+                    &rollback_args,
+                    format!("skills_manage:lifecycle_rollback:release-notes:{revision}"),
                 ),
             ] {
                 let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
@@ -1948,6 +2033,250 @@ mod tests {
                 .contains("no such proposal"),
             "the bound grant must reach the service: {:?}",
             reached.error
+        );
+    }
+
+    /// What `grant_op_for_call` mints for `args`: the exact operation and
+    /// whether the grant is issued at high risk.
+    fn minted(args: &serde_json::Value) -> Option<(String, bool)> {
+        use crate::acl::approval_grant::RiskLevel;
+        use crate::security::approval_operation::{GrantOp, grant_op_for_call};
+        match grant_op_for_call("skills_manage", args)? {
+            GrantOp::ResourceExact(operation, risk) => Some((operation, risk == RiskLevel::High)),
+            GrantOp::Command(_) | GrantOp::ResourceGlob(..) => None,
+        }
+    }
+
+    fn supervised_tool(workspace: &Path, autonomy: crate::security::AutonomyLevel) -> SkillsManageTool {
+        lifecycle_tool_with(
+            workspace,
+            crate::skills::lifecycle::LifecycleMode::Shadow,
+            Arc::new(SecurityPolicy {
+                autonomy,
+                workspace_dir: workspace.to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+        )
+    }
+
+    /// The operation the runtime mints for a call is exactly the one the tool
+    /// checks: a grant for the minted operation gets the call to the service,
+    /// in both gated autonomy levels.
+    #[tokio::test]
+    async fn the_runtime_minted_operations_are_the_ones_the_tool_checks() {
+        use crate::security::AutonomyLevel;
+        let revision = format!("r1-{}", "0".repeat(64));
+        let cases = [
+            (
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                true,
+                "does not allow",
+            ),
+            (
+                json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL}),
+                false,
+                "no such proposal",
+            ),
+            (
+                json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 7}),
+                true,
+                "does not allow",
+            ),
+        ];
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let tool = supervised_tool(workspace.path(), autonomy);
+            for (args, high, reaches) in &cases {
+                let (operation, minted_high) = minted(args).expect("a lifecycle mutation gets a grant");
+                assert_eq!(minted_high, *high, "{operation}");
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result.error.as_deref().unwrap_or_default().contains(reaches),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+        }
+        let (rollback, _) = minted(&cases[2].0).unwrap();
+        assert_eq!(
+            rollback,
+            format!("skills_manage:lifecycle_rollback:release-notes:{revision}:7")
+        );
+        // Reads, incomplete mutations and the other actions get no grant.
+        for args in [
+            json!({"action": "lifecycle_status"}),
+            json!({"action": "lifecycle_list"}),
+            json!({"action": "lifecycle_inspect", "proposal_id": PROPOSAL}),
+            json!({"action": "lifecycle_publish"}),
+            json!({"action": "lifecycle_rollback", "skill_id": "a", "revision_id": "b"}),
+            json!({"action": "create", "name": "x"}),
+            json!({"action": "lifecycle_force_close", "proposal_id": PROPOSAL}),
+        ] {
+            assert!(minted(&args).is_none(), "{args}");
+        }
+    }
+
+    /// A rollback grant minted for one observed generation does not permit
+    /// another.
+    #[tokio::test]
+    async fn a_rollback_grant_is_bound_to_the_generation() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let revision = format!("r1-{}", "0".repeat(64));
+        let args_at = |generation: u64| json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": generation});
+        let (operation, _) = minted(&args_at(3)).unwrap();
+        let wrong = tool.execute(with_grant(args_at(4), &operation)).await.unwrap();
+        assert!(
+            wrong
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            wrong.error
+        );
+        let right = tool.execute(with_grant(args_at(3), &operation)).await.unwrap();
+        assert!(
+            right.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            right.error
+        );
+    }
+
+    /// A grant authorizes one publication or rollback: replaying it is refused
+    /// under supervised (the gate spends it) and under full (the tool does).
+    #[tokio::test]
+    async fn a_publication_grant_cannot_be_replayed_in_any_autonomy_level() {
+        use crate::security::AutonomyLevel;
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let tool = supervised_tool(workspace.path(), autonomy);
+            let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+            let (operation, _) = minted(&args).unwrap();
+            let grant = grant_for(&operation);
+
+            let first = tool.execute(attach_grant(args.clone(), grant.clone())).await.unwrap();
+            assert!(
+                first.error.as_deref().unwrap_or_default().contains("does not allow"),
+                "{autonomy:?}: the first use reaches the service: {:?}",
+                first.error
+            );
+            let replay = tool.execute(attach_grant(args.clone(), grant.clone())).await.unwrap();
+            assert!(!replay.success);
+            assert!(
+                replay.error.as_deref().unwrap_or_default().contains("replay"),
+                "{autonomy:?}: {:?}",
+                replay.error
+            );
+            assert!(
+                !replay.error.as_deref().unwrap_or_default().contains("does not allow"),
+                "{autonomy:?}: a replay must not reach the service"
+            );
+            // A fresh grant works again.
+            let fresh = tool.execute(with_grant(args, &operation)).await.unwrap();
+            assert!(fresh.error.as_deref().unwrap_or_default().contains("does not allow"));
+        }
+    }
+
+    /// Only a signed one-shot grant authorizes a publication or rollback: a v1
+    /// operation hash grant has no use budget and never expires.
+    #[tokio::test]
+    async fn a_hash_grant_does_not_authorize_a_publication() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let (operation, _) = minted(&args).unwrap();
+        let v1 = serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+            "skills_manage",
+            &operation,
+            "test",
+            None,
+        ))
+        .unwrap();
+        let result = tool.execute(attach_grant(args, v1)).await.unwrap();
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// A caller the runtime knows to be another owner never reaches the store,
+    /// and does not spend its grant trying.
+    #[tokio::test]
+    async fn another_owner_does_not_reach_the_lifecycle_store() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let foreign = |owner: &str| {
+            let mut args = with_grant(
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                &format!("skills_manage:lifecycle_publish:{PROPOSAL}"),
+            );
+            if let Some(object) = args.as_object_mut() {
+                object.insert(
+                    "_zc_scope".to_string(),
+                    json!({"principal_id": "telegram:alice", "owner_id": owner}),
+                );
+            }
+            args
+        };
+        let denied = tool.execute(foreign("owner:ws:cli:bob")).await.unwrap();
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another owner scope"),
+            "{:?}",
+            denied.error
+        );
+        let status = tool.execute(json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"owner_id": "owner:ws:cli:bob"}})).await.unwrap();
+        assert!(!status.success);
+        // The configured owner is served.
+        let served = tool.execute(foreign("owner:ws:cli:alice")).await.unwrap();
+        assert!(
+            served.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            served.error
+        );
+    }
+
+    /// A disabled lifecycle builds the tool without any lifecycle action and
+    /// opens no store.
+    #[test]
+    fn a_disabled_lifecycle_offers_nothing_and_opens_no_store() {
+        let workspace = TempDir::new().unwrap();
+        let tool = SkillsManageTool::from_config(
+            workspace.path().to_path_buf(),
+            test_config(workspace.path()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(tool.lifecycle.is_none());
+        assert!(
+            offered_actions(&tool)
+                .iter()
+                .all(|action| !action.starts_with("lifecycle_"))
+        );
+        assert!(!workspace.path().join("self").exists(), "no store was opened");
+
+        let mut config = test_config(workspace.path());
+        config.skills_lifecycle.enabled = true;
+        config.skills_lifecycle.owner_scope = Some("owner:ws:cli:alice".to_string());
+        let enabled = SkillsManageTool::from_config(
+            workspace.path().to_path_buf(),
+            config,
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(enabled.lifecycle.is_some());
+        assert!(
+            offered_actions(&enabled)
+                .iter()
+                .any(|action| action == "lifecycle_status")
         );
     }
 }

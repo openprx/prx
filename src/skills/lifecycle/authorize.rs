@@ -497,6 +497,77 @@ impl SkillLifecycleStore {
     }
 }
 
+/// How an operator closes a stuck authorized proposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForceClose {
+    /// The proposal ends `Failed`.
+    Failed,
+    /// The proposal ends `Stale`: the world moved on, a new proposal may follow.
+    Stale,
+}
+
+impl SkillLifecycleStore {
+    /// Closes a `PublicationAuthorized` proposal without publishing (see
+    /// `SkillsLifecycleService::force_close`). The binding is never touched.
+    /// A `TransactionConflict` while settling the publication is the case this
+    /// exists for and does not stop the close; a publication that settles as
+    /// committed does (the proposal is then recorded `Committed`).
+    pub(in crate::skills) fn force_close_proposal(
+        &self,
+        id: &str,
+        reason: &str,
+        outcome: ForceClose,
+    ) -> Result<SkillProposal, LifecycleError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(LifecycleError::ProposalRefused(
+                "a force-close needs a reason".to_string(),
+            ));
+        }
+        let lock = self.lock_proposals()?;
+        let mut proposal = self
+            .read_proposal_record(id)?
+            .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {id}")))?;
+        if proposal.status != ProposalStatus::PublicationAuthorized {
+            return Err(LifecycleError::ProposalRefused(format!(
+                "only a publication_authorized proposal can be force-closed; {id} is {}",
+                proposal.status.as_str()
+            )));
+        }
+        match self.settle_publication(&lock, &mut proposal) {
+            Ok(Settlement::Committed) => {
+                return Err(LifecycleError::ProposalRefused(format!(
+                    "the publication of {id} is live; it is recorded committed and was not closed"
+                )));
+            }
+            Ok(Settlement::Aborted | Settlement::NotPublished) => {}
+            Err(LifecycleError::TransactionConflict { transaction_id }) => {
+                tracing::warn!(
+                    proposal_id = %id,
+                    transaction_id = %transaction_id,
+                    "force-closing a proposal stuck on a transaction conflict"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        let (next, kind_note) = match outcome {
+            ForceClose::Failed => (ProposalStatus::Failed, "failed"),
+            ForceClose::Stale => (ProposalStatus::Stale, "stale"),
+        };
+        proposal.failure = Some(ProposalFailure {
+            kind: ProposalFailureKind::OperatorClosed,
+            detail: bounded(reason),
+        });
+        self.move_locked(
+            &lock,
+            &mut proposal,
+            next,
+            &format!("operator force-close ({kind_note}): {reason}"),
+        )?;
+        Ok(proposal)
+    }
+}
+
 /// What [`SkillLifecycleStore::finalize_published_proposals_lenient`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Finalization {

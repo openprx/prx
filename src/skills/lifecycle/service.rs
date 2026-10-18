@@ -20,7 +20,7 @@
 //! `DraftOnly`-like for publication (spec 8.2): [`SkillsLifecycleSettings::
 //! publication_block`] says why.
 
-use super::authorize::{Finalization, PublicationOutcome};
+use super::authorize::{Finalization, ForceClose, PublicationOutcome};
 use super::evaluate::{CaseExecutor, EvaluationError};
 use super::evaluator::{EvaluationRequest, RecordedEvaluation};
 use super::gate::{GateError, GateOutcome, GatePolicy, GateRequest};
@@ -91,6 +91,28 @@ pub const fn default_gate_policy() -> GatePolicy {
     }
 }
 
+/// Per-cycle limits from `[skills_lifecycle]`. They bound the work a proposing
+/// or evaluating cycle may start. The service reports them in its status; the
+/// proposal path will take them from here once it is wired (SL05 gate).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct LifecycleLimits {
+    pub max_concurrent_evaluations: u32,
+    pub max_proposals_per_cycle: u32,
+    pub max_edit_tokens: u64,
+    pub max_edit_fraction: f64,
+}
+
+impl Default for LifecycleLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_evaluations: 1,
+            max_proposals_per_cycle: 1,
+            max_edit_tokens: 300,
+            max_edit_fraction: 0.20,
+        }
+    }
+}
+
 /// Operator-owned map from a skill to the digest of the frozen suite that
 /// governs its proposals. It is built once from configuration; there is no way
 /// to add, change or remove an entry afterwards.
@@ -132,14 +154,15 @@ impl SuiteRegistry {
 }
 
 /// The operator's lifecycle settings. They belong to the service; no tool or
-/// model output can replace them. (The `[skills_lifecycle]` configuration
-/// section that builds them is SL09 part B.)
+/// model output can replace them. (`[skills_lifecycle]` builds them; see
+/// `config::skills_lifecycle`.)
 #[derive(Clone, Debug)]
 pub struct SkillsLifecycleSettings {
     pub enabled: bool,
     pub mode: LifecycleMode,
     pub gate_policy: GatePolicy,
     pub suites: SuiteRegistry,
+    pub limits: LifecycleLimits,
 }
 
 impl Default for SkillsLifecycleSettings {
@@ -150,6 +173,7 @@ impl Default for SkillsLifecycleSettings {
             mode: LifecycleMode::DraftOnly,
             gate_policy: default_gate_policy(),
             suites: SuiteRegistry::default(),
+            limits: LifecycleLimits::default(),
         }
     }
 }
@@ -258,6 +282,58 @@ impl From<EvaluationError> for ServiceError {
     }
 }
 
+/// Most skipped proposals a [`StartupSummary`] lists; the rest are counted.
+const MAX_SUMMARY_SKIPPED: usize = 32;
+
+/// A proposal startup recovery could not read or settle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SkippedProposal {
+    pub proposal_id: String,
+    pub reason: String,
+}
+
+/// The part of a [`StartupReport`] lifecycle status shows: what recovery
+/// settled and which proposals it had to skip.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StartupSummary {
+    pub transactions_committed: usize,
+    pub transactions_aborted: usize,
+    pub finalized_proposals: usize,
+    pub interrupted_proposals: usize,
+    pub skipped_total: usize,
+    /// The first skipped proposals (bounded); `skipped_total` counts all.
+    pub skipped: Vec<SkippedProposal>,
+    pub warnings: Vec<String>,
+}
+
+impl StartupSummary {
+    fn of(report: &StartupReport) -> Self {
+        Self {
+            transactions_committed: report.recovery.committed.len(),
+            transactions_aborted: report.recovery.aborted.len(),
+            finalized_proposals: report.finalized.len(),
+            interrupted_proposals: report.interrupted.len(),
+            skipped_total: report.skipped.len(),
+            skipped: report
+                .skipped
+                .iter()
+                .take(MAX_SUMMARY_SKIPPED)
+                .map(|(proposal_id, reason)| SkippedProposal {
+                    proposal_id: proposal_id.clone(),
+                    reason: bounded(reason),
+                })
+                .collect(),
+            warnings: report.warnings.iter().map(|w| bounded(w)).collect(),
+        }
+    }
+}
+
+/// The last startup summary of this process per store root. A process-wide
+/// table, because the daemon runs recovery on one service handle and the
+/// agent tool and CLI report from others over the same store.
+static LAST_STARTUP: std::sync::LazyLock<parking_lot::Mutex<BTreeMap<std::path::PathBuf, StartupSummary>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
+
 /// What startup recovery did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartupReport {
@@ -316,7 +392,7 @@ pub struct ReviewSummary {
 }
 
 /// Read-only status of the lifecycle.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LifecycleStatus {
     pub enabled: bool,
     pub mode: LifecycleMode,
@@ -324,6 +400,10 @@ pub struct LifecycleStatus {
     pub registered_suites: usize,
     pub proposals_by_status: BTreeMap<&'static str, usize>,
     pub unreadable_proposals: usize,
+    pub limits: LifecycleLimits,
+    /// What the last startup recovery of this process did, `None` when none
+    /// ran in this process.
+    pub last_startup: Option<StartupSummary>,
 }
 
 /// The policy owner. Cheap to share behind an `Arc`.
@@ -376,6 +456,12 @@ impl SkillsLifecycleService {
     #[must_use]
     pub const fn settings(&self) -> &SkillsLifecycleSettings {
         &self.settings
+    }
+
+    /// The owner scope whose store this service manages.
+    #[must_use]
+    pub fn owner_scope(&self) -> &super::types::OwnerScope {
+        self.store.owner_scope()
     }
 
     #[must_use]
@@ -453,13 +539,20 @@ impl SkillsLifecycleService {
                 Vec::new()
             }
         };
-        Ok(StartupReport {
+        for (proposal_id, reason) in &skipped {
+            tracing::warn!(proposal_id = %proposal_id, reason = %reason, "startup recovery skipped a skill proposal");
+        }
+        let report = StartupReport {
             recovery,
             finalized,
             skipped,
             interrupted,
             warnings,
-        })
+        };
+        LAST_STARTUP
+            .lock()
+            .insert(self.store.root().to_path_buf(), StartupSummary::of(&report));
+        Ok(report)
     }
 
     // ---- read-only ------------------------------------------------------------
@@ -478,6 +571,8 @@ impl SkillsLifecycleService {
             registered_suites: self.settings.suites.len(),
             proposals_by_status,
             unreadable_proposals: unreadable.len(),
+            limits: self.settings.limits,
+            last_startup: LAST_STARTUP.lock().get(self.store.root()).cloned(),
         })
     }
 
@@ -713,6 +808,22 @@ impl SkillsLifecycleService {
             target: target.clone(),
             expected_generation,
         })?)
+    }
+
+    /// Operator repair: closes a `PublicationAuthorized` proposal whose
+    /// publication cannot go on, in practice one stuck on a
+    /// `TransactionConflict` that `cancel` and `publish` both keep hitting.
+    /// The proposal ends `Failed` or `Stale` with the operator's reason on
+    /// record. The active binding is left exactly as it is and nothing is
+    /// published; a publication that turns out to be live is recorded as
+    /// committed and the close is refused.
+    ///
+    /// Operator-only: the CLI calls it, no agent tool action maps to it.
+    /// Allowed in every mode (it only closes), but not when the lifecycle is
+    /// disabled.
+    pub fn force_close(&self, id: &str, reason: &str, outcome: ForceClose) -> Result<SkillProposal, ServiceError> {
+        self.require_enabled()?;
+        Ok(self.store.force_close_proposal(id, reason, outcome)?)
     }
 
     /// Cancels a pre-commit proposal. Allowed in every mode: it only closes.
