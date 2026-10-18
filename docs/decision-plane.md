@@ -172,6 +172,13 @@ so handing reported usage to persistence cannot suspend behind another request.
 Metering and estimated-liability reconciliation share one held ledger lock and
 snapshot. The canonical cost row is synced before journal reconciliation;
 invalid journal state still retains the charge and fails cleanup closed.
+Already queued ordinary phase events persist in batches of at most 32. SQLite
+commits each batch once, isolating individual invalid events with savepoints;
+other backends retain ordered per-event results. At most two SQLite event batches
+write concurrently across workspaces; scalar and Applied writes, selected reads
+and accounting are outside this background gate. Observers remain immediate.
+Batches stop at Applied and drain markers, preserving their FIFO boundary;
+a storage failure still reports incomplete persistence for each affected event.
 A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
 or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.

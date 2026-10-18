@@ -64,18 +64,54 @@ impl DurableCausalEventSink {
         let deferral = Arc::new(deferral::PersistenceDeferral::default());
         let worker_deferral = Arc::clone(&deferral);
         handle.spawn(async move {
-            while let Some(item) = receiver.recv().await {
+            let mut pending = None;
+            loop {
+                let item = match pending.take() {
+                    Some(item) => item,
+                    None => match receiver.recv().await {
+                        Some(item) => item,
+                        None => break,
+                    },
+                };
                 match item {
                     QueueItem::Event(event) => {
                         worker_deferral.wait().await;
-                        let input =
-                            to_message_input(&event, &workspace_id, config_generation_id, &config_source_revision);
-                        if memory.append_message_event(input).await.is_err() {
-                            report_incomplete(
-                                worker_observer.as_ref(),
-                                event.lineage.clone(),
-                                IncompleteReason::StoreFailed,
-                            );
+                        let mut batch = vec![event];
+                        while batch.len() < crate::memory::traits::MESSAGE_EVENT_BATCH_LIMIT {
+                            match receiver.try_recv() {
+                                Ok(QueueItem::Event(event)) => batch.push(event),
+                                Ok(boundary) => {
+                                    pending = Some(boundary);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let inputs = batch
+                            .iter()
+                            .map(|event| {
+                                to_message_input(event, &workspace_id, config_generation_id, &config_source_revision)
+                            })
+                            .collect();
+                        let results = memory.append_message_events(inputs).await;
+                        if results.len() != batch.len() {
+                            for event in batch {
+                                report_incomplete(
+                                    worker_observer.as_ref(),
+                                    event.lineage.clone(),
+                                    IncompleteReason::StoreFailed,
+                                );
+                            }
+                            continue;
+                        }
+                        for (event, result) in batch.into_iter().zip(results) {
+                            if result.is_err() {
+                                report_incomplete(
+                                    worker_observer.as_ref(),
+                                    event.lineage.clone(),
+                                    IncompleteReason::StoreFailed,
+                                );
+                            }
                         }
                     }
                     QueueItem::Drain(reply) => {
