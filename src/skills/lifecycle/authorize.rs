@@ -514,7 +514,8 @@ impl SkillLifecycleStore {
     /// live: the journal entry is aborted (or absent, or a PREPARED one that
     /// reconciles to aborted) and the binding does not carry the transaction.
     /// A publication that settles as committed, or that is live behind the
-    /// conflict, is refused.
+    /// conflict, is not closed: the proposal is recorded `Committed` from the
+    /// journal entry (its transaction and generation) and returned.
     pub(in crate::skills) fn force_close_proposal(
         &self,
         id: &str,
@@ -538,11 +539,8 @@ impl SkillLifecycleStore {
             )));
         }
         match self.settle_publication(&lock, &mut proposal) {
-            Ok(Settlement::Committed) => {
-                return Err(LifecycleError::ProposalRefused(format!(
-                    "the publication of {id} is live; it is recorded committed and was not closed"
-                )));
-            }
+            // Settled as published: the proposal is Committed now.
+            Ok(Settlement::Committed) => return Ok(proposal),
             Ok(Settlement::Aborted | Settlement::NotPublished) => {}
             Err(LifecycleError::TransactionConflict { transaction_id }) => {
                 // The conflict says nothing about the candidate. Read the
@@ -553,11 +551,16 @@ impl SkillLifecycleStore {
                     .as_ref()
                     .ok_or_else(|| LifecycleError::ProposalRefused(format!("{id} carries no authorization record")))?;
                 let tx = publication_tx(&proposal.proposal_id, auth.attempt)?;
-                if self.publication_is_live(&proposal.skill_id, &tx)? {
-                    return Err(LifecycleError::ProposalRefused(format!(
-                        "the publication {transaction_id} of {id} is live (its journal entry is committed or the \
-                         active binding carries it); it was not closed. Roll back or repair the binding instead"
-                    )));
+                if let Some(entry) = self.live_publication(&proposal.skill_id, &tx)? {
+                    // The publication went live behind the conflict. Closing
+                    // the proposal would strand it, so record it as what it is.
+                    tracing::warn!(
+                        proposal_id = %id,
+                        transaction_id = %transaction_id,
+                        "force-close found the publication live; recording the proposal committed"
+                    );
+                    self.finish_commit(&lock, &mut proposal, &TransactionOutcome { entry, replayed: true })?;
+                    return Ok(proposal);
                 }
                 tracing::warn!(
                     proposal_id = %id,

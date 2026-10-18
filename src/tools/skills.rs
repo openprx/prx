@@ -858,16 +858,21 @@ impl Tool for SkillsManageTool {
             // caller whose owner is unknown, never reach it and do not spend
             // a grant trying.
             if let Some(service) = self.lifecycle.as_ref() {
+                let configured = service.owner_scope().as_str();
                 let refusal = match Self::lifecycle_caller_owner(&args) {
-                    Some(caller) if caller == service.owner_scope().as_str() => None,
-                    Some(_) => Some("the skill lifecycle store belongs to another owner scope"),
-                    None => Some("the skill lifecycle needs a caller with a known owner scope"),
+                    Some(caller) if caller == configured => None,
+                    Some(caller) => Some(format!(
+                        "the skill lifecycle store belongs to another owner scope (configured owner_scope: {configured}; this caller's owner id: {caller})"
+                    )),
+                    None => Some(format!(
+                        "the skill lifecycle needs a caller with a known owner scope (configured owner_scope: {configured}; the runtime could not derive one for this caller)"
+                    )),
                 };
                 if let Some(error) = refusal {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(error.to_string()),
+                        error: Some(error),
                     });
                 }
             }

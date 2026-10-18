@@ -12,7 +12,7 @@ use super::gate::{all_better, edit_proposal, mark_evaluated, policy, stage_draft
 use crate::skills::lifecycle::publish::crash_hooks;
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, EvalSplit, EvaluationPin, ForceClose, FrozenSuite, GateError, LifecycleError, LifecycleMode,
-    NewRevision, ProposalFailureKind, ProposalStatus, PublicationAuthorization, ReviewCheck, ServiceError,
+    NewRevision, ProposalFailureKind, ProposalStatus, PublicationAuthorization, ReviewCheck, ServiceError, SkillId,
     SkillLifecycleStore, SkillProposal, SkillsLifecycleService, SkillsLifecycleSettings, SourceKind, SuiteRegistry,
     TransactionId, default_gate_policy,
 };
@@ -1204,45 +1204,35 @@ async fn force_close_resolves_a_conflict_stuck_proposal_without_publishing() {
 }
 
 /// The conflict hides a publication that went live: the candidate is the
-/// active revision. Closing the proposal would strand it, so it is refused in
-/// every mode and for both outcomes, and nothing changes.
+/// active revision. Closing the proposal would strand it, so force-close
+/// records it Committed instead (from the journal entry), for both outcomes,
+/// and the binding does not change.
 #[tokio::test]
-async fn force_close_refuses_a_live_publication_behind_a_conflict() {
-    for outcome in [ForceClose::Failed, ForceClose::Stale] {
-        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-live-c", LIVE).await;
+async fn force_close_records_a_live_publication_behind_a_conflict_as_committed() {
+    for (outcome, request, crash) in [
+        (ForceClose::Failed, "req-force-live-c", LIVE),
+        (ForceClose::Stale, "req-force-live-s", LIVE),
+        // A PREPARED entry whose swap did happen is live too.
+        (ForceClose::Failed, "req-force-live-p", "after_binding"),
+    ] {
+        let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, request, crash).await;
         let live = active(&fx);
         assert_eq!(live.1, 2, "the candidate is the active revision");
         assert!(matches!(
             svc.publish(&id),
             Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
         ));
-        let refused = svc.force_close(&id, "operator", outcome);
-        assert!(
-            matches!(&refused, Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(reason))) if reason.contains("is live")),
-            "{refused:?}"
+        let closed = svc.force_close(&id, "operator", outcome).expect("test: recorded");
+        assert_eq!(closed.status, ProposalStatus::Committed, "{crash}");
+        let publication = closed.publication.expect("test: the publication is recorded");
+        assert_eq!(
+            (publication.generation, publication.revision_id),
+            (live.1, live.0.clone())
         );
-        assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+        assert!(closed.failure.is_none());
+        assert_eq!(stored(&fx, &id).status, ProposalStatus::Committed);
         assert_eq!(active(&fx), live);
     }
-}
-
-/// A PREPARED entry whose swap did happen (crash right after the binding) is
-/// live too, though its state still reads prepared.
-#[tokio::test]
-async fn force_close_refuses_a_prepared_entry_whose_binding_swap_happened() {
-    let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-force-live-p", "after_binding").await;
-    let live = active(&fx);
-    assert_eq!(live.1, 2);
-    let refused = svc.force_close(&id, "operator", ForceClose::Failed);
-    assert!(
-        matches!(
-            &refused,
-            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
-        ),
-        "{refused:?}"
-    );
-    assert_eq!(active(&fx), live);
-    assert_ne!(stored(&fx, &id).status, ProposalStatus::Failed);
 }
 
 #[tokio::test]
@@ -1305,14 +1295,10 @@ async fn force_close_never_discards_a_publication_that_is_live() {
     assert!(svc.publish(id).is_err());
     crash_hooks::disarm();
     // The journal is intact: the publication went live before the crash.
-    let refused = svc.force_close(id, "operator", ForceClose::Failed);
-    assert!(
-        matches!(
-            refused,
-            Err(ServiceError::Lifecycle(LifecycleError::ProposalRefused(_)))
-        ),
-        "{refused:?}"
-    );
+    let recorded = svc
+        .force_close(id, "operator", ForceClose::Failed)
+        .expect("test: a live publication is recorded");
+    assert_eq!(recorded.status, ProposalStatus::Committed);
     assert_eq!(
         stored(&fx, id).status,
         ProposalStatus::Committed,
@@ -1451,7 +1437,7 @@ async fn the_cli_publishes_through_the_service_in_auto_mode_and_can_roll_back() 
 }
 
 #[tokio::test]
-async fn the_cli_status_surfaces_the_startup_skips_and_force_close_refuses_a_live_publication() {
+async fn the_cli_status_surfaces_the_startup_skips_and_force_close_records_a_live_publication() {
     use crate::ForceCloseArg;
     use crate::SkillLifecycleCommands as Cmd;
     let (fx, svc, id) = stuck_on_a_transaction_conflict(LifecycleMode::Auto, "req-cli-live", LIVE).await;
@@ -1465,7 +1451,7 @@ async fn the_cli_status_surfaces_the_startup_skips_and_force_close_refuses_a_liv
     assert!(status.contains(&format!("skipped {id}")), "{status}");
     assert!(status.contains("1 skipped"), "{status}");
 
-    let refused = cli(
+    let recorded = cli(
         &fx,
         LifecycleMode::Auto,
         Cmd::ForceClose {
@@ -1474,9 +1460,11 @@ async fn the_cli_status_surfaces_the_startup_skips_and_force_close_refuses_a_liv
             outcome: ForceCloseArg::Failed,
         },
     )
-    .await;
-    assert!(format!("{:#}", refused.expect_err("test: a live publication is not closed")).contains("is live"));
-    assert_eq!(stored(&fx, &id).status, ProposalStatus::PublicationAuthorized);
+    .await
+    .expect("test: a live publication is recorded");
+    assert!(recorded.contains("already published; recorded Committed"), "{recorded}");
+    assert_eq!(stored(&fx, &id).status, ProposalStatus::Committed);
+    assert!(status.contains(&format!("owner scope: {OWNER_FOR_TESTS}")), "{status}");
     assert_eq!(active(&fx), before);
 }
 
@@ -1545,4 +1533,25 @@ async fn the_cli_of_a_disabled_lifecycle_opens_nothing_and_refuses_everything_bu
             .expect_err("test: a disabled lifecycle refuses");
         assert!(error.to_string().contains("disabled"), "{error}");
     }
+}
+
+/// The startup summary is staged under a reserved id, so a real skill named
+/// like the old staging id neither collides with it nor is disturbed by it.
+#[tokio::test]
+async fn the_startup_summary_does_not_collide_with_a_skill_named_startup_summary() {
+    assert!(SkillId::parse("startup-summary").is_ok(), "an ordinary skill id");
+    assert!(
+        SkillId::parse("_skill-status").is_err(),
+        "the reserved staging id cannot be a skill"
+    );
+    assert!(SkillId::reserved("_skill-status").is_some());
+    let (fx, _) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let svc = service_over(&fx, LifecycleMode::Auto, &suite);
+    svc.startup_recovery().expect("test: recovery");
+    assert!(svc.status().expect("test: status").last_startup.is_some());
+    let leftovers = std::fs::read_dir(fx.store.root().join("staging"))
+        .expect("test: staging dir")
+        .count();
+    assert_eq!(leftovers, 0, "the staged summary was committed, not left behind");
 }

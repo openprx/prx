@@ -39,8 +39,9 @@ pub(crate) async fn execute(
         // Disabled: nothing was opened. Status says so; the rest refuses.
         if matches!(command, SkillLifecycleCommands::Status) {
             return Ok(format!(
-                "Skill lifecycle: disabled (configured mode: {:?}). Set [skills_lifecycle] enabled = true to use it.",
-                config.skills_lifecycle.mode
+                "Skill lifecycle: disabled (configured mode: {:?}, owner scope: {}). Set [skills_lifecycle] enabled = true to use it.",
+                config.skills_lifecycle.mode,
+                config.skills_lifecycle.owner_scope.as_deref().unwrap_or("not set")
             ));
         }
         bail!("the skill lifecycle is disabled; set [skills_lifecycle] enabled = true");
@@ -106,6 +107,12 @@ pub(crate) async fn execute(
                 ForceCloseArg::Stale => ForceClose::Stale,
             };
             let proposal = blocking(&service, move |s| s.force_close(&proposal_id, &reason, outcome)).await?;
+            if proposal.status == crate::skills::lifecycle::ProposalStatus::Committed {
+                return Ok(format!(
+                    "Proposal {} was already published; recorded Committed. The active binding was not changed.",
+                    proposal.proposal_id
+                ));
+            }
             Ok(format!(
                 "Proposal {} force-closed as {}. The active binding was not changed.",
                 proposal.proposal_id,
@@ -139,9 +146,10 @@ fn render_status(status: &LifecycleStatus) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Skill lifecycle: {} (mode: {})",
+        "Skill lifecycle: {} (mode: {}, owner scope: {})",
         if status.enabled { "enabled" } else { "disabled" },
-        status.mode
+        status.mode,
+        status.owner_scope
     );
     match &status.publication_block {
         Some(reason) => {

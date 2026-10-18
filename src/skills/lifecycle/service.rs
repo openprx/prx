@@ -285,6 +285,7 @@ impl From<EvaluationError> for ServiceError {
 /// Most skipped proposals a [`StartupSummary`] lists; the rest are counted.
 const MAX_SUMMARY_SKIPPED: usize = 32;
 const STATUS_DIR: &str = "status";
+const STATUS_LOCK_ID: &str = "_skill-status";
 const STARTUP_SUMMARY_FILE: &str = "last_startup.json";
 
 /// A proposal startup recovery could not read or settle.
@@ -392,6 +393,8 @@ pub struct ReviewSummary {
 pub struct LifecycleStatus {
     pub enabled: bool,
     pub mode: LifecycleMode,
+    /// The owner scope whose store this is (`[skills_lifecycle].owner_scope`).
+    pub owner_scope: String,
     pub publication_block: Option<String>,
     pub registered_suites: usize,
     pub proposals_by_status: BTreeMap<&'static str, usize>,
@@ -567,7 +570,8 @@ impl SkillsLifecycleService {
             super::store::ensure_real_dir(dir, true)?;
         }
         let bytes = super::store::record_bytes(summary, &path)?;
-        let staging = SkillId::parse("startup-summary")?;
+        // Staged under a reserved id, which no skill id can equal.
+        let staging = super::consolidate::reserved_lock(STATUS_LOCK_ID)?;
         self.store.write_atomic(&staging, &path, &bytes)
     }
 
@@ -605,6 +609,7 @@ impl SkillsLifecycleService {
         Ok(LifecycleStatus {
             enabled: self.settings.enabled,
             mode: self.settings.mode,
+            owner_scope: self.store.owner_scope().to_string(),
             publication_block: self.settings.publication_block(),
             registered_suites: self.settings.suites.len(),
             proposals_by_status,
@@ -853,8 +858,9 @@ impl SkillsLifecycleService {
     /// `TransactionConflict` that `cancel` and `publish` both keep hitting.
     /// The proposal ends `Failed` or `Stale` with the operator's reason on
     /// record. The active binding is left exactly as it is and nothing is
-    /// published; a publication that turns out to be live is recorded as
-    /// committed and the close is refused.
+    /// published. When the publication turns out to be live, the proposal is
+    /// not closed: it is recorded `Committed` from the journal entry and
+    /// returned as such, so it never stays authorized beside a live revision.
     ///
     /// Operator-only: the CLI calls it, no agent tool action maps to it.
     /// Allowed in every mode (it only closes), but not when the lifecycle is
