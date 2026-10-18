@@ -1217,7 +1217,8 @@ unknown or ineligible names fail before the provider turn starts. The exclusive
 wildcard form `allowed_tools = ["*"]` inherits the eligible parent tool surface
 within the admitted child authority. Nested delegation still requires its own
 selected capability, source binding and reduced-depth authority. An empty list
-never means “inherit all.”
+never means “inherit all.” Delegate task logs retain the parent tracing subscriber;
+provider endpoint userinfo remains redacted.
 
 In the current decision-plane candidate, every delegate model turn requires an
 admitted parent source, including when the decision plane is disabled. Agent
