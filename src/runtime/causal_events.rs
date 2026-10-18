@@ -20,6 +20,8 @@ use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSou
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
+mod deferral;
+
 enum QueueItem {
     Event(Box<CausalEvent>),
     Applied {
@@ -40,6 +42,7 @@ pub(crate) struct DurableCausalEventSink {
     revision: String,
     observer: Arc<dyn CausalEventSink>,
     queue: mpsc::Sender<QueueItem>,
+    deferral: Arc<deferral::PersistenceDeferral>,
 }
 
 impl DurableCausalEventSink {
@@ -57,10 +60,13 @@ impl DurableCausalEventSink {
         let replay_workspace = workspace_id.clone();
         let replay_revision = config_source_revision.clone();
         let worker_observer = Arc::clone(&observer);
+        let deferral = Arc::new(deferral::PersistenceDeferral::default());
+        let worker_deferral = Arc::clone(&deferral);
         handle.spawn(async move {
             while let Some(item) = receiver.recv().await {
                 match item {
                     QueueItem::Event(event) => {
+                        worker_deferral.wait().await;
                         let input =
                             to_message_input(&event, &workspace_id, config_generation_id, &config_source_revision);
                         if memory.append_message_event(input).await.is_err() {
@@ -116,6 +122,7 @@ impl DurableCausalEventSink {
             }
         });
         Ok(Self {
+            deferral,
             observer,
             queue,
             memory: replay_memory,
@@ -123,6 +130,12 @@ impl DurableCausalEventSink {
             generation_id: config_generation_id,
             revision: replay_revision,
         })
+    }
+
+    /// Already-started I/O completes normally. New ordinary writes wait until
+    /// every guard drops; observers remain immediate and drain stays FIFO.
+    pub(super) fn defer_ordinary_persistence(&self) -> deferral::PersistenceGuard {
+        self.deferral.begin()
     }
 
     /// Wait at most until `deadline` for every event queued before this marker.

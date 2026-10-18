@@ -621,3 +621,15 @@ fn snapshot_digest_retains_every_v1_field_order_and_signed_zero_bit() {
         assert_eq!(super::snapshot_digest(&changed), expected);
     }
 }
+
+#[test]
+fn snapshot_digest_keeps_v1_bytes_at_batched_float_boundaries() {
+    for dimensions in [127, 128, 129, 255, 256, 257, 383, 384, 385, 2048] {
+        let read = snapshot_fixture(dimensions, 3);
+        assert_eq!(
+            super::snapshot_digest(&read),
+            scalar_snapshot_digest(&read),
+            "dimensions={dimensions}"
+        );
+    }
+}

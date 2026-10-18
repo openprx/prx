@@ -84,6 +84,14 @@ does not revive a retired row or add absent Router metadata.
 `router.cost_per_million_tokens` is a comparative ranking input, not a billing
 tariff; billing uses the separate catalog price or operator override.
 
+Before reading scoped history, the selected Router decision is committed and
+read back from SQLite in one writer operation. The returned row must pass the
+same owner, lineage and digest checks within the existing 100 ms history
+deadline; a queued write or an expired acknowledgement grants no read.
+Ordinary background phase-event writes wait until that hop finishes, including
+on cancellation. Observers remain immediate, queued events keep their order,
+and cleanup still drains them; the selected decision commit is never deferred.
+
 The `ollama/*` row exists only to seed the Router's conservative local fallback.
 It does not verify an arbitrary Ollama model, assign it a 32K context window, or
 deny its vision support. Exact release, discovery, or operator facts determine

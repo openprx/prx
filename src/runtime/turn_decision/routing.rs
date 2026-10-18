@@ -9,7 +9,7 @@ use super::{
     AgentDecisionError, AgentTurnKind, Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityRef, CapabilityTarget,
     CausalDecisionEngine, CausalEventKind, CausalState, Context, DecisionId, DecisionKey, DecisionRecordBuilder,
     DecisionScope, DecisionTokenReservation, DerivedState, DirectiveContext, DiscoveredRefs, EngineDecision,
-    EngineInputs, Enqueue, GateInputs, HopLineage, Instant, KeyDomain, Memory, NonZeroU8, ObservedState, ObservedStep,
+    EngineInputs, GateInputs, HopLineage, Instant, KeyDomain, Memory, NonZeroU8, ObservedState, ObservedStep,
     ObservedStepKind, ObservedStepStatus, PinnedCatalogRehearsal, RehearsalPorts, RequestLimits, Requirement,
     TrustedState, TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
     UnknownPolicy, directive_from_selection, effective_agent_exclusions,
@@ -248,22 +248,12 @@ impl TurnDecisionService {
                     "Router read recording expired before queue admission"
                 );
                 let writer = store.writer().context("Router decision writer unavailable")?;
-                ensure!(
-                    writer.record_chain(vec![record]) == Enqueue::Queued,
-                    "Router selected read record was dropped"
-                );
-                ensure!(
-                    writer.drain(deadline).await,
-                    "Router selected read record drain is unconfirmed"
-                );
-                // Drain is only a FIFO acknowledgement; the writer can report
-                // an insert failure before it. Read the real owned row back.
-                let reader = store.reader();
-                let row = crate::runtime::ingress_recovery::owned_store_read(&owner, move || {
-                    Ok(reader.replay_record_until(&scope, &id, deadline)?)
-                })
-                .await?
-                .context("Router selected read is not durable")?;
+                // Commit and decode the real scoped row in one writer job;
+                // a FIFO drain alone would not prove insertion succeeded.
+                let row = writer
+                    .record_and_replay(record, scope, deadline)
+                    .await?
+                    .context("Router selected read is not durable")?;
                 ensure!(
                     row.digest == expected_digest
                         && row.decision.decision_id == id
@@ -402,6 +392,10 @@ impl TurnDecisionService {
             #[cfg(test)]
             after_prediction_pause: None,
         };
+        let _telemetry_deferral = self
+            .durable_events
+            .as_ref()
+            .map(|events| events.defer_ordinary_persistence());
         self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
         let prepared = CausalDecisionEngine::prepare_hop(&inputs)?;
         self.emit_agent_phase(
@@ -813,17 +807,14 @@ fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
             digest.update(text.as_bytes());
         }
         digest.update(&[u8::from(row.success)]);
-        // Preserve the v1 byte stream while amortizing SHA update overhead.
-        let mut bytes = [0_u8; 64];
-        let (chunks, remainder) = row.embedding.as_chunks::<16>();
-        for values in chunks {
+        // Preserve every v1 float bit while amortizing SHA update overhead.
+        // chunks(128) bounds encoded_len by this fixed 512-byte buffer.
+        let mut bytes = [0_u8; 512];
+        for values in row.embedding.chunks(128) {
             for (slot, value) in bytes.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
                 *slot = value.to_le_bytes();
             }
-            digest.update(&bytes);
-        }
-        for value in remainder {
-            digest.update(&value.to_le_bytes());
+            digest.update(bytes.split_at(values.len() * 4).0);
         }
     }
     let result = digest.finish();
