@@ -43,6 +43,8 @@ mod review;
 mod service;
 mod store;
 mod suite;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod types;
 
 #[cfg(test)]

@@ -23,9 +23,16 @@ pub(super) const PROPOSAL_TX_PREFIX: &str = "pub-";
 /// Transaction id prefix of legacy imports (migrate.rs).
 pub(super) const MIGRATION_TX_PREFIX: &str = "mig-";
 
+/// ASCII case-insensitive prefix test: `PUB-` must not slip past `pub-` and
+/// land on the same file on a case-insensitive file system.
+fn has_prefix(id: &str, prefix: &str) -> bool {
+    id.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 fn refuse_reserved(transaction: &TransactionId) -> Result<(), LifecycleError> {
     let id = transaction.as_str();
-    if id.starts_with(PROPOSAL_TX_PREFIX) || id.starts_with(MIGRATION_TX_PREFIX) {
+    if has_prefix(id, PROPOSAL_TX_PREFIX) || has_prefix(id, MIGRATION_TX_PREFIX) {
         return Err(LifecycleError::ReservedTransactionId {
             transaction_id: id.to_string(),
         });
@@ -171,16 +178,15 @@ impl SkillLifecycleStore {
     /// generation still equals `request.expected_generation`.
     ///
     /// This is the raw store-level transition: it applies no lifecycle mode,
-    /// gate policy or authorization. Production code outside `src/skills`
-    /// must go through `SkillsLifecycleService`; it is `pub(crate)` only
-    /// because test fixtures in other modules publish an operator revision
-    /// (an architecture test pins the allowed call sites). The transaction id
+    /// gate policy or authorization, so it is `pub(in crate::skills)`; code
+    /// elsewhere goes through `SkillsLifecycleService` (test fixtures use
+    /// `test_support`). The transaction id
     /// prefixes `pub-` (proposal publication) and `mig-` (legacy import) are
     /// reserved for their owners and refused here.
     ///
     /// Blocking: waits for locks and does file I/O; async callers must use
     /// `spawn_blocking`.
-    pub(crate) fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
+    pub(in crate::skills) fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
         refuse_reserved(&request.transaction_id)?;
         self.publish_inner(request, None)
     }

@@ -2459,10 +2459,7 @@ mod tests {
         crate::skills::lifecycle::SkillId,
         crate::skills::lifecycle::PinnedSkillRevision,
     ) {
-        use crate::skills::lifecycle::{
-            Bundle, BundleEntry, NewRevision, OwnerScope, PublishRequest, SkillId, SkillLifecycleStore, SourceKind,
-            TransactionId,
-        };
+        use crate::skills::lifecycle::{Bundle, BundleEntry, OwnerScope, SkillId, SkillLifecycleStore, SourceKind};
         let store = SkillLifecycleStore::open(workspace, OwnerScope::new(owner).unwrap()).unwrap();
         let skill = SkillId::parse("terminal-skill").unwrap();
         let bundle = Bundle::from_entries(vec![BundleEntry {
@@ -2471,19 +2468,7 @@ mod tests {
             executable: false,
         }])
         .unwrap();
-        let written = store
-            .write_revision(&NewRevision::new(skill.clone(), SourceKind::Operator), &bundle)
-            .unwrap();
-        store
-            .publish(&PublishRequest {
-                transaction_id: TransactionId::generate(),
-                skill_id: skill.clone(),
-                candidate: written.revision.revision_id,
-                candidate_record_digest: written.record_digest,
-                expected_generation: 0,
-                enabled: true,
-            })
-            .unwrap();
+        crate::skills::lifecycle::test_support::publish_revision(&store, &skill, SourceKind::Operator, &bundle, 0);
         let pin = store.pin_active(&skill).unwrap().unwrap();
         (store, skill, pin)
     }

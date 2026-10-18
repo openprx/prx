@@ -1461,8 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn skill_read_serves_lifecycle_revisions_pinned_per_task() {
         use crate::skills::lifecycle::{
-            Bundle, BundleEntry, NewRevision, OwnerScope, SkillId, SkillLifecycleStore, SourceKind, apply_migration,
-            plan_migration,
+            Bundle, BundleEntry, OwnerScope, SkillId, SkillLifecycleStore, SourceKind, apply_migration, plan_migration,
         };
         let temp = TempDir::new().unwrap();
         let skill_dir = temp.path().join("skills/demo");
@@ -1495,19 +1494,7 @@ mod tests {
             executable: false,
         }])
         .unwrap();
-        let written = store
-            .write_revision(&NewRevision::new(id.clone(), SourceKind::Learned), &bundle)
-            .unwrap();
-        store
-            .publish(&crate::skills::lifecycle::PublishRequest {
-                transaction_id: crate::skills::lifecycle::TransactionId::generate(),
-                skill_id: id.clone(),
-                candidate: bundle.revision_id().clone(),
-                candidate_record_digest: written.record_digest,
-                expected_generation: 1,
-                enabled: true,
-            })
-            .unwrap();
+        crate::skills::lifecycle::test_support::publish_revision(&store, &id, SourceKind::Learned, &bundle, 1);
 
         let same_task = read(scoped_args(owner, "task-tool-1", json!({"name": "demo"}))).await;
         assert!(

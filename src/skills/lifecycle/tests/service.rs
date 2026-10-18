@@ -881,7 +881,12 @@ fn edit_journal(path: &std::path::Path, edit: impl FnOnce(&mut serde_json::Value
 fn raw_publish_refuses_the_reserved_transaction_prefixes() {
     let (fx, _) = fixture_candidate_unwritten();
     let revision = write_revision(&fx.store, "ANSWER=other");
-    for id in ["pub-0123456789abcdef-1", "mig-0123456789abcdef"] {
+    for id in [
+        "pub-0123456789abcdef-1",
+        "mig-0123456789abcdef",
+        "PUB-0123456789abcdef-1",
+        "Mig-0123456789abcdef",
+    ] {
         let result = fx.store.publish(&crate::skills::lifecycle::PublishRequest {
             transaction_id: TransactionId::parse(id).expect("test: id"),
             skill_id: skill(),
@@ -1082,4 +1087,26 @@ fn a_changed_executable_or_tool_script_widens_capabilities() {
             "a changed script must widen capabilities"
         );
     }
+}
+
+#[test]
+fn an_over_budget_edit_with_consistent_figures_fails_the_review() {
+    let (fx, _) = fixture_candidate_unwritten();
+    // The record's figures are the true ones for this edit, so the only thing
+    // wrong is the size: far more changed text than the 20% budget allows.
+    let text = format!("ANSWER=report-v2 {}", "extra ".repeat(120));
+    let bundle = candidate_bundle(&text);
+    let draft = stage_draft(&fx, "req-over-budget", &bundle, &text);
+    let outcome = fx.store.review_source(&draft.proposal_id, "op").expect("test: review");
+    assert!(!outcome.record.passed);
+    let bounded = outcome
+        .record
+        .findings
+        .iter()
+        .find(|f| f.check == ReviewCheck::BoundedChanges)
+        .expect("test: finding");
+    assert!(!bounded.passed);
+    assert!(bounded.detail.contains("are allowed"), "{}", bounded.detail);
+    assert!(!bounded.detail.contains("disagree"), "{}", bounded.detail);
+    assert_eq!(outcome.proposal.status, ProposalStatus::Failed);
 }
