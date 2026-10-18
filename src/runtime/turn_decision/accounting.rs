@@ -1,5 +1,5 @@
 //! Bounded admission resources and deferred physical-send accounting.
-use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
+use super::{TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
 use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
 use crate::decision::{DecisionError, KeyDomain};
 use crate::runtime::causal_events::PersistenceGuard;
@@ -9,6 +9,8 @@ use std::{
     sync::{Arc, OnceLock},
     time::Instant,
 };
+
+pub(super) type AdmissionDecision = (Arc<TurnDecisionContext>, Option<PersistenceGuard>);
 
 pub(super) struct TurnAccounting<'a> {
     service: &'a TurnDecisionService,
@@ -20,6 +22,13 @@ pub(super) struct TurnAccounting<'a> {
 
 /// The telemetry guard belongs to admission, independently of the physical
 /// accounting scope that an issued context can retain after admission ends.
+pub(super) fn admission_persistence(service: &TurnDecisionService) -> Option<PersistenceGuard> {
+    service
+        .durable_events
+        .as_ref()
+        .map(|events| events.defer_ordinary_persistence())
+}
+
 pub(super) fn admission_resources<'a>(
     service: &'a TurnDecisionService,
     proof: &'a dyn TurnSourceProof,
@@ -28,10 +37,7 @@ pub(super) fn admission_resources<'a>(
 ) -> (TurnAccounting<'a>, Option<PersistenceGuard>) {
     (
         TurnAccounting::new(service, proof, budgets, deadline),
-        service
-            .durable_events
-            .as_ref()
-            .map(|events| events.defer_ordinary_persistence()),
+        admission_persistence(service),
     )
 }
 

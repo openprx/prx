@@ -1021,6 +1021,7 @@ enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
     VerifiedDecision(Box<acknowledged::VerifiedDecision>),
+    ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
     /// A v1 file's progress, saved only when every listed decision is
     /// stored (a record the writer failed to store is never marked done).
@@ -2665,6 +2666,7 @@ fn run_writer(mut thread: WriterThread) {
         match command {
             WriterMessage::DecisionBatch(records) => thread.write_decisions(&records),
             WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
+            WriterMessage::ReplayChain(read) => read.finish(&thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
             WriterMessage::Imported(progress, imported) => match all_stored(&thread.conn, &imported) {

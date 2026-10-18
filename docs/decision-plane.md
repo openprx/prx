@@ -172,6 +172,9 @@ so handing reported usage to persistence cannot suspend behind another request.
 Metering and estimated-liability reconciliation share one held ledger lock and
 snapshot. The canonical cost row is synced before journal reconciliation;
 invalid journal state still retains the charge and fails cleanup closed.
+Ordinary phase writes remain deferred through final issuance, including delegation
+storage validation. Delegation reads its committed chain in one bounded operation
+on the writer connection, retaining owner, lineage and replay-digest checks.
 Already queued ordinary phase events persist in batches of at most 32. SQLite
 commits each batch once, isolating individual invalid events with savepoints;
 other backends retain ordered per-event results. At most two SQLite event batches

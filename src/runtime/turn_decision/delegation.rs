@@ -37,13 +37,8 @@ impl TurnDecisionService {
             Instant::now() < deadline,
             "delegation persistence exceeded the decision deadline"
         );
-        let settlement = self.settlement_ref(Arc::clone(&context))?;
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            settlement.validate_durable_chain(),
-        )
-        .await
-        .context("delegation persistence exceeded the decision deadline")??;
+        // Preserve the issued-context authority checks before reading storage.
+        let _settlement = self.settlement_ref(Arc::clone(&context))?;
         let workspace = self.store.workspace_id().context("parent decision store missing")?;
         let trusted = context.engine.state.trusted.parts();
         let scope = crate::causal_tree::store::DecisionScope::Owner {
@@ -56,17 +51,23 @@ impl TurnDecisionService {
             true,
             self.generation.effective.causal_tree.store.record_redacted_projection,
         )?;
-        let reader = self.store.reader();
-        for record in records {
+        let writer = self.store.writer().context("parent decision writer missing")?;
+        let rows = writer.replay_chain(scope, context.hop_ids().to_vec(), deadline).await?;
+        anyhow::ensure!(rows.len() == records.len(), "delegation chain readback count conflicts");
+        for (position, (record, stored)) in records.iter().zip(rows).enumerate() {
+            let stored = stored.context("delegation parent hop was not durably stored")?;
+            let view = &stored.decision;
             anyhow::ensure!(
-                Instant::now() < deadline,
-                "delegation readback exceeded the decision deadline"
-            );
-            let stored = reader
-                .replay_record(&scope, &record.decision_id)?
-                .context("delegation parent hop was not durably stored")?;
-            anyhow::ensure!(
-                stored.digest == record.replay_digest(&workspace)?,
+                view.enabled_snapshot
+                    && !view.legacy_v1
+                    && view.prior_decision_id
+                        == position.checked_sub(1).and_then(|n| context.hop_ids().get(n)).copied()
+                    && view.session_key.as_deref() == trusted.session_key.as_deref()
+                    && view.run_id.as_deref() == trusted.run_id.as_deref()
+                    && view.channel.is_none()
+                    && view.policy_version == trusted.policy_version.as_ref()
+                    && view.decision_id == record.decision_id
+                    && stored.digest == record.replay_digest(&workspace)?,
                 "stored delegation parent differs from the issued decision chain"
             );
         }
