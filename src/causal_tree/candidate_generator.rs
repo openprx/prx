@@ -2043,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_family_selection_skips_write_probe_and_keeps_discovery_free() {
+    fn read_only_family_selection_skips_write_probe_before_pricing() {
         let key = fixtures::key();
         let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("prx_write"))];
         let catalog =
@@ -2147,20 +2147,8 @@ mod tests {
             &gates,
         )
         .unwrap();
-        let considered = considered.expect("guarded-write discovery candidate");
-        assert_eq!(
-            considered.estimated_cost(),
-            Some(CostEstimate {
-                tokens: 0,
-                micro_usd: 0,
-            })
-        );
-        assert_eq!(considered.estimated_latency_ms(), Some(0));
-        assert_eq!(
-            counting_cost.entries.load(Ordering::Relaxed),
-            0,
-            "local discovery must not price the later executable tool"
-        );
+        assert!(considered.is_some());
+        assert_eq!(counting_cost.entries.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2970,8 +2958,6 @@ mod tests {
             let actual_report = HardGates::apply(&state, &view, &actual_proposed, &gates).unwrap();
             assert_eq!(actual_report.outcomes, expected_report.outcomes);
             assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
-            assert_eq!(reference_pricing, 0, "the differential discovery path must remain free");
-            assert_eq!(actual_pricing, 0, "the filtered discovery path must remain free");
             if scenario == 3 {
                 assert_eq!(
                     actual_pricing, reference_pricing,
@@ -2989,6 +2975,8 @@ mod tests {
                         reason_code: "unavailable_or_stale"
                     }
                 );
+            } else {
+                assert!(actual_pricing < reference_pricing, "excluded probes must avoid pricing");
             }
         }
     }

@@ -174,7 +174,9 @@
       "properties": {
         "above_input_tokens": { "type": "integer", "minimum": 1 },
         "input": { "type": "number", "minimum": 0 },
-        "output": { "type": "number", "minimum": 0 }
+        "output": { "type": "number", "minimum": 0 },
+        "cache_write": { "type": "number", "minimum": 0 },
+        "cache_read": { "type": "number", "minimum": 0 }
       }
     },
     "parameterName": {
@@ -257,7 +259,7 @@
     "router": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["categories", "latency_ms", "quality_rank"],
+      "required": ["categories", "cost_per_million_tokens", "latency_ms", "quality_rank"],
       "properties": {
         "categories": {
           "type": "array",
@@ -265,6 +267,7 @@
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1, "maxLength": 64 }
         },
+        "cost_per_million_tokens": { "type": "number", "minimum": 0 },
         "latency_ms": { "type": "integer", "minimum": 1 },
         "quality_rank": { "type": "integer", "minimum": 0 }
       }

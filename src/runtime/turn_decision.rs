@@ -194,6 +194,40 @@ pub(crate) struct TurnDecisionService {
     durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
+impl TurnDecisionService {
+    /// Bind runtime adapter ceilings to the provider catalog pinned by this
+    /// exact configuration generation.
+    pub(crate) fn effective_provider_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        adapter: crate::providers::ProviderCapabilities,
+    ) -> crate::providers::ProviderCapabilities {
+        self.provider_catalog
+            .effective_provider_capabilities(provider, model, adapter)
+    }
+
+    /// Resolve model limits against the provider catalog pinned to this
+    /// configuration generation. Runtime surfaces must not reconstruct a
+    /// release-only view after admission has already selected stronger
+    /// operator or discovery evidence.
+    pub(crate) fn effective_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::router::context::EffectiveCompactionConfig {
+        let config = &self.generation.effective;
+        crate::router::context::resolve_effective_compaction_config_with_catalog(
+            &config.agent.compaction,
+            provider,
+            model,
+            &config.router,
+            &config.model_routes,
+            &self.provider_catalog,
+        )
+    }
+}
+
 /// Read-only status of the exact generation attached to a runtime surface.
 /// The factory's configured slots are distinct from the catalog and store
 /// attachment. `backend.enabled` reports configuration, not remote admission;
@@ -918,22 +952,6 @@ fn direct_answer_refs(
     if !gates.model_can_call_tools {
         return BTreeSet::new();
     }
-    // A selected retrieval has already completed the only capability action
-    // authorized for this turn. The following Answer consumes that evidence;
-    // publishing the ordinary Direct surface here would reopen execution after
-    // the engine committed the terminal action. A completed discovery is
-    // different: its exact selected references are intentionally offered to
-    // the serving model for the bounded final hop below.
-    if selected_discovery_refs.is_empty()
-        && decision
-            .state
-            .observed
-            .completed_steps()
-            .iter()
-            .any(|step| step.kind() == ObservedStepKind::Retrieve && step.status() == ObservedStepStatus::Ok)
-    {
-        return BTreeSet::new();
-    }
     let trusted = decision.state.trusted.parts();
     catalog
         .iter_entries()
@@ -989,6 +1007,23 @@ fn direct_answer_refs(
             .then_some(reference)
         })
         .collect()
+}
+
+fn discovery_source_guards_clear(state: &CausalState) -> bool {
+    !state.trusted.parts().approval_pending
+        && !state
+            .derived
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.exact_mention)
+}
+
+fn discovery_can_answer(decision: &EngineDecision) -> bool {
+    discovery_source_guards_clear(&decision.state)
+        && decision
+            .prediction
+            .as_ref()
+            .is_none_or(crate::decision::factory::PredictionResult::served_attempt_succeeded)
 }
 
 impl TurnDecisionContext {
@@ -1196,7 +1231,7 @@ impl TurnDecisionContext {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
-                if !self.execution_closed.load(Ordering::Acquire) && Instant::now() < self.engine.deadline =>
+                if !self.execution_closed.load(Ordering::Acquire) =>
             {
                 Ok(TurnDisposition::Run)
             }
@@ -2806,15 +2841,7 @@ impl TurnDecisionService {
                     // must not turn the rejected decision into an answer.
                     // The discovered refs still pass the normal G1-G9 gates;
                     // this changes only the terminal fallback after the read.
-                    allow_terminal_answer = decision.prediction.as_ref().is_none_or(|prediction| {
-                        prediction.attempts.iter().all(|attempt| {
-                            matches!(
-                                attempt.outcome,
-                                crate::decision::factory::AttemptOutcome::Served
-                                    | crate::decision::factory::AttemptOutcome::Cached
-                            )
-                        })
-                    });
+                    allow_terminal_answer = discovery_can_answer(&decision);
                     discovery_change = Some((previous_refs, added_refs));
                     state = decision.state.clone();
                     let mut steps = state.observed.completed_steps().to_vec();
@@ -3102,13 +3129,7 @@ impl TurnDecisionService {
     ) -> Result<AgentDecisionBudget, AgentDecisionBudgetError> {
         let _model = self.resolve_agent_model(proof)?;
         let config = &self.generation.effective;
-        let effective = crate::router::resolve_effective_compaction_config(
-            &config.agent.compaction,
-            proof.provider_name(),
-            proof.model_name(),
-            &config.router,
-            &config.model_routes,
-        );
+        let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
         let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
         let reservation =
             DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
@@ -3476,6 +3497,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::causal_tree::decision_select::Selection;
     use crate::decision::backend::DecisionBackend;
     use crate::decision::builtin::BuiltinDecisionBackend;
     use crate::decision::factory::BackendSpec;
@@ -4166,6 +4188,8 @@ mod tests {
                 .expect("unshared returned context")
                 .engine
                 .deadline = Instant::now();
+            assert!(matches!(expired.disposition(), Ok(TurnDisposition::Run)));
+            let _ = expired.terminal_execution_trace();
             assert!(matches!(expired.disposition(), Err(DirectiveError::NotAdmitted)));
         }
     }
@@ -6097,7 +6121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_memory_service_rejects_foreign_turn_before_backend_read() {
+    async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_after_read() {
         use crate::causal_tree::branch::{
             ApprovalRequirement, CandidateSpec, CapabilityRef, CapabilityTarget, CausalActionKind, CausalCandidate,
             SideEffectClass,
@@ -6110,6 +6134,12 @@ mod tests {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .expect("verified retrieval fixture model"),
+        );
         let generation = crate::config::new_shared(config.clone()).pin();
         let provider_catalog = ProviderCatalogView::from_config(&config);
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
@@ -6129,12 +6159,14 @@ mod tests {
             ledger: Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("real fixture SQLite")),
             probe: Arc::clone(&memory),
         });
-        let registry: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(crate::tools::memory_search::MemorySearchTool::new(
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(crate::tools::memory_search::MemorySearchTool::new(
                 workspace.path().to_path_buf(),
                 Arc::clone(&ledger_memory),
                 false,
-            ))]);
+            )),
+            Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false)),
+        ]);
         let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
             Arc::clone(&registry),
             Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
@@ -6151,7 +6183,10 @@ mod tests {
                 registry,
                 execution,
                 catalog_sources: sources(&generation, &config),
-                surface_policy: SurfacePolicy::default(),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["file_read".to_owned()]),
+                    ..SurfacePolicy::default()
+                },
                 provider_catalog: &provider_catalog,
                 transports: &transports,
                 events: Arc::new(SilentEvents),
@@ -6323,7 +6358,7 @@ mod tests {
                 chat_type: "private",
                 model_ref: next.trusted.parts().resolved_model.as_ref(),
                 model_can_chat: true,
-                model_can_call_tools: false,
+                model_can_call_tools: true,
                 decision_endpoint_ready: true,
                 child_scope: None,
                 verified_approval_calls,
@@ -6380,12 +6415,28 @@ mod tests {
             ));
             assert!(terminal.prediction.is_none(), "local terminal makes no backend call");
 
+            let execution_refs = direct_answer_refs(&terminal, &view, &gates, &BTreeSet::new());
+            let file_read_ref = view
+                .entries()
+                .iter()
+                .find(|entry| entry.public_name == "file_read")
+                .map(|entry| CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                })
+                .expect("direct file-read reference");
+            assert!(
+                execution_refs.contains(&file_read_ref),
+                "a successful Retrieve must keep the Direct tool core for the serving model"
+            );
+
             let answer_context = TurnDecisionContext {
                 resume: None,
                 accounting: None,
                 owner_filesystem: None,
                 source_actor: (Arc::from("cli"), Arc::from("local-user")),
-                service_id: uuid::Uuid::nil(),
+                service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
                 execution_trace: std::sync::OnceLock::new(),
                 served_auxiliary: std::sync::OnceLock::new(),
@@ -6399,12 +6450,19 @@ mod tests {
                 engine: terminal,
                 directive: TurnExecutionDirective::AnswerDirectly,
                 main_compaction: config.agent.compaction.clone(),
-                execution_refs: BTreeSet::new(),
+                execution_refs,
                 selected_retrieved: observed.selected_artifacts.clone(),
                 selected_custom_memory_context: None,
                 #[cfg(feature = "llm-router")]
                 router_transition: None,
             };
+            let specs = service
+                .agent_execution_specs(&proof_a, &answer_context)
+                .expect("retrieval answer Direct specs");
+            assert!(
+                specs.specs.iter().any(|spec| spec.name == "file_read"),
+                "the production request after Retrieve must still publish the Direct file tool"
+            );
             assert!(matches!(answer_context.disposition(), Ok(TurnDisposition::Run)));
             assert_eq!(answer_context.retrieved().expect("live selected evidence").len(), 1);
             let close_spy = CloseSpy::default();
@@ -6747,6 +6805,45 @@ mod tests {
                 .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .expect("bounded builtin decision");
+            let discovery_decision = context
+                .audit_hops()
+                .find(|decision| {
+                    let candidate_id = match &decision.selection {
+                        Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => {
+                            candidate_id
+                        }
+                        _ => return false,
+                    };
+                    let CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+                        return false;
+                    };
+                    candidates.iter().any(|candidate| {
+                        candidate.candidate_id() == candidate_id && candidate.action() == CausalActionKind::Discover
+                    })
+                })
+                .expect("bounded path selected discovery");
+            assert!(discovery_source_guards_clear(&discovery_decision.state));
+
+            let mut pending_state = discovery_decision.state.clone();
+            let mut pending_trusted = pending_state.trusted.parts().clone();
+            pending_trusted.approval_pending = true;
+            pending_state.trusted = TrustedState::from_runtime(pending_trusted);
+            assert!(
+                !discovery_source_guards_clear(&pending_state),
+                "pending approval must block a terminal discovery answer"
+            );
+
+            let mut exact_state = discovery_decision.state.clone();
+            let mut derived = exact_state.derived.candidates().to_vec();
+            derived
+                .first_mut()
+                .expect("selected discovery carries derived candidates")
+                .exact_mention = true;
+            exact_state.derived = DerivedState::new(derived).expect("exact derived fixture state");
+            assert!(
+                !discovery_source_guards_clear(&exact_state),
+                "an exact capability mention must block a terminal discovery answer"
+            );
             assert!(
                 context.hop_ids().len() >= 2,
                 "selected discovery should lead to a dependent hop: {:?}; candidates={:?}; gates={:?}",

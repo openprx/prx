@@ -39,6 +39,12 @@ llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
 discovery. Kimi Code rejects model strings outside its three documented IDs
 because that endpoint can silently accept or remap a mistyped model.
 
+Catalog lifecycle controls new selections: active and deprecated chat rows are
+listed, with deprecated rows labeled with their replacement when one exists;
+retired rows stay hidden. Ollama Cloud has no live model-list endpoint, so an
+authenticated onboarding fallback uses the release rows and places `:cloud`
+models before local-only ids.
+
 ## Capability contracts
 
 - OpenAI-compatible providers support non-streaming and streaming text and
@@ -378,7 +384,11 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
   was shown.
 - **Hot reload.** The declarations are part of the configuration generation
   providers are rebuilt from, so an edited entry applies to providers built
-  after the reload, like every other provider setting.
+  after the reload, like every other provider setting. The long-lived channel
+  `image` tool resolves the provider and model catalog owned by the invoking
+  generation; `sessions_spawn` uses the child provider binding admitted for
+  that invocation. Provider, model, temperature, credential and capability
+  declarations therefore move together after a reload.
 - **Consequence of `no_root_combinators`.** Tools whose published contract uses
   a conditional or alternative root combinator are refused on that endpoint,
   and a request that includes any of them fails before transport, naming every
@@ -653,15 +663,110 @@ the root `api_key` and `api_url` are reused only for the configured default
 provider. A different provider resolves its route credential or active auth
 profile unless the named delegate supplies an explicit `api_key`.
 
-Static prices are recorded only when the provider publishes token prices for a
-stable model ID. Current Anthropic, OpenAI GPT-5.6, and documented Gemini 3.1
-prices are included. Kimi Code is subscription/quota billed, so PRX deliberately
-does not invent a per-token cost for `k3` or the `kimi-for-coding*` aliases.
-OpenRouter and proxy pricing remains dynamic.
+Static prices are recorded in the embedded release catalog only when the
+provider publishes token prices for a stable model ID. Kimi Code is
+subscription/quota billed, so PRX deliberately does not invent a per-token cost
+for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
+recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
+OpenRouter and proxy pricing remains dynamic except for exact release rows with
+a published price. The release values are checked against the providers'
+published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
+[xAI pricing](https://docs.x.ai/developers/pricing), and
+[Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat).
+An uncertain model-specific price is omitted instead of inferred from another
+generation. Router ranking cost is a separate catalog hint and is never used as
+the input/output billing tariff.
 
-When a selected model has no matching `cost.prices` entry, only `ollama` is
-treated as zero-cost. LM Studio, llama.cpp, vLLM, and custom loopback endpoints
-need an explicit `cost.prices` entry before PRX can produce a cost estimate.
+OpenAI tariff snapshot (2026-10-17), USD per million tokens:
+
+| Exact catalog model | Input | Cached input | Output | Published source |
+| --- | ---: | ---: | ---: | --- |
+| `gpt-4o` | 2.50 | 1.25 | 10.00 | [GPT-4o](https://developers.openai.com/api/docs/models/gpt-4o) |
+| `gpt-4o-mini` | 0.15 | 0.075 | 0.60 | [GPT-4o Mini](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
+| `gpt-5.2-codex` | 1.75 | 0.175 | 14.00 | [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
+| `gpt-5.6`, `gpt-5.6-sol` | 4.00 | 0.40 | 20.00 | [GPT-5.6 Sol and its alias](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `gpt-5.6-luna` | 0.20 | 0.02 | 1.20 | [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+| `gpt-5.6-terra` | 2.00 | 0.20 | 12.00 | [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
+| `o1-preview` | 15.00 | 7.50 | 60.00 | [o1 Preview](https://developers.openai.com/api/docs/models/o1-preview) |
+
+For the GPT-5.6 family, the cited pages price requests above 272,000 input
+tokens at twice the input/cached-input rate and 1.5 times the output rate for
+the whole request. Cache writes cost 1.25 times the applicable uncached input
+rate. The catalog records both tiers; these are not Router ranking costs.
+Sol's published promotional tariff runs at least through 2026-11-21, so a later
+release must recheck it rather than treating it as permanent.
+
+The same 2026-10-17 check pins Gemini 3.1 Flash-Lite text/image/video input,
+cached input and text output at 0.25/0.025/1.50. Gemini 3.1 Pro Preview uses
+2.00/0.20/12.00 through 200,000 input tokens and 4.00/0.40/18.00 above that
+threshold, as published in [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing).
+The token catalog does not represent explicit-cache hourly storage or search
+fees. Kimi K2.6 uses the published 0.95 cache-miss input, 0.16 cache-hit input
+and 4.00 output tariff; its cache-write field uses the miss rate, not an extra
+charge on top of input. The Kimi page's rendered table is also published in its
+[Markdown source](https://platform.kimi.ai/docs/pricing/chat.md).
+
+Gemini 1.5 Pro, Gemini 2.0 Flash, Kimi K2.5 and Grok 3 are left unpriced in this
+release: the fetched official pricing pages did not establish their exact
+current tariffs. Old rates and zero cached-input placeholders are not reused as
+proof. Exact operator price overrides still take precedence; release lifecycle
+eligibility is unchanged by removing an unverified tariff.
+The same rule applies to the older Claude 3 Haiku aliases and Claude 3.5
+Sonnet, whose exact rates were absent from the fetched current table. Direct
+Claude Sonnet 5 now matches its separately verified 2.00/10.00/2.50/0.20
+input/output/default-cache-write/cache-read row on the cited Anthropic page.
+OpenRouter Kimi K2.5 is also left unpriced: its model page and public model
+metadata returned different input rates, so neither the old Moonshot rate nor
+one arbitrarily selected provider rate is substituted. OpenRouter
+[Jev 1.13](https://openrouter.ai/typesafe/jev-1.13) publishes 0.042 input and
+zero output per million tokens; the catalog no longer invents an output charge.
+
+Automatic Router candidates require an active release row, explicit Router
+hints and a context limit, plus the same effective billing-tariff check used by
+onboarding. This includes verified upstream tariffs for supported OpenRouter
+IDs; a ranking hint alone never makes a row priced. The release includes active
+[Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
+and [Gemini 3.1 Pro Preview](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview)
+candidates with their published limits. Direct OpenAI
+tariffs remain available, but automatic hints wait for the catalog parameter
+wire mapping: the current adapter always sends temperature and cannot choose
+the required reasoning settings. GPT-5.2-Codex additionally supports Responses,
+not that adapter's Chat Completions endpoint. Pricing is not transport proof.
+`prx doctor` now reports when the actual registry expansion and provider filter
+leave no Router candidates, including a direct-OpenAI-only configuration; the
+diagnostic does not change the selected default or invent a fallback. Explicit
+`[[router.models]]` entries remain operator choices and use the same filter.
+For the default OpenRouter provider, [Claude Sonnet 5](https://openrouter.ai/anthropic/claude-sonnet-5)
+has a 1,000,000-token context and a separately published 2.00/10.00 input/output
+tariff. Its [public model metadata](https://openrouter.ai/api/v1/models) lists
+0.20 cached input and 2.50 default cache writes per million tokens. One-hour
+cache writes and regional endpoint uplifts are separate tariffs and need a
+matching operator override; they are not silently treated as the default rate.
+Router latency, cost ranking and initial quality values are project-owned
+selection hints, not provider performance guarantees or billing prices.
+
+OpenRouter `:free` variants settle at zero token cost unless an operator override
+is present. The deprecated `:online` variant stays unpriced because its
+separately billed web-search component is not representable by PRX's token-only
+catalog tariff; use an exact `[cost.prices]` override or migrate to OpenRouter's
+server web-search tool. The variant and its extra search pricing are documented
+by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-search).
+
+`[cost.prices]` is an operator-override table and wins over the release catalog.
+When neither source has a matching price, only `ollama` is treated as zero-cost.
+LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
+`cost.prices` entry before PRX can produce a cost estimate.
+
+The Router's built-in candidates are limited to active release rows with a
+published billing tariff. Retired or unpriced rows remain available only through
+an explicit operator route; they are never automatic candidates. Onboarding
+labels a selectable catalog row when its effective token tariff is unavailable.
+
+The catalog's `ollama/*` entry seeds only the Router's conservative local
+candidate. It does not assert vision, context-window, or verification facts for
+an arbitrary local model; exact discovery or `[[providers.models]]` declarations
+remain authoritative for those models.
 
 The canonical routing, usage, and cost settlement boundary is described in
 [provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).

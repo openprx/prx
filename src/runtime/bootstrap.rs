@@ -478,7 +478,7 @@ impl RuntimeBootstrap {
             let mem = memory
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("memory backend must be set before enabling router"))?;
-            let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+            let provider_name = crate::providers::selection::default_provider(&config);
             let (router_embedder, local_history) = match memory::create_configured_embedder(&config) {
                 memory::ConfiguredEmbedding::LocalHash(embedder) => (None, Some(embedder)),
                 memory::ConfiguredEmbedding::Other(embedder) => (Some(embedder), None),

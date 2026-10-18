@@ -52,6 +52,13 @@ A successful model-list request does not prove generation, tool execution,
 usage accounting or decision-endpoint behavior. Inspect the exact selected
 provider/model and operation before interpreting a capability result.
 
+Built-in defaults, prices, context windows, Router hints and model feature
+facts come from the embedded release catalog. TOML retains operator choices:
+`[cost.prices]`, `[[router.models]]`, agent compaction settings and
+`[[providers.models]]` override the corresponding release facts at their
+documented boundaries. A configuration rollback therefore restores choices;
+the binary rollback restores the embedded catalog revision.
+
 Provider add/update/remove, model declarations, defaults and routes use the
 management change flow. For example, `prx providers add <PROVIDER> --fallback`
 previews adding that provider to the fallback chain; `--yes` applies the plan.

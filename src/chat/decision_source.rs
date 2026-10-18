@@ -17,6 +17,18 @@ pub(super) struct ChatProviderBinding {
 }
 
 impl ChatProviderBinding {
+    pub(super) fn effective_compaction(&self) -> crate::router::context::EffectiveCompactionConfig {
+        let config = &self.generation.effective;
+        crate::router::context::resolve_effective_compaction_config_with_catalog(
+            &config.agent.compaction,
+            self.choice.provider_name(),
+            self.choice.model_name(),
+            &config.router,
+            &config.model_routes,
+            self.choice.catalog(),
+        )
+    }
+
     pub(super) async fn record_guarded(
         &self,
         fabric: crate::memory::MemoryFabric,
@@ -806,6 +818,16 @@ impl ChatTurnBinding {
 
     pub(super) fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
         self.decision.get().map(|decided| decided.context.main_compaction())
+    }
+
+    pub(super) fn effective_compaction(&self) -> anyhow::Result<crate::router::context::EffectiveCompactionConfig> {
+        let decided = self
+            .decision
+            .get()
+            .context("chat compaction requires an admitted decision")?;
+        Ok(decided
+            .service
+            .effective_compaction(self.choice.provider_name(), self.choice.model_name()))
     }
 
     /// Persist a fixed directive without inventing provider execution. The

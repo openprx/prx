@@ -1855,10 +1855,11 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
 }
 
 #[tokio::test]
-async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+async fn image_turn_is_gated_by_catalog_vision_input_before_provider_transport() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let provider = NonVisionProvider {
+    let provider = VisionProvider {
         calls: Arc::clone(&calls),
+        expected_user_text: None,
     };
 
     let mut history = vec![ChatMessage::user(
@@ -1868,9 +1869,15 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
     let observer = NoopObserver;
 
     let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("multimodal fixture memory"));
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
+        config,
         &history.last().expect("source input").content,
+        Arc::new(Vec::new()),
+        memory,
+        ("ollama", "codellama"),
     )
     .await;
     let err = run_turn(
@@ -1894,7 +1901,7 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         crate::agent::turn_request::TurnServices {
             provider: &provider,
             provider_name: "ollama",
-            model: "prx-local-model",
+            model: "codellama",
             temperature: 0.0,
             tools_registry: Arc::new(tools_registry),
             observer: &observer,
@@ -1914,10 +1921,10 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
     )
     .await
     .map(|(outcome, _trace)| outcome.into_text())
-    .expect_err("provider without vision support should fail");
+    .expect_err("catalog model without vision support should fail");
 
-    assert!(err.to_string().contains("provider_capability_error"));
-    assert!(err.to_string().contains("capability=vision"));
+    assert!(err.to_string().contains("provider_capability_error"), "{err:#}");
+    assert!(err.to_string().contains("capability=vision"), "{err:#}");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 

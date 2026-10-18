@@ -3,8 +3,8 @@
 use super::{md, owner};
 use crate::skills::lifecycle::NewRevision;
 use crate::skills::lifecycle::{
-    Bundle, MigrationAction, MigrationEntry, SkillId, SkillLifecycleStore, SourceKind, apply_migration, plan_migration,
-    read_managed_resource,
+    Bundle, Correlation, ManagedReadRequest, MigrationAction, MigrationEntry, SkillId, SkillLifecycleStore, SourceKind,
+    apply_migration, plan_migration, read_managed_resource,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -245,9 +245,18 @@ fn imported_skills_read_like_the_legacy_directory() {
         (None, "alpha/SKILL.md"),
         (Some("references/note.md"), "alpha/references/note.md"),
     ] {
-        let managed = read_managed_resource(tmp.path(), &owner(OWNER), "alpha", resource, None, 64 * 1024)
-            .expect("test: read")
-            .expect("test: managed");
+        let managed = read_managed_resource(&ManagedReadRequest {
+            workspace_dir: tmp.path(),
+            owner: &owner(OWNER),
+            skill_name: "alpha",
+            resource_path: resource,
+            task_id: None,
+            correlation: Correlation::default(),
+            pin_task: false,
+            max_bytes: 64 * 1024,
+        })
+        .expect("test: read")
+        .expect("test: managed");
         let expected = fs::read_to_string(tmp.path().join("skills").join(legacy)).expect("test: legacy");
         assert_eq!(managed.content, expected);
     }

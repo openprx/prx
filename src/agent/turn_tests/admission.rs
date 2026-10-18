@@ -123,6 +123,32 @@ impl AdmittedTurn {
         .await
     }
 
+    pub(crate) async fn with_enabled_builtin_model(
+        config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+    ) -> Self {
+        assert!(
+            config.causal_tree.enabled,
+            "enabled-builtin fixture requires causal tree"
+        );
+        Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            selection,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
     pub(crate) async fn with_channel(
         config: crate::config::Config,
         message: crate::channels::traits::ChannelMessage,
@@ -175,6 +201,37 @@ impl AdmittedTurn {
         .await
     }
 
+    /// Default builtin channel admission with a caller-owned durable backend.
+    /// This keeps the decision plane enabled so tests can prove that source
+    /// guards close a gated exact tool request instead of falling back to an
+    /// Answer surface.
+    pub(crate) async fn enabled_builtin_channel_with_memory(
+        config: crate::config::Config,
+        message: crate::channels::traits::ChannelMessage,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+    ) -> Self {
+        assert!(
+            config.causal_tree.enabled,
+            "builtin channel fixture requires causal tree"
+        );
+        let input = message.content.clone();
+        Self::build_mode(
+            config,
+            &input,
+            registry,
+            memory,
+            FixtureOrigin::Channel(Box::new(message)),
+            selection,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
     /// Ordinary-channel admission bound to a caller-owned generation. Reload
     /// tests use this to keep the execution envelope, child publication and
     /// provider resolver on the same immutable snapshot.
@@ -201,6 +258,7 @@ impl AdmittedTurn {
             None,
             None,
             Some(generation),
+            false,
         )
         .await
     }
@@ -231,7 +289,10 @@ impl AdmittedTurn {
         origin: FixtureOrigin,
         selection: (&str, &str),
     ) -> Self {
-        Self::build_mode(config, input, registry, memory, origin, selection, None, None, None).await
+        Self::build_mode(
+            config, input, registry, memory, origin, selection, None, None, None, false,
+        )
+        .await
     }
 
     /// Explicit engine-only Answer fixture; existing Off/Builtin helpers are unchanged.
@@ -262,6 +323,7 @@ impl AdmittedTurn {
             Some(false),
             None,
             None,
+            false,
         )
         .await
     }
@@ -291,6 +353,7 @@ impl AdmittedTurn {
             Some(true),
             None,
             None,
+            false,
         )
         .await;
         if admitted
@@ -350,6 +413,7 @@ impl AdmittedTurn {
             Some(capabilities.native_tool_calling),
             None,
             None,
+            false,
         )
         .await;
         if admitted
@@ -409,6 +473,7 @@ impl AdmittedTurn {
             Some(capabilities.native_tool_calling),
             None,
             None,
+            false,
         )
         .await
     }
@@ -443,6 +508,7 @@ impl AdmittedTurn {
                 Some(capabilities.native_tool_calling),
                 audit,
                 None,
+                false,
             )
             .await
         })
@@ -458,10 +524,11 @@ impl AdmittedTurn {
         configured_native_tools: Option<bool>,
         audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
         generation_override: Option<Arc<crate::config::ConfigGeneration>>,
+        keep_builtin_enabled: bool,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
-        if configured_native_tools.is_none() {
+        if configured_native_tools.is_none() && !keep_builtin_enabled {
             config.causal_tree.enabled = false;
         }
         if !config
@@ -568,15 +635,26 @@ impl AdmittedTurn {
         };
         let (proof, envelope): (Box<dyn TurnSourceProof>, _) = match origin {
             FixtureOrigin::Channel(message) | FixtureOrigin::OrdinaryControlledChannel(message) => {
-                let (proof, envelope) = crate::channels::decision_source::recorded_fixture_source(
-                    &generation,
-                    Arc::clone(&memory),
-                    &message,
-                    "prx_channel_parent",
-                    selection,
-                )
-                .await
-                .expect("actual recorded channel fixture source");
+                let source = if generation.effective.causal_tree.enabled {
+                    crate::channels::decision_source::recorded_enabled_fixture_source(
+                        &generation,
+                        Arc::clone(&memory),
+                        &message,
+                        "prx_channel_parent",
+                        selection,
+                    )
+                    .await
+                } else {
+                    crate::channels::decision_source::recorded_fixture_source(
+                        &generation,
+                        Arc::clone(&memory),
+                        &message,
+                        "prx_channel_parent",
+                        selection,
+                    )
+                    .await
+                };
+                let (proof, envelope) = source.expect("actual recorded channel fixture source");
                 (Box::new(proof), envelope)
             }
             FixtureOrigin::Cli { recorded } => {

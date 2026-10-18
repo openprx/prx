@@ -6,7 +6,6 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
-use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -92,8 +91,6 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
-    /// Model-aware compaction resolver inherited from root config.
-    compaction_resolver: Arc<CompactionResolver>,
     /// Shared memory fabric backend for normalized delegation events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -262,9 +259,6 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -294,9 +288,6 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -395,21 +386,6 @@ impl DelegateTool {
     pub const fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
-    }
-
-    /// Attach model-aware compaction resolution for agentic sub-agent loops.
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = Arc::new(resolver);
-        self
-    }
-
-    #[cfg(test)]
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach shared memory so delegate requests/results join the live fabric.
@@ -1002,7 +978,6 @@ struct DelegateLoopRequest<'a> {
 struct DelegateLoopResources {
     security: Arc<SecurityPolicy>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
-    compaction_resolver: Arc<CompactionResolver>,
 }
 
 struct DelegateTaskContext {
@@ -1011,6 +986,22 @@ struct DelegateTaskContext {
     // Drop the cleanup owner before its acknowledgement receiver, as before.
     loop_cleanup: crate::runtime::turn_cleanup::CleanupScope,
     cleanup_confirmed: tokio::sync::oneshot::Receiver<Result<(), String>>,
+}
+
+fn resolve_pinned_child_compaction(
+    config: &crate::config::Config,
+    provider: &str,
+    model: &str,
+) -> crate::router::context::EffectiveCompactionConfig {
+    let catalog = crate::providers::selection::catalog_for(config);
+    crate::router::context::resolve_effective_compaction_config_with_catalog(
+        &config.agent.compaction,
+        provider,
+        model,
+        &config.router,
+        &config.model_routes,
+        &catalog,
+    )
 }
 
 impl DelegateTaskContext {
@@ -1045,7 +1036,6 @@ impl DelegateTool {
         DelegateLoopResources {
             security: Arc::clone(&self.security),
             parent_tools: Arc::clone(&self.parent_tools),
-            compaction_resolver: Arc::clone(&self.compaction_resolver),
         }
     }
 
@@ -1177,14 +1167,6 @@ impl DelegateTool {
 }
 
 impl DelegateLoopResources {
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
-    }
-
     #[inline(never)]
     fn boxed_delegate_loop<'a>(
         &'a self,
@@ -1411,7 +1393,11 @@ impl DelegateLoopResources {
         let child_memory = child_event_fabric.memory();
         let envelope = &child_execution.envelope;
         let scope_ctx = ScopeContext::from_execution_context(&security, &child_execution, &envelope.session_key);
-        let resolved_compaction = self.resolve_child_compaction(effective_provider, effective_model);
+        let child_config = match &child_source.authority {
+            DelegateChildAuthority::Granted(grant) => &grant.generation().effective,
+            DelegateChildAuthority::Ordinary { publication, .. } => &publication.generation().effective,
+        };
+        let resolved_compaction = resolve_pinned_child_compaction(child_config, effective_provider, effective_model);
         tracing::debug!(
             agent = agent_name,
             provider = %resolved_compaction.shown_provider(),
@@ -2132,14 +2118,6 @@ mod tests {
         }
     }
 
-    fn compaction_resolver_with_models(
-        models: Vec<crate::config::RouterModelConfig>,
-    ) -> crate::router::CompactionResolver {
-        let mut router = crate::config::RouterConfig::default();
-        router.models = models;
-        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
-    }
-
     #[test]
     fn name_and_schema() {
         let tool = DelegateTool::new(sample_agents(), test_security());
@@ -2763,59 +2741,151 @@ mod tests {
         custom_userinfo: bool,
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
-        use futures::FutureExt as _;
-        let retained = tempfile::tempdir().expect("private decision evidence").keep();
+        let retained = tempfile::tempdir().expect("private decision evidence");
         let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
             .await
             .expect("owned compatible decision listener")
-            .retain_evidence_at(retained);
+            .retain_evidence_at(retained.path().to_path_buf());
         let endpoint = driver.endpoint().to_owned();
         driver
             .run_factory(true, move || async move {
-                let cleanup =
-                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
-                        .expect("delegate fixture cleanup owner");
-                let mut observed = None;
-                let drained = cleanup
-                    .run(boxed_delegate_observation(|| async {
-                        observed = Some(
-                            CONFIGURED_DELEGATE_ENDPOINT
-                                .scope(
-                                    endpoint,
-                                    std::panic::AssertUnwindSafe(boxed_delegate_observation(|| {
-                                        run_admitted_delegate_fixture(
-                                            allowed_tools,
-                                            parent_tools,
-                                            tool_name,
-                                            arguments,
-                                            provider_error,
-                                            custom_userinfo,
-                                            context,
-                                        )
-                                    }))
-                                    .catch_unwind(),
+                observe_owned_delegate_workspace(move |workspace| async move {
+                    CONFIGURED_DELEGATE_ENDPOINT
+                        .scope(
+                            endpoint,
+                            boxed_delegate_observation(|| {
+                                run_admitted_delegate_fixture(
+                                    workspace,
+                                    allowed_tools,
+                                    parent_tools,
+                                    tool_name,
+                                    arguments,
+                                    provider_error,
+                                    custom_userinfo,
+                                    context,
                                 )
-                                .await,
-                        );
-                        Ok(())
-                    }))
-                    .await;
-                match observed {
-                    Some(Err(panic)) => std::panic::resume_unwind(panic),
-                    Some(Ok(value)) => {
-                        drained.expect("delegate fixture writers drained");
-                        value
-                    }
-                    None => {
-                        drained.expect("delegate fixture cleanup entered");
-                        panic!("delegate fixture did not run")
-                    }
-                }
+                            }),
+                        )
+                        .await
+                })
+                .await
             })
             .await
     }
 
+    async fn observe_owned_delegate_workspace<T, F, Fut>(work: F) -> T
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        use futures::FutureExt as _;
+        // The work future is dropped before CleanupScope drains its writers.
+        // Its temporary files must therefore belong to this enclosing owner.
+        let workspace = tempfile::tempdir().expect("delegate fixture workspace");
+        #[cfg(unix)]
+        let workspace = super::delegate_diagnostic::workspace(workspace);
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("delegate fixture cleanup owner");
+        let mut observed = None;
+        let drained = cleanup
+            .run(boxed_delegate_observation(|| async {
+                observed = Some(
+                    std::panic::AssertUnwindSafe(boxed_delegate_observation(|| work(workspace.path().to_owned())))
+                        .catch_unwind()
+                        .await,
+                );
+                Ok(())
+            }))
+            .await;
+        if drained.is_err() {
+            // An unconfirmed writer may still be using this directory. Keep
+            // that failure's files, but never leak a confirmed workspace.
+            #[cfg(unix)]
+            if let super::delegate_diagnostic::Workspace::Temporary(directory) = workspace {
+                let _retained = directory.keep();
+            }
+            #[cfg(not(unix))]
+            let _retained = workspace.keep();
+            tracing::warn!("delegate fixture workspace retained after unconfirmed cleanup");
+        }
+        match observed {
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            Some(Ok(value)) => {
+                drained.expect("delegate fixture writers drained");
+                value
+            }
+            None => {
+                drained.expect("delegate fixture cleanup entered");
+                panic!("delegate fixture did not run")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_delegate_fixture_keeps_its_workspace_until_owned_writers_drain() {
+        use futures::FutureExt as _;
+        let (finished, observed_writer) = tokio::sync::oneshot::channel();
+        let result: Result<(), _> =
+            std::panic::AssertUnwindSafe(observe_owned_delegate_workspace(move |workspace| async move {
+                let owner = crate::runtime::turn_cleanup::current_tracker().expect("fixture cleanup owner");
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let ticket = owner.register(cancellation.clone()).expect("owned fixture writer");
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    let existed = workspace.is_dir();
+                    let written = tokio::fs::write(workspace.join("owned-drain-proof"), b"drained")
+                        .await
+                        .is_ok();
+                    finished
+                        .send((workspace, existed, written))
+                        .expect("fixture writer observation");
+                    ticket.finish(written);
+                });
+                panic!("controlled delegate fixture abort");
+            }))
+            .catch_unwind()
+            .await;
+        assert!(result.is_err(), "the original fixture panic must escape");
+        assert_eq!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|panic| panic.downcast_ref::<&str>())
+                .copied(),
+            Some("controlled delegate fixture abort"),
+            "cleanup must preserve the original panic rather than replace it"
+        );
+        let (workspace, existed, written) = observed_writer.await.expect("owned writer completed");
+        assert!(existed, "the real cleanup drain must retain the fixture workspace");
+        assert!(
+            written,
+            "the owned writer must finish before temporary-directory cleanup"
+        );
+        assert!(!workspace.exists(), "the confirmed fixture workspace must not leak");
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_delegate_fixture_keeps_its_workspace() {
+        use futures::FutureExt as _;
+        let (finished, observed_workspace) = tokio::sync::oneshot::channel();
+        let result: Result<(), _> =
+            std::panic::AssertUnwindSafe(observe_owned_delegate_workspace(move |workspace| async move {
+                let owner = crate::runtime::turn_cleanup::current_tracker().expect("fixture cleanup owner");
+                let ticket = owner
+                    .register(tokio_util::sync::CancellationToken::new())
+                    .expect("owned fixture writer");
+                ticket.finish(false);
+                finished.send(workspace).expect("fixture workspace observation");
+            }))
+            .catch_unwind()
+            .await;
+        assert!(result.is_err(), "unconfirmed cleanup must not be accepted");
+        let workspace = observed_workspace.await.expect("fixture work completed");
+        assert!(workspace.is_dir(), "unconfirmed writer files must be retained");
+    }
+
     async fn run_admitted_delegate_fixture(
+        workspace: std::path::PathBuf,
         allowed_tools: Vec<String>,
         parent_tools: Vec<Arc<dyn Tool>>,
         tool_name: &'static str,
@@ -2824,9 +2894,6 @@ mod tests {
         custom_userinfo: bool,
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
-        let workspace = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        let workspace = super::delegate_diagnostic::workspace(workspace);
         let requests = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
         let capture = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2875,8 +2942,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.path().to_owned();
-        config.config_path = workspace.path().join("config.toml");
+        config.workspace_dir = workspace.clone();
+        config.config_path = workspace.join("config.toml");
         config.api_url = Some(endpoint.clone());
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
@@ -2926,7 +2993,7 @@ mod tests {
         );
         let delegate = DelegateTool::new(
             config.agents.clone(),
-            Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path())),
+            Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace)),
         )
         .with_parent_tools(Arc::new(parent_tools));
         use futures::FutureExt as _;
@@ -3337,17 +3404,42 @@ mod tests {
 
     #[test]
     fn delegate_inline_model_override_drives_child_compaction_resolution() {
-        let tool = DelegateTool::new(single_agent("tester", "openrouter", "config-model"), test_security())
-            .with_compaction_resolver(compaction_resolver_with_models(vec![
-                router_model("openrouter", "config-model", 1_000_000),
-                router_model("openrouter", "inline-small", 200_000),
-            ]));
+        let mut config = crate::config::Config::default();
+        config.router.models = vec![
+            router_model("openrouter", "config-model", 1_000_000),
+            router_model("openrouter", "inline-small", 200_000),
+        ];
 
-        let resolved = tool.resolve_child_compaction("openrouter", "inline-small");
+        let resolved = resolve_pinned_child_compaction(&config, "openrouter", "inline-small");
 
         assert_eq!(resolved.config.max_context_tokens, 200_000);
         assert_eq!(resolved.selected_model, "inline-small");
         assert_ne!(resolved.config.max_context_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn delegate_child_compaction_uses_the_pinned_generation_catalog_after_reload() {
+        let mut startup = crate::config::Config::default();
+        startup.providers.models.push(
+            toml::from_str("provider = \"openrouter\"\nmodel = \"vendor/reload-model\"\ncontext_window = 200000\n")
+                .expect("test: startup declaration"),
+        );
+        let mut reloaded = startup.clone();
+        reloaded.providers.models.clear();
+        reloaded.providers.models.push(
+            toml::from_str("provider = \"openrouter\"\nmodel = \"vendor/reload-model\"\ncontext_window = 64000\n")
+                .expect("test: reloaded declaration"),
+        );
+
+        let before = resolve_pinned_child_compaction(&startup, "openrouter", "vendor/reload-model");
+        let after = resolve_pinned_child_compaction(&reloaded, "openrouter", "vendor/reload-model");
+
+        assert_eq!(before.config.max_context_tokens, 200_000);
+        assert_eq!(after.config.max_context_tokens, 64_000);
+        assert_eq!(
+            after.max_context_source,
+            crate::router::context::ContextWindowSource::Catalog
+        );
     }
 
     #[tokio::test]

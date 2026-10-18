@@ -19,7 +19,7 @@ use std::fmt;
 use crate::auth::profiles::{AuthProfilesData, AuthProfilesStore};
 use crate::config::credential_slots::CredentialSlot;
 use crate::config::{Config, DelegateAgentConfig, EmbeddingRouteConfig, ModelRouteConfig};
-use crate::providers::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId};
+use crate::providers::{ProviderId, default_provider_for_unset};
 
 /// A legacy inline credential slot in configuration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -243,7 +243,10 @@ impl<'a> ConfigCredentialSource<'a> {
         let config = self.config;
         Ok(match slot {
             LegacySlot::Root => Some((
-                config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET),
+                config
+                    .default_provider
+                    .as_deref()
+                    .unwrap_or_else(default_provider_for_unset),
                 CredentialMaterial::connection(
                     config.api_key.as_deref(),
                     config.api_url.as_deref(),

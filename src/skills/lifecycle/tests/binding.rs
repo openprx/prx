@@ -3,8 +3,8 @@
 use super::{activate, basic_entries, entry, md, owner};
 use crate::skills::lifecycle::binding::PinTable;
 use crate::skills::lifecycle::{
-    Bundle, BundleEntry, LifecycleError, NewRevision, OwnerScope, RevisionId, SkillId, SkillLifecycleStore, SourceKind,
-    read_managed_resource, release_task_pins, task_pin,
+    Bundle, BundleEntry, Correlation, LifecycleError, ManagedReadRequest, NewRevision, OwnerScope, RevisionId, SkillId,
+    SkillLifecycleStore, SourceKind, read_managed_resource, release_task_pins, task_pin,
 };
 use std::fs;
 use std::path::Path;
@@ -48,7 +48,16 @@ fn read(
     resource: Option<&str>,
     task: Option<&str>,
 ) -> Result<Option<crate::skills::lifecycle::ManagedSkillRead>, LifecycleError> {
-    read_managed_resource(workspace, &owner(who), name, resource, task, LIMIT)
+    read_managed_resource(&ManagedReadRequest {
+        workspace_dir: workspace,
+        owner: &owner(who),
+        skill_name: name,
+        resource_path: resource,
+        task_id: task,
+        correlation: Correlation::default(),
+        pin_task: task.is_some(),
+        max_bytes: LIMIT,
+    })
 }
 
 #[test]
@@ -219,7 +228,7 @@ fn a_full_pin_table_refuses_new_pins_and_never_evicts_live_ones() {
     let a = publish_rev(&store, &skill(), version("A"));
     activate(&store, &skill(), &a, 0, true);
     let who = owner(OWNER_A);
-    let table = PinTable::new(2);
+    let table = PinTable::new(2, std::time::Duration::from_secs(3600));
     let issue = || store.pin_active(&skill());
     for task in ["t1", "t2"] {
         table
@@ -299,14 +308,16 @@ fn managed_reads_refuse_instead_of_falling_back() {
         let err = read(tmp.path(), OWNER_A, "deploy helper", Some(bad), None).expect_err("test: bad resource");
         assert!(matches!(err, LifecycleError::ResourceUnavailable(_)), "{bad}: {err}");
     }
-    let err = read_managed_resource(
-        tmp.path(),
-        &owner(OWNER_A),
-        "deploy helper",
-        Some("references/guide.md"),
-        None,
-        3,
-    )
+    let err = read_managed_resource(&ManagedReadRequest {
+        workspace_dir: tmp.path(),
+        owner: &owner(OWNER_A),
+        skill_name: "deploy helper",
+        resource_path: Some("references/guide.md"),
+        task_id: None,
+        correlation: Correlation::default(),
+        pin_task: false,
+        max_bytes: 3,
+    })
     .expect_err("test: too large");
     assert!(matches!(err, LifecycleError::ResourceUnavailable(_)), "{err}");
 
@@ -427,6 +438,79 @@ fn stray_files_in_the_active_directory_do_not_break_listing() {
         store
             .find_binding_by_name("deploy helper")
             .expect("test: find")
+            .is_some()
+    );
+}
+
+#[test]
+fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
+    let (_tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A"));
+    activate(&store, &skill(), &a, 0, true);
+    let who = owner(OWNER_A);
+    let issue = || store.pin_active(&skill());
+
+    let short = PinTable::new(1, std::time::Duration::from_millis(5));
+    short
+        .pin(&who, "old", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    // Young pins are never reclaimed.
+    assert!(matches!(
+        short.pin(&who, "new", &skill(), issue).expect_err("test: full"),
+        LifecycleError::PinTableFull(1)
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(
+        short
+            .pin(&who, "new", &skill(), issue)
+            .expect("test: reclaimed")
+            .is_some()
+    );
+    assert!(
+        short.find_by_name(&who, "old", "deploy helper").is_none(),
+        "the orphan was reclaimed"
+    );
+
+    let long = PinTable::new(1, std::time::Duration::from_secs(3600));
+    long.pin(&who, "a", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(long.pin(&who, "b", &skill(), issue).is_err());
+}
+
+#[test]
+fn a_pin_that_is_still_read_is_never_reclaimed() {
+    let (_tmp, store) = setup();
+    let a = publish_rev(&store, &skill(), version("A"));
+    activate(&store, &skill(), &a, 0, true);
+    let who = owner(OWNER_A);
+    let issue = || store.pin_active(&skill());
+    let table = PinTable::new(1, std::time::Duration::from_millis(120));
+    table
+        .pin(&who, "reader", &skill(), issue)
+        .expect("test: pin")
+        .expect("test: pinned");
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Each read refreshes the last-access time.
+        assert!(
+            table
+                .pin(&who, "reader", &skill(), issue)
+                .expect("test: read")
+                .is_some()
+        );
+    }
+    assert!(
+        table.pin(&who, "other", &skill(), issue).is_err(),
+        "a pin read within the orphan age is live, however old it is"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        table
+            .pin(&who, "other", &skill(), issue)
+            .expect("test: reclaimed")
             .is_some()
     );
 }

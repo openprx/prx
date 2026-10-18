@@ -51,7 +51,7 @@ use self::knn::KnnStore;
 pub use self::scorer::RouterResult;
 #[cfg(feature = "llm-router")]
 use self::scorer::rank_models;
-pub use context::{CompactionResolver, resolve_effective_compaction_config};
+pub use context::resolve_effective_compaction_config;
 // RouterResult remains the scorer output; RouteDecision is the durable
 // timeline projection used by ingress/provider execution paths.
 
@@ -299,8 +299,7 @@ impl RouterEngine {
             history.admitted_embedder()?;
         }
         anyhow::ensure!(
-            !self.config.models.is_empty()
-                && self.config.models.len() <= 128
+            self.config.models.len() <= 128
                 && self.config.models.iter().all(|model| !model.provider.is_empty()
                     && model.provider.len() <= 512
                     && !model.model_id.is_empty()
@@ -1485,6 +1484,34 @@ mod tests {
 
         let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(output.contains("no reachable models"));
+        assert!(router.models.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_history_stays_available_when_no_reachable_models() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let mut config = router_config();
+        config.models = vec![RouterModelConfig {
+            model_id: "gpt-4.1".into(),
+            provider: "openai".into(),
+            cost_per_million_tokens: 1.0,
+            max_context: 128_000,
+            reserved_output_tokens: None,
+            latency_ms: 1_000,
+            categories: vec!["analysis".into()],
+            elo_rating: 1_000.0,
+        }];
+
+        let router = RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
+            .await
+            .unwrap()
+            .with_local_hash_history(Arc::new(crate::memory::embeddings::LocalHashEmbedding::new(
+                "prx-local-hash-v1",
+                384,
+            )))
+            .expect("an empty reachable candidate set falls back to the primary model");
+
+        assert!(router.has_history());
         assert!(router.models.read().is_empty());
     }
 

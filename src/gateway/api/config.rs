@@ -1547,7 +1547,13 @@ mod tests {
                 stored.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
             }
         }
-        assert!(stored.contains("schema_version = 1"), "{stored}");
+        assert!(
+            stored.contains(&format!(
+                "schema_version = {}",
+                crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+            )),
+            "{stored}"
+        );
         server.abort();
     }
 

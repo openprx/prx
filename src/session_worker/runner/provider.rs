@@ -173,7 +173,7 @@ pub(super) fn worker_spawn_tool(
     manifest: &WorkerManifest,
     config: &Config,
     credentials: &WorkerCredentials<'_>,
-    provider: Arc<dyn Provider>,
+    #[cfg(test)] provider: Arc<dyn Provider>,
     security: Arc<SecurityPolicy>,
     options: &crate::providers::ProviderRuntimeOptions,
     active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
@@ -193,6 +193,7 @@ pub(super) fn worker_spawn_tool(
         .map_or_else(|| manifest.model.clone(), |hint| format!("hint:{hint}"));
     let tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::new(WorkerChannel),
+        #[cfg(test)]
         provider,
         spawn_provider_name,
         spawn_model,
@@ -200,20 +201,13 @@ pub(super) fn worker_spawn_tool(
         security,
         manifest.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         credentials.spawn_fallback.map(str::to_string),
         options.clone(),
         config.sessions_spawn.clone(),
         active_runs,
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
     .with_cost_config(config.cost.clone())
-    .with_reliability(credentials.reliability.as_ref().clone())
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
     .with_model_catalog(crate::providers::selection::catalog_for(config))
     .with_hint_config(config)

@@ -48,6 +48,12 @@ struct Entry {
     skill_metadata: Option<crate::skills::SkillMetadata>,
     exposure: Exposure,
     availability: CapabilityAvailability,
+    #[serde(default = "process_worker_compatible_by_default")]
+    process_worker_compatible: bool,
+}
+
+const fn process_worker_compatible_by_default() -> bool {
+    true
 }
 
 impl CapabilityCatalog {
@@ -83,6 +89,7 @@ impl CapabilityCatalog {
                     skill_metadata: entry.skill_metadata.as_deref().cloned(),
                     exposure: entry.exposure.clone(),
                     availability: entry.availability.clone(),
+                    process_worker_compatible: entry.process_worker_compatible,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -183,6 +190,7 @@ impl CapabilityCatalog {
                     skill_metadata: entry.skill_metadata.map(Arc::new),
                     exposure: entry.exposure,
                     availability: entry.availability,
+                    process_worker_compatible: entry.process_worker_compatible,
                 },
                 &mut entries,
                 &mut names,

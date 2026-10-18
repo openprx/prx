@@ -238,6 +238,10 @@ max_history = 200
 # defaults are deliberately different numbers (900 vs 1800) so an operator
 # always sees the warning well before anything is killed.
 #
+# Completed serving-request preparation counts as progress (`request_prepared`).
+# The event follows actual compilation; merely starting an iteration does not
+# report a provider response or repeatedly refresh a pending request's window.
+#
 # Termination goes through the normal cancellation path and the runtime
 # registry's kill path, so child process groups are cleaned up (`killpg`) and
 # the event is recorded in the registry. The error says explicitly that the turn
@@ -978,7 +982,7 @@ of what the templates themselves produced, so `prx init` writes one next to
 
 Without the sidecar, ordinary template-default refresh treats existing values
 as explicit. The decision-plane migration has its own versioned contract:
-`schema_version = 1` with `enabled = false` remains explicitly disabled, even
+Schema 1 or current schema 2 with `enabled = false` remains explicitly disabled, even
 when the sidecar also records false. Recognized unversioned legacy-default
 signatures, including the old bare `enabled = false` template, are treated as
 unset by the existing loader migration. An unversioned false alongside modern
@@ -996,7 +1000,7 @@ The staged source default and full `prx init` template change together:
 
 ```toml
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = true
 ```
 
@@ -1014,7 +1018,7 @@ cap; the default change grants no provider or credential permission.
 | Unversioned bare `enabled = false` from the old template | Recognized legacy default becomes unset, then inherits true |
 | Unversioned false with legacy-only keys | Legacy classification removes the default false and migrates compatible settings |
 | Unversioned false alongside modern non-legacy settings | Explicit false remains false |
-| `schema_version = 1` and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |
+| Schema 1 or current schema 2 and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |
 | Explicit true | Remains true; backend and cost gates still apply |
 | Incompatible legacy value or conflicting old/new keys | Migration refuses; `init --force` must not install an enabled template as fallback |
 
@@ -1022,11 +1026,11 @@ The same loader migration handles the merged main file and supported managed
 fragments. Ordinary load normalizes in memory; saving or authorized regeneration
 writes canonical keys. `init --force` uses its existing consistent snapshot and
 revision-checked publication, and preserves recognized explicit disables before
-generic default refresh. The schema marker stays at 1; it is not a rollout date
+generic default refresh. The current schema marker is 2; it is not a rollout date
 or an expiry for development configurations. Existing policy-table serialization
 and explicit policy values are unchanged.
 
-To disable deliberately, retain `schema_version = 1` and set `enabled = false`
+To disable deliberately, retain the current schema version and set `enabled = false`
 through the existing management flow. Causal changes remain restart-required;
 the desired file revision and active runtime generation are separate. Preserve
 prior revisions, decision/source/terminal evidence, approval state and cost
@@ -1992,8 +1996,21 @@ backend's provider. The hosted services (`kind = "typesafe"` or
 `"openrouter"`) take only a `cred-` reference owned by the service
 (`decision:typesafe` or `openrouter`, never the root key), one exact
 `model` version, and for OpenRouter the exact dated snapshot it answers
-with in `pinned_snapshot` (for example `typesafe/jev-1.13-20260917` for
-`typesafe/jev-1.13`); any other answering model falls back to the builtin.
+with in `pinned_snapshot`; any other answering model falls back to the builtin.
+When a managed backend change selects a release-catalog decision model and
+omits the snapshot or timeout, the same transaction writes the catalog's pinned
+snapshot and recommended timeout. It also writes the catalog's recommended
+extra-latency budget when the policy still has its default value. Explicit
+command and policy values remain operator choices. Built-in decision-model
+pricing comes from the catalog; `[cost.prices]` is only an override.
+During migration, only schema-1's serialized 500 ms default becomes implicit.
+An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
+remains an explicit operator choice, as does 500 ms in schema 2. Loading an
+already-configured hosted backend does not raise its current ceiling: when it
+is below the model's catalog recommendation, configuration loading logs a
+warning, `prx causal status` shows it (also as `latency_budget_warning` in JSON),
+and `prx doctor` reports it. Set the policy explicitly to adopt a larger budget;
+the warning itself changes neither admission limits nor backend credentials.
 An `endpoint` replaces a hosted service's base URL, and the backend stays
 remote, so it is used only with `remote_enabled`. The hosted credential
 belongs to the service, not to the URL: re-pointing the override sends that

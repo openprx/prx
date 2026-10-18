@@ -746,6 +746,7 @@ async fn run_owned_manifest(
         &manifest,
         &config,
         &credentials,
+        #[cfg(test)]
         Arc::clone(&provider),
         Arc::clone(&security),
         &provider_runtime_options,
@@ -789,13 +790,17 @@ async fn run_owned_manifest(
         &config,
         Arc::clone(&security),
     )));
-    full_tools.push(Box::new(crate::tools::ImageTool::new(
-        Arc::clone(&provider),
-        &manifest.model,
-        manifest.temperature,
-        Arc::clone(&security),
-        config.multimodal.clone(),
-    )));
+    full_tools.push(Box::new(
+        crate::tools::ImageTool::new(
+            Arc::clone(&provider),
+            &manifest.model,
+            manifest.temperature,
+            Arc::clone(&security),
+            config.multimodal.clone(),
+        )
+        .with_provider_name(&manifest.provider_name)
+        .with_model_catalog(crate::providers::selection::catalog_for(&config)),
+    ));
     full_tools.push(Box::new(crate::tools::ConfigReloadTool::with_security(
         shared_config.clone(),
         Arc::clone(&security),
