@@ -238,6 +238,10 @@ max_history = 200
 # defaults are deliberately different numbers (900 vs 1800) so an operator
 # always sees the warning well before anything is killed.
 #
+# Completed serving-request preparation counts as progress (`request_prepared`).
+# The event follows actual compilation; merely starting an iteration does not
+# report a provider response or repeatedly refresh a pending request's window.
+#
 # Termination goes through the normal cancellation path and the runtime
 # registry's kill path, so child process groups are cleaned up (`killpg`) and
 # the event is recorded in the registry. The error says explicitly that the turn
@@ -1999,6 +2003,14 @@ snapshot and recommended timeout. It also writes the catalog's recommended
 extra-latency budget when the policy still has its default value. Explicit
 command and policy values remain operator choices. Built-in decision-model
 pricing comes from the catalog; `[cost.prices]` is only an override.
+During migration, only schema-1's serialized 500 ms default becomes implicit.
+An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
+remains an explicit operator choice, as does 500 ms in schema 2. Loading an
+already-configured hosted backend does not raise its current ceiling: when it
+is below the model's catalog recommendation, configuration loading logs a
+warning, `prx causal status` shows it (also as `latency_budget_warning` in JSON),
+and `prx doctor` reports it. Set the policy explicitly to adopt a larger budget;
+the warning itself changes neither admission limits nor backend credentials.
 An `endpoint` replaces a hosted service's base URL, and the backend stays
 remote, so it is used only with `remote_enabled`. The hosted credential
 belongs to the service, not to the URL: re-pointing the override sends that

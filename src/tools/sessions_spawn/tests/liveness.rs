@@ -239,6 +239,7 @@ async fn registry_kill_of_a_spawned_run_makes_its_row_terminal() {
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: None,
         }),
     );
 
@@ -337,10 +338,12 @@ async fn a_terminal_status_is_never_overwritten_by_the_termination_commit() {
 async fn a_spawned_run_row_tracks_its_own_real_progress() {
     let (ch, _) = RecordingChannel::new();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
     let tool = make_tool(
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: Some(Arc::clone(&entered)),
         }),
     );
 
@@ -349,6 +352,9 @@ async fn a_spawned_run_row_tracks_its_own_real_progress() {
         .expect("spawn tool call");
     assert!(spawned.success, "{spawned:?}");
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the real provider must be parked before measuring silence");
     // While parked in the provider the run really has made no progress, and
     // the row must say so instead of inventing activity.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -360,7 +366,7 @@ async fn a_spawned_run_row_tracks_its_own_real_progress() {
     };
     assert_eq!(
         events_before, 1,
-        "only the admitted turn start may precede provider output"
+        "only completed request preparation may precede provider output"
     );
     assert!(
         idle_before >= std::time::Duration::from_millis(150),
@@ -374,13 +380,17 @@ async fn a_spawned_run_row_tracks_its_own_real_progress() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let runs = tool.active_runs_snapshot().await;
         let Some(run) = runs.first() else { continue };
-        if run.progress.events() > 0 {
+        if run.progress.events() > events_before {
             observed = Some((run.progress.events(), run.idle_for(), run.last_progress_at()));
             break;
         }
     }
     let (events_after, idle_after, stamp_after) = observed.expect("a released run must record progress on its own row");
     assert!(events_after >= 1);
+    assert!(
+        events_after > events_before,
+        "provider release must produce a new progress event"
+    );
     assert!(
         idle_after < idle_before,
         "real progress must reset the run's silence: {idle_after:?} vs {idle_before:?}"

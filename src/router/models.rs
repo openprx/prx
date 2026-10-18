@@ -7,17 +7,26 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
     let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
         return Vec::new();
     };
+    model_capabilities_from_catalog(catalog)
+}
+
+fn model_capabilities_from_catalog(catalog: &crate::providers::catalog::ReleaseCatalog) -> Vec<RouterModelConfig> {
+    let cost = crate::config::schema::CostConfig::default();
     catalog
         .models
         .iter()
         .filter_map(|model| {
-            if model.lifecycle.status != crate::providers::catalog::ModelLifecycleStatus::Active
-                || model.pricing.is_none()
-            {
+            if model.lifecycle.status != crate::providers::catalog::ModelLifecycleStatus::Active {
                 return None;
             }
             let router = model.router.as_ref()?;
             let context = model.limits.context_window?;
+            if !matches!(
+                crate::llm::route_decision::usage_cost_resolution(&model.provider, &model.api_model, 1, 1, 0, 0, &cost),
+                crate::llm::route_decision::UsagePrice::Priced(_)
+            ) {
+                return None;
+            }
             Some(RouterModelConfig {
                 model_id: model.api_model.clone(),
                 provider: model.provider.clone(),
@@ -86,16 +95,35 @@ mod tests {
                 "non-active router candidate: {}",
                 release.id
             );
-            assert!(release.pricing.is_some(), "unpriced router candidate: {}", release.id);
+            assert!(
+                matches!(
+                    crate::llm::route_decision::usage_cost_resolution(
+                        &model.provider,
+                        &model.model_id,
+                        1,
+                        1,
+                        0,
+                        0,
+                        &crate::config::schema::CostConfig::default(),
+                    ),
+                    crate::llm::route_decision::UsagePrice::Priced(_)
+                ),
+                "router candidate has no effective billing tariff: {}",
+                release.id
+            );
         }
         let providers: HashSet<&str> = models.iter().map(|model| model.provider.as_str()).collect();
         assert!(providers.contains("anthropic"));
         assert!(providers.contains("ollama"));
+        for provider in ["openrouter", "gemini"] {
+            assert!(
+                providers.contains(provider),
+                "missing active priced candidates for {provider}"
+            );
+        }
         assert!(
-            !models
-                .iter()
-                .any(|model| model.provider == "gemini" || model.provider == "openai"),
-            "providers whose only router rows are retired must not remain candidates"
+            !providers.contains("openai"),
+            "automatic direct OpenAI candidates require the C2 parameter wire mapping"
         );
     }
 
@@ -105,6 +133,55 @@ mod tests {
             .find(|model| model.provider == provider && model.model_id == model_id)
             .unwrap_or_else(|| panic!("missing builtin model {provider}/{model_id}"))
             .max_context
+    }
+
+    #[test]
+    fn responses_only_codex_is_not_an_automatic_chat_candidate() {
+        assert!(
+            !builtin_model_capabilities()
+                .iter()
+                .any(|model| model.provider == "openai" && model.model_id == "gpt-5.2-codex"),
+            "the direct OpenAI adapter has no Responses wire path"
+        );
+    }
+
+    #[test]
+    fn router_pricing_filter_uses_upstream_tariffs_and_rejects_missing_tariffs() {
+        let mut catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+            .expect("test: embedded catalog")
+            .clone();
+        let template = catalog
+            .models
+            .iter()
+            .find(|model| model.id == "openrouter/anthropic/claude-sonnet-5")
+            .expect("test: priced Router metadata");
+        let router = template.router.clone();
+        let limits = template.limits.clone();
+        // Only metadata needed to exercise the filter is added. This is not
+        // evidence that either endpoint is available or transport-admitted.
+        for id in ["openrouter/openai/gpt-5.6", "openrouter/google/gemini-3.5-flash"] {
+            let row = catalog
+                .models
+                .iter_mut()
+                .find(|model| model.id == id)
+                .expect("test: existing release row");
+            assert!(row.pricing.is_none(), "test: neither row has its own tariff");
+            row.router = router.clone();
+            row.limits = limits.clone();
+        }
+        let models = model_capabilities_from_catalog(&catalog);
+        assert!(
+            models
+                .iter()
+                .any(|model| model.provider == "openrouter" && model.model_id == "openai/gpt-5.6"),
+            "a published upstream tariff must satisfy the same pricing rule as onboarding"
+        );
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider == "openrouter" && model.model_id == "google/gemini-3.5-flash"),
+            "a ranking cost must not turn an unpriced model into a billing-priced candidate"
+        );
     }
 
     #[test]

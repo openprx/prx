@@ -176,6 +176,7 @@ async fn a_member_killed_from_outside_still_lets_the_join_return_and_is_reported
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: None,
         }),
     );
 
@@ -612,6 +613,7 @@ async fn a_batch_outlives_a_kill_of_its_parent_turn_and_dies_on_its_batch_id() {
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: None,
         }),
     );
 

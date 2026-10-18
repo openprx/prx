@@ -253,11 +253,15 @@ impl crate::providers::Provider for EchoProvider {
 /// observe many simultaneously live runs rather than a fast serial trickle.
 struct GatedProvider {
     gate: Arc<tokio::sync::Semaphore>,
+    entered: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl GatedProvider {
     /// Park until the test releases this run.
     async fn wait_for_release(&self) {
+        if let Some(entered) = &self.entered {
+            entered.notify_one();
+        }
         if let Ok(permit) = self.gate.acquire().await {
             drop(permit);
         }

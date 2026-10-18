@@ -73,6 +73,7 @@ async fn spawn_fan_out_is_uncapped_by_concurrency_or_children() {
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: None,
         }),
     );
     tool.set_default_recipient(Some("test-recipient".to_string())).await;
@@ -135,6 +136,7 @@ async fn spawn_nesting_is_uncapped_and_still_reports_depth() {
         Arc::new(ch),
         Arc::new(GatedProvider {
             gate: Arc::clone(&gate),
+            entered: None,
         }),
     );
     tool.set_default_recipient(Some("test-recipient".to_string())).await;

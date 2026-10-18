@@ -2741,59 +2741,151 @@ mod tests {
         custom_userinfo: bool,
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
-        use futures::FutureExt as _;
-        let retained = tempfile::tempdir().expect("private decision evidence").keep();
+        let retained = tempfile::tempdir().expect("private decision evidence");
         let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
             .await
             .expect("owned compatible decision listener")
-            .retain_evidence_at(retained);
+            .retain_evidence_at(retained.path().to_path_buf());
         let endpoint = driver.endpoint().to_owned();
         driver
             .run_factory(true, move || async move {
-                let cleanup =
-                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
-                        .expect("delegate fixture cleanup owner");
-                let mut observed = None;
-                let drained = cleanup
-                    .run(boxed_delegate_observation(|| async {
-                        observed = Some(
-                            CONFIGURED_DELEGATE_ENDPOINT
-                                .scope(
-                                    endpoint,
-                                    std::panic::AssertUnwindSafe(boxed_delegate_observation(|| {
-                                        run_admitted_delegate_fixture(
-                                            allowed_tools,
-                                            parent_tools,
-                                            tool_name,
-                                            arguments,
-                                            provider_error,
-                                            custom_userinfo,
-                                            context,
-                                        )
-                                    }))
-                                    .catch_unwind(),
+                observe_owned_delegate_workspace(move |workspace| async move {
+                    CONFIGURED_DELEGATE_ENDPOINT
+                        .scope(
+                            endpoint,
+                            boxed_delegate_observation(|| {
+                                run_admitted_delegate_fixture(
+                                    workspace,
+                                    allowed_tools,
+                                    parent_tools,
+                                    tool_name,
+                                    arguments,
+                                    provider_error,
+                                    custom_userinfo,
+                                    context,
                                 )
-                                .await,
-                        );
-                        Ok(())
-                    }))
-                    .await;
-                match observed {
-                    Some(Err(panic)) => std::panic::resume_unwind(panic),
-                    Some(Ok(value)) => {
-                        drained.expect("delegate fixture writers drained");
-                        value
-                    }
-                    None => {
-                        drained.expect("delegate fixture cleanup entered");
-                        panic!("delegate fixture did not run")
-                    }
-                }
+                            }),
+                        )
+                        .await
+                })
+                .await
             })
             .await
     }
 
+    async fn observe_owned_delegate_workspace<T, F, Fut>(work: F) -> T
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        use futures::FutureExt as _;
+        // The work future is dropped before CleanupScope drains its writers.
+        // Its temporary files must therefore belong to this enclosing owner.
+        let workspace = tempfile::tempdir().expect("delegate fixture workspace");
+        #[cfg(unix)]
+        let workspace = super::delegate_diagnostic::workspace(workspace);
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("delegate fixture cleanup owner");
+        let mut observed = None;
+        let drained = cleanup
+            .run(boxed_delegate_observation(|| async {
+                observed = Some(
+                    std::panic::AssertUnwindSafe(boxed_delegate_observation(|| work(workspace.path().to_owned())))
+                        .catch_unwind()
+                        .await,
+                );
+                Ok(())
+            }))
+            .await;
+        if drained.is_err() {
+            // An unconfirmed writer may still be using this directory. Keep
+            // that failure's files, but never leak a confirmed workspace.
+            #[cfg(unix)]
+            if let super::delegate_diagnostic::Workspace::Temporary(directory) = workspace {
+                let _retained = directory.keep();
+            }
+            #[cfg(not(unix))]
+            let _retained = workspace.keep();
+            tracing::warn!("delegate fixture workspace retained after unconfirmed cleanup");
+        }
+        match observed {
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            Some(Ok(value)) => {
+                drained.expect("delegate fixture writers drained");
+                value
+            }
+            None => {
+                drained.expect("delegate fixture cleanup entered");
+                panic!("delegate fixture did not run")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_delegate_fixture_keeps_its_workspace_until_owned_writers_drain() {
+        use futures::FutureExt as _;
+        let (finished, observed_writer) = tokio::sync::oneshot::channel();
+        let result: Result<(), _> =
+            std::panic::AssertUnwindSafe(observe_owned_delegate_workspace(move |workspace| async move {
+                let owner = crate::runtime::turn_cleanup::current_tracker().expect("fixture cleanup owner");
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let ticket = owner.register(cancellation.clone()).expect("owned fixture writer");
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    let existed = workspace.is_dir();
+                    let written = tokio::fs::write(workspace.join("owned-drain-proof"), b"drained")
+                        .await
+                        .is_ok();
+                    finished
+                        .send((workspace, existed, written))
+                        .expect("fixture writer observation");
+                    ticket.finish(written);
+                });
+                panic!("controlled delegate fixture abort");
+            }))
+            .catch_unwind()
+            .await;
+        assert!(result.is_err(), "the original fixture panic must escape");
+        assert_eq!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|panic| panic.downcast_ref::<&str>())
+                .copied(),
+            Some("controlled delegate fixture abort"),
+            "cleanup must preserve the original panic rather than replace it"
+        );
+        let (workspace, existed, written) = observed_writer.await.expect("owned writer completed");
+        assert!(existed, "the real cleanup drain must retain the fixture workspace");
+        assert!(
+            written,
+            "the owned writer must finish before temporary-directory cleanup"
+        );
+        assert!(!workspace.exists(), "the confirmed fixture workspace must not leak");
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_delegate_fixture_keeps_its_workspace() {
+        use futures::FutureExt as _;
+        let (finished, observed_workspace) = tokio::sync::oneshot::channel();
+        let result: Result<(), _> =
+            std::panic::AssertUnwindSafe(observe_owned_delegate_workspace(move |workspace| async move {
+                let owner = crate::runtime::turn_cleanup::current_tracker().expect("fixture cleanup owner");
+                let ticket = owner
+                    .register(tokio_util::sync::CancellationToken::new())
+                    .expect("owned fixture writer");
+                ticket.finish(false);
+                finished.send(workspace).expect("fixture workspace observation");
+            }))
+            .catch_unwind()
+            .await;
+        assert!(result.is_err(), "unconfirmed cleanup must not be accepted");
+        let workspace = observed_workspace.await.expect("fixture work completed");
+        assert!(workspace.is_dir(), "unconfirmed writer files must be retained");
+    }
+
     async fn run_admitted_delegate_fixture(
+        workspace: std::path::PathBuf,
         allowed_tools: Vec<String>,
         parent_tools: Vec<Arc<dyn Tool>>,
         tool_name: &'static str,
@@ -2802,9 +2894,6 @@ mod tests {
         custom_userinfo: bool,
         context: Option<&str>,
     ) -> (ToolResult, Vec<serde_json::Value>) {
-        let workspace = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        let workspace = super::delegate_diagnostic::workspace(workspace);
         let requests = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
         let capture = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2853,8 +2942,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.path().to_owned();
-        config.config_path = workspace.path().join("config.toml");
+        config.workspace_dir = workspace.clone();
+        config.config_path = workspace.join("config.toml");
         config.api_url = Some(endpoint.clone());
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
@@ -2904,7 +2993,7 @@ mod tests {
         );
         let delegate = DelegateTool::new(
             config.agents.clone(),
-            Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path())),
+            Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace)),
         )
         .with_parent_tools(Arc::new(parent_tools));
         use futures::FutureExt as _;

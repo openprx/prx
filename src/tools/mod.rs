@@ -1403,8 +1403,10 @@ mod tests {
         };
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
             .expect("test: delegate cleanup owner");
+        // This fixture owns the large admission future. Keep it behind one
+        // pointer through the cleanup scope's task-local and select wrappers.
         let result = cleanup
-            .scope_admission(async {
+            .scope_admission(Box::pin(async {
                 let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
                     root,
                     message,
@@ -1416,7 +1418,7 @@ mod tests {
                 admitted
                     .execute_tool("delegate", serde_json::json!({"agent": "a", "prompt": "hi"}))
                     .await
-            })
+            }))
             .await
             .expect("test: delegate returns a tool result");
 

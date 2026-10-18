@@ -177,6 +177,8 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_config_semantics(config, &mut items);
     check_model_selection(config, &mut items);
     check_persisted_selections(config, &mut items);
+    #[cfg(feature = "llm-router")]
+    check_router_candidates(config, &mut items);
     check_decision_plane(config, &mut items);
     check_workspace(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
@@ -1372,6 +1374,9 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
 /// The decision plane reports refused backends and orphaned references.
 fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "decision";
+    if let Some(warning) = config.decision_latency_budget_warning() {
+        items.push(DiagItem::warn(cat, warning));
+    }
     if let Some(warning) = crate::config::manage::validate::decision_startup_check(config) {
         items.push(DiagItem::warn(cat, warning));
     }
@@ -1379,6 +1384,26 @@ fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
         && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(config)
     {
         items.push(DiagItem::warn(cat, warning));
+    }
+}
+
+/// Use the same registry expansion and provider filter as `RouterEngine::new`.
+#[cfg(feature = "llm-router")]
+fn check_router_candidates(config: &Config, items: &mut Vec<DiagItem>) {
+    let reachable = crate::router::capability::reachable_provider_names(
+        crate::providers::selection::default_provider(config),
+        &config.model_routes,
+    );
+    let candidates = if config.router.models.is_empty() {
+        crate::router::models::builtin_model_capabilities()
+    } else {
+        config.router.models.clone()
+    };
+    if crate::router::capability::filter_models_by_providers(candidates, &reachable).is_empty() {
+        items.push(DiagItem::warn(
+            "router",
+            "Router has no reachable candidates after provider filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
+        ));
     }
 }
 
@@ -2515,6 +2540,53 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn doctor_surfaces_an_empty_router_registry_beyond_the_startup_log() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".to_owned());
+        config.default_model = Some("gpt-5.6".to_owned());
+        let mut items = Vec::new();
+        check_router_candidates(&config, &mut items);
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("no reachable candidates"))
+        );
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.6"));
+
+        config.default_provider = Some("openrouter".to_owned());
+        config.default_model = Some("anthropic/claude-sonnet-5".to_owned());
+        items.clear();
+        check_router_candidates(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "the published OpenRouter candidate must actually be reachable"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_below_catalog_hosted_latency_budget() {
+        let temp = TempDir::new().expect("test: private doctor configuration");
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let mut items = Vec::new();
+        check_decision_plane(&config, &mut items);
+        assert!(items.iter().any(|item| {
+            item.message.contains("below the catalog recommendation")
+                && item.message.contains("500")
+                && item.message.contains("3000")
+        }));
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+    }
 
     /// D-094 C-1, C-5: the doctor names a refused decision backend (which
     /// runs builtin-only) and every decision credential nothing references,

@@ -32,47 +32,6 @@ impl EffectiveCompactionConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CompactionResolver {
-    base: AgentCompactionConfig,
-    router: RouterConfig,
-    model_routes: Vec<ModelRouteConfig>,
-    catalog: crate::providers::catalog::CatalogView,
-}
-
-impl CompactionResolver {
-    pub fn new(base: AgentCompactionConfig, router: RouterConfig, model_routes: Vec<ModelRouteConfig>) -> Self {
-        Self {
-            base,
-            router,
-            model_routes,
-            catalog: crate::providers::catalog::CatalogView::release_only(),
-        }
-    }
-
-    pub fn from_base(base: AgentCompactionConfig) -> Self {
-        Self::new(base, RouterConfig::default(), Vec::new())
-    }
-
-    /// Attach the exact generation's operator, discovery, and release facts.
-    #[must_use]
-    pub fn with_model_catalog(mut self, catalog: crate::providers::catalog::CatalogView) -> Self {
-        self.catalog = catalog;
-        self
-    }
-
-    pub fn resolve(&self, provider: &str, model: &str) -> EffectiveCompactionConfig {
-        resolve_effective_compaction_config_with_catalog(
-            &self.base,
-            provider,
-            model,
-            &self.router,
-            &self.model_routes,
-            &self.catalog,
-        )
-    }
-}
-
 pub fn resolve_effective_compaction_config(
     base: &AgentCompactionConfig,
     provider: &str,
@@ -278,7 +237,13 @@ mod tests {
     #[test]
     fn the_shown_provider_redacts_url_userinfo() {
         let label = "custom:http://u:CONTEXT-SECRET-pw@127.0.0.1:1/v1";
-        let resolution = CompactionResolver::from_base(AgentCompactionConfig::default()).resolve(label, "m");
+        let resolution = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            label,
+            "m",
+            &RouterConfig::default(),
+            &[],
+        );
         assert_eq!(resolution.selected_provider, label);
         assert_eq!(resolution.shown_provider(), "custom:http://[redacted]@127.0.0.1:1/v1");
     }
@@ -364,14 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn compaction_resolver_child_route_200k_beats_parent_1m() {
+    fn effective_compaction_child_route_200k_beats_parent_1m() {
         let router = router_with_models(vec![
             model("anthropic", "claude-opus-4-8", 1_000_000),
             model("openrouter", "small-child", 200_000),
         ]);
-        let resolver = CompactionResolver::new(AgentCompactionConfig::default(), router, Vec::new());
-
-        let result = resolver.resolve("openrouter", "small-child");
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "openrouter",
+            "small-child",
+            &router,
+            &[],
+        );
 
         assert_eq!(result.config.max_context_tokens, 200_000);
         assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
@@ -455,16 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn compaction_resolver_explicit_override_wins_and_caps_at_literal_10m() {
+    fn effective_compaction_explicit_override_wins_and_caps_at_literal_10m() {
         let router = router_with_model("openrouter", "small-child", 200_000);
         let mut base = AgentCompactionConfig {
             max_context_tokens: 20_000_000,
             ..AgentCompactionConfig::default()
         };
         base.max_context_tokens_explicit = true;
-        let resolver = CompactionResolver::new(base, router, Vec::new());
-
-        let result = resolver.resolve("openrouter", "small-child");
+        let result = resolve_effective_compaction_config(&base, "openrouter", "small-child", &router, &[]);
 
         assert_eq!(result.config.max_context_tokens, 10_000_000);
         assert_eq!(result.max_context_source, ContextWindowSource::AgentCompactionOverride);
@@ -473,11 +440,15 @@ mod tests {
     }
 
     #[test]
-    fn compaction_resolver_unknown_child_falls_back_to_literal_128k_not_parent() {
+    fn effective_compaction_unknown_child_falls_back_to_literal_128k_not_parent() {
         let router = router_with_models(vec![model("anthropic", "claude-opus-4-8", 1_000_000)]);
-        let resolver = CompactionResolver::new(AgentCompactionConfig::default(), router, Vec::new());
-
-        let result = resolver.resolve("unknown-provider", "unknown-child");
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "unknown-provider",
+            "unknown-child",
+            &router,
+            &[],
+        );
 
         assert_eq!(result.config.max_context_tokens, 128_000);
         assert_eq!(result.max_context_source, ContextWindowSource::FallbackDefault);

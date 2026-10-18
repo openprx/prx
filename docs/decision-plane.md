@@ -146,6 +146,13 @@ remaining declared token allowance at the highest applicable PMM rate, and
 checks the original token, latency and monetary limits before dispatch.
 The estimate is not a vendor-enforced billing cap. Each retry has its own durable
 reservation; builtin and cache-only paths do not open the cost ledger.
+For a two-attempt plan, accounting prefers an equal share of the remaining
+tokens. If the complete guarded input cannot fit that share but does fit the
+existing total allowance, the current attempt reserves the smallest larger
+share that satisfies the existing strict input-fit check instead.
+This does not raise a token, cost or time limit or guarantee a second attempt:
+each later attempt must fit the actual remaining allowance. Unknown usage keeps
+the whole claimed reservation; only fully reported usage releases unused tokens.
 If cancellation or a deadline prevents a completed reservation from reaching
 the transport, its unique unclaimed owner releases that unsent estimate and
 restores the local allowance before cleanup completes. The journal records this

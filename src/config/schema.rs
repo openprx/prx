@@ -6658,6 +6658,31 @@ impl Config {
         Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
     }
 
+    /// Advisory only: retain the configured ceiling while exposing the
+    /// release catalog recommendation outside the causal policy domain.
+    pub(crate) fn decision_latency_budget_warning(&self) -> Option<String> {
+        let section = &self.causal_tree;
+        if !section.enabled {
+            return None;
+        }
+        let selection = crate::decision::factory::configured_selection(section)?;
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+            .inspect_err(|error| tracing::warn!(%error, "cannot read the catalog latency recommendation"))
+            .ok()?;
+        let entry = catalog.model(
+            &crate::providers::ProviderId::of(&selection.provider),
+            section.backend.model.trim(),
+        )?;
+        let recommended = entry.transport.extra_latency_budget_ms?;
+        let configured = section.policy.extra_latency_budget_ms;
+        (configured < recommended).then(|| {
+            format!(
+                "causal_tree.policy.extra_latency_budget_ms={configured} is below the catalog recommendation {recommended} ms for {}; the configured ceiling is unchanged",
+                entry.id
+            )
+        })
+    }
+
     /// Turn a merged TOML tree into a `Config`.
     ///
     /// `config_path` is only used to tell an operator which file and line a
@@ -6684,6 +6709,9 @@ impl Config {
                  likely a typo); configuration is never silently ignored.",
                 unknown_paths.join(", ")
             );
+        }
+        if let Some(warning) = config.decision_latency_budget_warning() {
+            tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
         }
         Ok(config)
     }
@@ -8631,6 +8659,47 @@ max_context = 1000000
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
         assert!(loaded.agent.compaction.max_context_tokens_explicit);
         assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
+    }
+
+    #[test]
+    async fn hosted_latency_warning_does_not_change_the_configured_ceiling() {
+        let mut config = Config::default();
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let warning = config
+            .decision_latency_budget_warning()
+            .expect("test: below catalog recommendation");
+        assert!(warning.contains("500") && warning.contains("3000"), "{warning}");
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        config.causal_tree.policy.extra_latency_budget_ms = 3_000;
+        assert!(config.decision_latency_budget_warning().is_none());
+        config.causal_tree.policy.extra_latency_budget_ms = 500;
+        config.causal_tree.enabled = false;
+        assert!(config.decision_latency_budget_warning().is_none());
+    }
+
+    #[test]
+    async fn schema_one_hosted_backend_warns_on_load_without_raising_the_latency_budget() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().expect("test: private config directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_temperature = 0.7\n\
+             [auth]\ncodex_auth_json_auto_import = false\n\
+             [causal_tree]\nschema_version = 1\nenabled = true\n\
+             [causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\n\
+             pinned_snapshot = \"typesafe/jev-1.13-20260917\"\n\
+             [causal_tree.policy]\nextra_latency_budget_ms = 500\n",
+        )
+        .expect("test: write old hosted configuration");
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        let loaded = loaded.expect("test: old hosted config loads");
+        assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert!(logs.contains("below the catalog recommendation"), "{logs}");
+        assert!(logs.contains("500") && logs.contains("3000"), "{logs}");
     }
 
     #[test]

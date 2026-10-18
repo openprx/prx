@@ -611,9 +611,6 @@ async fn run_turn_unguarded(
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
-        // Reaching a new iteration means the previous one produced a complete
-        // model response and its tool results: unambiguous progress.
-        crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
         // Notify progress for multi-iteration tool loops (skip the first iteration).
         if iteration > 1 {
             if let Some(ref tx) = on_tool_call {
@@ -997,6 +994,10 @@ async fn run_turn_unguarded(
                 token_source = token_source_label(messages_measurement.source),
                 "final request system prompt compiled"
             );
+            // Compilation is completed work, including a cold tokenizer or a
+            // changed tool surface. Record it before the durable event yields;
+            // an iteration starting is not a completed provider response.
+            crate::agent::idle::beat(crate::agent::idle::ProgressKind::RequestPrepared);
 
             if let Some(fabric) = event_fabric.as_ref() {
                 let compiled_decision = {
@@ -1077,8 +1078,9 @@ async fn run_turn_unguarded(
                     tracing::warn!(error = %error, "Failed to persist compiled LLM request context");
                 }
             }
+        } else {
+            crate::agent::idle::beat(crate::agent::idle::ProgressKind::RequestPrepared);
         }
-
         hooks
             .emit(
                 HookEvent::LlmRequest,
