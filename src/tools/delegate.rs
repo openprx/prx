@@ -14,9 +14,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::Instrument as _;
-
-// Keep the measured owned suspension fields off the caller's poll frame.
-// Construct inside this synchronous boundary and erase the concrete poll type.
+#[cfg(test)]
+mod task_size_tests;
+// Box and erase owned suspension fields before caller polls or task spawning.
 #[inline(never)]
 fn boxed_delegate_field<'a, F>(
     make: impl FnOnce() -> F,
@@ -1127,7 +1127,7 @@ impl DelegateTool {
         };
         #[cfg(all(test, unix))]
         let work = delegate_diagnostic::inherit(work);
-        let mut task = DelegateTask(tokio::spawn(work));
+        let mut task = DelegateTask(tokio::spawn(boxed_delegate_field(|| work)));
         match (&mut task.0).await {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
