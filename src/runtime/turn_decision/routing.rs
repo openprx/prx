@@ -392,10 +392,6 @@ impl TurnDecisionService {
             #[cfg(test)]
             after_prediction_pause: None,
         };
-        let _telemetry_deferral = self
-            .durable_events
-            .as_ref()
-            .map(|events| events.defer_ordinary_persistence());
         self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
         let prepared = CausalDecisionEngine::prepare_hop(&inputs)?;
         self.emit_agent_phase(

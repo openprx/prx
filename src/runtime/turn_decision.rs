@@ -2259,7 +2259,7 @@ impl TurnDecisionService {
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
-        let accounting = accounting::TurnAccounting::new(self, proof, budget.budgets, deadline);
+        let (accounting, _telemetry) = accounting::admission_resources(self, proof, budget.budgets, deadline);
         let config = &self.generation.effective;
         let owner_filesystem = self
             .console_filesystem(proof)

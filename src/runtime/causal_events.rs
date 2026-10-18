@@ -21,6 +21,7 @@ use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSou
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 mod deferral;
+pub(super) use deferral::PersistenceGuard;
 
 enum QueueItem {
     Event(Box<CausalEvent>),
@@ -134,7 +135,7 @@ impl DurableCausalEventSink {
 
     /// Already-started I/O completes normally. New ordinary writes wait until
     /// every guard drops; observers remain immediate and drain stays FIFO.
-    pub(super) fn defer_ordinary_persistence(&self) -> deferral::PersistenceGuard {
+    pub(super) fn defer_ordinary_persistence(&self) -> PersistenceGuard {
         self.deferral.begin()
     }
 

@@ -180,6 +180,13 @@ their own execution-latency estimates. Administrative probes/tests use a
 separate owned scope under the existing live-test permission checks. An
 unfunded probe is reported as unprobed, not as successful health evidence.
 
+While a decision is admitted, ordinary phase-event persistence waits until that
+admission ends instead of competing with its required I/O. The guard starts
+after the decision deadline is set. Observers receive phases immediately;
+leaving admission, including cancellation, releases the queued writes in order.
+An issued context can retain physical accounting without retaining this guard,
+and cleanup still drains the phase events before confirming completion.
+
 Supported auxiliary transports account for each actual send, including nested
 fallbacks. Unsupported transports refuse the additional call before dispatch.
 The candidate still requires assembled behavioral, cancellation and fixed-budget
