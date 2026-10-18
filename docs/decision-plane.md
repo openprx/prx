@@ -148,8 +148,9 @@ The estimate is not a vendor-enforced billing cap. Each retry has its own durabl
 reservation; builtin and cache-only paths do not open the cost ledger.
 For a two-attempt plan, accounting prefers an equal share of the remaining
 tokens. If the complete guarded input cannot fit that share but does fit the
-existing total allowance, the current attempt reserves the smallest larger
-share that satisfies the existing strict input-fit check instead.
+existing total allowance, the current attempt reserves input plus the declared
+wire output cap, clamped to that available allowance. Without a wire output cap,
+it conservatively reserves the whole available allowance instead.
 This does not raise a token, cost or time limit or guarantee a second attempt:
 each later attempt must fit the actual remaining allowance. Unknown usage keeps
 the whole claimed reservation; only fully reported usage releases unused tokens.

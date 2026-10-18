@@ -24,6 +24,8 @@ use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, Usag
 #[cfg(test)]
 pub(crate) mod timing;
 
+mod output_allowance;
+
 #[cfg(feature = "llm-router")]
 mod cl100k_prefix_bound;
 
@@ -570,15 +572,15 @@ mod tranche_tests {
     }
 
     #[test]
-    fn an_input_above_the_share_claims_only_the_required_larger_share_and_measures_once() -> anyhow::Result<()> {
+    fn an_uncapped_input_above_the_share_claims_the_available_allowance_and_measures_once() -> anyhow::Result<()> {
         let remaining = AtomicU64::new(2059);
         let calls = std::cell::Cell::new(0);
         let tokens = claim_input_tokens(&remaining, 2, &"large input ".repeat(1024), || {
             calls.set(calls.get() + 1);
             1036
         })?;
-        assert_eq!(tokens, 1037);
-        assert_eq!(remaining.load(Ordering::Acquire), 1022);
+        assert_eq!(tokens, 2059);
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
         assert_eq!(calls.get(), 1);
         Ok(())
     }
@@ -617,14 +619,14 @@ mod tranche_tests {
                 second.join().expect("test: second claimant"),
             ];
             assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-            assert_eq!(results.into_iter().filter_map(Result::ok).sum::<u64>(), 1037);
+            assert_eq!(results.into_iter().filter_map(Result::ok).sum::<u64>(), 2059);
         });
-        assert_eq!(remaining.load(Ordering::Acquire), 1022);
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn a_changed_allowance_rechecks_fit_without_repeating_the_estimator() {
-        for (other_claim, expected) in [(10, Some(1037)), (1030, None)] {
+        for (other_claim, expected) in [(10, Some(2049)), (1030, None)] {
             let remaining = AtomicU64::new(2059);
             let calls = std::cell::Cell::new(0);
             let result = claim_input_tokens(&remaining, 2, &"large input ".repeat(1024), || {
@@ -699,17 +701,16 @@ fn claim_input_tokens(
         let tokens = if input_token_preflight(text, share, &mut measure)? {
             share
         } else {
-            // The failed preflight has already measured the input.
-            // Keep the existing strict input < reservation rule while leaving
-            // all unnecessary tokens available to the bounded remaining plan.
-            let required = u64::try_from(measure())?
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("physical input token estimate overflow"))?;
+            // An oversized input must leave room for the request's output,
+            // not merely one token. A wire without an output cap keeps the
+            // whole available allowance conservatively reserved.
+            let input = u64::try_from(measure())?;
             anyhow::ensure!(
-                required <= available,
-                "physical request exceeds the remaining decision token allowance"
+                input < available,
+                "physical input exhausts the remaining token allowance"
             );
-            required
+            let output = output_allowance::request_output_cap(text)?.unwrap_or(available);
+            input.saturating_add(output).min(available)
         };
         match remaining.compare_exchange_weak(available, available - tokens, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Ok(tokens),

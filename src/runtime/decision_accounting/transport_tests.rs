@@ -305,7 +305,7 @@ async fn a_request_above_the_retry_share_can_use_the_existing_owner_allowance() 
     );
     let input_tokens = u64::try_from(input_tokens)?;
     assert!(input_tokens >= budgets.tokens / 2 && input_tokens < budgets.tokens);
-    assert_eq!(receipt.reserved_tokens, input_tokens + 1);
+    assert_eq!(receipt.reserved_tokens, budgets.tokens);
     let reserved_tokens = receipt.reserved_tokens;
     let reserved_money = receipt.reserved_micro_usd;
     assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - reserved_tokens);
