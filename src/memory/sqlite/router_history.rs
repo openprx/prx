@@ -90,19 +90,21 @@ fn decode(
     row: &rusqlite::Row<'_>,
     domain: &RouterHistoryDomain,
 ) -> anyhow::Result<(RouterHistoryRow, [u8; 32], String)> {
-    let string = |index| -> anyhow::Result<String> {
-        row.get::<_, Option<String>>(index)?
+    let string = |index| -> anyhow::Result<&str> {
+        row.get_ref(index)?
+            .as_str()
             .context("Router history metadata exceeds bounds")
     };
-    let bytes = |index| -> anyhow::Result<Vec<u8>> {
-        row.get::<_, Option<Vec<u8>>>(index)?
+    let bytes = |index| -> anyhow::Result<&[u8]> {
+        row.get_ref(index)?
+            .as_blob()
             .context("Router history binary value exceeds bounds")
     };
     anyhow::ensure!(
         string(7)? == domain.workspace
             && string(8)? == domain.owner
             && string(9)? == domain.session
-            && bytes(10)?.as_slice() == domain.policy_sha256
+            && bytes(10)? == domain.policy_sha256.as_slice()
             && string(11)? == domain.embedding_model
             && row.get::<_, i64>(12)? == i64::from(domain.dimensions)
             && row.get::<_, i64>(13)? == i64::from(domain.embedding_version),
@@ -116,13 +118,13 @@ fn decode(
     let result = RouterHistoryRow {
         source_sequence: row.get(0)?,
         terminal_sequence: row.get(1)?,
-        terminal_event_id: string(2)?,
-        provider: string(3)?,
-        model: string(4)?,
+        terminal_event_id: string(2)?.to_owned(),
+        provider: string(3)?.to_owned(),
+        model: string(4)?.to_owned(),
         success: success == 1,
-        embedding: decode_vector(&bytes(6)?, domain.dimensions)?,
+        embedding: decode_vector(bytes(6)?, domain.dimensions)?,
     };
-    Ok((result, fingerprint, string(15)?))
+    Ok((result, fingerprint, string(15)?.to_owned()))
 }
 
 impl SqliteMemory {

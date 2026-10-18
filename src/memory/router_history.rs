@@ -323,16 +323,12 @@ pub(super) fn decode_vector(bytes: &[u8], dimensions: u16) -> Result<Vec<f32>> {
         (1..=ROUTER_HISTORY_MAX_DIMENSIONS).contains(&dimensions) && bytes.len() == dimensions * 4,
         "Router history vector exceeds its fixed encoding bounds"
     );
-    let vector = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| {
-            let value = f32::from_le_bytes(*chunk);
-            ensure!(value.is_finite(), "Router history vector is non-finite");
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut vector = Vec::with_capacity(dimensions);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let value = f32::from_le_bytes(*chunk);
+        ensure!(value.is_finite(), "Router history vector is non-finite");
+        vector.push(value);
+    }
     Ok(vector)
 }
 
@@ -350,3 +346,6 @@ fn hash_field(digest: &mut Sha256, value: &[u8]) {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value);
 }
+
+#[cfg(test)]
+mod codec_tests;

@@ -91,6 +91,8 @@ deadline; a queued write or an expired acknowledgement grants no read.
 Ordinary background phase-event writes wait until that hop finishes, including
 on cancellation. Observers remain immediate, queued events keep their order,
 and cleanup still drains them; the selected decision commit is never deferred.
+History reads retain exact finite vector bits and validate every eligible row
+through the existing 1,024-row capacity limit.
 
 The `ollama/*` row exists only to seed the Router's conservative local fallback.
 It does not verify an arbitrary Ollama model, assign it a 32K context window, or

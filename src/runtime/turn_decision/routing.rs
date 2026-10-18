@@ -795,6 +795,7 @@ fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     digest.update(b"router-history-snapshot-v1");
     digest.update(&read.source_sequence.to_be_bytes());
+    let mut encoded: Vec<[u8; 4]> = Vec::new();
     for row in &read.rows {
         digest.update(&row.source_sequence.to_be_bytes());
         digest.update(&row.terminal_sequence.to_be_bytes());
@@ -803,15 +804,10 @@ fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
             digest.update(text.as_bytes());
         }
         digest.update(&[u8::from(row.success)]);
-        // Preserve every v1 float bit while amortizing SHA update overhead.
-        // chunks(128) bounds encoded_len by this fixed 512-byte buffer.
-        let mut bytes = [0_u8; 512];
-        for values in row.embedding.chunks(128) {
-            for (slot, value) in bytes.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
-                *slot = value.to_le_bytes();
-            }
-            digest.update(bytes.split_at(values.len() * 4).0);
-        }
+        // Reuse one bounded row buffer; preserve the exact v1 float bits.
+        encoded.clear();
+        encoded.extend(row.embedding.iter().map(|value| value.to_le_bytes()));
+        digest.update(encoded.as_flattened());
     }
     let result = digest.finish();
     let mut bytes = [0_u8; 32];
