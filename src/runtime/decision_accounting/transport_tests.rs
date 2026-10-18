@@ -128,7 +128,7 @@ fn reply(usage: Option<Value>) -> Value {
     }
     value
 }
-fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
+pub(super) fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
     std::fs::read_to_string(workspace.join("state/costs.reservations.jsonl"))?
         .lines()
         .map(|line| serde_json::from_str(line).map_err(Into::into))
@@ -540,6 +540,13 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
                     )
                     .await;
                     assert!(denied.is_err(), "unknown liability cannot fund another send");
+                }
+                if let Some(remaining) = scope.remaining.get() {
+                    let _persisted = remaining.settlement_gate.lock().await;
+                    anyhow::ensure!(
+                        !remaining.settlement_failed.load(Ordering::Acquire),
+                        "usage persistence failed"
+                    );
                 }
                 let rows = journal(workspace.path())?;
                 let reserved: BTreeSet<_> = rows

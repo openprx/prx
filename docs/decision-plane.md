@@ -162,8 +162,15 @@ closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
-Actual usage above the estimate is recorded in full. Missing, partial or estimated
-usage retains the pending token and money liability; cancellation does not turn
+Actual usage above the estimate is recorded in full. Known usage updates the
+local budget while cleanup owns its durable settlement in the background, so
+semantic admission can overlap the ledger sync and reconciliation. The durable
+dispatched hold stays in place until both writes finish. Another physical send
+waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
+retains its serialization gate from reservation through transport and settlement,
+so handing reported usage to persistence cannot suspend behind another request.
+A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
+or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
 fingerprinted request state. A priced direct Answer has zero extra execution

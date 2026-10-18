@@ -2,7 +2,7 @@
 //! tool, provider, or source authority; callers validate their ingress first.
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
@@ -19,12 +19,13 @@ use crate::cost::{
 use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
 use crate::decision::protocol::DecisionUsage;
 use crate::decision::{DecisionError, DecisionKey, KeyDomain};
-use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
+use crate::llm::route_decision::{TokenUsageSource, UsagePrice, usage_cost_resolution};
 
 #[cfg(test)]
 pub(crate) mod timing;
 
 mod output_allowance;
+mod settlement;
 
 #[cfg(feature = "llm-router")]
 mod cl100k_prefix_bound;
@@ -44,10 +45,23 @@ pub(crate) struct AccountingScope {
 struct RemainingBudgets {
     tokens: AtomicU64,
     micro_usd: AtomicU64,
+    settlement_gate: Arc<tokio::sync::Mutex<()>>,
+    settlement_failed: AtomicBool,
 }
 
 impl AccountingScope {
     pub(crate) fn remaining_budgets(&self) -> TurnBudgets {
+        if self
+            .remaining
+            .get()
+            .is_some_and(|owner| owner.settlement_failed.load(Ordering::Acquire))
+        {
+            return TurnBudgets {
+                tokens: 0,
+                micro_usd: 0,
+                latency_ms: 0,
+            };
+        }
         TurnBudgets {
             tokens: self
                 .remaining
@@ -177,8 +191,19 @@ impl AccountingScope {
             Arc::new(RemainingBudgets {
                 tokens: AtomicU64::new(self.budgets.tokens),
                 micro_usd: AtomicU64::new(self.budgets.micro_usd),
+                settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
+                settlement_failed: AtomicBool::new(false),
             })
         }));
+        // A later physical attempt must observe the prior durable settlement.
+        // Semantic admission may meanwhile use the already known actual usage.
+        let settlement_guard =
+            tokio::time::timeout_at(deadline.into(), Arc::clone(&remaining.settlement_gate).lock_owned())
+                .await
+                .map_err(|_| DecisionError::BudgetExceeded)?;
+        if remaining.settlement_failed.load(Ordering::Acquire) {
+            return Err(DecisionError::BudgetExceeded);
+        }
         let planned = u64::from(attempt.remaining_attempts);
         if !(1..=2).contains(&planned) || (auxiliary && planned != 1) {
             return Err(DecisionError::BudgetExceeded);
@@ -321,6 +346,7 @@ impl AccountingScope {
                 // state are durable. Unknown send/usage retains the liability.
                 restore_tokens = false;
                 Ok(OwnedReceipt {
+                    _settlement_guard: settlement_guard,
                     tracker,
                     receipt,
                     config,
@@ -427,6 +453,7 @@ impl Drop for UnclaimedReceipt {
 }
 
 pub(super) struct OwnedReceipt {
+    _settlement_guard: tokio::sync::OwnedMutexGuard<()>,
     tracker: CostTracker,
     receipt: ReservationReceipt,
     config: Arc<Config>,
@@ -465,80 +492,6 @@ impl DecisionAttemptReceipt for OwnedReceipt {
             source: TokenUsageSource::Reported,
             ..crate::llm::route_decision::TokenUsage::default()
         })
-        .await
-    }
-}
-
-impl OwnedReceipt {
-    pub(super) async fn settle_provider_usage(
-        mut self: Box<Self>,
-        usage: crate::llm::route_decision::TokenUsage,
-    ) -> Result<(), DecisionError> {
-        if usage.source != TokenUsageSource::Reported {
-            return Ok(());
-        }
-        let (Some(input), Some(output)) = (usage.prompt_tokens, usage.completion_tokens) else {
-            // Durable Dispatched is deliberately retained, including its whole
-            // token and monetary estimate. Unknown usage is never zero.
-            return Ok(());
-        };
-        let ticket = self.ticket.take().ok_or(DecisionError::Cancelled)?;
-        let work = tokio::task::spawn_blocking(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let input = u64::from(input);
-                let output = u64::from(output);
-                let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
-                let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-                let UsagePrice::Priced(cost) = usage_cost_resolution(
-                    &self.provider,
-                    &self.model,
-                    input,
-                    output,
-                    cache_write,
-                    cache_read,
-                    &self.config.cost,
-                ) else {
-                    anyhow::bail!("decision usage has no valid pinned PMM price");
-                };
-                let total = input + output;
-                let record = MeteredTokenUsageRecord {
-                    settlement_id: Some(self.receipt.attempt_id().to_owned()),
-                    provider: crate::providers::redact_endpoint_userinfo(&self.provider).into_owned(),
-                    model: self.model.clone(),
-                    prompt_tokens: input,
-                    completion_tokens: output,
-                    total_tokens: total,
-                    cache_creation_input_tokens: cache_write,
-                    cache_read_input_tokens: cache_read,
-                    source: TokenUsageSource::Reported,
-                    cost_usd: Some(cost),
-                };
-                self.tracker.settle_metered(&record)?;
-                self.tracker.reconcile_estimated_attempt(&self.receipt, &record)?;
-                let actual_micro_usd = crate::cost::tracker::ceil_micro_usd(cost)?;
-                if actual_micro_usd <= u128::from(self.reserved_micro_usd) {
-                    self.remaining.micro_usd.fetch_add(
-                        self.reserved_micro_usd - u64::try_from(actual_micro_usd)?,
-                        Ordering::AcqRel,
-                    );
-                } else {
-                    let excess =
-                        u64::try_from(actual_micro_usd - u128::from(self.reserved_micro_usd)).unwrap_or(u64::MAX);
-                    let _ = self
-                        .remaining
-                        .micro_usd
-                        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                            Some(value.saturating_sub(excess))
-                        });
-                }
-
-                reconcile_token_allowance(&self.remaining.tokens, self.reserved_tokens, total);
-                Ok(())
-            })();
-            ticket.finish(result.is_ok());
-            result.map_err(|_| DecisionError::BudgetExceeded)
-        });
-        work.await.map_err(|_| DecisionError::BudgetExceeded)?
     }
 }
 
