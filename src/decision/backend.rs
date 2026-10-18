@@ -30,6 +30,13 @@ pub trait DecisionBackend: Send + Sync {
     /// Which model claims the validator accepts from this backend.
     fn version_policy(&self) -> ModelVersionPolicy;
 
+    /// Whether the backend independently enforces its configured transport
+    /// timeout. Such backends may use the manifest deadline for source-owned
+    /// accounting while their network client retains the narrower I/O bound.
+    fn bounds_transport_independently(&self) -> bool {
+        false
+    }
+
     /// Answer `request` before `deadline`, sending exactly `body`: the
     /// bytes the outbound guard checked (D-079 M-3). A backend never
     /// re-encodes the request; it may use the request to decode the answer.

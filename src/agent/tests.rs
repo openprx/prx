@@ -599,11 +599,6 @@ async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup()
         .with_hint_config(&config)
         .with_reliability(config.reliability.clone())
         .with_multimodal_config(config.multimodal.clone())
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
         .with_shared_memory(Arc::clone(&memory))
         .with_event_recording(config.memory.event_recording_config());
     let (parent, parent_requests) = NativeScriptedProvider::new(vec![
@@ -711,7 +706,6 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
         Arc::clone(&security),
         workspace.path().to_path_buf(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         HashMap::new(),
         None,
         crate::providers::provider_runtime_options_from_config(&config),

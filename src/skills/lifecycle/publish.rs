@@ -74,6 +74,13 @@ pub(super) mod crash_hooks {
 
     thread_local! {
         static ARMED: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+        static ACTION: RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `action` once, on this thread, when execution reaches `point`
+    /// (to move the world between two steps of a transition).
+    pub(in crate::skills::lifecycle) fn run_at(point: &'static str, action: Box<dyn FnOnce()>) {
+        ACTION.with(|a| *a.borrow_mut() = Some((point, action)));
     }
 
     pub(in crate::skills::lifecycle) fn arm(point: &'static str) {
@@ -94,6 +101,17 @@ pub(super) mod crash_hooks {
                 .and_then(|v| v.parse::<u64>().ok())
         {
             std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        let due = ACTION.with(|a| {
+            let mut slot = a.borrow_mut();
+            if slot.as_ref().is_some_and(|(armed, _)| *armed == point) {
+                slot.take().map(|(_, action)| action)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = due {
+            action();
         }
         let hit = ARMED.with(|a| a.borrow().is_some_and(|armed| armed == point));
         if hit {
@@ -323,6 +341,11 @@ impl SkillLifecycleStore {
     /// the binding carries the transaction, the mutation is live and the
     /// caller must be told so (spec 8.3 step 8).
     fn classify_failure(&self, skill: &SkillId, entry: &JournalEntry, source: LifecycleError) -> LifecycleError {
+        // The rename may be visible but not yet durable; read the binding only
+        // after the directory was flushed.
+        if let Err(e) = sync_dir(&self.root().join(super::generation::ACTIVE_DIR)) {
+            tracing::warn!(error = %e, "failed to sync the active binding directory before classifying a failure");
+        }
         match self.active_binding(skill) {
             Ok(Some(b)) if (&b.transaction_id, b.generation) == (&entry.transaction_id, entry.new_generation) => {
                 LifecycleError::CommittedRepairRequired {
@@ -494,5 +517,5 @@ fn staged_file_skill(name: &str) -> Option<SkillId> {
     const UUID_LEN: usize = 36;
     let middle = name.strip_prefix(ATOMIC_PREFIX)?.strip_suffix(ATOMIC_SUFFIX)?;
     let skill = middle.get(..middle.len().checked_sub(UUID_LEN + 1)?)?;
-    SkillId::parse(skill).ok()
+    SkillId::parse(skill).ok().or_else(|| SkillId::reserved(skill))
 }

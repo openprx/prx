@@ -503,11 +503,16 @@ pub(super) async fn run_channel_turn(
     let preflight = if vision_required {
         if let Some(scope) = vision_scope.as_ref() {
             let provider = scope.accounting.provider();
+            let model = scope.accounting.selected_model().model();
+            let adapter = provider.capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = providers::selection::catalog_for(&config_generation.effective)
+                .effective_provider_capabilities(scope.accounting.selected_model().provider_label(), model, adapter);
             run_signal_vision_preflight(
                 SignalVisionProvider {
                     provider: provider.as_ref(),
-                    model: scope.accounting.selected_model().model(),
+                    model,
                     temperature: runtime_defaults.temperature,
+                    capabilities,
                 },
                 &msg,
                 &message_runtime.multimodal,

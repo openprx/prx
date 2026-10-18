@@ -12,7 +12,7 @@ pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
 
-use super::branch::{CandidateId, CapabilityRef, CapabilityTarget, CausalActionKind, CausalCandidate};
+use super::branch::{CandidateId, CapabilityRef, CausalActionKind, CausalCandidate};
 use super::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, is_retrieval_source,
 };
@@ -427,7 +427,7 @@ impl EngineDecision {
             return Err(RetrievalIssueError);
         }
         let (family, reference) = self.selected_retrieval(catalog, context, source_query)?;
-        if family != CapabilityTarget::Memory {
+        if family != super::branch::CapabilityTarget::Memory {
             return Err(RetrievalIssueError);
         }
         let parts = self.state.trusted.parts();
@@ -1083,12 +1083,13 @@ impl CausalDecisionEngine {
                     &selection_evidence,
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(
+                    &selector_context_for_config(
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
                         resume_target,
                         inputs.discovered_refs,
+                        inputs.config.enabled,
                     ),
                     &inputs.config.evaluation,
                     inputs.key,
@@ -1102,12 +1103,13 @@ impl CausalDecisionEngine {
                         &selection_evidence,
                         &pre_commit,
                         &inputs.config.policy,
-                        &selector_context(
+                        &selector_context_for_config(
                             &candidates,
                             inputs.catalog,
                             trusted.delivery.interactive,
                             resume_target,
                             inputs.discovered_refs,
+                            inputs.config.enabled,
                         ),
                     )?,
                     BTreeMap::new(),
@@ -1121,12 +1123,13 @@ impl CausalDecisionEngine {
                     &empty_evidence(),
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(
+                    &selector_context_for_config(
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
                         resume_target,
                         inputs.discovered_refs,
+                        inputs.config.enabled,
                     ),
                 )?,
                 BTreeMap::new(),
@@ -1142,12 +1145,13 @@ impl CausalDecisionEngine {
                 &terminal_evidence(&candidates),
                 &pre_commit,
                 &inputs.config.policy,
-                &selector_context(
+                &selector_context_for_config(
                     &candidates,
                     inputs.catalog,
                     trusted.delivery.interactive,
                     resume_target,
                     inputs.discovered_refs,
+                    inputs.config.enabled,
                 ),
             )?;
             exploration_propensities.clear();
@@ -1473,10 +1477,15 @@ fn candidate_is_direct(
     })
 }
 
-fn exact_candidate_without_discovery_is_current(candidate: &CausalCandidate, catalog: &CatalogView<'_>) -> bool {
+fn exact_candidate_without_discovery_is_current(
+    candidate: &CausalCandidate,
+    catalog: &CatalogView<'_>,
+    include_discoverable_families: bool,
+) -> bool {
     candidate.action() == CausalActionKind::UseTool
         && candidate.required_capabilities().len() == 1
-        && !super::candidate_generator::DiscoveryFamilies::supports(candidate.target())
+        && (include_discoverable_families
+            || !super::candidate_generator::DiscoveryFamilies::supports(candidate.target()))
         && candidate.required_capabilities().iter().all(|reference| {
             catalog.entry_any(&reference.id).is_some_and(|entry| {
                 matches!(entry.exposure, Exposure::Searchable)
@@ -1515,7 +1524,7 @@ fn selector_context(
                     // stale, excluded, compound, or discoverable-family ref
                     // direct.
                     || (exact_mentions.contains(candidate.candidate_id())
-                        && exact_candidate_without_discovery_is_current(candidate, catalog))
+                        && exact_candidate_without_discovery_is_current(candidate, catalog, false))
                     || candidate_is_direct(candidate, catalog, resume_target, discovered_refs)
             })
             .map(|candidate| candidate.candidate_id().clone())
@@ -1527,6 +1536,42 @@ fn selector_context(
         direct_candidates,
         discovery_completed: discovered_refs.iter().next().is_some(),
     }
+}
+
+fn selector_context_for_config(
+    set: &CandidateSet,
+    catalog: &CatalogView<'_>,
+    interactive: bool,
+    resume_target: Option<&CapabilityRef>,
+    discovered_refs: &DiscoveredRefs,
+    decision_enabled: bool,
+) -> SelectorContext {
+    let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
+    if decision_enabled {
+        return context;
+    }
+    let CandidateSet::Legal {
+        candidates,
+        exact_mentions,
+        ..
+    } = set
+    else {
+        return context;
+    };
+    // With the decision plane explicitly disabled there is no discovery hop
+    // to authorize. Preserve legacy exact-name publication by treating only
+    // the named current searchable ref as direct; all ordinary hard gates
+    // have already passed and stale, excluded, or compound refs stay out.
+    context.direct_candidates.extend(
+        candidates
+            .iter()
+            .filter(|candidate| {
+                exact_mentions.contains(candidate.candidate_id())
+                    && exact_candidate_without_discovery_is_current(candidate, catalog, true)
+            })
+            .map(|candidate| candidate.candidate_id().clone()),
+    );
+    context
 }
 
 fn empty_evidence() -> PredictionEvidence {
@@ -2665,6 +2710,24 @@ mod tests {
                 .direct_candidates
                 .is_empty()
         );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.insert(use_id.clone());
+        }
+        assert!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), true,)
+                .direct_candidates
+                .is_empty(),
+            "an enabled decision plane must discover an exact discoverable-family tool"
+        );
+        assert_eq!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), false,)
+                .direct_candidates,
+            BTreeSet::from([use_id.clone()]),
+            "disabled mode preserves legacy exact-name publication without widening peers"
+        );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.clear();
+        }
         assert_eq!(
             selector_context(&available_set, &view, true, None, &selected_refs).direct_candidates,
             BTreeSet::from([use_id])

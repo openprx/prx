@@ -668,11 +668,6 @@ pub fn all_tools_with_runtime_ext_and_extensions(
             .with_parent_tools(parent_tools)
             .with_reliability(root_config.reliability.clone())
             .with_multimodal_config(root_config.multimodal.clone())
-            .with_compaction_resolver(crate::router::CompactionResolver::new(
-                root_config.agent.compaction.clone(),
-                root_config.router.clone(),
-                root_config.model_routes.clone(),
-            ))
             .with_shared_memory(Arc::clone(&memory))
             .with_event_recording(root_config.memory.event_recording_config());
         tool_arcs.push(Arc::new(delegate_tool));

@@ -32,7 +32,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let provider_runtime_options = crate::providers::provider_runtime_options_from_config(&config);
 
     let availability = crate::providers::summarize_provider_availability(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        crate::providers::selection::default_provider(&config),
         config.api_key.as_deref(),
         &config.reliability,
         &provider_runtime_options,

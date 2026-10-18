@@ -485,6 +485,7 @@ pub async fn start_channels_with_config(
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
+            #[cfg(test)]
             Arc::clone(&provider),
             &provider_name,
             &resolved_default_model(&config),
@@ -492,22 +493,14 @@ pub async fn start_channels_with_config(
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)
-        .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver))
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool
@@ -560,7 +553,7 @@ pub async fn start_channels_with_config(
                 security.clone(),
                 config.multimodal.clone(),
             )
-            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver), &turn_provider_name),
+            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver)),
         ));
 
         tools_list.push(Box::new(spawn_tool));

@@ -789,14 +789,23 @@ mod tests {
         assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
         let reloaded = Config::load_from_path(&config_path, tmp.path().join("workspace")).unwrap();
         assert_eq!(reloaded.causal_tree, causal);
-        assert_eq!(reloaded.causal_tree.schema_version, 1);
+        assert_eq!(
+            reloaded.causal_tree.schema_version,
+            crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+        );
         let mut stored = tokio::fs::read_to_string(&config_path).await.unwrap();
         if let Ok(entries) = std::fs::read_dir(tmp.path().join("config.d")) {
             for entry in entries.flatten() {
                 stored.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
             }
         }
-        assert!(stored.contains("schema_version = 1"), "{stored}");
+        assert!(
+            stored.contains(&format!(
+                "schema_version = {}",
+                crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+            )),
+            "{stored}"
+        );
     }
 
     /// CDP-04 (V6.07 `config.patch` half, SP-CDP-A 5.4): a model never

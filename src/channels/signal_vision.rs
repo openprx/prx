@@ -85,6 +85,7 @@ pub(super) struct SignalVisionProvider<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) model: &'a str,
     pub(super) temperature: f64,
+    pub(super) capabilities: crate::providers::ProviderCapabilities,
 }
 
 pub(super) struct SignalVisionScope {
@@ -104,6 +105,7 @@ pub(super) async fn run_signal_vision_preflight(
         provider,
         model,
         temperature,
+        capabilities,
     } = target;
     if !is_signal_image_message(msg) {
         return SignalVisionPreflightOutcome::NotRequired;
@@ -116,10 +118,7 @@ pub(super) async fn run_signal_vision_preflight(
     else {
         return fallback("auxiliary vision source or accounting admission refused");
     };
-    if !provider
-        .capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-        .vision
-    {
+    if !capabilities.vision {
         return fallback("auxiliary vision unsupported by selected provider");
     }
     let deadline = tokio::time::Instant::from_std(accounting.deadline());

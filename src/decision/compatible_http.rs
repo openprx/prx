@@ -483,6 +483,10 @@ impl DecisionBackend for CompatibleHttpBackend {
         self.version_policy.clone()
     }
 
+    fn bounds_transport_independently(&self) -> bool {
+        true
+    }
+
     async fn evaluate(
         &self,
         request: &DecisionRequest,

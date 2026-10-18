@@ -680,7 +680,7 @@ mod tests {
                     let tool = SessionsSpawnTool::new(
                         Arc::new(SilentChannel), Arc::clone(&provider), "ollama", "prx-gateway-parent", 0.0,
                         Arc::clone(&security), workspace.to_path_buf(), config.multimodal.clone(),
-                        config.agent.compaction.clone(), std::collections::HashMap::new(), None,
+                        std::collections::HashMap::new(), None,
                         crate::providers::provider_runtime_options_from_config(config), config.sessions_spawn.clone(),
                     ).with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
                         .with_model_catalog(catalog).with_hint_config(config).with_shared_memory(Arc::clone(&memory))
@@ -977,7 +977,6 @@ mod tests {
                 security,
                 workspace.to_path_buf(),
                 crate::config::MultimodalConfig::default(),
-                crate::config::AgentCompactionConfig::default(),
                 std::collections::HashMap::new(),
                 None,
                 crate::providers::ProviderRuntimeOptions::default(),

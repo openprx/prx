@@ -456,7 +456,7 @@ async fn run_case_work(
     config.default_provider = Some("ollama".into());
     config.default_model = Some(MODEL.into());
     config.providers.models.push(toml::from_str(&format!(
-        "provider = \"ollama\"\nmodel = \"{MODEL}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+        "provider = \"ollama\"\nmodel = \"{MODEL}\"\noperations = [\"chat\"]\nnative_tools = true\ncontext_window = 65536\n"
     ))?);
     let resolved = crate::providers::selection::check(
         &config,
@@ -692,6 +692,19 @@ async fn decision_reply(
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     calls.fetch_add(1, Ordering::SeqCst);
+    let filesystem = body
+        .pointer("/state/candidates")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate.get("action").and_then(serde_json::Value::as_str) == Some("use_tool")
+                    && candidate.get("target").and_then(serde_json::Value::as_str) == Some("filesystem")
+            })
+        });
+    assert!(
+        filesystem,
+        "the counted decision request must take the filesystem candidate branch"
+    );
     decision_answers(&body).map_or_else(
         |_| StatusCode::BAD_REQUEST.into_response(),
         |response| axum::Json(response).into_response(),

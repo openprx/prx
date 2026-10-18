@@ -1042,6 +1042,9 @@ pub struct ModelEntry {
     pub source: String,
     /// When the catalog the evidence came from was fetched.
     pub fetched_at_unix: Option<u64>,
+    /// Present when the embedded release catalog still permits this model but
+    /// recommends migration to an active row.
+    pub lifecycle_warning: Option<String>,
 }
 
 /// The operation named `text` (`chat`, `embedding`, `decision_endpoint`, ...).
@@ -1081,6 +1084,11 @@ fn model_entry_of(catalog: &crate::providers::catalog::CatalogView, provider: &s
     let id = ProviderId::of(provider);
     let descriptor = catalog.describe(&id, model);
     let features = &descriptor.features;
+    let lifecycle_warning = catalog
+        .release_catalog()
+        .ok()
+        .and_then(|release| release.model(&id, model))
+        .and_then(crate::providers::catalog::ReleaseModel::selection_warning);
     ModelEntry {
         provider: shown(provider),
         identity: redact_provider_text(&id.to_string()),
@@ -1109,6 +1117,7 @@ fn model_entry_of(catalog: &crate::providers::catalog::CatalogView, provider: &s
             DescriptorSource::Discovery { fetched_at_unix } => Some(*fetched_at_unix),
             _ => None,
         },
+        lifecycle_warning,
     }
 }
 

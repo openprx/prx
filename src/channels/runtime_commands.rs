@@ -74,10 +74,7 @@ pub(super) fn resolved_default_provider(config: &Config) -> String {
 }
 
 pub(super) fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    providers::selection::default_model(config).to_string()
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {

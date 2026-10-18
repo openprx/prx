@@ -17,6 +17,7 @@ use super::{DescriptorSource, FeatureSet, ModelDescriptor, ModelOperation, Suppo
 use crate::providers::ProviderId;
 
 const EMBEDDED_CATALOG_JSON: &str = include_str!("../../../catalog/models.json");
+static EMBEDDED_CATALOG: OnceLock<Result<Arc<ReleaseCatalog>, ReleaseCatalogError>> = OnceLock::new();
 #[cfg(test)]
 const EMBEDDED_CATALOG_SCHEMA: &str = include_str!("../../../catalog/models.schema.json");
 const SUPPORTED_SCHEMA_MAJOR: u64 = 1;
@@ -178,6 +179,10 @@ pub struct CatalogPriceTier {
     pub above_input_tokens: u64,
     pub input: f64,
     pub output: f64,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
 }
 
 /// Per-million-token prices shipped by a release.
@@ -246,10 +251,14 @@ impl CatalogParameter {
 }
 
 /// Router hints associated with one model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogRouterHints {
     pub categories: Vec<String>,
+    /// Router ranking cost per million tokens. This is deliberately separate
+    /// from [`CatalogPricing`]: routing may use a stable comparative estimate,
+    /// while billing and G6 admission require the full input/output tariff.
+    pub cost_per_million_tokens: f64,
     pub latency_ms: u32,
     pub quality_rank: u32,
 }
@@ -299,10 +308,27 @@ pub struct ReleaseModel {
 }
 
 impl ReleaseModel {
+    /// Whether this row is eligible to anchor a release default.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
+    }
+
     /// Whether this row can be offered for a new selection.
     #[must_use]
     pub fn is_listed(&self) -> bool {
-        self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
+        self.lifecycle.status != ModelLifecycleStatus::Retired && self.api_model != "*"
+    }
+
+    /// A lifecycle warning shown beside a still-selectable deprecated row.
+    #[must_use]
+    pub fn selection_warning(&self) -> Option<String> {
+        (self.lifecycle.status == ModelLifecycleStatus::Deprecated).then(|| {
+            self.lifecycle.replacement.as_deref().map_or_else(
+                || "deprecated; select an active model when possible".to_owned(),
+                |replacement| format!("deprecated; use {replacement}"),
+            )
+        })
     }
 
     /// Whether this model performs the requested operation.
@@ -314,6 +340,16 @@ impl ReleaseModel {
             .map(ModelOperation::from)
             .any(|item| item == operation)
     }
+}
+
+fn model_spelling_matches(catalog_model: &str, selected: &str) -> bool {
+    catalog_model.eq_ignore_ascii_case(selected)
+        || selected.get(..catalog_model.len()).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(catalog_model)
+                && selected
+                    .get(catalog_model.len()..)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        })
 }
 
 /// Provider display and default-selection metadata.
@@ -375,8 +411,7 @@ impl ReleaseCatalog {
     /// The shipped document is invalid. Release CI treats that as a build
     /// defect; callers receive the typed failure instead of using partial data.
     pub fn embedded() -> Result<Arc<Self>, ReleaseCatalogError> {
-        static CATALOG: OnceLock<Result<Arc<ReleaseCatalog>, ReleaseCatalogError>> = OnceLock::new();
-        CATALOG
+        EMBEDDED_CATALOG
             .get_or_init(|| {
                 Self::from_json(EMBEDDED_CATALOG_JSON).map(|catalog| {
                     for warning in catalog.warnings() {
@@ -386,6 +421,23 @@ impl ReleaseCatalog {
                 })
             })
             .clone()
+    }
+
+    /// The one catalog compiled into this binary, borrowed for process-wide
+    /// default and policy lookups that must not copy model facts into Rust.
+    pub fn embedded_ref() -> Result<&'static Self, ReleaseCatalogError> {
+        EMBEDDED_CATALOG
+            .get_or_init(|| {
+                Self::from_json(EMBEDDED_CATALOG_JSON).map(|catalog| {
+                    for warning in catalog.warnings() {
+                        tracing::warn!(warning, "embedded model catalog warning");
+                    }
+                    Arc::new(catalog)
+                })
+            })
+            .as_ref()
+            .map(Arc::as_ref)
+            .map_err(Clone::clone)
     }
 
     /// Forward-compatibility warnings collected while loading.
@@ -407,13 +459,17 @@ impl ReleaseCatalog {
         let selected = selected.trim();
         self.models.iter().find(|model| {
             model.provider.eq_ignore_ascii_case(provider)
-                && (model.api_model.eq_ignore_ascii_case(selected)
-                    || model.id.eq_ignore_ascii_case(selected)
-                    || model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(selected)))
+                && (model_spelling_matches(&model.api_model, selected)
+                    || model_spelling_matches(&model.id, selected)
+                    || model
+                        .aliases
+                        .iter()
+                        .any(|alias| model_spelling_matches(alias, selected)))
         })
     }
 
-    /// Active chat models offered for one provider, with its release default first.
+    /// Active and deprecated chat models offered for one provider, with its
+    /// release default first. Retired rows remain hidden.
     #[must_use]
     pub fn listed_models(&self, provider: &str) -> Vec<&ReleaseModel> {
         let Some(provider) = self.provider_name(provider) else {
@@ -448,6 +504,21 @@ impl ReleaseCatalog {
         self.models
             .iter()
             .find(|model| model.id.eq_ignore_ascii_case(default))
+            .map(|model| model.api_model.as_str())
+    }
+
+    /// The release-wide default provider.
+    #[must_use]
+    pub fn default_provider(&self) -> &str {
+        &self.defaults.provider
+    }
+
+    /// The release-wide default in the API-model spelling used by config.
+    #[must_use]
+    pub fn global_default_model(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|model| model.id.eq_ignore_ascii_case(&self.defaults.model))
             .map(|model| model.api_model.as_str())
     }
 
@@ -576,7 +647,7 @@ impl ReleaseCatalog {
             if name.trim().is_empty()
                 || provider.display_name.trim().is_empty()
                 || default_model.is_none()
-                || default_model.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
+                || default_model.is_some_and(|model| !model.is_active() || !model.supports(ModelOperation::Chat))
                 || !provider.default_model.starts_with(&format!("{name}/"))
             {
                 return Err(ReleaseCatalogError::new(
@@ -590,7 +661,7 @@ impl ReleaseCatalog {
             .find(|model| model.id.eq_ignore_ascii_case(&self.defaults.model));
         if !self.providers.contains_key(&self.defaults.provider)
             || global_default.is_none()
-            || global_default.is_some_and(|model| !model.is_listed() || !model.supports(ModelOperation::Chat))
+            || global_default.is_some_and(|model| !model.is_active() || !model.supports(ModelOperation::Chat))
             || !self.defaults.model.starts_with(&format!("{}/", self.defaults.provider))
         {
             return Err(ReleaseCatalogError::new(
@@ -727,13 +798,18 @@ fn validate_model_shape(model: &ReleaseModel) -> Result<(), ReleaseCatalogError>
                     || tier.input < 0.0
                     || !tier.output.is_finite()
                     || tier.output < 0.0
+                    || tier.cache_write.is_some_and(|price| !price.is_finite() || price < 0.0)
+                    || tier.cache_read.is_some_and(|price| !price.is_finite() || price < 0.0)
             })
         {
             return Err(ReleaseCatalogError::new("catalog pricing is invalid"));
         }
     }
     if let Some(router) = &model.router
-        && (router.categories.is_empty() || router.latency_ms == 0)
+        && (router.categories.is_empty()
+            || !router.cost_per_million_tokens.is_finite()
+            || router.cost_per_million_tokens < 0.0
+            || router.latency_ms == 0)
     {
         return Err(ReleaseCatalogError::new("catalog router hints are invalid"));
     }
@@ -867,7 +943,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-16.2");
+        assert_eq!(catalog.revision, "2026-10-17.1");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -884,6 +960,109 @@ mod tests {
             assert!(model.levels.contains_key("low"), "{} lacks low", model.id);
             assert!(model.levels.contains_key("medium"), "{} lacks medium", model.id);
             assert!(model.levels.contains_key("high"), "{} lacks high", model.id);
+        }
+    }
+
+    #[test]
+    fn openai_release_tariffs_include_published_cached_and_long_context_rates() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        let provider = ProviderId::of("openai");
+        for (model, input, output, write, read) in [
+            ("gpt-4o", 2.5_f64, 10.0, 0.0, 1.25),
+            ("gpt-4o-mini", 0.15, 0.6, 0.0, 0.075),
+            ("gpt-5.2-codex", 1.75, 14.0, 0.0, 0.175),
+            ("gpt-5.6", 4.0, 20.0, 5.0, 0.4),
+            ("gpt-5.6-sol", 4.0, 20.0, 5.0, 0.4),
+            ("gpt-5.6-luna", 0.2, 1.2, 0.25, 0.02),
+            ("gpt-5.6-terra", 2.0, 12.0, 2.5, 0.2),
+            ("o1-preview", 15.0, 60.0, 0.0, 7.5),
+        ] {
+            let pricing = catalog
+                .model(&provider, model)
+                .expect("test: published OpenAI model")
+                .pricing
+                .as_ref()
+                .expect("test: published OpenAI tariff");
+            for (actual, expected) in [
+                (pricing.input, input),
+                (pricing.output, output),
+                (pricing.cache_write, write),
+                (pricing.cache_read, read),
+            ] {
+                assert!((actual - expected).abs() < 1e-9, "{model}: {actual} != {expected}");
+            }
+            if model.starts_with("gpt-5.6") {
+                assert_eq!(pricing.tiers.len(), 1);
+                let tier = pricing.tiers.first().expect("test: published long-context tier");
+                assert_eq!(tier.above_input_tokens, 272_000);
+                for (actual, expected) in [
+                    (tier.input, input * 2.0),
+                    (tier.output, output * 1.5),
+                    (
+                        tier.cache_write.expect("test: long-context cache-write rate"),
+                        write * 2.0,
+                    ),
+                    (
+                        tier.cache_read.expect("test: long-context cached-input rate"),
+                        read * 2.0,
+                    ),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "{model} long context: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_release_tariffs_pin_cached_input_and_the_long_context_threshold() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        let provider = ProviderId::of("gemini");
+        let lite = catalog
+            .model(&provider, "gemini-3.1-flash-lite")
+            .and_then(|model| model.pricing.as_ref())
+            .expect("test: published Flash-Lite tariff");
+        assert!((lite.input - 0.25).abs() < 1e-9);
+        assert!((lite.output - 1.5).abs() < 1e-9);
+        assert!((lite.cache_read - 0.025).abs() < 1e-9);
+        let pro = catalog
+            .model(&provider, "gemini-3.1-pro-preview")
+            .and_then(|model| model.pricing.as_ref())
+            .expect("test: published Pro tariff");
+        assert!((pro.input - 2.0).abs() < 1e-9);
+        assert!((pro.output - 12.0).abs() < 1e-9);
+        assert!((pro.cache_read - 0.2).abs() < 1e-9);
+        assert_eq!(pro.tiers.len(), 1);
+        let long = pro.tiers.first().expect("test: published long-context tariff");
+        assert_eq!(long.above_input_tokens, 200_000);
+        assert!((long.input - 4.0).abs() < 1e-9);
+        assert!((long.output - 18.0).abs() < 1e-9);
+        assert!((long.cache_read.expect("test: long-context cached input") - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unverified_legacy_tariffs_are_not_replaced_with_other_models_prices() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
+        for (provider, model) in [
+            ("anthropic", "claude-3-haiku"),
+            ("anthropic", "claude-3.5-sonnet"),
+            ("anthropic", "claude-haiku-3"),
+            ("gemini", "gemini-1.5-pro"),
+            ("gemini", "gemini-2.0-flash"),
+            ("moonshot", "kimi-k2.5"),
+            ("openrouter", "moonshotai/kimi-k2.5"),
+            ("xai", "grok-3"),
+        ] {
+            assert!(
+                catalog
+                    .model(&ProviderId::of(provider), model)
+                    .expect("test: retained model identity")
+                    .pricing
+                    .is_none(),
+                "{provider}/{model}: unverified tariff must remain absent"
+            );
         }
     }
 
@@ -953,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn listed_models_are_active_chat_rows_with_the_provider_default_first() {
+    fn listed_models_are_selectable_chat_rows_with_the_provider_default_first() {
         let catalog = ReleaseCatalog::embedded().expect("test: embedded catalog validates");
         let anthropic = catalog.listed_models("anthropic");
         assert_eq!(
@@ -968,7 +1147,7 @@ mod tests {
         assert!(
             anthropic
                 .iter()
-                .all(|model| model.lifecycle.status == ModelLifecycleStatus::Active)
+                .all(|model| model.lifecycle.status != ModelLifecycleStatus::Retired)
         );
         assert!(anthropic.iter().all(|model| model.supports(ModelOperation::Chat)));
 
@@ -981,6 +1160,86 @@ mod tests {
             openrouter.iter().all(|model| model.api_model != "typesafe/jev-1.13"),
             "a decision-only model must not be offered as a chat selection"
         );
+    }
+
+    #[test]
+    fn deprecated_chat_models_remain_selectable_with_a_replacement_warning() {
+        let document = minimal_catalog("gpt-fixture");
+        let mut value: Value = serde_json::from_str(&document).expect("test: catalog fixture JSON");
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: models array");
+        let mut deprecated = models.first().cloned().expect("test: first model");
+        let fields = deprecated.as_object_mut().expect("test: model object");
+        fields.insert("id".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        fields.insert("api_model".to_owned(), Value::String("gpt-legacy".to_owned()));
+        fields.insert("display_name".to_owned(), Value::String("Legacy fixture".to_owned()));
+        fields.insert(
+            "lifecycle".to_owned(),
+            serde_json::json!({
+                "status": "deprecated",
+                "deprecated_at": "2026-10-16T00:00:00Z",
+                "replacement": "openai/gpt-fixture"
+            }),
+        );
+        models.push(deprecated);
+        let catalog = ReleaseCatalog::from_json(&value.to_string()).expect("test: deprecated row validates");
+        let listed = catalog.listed_models("openai");
+        let model = listed
+            .into_iter()
+            .find(|model| model.id == "openai/gpt-legacy")
+            .expect("test: deprecated row stays listed");
+        assert_eq!(model.lifecycle.status, ModelLifecycleStatus::Deprecated);
+        assert_eq!(
+            model.selection_warning().as_deref(),
+            Some("deprecated; use openai/gpt-fixture")
+        );
+    }
+
+    #[test]
+    fn deprecated_models_cannot_anchor_provider_or_global_defaults() {
+        let document = minimal_catalog("gpt-fixture");
+        let mut value: Value = serde_json::from_str(&document).expect("test: catalog fixture JSON");
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .expect("test: models array");
+        let mut deprecated = models.first().cloned().expect("test: first model");
+        let fields = deprecated.as_object_mut().expect("test: model object");
+        fields.insert("id".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        fields.insert("api_model".to_owned(), Value::String("gpt-legacy".to_owned()));
+        fields.insert(
+            "lifecycle".to_owned(),
+            serde_json::json!({
+                "status": "deprecated",
+                "deprecated_at": "2026-10-16T00:00:00Z"
+            }),
+        );
+        models.push(deprecated);
+
+        let mut provider_default = value.clone();
+        provider_default
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("openai"))
+            .and_then(Value::as_object_mut)
+            .expect("test: openai provider object")
+            .insert(
+                "default_model".to_owned(),
+                Value::String("openai/gpt-legacy".to_owned()),
+            );
+        let refusal =
+            ReleaseCatalog::from_json(&provider_default.to_string()).expect_err("provider default must be active");
+        assert!(refusal.to_string().contains("provider has an invalid default model"));
+
+        value
+            .get_mut("defaults")
+            .and_then(Value::as_object_mut)
+            .expect("test: defaults object")
+            .insert("model".to_owned(), Value::String("openai/gpt-legacy".to_owned()));
+        let refusal = ReleaseCatalog::from_json(&value.to_string()).expect_err("global default must be active");
+        assert!(refusal.to_string().contains("catalog-wide provider/model default"));
     }
 
     #[test]
@@ -1002,6 +1261,30 @@ mod tests {
             DescriptorSource::Catalog {
                 revision: Arc::from("fixture.1")
             }
+        );
+    }
+
+    #[test]
+    fn model_matching_accepts_vendor_and_variant_spellings_without_wildcard_verification() {
+        let catalog = ReleaseCatalog::embedded().expect("test: embedded catalog validates");
+
+        assert!(
+            catalog
+                .model(&ProviderId::of("openrouter"), "moonshotai/kimi-k2.5:free")
+                .is_some(),
+            "an aggregator suffix keeps the base model's catalog facts"
+        );
+        assert!(
+            catalog
+                .model(&ProviderId::of("anthropic"), "anthropic/claude-sonnet-5")
+                .is_some(),
+            "a vendor/model spelling matches a direct-provider API model"
+        );
+        assert!(
+            catalog
+                .model(&ProviderId::of("ollama"), "prx-unknown-local-model")
+                .is_none(),
+            "the router-only Ollama wildcard must not verify every local model"
         );
     }
 
