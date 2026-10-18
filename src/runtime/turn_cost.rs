@@ -297,9 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn known_price_uses_pmm_model_and_unknown_price_stays_unestimated() {
+    fn g6_admits_release_catalog_price_without_a_config_override() {
         let config = crate::config::Config::default();
-        let model = model(&config, "openai", "gpt-4o");
+        assert!(config.cost.prices.is_empty(), "cost.prices is override-only");
+        let provider = crate::providers::selection::default_provider(&config);
+        let selected = crate::providers::selection::default_model(&config);
+        assert_eq!(provider, "openrouter");
+        assert_eq!(selected, "anthropic/claude-sonnet-5");
+        let model = model(&config, provider, selected);
         let catalog = empty_catalog();
         let view = catalog.view(&Default::default());
         let priced = build_cost_model(&view, &model, &config.cost, &BTreeMap::new());
@@ -310,16 +315,27 @@ mod tests {
         assert_eq!(cost.tokens, 128);
         assert!(cost.micro_usd > 0);
         assert_eq!(latency, default_latency_ms(CapabilityTarget::None));
+        assert!(
+            RuntimeCostModel::new(&model, &config, &BTreeMap::new())
+                .estimate_terminal()
+                .is_some()
+        );
+    }
 
-        let mut unknown = config;
-        unknown.cost.prices.clear();
-        let unpriced = build_cost_model(&view, &model, &unknown.cost, &BTreeMap::new());
+    #[test]
+    fn an_unknown_price_cannot_become_a_free_candidate() {
+        let config = crate::config::Config::default();
+        let model = model(&config, "openai", "prx-unlisted-model");
+        let catalog = empty_catalog();
+        let view = catalog.view(&Default::default());
+        let unpriced = build_cost_model(&view, &model, &config.cost, &BTreeMap::new());
+
         assert!(
             unpriced.estimates.is_empty(),
             "an unknown price cannot become a free candidate"
         );
         assert!(
-            RuntimeCostModel::new(&model, &unknown, &BTreeMap::new())
+            RuntimeCostModel::new(&model, &config, &BTreeMap::new())
                 .estimate_terminal()
                 .is_none()
         );

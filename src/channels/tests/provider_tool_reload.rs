@@ -7,6 +7,7 @@ use crate::config::{ConfigGeneration, ConfigGenerationParticipant, PreparedConfi
 use crate::tools::execution::{ToolExecutionCommand, ToolExecutionContext, ToolExecutionService};
 
 const MODEL: &str = "gpt-4o";
+const RELOADED_IMAGE_MODEL: &str = "prx-reloaded-vision";
 const PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 struct ReloadAck;
@@ -18,7 +19,10 @@ impl ConfigGenerationParticipant for ReloadAck {
     }
 
     fn supports_rebuild_field(&self, field: &str) -> bool {
-        matches!(field, "api_key" | "api_url")
+        matches!(
+            field,
+            "api_key" | "api_url" | "default_provider" | "default_model" | "default_temperature"
+        )
     }
 
     fn prepare(
@@ -44,7 +48,7 @@ impl PreparedConfigGeneration for PreparedReloadAck {
 
 struct ProviderEndpoint {
     url: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
     received: Arc<tokio::sync::Notify>,
     shutdown: tokio_util::sync::CancellationToken,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -64,7 +68,7 @@ impl ProviderEndpoint {
         let captured = Arc::clone(&requests);
         let notification = Arc::clone(&received);
         let app = axum::Router::new().fallback(axum::routing::any(
-            move |headers: axum::http::HeaderMap, _body: axum::body::Bytes| {
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
                 let captured = Arc::clone(&captured);
                 let notification = Arc::clone(&notification);
                 async move {
@@ -73,8 +77,9 @@ impl ProviderEndpoint {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
-                    captured.lock().push(authorization);
-                    notification.notify_waiters();
+                    let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    captured.lock().push((uri.path().to_owned(), authorization, body));
+                    notification.notify_one();
                     axum::Json(serde_json::json!({
                         "choices": [{
                             "index": 0,
@@ -103,8 +108,9 @@ impl ProviderEndpoint {
     }
 
     async fn wait_for_request(&self) {
+        let notified = self.received.notified();
         if self.requests.lock().is_empty() {
-            tokio::time::timeout(Duration::from_secs(10), self.received.notified())
+            tokio::time::timeout(Duration::from_secs(10), notified)
                 .await
                 .expect("reloaded provider request");
         }
@@ -187,6 +193,25 @@ fn apply_provider_reload(
     shared.pin()
 }
 
+fn apply_image_provider_reload(
+    shared: &crate::config::SharedConfig,
+    endpoint: &ProviderEndpoint,
+    key: &str,
+    provider: &str,
+) -> Arc<ConfigGeneration> {
+    let mut desired = shared.pin().effective.as_ref().clone();
+    desired.default_provider = Some(provider.to_owned());
+    desired.default_model = Some(RELOADED_IMAGE_MODEL.to_owned());
+    desired.default_temperature = 0.37;
+    desired.api_key = Some(key.to_owned());
+    desired.api_url = Some(endpoint.url.clone());
+    let report = shared
+        .apply_runtime_config(desired, crate::config::ConfigReloadTrigger::Test)
+        .expect("image provider/model hot reload");
+    assert_eq!(report.participant_acks, vec!["prx-provider-tool-reload"]);
+    shared.pin()
+}
+
 fn provider_resolver(
     shared: &crate::config::SharedConfig,
     generation: &Arc<ConfigGeneration>,
@@ -222,12 +247,58 @@ fn channel_message() -> traits::ChannelMessage {
     }
 }
 
+async fn wait_for_completed_marker(
+    runs: &Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
+    marker: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = runs.read().await.first().map(|run| run.status.clone());
+            match status {
+                Some(crate::tools::sessions_spawn::SubAgentStatus::Completed(output)) => {
+                    assert!(
+                        output.contains(marker),
+                        "spawn completed without the provider marker: {output}"
+                    );
+                    return;
+                }
+                Some(crate::tools::sessions_spawn::SubAgentStatus::Failed(error)) => {
+                    panic!("spawn failed before returning the provider marker: {error}");
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("spawn did not complete with the reloaded provider");
+}
+
 #[tokio::test]
 async fn image_uses_the_provider_owned_by_the_reloaded_generation() {
     let workspace = tempfile::tempdir().expect("image reload workspace");
     let first = ProviderEndpoint::start("startup image provider").await;
     let second = ProviderEndpoint::start("reloaded image provider").await;
-    let initial = provider_config(workspace.path(), &first, "prx-image-key-zero");
+    let reloaded_provider = format!("custom:{}", second.url);
+    let mut initial = provider_config(workspace.path(), &first, "prx-image-key-zero");
+    initial.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider": reloaded_provider,
+            "model": RELOADED_IMAGE_MODEL,
+            "operations": ["chat"],
+            "native_tools": true,
+            "vision_input": true
+        }))
+        .expect("reloaded image model declaration"),
+    );
+    initial.cost.prices.insert(
+        format!("{reloaded_provider}/{RELOADED_IMAGE_MODEL}"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
     let shared = crate::config::new_shared(initial);
     let initial_generation = shared.pin();
     let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadAck);
@@ -238,7 +309,7 @@ async fn image_uses_the_provider_owned_by_the_reloaded_generation() {
     )
     .expect("startup image provider");
     let resolver = provider_resolver(&shared, &initial_generation, Arc::clone(&startup_provider));
-    let generation = apply_provider_reload(&shared, &second, "prx-image-key-one");
+    let generation = apply_image_provider_reload(&shared, &second, "prx-image-key-one", &reloaded_provider);
     let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
     let image = crate::tools::ImageTool::new(
         startup_provider,
@@ -247,7 +318,7 @@ async fn image_uses_the_provider_owned_by_the_reloaded_generation() {
         Arc::clone(&security),
         generation.effective.multimodal.clone(),
     )
-    .with_pinned_provider_resolver(resolver, "openai");
+    .with_pinned_provider_resolver(resolver);
     let service = ToolExecutionService::with_security_policy(vec![Box::new(image)], security);
     let envelope = crate::runtime::envelope::RuntimeEnvelope::channel(
         workspace.path().to_string_lossy(),
@@ -273,9 +344,20 @@ async fn image_uses_the_provider_owned_by_the_reloaded_generation() {
     );
     assert!(outcome.model_content.contains("reloaded image provider"));
     assert!(first.requests.lock().is_empty(), "startup image provider was reused");
+    second.wait_for_request().await;
     let reloaded = second.requests.lock().clone();
-    assert_ne!(reloaded, Vec::<String>::new());
-    assert!(reloaded.iter().all(|header| header == "Bearer prx-image-key-one"));
+    let authenticated = reloaded
+        .iter()
+        .filter(|(path, authorization, body)| {
+            path.ends_with("/chat/completions") && !authorization.is_empty() && body.get("model").is_some()
+        })
+        .collect::<Vec<_>>();
+    assert!(!authenticated.is_empty(), "reloaded image chat request missing");
+    assert!(authenticated.iter().all(|(_, authorization, body)| {
+        authorization == "Bearer prx-image-key-one"
+            && body["model"] == RELOADED_IMAGE_MODEL
+            && body["temperature"] == 0.37
+    }));
     drop(participant);
     first.close().await;
     second.close().await;
@@ -296,7 +378,6 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         &providers::provider_runtime_options_from_config(&initial_generation.effective),
     )
     .expect("startup spawn provider");
-    let resolver = provider_resolver(&shared, &initial_generation, Arc::clone(&startup_provider));
     let generation = apply_provider_reload(&shared, &second, "prx-spawn-key-one");
     let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("spawn reload memory"));
@@ -309,17 +390,14 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         security,
         workspace.path().to_owned(),
         generation.effective.multimodal.clone(),
-        generation.effective.agent.compaction.clone(),
         generation.effective.agents_with_references().into_owned(),
         generation.effective.api_key.clone(),
         providers::provider_runtime_options_from_config(&generation.effective),
         generation.effective.sessions_spawn.clone(),
     )
-    .with_reliability(generation.effective.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&generation.effective))
     .with_model_catalog(providers::selection::catalog_for(&generation.effective))
     .with_hint_config(&generation.effective)
-    .with_pinned_provider_resolver(resolver)
     .with_shared_memory(Arc::clone(&memory));
     let runs = spawn.active_runs_arc();
     let tools_handle = spawn.tools_handle();
@@ -342,7 +420,7 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
                 .await
                 .expect("admitted spawn reload execution");
             assert!(outcome.success, "spawn reload rejected: {:?}", outcome.error);
-            second.wait_for_request().await;
+            wait_for_completed_marker(&runs, "reloaded spawn provider").await;
             Ok::<_, anyhow::Error>(())
         }))
         .await
@@ -358,9 +436,20 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
     }
     cleanup.run(async { Ok(()) }).await.expect("spawn reload cleanup");
     assert!(first.requests.lock().is_empty(), "startup spawn provider was reused");
+    second.wait_for_request().await;
     let reloaded = second.requests.lock().clone();
-    assert_ne!(reloaded, Vec::<String>::new());
-    assert!(reloaded.iter().all(|header| header == "Bearer prx-spawn-key-one"));
+    let authenticated = reloaded
+        .iter()
+        .filter(|(path, header, body)| {
+            path.ends_with("/chat/completions") && !header.is_empty() && body.get("model").is_some()
+        })
+        .collect::<Vec<_>>();
+    assert!(!authenticated.is_empty(), "reloaded spawn chat request missing");
+    assert!(
+        authenticated
+            .iter()
+            .all(|(_, header, body)| { header == "Bearer prx-spawn-key-one" && body["model"] == MODEL })
+    );
     drop(participant);
     first.close().await;
     second.close().await;

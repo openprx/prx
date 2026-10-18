@@ -19,25 +19,34 @@ use super::catalog::{
     decision_adapter,
 };
 use super::credentials::{ConfigCredentialSource, CredentialRef, LegacySlot};
-use super::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId};
+use super::{ProviderId, default_provider_for_unset};
 use crate::config::Config;
 use crate::decision::model_pin::is_unpinned_model;
 
 /// The model a surface runs when neither the selection nor `default_model`
-/// names one.
-pub const DEFAULT_MODEL_FOR_UNSET: &str = "anthropic/claude-sonnet-5";
+/// names one. The release catalog is the sole owner of that fact.
+#[must_use]
+pub fn default_model_for_unset<'a>() -> &'a str {
+    catalog::ReleaseCatalog::embedded_ref()
+        .ok()
+        .and_then(catalog::ReleaseCatalog::global_default_model)
+        .unwrap_or("")
+}
 
 /// The configured default provider, or the one an unset `default_provider`
 /// means.
 #[must_use]
 pub fn default_provider(config: &Config) -> &str {
-    config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET)
+    config
+        .default_provider
+        .as_deref()
+        .unwrap_or_else(default_provider_for_unset)
 }
 
 /// The configured default model, or the one an unset `default_model` means.
 #[must_use]
 pub fn default_model(config: &Config) -> &str {
-    config.default_model.as_deref().unwrap_or(DEFAULT_MODEL_FOR_UNSET)
+    config.default_model.as_deref().unwrap_or_else(default_model_for_unset)
 }
 
 /// The evidence a surface resolves against: the operator declarations in
@@ -1150,6 +1159,18 @@ mod tests {
         let text = error.to_string();
         assert!(!text.contains("whitespace"), "{text}");
         assert!(text.contains("hint:<name>"), "{text}");
+    }
+
+    #[test]
+    fn unset_model_default_is_owned_by_the_release_catalog() {
+        let catalog =
+            crate::providers::catalog::ReleaseCatalog::embedded().expect("test: embedded model catalog validates");
+        assert_eq!(
+            default_model_for_unset(),
+            catalog
+                .global_default_model()
+                .expect("test: release-wide model default")
+        );
     }
 
     #[test]

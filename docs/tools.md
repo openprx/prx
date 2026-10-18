@@ -234,8 +234,12 @@ completion to the original authenticated spawn input, preserving its source,
 owner, visibility and complete lineage. Worker model segments and worker-result
 events retain their separate worker scope. Logical terminal issuance and the
 final draft use the same original task identity; receipt, backend, signature and
-scope checks remain mandatory. This does not create a new grant or accept an
-unsigned completion. For a native issued child grant, a new child session is
+scope checks remain mandatory. Before transport, the runtime derives a strict
+sibling subset that omits `chat_schedule`, whose backend exists only in the
+interactive parent loop. The subset keeps the same authenticated parent,
+delegation depth, model binding and source proof; it does not mint another
+delegation. This does not create a new grant or accept an unsigned completion.
+For a native issued child grant, a new child session is
 derived from the authenticated parent session and the runtime-reserved child run
 ID before recording the input. The original parent session remains separate
 lineage. Ordinary and operator spawning retain their existing session behavior;
@@ -1104,6 +1108,11 @@ link-local, multicast, reserved, and legacy numeric-IP forms; applies
 `browser.allowed_domains` when configured; never follows redirects; and stops
 reading the response body at `http_request.max_response_size` rather than
 buffering an unlimited body before truncation.
+
+`web_fetch` rejects a hostname outside `browser.allowed_domains` before DNS
+resolution, so denied names do not cause resolver traffic. Local/private
+address literals remain blocked before the allowlist, and permitted names
+still undergo the private-address/DNS-rebinding check (including redirects).
 
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
 

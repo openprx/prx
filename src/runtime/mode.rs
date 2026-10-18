@@ -391,7 +391,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
+                crate::providers::redact_endpoint_userinfo(crate::providers::selection::default_provider(&config))
             );
             println!(
                 "   Model:         {}",

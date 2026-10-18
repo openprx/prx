@@ -484,6 +484,7 @@ impl CostTracker {
     }
 
     /// Reserve the versioned local estimate under the actual ledger lock.
+    #[cfg(test)]
     pub(crate) fn reserve_estimated_attempt(
         &self,
         request: super::reservation::EstimatedReservationRequest,
@@ -510,18 +511,65 @@ impl CostTracker {
         reservations.reserve_estimated(workspace, request, remaining)
     }
 
+    /// Append an estimated reservation and its dispatched state in one synced
+    /// batch under the actual ledger lock before a latency-bounded physical send.
+    pub(crate) fn reserve_dispatched_estimated_attempt(
+        &self,
+        request: super::reservation::EstimatedReservationRequest,
+        may_dispatch: impl FnOnce() -> bool,
+    ) -> Result<super::reservation::ReservationReceipt> {
+        let config = self.config.lock().clone();
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        let workspace = storage.workspace()?;
+        let mut reservations = super::reservation::Reservations::load(workspace)?;
+        let active = reservations.active_micro_usd()?;
+        let daily = storage
+            .daily_micro_usd
+            .checked_add(active)
+            .context("daily reserved cost overflows")?;
+        let monthly = storage
+            .monthly_micro_usd
+            .checked_add(active)
+            .context("monthly reserved cost overflows")?;
+        let remaining = floor_micro_usd(config.daily_limit_usd)?
+            .saturating_sub(daily)
+            .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
+            .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
+        anyhow::ensure!(may_dispatch(), "attempt deadline elapsed before durable dispatch");
+        reservations.reserve_dispatched_estimated(workspace, request, remaining)
+    }
+
+    /// Release a completed dispatch batch whose unique receipt has never been
+    /// handed to a transport. Dispatched/unknown transport receipts cannot use
+    /// this path; the runtime keeps them outside its unclaimed wrapper.
+    pub(crate) fn release_unclaimed_estimated_attempt(
+        &self,
+        receipt: &super::reservation::ReservationReceipt,
+    ) -> Result<()> {
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        let workspace = storage.workspace()?;
+        super::reservation::Reservations::load(workspace)?.release_unclaimed_estimated(workspace, receipt)
+    }
+
     /// Persist before initiating a physical send. This transition is one-use;
     /// a repeated call cannot authorize another physical attempt.
+    #[cfg(test)]
     pub(crate) fn mark_attempt_dispatched(&self, receipt: &super::reservation::ReservationReceipt) -> Result<()> {
         self.transition_reservation(receipt, true)
     }
 
     /// Explicitly release only a reservation that has never been dispatched.
     /// Dropping a receipt never releases potentially chargeable liability.
+    #[cfg(test)]
     pub(crate) fn release_unsent_attempt(&self, receipt: &super::reservation::ReservationReceipt) -> Result<()> {
         self.transition_reservation(receipt, false)
     }
 
+    #[cfg(test)]
     fn transition_reservation(&self, receipt: &super::reservation::ReservationReceipt, dispatch: bool) -> Result<()> {
         let config = self.config.lock().clone();
         let mut storage = self.lock_storage();
@@ -717,6 +765,10 @@ impl CostTracker {
         };
         let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
         cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
+        cost_record.settlement_provider = Some(record.provider.clone());
+        cost_record.settlement_source = Some(record.source);
+        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
+        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
         storage.add_record(cost_record.clone())?;
         drop(storage);
         self.lock_session_costs().push(cost_record);
@@ -909,6 +961,50 @@ fn settlement_fingerprint(
         cost_usd.to_bits(),
     ))?;
     Ok(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)))
+}
+
+/// Whether a stored settlement row carries the fingerprint the ledger derives
+/// for it. A row written with its settlement inputs (provider, source and cache
+/// counts) is checked exactly. An older row lacks them, so every split of the
+/// model string and both sources are tried with no cache tokens; a legacy row
+/// that settled cache usage does not verify (fail closed).
+pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
+    use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
+    let (Some(settlement_id), Some(digest)) = (row.settlement_id.as_deref(), row.settlement_sha256.as_deref()) else {
+        return false;
+    };
+    if settlement_id.trim().is_empty() {
+        return false;
+    }
+    let usage = &row.usage;
+    let matches = |provider: &str, model: &str, source: TokenUsageSource| {
+        let record = MeteredTokenUsageRecord {
+            settlement_id: Some(settlement_id.to_string()),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cache_creation_input_tokens: row.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: row.cache_read_input_tokens.unwrap_or(0),
+            source,
+            cost_usd: Some(usage.cost_usd),
+        };
+        settlement_fingerprint(&record, usage.cost_usd).is_ok_and(|expected| expected == digest)
+    };
+    if let (Some(provider), Some(source)) = (row.settlement_provider.as_deref(), row.settlement_source) {
+        return usage
+            .model
+            .strip_prefix(provider)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|model| matches(provider, model, source));
+    }
+    usage.model.match_indices('/').any(|(at, _)| {
+        let (provider, model) = usage.model.split_at(at);
+        [TokenUsageSource::Reported, TokenUsageSource::Estimated]
+            .into_iter()
+            .any(|source| matches(provider, model.trim_start_matches('/'), source))
+    })
 }
 
 /// Persistent storage for cost records.
@@ -1291,6 +1387,98 @@ mod tests {
             reopened
                 .reserve_estimated_attempt(estimated("prx-no-token-reset", 1, 1, 30))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn estimated_dispatch_batches_existing_journal_rows_before_authority_returns() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 1.0,
+            ..enabled_config()
+        };
+        let request = estimated("prx-batched-dispatch", 250_000, 30, 30);
+        let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
+        let receipt = tracker
+            .reserve_dispatched_estimated_attempt(request.clone(), || true)
+            .unwrap();
+        assert!(tracker.mark_attempt_dispatched(&receipt).is_err());
+        assert!(tracker.release_unsent_attempt(&receipt).is_err());
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(tmp.path().join("state").join(super::super::reservation::JOURNAL))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get("event"))
+                .and_then(serde_json::Value::as_str),
+            Some("estimated_reserved_v1")
+        );
+        assert_eq!(
+            rows.get(1)
+                .and_then(|row| row.get("event"))
+                .and_then(serde_json::Value::as_str),
+            Some("dispatched")
+        );
+        let reserved_attempt_id = rows
+            .first()
+            .and_then(|row| row.get("request"))
+            .and_then(|request| request.get("reservation"))
+            .and_then(|reservation| reservation.get("attempt_id"));
+        let dispatched_attempt_id = rows.get(1).and_then(|row| row.get("attempt_id"));
+        assert!(reserved_attempt_id.is_some());
+        assert_eq!(reserved_attempt_id, dispatched_attempt_id);
+
+        drop(receipt);
+        drop(tracker);
+        let reopened = CostTracker::new(config, tmp.path()).unwrap();
+        assert!(reopened.reserve_dispatched_estimated_attempt(request, || true).is_err());
+    }
+
+    #[test]
+    fn expired_reservation_wait_never_marks_attempt_dispatched() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 1.0,
+            ..enabled_config()
+        };
+        let tracker = Arc::new(CostTracker::new(config, tmp.path()).unwrap());
+        let lock_path = tmp.path().join("state/costs.jsonl.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let blocked = {
+            let tracker = Arc::clone(&tracker);
+            std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                tracker.reserve_dispatched_estimated_attempt(
+                    estimated("prx-expired-before-dispatch", 250_000, 30, 30),
+                    || std::time::Instant::now() < deadline,
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        lock.unlock().unwrap();
+
+        let error = blocked.join().unwrap().expect_err("expired attempt must not dispatch");
+        assert!(error.to_string().contains("deadline elapsed"), "{error:#}");
+        let journal = tmp.path().join("state").join(super::super::reservation::JOURNAL);
+        assert!(
+            !journal.exists() || std::fs::read_to_string(journal).unwrap().is_empty(),
+            "an expired wait must not leave a reservation or dispatched hold"
         );
     }
 

@@ -66,6 +66,7 @@ pub(crate) struct CapabilityEntry {
     pub skill_metadata: Option<Arc<SkillMetadata>>,
     pub exposure: Exposure,
     pub availability: CapabilityAvailability,
+    pub process_worker_compatible: bool,
 }
 
 impl CapabilityEntry {
@@ -329,6 +330,7 @@ impl CapabilityCatalog {
                 descriptor.categories.clone(),
                 effect,
                 descriptor.availability.clone(),
+                descriptor.process_worker_compatible,
                 ExecutionTarget::Tool(descriptor.public_name.clone()),
                 surface,
             )?;
@@ -343,6 +345,7 @@ impl CapabilityCatalog {
                 vec![ToolCategory::Automation],
                 SideEffectClass::Destructive,
                 CapabilityAvailability::ready("discovered allowed MCP backend"),
+                true,
                 ExecutionTarget::Tool(discovered.spec.name.clone()),
                 surface,
             )?;
@@ -367,6 +370,7 @@ impl CapabilityCatalog {
                 vec![ToolCategory::System],
                 SideEffectClass::ReadOnly,
                 CapabilityAvailability::configured("installed skill metadata"),
+                true,
                 ExecutionTarget::Skill {
                     name: skill.name.clone(),
                     root: "skill_read".to_string(),
@@ -391,6 +395,7 @@ impl CapabilityCatalog {
                 vec![ToolCategory::Automation],
                 hook.effect,
                 CapabilityAvailability::configured("registered lifecycle hook"),
+                true,
                 ExecutionTarget::Hook,
                 surface,
             )?;
@@ -423,6 +428,7 @@ impl CapabilityCatalog {
                 vec![ToolCategory::DevOps],
                 SideEffectClass::ProcessExec,
                 node.availability.clone(),
+                true,
                 ExecutionTarget::Node {
                     id: node.id.clone(),
                     root: "nodes".to_string(),
@@ -813,6 +819,7 @@ fn entry_from_spec(
     categories: Vec<ToolCategory>,
     effect: SideEffectClass,
     availability: CapabilityAvailability,
+    process_worker_compatible: bool,
     target: ExecutionTarget,
     surface: &SurfacePolicy,
 ) -> Result<CapabilityEntry, CatalogError> {
@@ -865,6 +872,7 @@ fn entry_from_spec(
         skill_metadata: None,
         exposure,
         availability,
+        process_worker_compatible,
     })
 }
 

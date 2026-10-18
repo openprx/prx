@@ -146,11 +146,11 @@ fn default_model_for_provider(provider: &str) -> String {
                     .find(|model| model.id == catalog.defaults.model)
                     .map(|model| model.api_model.as_str())
             })
-            .unwrap_or(crate::providers::selection::DEFAULT_MODEL_FOR_UNSET)
-            .to_string(),
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_string()),
         Err(error) => {
             tracing::error!(error = %error, "embedded model catalog is invalid");
-            crate::providers::selection::DEFAULT_MODEL_FOR_UNSET.to_string()
+            crate::providers::selection::default_model_for_unset().to_string()
         }
     }
 }
@@ -296,9 +296,10 @@ fn try_config_toml() -> Option<(String, String)> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .unwrap_or("openrouter");
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::providers::default_provider_for_unset().to_string());
 
-    Some((provider.to_string(), api_key.to_string()))
+    Some((provider, api_key.to_string()))
 }
 
 /// Try reading config.toml with secret decryption via SecretStore.
@@ -331,9 +332,10 @@ fn try_config_toml_with_decryption(config_dir: &Path, config_path: &Path) -> Opt
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .unwrap_or("openrouter");
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::providers::default_provider_for_unset().to_string());
 
-    Some((provider.to_string(), decrypted.to_string()))
+    Some((provider, decrypted.to_string()))
 }
 
 /// Try reading Claude Code OAuth credentials from ~/.claude/.credentials.json.

@@ -123,7 +123,7 @@ provider traffic, conversation recording and terminal persistence have their own
 contracts; disabling decisions is not a network kill switch.
 
 The staged candidate defaults `[causal_tree].enabled` to true and writes
-`schema_version = 1` in the full init template. Adoption and end-to-end migration
+`schema_version = 2` in the full init template. Adoption and end-to-end migration
 and rollback acceptance remain pending. The loader preserves versioned explicit
 disables, including development snapshots, while recognized unversioned legacy
 defaults become unset and inherit true. An explicit rollback to disabled retains

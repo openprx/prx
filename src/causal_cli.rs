@@ -518,7 +518,14 @@ pub const fn hosted_owner(kind: BackendKind) -> Option<&'static str> {
 #[must_use]
 pub fn hosted_setup_steps(kind: BackendKind, owner: &str, model: Option<&str>) -> String {
     let name = format!("decision-{}", kind.as_str());
-    let snapshot = if kind == BackendKind::OpenRouter {
+    let catalog_supplies_snapshot = model.is_some_and(|model| {
+        crate::providers::catalog::ReleaseCatalog::embedded_ref()
+            .ok()
+            .and_then(|catalog| catalog.model(&crate::providers::ProviderId::of(owner), model))
+            .and_then(|entry| entry.pinned_snapshot.as_deref())
+            .is_some()
+    });
+    let snapshot = if kind == BackendKind::OpenRouter && !catalog_supplies_snapshot {
         " --pinned-snapshot <exact dated snapshot>"
     } else {
         ""
@@ -725,6 +732,7 @@ async fn admin_accounting_scope(
     let cleanup =
         crate::runtime::turn_cleanup::current_tracker().context("admin accounting requires a request cleanup scope")?;
     let mut tokens = u64::MAX;
+    let catalog = crate::providers::selection::catalog_for(config);
     for slot in factory.status().order {
         if operation == b"health-loopback" && slot.locality != crate::decision::BackendLocality::Loopback {
             continue;
@@ -734,12 +742,13 @@ async fn admin_accounting_scope(
             .provider
             .as_ref()
             .context("admin backend provider unavailable")?;
-        let effective = crate::router::resolve_effective_compaction_config(
+        let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider.as_str(),
             &slot.identity.configured_model,
             &config.router,
             &config.model_routes,
+            &catalog,
         );
         let reservation = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
             &effective.config,
@@ -838,6 +847,9 @@ async fn execute(admin: &DecisionAdmin, json: bool, command: CausalReadCommands,
                         "unavailable"
                     }
                 )?;
+                if let Some(warning) = &status.latency_budget_warning {
+                    writeln!(out, "warning: {warning}")?;
+                }
                 writeln!(out, "Order:")?;
                 for (position, backend) in status.order.iter().enumerate() {
                     writeln!(

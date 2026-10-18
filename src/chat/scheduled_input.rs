@@ -263,6 +263,10 @@ impl Tool for ScheduledInputTool {
         )
     }
 
+    fn process_worker_compatible(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")

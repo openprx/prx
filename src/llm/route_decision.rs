@@ -306,10 +306,66 @@ pub(crate) fn usage_cost_resolution(
              charging the highest. Validation refuses such a configuration; keep one key per endpoint and model."
         );
     }
-    costs
-        .into_iter()
-        .reduce(f64::max)
-        .map_or(UsagePrice::Missing, UsagePrice::Priced)
+    if let Some(cost) = costs.into_iter().reduce(f64::max) {
+        return UsagePrice::Priced(cost);
+    }
+
+    let provider_id = crate::providers::ProviderId::of(provider);
+    if provider_id.catalog_name() == Some("openrouter") {
+        // Operator overrides above remain authoritative. Without one, the
+        // free variant has no token charge, while the deprecated online
+        // variant adds separately billed search that this token-only tariff
+        // cannot represent safely.
+        if model.trim().ends_with(":free") {
+            return UsagePrice::Priced(0.0);
+        }
+        if model.trim().ends_with(":online") {
+            return UsagePrice::Missing;
+        }
+    }
+
+    let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
+        return UsagePrice::Missing;
+    };
+    let direct_pricing = catalog
+        .model(&provider_id, model)
+        .and_then(|entry| entry.pricing.as_ref());
+    let upstream_pricing = (provider_id.catalog_name() == Some("openrouter"))
+        .then(|| openrouter_upstream_model(model))
+        .flatten()
+        .and_then(|(provider, upstream_model)| {
+            catalog
+                .model(&crate::providers::ProviderId::of(provider), upstream_model)
+                .and_then(|entry| entry.pricing.as_ref())
+        });
+    let Some(pricing) = direct_pricing.or(upstream_pricing) else {
+        return UsagePrice::Missing;
+    };
+    let tier = pricing
+        .tiers
+        .iter()
+        .filter(|tier| prompt_tokens > tier.above_input_tokens)
+        .max_by_key(|tier| tier.above_input_tokens);
+    let catalog_pricing = crate::config::schema::ModelPricing {
+        input: tier.map_or(pricing.input, |tier| tier.input),
+        output: tier.map_or(pricing.output, |tier| tier.output),
+        cache_write: tier.and_then(|tier| tier.cache_write).unwrap_or(pricing.cache_write),
+        cache_read: tier.and_then(|tier| tier.cache_read).unwrap_or(pricing.cache_read),
+    };
+    turn_cost(&catalog_pricing).map_or(UsagePrice::Invalid, UsagePrice::Priced)
+}
+
+fn openrouter_upstream_model(model: &str) -> Option<(&str, &str)> {
+    let (vendor, model) = model.trim().split_once('/')?;
+    let provider = match vendor.to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic",
+        "google" => "gemini",
+        "moonshotai" => "moonshot",
+        "openai" => "openai",
+        "x-ai" => "xai",
+        _ => return None,
+    };
+    Some((provider, model))
 }
 
 pub(crate) fn usage_cost_usd(
@@ -1502,6 +1558,112 @@ mod tests {
             usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
             UsagePrice::Missing
         );
+    }
+
+    #[test]
+    fn openrouter_uses_upstream_catalog_tariff_but_keeps_variant_charges_distinct() {
+        let config = crate::config::schema::CostConfig::default();
+        assert!(config.prices.is_empty(), "operator price overrides start empty");
+
+        // Sonnet has an independently published OpenRouter tariff. Keep a
+        // separate own-price-absent witness for the upstream fallback itself.
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("test: release catalog");
+        let upstream = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "openai/gpt-5.6")
+            .expect("test: retained upstream-priced OpenRouter identity");
+        assert!(upstream.pricing.is_none(), "test: must exercise the upstream tariff");
+        assert!(matches!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6", 64, 64, 0, 0, &config),
+            UsagePrice::Priced(cost) if (cost - 0.001_536).abs() < 1e-12
+        ));
+
+        assert!(matches!(
+            usage_cost_resolution(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                64,
+                64,
+                0,
+                0,
+                &config,
+            ),
+            UsagePrice::Priced(cost) if cost > 0.0
+        ));
+        assert!(matches!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6:free", 64, 64, 0, 0, &config),
+            UsagePrice::Priced(0.0)
+        ));
+        assert_eq!(
+            usage_cost_resolution("openrouter", "openai/gpt-5.6:online", 64, 64, 0, 0, &config),
+            UsagePrice::Missing
+        );
+    }
+
+    #[test]
+    fn release_billing_uses_published_input_and_output_not_router_ranking_cost() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let model = catalog
+            .model(&crate::providers::ProviderId::of("anthropic"), "claude-opus-4-8")
+            .expect("published priced model");
+        let pricing = model.pricing.as_ref().expect("published tariff");
+        let ranking_cost = model.router.as_ref().expect("router hint").cost_per_million_tokens;
+        assert_ne!(pricing.input, pricing.output, "fixture needs a distinct output tariff");
+        assert_eq!(
+            ranking_cost, pricing.input,
+            "fixture makes accidental ranking reuse observable"
+        );
+
+        let resolved = usage_cost_resolution(
+            "anthropic",
+            "claude-opus-4-8",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            &crate::config::schema::CostConfig::default(),
+        );
+        assert_eq!(resolved, UsagePrice::Priced(pricing.input + pricing.output));
+    }
+
+    #[test]
+    fn release_tariffs_bill_published_cache_and_long_context_rates() {
+        let config = crate::config::schema::CostConfig::default();
+        for (provider, model, prompt, cached, expected) in [
+            ("openai", "gpt-4o", 1_000_000, 1_000_000, 11.25_f64),
+            ("openai", "gpt-5.6", 272_000, 272_000, 20.1088),
+            ("openai", "gpt-5.6", 272_001, 272_001, 30.217_600_8),
+            ("gemini", "gemini-3.1-flash-lite", 1_000_000, 1_000_000, 1.525),
+            ("gemini", "gemini-3.1-pro-preview", 200_000, 200_000, 12.04),
+            ("gemini", "gemini-3.1-pro-preview", 200_001, 200_001, 18.080_000_4),
+            ("openrouter", "anthropic/claude-sonnet-5", 1_000_000, 0, 12.0),
+            ("openrouter", "typesafe/jev-1.13", 1_000_000, 0, 0.042),
+        ] {
+            let actual = usage_cost_resolution(provider, model, prompt, 1_000_000, 0, cached, &config);
+            assert!(
+                matches!(actual, UsagePrice::Priced(cost) if (cost - expected).abs() < 1e-12),
+                "{provider}/{model}: {actual:?}, expected {expected}"
+            );
+        }
+        for (provider, model) in [
+            ("moonshot", "kimi-k2.5"),
+            ("openrouter", "moonshotai/kimi-k2.5"),
+            ("xai", "grok-3"),
+        ] {
+            assert_eq!(
+                usage_cost_resolution(provider, model, 64, 64, 0, 0, &config),
+                UsagePrice::Missing,
+                "unverified prices must not settle as free usage"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_long_context_tier_prices_output_and_cached_input() {
+        let config = crate::config::schema::CostConfig::default();
+        let short = usage_cost_resolution("gemini", "gemini-2.5-pro", 200_000, 1_000_000, 0, 200_000, &config);
+        let long = usage_cost_resolution("gemini", "gemini-2.5-pro", 1_000_000, 1_000_000, 0, 1_000_000, &config);
+        assert!(matches!(short, UsagePrice::Priced(cost) if (cost - 10.025).abs() < 1e-12));
+        assert!(matches!(long, UsagePrice::Priced(cost) if (cost - 15.25).abs() < 1e-12));
     }
 
     #[test]

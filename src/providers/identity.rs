@@ -8,12 +8,13 @@
 use super::{canonical_china_provider_name, canonical_provider_info, parse_custom_provider_url, regional_endpoint_for};
 use std::sync::Arc;
 
-/// The provider an unset `default_provider` means.
-///
-/// Every reader that falls back for an unset default names this constant (or
-/// [`ProviderId::default_for_unset`]) instead of repeating the literal, so the
-/// fallback and the credential it releases cannot drift apart.
-pub const DEFAULT_PROVIDER_FOR_UNSET: &str = "openrouter";
+/// The provider an unset `default_provider` means, owned by the release
+/// catalog. An invalid catalog yields an empty identity so typed selection
+/// rejects it instead of silently choosing a Rust fallback.
+#[must_use]
+pub fn default_provider_for_unset<'a>() -> &'a str {
+    super::catalog::ReleaseCatalog::embedded_ref().map_or("", super::catalog::ReleaseCatalog::default_provider)
+}
 
 /// Which kind of thing a [`ProviderId`] names. It is also the key's prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,7 +153,7 @@ impl ProviderId {
     /// The identity an unset `default_provider` means.
     #[must_use]
     pub fn default_for_unset() -> Self {
-        Self::of(DEFAULT_PROVIDER_FOR_UNSET)
+        Self::of(default_provider_for_unset())
     }
 
     /// The raw key. It may carry URL userinfo: compare and store it, never
@@ -673,7 +674,7 @@ mod tests {
         assert_eq!(ProviderId::default_for_unset(), ProviderId::of("openrouter"));
         assert_eq!(
             ProviderId::default_for_unset().catalog_name(),
-            Some(DEFAULT_PROVIDER_FOR_UNSET)
+            Some(default_provider_for_unset())
         );
     }
 

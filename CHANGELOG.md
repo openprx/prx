@@ -15,13 +15,20 @@ for integration, validation and rollback limits.
 
 ### Changed
 
-- Provider defaults, onboarding choices, model listings, and baseline
-  capability descriptors now read the validated `catalog/models.json` embedded
-  in the binary. The release catalog has a versioned JSON schema, typed model
-  facts and `low`/`medium`/`high` model levels; live discovery and
-  `[[providers.models]]` keep their documented precedence. Child process
-  snapshots pin the embedded catalog revision and refuse a mixed-version
-  mismatch. See [the model catalog contract](docs/model-catalog.md).
+- Fresh configurations now select `openrouter` with
+  `anthropic/claude-sonnet-5`; `prx init` writes that pair, and the unset
+  `Config` default follows the release catalog. Stable direct Gemini tariffs
+  now come from the same catalog as other built-in prices.
+
+- Provider defaults, onboarding choices, model listings, prices, context
+  windows, Router candidates, model tool/vision features, and hosted decision
+  transport defaults now read the validated `catalog/models.json` embedded in
+  the binary. `[cost.prices]` remains an operator override. The release catalog
+  has a versioned JSON schema, typed model facts and `low`/`medium`/`high` model
+  levels; live discovery and `[[providers.models]]` keep their documented
+  precedence. Child process snapshots pin the embedded catalog revision and
+  refuse a mixed-version mismatch. See
+  [the model catalog contract](docs/model-catalog.md).
 
 - Matrix channel support is now opt-in with the `channel-matrix` Cargo feature.
   Default and release binaries omit Matrix; source builds can enable it with
@@ -39,11 +46,11 @@ for integration, validation and rollback limits.
 
 - `[causal_tree]` has a new schema (the decision plane). A configuration
   written by an earlier release is mapped on load and written in the new form
-  on the next save, with `schema_version = 1`. Keys left at their old default
+  on the next save, currently with `schema_version = 2`. Keys left at their old default
   take the new default. Other values move to their new home, for example
   `policy.max_branches` to `policy.max_candidates` and
   `policy.rehearsal_timeout_ms` to `rehearsal.timeout_ms`. Under D-073/D-074,
-  versioned `schema_version = 1` plus `enabled = false` stays disabled, including
+  versioned schema 1 or current schema 2 plus `enabled = false` stays disabled, including
   an init-default sidecar that also records false. Only recognized unversioned
   legacy-default signatures, including the old bare false template, treat that
   false as unset; unversioned false with modern non-legacy settings stays
@@ -95,6 +102,47 @@ for integration, validation and rollback limits.
   unavailable in this candidate; ordinary chat authority does not permit that
   additional send. Full behavior, restart, performance and independent acceptance
   remain pending.
+
+- `[agent] tool_dispatcher` is removed because it was never read: the tool-call
+  wire form follows the provider's capabilities. A file that still carries it
+  loads with a deprecation warning and the value is ignored. Likewise
+  `[causal_tree.observability]` (`decision_log`, `metrics`, and the earlier
+  `write_decision_log` / `write_metrics`) is removed; a file that carries it
+  still loads, the keys are dropped and the load logs which. Decision events
+  follow the configured `[observability]` backend. See the
+  [upgrade actions](docs/migration-unreleased.md).
+
+- Skill lifecycle groundwork: immutable owner-scoped skill revisions, a
+  publication journal with generation compare-and-swap and rollback, and a
+  replay-safe import of existing skill directories. `skill_read` serves a
+  managed revision only for a caller that has a managed
+  binding; otherwise it reads the existing skill files exactly as before. No
+  command creates managed revisions in this candidate and nothing rewrites an
+  existing skill directory.
+
+### Fixed
+
+- Existing configurations no longer mistake the previously serialized 500 ms
+  decision latency default for an operator override when selecting a hosted
+  decision backend. Published cache and long-context tariffs are retained in
+  billing, OpenRouter `:free` is zero-cost while `:online` remains explicitly
+  unpriced, automatic Router candidates exclude retired or unpriced rows, and
+  onboarding marks selections that need a `[cost.prices]` override.
+
+- OpenRouter's release default and recognized upstream models remain
+  cost-admissible when `[cost.prices]` is empty. Router ranking estimates are
+  no longer treated as input/output billing tariffs, and the Router-only
+  `ollama/*` row no longer marks every local model as non-vision, 32K-context,
+  or catalog-verified.
+
+- A tool the user names exactly in a message (for example an MCP tool that
+  needs approval) now produces an approval request instead of a plain answer
+  when a verified approval scope exists. The override applies only to exact
+  mentions and still needs the bound call fingerprint, an approval channel and
+  a non-read-only turn; an unnamed tool never triggers it.
+- The PostgreSQL memory backend now counts useful recalls
+  (`increment_useful_count` incremented nothing before). An unknown id updates
+  nothing and is not an error, as in SQLite.
 
 ## [0.8.162] - 19 September 2026
 

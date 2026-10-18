@@ -29,6 +29,14 @@ struct ListenerOwner {
 }
 impl ListenerOwner {
     async fn start(replies: Vec<(u16, Value)>, block_premium: bool) -> anyhow::Result<Self> {
+        Self::start_with_main_delay(replies, block_premium, Duration::ZERO).await
+    }
+
+    async fn start_with_main_delay(
+        replies: Vec<(u16, Value)>,
+        block_premium: bool,
+        main_delay: Duration,
+    ) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let cancel = CancellationToken::new();
@@ -44,8 +52,15 @@ impl ListenerOwner {
         let task = tokio::spawn(async move {
             let mut replies = replies.into_iter();
             loop {
+                // The agent is built after this listener publishes its URL.
+                // Waiting for that first client is not stalled connection I/O;
+                // the caller already bounds the actual turn independently.
+                let (mut socket, peer) = tokio::select! {
+                    biased;
+                    () = stop.cancelled() => return Ok(()),
+                    accepted = listener.accept() => accepted?,
+                };
                 let work = async {
-                    let (mut socket, peer) = listener.accept().await?;
                     anyhow::ensure!(peer.ip().is_loopback(), "fixture accepted non-loopback peer");
                     let mut bytes = Vec::new();
                     let (header_end, length) = loop {
@@ -92,6 +107,9 @@ impl ListenerOwner {
                     );
                     let premium = body.get("model").expect("model field exists") == PREMIUM;
                     captured.lock().push(body);
+                    if !premium && !main_delay.is_zero() {
+                        tokio::time::sleep(main_delay).await;
+                    }
                     if premium && block_premium {
                         seen.notify_one();
                         proceed.notified().await;
@@ -144,6 +162,115 @@ impl Drop for ListenerOwner {
             task.abort();
         }
     }
+}
+
+#[tokio::test]
+async fn listener_waits_for_a_client_before_starting_its_connection_watchdog() {
+    let mut listener = ListenerOwner::start(vec![(200, response(CHEAP_REPLY))], false)
+        .await
+        .expect("owned listener");
+    tokio::time::sleep(Duration::from_millis(5_050)).await;
+    let mut socket = tokio::net::TcpStream::connect(listener.address)
+        .await
+        .expect("listener must remain available while the agent is built");
+    let body = serde_json::to_vec(&json!({"model": CHEAP})).expect("fixture body");
+    let header = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(header.as_bytes()).await.expect("request header");
+    socket.write_all(&body).await.expect("request body");
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut reply))
+        .await
+        .expect("connected fixture must respond within its original watchdog")
+        .expect("response");
+    assert!(reply.starts_with(b"HTTP/1.1 200 "));
+    assert_eq!(listener.requests.lock().len(), 1);
+    listener.finish().await.expect("listener drains");
+}
+
+#[tokio::test]
+async fn listener_still_rejects_a_connected_client_that_never_sends_headers() {
+    let mut listener = ListenerOwner::start(vec![(200, response(CHEAP_REPLY))], false)
+        .await
+        .expect("owned listener");
+    let mut socket = tokio::net::TcpStream::connect(listener.address)
+        .await
+        .expect("actual connected client");
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(6), socket.read_to_end(&mut bytes))
+        .await
+        .expect("the unchanged five-second connected-client watchdog must close the socket")
+        .expect("closed connection");
+    assert_eq!(bytes, [] as [u8; 0]);
+    assert!(listener.requests.lock().is_empty());
+    let error = listener.finish().await.expect_err("stalled connection must still fail");
+    assert!(error.to_string().contains("connection watchdog expired"), "{error:#}");
+}
+
+#[tokio::test]
+async fn completed_main_after_original_deadline_does_not_reset_the_premium_allowance() -> anyhow::Result<()> {
+    Box::pin(async {
+        let workspace = tempfile::tempdir()?;
+        let mut listener = ListenerOwner::start_with_main_delay(
+            vec![(200, response(CHEAP_REPLY)), (200, response(PREMIUM_REPLY))],
+            false,
+            Duration::from_millis(650),
+        )
+        .await?;
+        let mut agent = build_agent(workspace.path(), &listener, false).await?;
+        let result = AssertUnwindSafe(async {
+            // Delay a real main HTTP response, not the decision backend or a
+            // fabricated continuation. The original 500ms allowance remains.
+            let reply = tokio::time::timeout(Duration::from_secs(5), turn(&mut agent)).await??;
+            assert_eq!(reply, CHEAP_REPLY);
+            agent.cleanup_state.confirm().await?;
+            assert_eq!(listener.requests.lock().len(), 1);
+            assert_eq!(*listener.response_statuses.lock(), vec![200]);
+            let reservation_path = workspace.path().join("state/costs.reservations.jsonl");
+            if reservation_path.exists() {
+                assert_eq!(
+                    std::fs::read_to_string(reservation_path)?,
+                    "",
+                    "an expired continuation must never reserve or dispatch premium"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?
+                    .lines()
+                    .count(),
+                1,
+                "the served main call must still settle exactly once"
+            );
+            let terminal = crate::memory::sqlite::fixture_readback::terminal_rows(workspace.path())?;
+            assert_eq!(terminal.len(), 1);
+            let payload: Value = serde_json::from_str(&terminal.first().context("actual terminal")?.raw_payload)?;
+            assert_eq!(payload.get("status").context("actual terminal status")?, "completed");
+            assert!(payload.get("served_auxiliary").is_none());
+            Ok::<_, anyhow::Error>(())
+        })
+        .catch_unwind()
+        .await;
+        let confirmed = matches!(
+            tokio::time::timeout(Duration::from_secs(5), agent.cleanup_state.confirm()).await,
+            Ok(Ok(()))
+        );
+        let listener_cleanup = listener.finish().await;
+        if !confirmed || listener_cleanup.is_err() || !matches!(&result, Ok(Ok(()))) {
+            let retained = workspace.keep();
+            tracing::error!(path=%retained.display(), "expired Automix continuation fixture retained");
+        }
+        anyhow::ensure!(
+            confirmed && listener_cleanup.is_ok(),
+            "expired continuation cleanup unconfirmed"
+        );
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+    .await
 }
 
 fn response(text: &str) -> Value {
@@ -552,7 +679,10 @@ async fn run_case_work(recording: bool) -> anyhow::Result<()> {
     let listener_cleanup = listener.finish().await;
     if !agent_cleanup || listener_cleanup.is_err() {
         let retained = workspace.keep();
-        anyhow::bail!("Automix cleanup unconfirmed; retained {}", retained.display());
+        anyhow::bail!(
+            "Automix cleanup unconfirmed; agent_confirmed={agent_cleanup}; listener_cleanup={listener_cleanup:?}; retained {}",
+            retained.display()
+        );
     }
     if !matches!(&result, Ok(Ok(()))) {
         let _retained_workspace = workspace.keep();
@@ -616,6 +746,10 @@ async fn run_dropped_premium_work() -> anyhow::Result<()> {
         let rows: Vec<Value> = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))?.lines().map(serde_json::from_str).collect::<Result<_,_>>()?;
         assert_eq!(rows.iter().filter(|row| row.get("event").expect("event field exists") == "dispatched").count(), 1);
         assert_eq!(rows.iter().filter(|row| row.get("event").expect("event field exists") == "estimated_settled_v1").count(), 0);
+        assert!(rows.iter().all(|row| !matches!(
+            row.get("event").and_then(Value::as_str),
+            Some("released" | "estimated_unsent_v1" | "settled" | "estimated_settled_v1")
+        )), "a physically dispatched unknown attempt must never be released or settled");
         let reservation = rows.iter().find(|row| row.get("event").expect("event field exists") == "estimated_reserved_v1").context("actual reservation")?;
         assert!(reservation.get("request").expect("request field exists").get("reservation").expect("reservation field exists").get("attempt_id").expect("attempt_id field exists").as_str().is_some_and(|id| id.starts_with("automix_premium:")));
         assert!(reservation.get("request").expect("request field exists").get("reservation").expect("reservation field exists").get("maximum_micro_usd").expect("maximum_micro_usd field exists").as_u64().is_some_and(|cost| cost > 0));
@@ -638,7 +772,10 @@ async fn run_dropped_premium_work() -> anyhow::Result<()> {
     let listener_cleanup = listener.finish().await;
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
-        anyhow::bail!("Automix drop cleanup unconfirmed; retained {}", retained.display());
+        anyhow::bail!(
+            "Automix drop cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            retained.display()
+        );
     }
     if !matches!(&result, Ok(Ok(()))) {
         let _retained_workspace = workspace.keep();
@@ -831,7 +968,7 @@ async fn run_cheap_outcome_case_work(fail_premium: bool, turns: usize) -> anyhow
             assert!(
                 journal.iter().all(|row| !matches!(
                     row.get("event").and_then(Value::as_str),
-                    Some("released" | "settled" | "estimated_settled_v1")
+                    Some("released" | "estimated_unsent_v1" | "settled" | "estimated_settled_v1")
                 )),
                 "unknown attempt must retain its liability"
             );
@@ -897,7 +1034,10 @@ async fn run_cheap_outcome_case_work(fail_premium: bool, turns: usize) -> anyhow
     let listener_cleanup = listener.finish().await;
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
-        anyhow::bail!("Automix fixture cleanup unconfirmed; retained {}", retained.display());
+        anyhow::bail!(
+            "Automix fixture cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            retained.display()
+        );
     }
     if !matches!(&result, Ok(Ok(()))) {
         let _retained = workspace.keep();
