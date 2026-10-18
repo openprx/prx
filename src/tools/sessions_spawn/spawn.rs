@@ -7,10 +7,9 @@ use super::{
     exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
     parse_memory_scope, parse_spawn_scope, process_terminal, record_spawn_request_event, record_spawn_result_event,
     refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_child_provider_api_key,
-    resolve_pinned_child_compaction, resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task,
-    running_run_count, spawn_completion_note, spawn_event_scope, spawn_lineage, spawn_session_scope_key,
-    sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
-    watch_task_mode_monitor,
+    resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_completion_note,
+    spawn_event_scope, spawn_lineage, spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason,
+    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
 };
 use crate::channels::build_identity_prompt;
 use crate::providers;
@@ -57,6 +56,22 @@ impl SpawnOutcome {
             run_id: Some(run_id),
         }
     }
+}
+
+pub(super) fn resolve_pinned_child_compaction(
+    config: &crate::config::Config,
+    catalog: &providers::catalog::CatalogView,
+    provider: &str,
+    model: &str,
+) -> crate::router::context::EffectiveCompactionConfig {
+    crate::router::context::resolve_effective_compaction_config_with_catalog(
+        &config.agent.compaction,
+        provider,
+        model,
+        &config.router,
+        &config.model_routes,
+        catalog,
+    )
 }
 
 impl SessionsSpawnTool {

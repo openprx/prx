@@ -3723,7 +3723,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         }
         if matches!(
             relative.as_str(),
-            "src/tools/delegate.rs" | "src/tools/sessions_spawn/batch.rs"
+            "src/tools/delegate.rs" | "src/tools/sessions_spawn/spawn.rs"
         ) {
             for (at, _) in production.match_indices("resolve_effective_compaction_config_with_catalog(") {
                 admitted_resolution_sites.push(site(at));
@@ -3748,7 +3748,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         admitted_resolution_sites,
         &[
             "src/tools/delegate.rs::resolve_pinned_child_compaction",
-            "src/tools/sessions_spawn/batch.rs::resolve_pinned_child_compaction",
+            "src/tools/sessions_spawn/spawn.rs::resolve_pinned_child_compaction",
         ],
     );
 }

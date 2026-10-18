@@ -38,22 +38,6 @@ pub(super) struct BatchRoster {
 /// this field replaced — the pre-existing behaviour, not a new failure.
 const MAX_TRACKED_BATCH_ROSTERS: usize = 256;
 
-pub(super) fn resolve_pinned_child_compaction(
-    config: &crate::config::Config,
-    catalog: &crate::providers::catalog::CatalogView,
-    provider: &str,
-    model: &str,
-) -> crate::router::context::EffectiveCompactionConfig {
-    crate::router::context::resolve_effective_compaction_config_with_catalog(
-        &config.agent.compaction,
-        provider,
-        model,
-        &config.router,
-        &config.model_routes,
-        catalog,
-    )
-}
-
 /// Terminal verdict for one member of a joined batch.
 ///
 /// `Killed` is deliberately not folded into `Failed`: a task that concluded

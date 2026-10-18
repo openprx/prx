@@ -41,7 +41,7 @@ mod worker_manifest;
 pub(crate) use self::actions::{STEER_CHANNEL_CAPACITY, steering_instruction};
 pub(crate) use self::announce::{AnnounceOrigin, announce_is_authorized};
 use self::announce::{OutboundNotice, deliver_or_withhold_notice, format_announce_message};
-use self::batch::{BatchMember, BatchRoster, resolve_pinned_child_compaction};
+use self::batch::{BatchMember, BatchRoster};
 #[cfg(test)]
 use self::batch::{JoinedMember, JoinedVerdict, join_batch_members, join_summary, settled_verdict};
 use self::child_lifecycle::{
@@ -87,6 +87,8 @@ use self::scope::{
     SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage,
     spawn_session_scope_key,
 };
+#[cfg(test)]
+use self::spawn::resolve_pinned_child_compaction;
 #[cfg(test)]
 use self::task_mode::restore_run_to_running;
 use self::task_mode::run_sub_agent_task;
