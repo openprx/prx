@@ -1395,7 +1395,7 @@ fn check_router_candidates(config: &Config, items: &mut Vec<DiagItem>) {
         &config.model_routes,
     );
     let candidates = if config.router.models.is_empty() {
-        crate::router::models::builtin_model_capabilities()
+        crate::router::models::builtin_model_capabilities(&config.cost)
     } else {
         config.router.models.clone()
     };

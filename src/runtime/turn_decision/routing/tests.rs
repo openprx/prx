@@ -95,11 +95,18 @@ impl Fixture {
             }],
             ..RouterConfig::default()
         };
-        let router = RouterEngine::new(policy.clone(), "ollama".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap()
-            .with_local_hash_history(Arc::new(LocalHashEmbedding::new("prx-local-hash-v1", 384)))
-            .unwrap();
+        let router = RouterEngine::new(
+            policy.clone(),
+            "ollama".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap()
+        .with_local_hash_history(Arc::new(LocalHashEmbedding::new("prx-local-hash-v1", 384)))
+        .unwrap();
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");

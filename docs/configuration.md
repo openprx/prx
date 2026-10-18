@@ -2003,6 +2003,8 @@ snapshot and recommended timeout. It also writes the catalog's recommended
 extra-latency budget when the policy still has its default value. Explicit
 command and policy values remain operator choices. Built-in decision-model
 pricing comes from the catalog; `[cost.prices]` is only an override.
+Automatic Router candidates and doctor use those configured price overrides
+when filtering active release rows with Router metadata.
 During migration, only schema-1's serialized 500 ms default becomes implicit.
 An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
 remains an explicit operator choice, as does 500 ms in schema 2. Loading an

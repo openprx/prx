@@ -77,9 +77,12 @@ tariff resolve stable upstream Anthropic, Google/Gemini, Moonshot, OpenAI and
 xAI model prices from those providers' release rows; unknown or dynamic proxy
 models remain unpriced. Compaction reads the effective
 descriptor's context window after explicit agent and `[[router.models]]`
-overrides. The default Router candidate list is derived from rows that carry
-`router` hints. `router.cost_per_million_tokens` is a comparative ranking input,
-not a billing tariff; billing always uses the separate `pricing` object.
+overrides. The default Router candidate list uses active rows with `router`
+hints and an effective billing tariff, including configured `[cost.prices]`
+overrides. Doctor applies the same configured-price filter. A price override
+does not revive a retired row or add absent Router metadata.
+`router.cost_per_million_tokens` is a comparative ranking input, not a billing
+tariff; billing uses the separate catalog price or operator override.
 
 The `ollama/*` row exists only to seed the Router's conservative local fallback.
 It does not verify an arbitrary Ollama model, assign it a 32K context window, or
