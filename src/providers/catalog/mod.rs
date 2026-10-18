@@ -182,6 +182,22 @@ impl std::fmt::Debug for RouteTarget {
 }
 
 impl CatalogView {
+    /// Release evidence without operator declarations or discovery state.
+    #[must_use]
+    pub fn release_only() -> Self {
+        let (release, release_error) = match ReleaseCatalog::embedded() {
+            Ok(catalog) => (Some(catalog), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            curated: Vec::new(),
+            discovered: Vec::new(),
+            routes: Vec::new(),
+            release,
+            release_error,
+        }
+    }
+
     /// The operator declarations in `config`: `[[providers.models]]` and
     /// `[[providers.tool_dialects]]`.
     #[must_use]
@@ -412,6 +428,26 @@ impl CatalogView {
             }
         }
         descriptor
+    }
+
+    /// Intersect a concrete adapter's ceiling with the effective model facts.
+    #[must_use]
+    pub fn effective_provider_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        adapter: crate::providers::ProviderCapabilities,
+    ) -> crate::providers::ProviderCapabilities {
+        let descriptor = self.describe(&ProviderId::of(provider), model);
+        let effective = |feature: Feature, ceiling: bool| match descriptor.features.get(feature) {
+            Support::Supported => ceiling,
+            Support::Unsupported(_) => false,
+            Support::Unknown => ceiling,
+        };
+        crate::providers::ProviderCapabilities {
+            native_tool_calling: effective(Feature::NativeTools, adapter.native_tool_calling),
+            vision: effective(Feature::VisionInput, adapter.vision),
+        }
     }
 }
 

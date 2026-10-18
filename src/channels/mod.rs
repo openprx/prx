@@ -1039,10 +1039,7 @@ fn resolved_default_provider(config: &Config) -> String {
 }
 
 fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    providers::selection::default_model(config).to_string()
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -2189,6 +2186,7 @@ struct SignalVisionProvider<'a> {
     provider: &'a dyn Provider,
     model: &'a str,
     temperature: f64,
+    capabilities: crate::providers::ProviderCapabilities,
 }
 
 struct SignalVisionScope {
@@ -2208,6 +2206,7 @@ async fn run_signal_vision_preflight(
         provider,
         model,
         temperature,
+        capabilities,
     } = target;
     if !is_signal_image_message(msg) {
         return SignalVisionPreflightOutcome::NotRequired;
@@ -2220,10 +2219,7 @@ async fn run_signal_vision_preflight(
     else {
         return fallback("auxiliary vision source or accounting admission refused");
     };
-    if !provider
-        .capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-        .vision
-    {
+    if !capabilities.vision {
         return fallback("auxiliary vision unsupported by selected provider");
     }
     let deadline = tokio::time::Instant::from_std(accounting.deadline());
@@ -3381,11 +3377,16 @@ async fn run_channel_turn(
     let preflight = if vision_required {
         if let Some(scope) = vision_scope.as_ref() {
             let provider = scope.accounting.provider();
+            let model = scope.accounting.selected_model().model();
+            let adapter = provider.capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = providers::selection::catalog_for(&config_generation.effective)
+                .effective_provider_capabilities(scope.accounting.selected_model().provider_label(), model, adapter);
             run_signal_vision_preflight(
                 SignalVisionProvider {
                     provider: provider.as_ref(),
-                    model: scope.accounting.selected_model().model(),
+                    model,
                     temperature: runtime_defaults.temperature,
+                    capabilities,
                 },
                 &msg,
                 &message_runtime.multimodal,
@@ -5801,6 +5802,7 @@ pub async fn start_channels_with_config(
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
+            #[cfg(test)]
             Arc::clone(&provider),
             &provider_name,
             &resolved_default_model(&config),
@@ -5808,22 +5810,14 @@ pub async fn start_channels_with_config(
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)
-        .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver))
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool
@@ -5876,7 +5870,7 @@ pub async fn start_channels_with_config(
                 security.clone(),
                 config.multimodal.clone(),
             )
-            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver), &turn_provider_name),
+            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver)),
         ));
 
         tools_list.push(Box::new(spawn_tool));

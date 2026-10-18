@@ -1,195 +1,38 @@
 use crate::config::RouterModelConfig;
 
-const MODERN_LONG_CONTEXT_TOKENS: usize = 1_000_000;
-const ANTHROPIC_HAIKU_CONTEXT_TOKENS: usize = 200_000;
-const GPT_4O_CONTEXT_TOKENS: usize = 128_000;
-const KIMI_K2_5_CONTEXT_TOKENS: usize = 262_144;
-const AGGREGATOR_STANDARD_CONTEXT_TOKENS: usize = 128_000;
-const LEGACY_LOCAL_CONTEXT_TOKENS: usize = 32_000;
-
-fn model(
-    provider: &str,
-    model_id: &str,
-    cost_per_million_tokens: f32,
-    max_context: usize,
-    latency_ms: u32,
-    categories: &[&str],
-) -> RouterModelConfig {
-    RouterModelConfig {
-        model_id: model_id.to_string(),
-        provider: provider.to_string(),
-        cost_per_million_tokens,
-        max_context,
-        reserved_output_tokens: None,
-        latency_ms,
-        categories: categories.iter().map(|value| (*value).to_string()).collect(),
-        elo_rating: 1_000.0,
-    }
-}
-
+/// Router candidates derived entirely from the embedded release catalog.
+/// The operator's explicit `[[router.models]]` entries still replace this
+/// list at the router boundary.
 pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
-    vec![
-        model(
-            "anthropic",
-            "claude-fable-5",
-            10.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_500,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-8",
-            5.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-7",
-            5.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-6",
-            15.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            3_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "anthropic",
-            "claude-sonnet-4-6",
-            3.0,
-            MODERN_LONG_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code", "summary"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-4-5-20251001",
-            1.0,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-4-5",
-            1.0,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "anthropic",
-            "claude-haiku-3",
-            0.25,
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openai-codex",
-            "gpt-code5.3",
-            2.0,
-            GPT_4O_CONTEXT_TOKENS,
-            1_500,
-            &["code", "debug", "refactor", "analysis"],
-        ),
-        model(
-            "openai",
-            "gpt-4o",
-            5.0,
-            GPT_4O_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "openai",
-            "gpt-4o-mini",
-            0.15,
-            GPT_4O_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openrouter",
-            "moonshotai/kimi-k2.5",
-            0.6,
-            KIMI_K2_5_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "long_doc"],
-        ),
-        model(
-            "openrouter",
-            "qwen/qwen3.5-plus",
-            0.5,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_500,
-            &["conversation", "code", "summary"],
-        ),
-        model(
-            "openrouter",
-            "thudm/glm-5",
-            0.3,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_500,
-            &["conversation", "summary", "translation"],
-        ),
-        model(
-            "openrouter",
-            "google/gemini-3-flash",
-            0.1,
-            MODERN_LONG_CONTEXT_TOKENS,
-            1_000,
-            &["conversation", "summary", "long_doc"],
-        ),
-        model(
-            "openrouter",
-            "x-ai/grok-4.1-fast",
-            1.0,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            1_200,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "xai",
-            "grok-3",
-            3.0,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "code"],
-        ),
-        model(
-            "gemini",
-            "gemini-2.5-pro",
-            1.25,
-            MODERN_LONG_CONTEXT_TOKENS,
-            2_000,
-            &["conversation", "analysis", "long_doc", "code"],
-        ),
-        model(
-            "gemini",
-            "gemini-2.0-flash",
-            0.1,
-            MODERN_LONG_CONTEXT_TOKENS,
-            800,
-            &["conversation", "summary", "long_doc"],
-        ),
-        model(
-            "ollama",
-            "*",
-            0.0,
-            LEGACY_LOCAL_CONTEXT_TOKENS,
-            500,
-            &["conversation", "code"],
-        ),
-    ]
+    let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
+        return Vec::new();
+    };
+    catalog
+        .models
+        .iter()
+        .filter_map(|model| {
+            if model.lifecycle.status != crate::providers::catalog::ModelLifecycleStatus::Active
+                || model.pricing.is_none()
+            {
+                return None;
+            }
+            let router = model.router.as_ref()?;
+            let context = model.limits.context_window?;
+            Some(RouterModelConfig {
+                model_id: model.api_model.clone(),
+                provider: model.provider.clone(),
+                cost_per_million_tokens: router.cost_per_million_tokens as f32,
+                max_context: usize::try_from(context).unwrap_or(usize::MAX),
+                reserved_output_tokens: model
+                    .limits
+                    .max_output_tokens
+                    .and_then(|tokens| usize::try_from(tokens).ok()),
+                latency_ms: router.latency_ms,
+                categories: router.categories.clone(),
+                elo_rating: router.quality_rank as f32,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -230,13 +73,30 @@ mod tests {
     }
 
     #[test]
-    fn builtin_models_include_major_providers() {
+    fn builtin_models_exclude_retired_and_unpriced_catalog_rows() {
         let models = builtin_model_capabilities();
-        let providers: HashSet<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        for model in &models {
+            let release = catalog
+                .model(&crate::providers::ProviderId::of(&model.provider), &model.model_id)
+                .expect("every builtin router row comes from the release catalog");
+            assert_eq!(
+                release.lifecycle.status,
+                crate::providers::catalog::ModelLifecycleStatus::Active,
+                "non-active router candidate: {}",
+                release.id
+            );
+            assert!(release.pricing.is_some(), "unpriced router candidate: {}", release.id);
+        }
+        let providers: HashSet<&str> = models.iter().map(|model| model.provider.as_str()).collect();
         assert!(providers.contains("anthropic"));
-        assert!(providers.contains("openai"));
-        assert!(providers.contains("gemini"));
         assert!(providers.contains("ollama"));
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider == "gemini" || model.provider == "openai"),
+            "providers whose only router rows are retired must not remain candidates"
+        );
     }
 
     fn context_for(models: &[RouterModelConfig], provider: &str, model_id: &str) -> usize {
@@ -248,59 +108,49 @@ mod tests {
     }
 
     #[test]
-    fn builtin_context_windows_match_p4b_policy() {
+    fn builtin_context_windows_match_the_active_priced_router_rows() {
         let models = builtin_model_capabilities();
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
 
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-fable-5"),
-            1_000_000,
-            "Claude Fable 5 is a current 1M model and must not fall back to 128K"
-        );
+        for (provider, model_id, expected_context) in [
+            ("anthropic", "claude-fable-5", 1_000_000),
+            ("anthropic", "claude-opus-4-7", 1_000_000),
+            ("anthropic", "claude-opus-4-6", 1_000_000),
+            ("anthropic", "claude-sonnet-4-6", 1_000_000),
+            ("openrouter", "google/gemini-3-flash", 1_000_000),
+            ("gemini", "gemini-2.5-pro", 1_000_000),
+            ("gemini", "gemini-2.0-flash", 1_000_000),
+            ("anthropic", "claude-haiku-4-5", 200_000),
+            ("anthropic", "claude-haiku-3", 200_000),
+            ("openai", "gpt-4o", 128_000),
+            ("openai", "gpt-4o-mini", 128_000),
+            ("openrouter", "moonshotai/kimi-k2.5", 262_144),
+        ] {
+            let release = catalog
+                .model(&crate::providers::ProviderId::of(provider), model_id)
+                .unwrap_or_else(|| panic!("missing release model {provider}/{model_id}"));
+            assert_eq!(
+                release.limits.context_window,
+                Some(expected_context),
+                "release context changed for {provider}/{model_id}"
+            );
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model.provider == provider && model.model_id == model_id),
+                "retired or unpriced model remained an automatic candidate: {provider}/{model_id}"
+            );
+        }
+
         assert_eq!(
             context_for(&models, "anthropic", "claude-opus-4-8"),
             1_000_000,
             "Claude Opus 4.8 is a current 1M model and must not fall back to 128K"
         );
         assert_eq!(
-            context_for(&models, "anthropic", "claude-opus-4-7"),
-            1_000_000,
-            "Claude Opus 4.7 is a current 1M model and must not fall back to 128K"
-        );
-        assert_eq!(context_for(&models, "anthropic", "claude-opus-4-6"), 1_000_000);
-        assert_eq!(context_for(&models, "anthropic", "claude-sonnet-4-6"), 1_000_000);
-        assert_eq!(context_for(&models, "openrouter", "google/gemini-3-flash"), 1_000_000);
-        assert_eq!(context_for(&models, "gemini", "gemini-2.5-pro"), 1_000_000);
-        assert_eq!(context_for(&models, "gemini", "gemini-2.0-flash"), 1_000_000);
-
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-haiku-4-5"),
-            200_000,
-            "Haiku 4.5 is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
             context_for(&models, "anthropic", "claude-haiku-4-5-20251001"),
             200_000,
             "Haiku 4.5 dated ID is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "anthropic", "claude-haiku-3"),
-            200_000,
-            "Haiku is a known-smaller Claude family and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openai", "gpt-4o"),
-            128_000,
-            "gpt-4o is a known 128K model and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openai", "gpt-4o-mini"),
-            128_000,
-            "gpt-4o-mini is a known 128K model and must not inherit 1M"
-        );
-        assert_eq!(
-            context_for(&models, "openrouter", "moonshotai/kimi-k2.5"),
-            262_144,
-            "Kimi K2.5 must match OpenRouter's published context length"
         );
         assert_eq!(
             context_for(&models, "ollama", "*"),

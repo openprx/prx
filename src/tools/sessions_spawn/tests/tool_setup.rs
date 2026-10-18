@@ -82,133 +82,6 @@ fn restricted_spawn_allowlist_inherits_transcript_recovery_dependency() {
     );
 }
 
-// ── Sub-agent provider override: resilience evidence ─────────
-
-/// Serializes the tests that drive the mock provider through
-/// `OPENPRX_MOCK_ERROR`, since env vars are process-global.
-fn mock_error_env_lock() -> &'static parking_lot::Mutex<()> {
-    static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
-}
-
-struct MockErrorEnvGuard {
-    original: Option<String>,
-}
-
-impl MockErrorEnvGuard {
-    #[allow(unsafe_code)]
-    fn set(value: &str) -> Self {
-        let original = std::env::var("OPENPRX_MOCK_ERROR").ok();
-        // SAFETY: test-only env mutation, serialized by `mock_error_env_lock`
-        // and restored on drop.
-        unsafe { std::env::set_var("OPENPRX_MOCK_ERROR", value) };
-        Self { original }
-    }
-}
-
-impl Drop for MockErrorEnvGuard {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        // SAFETY: paired with the mutation above, under the same lock.
-        unsafe {
-            match &self.original {
-                Some(value) => std::env::set_var("OPENPRX_MOCK_ERROR", value),
-                None => std::env::remove_var("OPENPRX_MOCK_ERROR"),
-            }
-        }
-    }
-}
-
-/// A sub-agent that pins its own provider must still get the reliability
-/// layer. This path used to build a **bare** provider: an upstream 429 ended
-/// the sub-agent in well under a second with zero retries, and the surfaced
-/// error carried no attempt trail at all — the signature of the 2026-08-21
-/// incident. Reverting `build_override_provider` to
-/// `create_provider_with_options` turns this test red on both assertions.
-#[tokio::test]
-async fn provider_override_goes_through_the_reliability_layer() {
-    // The env lock and the env mutation are both released before the first
-    // await: the mock captured its error at construction time, so nothing
-    // after this block depends on the variable still being set.
-    let provider = {
-        let _serialized = mock_error_env_lock().lock();
-        let _env = MockErrorEnvGuard::set("Mock API error (429 Too Many Requests): rate_limit_error");
-        let mut config = crate::config::Config::default();
-        config.default_provider = Some("mock".to_string());
-        config.default_model = Some("mock-model".to_string());
-        let catalog = providers::selection::catalog_for(&config);
-        let resolved = providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
-            .expect("test: mock selection resolves");
-        SessionsSpawnTool::build_override_provider(
-            &resolved,
-            &catalog,
-            &crate::config::ReliabilityConfig {
-                provider_retries: 2,
-                provider_backoff_ms: 200,
-                ..crate::config::ReliabilityConfig::default()
-            },
-            &config.cost,
-            &providers::ProviderRuntimeOptions::default(),
-        )
-        .expect("test: mock provider must build")
-    };
-
-    let started = std::time::Instant::now();
-    let error = provider
-        .chat_with_system(None, "audit this module", "mock-model", 0.0)
-        .await
-        .expect_err("test: the mock is configured to fail");
-    let elapsed = started.elapsed();
-    let text = error.to_string();
-
-    assert!(
-        text.contains("All providers/models failed"),
-        "the override path must produce the aggregated reliability error, got: {text}"
-    );
-    assert!(
-        text.contains("attempt 1/3") && text.contains("attempt 3/3"),
-        "every attempt must be in the trail, got: {text}"
-    );
-    assert!(
-        text.contains("rate_limited"),
-        "the failure reason must be classified as a rate limit, got: {text}"
-    );
-    // Two jittered backoffs: [100,200] + [200,400].
-    assert!(
-        elapsed >= std::time::Duration::from_millis(280),
-        "the override path did not back off (bare provider fails instantly): {elapsed:?}"
-    );
-}
-
-/// The pinned provider must stay pinned: widening the chain would silently
-/// answer "run this with a different model" from the wrong vendor, and would
-/// replay the gateway's rotation credentials against it.
-#[test]
-fn override_reliability_drops_chain_widening_knobs() {
-    let base = crate::config::ReliabilityConfig {
-        provider_retries: 5,
-        provider_backoff_ms: 900,
-        fallback_providers: vec!["openai".to_string()],
-        api_keys: vec!["sk-gateway-key".to_string()],
-        model_fallbacks: std::collections::HashMap::from([("k3".to_string(), vec!["k3-mini".to_string()])]),
-        ..crate::config::ReliabilityConfig::default()
-    };
-
-    let scoped = SessionsSpawnTool::override_reliability(&base);
-
-    assert_eq!(scoped.provider_retries, 5, "retry budget must carry over");
-    assert_eq!(scoped.provider_backoff_ms, 900, "backoff must carry over");
-    assert_eq!(scoped.model_fallbacks, base.model_fallbacks, "model chain carries over");
-    assert!(
-        scoped.fallback_providers.is_empty(),
-        "a pinned provider must not fail over"
-    );
-    assert!(
-        scoped.api_keys.is_empty(),
-        "gateway rotation keys belong to another vendor"
-    );
-}
-
 /// D-098: a registry that was bound and is gone (its configuration was
 /// replaced) refuses the spawn, instead of running the sub-agent
 /// silently without tools. A tool that never had one runs as before.
@@ -265,23 +138,21 @@ fn router_model(provider: &str, model_id: &str, max_context: usize) -> crate::co
     }
 }
 
-fn compaction_resolver_with_models(models: Vec<crate::config::RouterModelConfig>) -> crate::router::CompactionResolver {
-    let mut router = crate::config::RouterConfig::default();
-    router.models = models;
-    crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
+fn child_compaction_config(models: Vec<crate::config::RouterModelConfig>) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.router.models = models;
+    config
 }
 
 #[test]
 fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
-    let (ch, _) = RecordingChannel::new();
-    let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-        compaction_resolver_with_models(vec![
-            router_model("anthropic", "claude-opus-4-8", 1_000_000),
-            router_model("openrouter", "small-child", 200_000),
-        ]),
-    );
+    let config = child_compaction_config(vec![
+        router_model("anthropic", "claude-opus-4-8", 1_000_000),
+        router_model("openrouter", "small-child", 200_000),
+    ]);
+    let catalog = providers::selection::catalog_for(&config);
 
-    let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+    let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
 
     assert_eq!(resolved.config.max_context_tokens, 200_000);
     assert_eq!(
@@ -292,14 +163,12 @@ fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
 
 #[test]
 fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
-    let (ch, _) = RecordingChannel::new();
-    let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-        compaction_resolver_with_models(vec![
-            router_model("anthropic", "claude-opus-4-8", 1_000_000),
-            router_model("openrouter", "small-child", 200_000),
-        ]),
-    );
-    let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+    let config = child_compaction_config(vec![
+        router_model("anthropic", "claude-opus-4-8", 1_000_000),
+        router_model("openrouter", "small-child", 200_000),
+    ]);
+    let catalog = providers::selection::catalog_for(&config);
+    let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
     let temp = tempfile::TempDir::new().expect("tempdir");
     let lineage = SpawnLineage {
         owner_id: None,
@@ -383,9 +252,9 @@ fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal
     // boundary: the manifest had no field for it, so the worker started
     // with the whole operations surface back. The list travels in the
     // manifest now, and the manifest is what the capability seals.
-    let (ch, _) = RecordingChannel::new();
-    let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+    let config = crate::config::Config::default();
+    let catalog = providers::selection::catalog_for(&config);
+    let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
     let temp = tempfile::TempDir::new().expect("tempdir");
     let lineage = SpawnLineage {
         owner_id: None,

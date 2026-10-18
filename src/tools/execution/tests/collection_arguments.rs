@@ -18,6 +18,7 @@ fn descriptor() -> ToolDescriptor {
         Vec::new(),
         |_| ToolAdapterKind::Native,
         CapabilityAvailability::ready("isolated schema fixture"),
+        true,
     )
 }
 

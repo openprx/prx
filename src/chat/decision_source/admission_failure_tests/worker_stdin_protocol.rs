@@ -311,7 +311,6 @@ async fn run_protocol_case(case: TestWorkerProtocolCase) -> anyhow::Result<Worke
             Arc::clone(&security),
             workspace.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             Default::default(),
             None,
             crate::providers::provider_runtime_options_from_config(&config),

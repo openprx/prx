@@ -1,16 +1,16 @@
 use super::{
-    AllowedToolProxy, AnnounceOrigin, ChildProvider, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope,
-    OutboundNotice, PROCESS_OWNER_PANICKED_PREFIX, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl,
-    ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext,
-    SpawnScope, SubAgentRun, SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field,
-    commit_process_owner_failure_if_unfinalized, commit_process_terminal_state, current_spawn_execution_context,
-    deliver_or_withhold_notice, exited_without_result_reason, format_announce_message, new_process_mode_run,
-    normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
-    record_spawn_request_event, record_spawn_result_event, refresh_tools_for_explicit_allowlist,
-    register_killable_process_run, resolve_child_provider_api_key, resolve_tools_for_agent, run_sub_agent_process,
-    run_sub_agent_task, running_run_count, spawn_completion_note, spawn_event_scope, spawn_lineage,
-    spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause,
-    watch_process_mode_monitor, watch_task_mode_monitor,
+    AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
+    PROCESS_OWNER_PANICKED_PREFIX, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
+    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun,
+    SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_owner_failure_if_unfinalized,
+    commit_process_terminal_state, current_spawn_execution_context, deliver_or_withhold_notice,
+    exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
+    parse_memory_scope, parse_spawn_scope, process_terminal, record_spawn_request_event, record_spawn_result_event,
+    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_child_provider_api_key,
+    resolve_pinned_child_compaction, resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task,
+    running_run_count, spawn_completion_note, spawn_event_scope, spawn_lineage, spawn_session_scope_key,
+    sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
+    watch_task_mode_monitor,
 };
 use crate::channels::build_identity_prompt;
 use crate::providers;
@@ -133,7 +133,6 @@ impl SessionsSpawnTool {
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
         let provider_options = providers::provider_runtime_options_from_config(child_model_config);
         let provider_options = &provider_options;
-        let provider_reliability = &child_model_config.reliability;
         let spawn_config = &child_model_config.sessions_spawn;
         let agents = &child_model_config.agents;
         let task = args
@@ -581,12 +580,11 @@ impl SessionsSpawnTool {
                     )
             },
         );
-        let resolved_compaction = crate::router::context::resolve_effective_compaction_config(
-            &child_model_config.agent.compaction,
+        let resolved_compaction = resolve_pinned_child_compaction(
+            child_model_config,
+            child_model_catalog,
             &resolved_provider_name,
             &resolved_model,
-            &child_model_config.router,
-            &child_model_config.model_routes,
         );
         tracing::debug!(
             mode = mode.as_str(),
@@ -616,14 +614,14 @@ impl SessionsSpawnTool {
             },
             |resolved| resolved.credential().api_key().map(str::to_string),
         );
-        let task_provider_plan =
-            self.child_provider_plan(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
+        let reuses_parent_provider =
+            self.reuses_parent_provider_identity(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
         // A spelling alias of the already-configured gateway is the same
         // connection, credential, and catalog identity. Issue its ordinary
         // child proof under the configured spelling so the decision service
         // sees the catalog row it actually published. Route hints retain their
         // requested source spelling because that spelling selects the route.
-        if matches!(&task_provider_plan, ChildProvider::Gateway)
+        if reuses_parent_provider
             && selected_route_hint.is_none()
             && let Some((provider, _)) = child_requested_model.as_mut()
         {
@@ -649,6 +647,16 @@ impl SessionsSpawnTool {
                 ))
             })
             .transpose()?;
+        let process_child_grant = (mode == "process")
+            .then(|| {
+                child_grant
+                    .as_deref()
+                    .map(crate::runtime::child_source::IssuedChildGrant::for_process_worker)
+                    .transpose()
+                    .map(|grant| grant.map(Arc::new))
+            })
+            .transpose()?
+            .flatten();
         let event_workspace = memory_fabric.workspace_id();
         let mut spawn_scope_for_event = spawn_event_scope(
             event_workspace,
@@ -658,7 +666,7 @@ impl SessionsSpawnTool {
             agent_name.as_deref(),
             spawn_scope.as_ref(),
         );
-        if let Some(grant) = child_grant.as_ref() {
+        if let Some(grant) = process_child_grant.as_ref().or(child_grant.as_ref()) {
             grant.bind_event_scope(&mut spawn_scope_for_event)?;
         }
         if let Some(binding) = &ordinary_binding {
@@ -858,7 +866,7 @@ impl SessionsSpawnTool {
             let process_execution_ctx = SpawnExecutionContext {
                 operator_authority: None,
                 ordinary_authority: None,
-                incoming_grant: child_grant.clone(),
+                incoming_grant: process_child_grant.clone(),
                 provider_binding: None,
                 terminal_usage: None,
                 input_receipt: source_receipt.clone(),
@@ -903,7 +911,7 @@ impl SessionsSpawnTool {
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
             sub_agent_work.require_cleanup_acknowledgement();
             let process_work_id = sub_agent_work.id();
-            let process_recovery = child_grant.as_ref().map(|grant| {
+            let process_recovery = process_child_grant.as_ref().map(|grant| {
                 Arc::new(process_terminal::ProcessRecovery::new(
                     process_memory_fabric.clone(),
                     Arc::clone(grant),
@@ -1376,108 +1384,10 @@ impl SessionsSpawnTool {
                 "operator child provider differs from captured ingress"
             );
         }
-        let pinned_generation_id = || {
-            child_grant
-                .as_ref()
-                .map(|grant| grant.generation().id.0)
-                .or_else(|| ordinary_publication.map(|publication| publication.generation().id.0))
-                .or_else(|| operator_source.as_ref().map(|source| source.generation().id.0))
-                .context("gateway child provider generation missing")
-        };
-        let provider_result = if matches!(&task_provider_plan, ChildProvider::Gateway)
-            && operator_source.is_none()
-            && let Some(resolver) = &self.pinned_provider_resolver
-        {
-            resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
-        } else if let Some(binding) = child_provider_binding.as_ref() {
-            Ok(binding.provider())
-        } else if let Some(resolved) = selected_hint.as_ref() {
-            let reliability = crate::config::ReliabilityConfig {
-                fallback_providers: Vec::new(),
-                ..provider_reliability.clone()
-            };
-            providers::create_provider_for(
-                resolved,
-                child_model_catalog,
-                &reliability,
-                &child_model_config.cost,
-                provider_options,
-            )
-            .map(Arc::from)
-        } else {
-            match task_provider_plan {
-                ChildProvider::Root => {
-                    let credential = child_credential.clone().context("child credential selection missing")?;
-                    let resolved = match providers::selection::check_with(
-                        child_model_config,
-                        child_model_catalog,
-                        &provider_name,
-                        &model,
-                        credential,
-                        &providers::catalog::Requirement::chat(),
-                        providers::catalog::UnknownPolicy::Invocation,
-                    ) {
-                        Ok(resolved) => resolved,
-                        Err(refusal) => return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}"))),
-                    };
-                    providers::create_provider_for(
-                        &resolved,
-                        child_model_catalog,
-                        provider_reliability,
-                        &child_model_config.cost,
-                        provider_options,
-                    )
-                    .map(Arc::from)
-                }
-                ChildProvider::Build { api_key } => {
-                    let credential = child_credential.clone().context("child credential selection missing")?;
-                    let resolved = match providers::selection::check_with(
-                        child_model_config,
-                        child_model_catalog,
-                        &provider_name,
-                        &model,
-                        credential,
-                        &providers::catalog::Requirement::chat(),
-                        providers::catalog::UnknownPolicy::Invocation,
-                    ) {
-                        Ok(resolved) => resolved,
-                        Err(refusal) => {
-                            return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}")));
-                        }
-                    };
-                    if let Some(planned_key) = api_key.as_deref() {
-                        anyhow::ensure!(
-                            resolved.credential().api_key() == Some(planned_key),
-                            "resolved child credential differs from the provider plan"
-                        );
-                    }
-                    Self::build_override_provider(
-                        &resolved,
-                        child_model_catalog,
-                        provider_reliability,
-                        &child_model_config.cost,
-                        provider_options,
-                    )
-                }
-                ChildProvider::Gateway => {
-                    if let Some(resolver) = &self.pinned_provider_resolver {
-                        resolver.resolve(pinned_generation_id()?, &provider_name, &model).await
-                    } else {
-                        Ok(self.provider.clone())
-                    }
-                }
-            }
-        };
-        let provider = match provider_result {
-            Ok(provider) => provider,
-            Err(error) => {
-                return Ok(SpawnOutcome::rejected(format!(
-                    "Failed to create provider '{}' for sessions_spawn: {}",
-                    providers::redact_endpoint_userinfo(&provider_name),
-                    providers::sanitize_api_error(&providers::redact_endpoint_userinfo(&error.to_string()))
-                )));
-            }
-        };
+        let provider = child_provider_binding
+            .as_ref()
+            .context("admitted sessions_spawn child model binding missing")?
+            .provider();
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
         // Event bridge (v1.1a): if a chat-side sink is attached, create this

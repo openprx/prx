@@ -41,7 +41,7 @@ mod worker_manifest;
 pub(crate) use self::actions::{STEER_CHANNEL_CAPACITY, steering_instruction};
 pub(crate) use self::announce::{AnnounceOrigin, announce_is_authorized};
 use self::announce::{OutboundNotice, deliver_or_withhold_notice, format_announce_message};
-use self::batch::{BatchMember, BatchRoster};
+use self::batch::{BatchMember, BatchRoster, resolve_pinned_child_compaction};
 #[cfg(test)]
 use self::batch::{JoinedMember, JoinedVerdict, join_batch_members, join_summary, settled_verdict};
 use self::child_lifecycle::{
@@ -81,7 +81,7 @@ use self::process_control::{ProcessModeRunSeed, new_process_mode_run};
 #[cfg(test)]
 use self::process_mode::classify_worker_output;
 use self::process_mode::run_sub_agent_process;
-use self::provider::{ChildProvider, resolve_child_provider_api_key};
+use self::provider::resolve_child_provider_api_key;
 pub(crate) use self::scope::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext, ambient_channel_excluded_tools};
 use self::scope::{
     SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage,
@@ -123,8 +123,8 @@ use crate::memory::Memory;
 use crate::memory::MemoryEventRecording;
 use crate::memory::MemoryFabric;
 use crate::providers;
+#[cfg(test)]
 use crate::providers::Provider;
-use crate::router::CompactionResolver;
 use crate::security::SecurityPolicy;
 use crate::tools::traits::Tool;
 use chrono::DateTime;
@@ -384,9 +384,10 @@ pub struct SessionsSpawnTool {
     /// processing (the channels JoinSet) would otherwise cause. Empty in unit
     /// tests / single-channel paths, where the shared `channel` fallback applies.
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
-    /// Provider for sub-agent LLM calls.
-    provider: Arc<dyn Provider>,
-    pinned_provider_resolver: Option<Arc<dyn providers::generation::PinnedProviderResolver>>,
+    /// Test-only parent provider injected at the admitted-source seam. Child
+    /// providers always come from the production admitted binding.
+    #[cfg(test)]
+    test_parent_provider: Arc<dyn Provider>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.
@@ -404,8 +405,6 @@ pub struct SessionsSpawnTool {
     tools: Arc<ParentToolRegistry>,
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
-    /// Model-aware compaction resolver for sub-agent tool call loops.
-    compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     /// Credential issued for `provider_name` (the gateway provider): released
@@ -422,11 +421,6 @@ pub struct SessionsSpawnTool {
     default_route_source: Option<(String, providers::credentials::CredentialRef)>,
     fallback_api_key_owner: String,
     fallback_uses_root_connection: bool,
-    /// Reliability settings applied when a sub-agent overrides the provider.
-    ///
-    /// Without this the override path built a bare provider with no retry,
-    /// backoff or rate-limit handling at all — see [`Self::build_override_provider`].
-    reliability: crate::config::ReliabilityConfig,
     /// Pricing table used only for recording/displaying child-agent token cost.
     cost_config: crate::config::schema::CostConfig,
     /// Shared memory backend for normalized spawn lifecycle events.

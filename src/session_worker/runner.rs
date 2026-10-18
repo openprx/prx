@@ -234,7 +234,7 @@ fn worker_spawn_tool(
     manifest: &WorkerManifest,
     config: &Config,
     credentials: &WorkerCredentials<'_>,
-    provider: Arc<dyn Provider>,
+    #[cfg(test)] provider: Arc<dyn Provider>,
     security: Arc<SecurityPolicy>,
     options: &crate::providers::ProviderRuntimeOptions,
     active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
@@ -254,6 +254,7 @@ fn worker_spawn_tool(
         .map_or_else(|| manifest.model.clone(), |hint| format!("hint:{hint}"));
     let tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::new(WorkerChannel),
+        #[cfg(test)]
         provider,
         spawn_provider_name,
         spawn_model,
@@ -261,20 +262,13 @@ fn worker_spawn_tool(
         security,
         manifest.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         credentials.spawn_fallback.map(str::to_string),
         options.clone(),
         config.sessions_spawn.clone(),
         active_runs,
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
     .with_cost_config(config.cost.clone())
-    .with_reliability(credentials.reliability.as_ref().clone())
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
     .with_model_catalog(crate::providers::selection::catalog_for(config))
     .with_hint_config(config)
@@ -1855,6 +1849,7 @@ async fn run_owned_manifest(
         &manifest,
         &config,
         &credentials,
+        #[cfg(test)]
         Arc::clone(&provider),
         Arc::clone(&security),
         &provider_runtime_options,
@@ -1898,13 +1893,17 @@ async fn run_owned_manifest(
         &config,
         Arc::clone(&security),
     )));
-    full_tools.push(Box::new(crate::tools::ImageTool::new(
-        Arc::clone(&provider),
-        &manifest.model,
-        manifest.temperature,
-        Arc::clone(&security),
-        config.multimodal.clone(),
-    )));
+    full_tools.push(Box::new(
+        crate::tools::ImageTool::new(
+            Arc::clone(&provider),
+            &manifest.model,
+            manifest.temperature,
+            Arc::clone(&security),
+            config.multimodal.clone(),
+        )
+        .with_provider_name(&manifest.provider_name)
+        .with_model_catalog(crate::providers::selection::catalog_for(&config)),
+    ));
     full_tools.push(Box::new(crate::tools::ConfigReloadTool::with_security(
         shared_config.clone(),
         Arc::clone(&security),

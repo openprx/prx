@@ -1262,6 +1262,7 @@ pub(crate) struct AgentModelChoice {
     model_name: String,
     model_binding: AgentModelBinding,
     resolved: crate::providers::catalog::ResolvedModel,
+    catalog: crate::providers::catalog::CatalogView,
 }
 
 impl AgentModelChoice {
@@ -1275,6 +1276,10 @@ impl AgentModelChoice {
 
     pub(crate) fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    pub(crate) const fn catalog(&self) -> &crate::providers::catalog::CatalogView {
+        &self.catalog
     }
 
     /// An injected provider may switch model IDs only within the connection
@@ -1298,8 +1303,7 @@ impl AgentModelChoice {
         if self.provider_name.trim() != self.provider_name {
             return false;
         }
-        let catalog = providers::selection::catalog_for(config);
-        let route = match providers::selection::route_target(&catalog, &self.provider_name, &self.model_name) {
+        let route = match providers::selection::route_target(&self.catalog, &self.provider_name, &self.model_name) {
             Ok(route) => route.cloned(),
             Err(_) => return false,
         };
@@ -1308,7 +1312,7 @@ impl AgentModelChoice {
         }
         providers::selection::check_with(
             config,
-            &catalog,
+            &self.catalog,
             &self.provider_name,
             &self.model_name,
             self.resolved.credential().reference().clone(),
@@ -1407,6 +1411,7 @@ pub(crate) fn resolve_agent_model_choice(
         model_name: model_name.to_string(),
         model_binding: AgentModelBinding::from_resolved(&resolved, route),
         resolved,
+        catalog,
     })
 }
 
@@ -1421,6 +1426,7 @@ pub(crate) struct AgentProviderSelection<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) model_name: &'a str,
     resolved: &'a crate::providers::catalog::ResolvedModel,
+    catalog: &'a crate::providers::catalog::CatalogView,
 }
 
 /// Scope the connection for a resolved selection. Resolution already ran in
@@ -1430,6 +1436,7 @@ pub(crate) fn agent_provider_selection(choice: &AgentModelChoice) -> AgentProvid
         provider_name: &choice.provider_name,
         model_name: &choice.model_name,
         resolved: &choice.resolved,
+        catalog: &choice.catalog,
     }
 }
 
@@ -1440,8 +1447,7 @@ impl AgentProviderSelection<'_> {
         config: &Config,
         options: &providers::ProviderRuntimeOptions,
     ) -> Result<Box<dyn Provider>> {
-        let catalog = providers::selection::catalog_for(config);
-        providers::create_routed_provider_for(self.resolved, &catalog, config, options)
+        providers::create_routed_provider_for(self.resolved, self.catalog, config, options)
     }
 }
 
@@ -1613,12 +1619,13 @@ pub(crate) async fn run_with_runtime_envelope(
         let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
         let provider: Box<dyn Provider> = selection.build_provider(&config, &provider_runtime_options)?;
-        let effective_compaction = crate::router::resolve_effective_compaction_config(
+        let effective_compaction = crate::router::context::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider_name,
             model_name,
             &config.router,
             &config.model_routes,
+            choice.catalog(),
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
 

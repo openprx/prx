@@ -4,9 +4,49 @@ use super::*;
 
 #[tokio::test]
 async fn spawn_action_obeys_readonly_resource_gate() {
+    let workspace = tempfile::tempdir().expect("test: isolated gate workspace");
+    let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+    let task = json!({"task": "sessions_spawn: run the blocked child task"});
+    let (control_channel, _) = RecordingChannel::new();
+    let mut control = make_tool_with_security_and_spawn_config(
+        Arc::new(control_channel),
+        Arc::new(EchoProvider {
+            response: "control completed".into(),
+        }),
+        Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        }),
+        crate::config::SessionsSpawnConfig::default(),
+    );
+    control.workspace_dir = workspace.path().to_path_buf();
+    control.provider_name = probe.custom_provider();
+    control.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+    control.configured_providers =
+        providers::ConfiguredProviders::default().with_providers([control.provider_name.as_str()]);
+    let allowed = execute_enabled_admitted_spawn(&control, task.clone())
+        .await
+        .expect("the same task must reach the enabled spawn path without the read-only gate");
+    assert!(allowed.success, "ungated control did not execute: {:?}", allowed.error);
+    let runs = control.active_runs_arc();
+    let run_id = runs
+        .read()
+        .await
+        .first()
+        .expect("test: control registered a child")
+        .id
+        .clone();
+    assert_eq!(
+        await_terminal_reason(&runs, &run_id).await,
+        crate::providers::credential_probe::PROBE_REPLY
+    );
+    assert_eq!(probe.requests().len(), 1, "test: control reached the child provider");
+
     let (ch, _) = RecordingChannel::new();
     let readonly_security = Arc::new(SecurityPolicy {
         autonomy: crate::security::policy::AutonomyLevel::ReadOnly,
+        workspace_dir: workspace.path().to_path_buf(),
         ..SecurityPolicy::default()
     });
     let tool = SessionsSpawnTool::new(
@@ -14,28 +54,32 @@ async fn spawn_action_obeys_readonly_resource_gate() {
         Arc::new(EchoProvider {
             response: "done".into(),
         }),
-        "ollama",
-        "prx-local-model",
+        probe.custom_provider(),
+        crate::providers::credential_probe::PROBE_MODEL,
         0.7,
         readonly_security,
-        std::path::PathBuf::from("/tmp"),
+        workspace.path().to_path_buf(),
         crate::config::MultimodalConfig::default(),
-        crate::config::AgentCompactionConfig::default(),
         HashMap::new(),
         None,
         crate::providers::ProviderRuntimeOptions::default(),
         crate::config::SessionsSpawnConfig::default(),
     );
 
-    let error = execute_admitted_spawn(&tool, json!({"task": "blocked"}))
+    let error = execute_enabled_admitted_spawn(&tool, task)
         .await
         .expect_err("a side-effect tool must not be offered on a read-only surface");
     assert_eq!(
         error.to_string(),
-        "decision has no executable selection",
+        "admitted fixture did not select tool 'sessions_spawn'",
         "a read-only turn must close before publishing an executable spawn selection"
     );
     assert!(tool.active_runs_snapshot().await.is_empty());
+    assert_eq!(
+        probe.requests().len(),
+        1,
+        "gated turn must not contact the child provider"
+    );
 }
 
 #[tokio::test]

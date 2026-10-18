@@ -494,7 +494,8 @@ async fn run_turn_unguarded(
     } else {
         crate::providers::traits::ProviderRequestMode::NonStreaming
     };
-    let mode_capabilities = provider.capabilities_for(model, provider_mode);
+    let mode_capabilities =
+        service.effective_provider_capabilities(provider_name, model, provider.capabilities_for(model, provider_mode));
 
     // FIX-P3-05: Letta/MemGPT-style OS-paging for legacy compaction modes.
     // Exact context switching bypasses this block so the durable handoff owns

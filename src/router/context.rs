@@ -6,7 +6,7 @@ pub const KERNEL_SUPPORTED_CONTEXT_TOKENS: usize = 10_000_000;
 pub enum ContextWindowSource {
     AgentCompactionOverride,
     RouterModelConfig,
-    RouterBuiltin,
+    Catalog,
     FallbackDefault,
 }
 
@@ -37,14 +37,16 @@ pub struct CompactionResolver {
     base: AgentCompactionConfig,
     router: RouterConfig,
     model_routes: Vec<ModelRouteConfig>,
+    catalog: crate::providers::catalog::CatalogView,
 }
 
 impl CompactionResolver {
-    pub const fn new(base: AgentCompactionConfig, router: RouterConfig, model_routes: Vec<ModelRouteConfig>) -> Self {
+    pub fn new(base: AgentCompactionConfig, router: RouterConfig, model_routes: Vec<ModelRouteConfig>) -> Self {
         Self {
             base,
             router,
             model_routes,
+            catalog: crate::providers::catalog::CatalogView::release_only(),
         }
     }
 
@@ -52,8 +54,22 @@ impl CompactionResolver {
         Self::new(base, RouterConfig::default(), Vec::new())
     }
 
+    /// Attach the exact generation's operator, discovery, and release facts.
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: crate::providers::catalog::CatalogView) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
     pub fn resolve(&self, provider: &str, model: &str) -> EffectiveCompactionConfig {
-        resolve_effective_compaction_config(&self.base, provider, model, &self.router, &self.model_routes)
+        resolve_effective_compaction_config_with_catalog(
+            &self.base,
+            provider,
+            model,
+            &self.router,
+            &self.model_routes,
+            &self.catalog,
+        )
     }
 }
 
@@ -63,6 +79,24 @@ pub fn resolve_effective_compaction_config(
     model: &str,
     router: &RouterConfig,
     model_routes: &[ModelRouteConfig],
+) -> EffectiveCompactionConfig {
+    resolve_effective_compaction_config_with_catalog(
+        base,
+        provider,
+        model,
+        router,
+        model_routes,
+        &crate::providers::catalog::CatalogView::release_only(),
+    )
+}
+
+pub fn resolve_effective_compaction_config_with_catalog(
+    base: &AgentCompactionConfig,
+    provider: &str,
+    model: &str,
+    router: &RouterConfig,
+    model_routes: &[ModelRouteConfig],
+    catalog: &crate::providers::catalog::CatalogView,
 ) -> EffectiveCompactionConfig {
     let (selected_provider, selected_model) = resolve_selected_model(provider, model, model_routes);
 
@@ -92,19 +126,16 @@ pub fn resolve_effective_compaction_config(
         );
     }
 
-    #[cfg(feature = "llm-router")]
-    {
-        let builtin_models = crate::router::models::builtin_model_capabilities();
-        if let Some(model_config) = find_model_config(&builtin_models, &selected_provider, &selected_model) {
-            return with_model_context(
-                base,
-                model_config.max_context,
-                model_config.reserved_output_tokens,
-                ContextWindowSource::RouterBuiltin,
-                selected_provider,
-                selected_model,
-            );
-        }
+    let descriptor = catalog.describe(&crate::providers::ProviderId::of(&selected_provider), &selected_model);
+    if let Some(context_window) = descriptor.context_window {
+        return with_model_context(
+            base,
+            usize::try_from(context_window).unwrap_or(usize::MAX),
+            None,
+            ContextWindowSource::Catalog,
+            selected_provider,
+            selected_model,
+        );
     }
 
     let capped = cap_to_kernel(base.max_context_tokens);
@@ -476,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_builtin_model_when_config_models_are_empty() {
+    fn compaction_window_comes_from_release_catalog_without_router_rows() {
         let result = resolve_effective_compaction_config(
             &AgentCompactionConfig::default(),
             "openrouter",
@@ -485,7 +516,7 @@ mod tests {
             &[],
         );
         assert_eq!(result.config.max_context_tokens, 1_000_000);
-        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+        assert_eq!(result.max_context_source, ContextWindowSource::Catalog);
     }
 
     #[test]
@@ -498,7 +529,7 @@ mod tests {
             &[],
         );
         assert_eq!(result.config.max_context_tokens, 1_000_000);
-        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+        assert_eq!(result.max_context_source, ContextWindowSource::Catalog);
     }
 
     #[test]
@@ -511,7 +542,7 @@ mod tests {
             &[],
         );
         assert_eq!(result.config.max_context_tokens, 200_000);
-        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+        assert_eq!(result.max_context_source, ContextWindowSource::Catalog);
     }
 
     #[test]
@@ -524,7 +555,30 @@ mod tests {
             &[],
         );
         assert_eq!(result.config.max_context_tokens, 32_000);
-        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+        assert_eq!(result.max_context_source, ContextWindowSource::Catalog);
+    }
+
+    #[test]
+    fn catalog_context_matches_aggregator_suffix_without_matching_ollama_wildcard() {
+        let variant = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "openrouter",
+            "moonshotai/kimi-k2.5:free",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(variant.config.max_context_tokens, 262_144);
+        assert_eq!(variant.max_context_source, ContextWindowSource::Catalog);
+
+        let unknown_local = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "ollama",
+            "prx-unknown-local-model",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(unknown_local.config.max_context_tokens, 128_000);
+        assert_eq!(unknown_local.max_context_source, ContextWindowSource::FallbackDefault);
     }
 
     #[test]

@@ -28,7 +28,7 @@ mod tool_setup;
 
 use super::*;
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::{AgentCompactionConfig, MultimodalConfig};
+use crate::config::MultimodalConfig;
 use crate::hooks::HookManager;
 use crate::memory::MessageEventScope;
 use crate::memory::{Memory, MemoryEventInput, MemoryPrincipal, MemoryVisibility, SqliteMemory};
@@ -580,7 +580,7 @@ async fn dispatch_preconstruction_parent(
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
     cleanup
         .run(Box::pin(async move {
-            let provider = Arc::clone(&tool.provider);
+            let provider = Arc::clone(&tool.test_parent_provider);
             let security = Arc::clone(&tool.security);
             let workspace = config.workspace_dir.clone();
             // Q71 hybrid is deliberately invalid for persistence; publish the
@@ -641,7 +641,6 @@ fn make_tool_with_security_and_spawn_config(
         security,
         std::path::PathBuf::from("/tmp"),
         crate::config::MultimodalConfig::default(),
-        crate::config::AgentCompactionConfig::default(),
         HashMap::new(),
         None,
         crate::providers::ProviderRuntimeOptions::default(),
@@ -685,8 +684,7 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         channel: Arc::clone(&tool.channel),
         test_worker_executable: tool.test_worker_executable.clone(),
         channels: Arc::clone(&tool.channels),
-        provider: Arc::clone(&tool.provider),
-        pinned_provider_resolver: tool.pinned_provider_resolver.clone(),
+        test_parent_provider: Arc::clone(&tool.test_parent_provider),
         provider_name: tool.provider_name.clone(),
         model: tool.model.clone(),
         security: Arc::clone(&tool.security),
@@ -694,7 +692,6 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         active_runs: Arc::clone(&tool.active_runs),
         tools: Arc::clone(&tool.tools),
         workspace_dir: tool.workspace_dir.clone(),
-        compaction_resolver: tool.compaction_resolver.clone(),
         agents: Arc::clone(&tool.agents),
         fallback_api_key: tool.fallback_api_key.clone(),
         configured_providers: tool.configured_providers.clone(),
@@ -703,7 +700,6 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         default_route_source: tool.default_route_source.clone(),
         fallback_api_key_owner: tool.fallback_api_key_owner.clone(),
         fallback_uses_root_connection: tool.fallback_uses_root_connection,
-        reliability: tool.reliability.clone(),
         cost_config: tool.cost_config.clone(),
         memory: tool.memory.clone(),
         source_fabric: tool.source_fabric.clone(),
@@ -722,6 +718,21 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
 /// the tool this way; a raw unit call has neither a parent grant nor an
 /// ordinary publication and must fail closed.
 async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json::Value) -> anyhow::Result<ToolResult> {
+    execute_admitted_spawn_with_plane(tool, arguments, false).await
+}
+
+async fn execute_enabled_admitted_spawn(
+    tool: &SessionsSpawnTool,
+    arguments: serde_json::Value,
+) -> anyhow::Result<ToolResult> {
+    execute_admitted_spawn_with_plane(tool, arguments, true).await
+}
+
+async fn execute_admitted_spawn_with_plane(
+    tool: &SessionsSpawnTool,
+    arguments: serde_json::Value,
+    decision_enabled: bool,
+) -> anyhow::Result<ToolResult> {
     fn fixture_price() -> crate::config::schema::ModelPricing {
         crate::config::schema::ModelPricing {
             input: 1.0,
@@ -769,7 +780,7 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
     config.config_path = workspace.join("config.toml");
     config.default_provider = Some(tool.provider_name.clone());
     config.default_model = Some(tool.model.clone());
-    config.causal_tree.enabled = false;
+    config.causal_tree.enabled = decision_enabled;
     config.autonomy.level = tool.security.autonomy;
     config.autonomy.workspace_only = tool.security.workspace_only;
     config
@@ -790,7 +801,6 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
         .clone_from(&tool.security.assign_owners);
     config.security.audit = tool.security.audit_config.clone();
     config.agents = tool.agents.as_ref().clone();
-    config.reliability = tool.reliability.clone();
     config.cost = tool.cost_config.clone();
     if !config
         .providers
@@ -856,7 +866,7 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
         .entry("ollama/prx-local-model".to_owned())
         .or_insert_with(fixture_price);
     let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
-    let provider = Arc::clone(&tool.provider);
+    let provider = Arc::clone(&tool.test_parent_provider);
     let provider_name = tool.provider_name.clone();
     let model_name = tool.model.clone();
     let registry =
@@ -872,7 +882,15 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
             .to_owned(),
         sender: field("sender").unwrap_or("prx_user").to_owned(),
         reply_target: field("chat_id").unwrap_or_default().to_owned(),
-        content: "sessions_spawn admitted fixture".to_owned(),
+        content: if decision_enabled {
+            arguments
+                .get("task")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("complete the requested child task")
+                .to_owned()
+        } else {
+            "sessions_spawn admitted fixture".to_owned()
+        },
         channel: field("channel").unwrap_or("wacli").to_owned(),
         timestamp: 0,
         chat_kind,
@@ -887,14 +905,25 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
     cleanup
         .run(Box::pin(async move {
-            let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
-                config,
-                message,
-                registry,
-                admission_memory,
-                (&provider_name, &model_name),
-            )
-            .await;
+            let admitted = if decision_enabled {
+                crate::agent::test_admission::AdmittedTurn::enabled_builtin_channel_with_memory(
+                    config,
+                    message,
+                    registry,
+                    admission_memory,
+                    (&provider_name, &model_name),
+                )
+                .await
+            } else {
+                crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                    config,
+                    message,
+                    registry,
+                    admission_memory,
+                    (&provider_name, &model_name),
+                )
+                .await
+            };
             crate::runtime::child_source::scope_ordinary_provider_fixture(
                 provider,
                 provider_name.clone(),

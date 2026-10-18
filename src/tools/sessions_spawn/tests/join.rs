@@ -241,7 +241,6 @@ fn tool_with_broken_agent(agent: &str) -> SessionsSpawnTool {
         test_security(),
         std::path::PathBuf::from("/tmp"),
         crate::config::MultimodalConfig::default(),
-        crate::config::AgentCompactionConfig::default(),
         agents,
         None,
         crate::providers::ProviderRuntimeOptions::default(),

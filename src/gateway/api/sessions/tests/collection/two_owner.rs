@@ -1,6 +1,7 @@
 #![cfg(test)]
 //! Real authenticated API routing for two independent owner-approved writes.
 use super::*;
+use axum::response::IntoResponse;
 use tower::ServiceExt;
 
 const OWNERS: [(&str, &str, &str); 2] = [
@@ -427,7 +428,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
     config.default_provider = Some("ollama".into());
     config.default_model = Some(MODEL.into());
     config.providers.models.push(toml::from_str(&format!(
-        "provider = \"ollama\"\nmodel = \"{MODEL}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+        "provider = \"ollama\"\nmodel = \"{MODEL}\"\noperations = [\"chat\"]\nnative_tools = true\ncontext_window = 65536\n"
     ))?);
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
@@ -611,7 +612,7 @@ async fn run_two_owner_case() -> anyhow::Result<()> {
     let stop = tokio_util::sync::CancellationToken::new();
     let server_stop = stop.clone();
     let app = axum::Router::new()
-        .route("/v1/systemone", axum::routing::post(decision_reply))
+        .route("/v1/systemone", axum::routing::post(two_owner_decision_reply))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::clone(&calls));
     let mut server = tokio::spawn(async move {
@@ -639,6 +640,17 @@ async fn run_two_owner_case() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+async fn two_owner_decision_reply(
+    axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    calls.fetch_add(1, Ordering::SeqCst);
+    decision_answers(&body).map_or_else(
+        |_| axum::http::StatusCode::BAD_REQUEST.into_response(),
+        |response| axum::Json(response).into_response(),
+    )
 }
 
 mod browser_fixture;

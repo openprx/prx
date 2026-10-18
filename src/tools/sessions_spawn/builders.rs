@@ -3,11 +3,11 @@ use super::{AbortOnDrop, ParentToolRegistry, SessionsSpawnTool, SubAgentRun, pro
 use super::{TestWorkerExecutable, TestWorkerProtocolControl, TestWorkerRecoveryResult, TestWorkerRouteCapture};
 use crate::agent::turn_request::SpawnEventSink;
 use crate::channels::traits::Channel;
-use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
+use crate::config::{DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric};
 use crate::providers;
+#[cfg(test)]
 use crate::providers::Provider;
-use crate::router::CompactionResolver;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::config_source_generation;
 use anyhow::Context as _;
@@ -41,7 +41,8 @@ impl SessionsSpawnTool {
         Ok((config_dir, generation))
     }
 
-    /// Create a new `SessionsSpawnTool` with the given channel and provider.
+    /// Create a new `SessionsSpawnTool` with the given channel and provider
+    /// selection metadata. The admitted binding owns actual child providers.
     ///
     /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
     /// `active_runs` registry owned solely by this tool. Behaviour is identical to
@@ -50,14 +51,13 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         temperature: f64,
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
@@ -65,6 +65,7 @@ impl SessionsSpawnTool {
     ) -> Self {
         Self::new_with_registry(
             channel,
+            #[cfg(test)]
             provider,
             provider_name,
             model,
@@ -72,7 +73,6 @@ impl SessionsSpawnTool {
             security,
             workspace_dir,
             multimodal_config,
-            compaction_config,
             agents,
             fallback_api_key,
             provider_runtime_options,
@@ -92,22 +92,19 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_registry(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         _temperature: f64,
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         _multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         _provider_runtime_options: providers::ProviderRuntimeOptions,
         _spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
-        let compaction_resolver = CompactionResolver::from_base(compaction_config);
-        tracing::debug!("sessions_spawn initialized child compaction resolver");
         let provider_name: String = provider_name.into();
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(std::iter::once(provider_name.as_str()))
@@ -117,8 +114,8 @@ impl SessionsSpawnTool {
             #[cfg(test)]
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
-            provider,
-            pinned_provider_resolver: None,
+            #[cfg(test)]
+            test_parent_provider: provider,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,
@@ -128,14 +125,12 @@ impl SessionsSpawnTool {
             active_runs,
             tools: Arc::new(ParentToolRegistry::default()),
             workspace_dir,
-            compaction_resolver,
             configured_providers,
             model_catalog: Arc::default(),
             hint_config: None,
             default_route_source: None,
             agents: Arc::new(agents),
             fallback_api_key,
-            reliability: crate::config::ReliabilityConfig::default(),
             cost_config: crate::config::schema::CostConfig::default(),
             memory: None,
             source_fabric: None,
@@ -196,15 +191,6 @@ impl SessionsSpawnTool {
         Ok(self)
     }
 
-    #[must_use]
-    pub(crate) fn with_pinned_provider_resolver(
-        mut self,
-        resolver: Arc<dyn providers::generation::PinnedProviderResolver>,
-    ) -> Self {
-        self.pinned_provider_resolver = Some(resolver);
-        self
-    }
-
     #[cfg(test)]
     pub(crate) fn with_test_worker_protocol(mut self, control: Arc<TestWorkerProtocolControl>) -> anyhow::Result<Self> {
         self.test_worker_executable
@@ -225,11 +211,6 @@ impl SessionsSpawnTool {
             .context("route observation requires an attested worker artifact")?
             .route_observer = Some(observer);
         Ok(self)
-    }
-
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = resolver;
-        self
     }
 
     #[must_use]
@@ -280,18 +261,6 @@ impl SessionsSpawnTool {
 
     pub const fn with_fallback_root_connection(mut self, uses_root: bool) -> Self {
         self.fallback_uses_root_connection = uses_root;
-        self
-    }
-
-    /// Supply the deployment's reliability settings.
-    ///
-    /// Only consumed when a sub-agent overrides the provider and this tool has
-    /// to build a fresh chain; without it the retry budget falls back to
-    /// [`ReliabilityConfig::default`](crate::config::ReliabilityConfig::default)
-    /// rather than to "no retries at all".
-    #[must_use]
-    pub fn with_reliability(mut self, reliability: crate::config::ReliabilityConfig) -> Self {
-        self.reliability = reliability;
         self
     }
 

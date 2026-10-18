@@ -687,9 +687,45 @@ fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> R
                     unproven.join(", ")
                 );
             }
+            if let Ok(release) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                && let Some(model) = release.model(
+                    &crate::providers::ProviderId::of(resolved.provider_label()),
+                    resolved.model(),
+                )
+                && model_has_no_billing_tariff(resolved.provider_label(), model, &config.cost)
+            {
+                println!(
+                    "  {} model '{}' has no published token tariff; add an exact `[cost.prices]` entry before \
+                     cost-admitted use.",
+                    style("!").yellow().bold(),
+                    resolved.model()
+                );
+            }
             Ok(())
         }
         Err(refusal) => bail!("{refusal}. Nothing was written."),
+    }
+}
+
+fn model_has_no_billing_tariff(
+    provider: &str,
+    model: &crate::providers::catalog::ReleaseModel,
+    cost: &crate::config::schema::CostConfig,
+) -> bool {
+    matches!(
+        crate::llm::route_decision::usage_cost_resolution(provider, &model.api_model, 1, 1, 0, 0, cost,),
+        crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid
+    )
+}
+
+fn onboarding_model_warning(provider: &str, model: &crate::providers::catalog::ReleaseModel) -> Option<String> {
+    let lifecycle = model.selection_warning();
+    let pricing = model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
+        .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned());
+    match (lifecycle, pricing) {
+        (Some(lifecycle), Some(pricing)) => Some(format!("{lifecycle}; {pricing}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
     }
 }
 
@@ -706,11 +742,11 @@ fn default_model_for_provider(provider: &str) -> String {
                     .find(|model| model.id == catalog.defaults.model)
                     .map(|model| model.api_model.as_str())
             })
-            .unwrap_or(crate::providers::selection::DEFAULT_MODEL_FOR_UNSET)
-            .to_string(),
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_string()),
         Err(error) => {
             tracing::error!(error = %error, "embedded model catalog is invalid");
-            crate::providers::selection::DEFAULT_MODEL_FOR_UNSET.to_string()
+            crate::providers::selection::default_model_for_unset().to_string()
         }
     }
 }
@@ -721,7 +757,13 @@ fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         Ok(catalog) => catalog
             .listed_models(provider)
             .into_iter()
-            .map(|model| (model.api_model.clone(), model.display_name.clone()))
+            .map(|model| {
+                let label = onboarding_model_warning(provider, model).map_or_else(
+                    || model.display_name.clone(),
+                    |warning| format!("{} ({warning})", model.display_name),
+                );
+                (model.api_model.clone(), label)
+            })
             .collect(),
         Err(error) => {
             tracing::error!(error = %error, "embedded model catalog is invalid");
@@ -987,12 +1029,17 @@ fn fetch_live_models_for_provider(
                 // Ollama Cloud does not expose a model-list endpoint. Its
                 // release-owned fallback comes from the same catalog as every
                 // other offline model surface.
-                crate::providers::catalog::ReleaseCatalog::embedded()
+                let mut models = crate::providers::catalog::ReleaseCatalog::embedded()
                     .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?
                     .listed_models("ollama")
                     .into_iter()
                     .map(|model| DiscoveredModel::id_only(&model.api_model))
-                    .collect()
+                    .collect::<Vec<_>>();
+                // The credential means this is Ollama Cloud discovery. Keep
+                // the release catalog as the source, but offer hosted ids
+                // before local-only defaults.
+                models.sort_by_key(|model| !model.id.ends_with(":cloud"));
+                models
             }
         }
         _ => {
@@ -1044,7 +1091,7 @@ struct DiscoveryConnection<'a> {
 /// probed with its own auth profile (or its own environment variable, read by
 /// the fetcher), or without a credential.
 fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
-    let configured_provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let configured_provider = crate::providers::selection::default_provider(config);
     let root = crate::providers::configured_connection_for(
         provider_name,
         configured_provider,
@@ -1157,11 +1204,31 @@ fn humanize_age(age_secs: u64) -> String {
     }
 }
 
-fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+    let provider_name = canonical_provider_name(provider_name);
+    let provider = crate::providers::ProviderId::of(provider_name);
+    let release = crate::providers::catalog::ReleaseCatalog::embedded().ok();
+    build_model_options_with_warnings(model_ids, source, |model_id| {
+        release
+            .as_ref()
+            .and_then(|catalog| catalog.model(&provider, model_id))
+            .and_then(|model| onboarding_model_warning(provider_name, model))
+    })
+}
+
+fn build_model_options_with_warnings(
+    model_ids: Vec<String>,
+    source: &str,
+    mut warning_for: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     model_ids
         .into_iter()
         .map(|model_id| {
-            let label = format!("{model_id} ({source})");
+            let warning = warning_for(&model_id);
+            let label = warning.map_or_else(
+                || format!("{model_id} ({source})"),
+                |warning| format!("{model_id} ({source}; {warning})"),
+            );
             (model_id, label)
         })
         .collect()
@@ -1187,6 +1254,7 @@ fn apply_wizard_model_fetch(
             let fetched_count = live_model_ids.len();
             let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
             *live_options = Some(build_model_options(
+                provider_name,
                 live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                 "live",
             ));
@@ -1203,6 +1271,7 @@ fn apply_wizard_model_fetch(
             {
                 stale_age_secs = Some(stale.age_secs);
                 *live_options = Some(build_model_options(
+                    provider_name,
                     stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "stale-cache",
                 ));
@@ -1915,6 +1984,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 ));
 
                 live_options = Some(build_model_options(
+                    provider_name,
                     cached.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "cached",
                 ));
@@ -2052,7 +2122,7 @@ fn quick_summary_provider_line(config: &Config) -> String {
     format!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
+        crate::providers::redact_endpoint_userinfo(crate::providers::selection::default_provider(config))
     )
 }
 
@@ -4360,7 +4430,7 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = crate::providers::selection::default_provider(config);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if provider == "openai-codex" {
             println!(
@@ -5480,10 +5550,78 @@ mod tests {
         let discovered = fetch_live_models_for_provider("ollama", "fixture-key", None)
             .expect("test: embedded Ollama fallback must load");
         let ids: Vec<_> = discovered.iter().map(|model| model.id.as_str()).collect();
-        assert_eq!(ids.first().copied(), Some("llama3.2"));
+        assert!(ids.first().is_some_and(|model| model.ends_with(":cloud")));
         assert!(ids.contains(&"glm-5:cloud"));
         assert!(ids.contains(&"qwen2.5-coder:3b"));
         assert!(!ids.contains(&"*"));
+    }
+
+    #[test]
+    fn model_options_label_deprecated_rows_without_hiding_them() {
+        let options = build_model_options_with_warnings(
+            vec!["prx-current".to_owned(), "prx-legacy".to_owned()],
+            "live",
+            |model| (model == "prx-legacy").then(|| "deprecated; use ollama/prx-current".to_owned()),
+        );
+        assert_eq!(
+            options,
+            vec![
+                ("prx-current".to_owned(), "prx-current (live)".to_owned()),
+                (
+                    "prx-legacy".to_owned(),
+                    "prx-legacy (live; deprecated; use ollama/prx-current)".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn onboarding_labels_catalog_rows_that_have_no_billing_tariff() {
+        for (provider, model) in [
+            ("openrouter", "deepseek/deepseek-v3.2"),
+            ("openrouter", "google/gemini-3.5-flash"),
+            ("openrouter", "meta-llama/llama-4-maverick"),
+            ("openrouter", "openai/gpt-5-mini"),
+            ("openrouter", "x-ai/grok-4.20"),
+            ("gemini", "gemini-3.5-flash"),
+            ("xai", "grok-4.20"),
+        ] {
+            let option = catalog_models_for_provider(provider)
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing onboarding row {provider}/{model}"));
+            assert!(option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        for model in ["anthropic/claude-sonnet-5", "openai/gpt-5.6"] {
+            let option = catalog_models_for_provider("openrouter")
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing priced upstream row {model}"));
+            assert!(!option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let row = release
+            .model(
+                &crate::providers::ProviderId::of("openrouter"),
+                "deepseek/deepseek-v3.2",
+            )
+            .expect("unpriced onboarding row");
+        let mut cost = crate::config::schema::CostConfig::default();
+        cost.prices.insert(
+            "deepseek/deepseek-v3.2".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 0.1,
+                output: 0.2,
+                cache_write: 0.1,
+                cache_read: 0.01,
+            },
+        );
+        assert!(
+            !model_has_no_billing_tariff("openrouter", row, &cost),
+            "an exact operator override must clear the selected-model warning"
+        );
     }
 
     #[test]

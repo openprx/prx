@@ -15,8 +15,8 @@ use crate::providers::credentials::{
     ConfigCredentialSource, CredentialLookupError, CredentialMaterial, CredentialRef, CredentialSource, LegacySlot,
 };
 use crate::providers::{
-    DEFAULT_PROVIDER_FOR_UNSET, Provider, ProviderCapabilityError, ProviderId, create_provider_for,
-    create_provider_with_options, provider_runtime_options_from_config,
+    Provider, ProviderCapabilityError, ProviderId, create_provider_for, create_provider_with_options,
+    default_provider_for_unset, provider_runtime_options_from_config,
 };
 use crate::tools::ToolSchemaDialect;
 
@@ -70,7 +70,10 @@ fn chat_model(provider: &str, model: &str, features: FeatureSet) -> ModelDescrip
 /// The default selection, resolved and then built — the order every surface
 /// adopts in PMM-C.
 fn select_and_build(config: &Config, catalog: &CatalogView) -> anyhow::Result<Box<dyn Provider>> {
-    let provider = config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET);
+    let provider = config
+        .default_provider
+        .as_deref()
+        .map_or_else(default_provider_for_unset, |provider| provider);
     let model = config.default_model.as_deref().unwrap_or_default();
     let resolved = resolve(
         &Selection {

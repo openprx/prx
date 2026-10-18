@@ -39,6 +39,12 @@ llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
 discovery. Kimi Code rejects model strings outside its three documented IDs
 because that endpoint can silently accept or remap a mistyped model.
 
+Catalog lifecycle controls new selections: active and deprecated chat rows are
+listed, with deprecated rows labeled with their replacement when one exists;
+retired rows stay hidden. Ollama Cloud has no live model-list endpoint, so an
+authenticated onboarding fallback uses the release rows and places `:cloud`
+models before local-only ids.
+
 ## Capability contracts
 
 - OpenAI-compatible providers support non-streaming and streaming text and
@@ -378,7 +384,11 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
   was shown.
 - **Hot reload.** The declarations are part of the configuration generation
   providers are rebuilt from, so an edited entry applies to providers built
-  after the reload, like every other provider setting.
+  after the reload, like every other provider setting. The long-lived channel
+  `image` tool resolves the provider and model catalog owned by the invoking
+  generation; `sessions_spawn` uses the child provider binding admitted for
+  that invocation. Provider, model, temperature, credential and capability
+  declarations therefore move together after a reload.
 - **Consequence of `no_root_combinators`.** Tools whose published contract uses
   a conditional or alternative root combinator are refused on that endpoint,
   and a request that includes any of them fails before transport, naming every
@@ -653,15 +663,41 @@ the root `api_key` and `api_url` are reused only for the configured default
 provider. A different provider resolves its route credential or active auth
 profile unless the named delegate supplies an explicit `api_key`.
 
-Static prices are recorded only when the provider publishes token prices for a
-stable model ID. Current Anthropic, OpenAI GPT-5.6, and documented Gemini 3.1
-prices are included. Kimi Code is subscription/quota billed, so PRX deliberately
-does not invent a per-token cost for `k3` or the `kimi-for-coding*` aliases.
-OpenRouter and proxy pricing remains dynamic.
+Static prices are recorded in the embedded release catalog only when the
+provider publishes token prices for a stable model ID. Kimi Code is
+subscription/quota billed, so PRX deliberately does not invent a per-token cost
+for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
+recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
+OpenRouter and proxy pricing remains dynamic except for exact release rows with
+a published price. The release values are checked against the providers'
+published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
+[xAI model metadata](https://docs.x.ai/developers/rest-api-reference/management/auth).
+An uncertain model-specific price is omitted instead of inferred from another
+generation. Router ranking cost is a separate catalog hint and is never used as
+the input/output billing tariff.
 
-When a selected model has no matching `cost.prices` entry, only `ollama` is
-treated as zero-cost. LM Studio, llama.cpp, vLLM, and custom loopback endpoints
-need an explicit `cost.prices` entry before PRX can produce a cost estimate.
+OpenRouter `:free` variants settle at zero token cost unless an operator override
+is present. The deprecated `:online` variant stays unpriced because its
+separately billed web-search component is not representable by PRX's token-only
+catalog tariff; use an exact `[cost.prices]` override or migrate to OpenRouter's
+server web-search tool. The variant and its extra search pricing are documented
+by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-search).
+
+`[cost.prices]` is an operator-override table and wins over the release catalog.
+When neither source has a matching price, only `ollama` is treated as zero-cost.
+LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
+`cost.prices` entry before PRX can produce a cost estimate.
+
+The Router's built-in candidates are limited to active release rows with a
+published billing tariff. Retired or unpriced rows remain available only through
+an explicit operator route; they are never automatic candidates. Onboarding
+labels a selectable catalog row when its effective token tariff is unavailable.
+
+The catalog's `ollama/*` entry seeds only the Router's conservative local
+candidate. It does not assert vision, context-window, or verification facts for
+an arbitrary local model; exact discovery or `[[providers.models]]` declarations
+remain authoritative for those models.
 
 The canonical routing, usage, and cost settlement boundary is described in
 [provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).

@@ -79,27 +79,71 @@ async fn kill_uses_per_turn_channel_not_shared_state() {
 /// deny the spawn outright — no run is registered and no announcement fires.
 #[tokio::test]
 async fn spawn_denied_without_grant_under_supervised() {
+    let workspace = tempfile::tempdir().expect("test: isolated gate workspace");
+    let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+    let task = json!({"task": "sessions_spawn: tell a joke in a child task"});
+    let (control_channel, _) = RecordingChannel::new();
+    let mut control = make_tool_with_security_and_spawn_config(
+        Arc::new(control_channel),
+        Arc::new(EchoProvider {
+            response: "control completed".into(),
+        }),
+        Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        }),
+        crate::config::SessionsSpawnConfig::default(),
+    );
+    control.workspace_dir = workspace.path().to_path_buf();
+    control.provider_name = probe.custom_provider();
+    control.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+    control.configured_providers =
+        providers::ConfiguredProviders::default().with_providers([control.provider_name.as_str()]);
+    let allowed = execute_enabled_admitted_spawn(&control, task.clone())
+        .await
+        .expect("the same task must reach the enabled spawn path without the supervised gate");
+    assert!(allowed.success, "ungated control did not execute: {:?}", allowed.error);
+    let runs = control.active_runs_arc();
+    let run_id = runs
+        .read()
+        .await
+        .first()
+        .expect("test: control registered a child")
+        .id
+        .clone();
+    assert_eq!(
+        await_terminal_reason(&runs, &run_id).await,
+        crate::providers::credential_probe::PROBE_REPLY
+    );
+    assert_eq!(probe.requests().len(), 1, "test: control reached the child provider");
+
     let (ch, sent) = RecordingChannel::new();
-    let tool = make_tool_with_security_and_spawn_config(
+    let mut tool = make_tool_with_security_and_spawn_config(
         Arc::new(ch),
         Arc::new(EchoProvider {
             response: "should never run".into(),
         }),
         Arc::new(SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         }),
         crate::config::SessionsSpawnConfig::default(),
     );
+    tool.workspace_dir = workspace.path().to_path_buf();
+    tool.provider_name = probe.custom_provider();
+    tool.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+    tool.configured_providers = providers::ConfiguredProviders::default().with_providers([tool.provider_name.as_str()]);
     tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
     // No grant injected → Medium-risk gate denies under supervised autonomy.
-    let denied = execute_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
+    let denied = execute_enabled_admitted_spawn(&tool, task)
         .await
         .expect_err("an unapproved side-effect tool must not be offered for execution");
     assert_eq!(
         denied.to_string(),
-        "decision has no executable selection",
+        "admitted fixture did not select tool 'sessions_spawn'",
         "the admitted surface must exclude the unapproved tool"
     );
 
@@ -109,6 +153,11 @@ async fn spawn_denied_without_grant_under_supervised() {
     // Give any (non-existent) async work a chance; nothing should be sent.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(sent.lock().await.len(), 0);
+    assert_eq!(
+        probe.requests().len(),
+        1,
+        "gated turn must not contact the child provider"
+    );
 }
 
 #[tokio::test]

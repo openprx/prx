@@ -6,7 +6,6 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
-use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -92,8 +91,6 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
-    /// Model-aware compaction resolver inherited from root config.
-    compaction_resolver: Arc<CompactionResolver>,
     /// Shared memory fabric backend for normalized delegation events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -262,9 +259,6 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -294,9 +288,6 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_resolver: Arc::new(CompactionResolver::from_base(
-                crate::config::AgentCompactionConfig::default(),
-            )),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -395,21 +386,6 @@ impl DelegateTool {
     pub const fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
-    }
-
-    /// Attach model-aware compaction resolution for agentic sub-agent loops.
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = Arc::new(resolver);
-        self
-    }
-
-    #[cfg(test)]
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach shared memory so delegate requests/results join the live fabric.
@@ -1002,7 +978,6 @@ struct DelegateLoopRequest<'a> {
 struct DelegateLoopResources {
     security: Arc<SecurityPolicy>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
-    compaction_resolver: Arc<CompactionResolver>,
 }
 
 struct DelegateTaskContext {
@@ -1011,6 +986,22 @@ struct DelegateTaskContext {
     // Drop the cleanup owner before its acknowledgement receiver, as before.
     loop_cleanup: crate::runtime::turn_cleanup::CleanupScope,
     cleanup_confirmed: tokio::sync::oneshot::Receiver<Result<(), String>>,
+}
+
+fn resolve_pinned_child_compaction(
+    config: &crate::config::Config,
+    provider: &str,
+    model: &str,
+) -> crate::router::context::EffectiveCompactionConfig {
+    let catalog = crate::providers::selection::catalog_for(config);
+    crate::router::context::resolve_effective_compaction_config_with_catalog(
+        &config.agent.compaction,
+        provider,
+        model,
+        &config.router,
+        &config.model_routes,
+        &catalog,
+    )
 }
 
 impl DelegateTaskContext {
@@ -1045,7 +1036,6 @@ impl DelegateTool {
         DelegateLoopResources {
             security: Arc::clone(&self.security),
             parent_tools: Arc::clone(&self.parent_tools),
-            compaction_resolver: Arc::clone(&self.compaction_resolver),
         }
     }
 
@@ -1177,14 +1167,6 @@ impl DelegateTool {
 }
 
 impl DelegateLoopResources {
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
-    }
-
     #[inline(never)]
     fn boxed_delegate_loop<'a>(
         &'a self,
@@ -1411,7 +1393,11 @@ impl DelegateLoopResources {
         let child_memory = child_event_fabric.memory();
         let envelope = &child_execution.envelope;
         let scope_ctx = ScopeContext::from_execution_context(&security, &child_execution, &envelope.session_key);
-        let resolved_compaction = self.resolve_child_compaction(effective_provider, effective_model);
+        let child_config = match &child_source.authority {
+            DelegateChildAuthority::Granted(grant) => &grant.generation().effective,
+            DelegateChildAuthority::Ordinary { publication, .. } => &publication.generation().effective,
+        };
+        let resolved_compaction = resolve_pinned_child_compaction(child_config, effective_provider, effective_model);
         tracing::debug!(
             agent = agent_name,
             provider = %resolved_compaction.shown_provider(),
@@ -2130,14 +2116,6 @@ mod tests {
             categories: vec!["code".to_string()],
             elo_rating: 1_000.0,
         }
-    }
-
-    fn compaction_resolver_with_models(
-        models: Vec<crate::config::RouterModelConfig>,
-    ) -> crate::router::CompactionResolver {
-        let mut router = crate::config::RouterConfig::default();
-        router.models = models;
-        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
     }
 
     #[test]
@@ -3337,17 +3315,42 @@ mod tests {
 
     #[test]
     fn delegate_inline_model_override_drives_child_compaction_resolution() {
-        let tool = DelegateTool::new(single_agent("tester", "openrouter", "config-model"), test_security())
-            .with_compaction_resolver(compaction_resolver_with_models(vec![
-                router_model("openrouter", "config-model", 1_000_000),
-                router_model("openrouter", "inline-small", 200_000),
-            ]));
+        let mut config = crate::config::Config::default();
+        config.router.models = vec![
+            router_model("openrouter", "config-model", 1_000_000),
+            router_model("openrouter", "inline-small", 200_000),
+        ];
 
-        let resolved = tool.resolve_child_compaction("openrouter", "inline-small");
+        let resolved = resolve_pinned_child_compaction(&config, "openrouter", "inline-small");
 
         assert_eq!(resolved.config.max_context_tokens, 200_000);
         assert_eq!(resolved.selected_model, "inline-small");
         assert_ne!(resolved.config.max_context_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn delegate_child_compaction_uses_the_pinned_generation_catalog_after_reload() {
+        let mut startup = crate::config::Config::default();
+        startup.providers.models.push(
+            toml::from_str("provider = \"openrouter\"\nmodel = \"vendor/reload-model\"\ncontext_window = 200000\n")
+                .expect("test: startup declaration"),
+        );
+        let mut reloaded = startup.clone();
+        reloaded.providers.models.clear();
+        reloaded.providers.models.push(
+            toml::from_str("provider = \"openrouter\"\nmodel = \"vendor/reload-model\"\ncontext_window = 64000\n")
+                .expect("test: reloaded declaration"),
+        );
+
+        let before = resolve_pinned_child_compaction(&startup, "openrouter", "vendor/reload-model");
+        let after = resolve_pinned_child_compaction(&reloaded, "openrouter", "vendor/reload-model");
+
+        assert_eq!(before.config.max_context_tokens, 200_000);
+        assert_eq!(after.config.max_context_tokens, 64_000);
+        assert_eq!(
+            after.max_context_source,
+            crate::router::context::ContextWindowSource::Catalog
+        );
     }
 
     #[tokio::test]

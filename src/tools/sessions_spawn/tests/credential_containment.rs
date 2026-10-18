@@ -45,7 +45,6 @@ fn containment_tool(
         }),
         temp.path().to_path_buf(),
         MultimodalConfig::default(),
-        AgentCompactionConfig::default(),
         agents,
         fallback_api_key.map(str::to_string),
         providers::ProviderRuntimeOptions {
@@ -84,8 +83,7 @@ async fn admitted_named_agent_spawn_refuses_a_cross_dialect_fallback_before_tran
     let tool = containment_tool(&temp, agents, "ollama", None)
         .with_hint_config(&config)
         .with_model_catalog(catalog)
-        .with_configured_providers(&configured)
-        .with_reliability(config.reliability.clone());
+        .with_configured_providers(&configured);
 
     let refusal =
         match execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"}))).await {
@@ -103,6 +101,144 @@ async fn admitted_named_agent_spawn_refuses_a_cross_dialect_fallback_before_tran
     assert!(
         tool.active_runs_snapshot().await.is_empty(),
         "a refused fallback created a run"
+    );
+}
+
+/// The admitted child binding, rather than the removed local reconstruction
+/// shim, owns retries for a named provider override.
+#[tokio::test]
+async fn provider_override_goes_through_the_reliability_layer() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let temp = tempfile::tempdir().expect("test: temp dir");
+    let probe = CredentialProbe::start_with_statuses(vec![429, 429]).await;
+    let provider_name = probe.custom_provider();
+    let agents = HashMap::from([(
+        "prx_agent".to_string(),
+        containment_agent(&provider_name, Some("PRX-CHILD-RETRY-CREDENTIAL")),
+    )]);
+    let mut tool = containment_tool(&temp, agents, "ollama", None);
+    let mut config = preconstruction_parent_config(&tool, temp.path());
+    config.reliability.provider_retries = 2;
+    config.reliability.provider_backoff_ms = 1;
+    config.providers.models.push(
+        serde_json::from_value(json!({
+            "provider": provider_name, "model": PROBE_MODEL,
+            "operations": ["chat"], "native_tools": true
+        }))
+        .expect("test: child model declaration"),
+    );
+    config.cost.prices.insert(
+        format!("{provider_name}/{PROBE_MODEL}"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let catalog = providers::selection::catalog_for(&config);
+    tool = tool
+        .with_hint_config(&config)
+        .with_model_catalog(catalog)
+        .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+    let runs = tool.active_runs_arc();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+    let result = dispatch_preconstruction_parent(
+        tool,
+        config,
+        memory,
+        with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+    )
+    .await
+    .expect("test: admitted retry spawn");
+    assert!(result.success, "named child was not started: {:?}", result.error);
+    assert_eq!(probe.wait_for_requests(3, std::time::Duration::from_secs(10)).await, 3);
+    let run_id = runs.read().await.first().expect("test: child run").id.clone();
+    assert_eq!(
+        await_terminal_reason(&runs, &run_id).await,
+        crate::providers::credential_probe::PROBE_REPLY
+    );
+    assert!(probe.requests().iter().all(|request| {
+        request
+            .authorization()
+            .is_some_and(|value| value.contains("PRX-CHILD-RETRY-CREDENTIAL"))
+    }));
+}
+
+/// Provider fallbacks and root rotation keys belong to the parent chain;
+/// an admitted named child keeps only its selected vendor and credential.
+#[tokio::test]
+async fn override_reliability_drops_chain_widening_knobs() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    let temp = tempfile::tempdir().expect("test: temp dir");
+    let selected = CredentialProbe::start_failing(429, "selected child refused").await;
+    let fallback = CredentialProbe::start().await;
+    let selected_provider = selected.custom_provider();
+    let fallback_provider = fallback.custom_provider();
+    let agents = HashMap::from([(
+        "prx_agent".to_string(),
+        containment_agent(&selected_provider, Some("PRX-CHILD-ONLY-CREDENTIAL")),
+    )]);
+    let mut tool = containment_tool(&temp, agents, "ollama", Some("PRX-PARENT-ROOT-CREDENTIAL"));
+    let mut config = preconstruction_parent_config(&tool, temp.path());
+    config.reliability.provider_retries = 0;
+    config.reliability.fallback_providers = vec![fallback_provider.clone()];
+    config.reliability.api_keys = vec!["PRX-PARENT-ROTATION-CREDENTIAL".to_string()];
+    for provider in [&selected_provider, &fallback_provider] {
+        config.providers.models.push(
+            serde_json::from_value(json!({
+                "provider": provider, "model": PROBE_MODEL,
+                "operations": ["chat"], "native_tools": true
+            }))
+            .expect("test: child model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
+    let catalog = providers::selection::catalog_for(&config);
+    tool = tool
+        .with_hint_config(&config)
+        .with_model_catalog(catalog)
+        .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+    let runs = tool.active_runs_arc();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+    let result = dispatch_preconstruction_parent(
+        tool,
+        config,
+        memory,
+        with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+    )
+    .await
+    .expect("test: admitted contained spawn");
+    assert!(result.success, "named child was not started: {:?}", result.error);
+    assert_eq!(
+        selected.wait_for_requests(1, std::time::Duration::from_secs(10)).await,
+        1
+    );
+    let run_id = runs.read().await.first().expect("test: child run").id.clone();
+    let failure = await_terminal_reason(&runs, &run_id).await;
+    assert!(failure.contains("selected child refused"), "{failure}");
+    let requests = selected.requests();
+    assert_eq!(requests.len(), 1, "rotation credentials widened the child chain");
+    assert!(requests.first().is_some_and(|request| {
+        request
+            .authorization()
+            .is_some_and(|value| value.contains("PRX-CHILD-ONLY-CREDENTIAL"))
+    }));
+    assert!(!selected.saw("PRX-PARENT-ROOT-CREDENTIAL"));
+    assert!(!selected.saw("PRX-PARENT-ROTATION-CREDENTIAL"));
+    assert!(
+        fallback.requests().is_empty(),
+        "parent fallback provider received child traffic"
     );
 }
 
@@ -191,10 +327,16 @@ async fn a_spawn_never_logs_or_returns_provider_url_userinfo() {
     let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
     // The value the compaction line prints, checked directly
     // (deterministic); the log capture is checked for absence only.
-    let shown = tool
-        .resolve_child_compaction("custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1", "m")
-        .shown_provider()
-        .into_owned();
+    let config = crate::config::Config::default();
+    let catalog = providers::selection::catalog_for(&config);
+    let shown = resolve_pinned_child_compaction(
+        &config,
+        &catalog,
+        "custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1",
+        "m",
+    )
+    .shown_provider()
+    .into_owned();
     assert_eq!(shown, "custom:http://[redacted]@127.0.0.1:99999/v1");
     assert!(!logs.contains("SPAWN-SECRET-pw"), "{logs}");
 }
@@ -294,7 +436,10 @@ async fn a_spawned_agent_key_stays_with_its_own_provider() {
         ),
         ("b".to_string(), containment_agent(&other.custom_provider(), None)),
     ]);
-    let tool = containment_tool(&temp, agents, "ollama", None);
+    let mut tool = containment_tool(&temp, agents, &own.custom_provider(), Some(SPAWN_ROOT_SENTINEL));
+    let mut root_config = preconstruction_parent_config(&tool, temp.path());
+    root_config.api_key = Some(SPAWN_ROOT_SENTINEL.to_owned());
+    tool = tool.with_hint_config(&root_config);
 
     let result = execute_admitted_spawn(
         &tool,
@@ -313,6 +458,10 @@ async fn a_spawned_agent_key_stays_with_its_own_provider() {
         "agent a's key reached another provider"
     );
     assert!(other.requests().iter().all(|request| request.authorization().is_none()));
+    assert!(
+        !other.saw(SPAWN_ROOT_SENTINEL),
+        "root key reached an independently selected provider"
+    );
     assert!(own.requests().is_empty());
 }
 
@@ -336,15 +485,16 @@ async fn the_gateway_key_still_reaches_the_gateway_provider() {
         api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
         ..crate::config::Config::default()
     };
-    tool.provider = Arc::from(
+    tool.test_parent_provider = Arc::from(
         providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
             .expect("test: gateway chain builds"),
     );
+    tool = tool.with_hint_config(&gateway_config);
 
-    let result = execute_admitted_spawn(
+    let result = execute_enabled_admitted_spawn(
         &tool,
         with_spawn_grant(json!({
-            "task": "probe", "provider": format!("{}/", gateway.custom_provider())
+            "task": "sessions_spawn: probe", "provider": format!("{}/", gateway.custom_provider())
         })),
     )
     .await
@@ -358,52 +508,6 @@ async fn the_gateway_key_still_reaches_the_gateway_provider() {
 // ── C0-f F-1: the root key travels only with the root URL ─────────────
 
 const F1_SPAWN_ROOT_SENTINEL: &str = "C0F-SPAWN-ROOT-SENTINEL";
-
-/// Reviewer scenario: a `litellm` gateway whose root key belongs to its own
-/// base URL. A model-chosen spelling of the same provider reuses the
-/// gateway chain (key, URL and rotation keys together) instead of
-/// rebuilding on the catalog default host with the key alone.
-#[test]
-fn a_respelled_gateway_provider_reuses_the_gateway_chain() {
-    let temp = tempfile::tempdir().expect("test: temp dir");
-    let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-    for spelling in ["litellm", "lite-llm", "LiteLLM"] {
-        assert_eq!(
-            tool.child_provider_plan(None, spelling),
-            ChildProvider::Gateway,
-            "{spelling}"
-        );
-    }
-
-    let openai = containment_tool(&temp, HashMap::new(), "openai", Some(F1_SPAWN_ROOT_SENTINEL));
-    for spelling in ["openai", "OpenAI"] {
-        assert_eq!(
-            openai.child_provider_plan(None, spelling),
-            ChildProvider::Gateway,
-            "{spelling}"
-        );
-    }
-}
-
-/// A rebuild never carries the gateway key: only a named agent's own key
-/// for the agent's own provider, or nothing.
-#[test]
-fn a_rebuilt_child_never_carries_the_gateway_key() {
-    let temp = tempfile::tempdir().expect("test: temp dir");
-    let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-    let agent = containment_agent("groq", Some(SPAWN_AGENT_SENTINEL));
-
-    assert_eq!(
-        tool.child_provider_plan(Some(&agent), "GROQ"),
-        ChildProvider::Build {
-            api_key: Some(SPAWN_AGENT_SENTINEL.to_string())
-        }
-    );
-    assert_eq!(
-        tool.child_provider_plan(Some(&agent), "mistral"),
-        ChildProvider::Build { api_key: None }
-    );
-}
 
 /// A routed parent keeps its route key for an inherited child, while a
 /// direct-model child returns to the configured root connection.
@@ -454,13 +558,7 @@ async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_cost_config(config.cost.clone());
     tool.model = "hint:fast".to_string();
-    tool.provider = Arc::from(routed_provider);
-    assert_eq!(
-        tool.child_provider_plan(None, &root_provider),
-        ChildProvider::Root,
-        "a direct child of a hinted parent must rebuild from the resolved Root credential"
-    );
-
+    tool.test_parent_provider = Arc::from(routed_provider);
     let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
         .await
         .expect("test: inherited spawn result");
@@ -538,15 +636,7 @@ async fn child_provider_build_branch_uses_named_agent_credential_on_wire() {
         .with_model_catalog(catalog)
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
     tool.model = "hint:fast".to_string();
-    tool.provider = Arc::from(routed_provider);
-    assert_eq!(
-        tool.child_provider_plan(Some(&inline_agent), &root_provider),
-        ChildProvider::Build {
-            api_key: Some("PRX-HINT-AGENT-WIRE".to_string())
-        },
-        "the named agent must take the override build branch"
-    );
-
+    tool.test_parent_provider = Arc::from(routed_provider);
     let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
         .await
         .expect("test: direct agent child result");
@@ -615,19 +705,28 @@ async fn f1_wire_a_respelled_gateway_child_reaches_only_the_root_url() {
         },
     )
     .expect("test: litellm gateway builds");
-    let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-    tool.provider = Arc::from(gateway);
+    let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL))
+        .with_hint_config(&gateway_config);
+    tool.test_parent_provider = Arc::from(gateway);
 
-    let result = execute_admitted_spawn(
-        &tool,
-        with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})),
-    )
-    .await
-    .expect("test: spawn returns a tool result");
-    assert!(result.success, "{:?}", result.error);
-
-    let seen = root.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
-    let runs = tool.active_runs_snapshot().await;
-    assert_eq!(seen, 1, "gateway child did not reach root endpoint: {runs:?}");
+    for (index, spelling) in ["litellm", "lite-llm", "LiteLLM"].into_iter().enumerate() {
+        let result = execute_enabled_admitted_spawn(
+            &tool,
+            with_spawn_grant(json!({"task": "sessions_spawn: probe", "provider": spelling})),
+        )
+        .await
+        .expect("test: spawn returns a tool result");
+        assert!(result.success, "{spelling}: {:?}", result.error);
+        let seen = root
+            .wait_for_requests(index + 1, std::time::Duration::from_secs(10))
+            .await;
+        let runs = tool.active_runs_snapshot().await;
+        assert_eq!(seen, index + 1, "gateway child did not reach root endpoint: {runs:?}");
+    }
     assert!(root.saw(F1_SPAWN_ROOT_SENTINEL));
+    assert!(root.requests().iter().all(|request| {
+        request
+            .authorization()
+            .is_some_and(|header| header.contains(F1_SPAWN_ROOT_SENTINEL))
+    }));
 }

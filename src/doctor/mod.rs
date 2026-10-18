@@ -1546,7 +1546,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
         for fallback_model in fallback_chain {
             if !model_has_reachable_provider(
-                config.default_provider.as_deref().unwrap_or("openrouter"),
+                crate::providers::selection::default_provider(config),
                 &config.reliability.fallback_providers,
                 &route_providers,
                 fallback_model,
@@ -1562,7 +1562,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     let availability = crate::providers::summarize_provider_availability(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        crate::providers::selection::default_provider(config),
         config.api_key.as_deref(),
         &config.reliability,
         &crate::providers::provider_runtime_options_from_config(config),
