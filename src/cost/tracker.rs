@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+mod settlement;
+
 const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const MAX_READ_ONLY_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
@@ -659,6 +661,7 @@ impl CostTracker {
 
     /// Reconcile only a known, already durably metered estimated attempt.
     /// Partial/missing usage must retain the dispatched reservation instead.
+    #[cfg(test)]
     pub(crate) fn reconcile_estimated_attempt(
         &self,
         receipt: &super::reservation::ReservationReceipt,
@@ -674,27 +677,7 @@ impl CostTracker {
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
         storage.verify_replayed_settlement(record, cost)?;
-        let digest = settlement_fingerprint(record, cost)?;
-        let mut projection = None;
-        storage.for_each_record(|stored| {
-            if stored.settlement_id == record.settlement_id {
-                projection = Some(stored);
-            }
-        })?;
-        let projection = projection.context("reservation settlement cost projection is missing")?;
-        anyhow::ensure!(
-            projection.settlement_sha256.as_deref() == Some(digest.as_str()),
-            "reservation settlement requires a canonical cost projection"
-        );
-        let row_digest = super::reservation::cost_row_sha256(&projection)?;
-        let workspace = storage.workspace()?;
-        let mut reservations = super::reservation::Reservations::load(workspace)?;
-        let actual_tokens = u128::from(record.prompt_tokens) + u128::from(record.completion_tokens);
-        anyhow::ensure!(
-            actual_tokens == u128::from(record.total_tokens),
-            "estimated settlement token total conflicts"
-        );
-        reservations.settle_estimated(workspace, receipt, actual, actual_tokens, digest, row_digest)
+        settlement::reconcile_durable_projection(&storage, receipt, record, actual, None)
     }
 
     /// Record a usage event.
@@ -726,55 +709,7 @@ impl CostTracker {
         &self,
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     ) -> Result<CostSettlement> {
-        let config = self.config.lock().clone();
-        let settlement_id = record
-            .settlement_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
-        anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
-        let Some(cost_usd) = record.cost_usd else {
-            return Ok(CostSettlement::UnknownPricing);
-        };
-        if !cost_usd.is_finite() || cost_usd < 0.0 {
-            return Err(anyhow!("Metered usage cost must be a finite, non-negative value"));
-        }
-
-        let mut storage = self.lock_storage();
-        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
-        storage.refresh_from_disk()?;
-        if storage.has_settlement(settlement_id) {
-            storage.verify_replayed_settlement(record, cost_usd)?;
-            return Ok(CostSettlement::Replayed);
-        }
-        let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
-        let budget = budget_check(
-            &config,
-            daily_cost,
-            monthly_cost,
-            storage.daily_micro_usd,
-            storage.monthly_micro_usd,
-            cost_usd,
-        );
-        let usage = TokenUsage {
-            model: format!("{}/{}", record.provider, record.model),
-            input_tokens: record.prompt_tokens,
-            output_tokens: record.completion_tokens,
-            total_tokens: record.total_tokens,
-            cost_usd,
-            timestamp: Utc::now(),
-        };
-        let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
-        cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
-        cost_record.settlement_provider = Some(record.provider.clone());
-        cost_record.settlement_source = Some(record.source);
-        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
-        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
-        storage.add_record(cost_record.clone())?;
-        drop(storage);
-        self.lock_session_costs().push(cost_record);
-        // A configuration error must not erase usage already incurred.
-        // Persist the charge before returning the failed budget assessment.
-        Ok(CostSettlement::Recorded { budget: budget? })
+        self.settle_metered_inner(record, None)
     }
 
     /// Get the current cost summary.

@@ -84,10 +84,7 @@ impl OwnedReceipt {
         // separates reported usage from cleanup-owned persistence; cancellation
         // cannot discard a settlement while waiting behind another reservation.
         tokio::task::spawn_blocking(move || {
-            let result = self
-                .tracker
-                .settle_metered(&record)
-                .and_then(|_| self.tracker.reconcile_estimated_attempt(&self.receipt, &record));
+            let result = self.tracker.settle_and_reconcile_estimated(&self.receipt, &record);
             if result.is_err() {
                 self.remaining.settlement_failed.store(true, Ordering::Release);
                 tracing::warn!("decision usage persistence was not confirmed; further accounting is closed");

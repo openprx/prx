@@ -169,6 +169,9 @@ dispatched hold stays in place until both writes finish. Another physical send
 waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
 retains its serialization gate from reservation through transport and settlement,
 so handing reported usage to persistence cannot suspend behind another request.
+Metering and estimated-liability reconciliation share one held ledger lock and
+snapshot. The canonical cost row is synced before journal reconciliation;
+invalid journal state still retains the charge and fails cleanup closed.
 A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
 or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
