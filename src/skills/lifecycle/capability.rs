@@ -1,15 +1,20 @@
 //! Capability re-check at publication (spec 8.3 step 3).
 //!
-//! A learned revision may use what its baseline used and nothing more: no new
-//! declared capability requirement, no new executable file and no new
-//! `[[tools]]` entry in `SKILL.toml`. The check reads both revisions from the
-//! store again at publication, so a candidate that changed after the source
-//! review (or was written by another path) cannot widen what the skill may do.
+//! A learned revision may use what its baseline used and nothing more:
+//! - no new declared capability requirement;
+//! - no new executable file, and no executable whose bytes changed;
+//! - no new `[[tools]]` entry in `SKILL.toml`, and no file a tool entry
+//!   references (a bundle path named in its command) whose bytes changed.
+//!
+//! The check reads both revisions from the store again at publication, so a
+//! candidate that changed after the source review (or was written by another
+//! path) cannot widen what the skill may do. Files are compared by SHA-256.
 
-use super::bundle::Bundle;
+use super::bundle::{Bundle, BundleFile};
 use super::proposal::{SkillProposal, bounded};
 use super::store::SkillLifecycleStore;
 use super::types::LifecycleError;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const SKILL_TOML: &str = "SKILL.toml";
@@ -20,6 +25,40 @@ fn executables(bundle: &Bundle) -> BTreeSet<&str> {
         .iter()
         .filter(|f| f.is_executable())
         .map(|f| f.path())
+        .collect()
+}
+
+fn digest_of(bundle: &Bundle, path: &str) -> Option<String> {
+    bundle.file(path).map(|f| hex::encode(Sha256::digest(f.bytes())))
+}
+
+/// Bundle paths named by the `command` of a `[[tools]]` entry of `bundle`.
+fn tool_files(bundle: &Bundle) -> BTreeSet<String> {
+    let Some(file) = bundle.file(SKILL_TOML) else {
+        return BTreeSet::new();
+    };
+    let Ok(text) = std::str::from_utf8(file.bytes()) else {
+        return BTreeSet::new();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return BTreeSet::new();
+    };
+    let commands: Vec<&str> = value
+        .get("tools")
+        .and_then(toml::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("command").and_then(toml::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    bundle
+        .files()
+        .iter()
+        .map(BundleFile::path)
+        .filter(|path| commands.iter().any(|command| command.contains(path)))
+        .map(str::to_string)
         .collect()
 }
 
@@ -66,6 +105,13 @@ impl SkillLifecycleStore {
         for path in executables(&candidate.bundle) {
             if !before.contains(path) {
                 problems.push(format!("{} is a new executable file", bounded(path)));
+            } else if digest_of(&baseline.bundle, path) != digest_of(&candidate.bundle, path) {
+                problems.push(format!("the executable {} changed", bounded(path)));
+            }
+        }
+        for path in tool_files(&candidate.bundle) {
+            if digest_of(&baseline.bundle, &path) != digest_of(&candidate.bundle, &path) {
+                problems.push(format!("{} is run by a declared tool and changed", bounded(&path)));
             }
         }
         match (declared_tools(&baseline.bundle), declared_tools(&candidate.bundle)) {

@@ -621,8 +621,42 @@ impl SkillsManageTool {
             "lifecycle_publish" | "lifecycle_rollback" => ResourceRiskLevel::High,
             _ => ResourceRiskLevel::Medium,
         };
-        let operation = format!("skills_manage:{action}");
+        let arg = |key: &str| args.get(key).and_then(serde_json::Value::as_str).map(str::trim);
+        // A lifecycle mutation binds its target into the operation a grant
+        // authorizes, so a grant for one proposal (or one rollback) cannot be
+        // replayed against another.
+        let target = match action {
+            "lifecycle_publish" | "lifecycle_cancel" => arg("proposal_id").map(str::to_string),
+            "lifecycle_rollback" => match (arg("skill_id"), arg("revision_id")) {
+                (Some(skill), Some(revision)) => Some(format!("{skill}:{revision}")),
+                _ => None,
+            },
+            _ => None,
+        };
+        let operation = target.as_ref().map_or_else(
+            || format!("skills_manage:{action}"),
+            |target| format!("skills_manage:{action}:{target}"),
+        );
         let grant = Self::approval_grant(args);
+        if matches!(action, "lifecycle_publish" | "lifecycle_rollback") {
+            // Publication changes what every future task reads, so it needs an
+            // explicit grant bound to its target in every autonomy level, also
+            // under full autonomy where the gate would otherwise let it pass.
+            let now = chrono::Utc::now().timestamp();
+            let granted = target.is_some()
+                && grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.permits_resource_operation(self.name(), &operation, risk, now));
+            if !granted {
+                return Err(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "{action} requires an explicit approval grant bound to its target ({operation})"
+                    )),
+                });
+            }
+        }
         SideEffectGate::new(self.security.as_ref())
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map(|_| ())
@@ -1622,6 +1656,14 @@ mod tests {
     }
 
     fn lifecycle_tool(workspace: &Path, mode: crate::skills::lifecycle::LifecycleMode) -> SkillsManageTool {
+        lifecycle_tool_with(workspace, mode, Arc::new(SecurityPolicy::default()))
+    }
+
+    fn lifecycle_tool_with(
+        workspace: &Path,
+        mode: crate::skills::lifecycle::LifecycleMode,
+        security: Arc<SecurityPolicy>,
+    ) -> SkillsManageTool {
         use crate::skills::lifecycle::{
             OwnerScope, SkillLifecycleStore, SkillsLifecycleService, SkillsLifecycleSettings,
         };
@@ -1632,12 +1674,8 @@ mod tests {
             ..SkillsLifecycleSettings::default()
         };
         let service = SkillsLifecycleService::new(Arc::new(store), settings).unwrap();
-        SkillsManageTool::new(
-            workspace.to_path_buf(),
-            test_config(workspace),
-            Arc::new(SecurityPolicy::default()),
-        )
-        .with_lifecycle(Arc::new(service))
+        SkillsManageTool::new(workspace.to_path_buf(), test_config(workspace), security)
+            .with_lifecycle(Arc::new(service))
     }
 
     fn offered_actions(tool: &SkillsManageTool) -> Vec<String> {
@@ -1736,7 +1774,10 @@ mod tests {
 
         // A mutation reaches the service and is refused by the mode.
         let publish = tool
-            .execute(json!({"action": "lifecycle_publish", "proposal_id": "prop-00000000000000000000000000000000"}))
+            .execute(with_grant(
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                &format!("skills_manage:lifecycle_publish:{PROPOSAL}"),
+            ))
             .await
             .unwrap();
         assert!(!publish.success);
@@ -1772,5 +1813,154 @@ mod tests {
                 "{action}"
             );
         }
+    }
+
+    fn grant_for(operation: &str) -> serde_json::Value {
+        serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+            "skills_manage",
+            operation,
+            "test",
+            None,
+        ))
+        .unwrap()
+    }
+
+    fn with_grant(mut args: serde_json::Value, operation: &str) -> serde_json::Value {
+        if let Some(object) = args.as_object_mut() {
+            object.insert(
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                grant_for(operation),
+            );
+        }
+        args
+    }
+
+    const PROPOSAL: &str = "prop-00000000000000000000000000000000";
+    const OTHER_PROPOSAL: &str = "prop-11111111111111111111111111111111";
+
+    /// Publication and rollback need a grant bound to their target in every
+    /// autonomy level; cancel needs the bound grant when supervised.
+    #[tokio::test]
+    async fn lifecycle_mutations_need_grants_bound_to_their_target() {
+        use crate::security::AutonomyLevel;
+        let revision = format!("r1-{}", "0".repeat(64));
+        let rollback_args = json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 1});
+        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}");
+        let publish_args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let cancel_args = json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL});
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let tool = lifecycle_tool_with(
+                workspace.path(),
+                crate::skills::lifecycle::LifecycleMode::Shadow,
+                security,
+            );
+
+            // No grant: refused before the service is reached.
+            for args in [&publish_args, &rollback_args] {
+                let result = tool.execute(args.clone()).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("explicit approval grant"),
+                    "{autonomy:?}: {:?}",
+                    result.error
+                );
+            }
+            // A grant bound to another proposal or target is refused too.
+            for (args, operation) in [
+                (
+                    &publish_args,
+                    format!("skills_manage:lifecycle_publish:{OTHER_PROPOSAL}"),
+                ),
+                (&publish_args, "skills_manage:lifecycle_publish".to_string()),
+                (
+                    &rollback_args,
+                    "skills_manage:lifecycle_rollback:release-notes:r1-other".to_string(),
+                ),
+            ] {
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("explicit approval grant"),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+            // The bound grant reaches the service, which the mode then refuses.
+            for (args, operation) in [
+                (&publish_args, format!("skills_manage:lifecycle_publish:{PROPOSAL}")),
+                (&rollback_args, rollback_op.clone()),
+            ] {
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result.error.as_deref().unwrap_or_default().contains("does not allow"),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+        }
+
+        // Supervised cancel: refused without a grant, accepted with the bound one.
+        let workspace = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = lifecycle_tool_with(
+            workspace.path(),
+            crate::skills::lifecycle::LifecycleMode::Shadow,
+            security,
+        );
+        let refused = tool.execute(cancel_args.clone()).await.unwrap();
+        assert!(!refused.success);
+        assert!(
+            refused.error.as_deref().unwrap_or_default().contains("approval grant"),
+            "{:?}",
+            refused.error
+        );
+        let wrong = tool
+            .execute(with_grant(
+                cancel_args.clone(),
+                &format!("skills_manage:lifecycle_cancel:{OTHER_PROPOSAL}"),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wrong.error.as_deref().unwrap_or_default().contains("approval grant"),
+            "{:?}",
+            wrong.error
+        );
+        let reached = tool
+            .execute(with_grant(
+                cancel_args,
+                &format!("skills_manage:lifecycle_cancel:{PROPOSAL}"),
+            ))
+            .await
+            .unwrap();
+        assert!(!reached.success);
+        assert!(
+            reached
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no such proposal"),
+            "the bound grant must reach the service: {:?}",
+            reached.error
+        );
     }
 }

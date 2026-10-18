@@ -66,6 +66,8 @@ pub enum LifecycleError {
     SourceReviewRequired { proposal_id: String, reason: String },
     #[error("proposal {proposal_id} would widen the capabilities of its skill: {reason}")]
     CapabilityExpansion { proposal_id: String, reason: String },
+    #[error("transaction id {transaction_id} uses a prefix reserved for proposal publication or legacy import")]
+    ReservedTransactionId { transaction_id: String },
     #[error("task {task_id} already has a different terminal joined")]
     TerminalConflict { task_id: String },
     #[error("skill name {0:?} is bound to more than one skill id")]

@@ -1082,7 +1082,7 @@ impl SkillLifecycleStore {
     /// only turn an accept into a reject. A cancellation by the caller returns
     /// [`GateError::Cancelled`] and writes nothing; after an `Inconclusive`
     /// result, `begin_evaluation` opens a new epoch over the same evaluations.
-    pub async fn gate_proposal(
+    pub(in crate::skills) async fn gate_proposal(
         &self,
         request: &GateRequest<'_>,
         judge: Option<&dyn GateJudge>,

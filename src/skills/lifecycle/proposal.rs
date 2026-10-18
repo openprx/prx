@@ -770,7 +770,7 @@ impl SkillLifecycleStore {
     /// Moves a pre-commit proposal to `Cancelled`. In-flight attempts are
     /// marked abandoned: their liability stays unknown. A staged candidate is
     /// kept (private) for audit; it can never be published from this state.
-    pub fn cancel_proposal(&self, id: &str, reason: &str) -> Result<SkillProposal, LifecycleError> {
+    pub(in crate::skills) fn cancel_proposal(&self, id: &str, reason: &str) -> Result<SkillProposal, LifecycleError> {
         let lock = self.lock_proposals()?;
         let mut proposal = self
             .read_proposal_record(id)?

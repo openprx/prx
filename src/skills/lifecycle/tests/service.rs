@@ -859,3 +859,227 @@ fn a_candidate_with_a_new_executable_or_tool_widens_capabilities() {
         Err(LifecycleError::CapabilityExpansion { .. })
     ));
 }
+
+// ---- reserved transaction ids and the journal pin ---------------------------------------
+
+fn journal_path(fx: &Fixture, proposal_id: &str, attempt: u32) -> PathBuf {
+    let digest = proposal_id.trim_start_matches("prop-");
+    fx.store
+        .root()
+        .join("publication")
+        .join(format!("pub-{digest}-{attempt}.json"))
+}
+
+fn edit_journal(path: &std::path::Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("test: read journal")).expect("test: parse journal");
+    edit(&mut value);
+    std::fs::write(path, serde_json::to_vec(&value).expect("test: serialize")).expect("test: write journal");
+}
+
+#[test]
+fn raw_publish_refuses_the_reserved_transaction_prefixes() {
+    let (fx, _) = fixture_candidate_unwritten();
+    let revision = write_revision(&fx.store, "ANSWER=other");
+    for id in ["pub-0123456789abcdef-1", "mig-0123456789abcdef"] {
+        let result = fx.store.publish(&crate::skills::lifecycle::PublishRequest {
+            transaction_id: TransactionId::parse(id).expect("test: id"),
+            skill_id: skill(),
+            candidate: revision.0.clone(),
+            candidate_record_digest: revision.1.clone(),
+            expected_generation: 1,
+            enabled: true,
+        });
+        assert!(
+            matches!(result, Err(LifecycleError::ReservedTransactionId { .. })),
+            "{id}: {result:?}"
+        );
+    }
+    assert_eq!(active(&fx).1, 1, "nothing was published");
+}
+
+#[tokio::test]
+async fn a_journal_entry_with_another_or_no_pin_is_never_an_authorized_publication() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-pin", &bundle, "ANSWER=report-v2");
+    let svc = service_over(&fx, LifecycleMode::Auto, &suite);
+    let id = &draft.proposal_id;
+    to_eligible(&svc, &suite, id).await;
+    svc.publish(id).expect("test: publish");
+    let path = journal_path(&fx, id, 1);
+
+    // A legacy entry (no pin) under a proposal publication id.
+    edit_journal(&path, |entry| {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("authorization_digest");
+        }
+    });
+    let legacy = svc.publish(id);
+    assert!(
+        matches!(
+            legacy,
+            Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
+        ),
+        "{legacy:?}"
+    );
+
+    // An entry pinned to another authorization.
+    edit_journal(&path, |entry| {
+        entry["authorization_digest"] = serde_json::json!("0".repeat(64))
+    });
+    let other = svc.publish(id);
+    assert!(
+        matches!(
+            other,
+            Err(ServiceError::Lifecycle(LifecycleError::TransactionConflict { .. }))
+        ),
+        "{other:?}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_does_not_finalize_a_publication_whose_entry_lost_its_pin() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-pin-crash", &bundle, "ANSWER=report-v2");
+    let svc = service_over(&fx, LifecycleMode::Auto, &suite);
+    let id = &draft.proposal_id;
+    to_eligible(&svc, &suite, id).await;
+    crash_hooks::arm("publish_before_finalize");
+    assert!(svc.publish(id).is_err());
+    crash_hooks::disarm();
+    edit_journal(&journal_path(&fx, id, 1), |entry| {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("authorization_digest");
+        }
+    });
+    let report = svc.startup_recovery().expect("test: recovery");
+    assert_eq!(report.finalized, Vec::<String>::new());
+    assert!(report.skipped.iter().any(|(skipped, _)| skipped == id), "{report:?}");
+    assert_eq!(stored(&fx, id).status, ProposalStatus::PublicationAuthorized);
+}
+
+// ---- races and retries -------------------------------------------------------------------
+
+#[test]
+fn concurrent_installs_of_one_content_have_exactly_one_winner() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let first = stage_draft(&fx, "req-race-a", &bundle, "ANSWER=report-v2");
+    let second = stage_draft(&fx, "req-race-b", &bundle, "ANSWER=report-v2");
+    for draft in [&first, &second] {
+        fx.store.review_source(&draft.proposal_id, "op").expect("test: review");
+    }
+    let results = std::thread::scope(|scope| {
+        let a = scope.spawn(|| fx.store.install_candidate(&first.proposal_id));
+        let b = scope.spawn(|| fx.store.install_candidate(&second.proposal_id));
+        vec![a.join().expect("test: thread"), b.join().expect("test: thread")]
+    });
+    let winners = results.iter().filter(|r| r.is_ok()).count();
+    let refused = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(LifecycleError::CandidateRevisionConflict { .. } | LifecycleError::DuplicateCandidate { .. })
+            )
+        })
+        .count();
+    assert_eq!((winners, refused), (1, 1), "{results:?}");
+    let written = fx
+        .store
+        .read_revision(&skill(), &fx.candidate, None)
+        .expect("test: revision");
+    let owner = written.revision.proposal_id.expect("test: provenance");
+    assert!(owner == first.proposal_id || owner == second.proposal_id);
+}
+
+#[test]
+fn a_crash_retry_of_a_review_that_found_the_skill_moved_stays_stale() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let draft = stage_draft(&fx, "req-moved-retry", &bundle, "ANSWER=report-v2");
+    let other = write_revision(&fx.store, "ANSWER=operator-update");
+    super::activate(&fx.store, &skill(), &other, 1, true);
+    let id = &draft.proposal_id;
+    assert_eq!(
+        fx.store.review_source(id, "op").expect("test: review").proposal.status,
+        ProposalStatus::Stale
+    );
+    // The record was written but the proposal still reads Draft (a crash).
+    edit_proposal(&fx, id, |p| p.status = ProposalStatus::Draft);
+    let again = fx.store.review_source(id, "op").expect("test: retry");
+    assert_eq!(again.proposal.status, ProposalStatus::Stale);
+    assert!(again.proposal.failure.is_none());
+}
+
+#[test]
+fn a_long_cancel_reason_is_cut_on_a_character_boundary() {
+    let (fx, bundle) = fixture_candidate_unwritten();
+    let suite = governing_suite();
+    let draft = stage_draft(&fx, "req-reason", &bundle, "ANSWER=report-v2");
+    let svc = service_over(&fx, LifecycleMode::DraftOnly, &suite);
+    let reason = "é".repeat(400);
+    let cancelled = svc.cancel(&draft.proposal_id, &reason).expect("test: cancel");
+    let kept = cancelled.status_reason.expect("test: reason");
+    assert!(kept.len() <= 500 && !kept.is_empty());
+    assert!(kept.chars().all(|c| c == 'é'));
+}
+
+// ---- digests of executables and tool files ------------------------------------------------
+
+#[test]
+fn a_changed_executable_or_tool_script_widens_capabilities() {
+    let (fx, _) = fixture_candidate_unwritten();
+    let toml = "[skill]\nname = \"release-notes\"\ndescription = \"Writes release notes\"\nversion = \"0.1.0\"\n\n[[tools]]\nname = \"deploy\"\ndescription = \"d\"\nkind = \"shell\"\ncommand = \"sh scripts/deploy.sh\"\n";
+    let make = |body: &str, script: &[u8], exec: bool| {
+        Bundle::from_entries(vec![
+            BundleEntry {
+                path: PathBuf::from("SKILL.md"),
+                bytes: format!("---\nname: release-notes\ndescription: Writes release notes\n---\n\n{body}\n")
+                    .into_bytes(),
+                executable: false,
+            },
+            BundleEntry {
+                path: PathBuf::from("SKILL.toml"),
+                bytes: toml.as_bytes().to_vec(),
+                executable: false,
+            },
+            BundleEntry {
+                path: PathBuf::from("scripts/deploy.sh"),
+                bytes: script.to_vec(),
+                executable: exec,
+            },
+        ])
+        .expect("test: bundle")
+    };
+    let write = |bundle: &Bundle, kind: SourceKind| {
+        fx.store
+            .write_revision(&NewRevision::new(skill(), kind), bundle)
+            .expect("test: revision")
+            .revision
+            .revision_id
+    };
+    let base = write(&make("ANSWER=draft", b"echo one\n", true), SourceKind::Operator);
+    let same = write(&make("ANSWER=v2", b"echo one\n", true), SourceKind::Learned);
+    let edited_exec = write(&make("ANSWER=v3", b"echo two\n", true), SourceKind::Learned);
+    let edited_tool_file = write(&make("ANSWER=v4", b"echo three\n", false), SourceKind::Learned);
+    let mut draft = stage_draft(
+        &fx,
+        "req-digests",
+        &candidate_bundle("ANSWER=report-v2"),
+        "ANSWER=report-v2",
+    );
+    draft.baseline_revision = base;
+    draft.candidate_revision = Some(same);
+    assert!(fx.store.check_capabilities(&draft, None).is_ok());
+    for changed in [edited_exec, edited_tool_file] {
+        draft.candidate_revision = Some(changed);
+        assert!(
+            matches!(
+                fx.store.check_capabilities(&draft, None),
+                Err(LifecycleError::CapabilityExpansion { .. })
+            ),
+            "a changed script must widen capabilities"
+        );
+    }
+}

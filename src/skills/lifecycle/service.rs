@@ -42,7 +42,6 @@ use tokio_util::sync::CancellationToken;
 /// Smallest `min_cases` floor a publication policy may have (the SL07 hard
 /// gate: the floor is above 2).
 pub const MIN_PUBLICATION_CASES_FLOOR: u32 = 3;
-const MAX_REASON_BYTES: usize = 500;
 
 /// What the lifecycle may do (spec 8.2). `Auto` is the spec's name for
 /// publishing mode.
@@ -697,7 +696,10 @@ impl SkillsLifecycleService {
     }
 
     /// Re-activates a revision that was published before. Same gate as
-    /// publication: `Auto` mode under a valid publication policy.
+    /// publication: `Auto` mode under a valid publication policy. Rollback is
+    /// refused in `DraftOnly` and `Shadow` on purpose: spec 8.2 gives those
+    /// modes no active-revision behavior, and a rollback changes the active
+    /// revision just as a publication does.
     pub fn rollback(
         &self,
         skill: &SkillId,
@@ -715,8 +717,8 @@ impl SkillsLifecycleService {
 
     /// Cancels a pre-commit proposal. Allowed in every mode: it only closes.
     pub fn cancel(&self, id: &str, reason: &str) -> Result<SkillProposal, ServiceError> {
-        let reason: String = reason.chars().take(MAX_REASON_BYTES).collect();
-        Ok(self.store.cancel_proposal(id, &reason)?)
+        // Truncated by bytes on a char boundary.
+        Ok(self.store.cancel_proposal(id, &bounded(reason))?)
     }
 }
 

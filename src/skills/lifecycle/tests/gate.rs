@@ -70,6 +70,30 @@ pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_t
     let owner = fx.store.owner_scope().clone();
     let id = proposal_id_of(&owner, request_id);
     let now = Utc::now();
+    // The figures are the ones the proposer would record for this edit.
+    let mut diff = BoundedDiff {
+        edits: vec![AppliedEdit {
+            op: EditOp::Replace,
+            old: Some("ANSWER=draft".to_string()),
+            new: new_text.to_string(),
+        }],
+        description_change: None,
+        changed_tokens: 0,
+        baseline_tokens: 0,
+        allowed_tokens: 0,
+        summary: None,
+    };
+    let baseline = fx
+        .store
+        .read_revision(&skill(), &fx.baseline, None)
+        .expect("test: baseline")
+        .bundle;
+    let baseline_md = String::from_utf8_lossy(baseline.file("SKILL.md").expect("test: SKILL.md").bytes()).into_owned();
+    let figures = crate::skills::lifecycle::propose::reapply_diff(&baseline_md, "Writes release notes", &diff)
+        .expect("test: the edit applies to the baseline");
+    diff.changed_tokens = figures.changed_tokens;
+    diff.baseline_tokens = figures.baseline_tokens;
+    diff.allowed_tokens = figures.allowed_tokens;
     let proposal = SkillProposal {
         schema_version: 1,
         record_id: id.clone(),
@@ -107,18 +131,7 @@ pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_t
         status: ProposalStatus::Draft,
         status_reason: None,
         failure: None,
-        diff: Some(BoundedDiff {
-            edits: vec![AppliedEdit {
-                op: EditOp::Replace,
-                old: Some("ANSWER=draft".to_string()),
-                new: new_text.to_string(),
-            }],
-            description_change: None,
-            changed_tokens: 2,
-            baseline_tokens: 20,
-            allowed_tokens: 4,
-            summary: None,
-        }),
+        diff: Some(diff),
         attempts: Vec::new(),
         required_suite: None,
         evaluation_epoch: 0,

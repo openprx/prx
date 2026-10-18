@@ -2,6 +2,7 @@
 
 mod authorize;
 mod binding;
+mod boundaries;
 mod bundle;
 mod capture;
 mod evaluate;

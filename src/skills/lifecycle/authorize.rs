@@ -106,7 +106,7 @@ impl SkillLifecycleStore {
     /// aborted attempt is verified again like any other).
     ///
     /// Blocking: waits for locks and does file I/O.
-    pub fn authorize_publication(
+    pub(in crate::skills) fn authorize_publication(
         &self,
         proposal_id: &str,
         gate_digest: &str,
@@ -207,7 +207,7 @@ impl SkillLifecycleStore {
     /// proposal that is already `Committed` returns its recorded publication.
     ///
     /// Blocking, like [`Self::publish`].
-    pub fn publish_authorized(
+    pub(in crate::skills) fn publish_authorized(
         &self,
         proposal_id: &str,
         policy: &GatePolicy,
@@ -260,7 +260,7 @@ impl SkillLifecycleStore {
             }
         }
         crash_point!("publish_before_store");
-        let outcome = match self.publish_pinned(&request, Some(&pin)) {
+        let outcome = match self.publish_pinned(&request, &pin) {
             Ok(outcome) => outcome,
             Err(e @ (LifecycleError::StaleGeneration { .. } | LifecycleError::RevisionAlreadyActive(_))) => {
                 if proposal.status == ProposalStatus::PublicationAuthorized {
@@ -383,7 +383,7 @@ impl SkillLifecycleStore {
             return Ok(Settlement::NotPublished);
         }
         let pin = authorization_pin(&proposal.proposal_id, &auth);
-        match self.publish_pinned(&publish_request(proposal, &auth)?, Some(&pin)) {
+        match self.publish_pinned(&publish_request(proposal, &auth)?, &pin) {
             Ok(outcome) => {
                 self.finish_commit(lock, proposal, &outcome)?;
                 Ok(Settlement::Committed)

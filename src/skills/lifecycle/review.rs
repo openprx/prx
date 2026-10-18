@@ -19,6 +19,7 @@ use super::types::{LifecycleError, OwnerScope, RevisionId, SCHEMA_VERSION, Skill
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 
 const SOURCE_REVIEW_FILE: &str = "source_review.json";
@@ -85,6 +86,10 @@ pub struct SourceReviewRecord {
     pub findings: Vec<ReviewFinding>,
     /// All findings passed.
     pub passed: bool,
+    /// The review failed because the active revision was no longer the
+    /// proposal's baseline; the proposal then goes `Stale`, not `Failed`.
+    #[serde(default)]
+    pub skill_moved: bool,
     pub reviewed_at: DateTime<Utc>,
 }
 
@@ -153,8 +158,14 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-/// Content safety of the candidate against its baseline: nothing hidden, no
-/// phrase that overrides instructions or approvals is introduced.
+/// Content safety of the candidate against its baseline: no hidden character
+/// kind and no phrase that overrides instructions or approvals is introduced.
+///
+/// This is a first-line heuristic only. A fixed denylist cannot recognise
+/// every way to phrase a harmful instruction; it catches the blunt cases and
+/// hidden text. What actually protects a published skill is the rest of the
+/// chain: the bounded edit budget, the unchanged non-instruction files, the
+/// capability re-check, the measured evaluation and the gate.
 fn safety_problems(baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
     let mut problems = Vec::new();
     for file in candidate.files() {
@@ -165,7 +176,9 @@ fn safety_problems(baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
             .file(file.path())
             .and_then(|f| std::str::from_utf8(f.bytes()).ok())
             .unwrap_or_default();
-        if text.chars().filter(|c| is_hidden(*c)).count() > before.chars().filter(|c| is_hidden(*c)).count() {
+        let hidden = |text: &str| -> BTreeSet<char> { text.chars().filter(|c| is_hidden(*c)).collect() };
+        let known = hidden(before);
+        if hidden(text).iter().any(|c| !known.contains(c)) {
             problems.push(format!("{} gains hidden or control characters", bounded(file.path())));
         }
         if file.path() != SKILL_MD {
@@ -184,7 +197,12 @@ fn safety_problems(baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
 /// Changes of the candidate against the baseline: only `SKILL.md` differs,
 /// executable bits are unchanged, and the recorded diff is within its budget
 /// and reproduces the candidate exactly.
-fn bounded_problems(proposal: &SkillProposal, baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
+fn bounded_problems(
+    proposal: &SkillProposal,
+    baseline: &Bundle,
+    baseline_description: &str,
+    candidate: &Bundle,
+) -> Vec<String> {
     let mut problems = Vec::new();
     let paths = |bundle: &Bundle| -> Vec<String> { bundle.files().iter().map(|f| f.path().to_string()).collect() };
     if paths(baseline) != paths(candidate) {
@@ -207,12 +225,6 @@ fn bounded_problems(proposal: &SkillProposal, baseline: &Bundle, candidate: &Bun
     if diff.edits.len() > MAX_EDITS {
         problems.push(format!("more than {MAX_EDITS} edits"));
     }
-    if diff.allowed_tokens > MAX_EDIT_TOKENS || diff.changed_tokens > diff.allowed_tokens {
-        problems.push(format!(
-            "{} changed tokens against {} allowed (hard maximum {MAX_EDIT_TOKENS})",
-            diff.changed_tokens, diff.allowed_tokens
-        ));
-    }
     let skill_md = |bundle: &Bundle| -> Option<String> {
         bundle
             .file(SKILL_MD)
@@ -220,9 +232,28 @@ fn bounded_problems(proposal: &SkillProposal, baseline: &Bundle, candidate: &Bun
             .map(str::to_string)
     };
     match (skill_md(baseline), skill_md(candidate)) {
-        (Some(original), Some(staged)) => match reapply_diff(&original, diff) {
-            Ok(rebuilt) if rebuilt == staged => {}
-            Ok(_) => problems.push("the recorded diff does not reproduce the staged candidate".to_string()),
+        (Some(original), Some(staged)) => match reapply_diff(&original, baseline_description, diff) {
+            Ok(rebuilt) => {
+                if rebuilt.skill_md != staged {
+                    problems.push("the recorded diff does not reproduce the staged candidate".to_string());
+                }
+                // The budget is recomputed from the texts, never read from the
+                // record; the record must agree with the recomputation.
+                if (diff.changed_tokens, diff.baseline_tokens, diff.allowed_tokens)
+                    != (rebuilt.changed_tokens, rebuilt.baseline_tokens, rebuilt.allowed_tokens)
+                {
+                    problems.push("the recorded edit figures disagree with the recomputed ones".to_string());
+                }
+                if rebuilt.allowed_tokens > MAX_EDIT_TOKENS
+                    || rebuilt.changed_tokens > rebuilt.allowed_tokens
+                    || rebuilt.changed_bytes > rebuilt.allowed_bytes
+                {
+                    problems.push(format!(
+                        "the edit changes {} tokens ({} bytes); at most {} tokens ({} bytes) are allowed",
+                        rebuilt.changed_tokens, rebuilt.changed_bytes, rebuilt.allowed_tokens, rebuilt.allowed_bytes
+                    ));
+                }
+            }
             Err(e) => problems.push(format!("the recorded diff does not apply: {e}")),
         },
         _ => problems.push("baseline or candidate has no readable SKILL.md".to_string()),
@@ -326,10 +357,13 @@ impl SkillLifecycleStore {
             .read_proposal(proposal_id)?
             .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {proposal_id}")))?;
         let existing = self.read_source_review(proposal_id)?;
-        let (record, moved) = match existing {
-            Some(record) => (record, false),
+        let record = match existing {
+            Some(record) => record,
             None => self.compute_review(&proposal, reviewer)?,
         };
+        // Also for a record found after a crash: a review that found the skill
+        // moved leaves the proposal stale, not failed.
+        let moved = record.skill_moved && !record.passed;
 
         let lock = self.lock_proposals()?;
         let mut current = self
@@ -389,16 +423,19 @@ impl SkillLifecycleStore {
         })
     }
 
-    /// Runs the three checks; the flag says the skill moved since the proposal.
-    fn compute_review(
-        &self,
-        proposal: &SkillProposal,
-        reviewer: &str,
-    ) -> Result<(SourceReviewRecord, bool), LifecycleError> {
+    /// Runs the three checks; `skill_moved` on the record says the skill moved
+    /// since the proposal.
+    fn compute_review(&self, proposal: &SkillProposal, reviewer: &str) -> Result<SourceReviewRecord, LifecycleError> {
         let candidate_id = proposal.candidate_revision.clone().ok_or_else(|| {
             LifecycleError::ProposalRefused("the proposal has no staged candidate to review".to_string())
         })?;
         let candidate = self.read_candidate_bundle(&proposal.proposal_id)?;
+        if candidate.revision_id() != &candidate_id {
+            return Err(LifecycleError::Tampered {
+                path: self.source_review_path(&proposal.proposal_id),
+                reason: "the staged candidate does not hash to the proposal's candidate revision".to_string(),
+            });
+        }
         let mut applicability = Vec::new();
         let mut moved = false;
         if proposal.operation != ProposalOperation::Revise {
@@ -442,7 +479,7 @@ impl SkillLifecycleStore {
                     (Err(e), _) => applicability.push(format!("the baseline manifest is invalid: {e}")),
                 }
                 (
-                    bounded_problems(proposal, &verified.bundle, &candidate),
+                    bounded_problems(proposal, &verified.bundle, &verified.revision.description, &candidate),
                     safety_problems(&verified.bundle, &candidate),
                 )
             },
@@ -463,22 +500,20 @@ impl SkillLifecycleStore {
             "no hidden characters and no instruction-override text introduced",
         ));
         let passed = findings.iter().all(|f| f.passed);
-        Ok((
-            SourceReviewRecord {
-                schema_version: SCHEMA_VERSION,
-                record_id: proposal.proposal_id.clone(),
-                owner_scope: self.owner_scope().clone(),
-                proposal_id: proposal.proposal_id.clone(),
-                skill_id: proposal.skill_id.clone(),
-                baseline_revision: proposal.baseline_revision.clone(),
-                candidate_revision: candidate_id,
-                reviewer: reviewer.to_string(),
-                review_identity: SOURCE_REVIEW_IDENTITY.to_string(),
-                findings,
-                passed,
-                reviewed_at: Utc::now(),
-            },
-            moved && !passed,
-        ))
+        Ok(SourceReviewRecord {
+            schema_version: SCHEMA_VERSION,
+            record_id: proposal.proposal_id.clone(),
+            owner_scope: self.owner_scope().clone(),
+            proposal_id: proposal.proposal_id.clone(),
+            skill_id: proposal.skill_id.clone(),
+            baseline_revision: proposal.baseline_revision.clone(),
+            candidate_revision: candidate_id,
+            reviewer: reviewer.to_string(),
+            review_identity: SOURCE_REVIEW_IDENTITY.to_string(),
+            findings,
+            passed,
+            skill_moved: moved,
+            reviewed_at: Utc::now(),
+        })
     }
 }

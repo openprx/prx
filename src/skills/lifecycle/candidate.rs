@@ -10,6 +10,13 @@
 //! be claimed by two proposals. Before any evaluation spend it refuses
 //! content that another live proposal already carries and a revision that
 //! already exists with other provenance.
+//!
+//! Rejection memory: a revision is content-addressed and immutable, and it
+//! names the proposal that wrote it. Content that a proposal installed once is
+//! therefore refused for every later proposal, also after the first was
+//! cancelled, rejected or failed. That is intended: it is the same permanent
+//! memory the rejection history keeps of a material change, and a new attempt
+//! must propose different content.
 
 use super::proposal::{ProposalStatus, SkillProposal};
 use super::store::{SkillLifecycleStore, WriteOutcome};

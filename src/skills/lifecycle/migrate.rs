@@ -264,7 +264,7 @@ fn import_one(
             expected_generation: 0,
             enabled,
         };
-        match store.publish(&request) {
+        match store.publish_migration(&request) {
             // A PREPARED entry of a dead writer was just reconciled to ABORTED.
             Err(LifecycleError::TransactionNotCommitted { .. }) => {}
             other => return other.map(|_| ()),

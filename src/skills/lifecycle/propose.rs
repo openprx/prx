@@ -1014,40 +1014,136 @@ fn rewrite_description(front: &str, new: &str) -> Result<String, Refusal> {
     }
 }
 
-/// Applies a recorded diff to a baseline `SKILL.md` exactly the way the
-/// proposer did and returns the resulting text. The source review uses it to
-/// prove that the staged candidate is what its recorded diff says it is.
-pub(super) fn reapply_diff(original: &str, diff: &BoundedDiff) -> Result<String, String> {
-    let (front, body) = split_frontmatter(original).ok_or_else(|| "the baseline has no frontmatter".to_string())?;
-    let mut new_body = body.to_string();
-    for edit in &diff.edits {
-        match edit.op {
-            EditOp::Replace => {
-                let old = edit
-                    .old
-                    .as_deref()
-                    .ok_or_else(|| "a replace edit has no replaced text".to_string())?;
-                if occurrences(&new_body, old) != 1 {
-                    return Err("a replaced text does not occur exactly once in the body".to_string());
-                }
-                new_body = new_body.replacen(old, &edit.new, 1);
+/// Tokens and bytes one edit changes.
+#[derive(Clone, Copy)]
+struct Cost {
+    tokens: u64,
+    bytes: u64,
+}
+
+fn description_cost(old: &str, new: &str) -> Cost {
+    let new = new.trim();
+    Cost {
+        tokens: count_tokens(old).max(count_tokens(new)),
+        bytes: byte_len(old).max(byte_len(new)),
+    }
+}
+
+/// Applies one edit to `body`, with every check the proposer makes, and
+/// returns what it changed. The proposer and the source review share it, so
+/// they cannot disagree about what an edit does or costs.
+fn apply_edit(body: &mut String, op: EditOp, old: Option<&str>, new: &str) -> Result<Cost, Refusal> {
+    check_edit_text("edit text", new)?;
+    match op {
+        EditOp::Replace => {
+            let old = old.ok_or_else(|| {
+                refusal(
+                    ProposalFailureKind::MalformedOutput,
+                    "a replace edit needs the text it replaces",
+                )
+            })?;
+            check_edit_text("replaced text", old)?;
+            if old.trim().is_empty() {
+                return Err(refusal(
+                    ProposalFailureKind::MalformedOutput,
+                    "a replace edit has empty old text",
+                ));
             }
-            EditOp::Append => {
-                if !new_body.ends_with('\n') {
-                    new_body.push('\n');
+            match occurrences(body, old) {
+                0 => {
+                    return Err(refusal(
+                        ProposalFailureKind::PatchNotApplicable,
+                        "replaced text does not occur in the body",
+                    ));
                 }
-                new_body.push_str(&edit.new);
-                if !new_body.ends_with('\n') {
-                    new_body.push('\n');
+                1 => {}
+                _ => {
+                    return Err(refusal(
+                        ProposalFailureKind::PatchNotApplicable,
+                        "replaced text occurs more than once in the body",
+                    ));
                 }
             }
+            *body = body.replacen(old, new, 1);
+            Ok(Cost {
+                tokens: count_tokens(old).max(count_tokens(new)),
+                bytes: byte_len(old).max(byte_len(new)),
+            })
+        }
+        EditOp::Append => {
+            if old.is_some() || new.trim().is_empty() {
+                return Err(refusal(
+                    ProposalFailureKind::MalformedOutput,
+                    "an append edit needs new text and no old text",
+                ));
+            }
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(new);
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            Ok(Cost {
+                tokens: count_tokens(new),
+                bytes: byte_len(new),
+            })
         }
     }
+}
+
+/// A recorded diff applied to its baseline again, with the figures recomputed
+/// the way the proposer computes them.
+pub(super) struct Reapplied {
+    pub(super) skill_md: String,
+    pub(super) changed_tokens: u64,
+    pub(super) changed_bytes: u64,
+    pub(super) baseline_tokens: u64,
+    pub(super) allowed_tokens: u64,
+    /// The byte cap that goes with `allowed_tokens`.
+    pub(super) allowed_bytes: u64,
+}
+
+/// Applies a recorded diff to a baseline `SKILL.md` exactly the way the
+/// proposer did. `baseline_description` is the baseline manifest's own
+/// description; a recorded description change must start from it.
+pub(super) fn reapply_diff(
+    original: &str,
+    baseline_description: &str,
+    diff: &BoundedDiff,
+) -> Result<Reapplied, String> {
+    let (front, body) = split_frontmatter(original).ok_or_else(|| "the baseline has no frontmatter".to_string())?;
+    let mut new_body = body.to_string();
+    let mut changed: u64 = 0;
+    let mut changed_bytes: u64 = 0;
+    for edit in &diff.edits {
+        let cost = apply_edit(&mut new_body, edit.op, edit.old.as_deref(), &edit.new).map_err(|r| r.detail)?;
+        changed = changed.saturating_add(cost.tokens);
+        changed_bytes = changed_bytes.saturating_add(cost.bytes);
+    }
     let new_front = match &diff.description_change {
-        Some(change) => rewrite_description(front, &change.new).map_err(|r| r.detail)?,
+        Some(change) => {
+            if change.old != baseline_description {
+                return Err("the recorded description change does not start from the baseline description".to_string());
+            }
+            check_edit_text("description", &change.new).map_err(|r| r.detail)?;
+            let cost = description_cost(baseline_description, &change.new);
+            changed = changed.saturating_add(cost.tokens);
+            changed_bytes = changed_bytes.saturating_add(cost.bytes);
+            rewrite_description(front, &change.new).map_err(|r| r.detail)?
+        }
         None => front.to_string(),
     };
-    Ok(format!("{new_front}{new_body}"))
+    let baseline_tokens = count_tokens(body);
+    let allowed = allowed_tokens(baseline_tokens);
+    Ok(Reapplied {
+        skill_md: format!("{new_front}{new_body}"),
+        changed_tokens: changed,
+        changed_bytes,
+        baseline_tokens,
+        allowed_tokens: allowed,
+        allowed_bytes: allowed.saturating_mul(BYTES_PER_TOKEN),
+    })
 }
 
 /// Parses and applies a model reply to the baseline. Every refusal is typed.
@@ -1110,77 +1206,22 @@ fn build_candidate(baseline: &Bundle, reply: &str) -> Result<Candidate, Refusal>
     let mut changed: u64 = 0;
     let mut changed_bytes: u64 = 0;
     for edit in patch.edits {
-        check_edit_text("edit text", &edit.new)?;
-        match edit.op {
-            EditOp::Replace => {
-                let old = edit.old.ok_or_else(|| {
-                    refusal(
-                        ProposalFailureKind::MalformedOutput,
-                        "a replace edit needs the text it replaces",
-                    )
-                })?;
-                check_edit_text("replaced text", &old)?;
-                if old.trim().is_empty() {
-                    return Err(refusal(
-                        ProposalFailureKind::MalformedOutput,
-                        "a replace edit has empty old text",
-                    ));
-                }
-                match occurrences(&new_body, &old) {
-                    0 => {
-                        return Err(refusal(
-                            ProposalFailureKind::PatchNotApplicable,
-                            "replaced text does not occur in the body",
-                        ));
-                    }
-                    1 => {}
-                    _ => {
-                        return Err(refusal(
-                            ProposalFailureKind::PatchNotApplicable,
-                            "replaced text occurs more than once in the body",
-                        ));
-                    }
-                }
-                new_body = new_body.replacen(old.as_str(), &edit.new, 1);
-                changed = changed.saturating_add(count_tokens(&old).max(count_tokens(&edit.new)));
-                changed_bytes = changed_bytes.saturating_add(byte_len(&old).max(byte_len(&edit.new)));
-                applied.push(AppliedEdit {
-                    op: EditOp::Replace,
-                    old: Some(old),
-                    new: edit.new,
-                });
-            }
-            EditOp::Append => {
-                if edit.old.is_some() || edit.new.trim().is_empty() {
-                    return Err(refusal(
-                        ProposalFailureKind::MalformedOutput,
-                        "an append edit needs new text and no old text",
-                    ));
-                }
-                if !new_body.ends_with('\n') {
-                    new_body.push('\n');
-                }
-                new_body.push_str(&edit.new);
-                if !new_body.ends_with('\n') {
-                    new_body.push('\n');
-                }
-                changed = changed.saturating_add(count_tokens(&edit.new));
-                changed_bytes = changed_bytes.saturating_add(byte_len(&edit.new));
-                applied.push(AppliedEdit {
-                    op: EditOp::Append,
-                    old: None,
-                    new: edit.new,
-                });
-            }
-        }
+        let cost = apply_edit(&mut new_body, edit.op, edit.old.as_deref(), &edit.new)?;
+        changed = changed.saturating_add(cost.tokens);
+        changed_bytes = changed_bytes.saturating_add(cost.bytes);
+        applied.push(AppliedEdit {
+            op: edit.op,
+            old: edit.old,
+            new: edit.new,
+        });
     }
     let (new_front, description_change) = match patch.description {
         Some(description) => {
             check_edit_text("description", &description)?;
             let rewritten = rewrite_description(front, &description)?;
-            changed = changed.saturating_add(count_tokens(&baseline_info.description).max(count_tokens(&description)));
-            changed_bytes =
-                changed_bytes.saturating_add(byte_len(&baseline_info.description).max(byte_len(&description)));
+            let cost = description_cost(&baseline_info.description, &description);
+            changed = changed.saturating_add(cost.tokens);
+            changed_bytes = changed_bytes.saturating_add(cost.bytes);
             (
                 rewritten,
                 Some(DescriptionChange {
