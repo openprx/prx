@@ -3310,6 +3310,13 @@ enum ProviderCredentialInput<'a> {
     Resolved(ResolvedPrimary<'a>),
 }
 
+/// The selected provider requires an explicit credential and none resolved.
+/// Typed so callers (for example `prx doctor`) classify it without matching
+/// message text.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("missing credential/api key")]
+pub(crate) struct MissingProviderCredential;
+
 impl<'a> From<Option<&'a str>> for ProviderCredentialInput<'a> {
     fn from(key: Option<&'a str>) -> Self {
         Self::Legacy(key)
@@ -3364,7 +3371,7 @@ impl<'a> ResolvedPrimary<'a> {
                 }),
         };
         if provider_requires_explicit_credential(name) && !resolved.is_usable_for(name) {
-            anyhow::bail!("missing credential/api key");
+            return Err(anyhow::Error::new(MissingProviderCredential));
         }
         Ok(resolved)
     }

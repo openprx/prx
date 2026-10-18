@@ -128,6 +128,10 @@ impl AuxiliaryProviderCall {
     pub(crate) fn served_reply_sha256(&self) -> Option<[u8; 32]> {
         self.state.lock().served_reply_sha256
     }
+    pub(crate) const fn purpose_label(&self) -> &'static str {
+        self.purpose.label()
+    }
+
     pub(crate) async fn persist(
         &self,
         fabric: &crate::memory::MemoryFabric,

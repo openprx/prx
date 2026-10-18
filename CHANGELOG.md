@@ -15,6 +15,10 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- `causal_tree.policy.extra_token_ratio_limit` must now be finite and greater
+  than 0; a zero, negative or non-finite value is rejected at config load
+  instead of refusing every Agent turn at admission.
+
 - Fresh configurations now select `openrouter` with
   `anthropic/claude-sonnet-5`; `prx init` writes that pair, and the unset
   `Config` default follows the release catalog. Stable direct Gemini tariffs

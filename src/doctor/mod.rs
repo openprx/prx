@@ -1840,7 +1840,15 @@ fn provider_validation_error(
         &crate::providers::provider_runtime_options_from_config(config),
     ) {
         Ok(_) => None,
-        Err(error) if error.to_string().contains("missing credential/api key") => None,
+        // A missing credential is reported by the credential checks, not
+        // as an invalid provider here.
+        Err(error)
+            if error
+                .downcast_ref::<crate::providers::MissingProviderCredential>()
+                .is_some() =>
+        {
+            None
+        }
         Err(error) => Some(error.to_string().lines().next().unwrap_or("invalid provider").into()),
     }
 }

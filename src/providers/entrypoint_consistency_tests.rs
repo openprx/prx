@@ -6,6 +6,7 @@ use crate::providers::traits::{ChatMessage, ChatRequest};
 
 pub(crate) const PRIMARY_MODEL: &str = "model-a";
 pub(crate) const FALLBACK_MODEL: &str = "model-b";
+pub(crate) const CROSS_DIALECT_PROVIDER: &str = "custom:http://127.0.0.1:9/v1";
 
 pub(crate) fn configure_cross_dialect(config: &mut Config, provider: &str) {
     config.default_provider = Some(provider.to_string());
@@ -37,7 +38,7 @@ pub(crate) fn assert_cross_dialect_refusal(surface: &str, refusal: &str) {
 }
 
 fn cross_dialect_config(temp: &tempfile::TempDir) -> Config {
-    let provider = "custom:http://127.0.0.1:9/v1";
+    let provider = CROSS_DIALECT_PROVIDER;
     let mut config = Config::default();
     config.workspace_dir = temp.path().to_path_buf();
     config.config_path = temp.path().join("config.toml");
@@ -291,4 +292,22 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
         probe.requests().is_empty(),
         "a refused route reached the default transport"
     );
+}
+
+/// Finding 79(e): `/models <provider>` from a sender whose current model is an
+/// unroutable or malformed hint reports the route refusal and leaves the
+/// selection unchanged.
+#[tokio::test]
+async fn provider_command_reports_an_unroutable_hint_and_keeps_the_selection() {
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let config = cross_dialect_config(&temp);
+    for (model, text) in [
+        ("hint:does-not-exist", "does-not-exist"),
+        ("hint:has space", "whitespace"),
+    ] {
+        let (reply, after) = crate::channels::route_command_response(&config, "/models openai", model).await;
+        assert!(reply.contains(text), "{model}: {reply}");
+        assert!(reply.contains("Route unchanged"), "{model}: {reply}");
+        assert_eq!(after, model, "the sender's selection must not change");
+    }
 }
