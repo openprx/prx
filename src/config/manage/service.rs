@@ -1042,6 +1042,9 @@ pub struct ModelEntry {
     pub source: String,
     /// When the catalog the evidence came from was fetched.
     pub fetched_at_unix: Option<u64>,
+    /// Present when the embedded release catalog still permits this model but
+    /// recommends migration to an active row.
+    pub lifecycle_warning: Option<String>,
 }
 
 /// The operation named `text` (`chat`, `embedding`, `decision_endpoint`, ...).
@@ -1081,6 +1084,11 @@ fn model_entry_of(catalog: &crate::providers::catalog::CatalogView, provider: &s
     let id = ProviderId::of(provider);
     let descriptor = catalog.describe(&id, model);
     let features = &descriptor.features;
+    let lifecycle_warning = catalog
+        .release_catalog()
+        .ok()
+        .and_then(|release| release.model(&id, model))
+        .and_then(crate::providers::catalog::ReleaseModel::selection_warning);
     ModelEntry {
         provider: shown(provider),
         identity: redact_provider_text(&id.to_string()),
@@ -1105,10 +1113,11 @@ fn model_entry_of(catalog: &crate::providers::catalog::CatalogView, provider: &s
         .collect(),
         context_window: descriptor.context_window,
         source: descriptor.source.label().to_string(),
-        fetched_at_unix: match descriptor.source {
-            DescriptorSource::Discovery { fetched_at_unix } => Some(fetched_at_unix),
+        fetched_at_unix: match &descriptor.source {
+            DescriptorSource::Discovery { fetched_at_unix } => Some(*fetched_at_unix),
             _ => None,
         },
+        lifecycle_warning,
     }
 }
 
@@ -1121,6 +1130,7 @@ fn model_entry_of(catalog: &crate::providers::catalog::CatalogView, provider: &s
 #[must_use]
 pub fn model_catalog(config: &Config, filter: &ModelFilter) -> Vec<ModelEntry> {
     use crate::providers::catalog::ModelOperation;
+    let catalog = crate::providers::selection::catalog_for(config);
     let mut candidates = validate::selected_models(config);
     candidates.extend(config.providers.models.iter().filter_map(|entry| {
         entry
@@ -1128,6 +1138,16 @@ pub fn model_catalog(config: &Config, filter: &ModelFilter) -> Vec<ModelEntry> {
             .as_ref()
             .map(|model| (entry.provider.clone(), model.clone()))
     }));
+    match catalog.release_catalog() {
+        Ok(release) => candidates.extend(
+            release
+                .models
+                .iter()
+                .filter(|model| model.is_listed())
+                .map(|model| (model.provider.clone(), model.api_model.clone())),
+        ),
+        Err(error) => tracing::error!(error = %error, "embedded model catalog is invalid"),
+    }
     match crate::providers::catalog::discovery::load_model_cache_state(&config.workspace_dir) {
         Ok(state) => {
             for entry in state.entries {
@@ -1147,7 +1167,6 @@ pub fn model_catalog(config: &Config, filter: &ModelFilter) -> Vec<ModelEntry> {
         ),
     }
     let wanted = filter.provider.as_deref().map(ProviderId::of);
-    let catalog = crate::providers::selection::catalog_for(config);
     let mut seen = Vec::new();
     let mut entries = Vec::new();
     for (provider, model) in candidates {
@@ -2264,7 +2283,33 @@ mod tests {
                 ..ModelFilter::default()
             },
         );
-        assert_eq!(names(&executable), ["openai/gpt-4o"], "only proven chat models");
+        let executable_names = names(&executable);
+        assert!(
+            executable_names.contains(&"openai/gpt-4o".to_string()),
+            "the declared chat model remains executable: {executable_names:?}"
+        );
+        assert!(
+            executable_names.contains(&"openai/gpt-5.6".to_string()),
+            "the embedded release catalog supplies executable chat models: {executable_names:?}"
+        );
+        assert!(
+            !executable_names.contains(&"openrouter/jev-decision-test".to_string()),
+            "a declared decision-only model remains excluded: {executable_names:?}"
+        );
+        assert!(
+            executable.iter().all(|entry| {
+                entry
+                    .operations
+                    .get("chat")
+                    .is_some_and(|support| support == "supported")
+            }),
+            "every executable row must carry positive chat evidence: {executable:?}"
+        );
+        let release_entry = executable
+            .iter()
+            .find(|entry| entry.provider == "openai" && entry.model == "gpt-5.6")
+            .expect("test: embedded catalog model is listed");
+        assert_eq!(release_entry.source, "embedded release catalog");
 
         let shown = model_entry(&config, "openrouter", "jev-decision-test").expect("test: show");
         // The declaration lists the decision endpoint only, and OpenRouter's

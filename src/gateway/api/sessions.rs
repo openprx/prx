@@ -448,17 +448,13 @@ async fn run_console_runtime_turn(
         None => console_route_decision(&turn_runtime, &turn_envelope, visible_message)?,
     };
     // OQ-23 / R5: budget on the *effective* window of the model this turn
-    // serves (the `[[router.models]]` / built-in `max_context` and
+    // serves (the operator/discovery/catalog model limits and
     // `reserved_output_tokens`), with the same arguments the CLI, TUI and
     // webhook resolve with, so one request is trimmed the same way on every
     // surface of this process.
-    let mut effective_compaction = crate::router::resolve_effective_compaction_config(
-        &config_snapshot.agent.compaction,
-        &provider_label,
-        &turn_runtime.model,
-        &config_snapshot.router,
-        &config_snapshot.model_routes,
-    );
+    let mut effective_compaction = decision
+        .service
+        .effective_compaction(&provider_label, &turn_runtime.model);
     effective_compaction.config = decision.context.main_compaction().clone();
     crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
     let provider_started_at = chrono::Utc::now();

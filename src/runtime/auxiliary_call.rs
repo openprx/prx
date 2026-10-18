@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxiliaryPurpose {
     SignalVision,
+    SmartGroupClassifier,
     #[cfg(feature = "llm-router")]
     AutomixPremium,
 }
@@ -13,6 +14,7 @@ impl AuxiliaryPurpose {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::SignalVision => "signal_vision",
+            Self::SmartGroupClassifier => "smart_group_classifier",
             #[cfg(feature = "llm-router")]
             Self::AutomixPremium => "automix_premium",
         }
@@ -126,6 +128,10 @@ impl AuxiliaryProviderCall {
     pub(crate) fn served_reply_sha256(&self) -> Option<[u8; 32]> {
         self.state.lock().served_reply_sha256
     }
+    pub(crate) const fn purpose_label(&self) -> &'static str {
+        self.purpose.label()
+    }
+
     pub(crate) async fn persist(
         &self,
         fabric: &crate::memory::MemoryFabric,
@@ -236,6 +242,7 @@ pub(crate) struct AuxiliaryAccounting {
     key: Arc<crate::decision::DecisionKey>,
     scope: Arc<super::decision_accounting::AccountingScope>,
     purpose: AuxiliaryPurpose,
+    execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
 }
 impl AuxiliaryAccounting {
     pub(super) fn new(
@@ -245,6 +252,7 @@ impl AuxiliaryAccounting {
         key: Arc<crate::decision::DecisionKey>,
         scope: Arc<super::decision_accounting::AccountingScope>,
         purpose: AuxiliaryPurpose,
+        execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
     ) -> anyhow::Result<Arc<Self>> {
         let targets = provider
             .accounting_targets(selected.model())
@@ -257,6 +265,7 @@ impl AuxiliaryAccounting {
             key,
             scope,
             purpose,
+            execution_trace,
         }))
     }
     pub(crate) const fn selected_model(&self) -> &crate::providers::catalog::ResolvedModel {
@@ -273,6 +282,18 @@ impl AuxiliaryAccounting {
     }
     pub(crate) fn deadline(&self) -> std::time::Instant {
         self.scope.deadline()
+    }
+    pub(crate) fn begin_provider_observation(
+        &self,
+    ) -> anyhow::Result<crate::tools::capability::execution_trace::PendingProvider> {
+        self.execution_trace.begin_provider()
+    }
+    pub(crate) fn authorize_silence(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.purpose == AuxiliaryPurpose::SmartGroupClassifier,
+            "only the smart-group classifier can authorize auxiliary silence"
+        );
+        self.execution_trace.record_authorized_silence()
     }
 }
 impl crate::providers::attempt_accounting::sealed::AccountingOwner for AuxiliaryAccounting {}

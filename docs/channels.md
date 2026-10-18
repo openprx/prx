@@ -121,7 +121,9 @@ refreshed throughout. Both are reports: neither can end anything.
 ## Tools On Channel Turns
 
 In the current local candidate, an admitted channel input is recorded before
-its source-bound decision. Smart-group pre-gates still run first. Selected
+its source-bound decision. A smart-group classifier runs only after that
+decision, through a resolver-built and physically accounted auxiliary call;
+only its completed `NO` can end the admitted turn silently. Selected
 Memory/Document/Session evidence supplies enrichment; recalled text does not
 replace the original input or grant tools. Provider execution consumes the
 same constrained decision and execution bindings as other admitted surfaces.

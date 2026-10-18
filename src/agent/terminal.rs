@@ -1052,8 +1052,15 @@ pub(crate) mod persistence_probe {
         let needle = PROBE_SECRET.to_ascii_lowercase();
         let mut redacted_somewhere = false;
         for file in &files {
-            let bytes = std::fs::read(file)
-                .unwrap_or_else(|error| panic!("test: read probed file {}: {error}", file.display()));
+            let bytes = match std::fs::read(file) {
+                Ok(bytes) => bytes,
+                // SQLite may checkpoint and unlink a WAL or shared-memory
+                // sidecar after directory enumeration. A path that no longer
+                // exists cannot retain the probe secret; every surviving file
+                // and the independent redaction witness remain mandatory.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("test: read probed file {}: {error}", file.display()),
+            };
             let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
             assert!(!text.contains(&needle), "{} persisted the probe secret", file.display());
             redacted_somewhere |= String::from_utf8_lossy(&bytes).contains(REDACTION_MARKER);

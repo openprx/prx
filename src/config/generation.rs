@@ -12,7 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
@@ -347,6 +347,10 @@ pub trait ConfigGenerationAuditSink: Send + Sync {
 /// Sole process-level owner of active and desired configuration generations.
 pub struct ConfigGenerationManager {
     active: ArcSwap<ConfigGeneration>,
+    /// Published generations remain addressable while an admitted operation
+    /// still owns its exact snapshot. Weak entries retain no configuration or
+    /// credentials after the last operation releases that generation.
+    published: Mutex<BTreeMap<ConfigGenerationId, Weak<ConfigGeneration>>>,
     desired: ArcSwap<DesiredConfigState>,
     reload_lock: Mutex<()>,
     next_generation: AtomicU64,
@@ -450,8 +454,10 @@ impl ConfigGenerationManager {
             config: Arc::clone(&generation.effective),
             observed_at: generation.applied_at,
         });
+        let published = BTreeMap::from([(generation.id, Arc::downgrade(&generation))]);
         Ok(Self {
             active: ArcSwap::from(generation),
+            published: Mutex::new(published),
             desired: ArcSwap::from(desired),
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(next_generation),
@@ -503,8 +509,10 @@ impl ConfigGenerationManager {
             config,
             observed_at: Utc::now(),
         });
+        let published = BTreeMap::from([(generation.id, Arc::downgrade(&generation))]);
         Self {
             active: ArcSwap::from(generation),
+            published: Mutex::new(published),
             desired: ArcSwap::from(desired),
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
@@ -535,6 +543,20 @@ impl ConfigGenerationManager {
     #[must_use]
     pub fn pin(&self) -> Arc<ConfigGeneration> {
         self.active.load_full()
+    }
+
+    /// Recover one published generation only while an admitted operation still
+    /// pins it. This lets long-lived tool registries resolve the provider owned
+    /// by an in-flight turn without retaining superseded credentials forever.
+    #[must_use]
+    pub(crate) fn pin_generation(&self, id: ConfigGenerationId) -> Option<Arc<ConfigGeneration>> {
+        let active = self.active.load_full();
+        if active.id == id {
+            return Some(active);
+        }
+        let mut published = self.published.lock();
+        published.retain(|_, generation| generation.strong_count() > 0);
+        published.get(&id).and_then(Weak::upgrade)
     }
 
     /// Compatibility accessor for readers that only need the effective config.
@@ -873,6 +895,11 @@ impl ConfigGenerationManager {
                 );
             }
             self.active.store(Arc::clone(&generation));
+            {
+                let mut published = self.published.lock();
+                published.retain(|_, pinned| pinned.strong_count() > 0);
+                published.insert(generation.id, Arc::downgrade(&generation));
+            }
             self.model_allowlist.refresh(&generation.effective);
             for update in &mut prepared {
                 update.finalize();
@@ -1648,7 +1675,7 @@ mod tests {
 
         for config in [manager.load_full(), Arc::clone(&manager.desired().config)] {
             let causal = &config.causal_tree;
-            assert_eq!(causal.schema_version, 1);
+            assert_eq!(causal.schema_version, 2);
             assert_eq!(causal.policy.max_candidates, 5);
             assert_eq!(causal.rehearsal.timeout_ms, 80);
             assert_eq!(causal.scoring.weights.w_cost, Some(0.4));

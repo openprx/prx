@@ -146,11 +146,11 @@ pub struct EmbeddingRootCredential<'a> {
 
 impl<'a> EmbeddingRootCredential<'a> {
     /// The root `api_key`, issued for the configured default provider (with
-    /// the same `"openrouter"` fallback the provider resolution uses).
+    /// the same catalog-owned fallback the provider resolution uses).
     #[must_use]
     pub fn from_config(config: &'a crate::config::Config) -> Self {
         Self {
-            owner: Some(config.default_provider.as_deref().unwrap_or("openrouter")),
+            owner: Some(crate::providers::selection::default_provider(config)),
             api_key: config.api_key.as_deref(),
             api_url: config.api_url.as_deref(),
         }

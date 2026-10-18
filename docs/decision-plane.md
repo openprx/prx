@@ -10,7 +10,7 @@ See [configuration](configuration.md), [tools](tools.md),
 ## Enable, disable and rollback
 
 This staged candidate defaults `[causal_tree].enabled` to `true`; the full init
-template writes `schema_version = 1` and `enabled = true` together. Adoption and
+template writes `schema_version = 2` and `enabled = true` together. Adoption and
 acceptance remain pending. Remote processing still defaults to disabled, and
 configured transports require source-owned estimated budget admission and actual
 per-attempt accounting, as described below.
@@ -19,7 +19,7 @@ An explicit disable must retain the version marker:
 
 ```toml
 [causal_tree]
-schema_version = 1
+schema_version = 2
 enabled = false
 ```
 
@@ -66,8 +66,16 @@ does not make a later ordinary message require external evidence. Empty input
 and turns made undecidable by failed or repeated tool work still Clarify. Brief
 ordinary requests (builtin request weight at most two), continued conversation,
 and turns with no viable read/recovery candidate receive the direct-answer
-preference. Longer unrouted text may take one bounded discovery hop and then
-answer when discovery adds no capability.
+preference. Longer unrouted text may take one bounded discovery hop. After that
+gate-checked local read completes, the terminal fallback may answer even when
+the source contains a path, URL or code shape. An exact capability mention or
+a pending approval remains nonterminal after discovery. Any capability found
+by the read still needs a normal nonterminal selection and all execution gates;
+completion of discovery grants no execution authority. Configured decision
+attempts all rejected for semantic validation remain fail
+closed even when the builtin shadow completes discovery. Transport, 5xx,
+circuit-open and local decision-budget failures fall back to the builtin; a
+later configured attempt that serves also keeps the normal terminal path.
 
 An exactly named, current Searchable tool, or an exactly named source-configured
 Delegate with a sealed child manifest, uses a narrower selection path. It may
@@ -85,10 +93,21 @@ An Answer turn may publish the bounded Direct core plus `capability_search` when
 the source/model may call tools and an eligible discovery family exists. A brief
 answer with no structural target, such as a greeting, keeps only the Direct core;
 search becomes available when the input has a URL, path or code shape, or exceeds
-the builtin brief-request bound. An Answer turn may also publish an exactly named
-`delegate` or `sessions_spawn` on any surface that admits delegation, even when
-that delegator is Searchable rather than configured as Direct, but only when the
-same decision carries a sealed child manifest.
+the builtin brief-request bound. If the runtime has no current
+`capability_search` backend, it omits that control instead of failing the Answer.
+An Answer that follows a successful selected Memory, Document or Session read
+consumes the admitted evidence and keeps the bounded Direct core, so the serving
+model can perform a subsequent ordinary operation. The read does not itself
+authorize a Searchable tool. The generic `capability_search` control can remain
+published when the original input independently meets the normal structural or
+length criteria; a search result still needs a fresh nonterminal selection and
+all execution gates. When `[causal_tree].enabled = false`, there is no discovery
+hop, so one exactly named, current Searchable capability is published directly
+for legacy compatibility; exclusions, freshness, model and execution gates
+still apply, and no peer capability is widened. An Answer turn may also publish
+an exactly named `delegate` or `sessions_spawn` on any surface that admits
+delegation, even when that delegator is Searchable rather than configured as
+Direct, but only when the same decision carries a sealed child manifest.
 Interactive Chat additionally places `sessions_spawn` in its Direct core.
 Exclusions, tools-off, read-only and plan interception still remove entries, and
 publication alone never executes one. Channel and gateway turns use these shared
@@ -106,8 +125,12 @@ separate contracts. The admission input is currently populated as follows:
 
 The effective model window is pinned before decision dispatch. After the
 configured response reserve, the runtime reserves one sixteenth of the remaining
-window for the sealed decision request (capped at 4,096 tokens) and requires a
-positive main-turn input slice. A smaller effective window fails closed with
+window for the sealed decision request, capped at 4,096 tokens and by
+`causal_tree.policy.extra_token_ratio_limit` times that baseline window
+(the limit must be finite and greater than 0; zero or non-finite values are
+rejected at config load). The
+decision and main-turn input slices must both be positive. A smaller effective
+window, or a configured ratio too small to fund one decision token, fails closed with
 `resolved Agent context window has no safe decision reserve` before provider
 execution. Published tool schemas and their prompt instructions are then
 reserved from the main-turn slice as part of each provider preflight.
@@ -115,21 +138,41 @@ reserved from the main-turn slice as part of each provider preflight.
 Use `prx causal backends` to inspect the computed backend order and exclusion
 reasons; `prx causal status` also reports health and circuit state. Availability
 or configuration alone does not authorize a physical send. The builtin is the
-local fallback. Configured physical attempts require source-owned accounting:
-the runtime estimates the guarded request with its existing token estimator,
-reserves the remaining declared token allowance at the highest applicable PMM
-rate, and checks the original token, latency and monetary limits before dispatch.
+local fallback unless every configured attempt failed semantic response
+validation; that condition terminates the decision instead of silently changing
+its meaning. Transport, server, open-circuit and decision-budget failures use the
+builtin fallback. Configured physical attempts require source-owned accounting:
+the runtime first applies a conservative byte/token upper bound and otherwise
+estimates the guarded request with its existing token estimator, reserves the
+remaining declared token allowance at the highest applicable PMM rate, and
+checks the original token, latency and monetary limits before dispatch.
 The estimate is not a vendor-enforced billing cap. Each retry has its own durable
 reservation; builtin and cache-only paths do not open the cost ledger.
+For a two-attempt plan, accounting prefers an equal share of the remaining
+tokens. If the complete guarded input cannot fit that share but does fit the
+existing total allowance, the current attempt reserves the smallest larger
+share that satisfies the existing strict input-fit check instead.
+This does not raise a token, cost or time limit or guarantee a second attempt:
+each later attempt must fit the actual remaining allowance. Unknown usage keeps
+the whole claimed reservation; only fully reported usage releases unused tokens.
+If cancellation or a deadline prevents a completed reservation from reaching
+the transport, its unique unclaimed owner releases that unsent estimate and
+restores the local allowance before cleanup completes. The journal records this
+as `estimated_unsent_v1`; older builds that do not recognize that event fail
+closed on that workspace ledger. Once the transport receives the receipt,
+missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Missing, partial or estimated
 usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
-fingerprinted request state. Administrative probes/tests use a separate owned
-scope under the existing live-test permission checks. An unfunded probe is
-reported as unprobed, not as successful health evidence.
+fingerprinted request state. A priced direct Answer has zero extra execution
+latency because the serving-model response is the turn's baseline path; its
+token and monetary estimate still pass G6. Retrieval and tool candidates keep
+their own execution-latency estimates. Administrative probes/tests use a
+separate owned scope under the existing live-test permission checks. An
+unfunded probe is reported as unprobed, not as successful health evidence.
 
 Supported auxiliary transports account for each actual send, including nested
 fallbacks. Unsupported transports refuse the additional call before dispatch.
@@ -186,12 +229,40 @@ backends remain remote even when an endpoint override is supplied. OpenRouter
 requires an exact pinned snapshot. Hosted snapshot values must satisfy the
 configuration validator rather than name a floating alias.
 
+For a hosted model present in the embedded release catalog, store a provider
+owned credential and select the exact catalog model through the managed flow:
+
+```bash
+prx providers credential set openrouter --name decision-openrouter --from-stdin
+prx causal config set backend --kind openrouter --model typesafe/jev-1.13 \
+  --reference cred-decision-openrouter --apply
+prx causal config enable-remote --apply
+```
+
+The backend transaction fills the catalog's pinned snapshot, transport timeout,
+latency budget, and built-in price. A model absent from the release catalog
+still needs an explicit pinned snapshot, timeout, and `[cost.prices]` override.
+Use the plan's revision and the normal high-risk confirmation flags when the
+command asks for them. `prx causal status`, `prx causal test`, and `prx doctor`
+show the resulting configured values before a live test is attempted.
+
 Plain HTTP is permitted only for accepted loopback spelling: canonical decimal
 127/8 addresses accepted by the validator, `[::1]`, or `localhost`
 (case-insensitive, transport-pinned to `127.0.0.1` without DNS). Abbreviated or
 numeric alternate IP forms, mapped IPv6, `localhost.` and subdomains are not
 loopback exemptions. Other endpoints require HTTPS. URL user information,
 query strings and fragments are refused.
+
+`prx onboard --decision-backend typesafe|openrouter --decision-model <id>
+--decision-credential-stdin` (and the interactive wizard) store the hosted
+credential as `cred-decision-<kind>`, reference it and leave remote processing
+off; setup refuses when that reference already exists and never replaces it.
+
+`prx causal config set auto` (Gateway `{"op":"reset_backend_to_auto"}`) returns
+to `kind = auto`: it clears the endpoint, model, pinned snapshot and credential
+reference and turns remote processing off. The credential it referenced stays in
+the store, unreferenced; `prx doctor` lists it as an orphaned decision credential
+and `prx providers credential remove cred-<name>` deletes it.
 
 `credential_ref` names a stored credential; it is not a raw key. Use the
 credential management flow and protected input, never URL parameters, logs or

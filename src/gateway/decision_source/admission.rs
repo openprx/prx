@@ -421,6 +421,12 @@ mod tests {
         ) -> anyhow::Result<Option<crate::memory::MessageEvent>> {
             self.inner.find_owned_message_event(workspace, owner, id).await
         }
+        async fn load_recent_session_context(
+            &self,
+            query: crate::memory::SessionContextQuery,
+        ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+            self.inner.load_recent_session_context(query).await
+        }
         async fn append_message_event(
             &self,
             input: crate::memory::MessageEventInput,

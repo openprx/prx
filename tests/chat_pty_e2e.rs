@@ -285,6 +285,13 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         String::from_utf8_lossy(&output.stderr)
     );
     let requests = seen.lock().expect("request sink");
+    let observed_results = requests
+        .iter()
+        .flat_map(|(_, body)| serde_json::from_str::<serde_json::Value>(body))
+        .flat_map(|request| request["messages"].as_array().cloned().unwrap_or_default())
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
     let joined = requests.iter().any(|(_, body)| {
         let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
             return false;
@@ -304,7 +311,16 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                     && result["no_result"] == serde_json::json!([])
             })
     });
-    assert!(joined, "parent did not observe one completed child");
+    assert!(
+        joined,
+        "parent did not observe one completed child; parent requests={}, total requests={}, tool results={observed_results:?}, stdout={}",
+        requests
+            .iter()
+            .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
+            .count(),
+        requests.len(),
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(
         requests.iter().any(|(_, body)| body.contains("PRX_CHAT_CHILD")),
         "process child never called the override"

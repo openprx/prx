@@ -19,25 +19,34 @@ use super::catalog::{
     decision_adapter,
 };
 use super::credentials::{ConfigCredentialSource, CredentialRef, LegacySlot};
-use super::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId};
+use super::{ProviderId, default_provider_for_unset};
 use crate::config::Config;
 use crate::decision::model_pin::is_unpinned_model;
 
 /// The model a surface runs when neither the selection nor `default_model`
-/// names one.
-pub const DEFAULT_MODEL_FOR_UNSET: &str = "anthropic/claude-sonnet-4";
+/// names one. The release catalog is the sole owner of that fact.
+#[must_use]
+pub fn default_model_for_unset<'a>() -> &'a str {
+    catalog::ReleaseCatalog::embedded_ref()
+        .ok()
+        .and_then(catalog::ReleaseCatalog::global_default_model)
+        .unwrap_or("")
+}
 
 /// The configured default provider, or the one an unset `default_provider`
 /// means.
 #[must_use]
 pub fn default_provider(config: &Config) -> &str {
-    config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET)
+    config
+        .default_provider
+        .as_deref()
+        .unwrap_or_else(default_provider_for_unset)
 }
 
 /// The configured default model, or the one an unset `default_model` means.
 #[must_use]
 pub fn default_model(config: &Config) -> &str {
-    config.default_model.as_deref().unwrap_or(DEFAULT_MODEL_FOR_UNSET)
+    config.default_model.as_deref().unwrap_or_else(default_model_for_unset)
 }
 
 /// The evidence a surface resolves against: the operator declarations in
@@ -70,10 +79,44 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
         .flatten()
         .any(|value| !value.trim().is_empty())
         || config.reliability.api_keys.iter().any(|key| !key.trim().is_empty());
-    if root_holds_material && ProviderId::of(provider) == ProviderId::of(default_provider(config)) {
+    let is_default = ProviderId::of(provider) == ProviderId::of(default_provider(config));
+    if root_holds_material && is_default {
         CredentialRef::LegacyInline(LegacySlot::Root)
+    } else if is_default && let Some(reference) = default_credential_reference(config, provider) {
+        reference
     } else {
         CredentialRef::ProviderStore
+    }
+}
+
+/// The credential reference `prx providers credential set <provider>` stores
+/// under its default name (`cred-<catalog name>`), when the configured default
+/// provider has one and it was issued for that provider. Used only when the
+/// root holds no connection material, so the precedence is: any root
+/// `api_key`, rotation key or `api_url`, then `cred-<name>`, then the
+/// provider's own store. A missing or foreign
+/// reference means no reference. An unreadable store is reported with a
+/// warning (never the value) and falls back to the provider store. The store
+/// is read on each call, not cached, so a credential stored a moment ago is
+/// used by the next provider construction.
+fn default_credential_reference(config: &Config, provider: &str) -> Option<CredentialRef> {
+    use crate::config::manage::credentials::{CredentialReferenceError, CredentialReferences};
+    let name = ProviderId::of(provider).catalog_name()?.to_ascii_lowercase();
+    let id = CredentialReferences::id_for(&name).ok()?;
+    let references = match CredentialReferences::for_config(config) {
+        Ok(references) => references,
+        Err(error) => {
+            tracing::warn!(%error, "credential store location unavailable; using the provider's own store");
+            return None;
+        }
+    };
+    match references.check_reference(&id, provider) {
+        Ok(_) => CredentialReferences::reference(&id).ok(),
+        Err(CredentialReferenceError::Store(reason)) => {
+            tracing::warn!(reference = %id, %reason, "credential store unreadable; using the provider's own store");
+            None
+        }
+        Err(_) => None,
     }
 }
 
@@ -150,6 +193,16 @@ pub fn check_with(
         tracing::warn!(target: "providers::selection", "{warning}");
     }
     Ok(resolved)
+}
+
+/// Add the selected route identity to a resolver refusal without changing its
+/// typed cause. Surfaces that accept `hint:` as user input use this display;
+/// direct provider/model selection retains the original typed error.
+pub(crate) fn route_refusal(route: Option<&catalog::RouteTarget>, refusal: ResolutionError) -> anyhow::Error {
+    match route {
+        Some(route) => anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint),
+        None => anyhow::Error::new(refusal),
+    }
 }
 
 /// Check a decision backend selection (D-036 item 4; D-040 OQ-A2).
@@ -510,47 +563,44 @@ pub fn check_default(config: &Config, policy: UnknownPolicy) -> Result<ResolvedM
     )
 }
 
-/// Resolve every `[[model_routes]]` destination for chat with its own key,
-/// so a route to a model that cannot chat is refused where the routed chain
-/// is built rather than on the first turn that routes to it.
-///
-/// # Errors
-///
-/// The first refused route, named by its hint.
-pub fn check_routes(config: &Config, catalog: &CatalogView, policy: UnknownPolicy) -> anyhow::Result<()> {
-    for route in &config.model_routes {
-        if route.model.trim().starts_with("hint:") {
-            return Err(anyhow::anyhow!(
-                "model route `hint:{}` is refused: its model '{}' is itself a routing hint, which the router sends \
-                 literally; name a model",
-                route.hint,
-                route.model.trim()
-            ));
-        }
-        let credential = if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-            CredentialRef::LegacyInline(LegacySlot::ModelRoute(route.hint.clone()))
-        } else if let Some(id) = route
-            .credential_ref
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            CredentialRef::Profile { id: id.to_string() }
-        } else {
-            credential_for(config, &route.provider)
-        };
-        check_with(
-            config,
-            catalog,
-            &route.provider,
-            &route.model,
-            credential,
-            &Requirement::chat(),
-            policy,
-        )
-        .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))?;
+/// Resolve one configured chat route. Routed provider construction uses this
+/// per route so one refused destination cannot disable unrelated surfaces.
+pub(crate) fn resolve_route(
+    config: &Config,
+    catalog: &CatalogView,
+    route: &crate::config::ModelRouteConfig,
+    policy: UnknownPolicy,
+) -> anyhow::Result<ResolvedModel> {
+    if route.model.trim().starts_with("hint:") {
+        anyhow::bail!(
+            "model route `hint:{}` is refused: its model '{}' is itself a routing hint, which the router sends \
+             literally; name a model",
+            route.hint,
+            route.model.trim()
+        );
     }
-    Ok(())
+    let credential = if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        CredentialRef::LegacyInline(LegacySlot::ModelRoute(route.hint.clone()))
+    } else if let Some(id) = route
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        CredentialRef::Profile { id: id.to_string() }
+    } else {
+        credential_for(config, &route.provider)
+    };
+    check_with(
+        config,
+        catalog,
+        &route.provider,
+        &route.model,
+        credential,
+        &Requirement::chat(),
+        policy,
+    )
+    .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
 /// How the configured default resolves, in one line for `prx doctor` and
@@ -627,6 +677,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_default_provider_credential_is_used_when_the_root_holds_no_key() {
+        let temp = tempfile::TempDir::new().expect("test: temp dir");
+        let mut config = config_in(&temp, "openai", "gpt-5");
+        config.api_key = None;
+        assert_eq!(credential_for(&config, "openai"), CredentialRef::ProviderStore);
+
+        let references = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .expect("test: reference store");
+        references
+            .set("openai", "openai", "sk-test-default-credential-0001")
+            .expect("test: store credential");
+        assert_eq!(
+            credential_for(&config, "openai"),
+            CredentialRef::Profile {
+                id: "cred-openai".to_string()
+            }
+        );
+        // Another provider never receives the default provider's reference.
+        assert_eq!(credential_for(&config, "anthropic"), CredentialRef::ProviderStore);
+        // An inline root key keeps winning over the store.
+        config.api_key = Some("PMMC-SELECTION-ROOT".to_string());
+        assert_eq!(
+            credential_for(&config, "openai"),
+            CredentialRef::LegacyInline(LegacySlot::Root)
+        );
+    }
+
+    #[test]
     fn the_root_connection_goes_only_to_the_default_identity_and_only_when_it_exists() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut config = config_in(&temp, "anthropic", "claude-sonnet-4");
@@ -668,14 +746,15 @@ mod tests {
             operations: Some(vec![ModelOperation::DecisionEndpoint]),
             ..catalog::CuratedModel::new(ProviderId::of("openrouter"), Some("vendor/decision"))
         }]);
-        let error = check_routes(&config, &catalog, UnknownPolicy::Invocation).expect_err("refused");
+        let route = config.model_routes.first().expect("test: configured route");
+        let error = resolve_route(&config, &catalog, route, UnknownPolicy::Invocation).expect_err("refused");
         let text = format!("{error:#}");
         assert!(
             text.contains("hint:judge") && text.contains("cannot be used for chat"),
             "{text}"
         );
         assert!(!text.contains("PMMC-ROUTE-KEY"), "{text}");
-        check_routes(&config, &catalog_for(&config), UnknownPolicy::Invocation).expect("an id-only route runs");
+        resolve_route(&config, &catalog_for(&config), route, UnknownPolicy::Invocation).expect("an id-only route runs");
     }
 
     /// A catalog that declares `model` of `provider` for the given
@@ -1104,7 +1183,8 @@ mod tests {
             UnknownPolicy::Invocation,
         )
         .expect_err("a route to another hint is refused");
-        check_routes(&nested, &catalog_for(&nested), UnknownPolicy::Invocation)
+        let route = nested.model_routes.first().expect("test: configured route");
+        resolve_route(&nested, &catalog_for(&nested), route, UnknownPolicy::Invocation)
             .expect_err("chat start-up refuses a route whose model is a hint");
     }
 
@@ -1141,6 +1221,18 @@ mod tests {
         let text = error.to_string();
         assert!(!text.contains("whitespace"), "{text}");
         assert!(text.contains("hint:<name>"), "{text}");
+    }
+
+    #[test]
+    fn unset_model_default_is_owned_by_the_release_catalog() {
+        let catalog =
+            crate::providers::catalog::ReleaseCatalog::embedded().expect("test: embedded model catalog validates");
+        assert_eq!(
+            default_model_for_unset(),
+            catalog
+                .global_default_model()
+                .expect("test: release-wide model default")
+        );
     }
 
     #[test]

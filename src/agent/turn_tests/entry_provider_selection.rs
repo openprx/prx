@@ -36,7 +36,7 @@ async fn a_custom_override_does_not_receive_the_root_key() {
 
     let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
         .expect("test: a keyless custom endpoint is selectable");
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("test: a keyless custom endpoint builds");
     let reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -57,12 +57,19 @@ fn a_catalog_override_without_its_own_credential_is_refused() {
     let options = crate::providers::provider_runtime_options_from_config(&config);
 
     let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"))
-        .and_then(|choice| agent_provider_selection(&config, &choice).build_provider(&config, &options));
+        .and_then(|choice| agent_provider_selection(&choice).build_provider(&config, &options));
 
-    let error = match outcome {
+    let typed = match outcome {
         Ok(_) => panic!("a catalog override must not build on the default provider's key"),
-        Err(error) => format!("{error:#}"),
+        Err(error) => error,
     };
+    assert!(
+        typed
+            .downcast_ref::<crate::providers::MissingProviderCredential>()
+            .is_some(),
+        "the refusal must be the typed missing-credential error: {typed:#}"
+    );
+    let error = format!("{typed:#}");
     assert!(error.contains("missing credential/api key"), "{error}");
     assert!(!error.contains(ROOT_SENTINEL), "{error}");
 }
@@ -78,14 +85,32 @@ fn the_configured_default_keeps_its_connection() {
     for spelling in [None, Some("openai"), Some("OPENAI")] {
         let choice =
             resolve_agent_model_choice(&config, spelling, None).expect("test: the default provider is selectable");
-        let selection = agent_provider_selection(&config, &choice);
-        assert_eq!(selection.connection.api_key, Some(ROOT_SENTINEL), "{spelling:?}");
         assert_eq!(
-            selection.connection.api_url,
+            choice.resolved.credential().api_key(),
+            Some(ROOT_SENTINEL),
+            "{spelling:?}"
+        );
+        assert_eq!(
+            choice.resolved.credential().api_url(),
             Some("https://api.openai.example/v1"),
             "{spelling:?}"
         );
     }
+}
+
+/// Finding 79(a): the construction-time attestation exists to catch a reload
+/// that changes the key under the same credential reference.
+#[test]
+fn a_changed_key_under_the_same_credential_reference_fails_the_attestation() {
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let mut config = isolated_config(&temp);
+    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default provider is selectable");
+    assert!(choice.factory_credential_source_matches(&config));
+    config.api_key = Some("C0-AGENT-ROTATED-ROOT".to_string());
+    assert!(
+        !choice.factory_credential_source_matches(&config),
+        "a rotated key under the same reference must not attest"
+    );
 }
 
 /// T4: a model the selected provider cannot serve is refused before any
@@ -115,7 +140,7 @@ async fn a_custom_override_does_not_receive_the_rotation_keys() {
 
     let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
         .expect("test: a keyless custom endpoint is selectable");
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("test: a keyless custom endpoint builds");
     let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -137,11 +162,13 @@ fn an_override_does_not_inherit_the_root_base_url() {
 
     let choice = resolve_agent_model_choice(&config, Some("litellm"), Some("probe-model"))
         .expect("test: litellm accepts a bare model id");
-    let selection = agent_provider_selection(&config, &choice);
-
-    assert_eq!(selection.connection.api_url, None);
-    assert_eq!(selection.connection.api_key, None);
-    assert!(!selection.connection.released);
+    assert_eq!(choice.resolved.credential().api_url(), None);
+    assert_eq!(choice.resolved.credential().api_key(), None);
+    assert_eq!(
+        choice.resolved.credential().reference(),
+        &crate::providers::credentials::CredentialRef::ProviderStore,
+        "the override may use only its own credential store"
+    );
 }
 
 fn declare_decision_only(config: &mut Config, provider: &str) {
@@ -189,9 +216,15 @@ async fn a_route_to_a_decision_only_model_is_refused() {
         credential_ref: None,
     }];
 
-    let Err(error) = resolve_agent_model_choice(&config, None, None) else {
-        panic!("a route to a decision-only model was accepted");
-    };
+    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default model resolves");
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let provider = agent_provider_selection(&choice)
+        .build_provider(&config, &options)
+        .expect("test: the default builds with the refused route retained");
+    let error = provider
+        .simple_chat("ping", "hint:decide", 0.0)
+        .await
+        .expect_err("a route to a decision-only model was accepted");
     assert!(format!("{error:#}").contains("hint:decide"), "{error:#}");
     assert!(probe.requests().is_empty(), "nothing is sent");
 }
@@ -216,17 +249,17 @@ fn a_hint_model_is_resolved_through_its_route() {
     assert!(format!("{error:#}").contains("hint:nope"), "{error:#}");
 }
 
-/// The current routed factory shares one handle per provider name. A direct
-/// turn with a keyed same-provider route therefore cannot issue a decision
-/// proof that claims the root credential reached the wire.
+/// A direct turn and a keyed same-provider route receive distinct resolved
+/// chains. The direct request keeps the root credential and can attest it.
 #[tokio::test]
-async fn direct_turn_refuses_proof_when_factory_uses_a_route_key() {
+async fn direct_turn_keeps_root_credential_beside_a_keyed_route() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start().await;
     let mut config = isolated_config(&temp);
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
+    config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
         hint: "fast".to_string(),
         provider: selected.clone(),
@@ -236,34 +269,35 @@ async fn direct_turn_refuses_proof_when_factory_uses_a_route_key() {
     });
     let choice = resolve_agent_model_choice(&config, None, None).expect("direct model selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
         provider.simple_chat("ping", PROBE_MODEL, 0.0).await.as_deref().ok(),
         Some(PROBE_REPLY)
     );
-    assert!(probe.saw("PRX-ROUTE-KEY"), "the factory used its keyed route");
-    assert!(!probe.saw(ROOT_SENTINEL));
+    assert!(probe.saw(ROOT_SENTINEL), "the direct request lost the root credential");
+    assert!(
+        !probe.saw("PRX-ROUTE-KEY"),
+        "the direct request used the route credential"
+    );
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
-    assert!(
-        issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err(),
-        "a root credential proof cannot attest to a route-key wire request"
-    );
+    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_ok());
 }
 
-/// Two hints to one provider with different keys share the first routed
-/// provider. The selected second hint cannot issue a credential proof.
+/// Two hints to one provider keep distinct resolved credentials, including
+/// when the second route is selected.
 #[tokio::test]
-async fn second_same_provider_hint_refuses_first_hint_wire_key() {
+async fn second_same_provider_hint_uses_its_own_wire_key() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start().await;
     let mut config = isolated_config(&temp);
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
+    config.causal_tree.enabled = false;
     for (hint, key) in [("first", "PRX-FIRST-KEY"), ("second", "PRX-SECOND-KEY")] {
         config.model_routes.push(crate::config::ModelRouteConfig {
             hint: hint.to_string(),
@@ -275,32 +309,33 @@ async fn second_same_provider_hint_refuses_first_hint_wire_key() {
     }
     let choice = resolve_agent_model_choice(&config, None, Some("hint:second")).expect("second hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
         provider.simple_chat("ping", "hint:second", 0.0).await.as_deref().ok(),
         Some(PROBE_REPLY)
     );
-    assert!(probe.saw("PRX-FIRST-KEY"), "the factory shared its first keyed route");
-    assert!(!probe.saw("PRX-SECOND-KEY"));
+    assert!(probe.saw("PRX-SECOND-KEY"), "the second route lost its credential");
+    assert!(
+        !probe.saw("PRX-FIRST-KEY"),
+        "the second route shared the first route's credential"
+    );
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
-    assert!(
-        issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err(),
-        "the second hint cannot attest to the first hint's wire credential"
-    );
+    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_ok());
 }
 
 #[tokio::test]
-async fn keyed_hint_after_unkeyed_route_refuses_factory_fallback_key() {
+async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start().await;
     let mut config = isolated_config(&temp);
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
+    config.causal_tree.enabled = false;
     config.model_routes = vec![
         crate::config::ModelRouteConfig {
             hint: "unkeyed".to_string(),
@@ -319,29 +354,36 @@ async fn keyed_hint_after_unkeyed_route_refuses_factory_fallback_key() {
     ];
     let choice = resolve_agent_model_choice(&config, None, Some("hint:keyed")).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     assert_eq!(
         provider.simple_chat("ping", "hint:keyed", 0.0).await.as_deref().ok(),
         Some(PROBE_REPLY)
     );
-    assert!(probe.saw(ROOT_SENTINEL), "the first unkeyed route falls back to root");
-    assert!(!probe.saw("PRX-LATER-KEY"));
+    assert!(
+        probe.saw("PRX-LATER-KEY"),
+        "the selected keyed route lost its credential"
+    );
+    assert!(
+        !probe.saw(ROOT_SENTINEL),
+        "the selected route inherited the root credential"
+    );
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
-    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err());
+    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_ok());
 }
 
 #[tokio::test]
-async fn keyed_primary_hint_refuses_root_rotation_on_retry() {
+async fn keyed_primary_hint_retries_without_root_rotation_key() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start_with_statuses(vec![429]).await;
     let mut config = isolated_config(&temp);
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
+    config.causal_tree.enabled = false;
     config.reliability.api_keys = vec![ROTATION_SENTINEL.to_string()];
     config.model_routes.push(crate::config::ModelRouteConfig {
         hint: "fast".to_string(),
@@ -352,23 +394,24 @@ async fn keyed_primary_hint_refuses_root_rotation_on_retry() {
     });
     let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
+    let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("routed provider");
     let _ = provider.simple_chat("ping", "hint:fast", 0.0).await;
     assert!(probe.saw("PRX-ROUTE-KEY"));
-    assert!(probe.saw(ROTATION_SENTINEL), "retry exposed the root rotation key");
+    assert!(!probe.saw(ROTATION_SENTINEL), "retry exposed the root rotation key");
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
-    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err());
+    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_ok());
 }
 
 #[test]
-fn keyed_primary_hint_refuses_root_endpoint_mix() {
+fn keyed_primary_hint_does_not_inherit_root_endpoint() {
     let temp = tempfile::tempdir().expect("test workspace");
     let mut config = isolated_config(&temp);
     config.api_url = Some("http://127.0.0.1:9/v1".to_string());
+    config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
         hint: "fast".to_string(),
         provider: "openai".to_string(),
@@ -377,12 +420,18 @@ fn keyed_primary_hint_refuses_root_endpoint_mix() {
         credential_ref: None,
     });
     let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
-    let selection = agent_provider_selection(&config, &choice);
-    assert_eq!(selection.connection.api_url, Some("http://127.0.0.1:9/v1"));
+    let selection = agent_provider_selection(&choice);
+    assert_eq!(selection.resolved.credential().api_url(), None);
+    selection
+        .build_provider(
+            &config,
+            &crate::providers::provider_runtime_options_from_config(&config),
+        )
+        .expect("the route builds from its resolved key without the root URL");
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
-    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err());
+    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_ok());
 }
 
 #[test]
@@ -405,7 +454,7 @@ fn raw_provider_whitespace_cannot_hide_a_keyed_factory_route() {
 }
 
 #[tokio::test]
-async fn root_url_without_root_key_cannot_attest_provider_profile_wire_key() {
+async fn root_url_without_root_key_uses_the_provider_profile() {
     let temp = tempfile::tempdir().expect("test workspace");
     let probe = CredentialProbe::start().await;
     let mut config = isolated_config(&temp);
@@ -417,6 +466,7 @@ async fn root_url_without_root_key_cannot_attest_provider_profile_wire_key() {
             .expect("loopback provider URL")
             .to_string(),
     );
+    config.causal_tree.enabled = false;
     config.secrets.encrypt = false;
     let store = crate::auth::profiles::AuthProfilesStore::new(temp.path(), false);
     store
@@ -427,21 +477,40 @@ async fn root_url_without_root_key_cannot_attest_provider_profile_wire_key() {
         .expect("isolated profile");
     let choice = resolve_agent_model_choice(&config, None, None).expect("PMM root URL selection");
     let options = crate::providers::provider_runtime_options_from_config(&config);
-    let provider = agent_provider_selection(&config, &choice)
-        .build_provider(&config, &options)
-        .expect("profile-backed provider");
+    let (built, counts) = crate::providers::credential_resolution_observation::observe(|| {
+        agent_provider_selection(&choice).build_provider(&config, &options)
+    });
+    let provider = built.expect("URL-only Root falls back to the provider's own credential store");
     assert_eq!(
-        provider.simple_chat("ping", "gpt-4o", 0.0).await.as_deref().ok(),
-        Some(PROBE_REPLY)
+        counts,
+        [1, 1, 0],
+        "construction must perform one provider-profile lookup"
     );
-    assert!(
-        probe.saw("PRX-PROFILE-KEY"),
-        "factory used provider store rather than Root"
-    );
-    let generation = crate::config::new_shared(config).pin();
-    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
-        .with_config_generation(&generation);
-    assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err());
+    let reply = provider
+        .simple_chat("ping", "gpt-4o", 0.0)
+        .await
+        .expect("the restored credential reaches the configured Root URL");
+    assert_eq!(reply, PROBE_REPLY);
+    assert!(probe.saw("PRX-PROFILE-KEY"), "the provider profile was not used");
+    assert!(choice.factory_credential_source_matches(&config));
+}
+
+#[test]
+fn openai_codex_ignores_root_key_url_and_rotation_material() {
+    let temp = tempfile::tempdir().expect("test workspace");
+    let mut config = isolated_config(&temp);
+    config.default_provider = Some("openai-codex".to_string());
+    config.default_model = Some("gpt-5.2-codex".to_string());
+    config.api_key = Some("PRX-IGNORED-CODEX-ROOT".to_string());
+    config.api_url = Some("https://ignored.example.invalid/v1".to_string());
+    config.reliability.api_keys = vec!["PRX-IGNORED-CODEX-ROTATION".to_string()];
+    let choice = resolve_agent_model_choice(&config, None, None).expect("Codex Root selection resolves");
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
+        agent_provider_selection(&choice).build_provider(&config, &options)
+    });
+    provider.expect("Codex builds from its own login despite unrelated Root material");
+    assert_eq!(counts, [0, 0, 0], "Codex must not resolve Root API-key material");
 }
 
 /// Kimi Code accepts any model string and answers anyway, so an id outside
@@ -459,7 +528,7 @@ fn an_unlisted_kimi_code_model_is_still_refused() {
 
 /// Real wire plus actual factory lookup observation: no header-only inference.
 #[tokio::test]
-async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
+async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire() {
     use futures_util::FutureExt;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -469,7 +538,7 @@ async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
             self.0.abort();
         }
     }
-    for label in ["ollama", "custom", "openai"] {
+    for label in ["openai", "ollama", "custom"] {
         let temp = tempfile::tempdir().expect("owned configuration");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = Arc::clone(&seen);
@@ -531,25 +600,30 @@ async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
                 .expect("owned conflicting profile");
             let choice = resolve_agent_model_choice(&config, None, None).expect("actual resolved connection");
             let options = crate::providers::provider_runtime_options_from_config(&config);
-            if label != "openai" {
-                let selection = agent_provider_selection(&config, &choice);
-                let mut changed = config.clone();
-                changed.model_routes.push(crate::config::ModelRouteConfig {
-                    hint: "prx_route".into(),
-                    provider: provider_label.clone(),
-                    model: "prx-local-model".into(),
-                    api_key: Some("PRX-CHANGED-ROUTE".into()),
-                    credential_ref: None,
-                });
-                let (refused, counts) = crate::providers::credential_resolution_observation::observe(|| {
-                    selection.build_provider(&changed, &options)
-                });
-                assert!(refused.is_err());
-                assert_eq!(counts, [0, 0, 0]);
-                assert!(seen.lock().is_empty());
-            }
+            let selection = agent_provider_selection(&choice);
+            let mut changed = config.clone();
+            changed.model_routes.push(crate::config::ModelRouteConfig {
+                hint: "prx_route".into(),
+                provider: provider_label.clone(),
+                model: "prx-local-model".into(),
+                api_key: Some("PRX-CHANGED-ROUTE".into()),
+                credential_ref: None,
+            });
+            let (built, counts) = crate::providers::credential_resolution_observation::observe(|| {
+                selection.build_provider(&changed, &options)
+            });
+            assert!(
+                built.is_ok(),
+                "an unrelated route cannot invalidate the resolved default"
+            );
+            assert_eq!(
+                counts,
+                [2, 1, 0],
+                "the URL-only Root resolves its provider profile and the new route resolves its explicit key"
+            );
+            assert!(seen.lock().is_empty());
             let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
-                agent_provider_selection(&config, &choice).build_provider(&config, &options)
+                agent_provider_selection(&choice).build_provider(&config, &options)
             });
             let provider = provider.expect("actual provider construction");
             let reply = tokio::time::timeout(
@@ -563,20 +637,16 @@ async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
             {
                 let requests = seen.lock();
                 assert_eq!(requests.len(), 1);
-                if label == "openai" {
-                    assert!(counts.first().is_some_and(|count| *count > 0));
-                    assert!(counts.get(1).is_some_and(|count| *count > 0));
-                    assert_eq!(
-                        requests.first().and_then(Option::as_deref),
-                        Some("Bearer PRX-CONFLICTING-PROFILE")
-                    );
-                } else {
-                    assert_eq!(counts, [0, 0, 0]);
-                    assert!(requests.first().is_some_and(Option::is_none));
-                }
+                assert_eq!(counts, [1, 1, 0]);
+                let expected_authorization = (label != "ollama").then_some("Bearer PRX-CONFLICTING-PROFILE");
+                assert_eq!(
+                    requests.first().and_then(Option::as_deref),
+                    expected_authorization,
+                    "{label} changed how it presents a resolved provider credential"
+                );
             }
             // The typed PMM factory must preserve the same absence independently
-            // of the CLI routed entry, with the same non-vacuous legacy control.
+            // of the CLI routed entry.
             let catalog = crate::providers::selection::catalog_for(&config);
             let (typed, typed_counts) = crate::providers::credential_resolution_observation::observe(|| {
                 crate::providers::create_provider_for(
@@ -599,24 +669,20 @@ async fn pinned_keyless_root_skips_profile_resolution_on_owned_wire() {
             {
                 let requests = seen.lock();
                 assert_eq!(requests.len(), 2);
-                if label == "openai" {
-                    assert!(typed_counts.first().is_some_and(|count| *count > 0));
-                    assert!(typed_counts.get(1).is_some_and(|count| *count > 0));
-                    assert!(
-                        requests
-                            .iter()
-                            .all(|header| header.as_deref() == Some("Bearer PRX-CONFLICTING-PROFILE"))
-                    );
-                } else {
-                    assert_eq!(typed_counts, [0, 0, 0]);
-                    assert!(requests.iter().all(Option::is_none));
-                }
+                assert_eq!(typed_counts, [1, 1, 0]);
+                let expected_authorization = (label != "ollama").then_some("Bearer PRX-CONFLICTING-PROFILE");
+                assert!(
+                    requests
+                        .iter()
+                        .all(|authorization| authorization.as_deref() == expected_authorization),
+                    "{label} changed how it presents a resolved provider credential"
+                );
             }
             let generation = crate::config::new_shared(config).pin();
             let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
                 .with_config_generation(&generation);
             let proof = issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice);
-            assert_eq!(proof.is_ok(), label != "openai");
+            assert!(proof.is_ok());
         })
         .catch_unwind()
         .await;

@@ -887,9 +887,14 @@ fn print_model_line(entry: &manage::ModelEntry, out: &mut dyn Write) -> Result<(
     } else {
         supported.join(",")
     };
+    let warning = entry
+        .lifecycle_warning
+        .as_deref()
+        .map(|warning| format!("  [{warning}]"))
+        .unwrap_or_default();
     writeln!(
         out,
-        "{}  {}  [{supported}]  ({})",
+        "{}  {}  [{supported}]  ({}){warning}",
         entry.provider, entry.model, entry.source
     )?;
     Ok(())
@@ -899,6 +904,9 @@ fn print_model(entry: &manage::ModelEntry, out: &mut dyn Write) -> Result<()> {
     writeln!(out, "Provider: {} ({})", entry.provider, entry.identity)?;
     writeln!(out, "Model: {}", entry.model)?;
     writeln!(out, "Evidence: {}", entry.source)?;
+    if let Some(warning) = &entry.lifecycle_warning {
+        writeln!(out, "Lifecycle: {warning}")?;
+    }
     if let Some(fetched) = entry.fetched_at_unix {
         writeln!(out, "Catalog fetched at (unix): {fetched}")?;
     }
@@ -1178,6 +1186,36 @@ mod tests {
 
     /// A credential-shaped sentinel. Not a real secret.
     const SECRET: &str = "pmme-cli-sentinel-value";
+
+    #[test]
+    fn deprecated_model_warning_is_visible_in_cli_and_json_surfaces() {
+        let entry = manage::ModelEntry {
+            provider: "openai".to_owned(),
+            identity: "openai".to_owned(),
+            model: "gpt-legacy".to_owned(),
+            operations: std::collections::BTreeMap::from([("chat".to_owned(), "supported".to_owned())]),
+            features: std::collections::BTreeMap::new(),
+            context_window: None,
+            source: "release catalog".to_owned(),
+            fetched_at_unix: None,
+            lifecycle_warning: Some("deprecated; use openai/gpt-current".to_owned()),
+        };
+        let mut listed = Vec::new();
+        print_model_line(&entry, &mut listed).expect("test: list line");
+        let listed = String::from_utf8(listed).expect("test: utf8 list line");
+        assert!(listed.contains("deprecated; use openai/gpt-current"));
+        let mut shown = Vec::new();
+        print_model(&entry, &mut shown).expect("test: model detail");
+        let shown = String::from_utf8(shown).expect("test: utf8 model detail");
+        assert!(shown.contains("Lifecycle: deprecated; use openai/gpt-current"));
+        let gateway_json = serde_json::to_value(&entry).expect("test: gateway JSON");
+        assert_eq!(
+            gateway_json
+                .get("lifecycle_warning")
+                .and_then(serde_json::Value::as_str),
+            Some("deprecated; use openai/gpt-current")
+        );
+    }
 
     async fn fixture(edit: impl FnOnce(&mut Config)) -> (tempfile::TempDir, Config) {
         let dir = tempfile::TempDir::new().expect("test: temp dir");
@@ -1828,6 +1866,10 @@ mod tests {
         .await;
         result.expect("test: list");
         assert!(out.contains("openai  gpt-4o  [chat]  (operator declaration)"), "{out}");
+        assert!(
+            out.contains("openai  gpt-5.6  [chat]  (embedded release catalog)"),
+            "the real CLI listing must include release-catalog models: {out}"
+        );
         assert!(!out.contains("jev-decision-test"), "{out}");
         let (result, out) = run_cli(&["models", "show", "openrouter", "jev-decision-test"], config, "", &[]).await;
         result.expect("test: show");

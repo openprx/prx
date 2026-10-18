@@ -45,6 +45,14 @@ pub enum DecisionError {
 }
 
 impl DecisionError {
+    /// A decoded backend response was received but cannot be trusted as a
+    /// decision. This is distinct from transport, service, circuit and budget
+    /// failures, for which the deterministic builtin remains a valid fallback.
+    #[must_use]
+    pub(crate) const fn is_semantic_validation_failure(&self) -> bool {
+        matches!(self, Self::InvalidResponse(_) | Self::ModelVersionMismatch)
+    }
+
     /// The stable class name, for metrics labels, events and records.
     #[must_use]
     pub const fn class(&self) -> &'static str {

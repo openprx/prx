@@ -1,9 +1,7 @@
-//! Runtime recovery helpers shared across the agent execution paths.
+//! Runtime recovery classification used by the agent turn engine.
 //!
-//! The submodules here provide a single, canonical implementation of recovery
-//! behaviours that were previously duplicated (and subtly divergent) across the
-//! three LLM-call paths in `crate::agent::turn_engine` and [`crate::agent::agent`].
-//! Centralizing them guarantees the streaming, tool-loop, and direct-turn paths
-//! react identically to the same failure class (FIX-P1-12).
+//! Entrypoints and provider adapters may classify a failure here, but the turn
+//! engine owns every recovery action so no caller starts a second compaction or
+//! replay loop.
 
 pub mod overflow;

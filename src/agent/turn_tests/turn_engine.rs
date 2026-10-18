@@ -755,7 +755,7 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
         Arc::clone(&memory),
     )
     .await;
-    admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
+    admission.assert_core_specs(&tool_specs_of(&tools_registry));
 
     let result = run_turn(
         &mut history,
@@ -1305,10 +1305,7 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             Arc::clone(&memory),
         )
         .await;
-        let expected_specs = tool_specs_of(&tools_registry)
-            .into_iter()
-            .filter(|spec| spec.name != "capability_search")
-            .collect::<Vec<_>>();
+        let expected_specs = tool_specs_of(&tools_registry);
         admission.assert_core_specs(&expected_specs);
         let runtime = admission.memory_runtime();
 
@@ -1362,9 +1359,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
         let raw = event.raw_payload_json.as_deref().expect("request context payload");
         let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
 
-        // The exact business tool is the only discoverable family, so the
-        // request contains its schema without a redundant search control.
-        assert_eq!(payload["tool_snapshot"]["count"], 1);
+        // Finding 80 keeps the gated search control beside the exact business
+        // schema on this structural terminal hop, and both must be measured.
+        assert_eq!(payload["tool_snapshot"]["count"], 2);
         assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
 
         let estimate = &payload["request_estimate"];
@@ -1858,10 +1855,11 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
 }
 
 #[tokio::test]
-async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+async fn image_turn_is_gated_by_catalog_vision_input_before_provider_transport() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let provider = NonVisionProvider {
+    let provider = VisionProvider {
         calls: Arc::clone(&calls),
+        expected_user_text: None,
     };
 
     let mut history = vec![ChatMessage::user(
@@ -1871,9 +1869,15 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
     let observer = NoopObserver;
 
     let workspace = TempDir::new().expect("multimodal fixture workspace");
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(
-        workspace.path(),
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("multimodal fixture memory"));
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
+        config,
         &history.last().expect("source input").content,
+        Arc::new(Vec::new()),
+        memory,
+        ("ollama", "codellama"),
     )
     .await;
     let err = run_turn(
@@ -1897,7 +1901,7 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         crate::agent::turn_request::TurnServices {
             provider: &provider,
             provider_name: "ollama",
-            model: "prx-local-model",
+            model: "codellama",
             temperature: 0.0,
             tools_registry: Arc::new(tools_registry),
             observer: &observer,
@@ -1917,10 +1921,10 @@ async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
     )
     .await
     .map(|(outcome, _trace)| outcome.into_text())
-    .expect_err("provider without vision support should fail");
+    .expect_err("catalog model without vision support should fail");
 
-    assert!(err.to_string().contains("provider_capability_error"));
-    assert!(err.to_string().contains("capability=vision"));
+    assert!(err.to_string().contains("provider_capability_error"), "{err:#}");
+    assert!(err.to_string().contains("capability=vision"), "{err:#}");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -3062,10 +3066,7 @@ async fn tool_arguments_are_validated_in_the_serving_models_dialect() {
         (PER_MODEL_LABEL, GEMINI_SERVED_MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     run_turn(
@@ -3240,10 +3241,7 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
         (PRIMARY, MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     let (_, trace) = run_turn(
@@ -3444,10 +3442,7 @@ async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
         (PRIMARY, MODEL),
     )
     .await;
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name != "capability_search")
-        .collect::<Vec<_>>();
+    let expected_specs = business_tool_specs_of(&tools_registry);
     admission.assert_core_specs(&expected_specs);
 
     let error = run_turn(

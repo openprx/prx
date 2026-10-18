@@ -33,7 +33,7 @@ fn is_tool_schema_refusal(err: &anyhow::Error) -> bool {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
-    if is_context_window_exceeded(err) || is_tool_schema_refusal(err) {
+    if crate::recovery::overflow::is_context_overflow_error(err) || is_tool_schema_refusal(err) {
         return true;
     }
 
@@ -127,22 +127,6 @@ fn is_non_retryable_provider_response_parse_error(msg_lower: &str) -> bool {
     // Unknown parse kinds remain non-retryable by default to preserve
     // fail-fast behavior on deterministic payload/protocol mismatches.
     true
-}
-
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    let hints = [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ];
-
-    hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -384,7 +368,7 @@ impl FallbackAdmission {
         self.candidates.insert((provider, model.into()), eligibility);
     }
 
-    fn eligibility(&self, provider: &super::ProviderId, model: &str) -> Option<FallbackEligibility> {
+    pub(super) fn eligibility(&self, provider: &super::ProviderId, model: &str) -> Option<FallbackEligibility> {
         if provider == &self.primary_provider && model == self.primary_model {
             return Some(FallbackEligibility {
                 cost_admitted: true,
@@ -566,14 +550,14 @@ pub struct ReliableProvider {
     base_backoff_ms: u64,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
-    /// Per-fallback G6/G7 facts for resolver-built chains. Legacy factories
-    /// leave this absent and retain their historical behavior.
+    /// Per-fallback G6/G7 facts for resolver-built chains. Direct unit-test
+    /// construction leaves this absent.
     fallback_admission: Option<FallbackAdmission>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
     unavailable_providers: Vec<(String, String)>,
     /// Per-provider cool-down learned from upstream 429/503 responses.
     ///
-    /// Chains built by [`create_resilient_provider_with_options`](super::create_resilient_provider_with_options)
+    /// Chains built by [`create_provider_for`](super::create_provider_for)
     /// share the process-wide gate, so a 429 on one request defers every other
     /// in-flight request to the same provider. Chains constructed directly get
     /// a private gate, keeping unit tests isolated from one another.
@@ -1068,7 +1052,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1216,7 +1200,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1426,7 +1410,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1619,7 +1603,7 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if crate::recovery::overflow::is_context_overflow_error(&e) {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
@@ -1989,7 +1973,7 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
     }
     let anyhow_err = anyhow::anyhow!("{message}");
 
-    if is_context_window_exceeded(&anyhow_err) {
+    if crate::recovery::overflow::is_context_overflow_error(&anyhow_err) {
         return StreamFailureClass::ContextOverflow;
     }
     if is_non_retryable_rate_limit(&anyhow_err) {

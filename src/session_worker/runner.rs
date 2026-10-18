@@ -234,7 +234,7 @@ fn worker_spawn_tool(
     manifest: &WorkerManifest,
     config: &Config,
     credentials: &WorkerCredentials<'_>,
-    provider: Arc<dyn Provider>,
+    #[cfg(test)] provider: Arc<dyn Provider>,
     security: Arc<SecurityPolicy>,
     options: &crate::providers::ProviderRuntimeOptions,
     active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
@@ -254,6 +254,7 @@ fn worker_spawn_tool(
         .map_or_else(|| manifest.model.clone(), |hint| format!("hint:{hint}"));
     let tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::new(WorkerChannel),
+        #[cfg(test)]
         provider,
         spawn_provider_name,
         spawn_model,
@@ -261,20 +262,13 @@ fn worker_spawn_tool(
         security,
         manifest.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         credentials.spawn_fallback.map(str::to_string),
         options.clone(),
         config.sessions_spawn.clone(),
         active_runs,
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
     .with_cost_config(config.cost.clone())
-    .with_reliability(credentials.reliability.as_ref().clone())
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
     .with_model_catalog(crate::providers::selection::catalog_for(config))
     .with_hint_config(config)
@@ -303,20 +297,75 @@ fn worker_provider(
     if manifest.model.trim().starts_with("hint:") {
         anyhow::bail!("session-worker received an unresolved model route");
     }
-    crate::providers::selection::check_model(
-        &crate::providers::selection::catalog_for(config),
+    let credential = if manifest.route_hint.is_some() {
+        manifest
+            .route_credential
+            .clone()
+            .context("session-worker manifest route credential provenance is missing")?
+    } else if let Some((name, agent)) = manifest
+        .agent_id
+        .as_deref()
+        .and_then(|name| config.agents.get(name).map(|agent| (name, agent)))
+        .filter(|(_, agent)| {
+            crate::providers::ProviderId::of(&agent.provider)
+                == crate::providers::ProviderId::of(&manifest.provider_name)
+        })
+    {
+        match agent
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+            None if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) => {
+                crate::providers::credentials::CredentialRef::LegacyInline(
+                    crate::providers::credentials::LegacySlot::Agent(name.to_string()),
+                )
+            }
+            None => crate::providers::selection::credential_for(config, &manifest.provider_name),
+        }
+    } else {
+        crate::providers::selection::credential_for(config, &manifest.provider_name)
+    };
+    build_worker_provider_selection(
+        config,
         &manifest.provider_name,
         &manifest.model,
-        &crate::providers::catalog::Requirement::chat(),
-        crate::providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    crate::providers::create_resilient_provider_with_options(
-        &manifest.provider_name,
-        credentials.provider.api_key,
-        credentials.provider.api_url,
+        credential,
+        &credentials.provider,
         &credentials.reliability,
         options,
     )
+}
+
+/// Resolve and construct the exact provider/model connection a worker was
+/// sealed to. This is the worker's sole provider-construction seam.
+pub(crate) fn build_worker_provider_selection(
+    config: &Config,
+    provider_name: &str,
+    model: &str,
+    credential: crate::providers::credentials::CredentialRef,
+    sealed_connection: &crate::providers::ProviderConnection<'_>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &crate::providers::ProviderRuntimeOptions,
+) -> Result<Box<dyn Provider>> {
+    let catalog = crate::providers::selection::catalog_for(config);
+    let resolved = crate::providers::selection::check_with(
+        config,
+        &catalog,
+        provider_name,
+        model,
+        credential,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    anyhow::ensure!(
+        resolved.credential().api_key() == sealed_connection.api_key
+            && resolved.credential().api_url() == sealed_connection.api_url,
+        "session-worker resolved credential differs from its sealed connection"
+    );
+    crate::providers::create_provider_for(&resolved, &catalog, reliability, &config.cost, options)
 }
 
 fn write_worker_result(result: &impl serde::Serialize) -> Result<()> {
@@ -1800,6 +1849,7 @@ async fn run_owned_manifest(
         &manifest,
         &config,
         &credentials,
+        #[cfg(test)]
         Arc::clone(&provider),
         Arc::clone(&security),
         &provider_runtime_options,
@@ -1843,13 +1893,17 @@ async fn run_owned_manifest(
         &config,
         Arc::clone(&security),
     )));
-    full_tools.push(Box::new(crate::tools::ImageTool::new(
-        Arc::clone(&provider),
-        &manifest.model,
-        manifest.temperature,
-        Arc::clone(&security),
-        config.multimodal.clone(),
-    )));
+    full_tools.push(Box::new(
+        crate::tools::ImageTool::new(
+            Arc::clone(&provider),
+            &manifest.model,
+            manifest.temperature,
+            Arc::clone(&security),
+            config.multimodal.clone(),
+        )
+        .with_provider_name(&manifest.provider_name)
+        .with_model_catalog(crate::providers::selection::catalog_for(&config)),
+    ));
     full_tools.push(Box::new(crate::tools::ConfigReloadTool::with_security(
         shared_config.clone(),
         Arc::clone(&security),
@@ -3737,6 +3791,28 @@ mod tests {
         assert!(probe.requests().is_empty());
     }
 
+    /// Finding 64: exercise the worker's own credential-choice and provider
+    /// construction seam, rather than calling its lower-level typed builder.
+    #[tokio::test]
+    async fn worker_provider_refuses_a_cross_dialect_fallback_before_transport() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut config = root_config(temp.path());
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &probe.custom_provider());
+        let mut manifest = base_manifest(temp.path(), "capability");
+        manifest.provider_name = probe.custom_provider();
+        manifest.model = crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL.to_string();
+        let options = crate::providers::provider_runtime_options_from_config(&config);
+        let credentials = worker_credentials(&manifest, &config);
+
+        let error = worker_provider(&manifest, &config, &credentials, &options)
+            .err()
+            .expect("a worker accepted an incompatible fallback");
+        let shown = format!("{error:#}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("worker", &shown);
+        assert!(probe.requests().is_empty(), "the worker reached transport: {shown}");
+    }
+
     /// The worker's own chain on a non-default provider carries neither the
     /// root key nor a rotation key onto the wire.
     #[tokio::test]
@@ -3747,6 +3823,7 @@ mod tests {
         let config = root_config(temp.path());
         let mut manifest = base_manifest(temp.path(), "capability");
         manifest.provider_name = probe.custom_provider();
+        manifest.model = PROBE_MODEL.to_string();
         manifest.api_key = None;
         let options = crate::providers::provider_runtime_options_from_config(&config);
 

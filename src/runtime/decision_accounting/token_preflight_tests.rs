@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{auxiliary_input_upper_bound, input_token_preflight};
+use super::{input_token_preflight, input_token_upper_bound};
 use crate::agent::context_budget::{
     TokenMeasurement, TokenMeasurementSource, count_tokens_with_source, estimate_request_tokens,
 };
@@ -10,7 +10,7 @@ fn estimate(text: &str) -> usize {
 }
 
 #[test]
-fn auxiliary_early_pass_preserves_actual_proxy_and_heuristic_admission() -> anyhow::Result<()> {
+fn sufficient_bound_preserves_actual_proxy_and_heuristic_admission() -> anyhow::Result<()> {
     let repeated = "the ".repeat(256);
     for text in [
         "",
@@ -30,7 +30,7 @@ fn auxiliary_early_pass_preserves_actual_proxy_and_heuristic_admission() -> anyh
             },
             TokenMeasurement::NONE,
         );
-        let upper = auxiliary_input_upper_bound(text);
+        let upper = input_token_upper_bound(text);
         assert!(actual <= upper && heuristic <= upper);
         for measured in [actual, heuristic] {
             for allowance in [
@@ -45,7 +45,7 @@ fn auxiliary_early_pass_preserves_actual_proxy_and_heuristic_admission() -> anyh
             ] {
                 let allowance = u64::try_from(allowance)?;
                 assert_eq!(
-                    input_token_preflight(text, allowance, true, || measured)?,
+                    input_token_preflight(text, allowance, || measured)?,
                     u64::try_from(measured)? < allowance
                 );
             }
@@ -55,30 +55,36 @@ fn auxiliary_early_pass_preserves_actual_proxy_and_heuristic_admission() -> anyh
 }
 
 #[test]
-fn auxiliary_sufficient_bound_skips_only_proxy_work_and_equality_falls_back() -> anyhow::Result<()> {
+fn sufficient_bound_skips_only_proxy_work_and_equality_falls_back() -> anyhow::Result<()> {
     let calls = std::cell::Cell::new(0);
     let measured = || {
         calls.set(calls.get() + 1);
         1
     };
-    assert_eq!(auxiliary_input_upper_bound("a"), 2);
-    assert!(input_token_preflight("a", 3, true, measured)?);
+    assert_eq!(input_token_upper_bound("a"), 2);
+    assert!(input_token_preflight("a", 3, measured)?);
     assert_eq!(calls.get(), 0, "strict sufficient bound skips the estimator");
-    assert!(input_token_preflight("a", 2, true, measured)?);
+    assert!(input_token_preflight("a", 2, measured)?);
     assert_eq!(calls.get(), 1, "equal upper bound is inconclusive, not rejection");
-    assert!(!input_token_preflight("a", 1, true, measured)?);
+    assert!(!input_token_preflight("a", 1, measured)?);
     assert_eq!(calls.get(), 2, "original strict predicate still rejects equality");
-    assert!(input_token_preflight("a", 3, false, measured)?);
-    assert_eq!(calls.get(), 3, "ordinary decision calls retain original estimator");
-    assert!(!input_token_preflight("", 0, true, || 0)?);
+    let ordinary = r#"{"state":"ordinary decision request"}"#;
+    let ordinary_allowance = u64::try_from(input_token_upper_bound(ordinary).saturating_add(1))?;
+    assert!(input_token_preflight(ordinary, ordinary_allowance, measured)?);
+    assert_eq!(
+        calls.get(),
+        2,
+        "a conclusive bound skips the proxy for an ordinary decision request"
+    );
+    assert!(!input_token_preflight("", 0, || 0)?);
     Ok(())
 }
 
 #[test]
-fn auxiliary_large_compressible_body_keeps_original_estimator_acceptance() -> anyhow::Result<()> {
+fn large_compressible_body_keeps_original_estimator_acceptance() -> anyhow::Result<()> {
     let text = "the ".repeat(256);
     let measured = estimate(&text);
-    let upper = auxiliary_input_upper_bound(&text);
+    let upper = input_token_upper_bound(&text);
     let allowance = u64::try_from(
         measured
             .checked_add(1)
@@ -89,10 +95,31 @@ fn auxiliary_large_compressible_body_keeps_original_estimator_acceptance() -> an
         "fixture requires the inconclusive branch"
     );
     let calls = std::cell::Cell::new(0);
-    assert!(input_token_preflight(&text, allowance, true, || {
+    assert!(input_token_preflight(&text, allowance, || {
         calls.set(calls.get() + 1);
         estimate(&text)
     })?);
     assert_eq!(calls.get(), 1);
+    Ok(())
+}
+
+#[cfg(feature = "llm-router")]
+#[test]
+fn large_ascii_prefix_bound_skips_the_exact_tokenizer() -> anyhow::Result<()> {
+    let text = "the ".repeat(1024);
+    let prefix_upper = super::cl100k_prefix_bound::upper_bound(&text)
+        .ok_or_else(|| anyhow::anyhow!("ASCII fixture must have a prefix bound"))?;
+    let allowance = u64::try_from(prefix_upper.saturating_add(1))?;
+    assert!(
+        u64::try_from(input_token_upper_bound(&text))? >= allowance,
+        "fixture requires the byte bound to remain inconclusive"
+    );
+
+    let calls = std::cell::Cell::new(0);
+    assert!(input_token_preflight(&text, allowance, || {
+        calls.set(calls.get() + 1);
+        estimate(&text)
+    })?);
+    assert_eq!(calls.get(), 0, "the conservative prefix bound skips exact BPE");
     Ok(())
 }

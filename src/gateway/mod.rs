@@ -1317,7 +1317,7 @@ fn register_gateway_turn_tools(
     config: &Config,
     shared_config: &crate::config::SharedConfig,
     security: &Arc<crate::security::SecurityPolicy>,
-    provider: &Arc<dyn Provider>,
+    #[cfg(test)] provider: &Arc<dyn Provider>,
     _model: &str,
     memory: &Arc<dyn Memory>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
@@ -1367,6 +1367,7 @@ fn register_gateway_turn_tools(
         let provider_name = providers::selection::default_provider(config).to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
             announce_channel,
+            #[cfg(test)]
             Arc::clone(provider),
             provider_name,
             providers::selection::default_model(config).to_string(),
@@ -1374,18 +1375,11 @@ fn register_gateway_turn_tools(
             Arc::clone(security),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
         .with_hint_config(config)
@@ -1487,6 +1481,7 @@ fn build_gateway_turn_runtime(
         config,
         &shared_config,
         &security,
+        #[cfg(test)]
         &provider,
         &model,
         &memory,
@@ -1521,10 +1516,21 @@ fn build_gateway_turn_runtime(
     })
 }
 
-/// Build the pinned generation's default chat connection. An explicit hint
-/// names one route, so its provider, model and credential must be resolved as
-/// one selection; the provider-wide routed factory can reuse another hint's
-/// credential when two hints name the same provider.
+/// Build the pinned generation's default chat connection. The selected
+/// provider, model and credential are resolved as one value before the exact
+/// connection is constructed, including when the default names a route hint.
+pub(crate) fn build_gateway_provider_selection(
+    config: &Config,
+    options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<(Arc<dyn Provider>, providers::catalog::ResolvedModel)> {
+    let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
+    let catalog = providers::selection::catalog_for(config);
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_for(
+        &resolved, &catalog, config, options,
+    )?);
+    Ok((provider, resolved))
+}
+
 fn build_gateway_turn_provider(
     config: &Config,
     options: &providers::ProviderRuntimeOptions,
@@ -1533,15 +1539,7 @@ fn build_gateway_turn_provider(
     String,
     Option<Arc<decision_source::GatewayProviderBinding>>,
 )> {
-    let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
-    let catalog = providers::selection::catalog_for(config);
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_provider_for(
-        &resolved,
-        &catalog,
-        &config.reliability,
-        &config.cost,
-        options,
-    )?);
+    let (provider, resolved) = build_gateway_provider_selection(config, options)?;
     let model = resolved.model().to_owned();
     let binding = Arc::new(decision_source::GatewayProviderBinding::new(
         Arc::clone(&provider),
@@ -1751,6 +1749,7 @@ pub async fn run_gateway(
         &config,
         &shared_config_for_reload,
         &security,
+        #[cfg(test)]
         &provider,
         &model,
         &mem,
@@ -2548,10 +2547,12 @@ async fn run_gateway_chat_with_multimodal(
 
             let user_messages = vec![crate::agent::turn_contracts::inbound_user_message(&enriched_message)];
             let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-            let mode_capabilities = turn_runtime.provider.capabilities_for(
+            let adapter_capabilities = turn_runtime.provider.capabilities_for(
                 &turn_runtime.model,
                 crate::providers::traits::ProviderRequestMode::NonStreaming,
             );
+            let mode_capabilities = providers::selection::catalog_for(&config_snapshot)
+                .effective_provider_capabilities(provider_label, &turn_runtime.model, adapter_capabilities);
             if image_marker_count > 0 && !mode_capabilities.vision {
                 return Err(ProviderCapabilityError {
                     provider: providers::redact_endpoint_userinfo(provider_label).into_owned(),
@@ -2623,16 +2624,9 @@ async fn run_gateway_chat_with_multimodal(
             // other execution surface — pre-turn flush/paging, the preflight before
             // each provider call (with the published tool schemas reserved) and the
             // reserved mid-turn trim. The window is the *effective* one, which applies
-            // the `[[router.models]]` / built-in `max_context` and
-            // `reserved_output_tokens` of the model this turn actually serves, as the
+            // the operator/discovery/catalog limits of the model this turn actually serves, as the
             // CLI and TUI do.
-            let mut effective_compaction = crate::router::resolve_effective_compaction_config(
-                &config_snapshot.agent.compaction,
-                provider_label,
-                &turn_runtime.model,
-                &config_snapshot.router,
-                &config_snapshot.model_routes,
-            );
+            let mut effective_compaction = service.effective_compaction(provider_label, &turn_runtime.model);
             effective_compaction.config = context.main_compaction().clone();
             crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
 

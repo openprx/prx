@@ -177,6 +177,8 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_config_semantics(config, &mut items);
     check_model_selection(config, &mut items);
     check_persisted_selections(config, &mut items);
+    #[cfg(feature = "llm-router")]
+    check_router_candidates(config, &mut items);
     check_decision_plane(config, &mut items);
     check_workspace(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
@@ -1372,6 +1374,9 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
 /// The decision plane reports refused backends and orphaned references.
 fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "decision";
+    if let Some(warning) = config.decision_latency_budget_warning() {
+        items.push(DiagItem::warn(cat, warning));
+    }
     if let Some(warning) = crate::config::manage::validate::decision_startup_check(config) {
         items.push(DiagItem::warn(cat, warning));
     }
@@ -1379,6 +1384,26 @@ fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
         && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(config)
     {
         items.push(DiagItem::warn(cat, warning));
+    }
+}
+
+/// Use the same registry expansion and provider filter as `RouterEngine::new`.
+#[cfg(feature = "llm-router")]
+fn check_router_candidates(config: &Config, items: &mut Vec<DiagItem>) {
+    let reachable = crate::router::capability::reachable_provider_names(
+        crate::providers::selection::default_provider(config),
+        &config.model_routes,
+    );
+    let candidates = if config.router.models.is_empty() {
+        crate::router::models::builtin_model_capabilities()
+    } else {
+        config.router.models.clone()
+    };
+    if crate::router::capability::filter_models_by_providers(candidates, &reachable).is_empty() {
+        items.push(DiagItem::warn(
+            "router",
+            "Router has no reachable candidates after provider filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
+        ));
     }
 }
 
@@ -1411,7 +1436,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Provider validity
     if let Some(ref provider) = config.default_provider {
-        if let Some(reason) = provider_validation_error(provider) {
+        if let Some(reason) = provider_validation_error(
+            config,
+            provider,
+            crate::providers::selection::default_model(config),
+            crate::providers::selection::credential_for(config, provider),
+        ) {
             items.push(DiagItem::error(
                 cat,
                 format!("default provider \"{provider}\" is invalid: {reason}"),
@@ -1486,7 +1516,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Reliability: fallback providers
     for fb in &config.reliability.fallback_providers {
-        if let Some(reason) = provider_validation_error(fb) {
+        if let Some(reason) = provider_validation_error(
+            config,
+            fb,
+            crate::providers::selection::default_model(config),
+            crate::providers::selection::credential_for(config, fb),
+        ) {
             items.push(DiagItem::warn(
                 cat,
                 format!("fallback provider \"{fb}\" is invalid: {reason}"),
@@ -1536,7 +1571,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
         for fallback_model in fallback_chain {
             if !model_has_reachable_provider(
-                config.default_provider.as_deref().unwrap_or("openrouter"),
+                crate::providers::selection::default_provider(config),
                 &config.reliability.fallback_providers,
                 &route_providers,
                 fallback_model,
@@ -1552,7 +1587,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     let availability = crate::providers::summarize_provider_availability(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        crate::providers::selection::default_provider(config),
         config.api_key.as_deref(),
         &config.reliability,
         &crate::providers::provider_runtime_options_from_config(config),
@@ -1596,7 +1631,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.provider) {
+        let credential = route.credential_ref.as_deref().map_or_else(
+            || {
+                if route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                    crate::providers::credentials::CredentialRef::LegacyInline(
+                        crate::providers::credentials::LegacySlot::ModelRoute(route.hint.clone()),
+                    )
+                } else {
+                    crate::providers::selection::credential_for(config, &route.provider)
+                }
+            },
+            |id| crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+        );
+        if let Some(reason) = provider_validation_error(config, &route.provider, &route.model, credential) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -1689,7 +1736,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         let Some(agent) = config.agents.get(name) else {
             continue;
         };
-        if let Some(reason) = provider_validation_error(&agent.provider) {
+        let credential = agent.credential_ref.as_deref().map_or_else(
+            || {
+                if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                    crate::providers::credentials::CredentialRef::LegacyInline(
+                        crate::providers::credentials::LegacySlot::Agent(name.clone()),
+                    )
+                } else {
+                    crate::providers::selection::credential_for(config, &agent.provider)
+                }
+            },
+            |id| crate::providers::credentials::CredentialRef::Profile { id: id.to_string() },
+        );
+        if let Some(reason) = provider_validation_error(config, &agent.provider, &agent.model, credential) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -1747,10 +1806,50 @@ fn active_auth_profile_credential_status(config: &Config, provider: &str) -> Aut
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match crate::providers::create_provider(name, None) {
+fn provider_validation_error(
+    config: &Config,
+    name: &str,
+    model: &str,
+    credential: crate::providers::credentials::CredentialRef,
+) -> Option<String> {
+    let catalog = crate::providers::selection::catalog_for(config);
+    let resolved = match crate::providers::selection::check_with(
+        config,
+        &catalog,
+        name,
+        model,
+        credential,
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error @ crate::providers::catalog::ResolutionError::UnknownProvider { .. }) => {
+            return Some(format!("Unknown provider: {error}"));
+        }
+        Err(error) => return Some(error.to_string()),
+    };
+    let mut reliability = config.reliability.clone();
+    reliability.fallback_providers.clear();
+    reliability.api_keys.clear();
+    reliability.model_fallbacks.clear();
+    match crate::providers::create_provider_for(
+        &resolved,
+        &catalog,
+        &reliability,
+        &config.cost,
+        &crate::providers::provider_runtime_options_from_config(config),
+    ) {
         Ok(_) => None,
-        Err(err) => Some(err.to_string().lines().next().unwrap_or("invalid provider").into()),
+        // A missing credential is reported by the credential checks, not
+        // as an invalid provider here.
+        Err(error)
+            if error
+                .downcast_ref::<crate::providers::MissingProviderCredential>()
+                .is_some() =>
+        {
+            None
+        }
+        Err(error) => Some(error.to_string().lines().next().unwrap_or("invalid provider").into()),
     }
 }
 
@@ -2450,6 +2549,53 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn doctor_surfaces_an_empty_router_registry_beyond_the_startup_log() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".to_owned());
+        config.default_model = Some("gpt-5.6".to_owned());
+        let mut items = Vec::new();
+        check_router_candidates(&config, &mut items);
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("no reachable candidates"))
+        );
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.6"));
+
+        config.default_provider = Some("openrouter".to_owned());
+        config.default_model = Some("anthropic/claude-sonnet-5".to_owned());
+        items.clear();
+        check_router_candidates(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "the published OpenRouter candidate must actually be reachable"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_below_catalog_hosted_latency_budget() {
+        let temp = TempDir::new().expect("test: private doctor configuration");
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            workspace_dir: temp.path().join("workspace"),
+            ..Config::default()
+        };
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let mut items = Vec::new();
+        check_decision_plane(&config, &mut items);
+        assert!(items.iter().any(|item| {
+            item.message.contains("below the catalog recommendation")
+                && item.message.contains("500")
+                && item.message.contains("3000")
+        }));
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+    }
+
     /// D-094 C-1, C-5: the doctor names a refused decision backend (which
     /// runs builtin-only) and every decision credential nothing references,
     /// by id, never by value.
@@ -2923,14 +3069,23 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let config = Config::default();
+        let validate = |provider: &str| {
+            provider_validation_error(
+                &config,
+                provider,
+                crate::providers::selection::default_model(&config),
+                crate::providers::selection::credential_for(&config, provider),
+            )
+        };
+        assert!(validate("openrouter").is_none());
+        assert!(validate("custom:https://example.com").is_none());
+        assert!(validate("anthropic-custom:https://example.com").is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = validate("custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown = validate("totally-fake").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown provider"));
     }
 

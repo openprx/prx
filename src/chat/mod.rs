@@ -83,9 +83,7 @@ use crate::agent::turn_contracts::{ScopeContext, ToolCallNotification, is_tool_l
 use crate::agent::turn_engine::run_turn;
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
-use crate::channels::{
-    Channel, SendMessage, TerminalChannel, is_context_window_overflow_error, sanitize_channel_response,
-};
+use crate::channels::{Channel, SendMessage, TerminalChannel, sanitize_channel_response};
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, payload_error};
@@ -95,9 +93,8 @@ use crate::llm::route_decision::{
 };
 #[cfg(test)]
 use crate::memory::MemoryPrincipal;
-use crate::memory::{
-    CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryStoreMetadata, MemoryVisibility, MessageEventScope,
-};
+use crate::memory::{CompactionRunInput, MemoryStoreMetadata};
+use crate::memory::{Memory, MemoryCategory, MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::observability::ObserverEvent;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -3900,7 +3897,7 @@ fn chat_model_switch(config: &Config, provider_name: &str, model_name: &str) -> 
 /// it, `providers::configured_connection_for`), and the rotation keys in
 /// `reliability.api_keys` follow them, because they are extra credentials for
 /// that same root key.
-fn chat_provider_chain<'a>(
+pub(crate) fn chat_provider_chain<'a>(
     config: &'a Config,
     provider_name: &str,
     configured_provider_name: &str,
@@ -3908,7 +3905,7 @@ fn chat_provider_chain<'a>(
     options: &providers::ProviderRuntimeOptions,
 ) -> Result<(providers::ProviderConnection<'a>, Box<dyn Provider>)> {
     let catalog = providers::selection::catalog_for(config);
-    providers::selection::check_with(
+    let resolved = providers::selection::check_with(
         config,
         &catalog,
         provider_name,
@@ -3917,23 +3914,13 @@ fn chat_provider_chain<'a>(
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )?;
-    providers::selection::check_routes(config, &catalog, providers::catalog::UnknownPolicy::Invocation)?;
     let connection = providers::configured_connection_for(
         provider_name,
         configured_provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
     );
-    let reliability = providers::scoped_reliability(&config.reliability, &connection);
-    let provider = providers::create_routed_provider_with_options(
-        provider_name,
-        connection.api_key,
-        connection.api_url,
-        &reliability,
-        &config.model_routes_with_references(),
-        model_name,
-        options,
-    )?;
+    let provider = providers::create_routed_provider_for(&resolved, &catalog, config, options)?;
     Ok((connection, provider))
 }
 
@@ -4299,6 +4286,7 @@ pub async fn run(
     );
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
+        #[cfg(test)]
         Arc::clone(&provider),
         provider_name,
         model_name,
@@ -4306,7 +4294,6 @@ pub async fn run(
         security.clone(),
         config.workspace_dir.clone(),
         config.multimodal.clone(),
-        config.agent.compaction.clone(),
         config.agents_with_references().into_owned(),
         // The spawn fallback is paired with `provider_name` (the `-p` override
         // when one is given), so it must be the credential released to that
@@ -4316,13 +4303,7 @@ pub async fn run(
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
     )
-    .with_compaction_resolver(crate::router::CompactionResolver::new(
-        config.agent.compaction.clone(),
-        config.router.clone(),
-        config.model_routes.clone(),
-    ))
     .with_cost_config(config.cost.clone())
-    .with_reliability(config.reliability.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
     .with_model_catalog(providers::selection::catalog_for(&config))
     .with_hint_config(&config)
@@ -5930,14 +5911,39 @@ pub async fn run(
                 emit_chat_output("Usage: /model <name>");
                 continue;
             }
-            let next_binding = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
-                decision_source::ChatProviderBinding::capture(
-                    &ctx.config_generation, &provider, provider_name, new_model,
+            let rebuilt = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
+                chat_provider_chain(
+                    &config,
+                    provider_name,
+                    configured_provider_name,
+                    new_model,
+                    &provider_runtime_options,
                 )
             });
-            match next_binding {
-                Ok(binding) => {
+            match rebuilt {
+                Ok((_connection, built)) => {
+                    let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
+                    let binding = match decision_source::ChatProviderBinding::capture(
+                        &ctx.config_generation,
+                        &new_provider_arc,
+                        provider_name,
+                        new_model,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            emit_chat_output(&format!(
+                                "Cannot bind model selection: {}",
+                                providers::sanitize_api_error(&error.to_string())
+                            ));
+                            continue;
+                        }
+                    };
                     provider_binding = binding;
+                    provider = Arc::clone(&new_provider_arc);
+                    #[cfg(feature = "terminal-tui")]
+                    if let Some(slot) = provider_slot.as_ref() {
+                        slot.set(Arc::clone(&new_provider_arc));
+                    }
                     current_model_owned = new_model.to_string();
                     #[cfg(feature = "terminal-tui")]
                     if let Some(slot) = model_slot.as_ref() {
@@ -6237,13 +6243,10 @@ Retry with a compatible model: /provider {shown} <model>",
         // Prefer the provider-backed summary patch used by the Redux driver; if
         // the summary call fails or times out, fall back to deterministic trim.
         if matches!(user_input.as_str(), "/compact") {
-            let compact_context = crate::router::resolve_effective_compaction_config(
-                &config.agent.compaction,
-                provider_name,
-                model_name,
-                &config.router,
-                &config.model_routes,
-            );
+            let compact_context = provider_binding
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))?
+                .effective_compaction();
             if manual_compact_below_trigger_threshold(&history, &compact_context.config) {
                 emit_chat_output(&format_nothing_to_compact_feedback(&history, &compact_context.config));
                 continue;
@@ -7879,13 +7882,7 @@ Retry with a compatible model: /provider {shown} <model>",
             config_source_revision: runtime_envelope.config_source_revision.as_deref(),
         };
 
-        let mut effective_compaction = crate::router::resolve_effective_compaction_config(
-            &config.agent.compaction,
-            provider_name,
-            model_name,
-            &config.router,
-            &config.model_routes,
-        );
+        let mut effective_compaction = admitted_binding.effective_compaction()?;
         effective_compaction.config = admitted_binding.main_compaction()
             .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
@@ -7926,16 +7923,14 @@ Retry with a compatible model: /provider {shown} <model>",
         }
         let provider_started_at = chrono::Utc::now();
 
-        // ── Retry loop (context overflow recovery) ──
-        //
-        // Mirrors the retry strategy in channels/mod.rs process_channel_message:
-        //  - Context overflow: compact history and retry while compaction makes progress
+        // The shared turn engine owns context-overflow recovery. Chat projects
+        // its final outcome and does not start a second compaction/replay loop.
         //
         // There is deliberately no wall-clock budget around the turn. A chat turn
         // ends when it finishes, when the user cancels it, or when the stall
         // detector in `crate::agent::idle` finds it has stopped making progress.
         #[cfg(feature = "terminal-tui")]
-        let mut history_len_before_tools;
+        let history_len_before_tools;
 
         // S2-A refinement: split the coarse `Failed` variant so the Redux
         // dispatch path can distinguish user-driven cancellation from real
@@ -8636,6 +8631,9 @@ Retry with a compatible model: /provider {shown} <model>",
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         if preflight_budget.over_hard_limit && !collection_turn {
+            let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+            let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+            let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
@@ -8667,6 +8665,15 @@ Retry with a compatible model: /provider {shown} <model>",
                     "chat.history_compacted_preflight",
                 );
             }
+            persist_legacy_chat_compaction_audit(
+                mem.as_ref(),
+                &runtime_envelope,
+                &audit_source_history,
+                &summary_projection,
+                token_metadata,
+                "chat_preflight",
+            )
+            .await;
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
@@ -8704,7 +8711,7 @@ Retry with a compatible model: /provider {shown} <model>",
         );
 
         // Keep the large trace inline outside the small outcome discriminator.
-        let (turn_outcome, successful_trace) = loop {
+        let (turn_outcome, successful_trace) = {
             #[cfg(feature = "terminal-tui")]
             {
                 history_len_before_tools = history.len();
@@ -8765,7 +8772,7 @@ Retry with a compatible model: /provider {shown} <model>",
 
             match result {
                 // ── Success ───────────────────────────────────────
-                Ok((resp, trace)) => break (TurnOutcome::Success(resp), Some(trace)),
+                Ok((resp, trace)) => (TurnOutcome::Success(resp), Some(trace)),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
                 Err(ref e) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
@@ -8774,109 +8781,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     // S2-A: user-driven cancel — distinguished from real
                     // failures so the reducer emits `StreamCancelled` (no
                     // Error hook fan-out) instead of `StreamFailed`.
-                    break (TurnOutcome::Cancelled, None);
-                }
-                // ── Context window overflow → compact + retry ─────
-                Err(ref e) if is_context_window_overflow_error(e) => {
-                    let audit_source_history =
-                        original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-                    let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-                    let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
-                    let turns_before = history
-                        .len()
-                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
-                    let tokens_before = estimate_chat_history_tokens(&history);
-                    if let Some(patch) = build_chat_compaction_patch(
-                        &history,
-                        &persisted_history_for_turn,
-                        provider.as_ref(),
-                        model_name,
-                        &effective_compaction.config,
-                        memory_runtime.ingest(),
-                        "chat_context_overflow",
-                    )
-                    .await
-                    {
-                        apply_chat_compaction_patch_and_sync(
-                            &mut history,
-                            Some(&persisted_history_for_turn),
-                            patch,
-                            &effective_compaction.config,
-                            crate::chat::action::CompactReason::ContextOverflow,
-                            &chat_dispatcher,
-                        );
-                    } else {
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::HistoryCompacted {
-                                reason: crate::chat::action::CompactReason::ContextOverflow,
-                            },
-                            "chat.history_compacted_overflow",
-                        );
-                        compact_chat_history(&mut history);
-                    }
-                    persist_legacy_chat_compaction_audit(
-                        mem.as_ref(),
-                        &runtime_envelope,
-                        &audit_source_history,
-                        &summary_projection,
-                        token_metadata,
-                        "chat_context_overflow",
-                    )
-                    .await;
-                    let turns_after = history
-                        .len()
-                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
-                    let tokens_after = estimate_chat_history_tokens(&history);
-                    #[cfg(feature = "terminal-tui")]
-                    refresh_context_budget_for_tui(
-                        &history,
-                        &effective_compaction.config,
-                        redraw_tx_for_main.is_some(),
-                        &chat_mirror,
-                        &chat_dispatcher,
-                    );
-                    let compact_msg = format_compact_feedback(
-                        turns_before,
-                        turns_after,
-                        tokens_before,
-                        tokens_after,
-                        effective_compaction.config.max_context_tokens,
-                    );
-                    surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
-                    let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
-                    let made_progress = turns_after < turns_before || tokens_after < tokens_before;
-                    tracing::warn!(
-                        compacted_chars,
-                        made_progress,
-                        "Context window overflow, history compacted"
-                    );
-
-                    if made_progress {
-                        continue;
-                    }
-                    // A minimal history that still overflows cannot be repaired
-                    // by repeating the same operation.
-                    if let Some(ref d_id) = draft_id {
-                        let _ = terminal.cancel_draft("user", d_id).await;
-                    }
-                    eprintln!("\nError: context window exceeded and compaction made no progress: {e}\n");
-                    if plain_mode {
-                        plain_mode_turn_failed = true;
-                    }
-                    // Phase E (5a-4): same dual_write_guard reasoning as the timeout branch.
-                    if !dual_write_guard.is_active() {
-                        hooks
-                            .emit(
-                                HookEvent::Error,
-                                payload_error("chat-turn", "context-overflow-no-progress"),
-                            )
-                            .await;
-                    }
-                    // No-progress overflow is non-retryable.
-                    break (TurnOutcome::FailedWithError {
-                        err: "context-overflow-no-progress".to_string(),
-                        retryable: false,
-                    }, None);
+                    (TurnOutcome::Cancelled, None)
                 }
                 // ── Other errors ──────────────────────────────────
                 Err(e) => {
@@ -8897,10 +8802,13 @@ Retry with a compatible model: /provider {shown} <model>",
                     // S2-A: generic provider/loop error — retryable hint is
                     // false (the caller already chose to surface and continue;
                     // retry policy is owned by upstream once tooling lands).
-                    break (TurnOutcome::FailedWithError {
-                        err: err_text,
-                        retryable: false,
-                    }, None);
+                    (
+                        TurnOutcome::FailedWithError {
+                            err: err_text,
+                            retryable: false,
+                        },
+                        None,
+                    )
                 }
             }
         };

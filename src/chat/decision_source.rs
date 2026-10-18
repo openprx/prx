@@ -9,6 +9,15 @@ use std::sync::Arc;
 
 /// Selection identity paired with the concrete provider instance. Only Chat's
 /// construction/switch path publishes it, before updating either UI slot.
+///
+/// Generation lifetime: an interactive chat process pins the configuration
+/// generation it started with (`ctx.config_generation`) for every turn and
+/// every `/model` switch; it is not re-pinned per turn. A configuration change
+/// made while the chat is open therefore applies to the next chat process (or
+/// to children/gateway work admitted under a newer generation), never
+/// half-way through a conversation, so a turn's provider, price and credential
+/// origin stay one coherent snapshot. `verify` refuses a binding whose
+/// generation differs from the one in use.
 #[derive(Clone)]
 pub(super) struct ChatProviderBinding {
     provider: Arc<dyn crate::providers::Provider>,
@@ -17,6 +26,18 @@ pub(super) struct ChatProviderBinding {
 }
 
 impl ChatProviderBinding {
+    pub(super) fn effective_compaction(&self) -> crate::router::context::EffectiveCompactionConfig {
+        let config = &self.generation.effective;
+        crate::router::context::resolve_effective_compaction_config_with_catalog(
+            &config.agent.compaction,
+            self.choice.provider_name(),
+            self.choice.model_name(),
+            &config.router,
+            &config.model_routes,
+            self.choice.catalog(),
+        )
+    }
+
     pub(super) async fn record_guarded(
         &self,
         fabric: crate::memory::MemoryFabric,
@@ -806,6 +827,16 @@ impl ChatTurnBinding {
 
     pub(super) fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
         self.decision.get().map(|decided| decided.context.main_compaction())
+    }
+
+    pub(super) fn effective_compaction(&self) -> anyhow::Result<crate::router::context::EffectiveCompactionConfig> {
+        let decided = self
+            .decision
+            .get()
+            .context("chat compaction requires an admitted decision")?;
+        Ok(decided
+            .service
+            .effective_compaction(self.choice.provider_name(), self.choice.model_name()))
     }
 
     /// Persist a fixed directive without inventing provider execution. The

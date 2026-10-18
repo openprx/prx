@@ -15,8 +15,8 @@ use crate::providers::credentials::{
     ConfigCredentialSource, CredentialLookupError, CredentialMaterial, CredentialRef, CredentialSource, LegacySlot,
 };
 use crate::providers::{
-    DEFAULT_PROVIDER_FOR_UNSET, Provider, ProviderCapabilityError, ProviderId, create_provider_for,
-    create_provider_with_options, provider_runtime_options_from_config,
+    Provider, ProviderCapabilityError, ProviderId, create_provider_for, create_provider_with_options,
+    default_provider_for_unset, provider_runtime_options_from_config,
 };
 use crate::tools::ToolSchemaDialect;
 
@@ -70,7 +70,10 @@ fn chat_model(provider: &str, model: &str, features: FeatureSet) -> ModelDescrip
 /// The default selection, resolved and then built — the order every surface
 /// adopts in PMM-C.
 fn select_and_build(config: &Config, catalog: &CatalogView) -> anyhow::Result<Box<dyn Provider>> {
-    let provider = config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET);
+    let provider = config
+        .default_provider
+        .as_deref()
+        .map_or_else(default_provider_for_unset, |provider| provider);
     let model = config.default_model.as_deref().unwrap_or_default();
     let resolved = resolve(
         &Selection {
@@ -855,6 +858,17 @@ async fn a_fallback_model_never_inherits_the_primarys_lowered_schema() {
         .reliability
         .model_fallbacks
         .insert("model-a".to_string(), vec!["model-b".to_string()]);
+    for model in ["model-a", "model-b"] {
+        config.cost.prices.insert(
+            format!("{label}/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     let catalog = CatalogView::from_config(&config);
     let resolved = resolve(
         &root(&label, "model-a"),
@@ -1022,11 +1036,28 @@ async fn a_fallback_with_the_same_declared_dialect_is_served_and_a_non_chat_one_
                 tool_schema: Some(crate::config::schema::ToolSchemaDialectSetting::NoRootCombinators),
                 tool_call: None,
             });
+        declare(
+            &mut config,
+            &label,
+            Some(model),
+            "operations = [\"chat\"]\nnative_tools = true\n",
+        );
     }
     config
         .reliability
         .model_fallbacks
         .insert("model-a".to_string(), vec!["model-b".to_string()]);
+    for model in ["model-a", "model-b"] {
+        config.cost.prices.insert(
+            format!("{label}/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     let catalog = CatalogView::from_config(&config);
     let resolved = resolve(
         &root(&label, "model-a"),
@@ -1102,19 +1133,15 @@ fn a_model_scoped_declaration_does_not_widen_the_endpoints_enforcement() {
         Some("model-a"),
         "tool_schema_dialect = \"no_root_combinators\"\n",
     );
-    let provider = crate::providers::create_resilient_provider_with_options(
-        label,
-        None,
-        None,
-        &config.reliability,
-        &provider_runtime_options_from_config(&config),
-    )
-    .expect("test: construct");
+    let provider =
+        crate::providers::create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+            .expect("test: construct");
     assert_eq!(
         provider.tool_schema_dialect(),
         ToolSchemaDialect::Raw,
         "a model-b turn on this endpoint is enforced against model-a's rewrite"
     );
+    assert_eq!(provider.tool_schema_dialect_for("model-b"), ToolSchemaDialect::Raw);
 
     let mut wide = isolated_config(&temp, label, "model-b");
     declare(
@@ -1123,18 +1150,18 @@ fn a_model_scoped_declaration_does_not_widen_the_endpoints_enforcement() {
         None,
         "tool_schema_dialect = \"no_root_combinators\"\n",
     );
-    let provider = crate::providers::create_resilient_provider_with_options(
-        label,
-        None,
-        None,
-        &wide.reliability,
-        &provider_runtime_options_from_config(&wide),
-    )
-    .expect("test: construct");
+    let provider =
+        crate::providers::create_provider_from_test_config(&wide, &provider_runtime_options_from_config(&wide))
+            .expect("test: construct");
     assert_eq!(
         provider.tool_schema_dialect(),
+        ToolSchemaDialect::Raw,
+        "the typed chain does not claim a provider-wide rewrite without a model"
+    );
+    assert_eq!(
+        provider.tool_schema_dialect_for("model-b"),
         ToolSchemaDialect::NoRootCombinators,
-        "a provider-wide declaration covers every model"
+        "a provider-wide declaration covers the selected model"
     );
 }
 
@@ -1229,7 +1256,7 @@ fn every_chain_member_is_checked_against_the_primarys_requirement() {
 #[test]
 fn a_routed_turn_is_enforced_in_its_destinations_dialect() {
     let temp = tempfile::TempDir::new().expect("test: temp dir");
-    let config = isolated_config(&temp, "openai", "gpt-4o");
+    let mut config = isolated_config(&temp, "openai", "gpt-4o");
     let routes = vec![crate::config::ModelRouteConfig {
         hint: "vision".to_string(),
         provider: "gemini".to_string(),
@@ -1237,16 +1264,11 @@ fn a_routed_turn_is_enforced_in_its_destinations_dialect() {
         api_key: Some("PMMC-ROUTE-SENTINEL".to_string()),
         credential_ref: None,
     }];
-    let router = crate::providers::create_routed_provider_with_options(
-        "openai",
-        Some(ROOT_SENTINEL),
-        None,
-        &config.reliability,
-        &routes,
-        "gpt-4o",
-        &provider_runtime_options_from_config(&config),
-    )
-    .expect("test: construct");
+    config.api_key = Some(ROOT_SENTINEL.to_string());
+    config.model_routes = routes;
+    let router =
+        crate::providers::create_provider_from_test_config(&config, &provider_runtime_options_from_config(&config))
+            .expect("test: construct");
     assert_eq!(router.tool_schema_dialect_for("hint:vision"), ToolSchemaDialect::Gemini);
     assert_eq!(router.tool_schema_dialect_for("gpt-4o"), ToolSchemaDialect::Raw);
     assert_eq!(

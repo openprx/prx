@@ -55,6 +55,7 @@ pub(crate) mod prediction_sealed {
 
 pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
     fn remaining_budget(&self) -> Option<(u64, u64)>;
+    fn terminal_fallback_cause(&self, result: &PredictionResult) -> Option<FallbackCause>;
     fn predict<'a>(
         &'a self,
         request: &'a crate::decision::DecisionRequest,
@@ -817,7 +818,7 @@ impl CausalDecisionEngine {
         if ![&post_rehearsal, &pre_commit].iter().all(|report| {
             matches!(
                 report.outcomes.get(candidate.candidate_id()),
-                Some(GateOutcome::ApprovalDeferred)
+                Some(GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. })
             )
         }) {
             return Ok(None);
@@ -940,14 +941,30 @@ impl CausalDecisionEngine {
             .await;
             match outcome {
                 Ok(Ok(result)) if Instant::now() < inputs.deadline => {
-                    let extracted = PredictionEvidence::extract(&result.served, &compiled, &candidates)?;
-                    audit_trace = Some(PredictionAuditTrace::capture(
-                        &result.served,
-                        &compiled,
-                        inputs.config.store.record_redacted_projection,
-                    )?);
-                    prediction = Some(result);
-                    evidence = Some(extracted);
+                    let terminal_cause = inputs.prediction.terminal_fallback_cause(&result);
+                    if let Some(cause) = terminal_cause {
+                        // Keep the factory result for truthful attempt and
+                        // accounting records, but never score or execute the
+                        // builtin shadow after a configured decision attempt
+                        // failed or exhausted its deadline.
+                        audit_trace = Some(PredictionAuditTrace::capture(
+                            &result.served,
+                            &compiled,
+                            inputs.config.store.record_redacted_projection,
+                        )?);
+                        prediction = Some(result);
+                        fallback_cause = Some(cause);
+                        evidence = Some(terminal_evidence(&candidates));
+                    } else {
+                        let extracted = PredictionEvidence::extract(&result.served, &compiled, &candidates)?;
+                        audit_trace = Some(PredictionAuditTrace::capture(
+                            &result.served,
+                            &compiled,
+                            inputs.config.store.record_redacted_projection,
+                        )?);
+                        prediction = Some(result);
+                        evidence = Some(extracted);
+                    }
                 }
                 Ok(Ok(_)) | Err(_) => {
                     // A failed builtin or exhausted deadline has no trusted
@@ -991,7 +1008,7 @@ impl CausalDecisionEngine {
             stage_cap: Duration::from_millis(u64::from(inputs.config.rehearsal.timeout_ms)),
             deadline: tokio::time::Instant::from_std(inputs.deadline),
         };
-        let rehearsal = if prediction.is_some() && Instant::now() < inputs.deadline {
+        let rehearsal = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
             BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
         } else {
             BTreeMap::new()
@@ -1006,7 +1023,7 @@ impl CausalDecisionEngine {
         let mut scores = BTreeMap::new();
         let mut scored_count = 0usize;
         let (mut selection, mut exploration_propensities) = if let Some(evidence) = evidence.as_ref() {
-            let weights = if prediction.is_some() && Instant::now() < inputs.deadline {
+            let weights = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
                 Some(ScorerWeights::effective(&inputs.config.scoring)?)
             } else {
                 None
@@ -1059,19 +1076,20 @@ impl CausalDecisionEngine {
             } else {
                 evidence.clone()
             };
-            if prediction.is_some() && Instant::now() < inputs.deadline {
+            if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
                 CausalSelector::select_with_exploration(
                     &candidates,
                     &scores,
                     &selection_evidence,
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(
+                    &selector_context_for_config(
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
                         resume_target,
                         inputs.discovered_refs,
+                        inputs.config.enabled,
                     ),
                     &inputs.config.evaluation,
                     inputs.key,
@@ -1085,12 +1103,13 @@ impl CausalDecisionEngine {
                         &selection_evidence,
                         &pre_commit,
                         &inputs.config.policy,
-                        &selector_context(
+                        &selector_context_for_config(
                             &candidates,
                             inputs.catalog,
                             trusted.delivery.interactive,
                             resume_target,
                             inputs.discovered_refs,
+                            inputs.config.enabled,
                         ),
                     )?,
                     BTreeMap::new(),
@@ -1104,12 +1123,13 @@ impl CausalDecisionEngine {
                     &empty_evidence(),
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context(
+                    &selector_context_for_config(
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
                         resume_target,
                         inputs.discovered_refs,
+                        inputs.config.enabled,
                     ),
                 )?,
                 BTreeMap::new(),
@@ -1125,12 +1145,13 @@ impl CausalDecisionEngine {
                 &terminal_evidence(&candidates),
                 &pre_commit,
                 &inputs.config.policy,
-                &selector_context(
+                &selector_context_for_config(
                     &candidates,
                     inputs.catalog,
                     trusted.delivery.interactive,
                     resume_target,
                     inputs.discovered_refs,
+                    inputs.config.enabled,
                 ),
             )?;
             exploration_propensities.clear();
@@ -1456,10 +1477,15 @@ fn candidate_is_direct(
     })
 }
 
-fn exact_candidate_without_discovery_is_current(candidate: &CausalCandidate, catalog: &CatalogView<'_>) -> bool {
+fn exact_candidate_without_discovery_is_current(
+    candidate: &CausalCandidate,
+    catalog: &CatalogView<'_>,
+    include_discoverable_families: bool,
+) -> bool {
     candidate.action() == CausalActionKind::UseTool
         && candidate.required_capabilities().len() == 1
-        && !super::candidate_generator::DiscoveryFamilies::supports(candidate.target())
+        && (include_discoverable_families
+            || !super::candidate_generator::DiscoveryFamilies::supports(candidate.target()))
         && candidate.required_capabilities().iter().all(|reference| {
             catalog.entry_any(&reference.id).is_some_and(|entry| {
                 matches!(entry.exposure, Exposure::Searchable)
@@ -1498,7 +1524,7 @@ fn selector_context(
                     // stale, excluded, compound, or discoverable-family ref
                     // direct.
                     || (exact_mentions.contains(candidate.candidate_id())
-                        && exact_candidate_without_discovery_is_current(candidate, catalog))
+                        && exact_candidate_without_discovery_is_current(candidate, catalog, false))
                     || candidate_is_direct(candidate, catalog, resume_target, discovered_refs)
             })
             .map(|candidate| candidate.candidate_id().clone())
@@ -1508,7 +1534,44 @@ fn selector_context(
     SelectorContext {
         interactive,
         direct_candidates,
+        discovery_completed: discovered_refs.iter().next().is_some(),
     }
+}
+
+fn selector_context_for_config(
+    set: &CandidateSet,
+    catalog: &CatalogView<'_>,
+    interactive: bool,
+    resume_target: Option<&CapabilityRef>,
+    discovered_refs: &DiscoveredRefs,
+    decision_enabled: bool,
+) -> SelectorContext {
+    let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
+    if decision_enabled {
+        return context;
+    }
+    let CandidateSet::Legal {
+        candidates,
+        exact_mentions,
+        ..
+    } = set
+    else {
+        return context;
+    };
+    // With the decision plane explicitly disabled there is no discovery hop
+    // to authorize. Preserve legacy exact-name publication by treating only
+    // the named current searchable ref as direct; all ordinary hard gates
+    // have already passed and stale, excluded, or compound refs stay out.
+    context.direct_candidates.extend(
+        candidates
+            .iter()
+            .filter(|candidate| {
+                exact_mentions.contains(candidate.candidate_id())
+                    && exact_candidate_without_discovery_is_current(candidate, catalog, true)
+            })
+            .map(|candidate| candidate.candidate_id().clone()),
+    );
+    context
 }
 
 fn empty_evidence() -> PredictionEvidence {
@@ -2647,6 +2710,24 @@ mod tests {
                 .direct_candidates
                 .is_empty()
         );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.insert(use_id.clone());
+        }
+        assert!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), true,)
+                .direct_candidates
+                .is_empty(),
+            "an enabled decision plane must discover an exact discoverable-family tool"
+        );
+        assert_eq!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), false,)
+                .direct_candidates,
+            BTreeSet::from([use_id.clone()]),
+            "disabled mode preserves legacy exact-name publication without widening peers"
+        );
+        if let CandidateSet::Legal { exact_mentions, .. } = &mut available_set {
+            exact_mentions.clear();
+        }
         assert_eq!(
             selector_context(&available_set, &view, true, None, &selected_refs).direct_candidates,
             BTreeSet::from([use_id])

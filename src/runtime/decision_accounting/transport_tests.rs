@@ -135,6 +135,264 @@ fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
         .collect()
 }
 
+#[tokio::test]
+async fn cancelled_reservation_handoff_releases_only_the_unclaimed_attempt() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config {
+        workspace_dir: workspace.path().to_path_buf(),
+        ..Config::default()
+    };
+    config.cost.prices.insert(
+        "openrouter/prx-unclaimed".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let config = Arc::new(config);
+    let cleanup = Arc::new(CleanupTracker::default());
+    let tracker = CostTracker::new(config.cost.clone(), workspace.path())?;
+    let initial_money = crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
+    let ledger_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(workspace.path().join("state/costs.jsonl.lock"))?;
+    ledger_lock.lock()?;
+    let budgets = TurnBudgets {
+        tokens: 1024,
+        micro_usd: 5000,
+        latency_ms: 500,
+    };
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::clone(&config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [1; 32],
+        budgets,
+        deadline,
+    );
+    let binding = [0; 32];
+    let estimate = || PhysicalEstimate {
+        purpose: "decision",
+        provider: "openrouter",
+        model: "prx-unclaimed",
+        body: b"{}",
+        transport_binding: &binding,
+        request_id: "prx-unclaimed",
+        deadline,
+        remaining_attempts: 1,
+    };
+    let mut work = Box::pin(scope.begin_physical(estimate()));
+    assert!(
+        futures::poll!(work.as_mut()).is_pending(),
+        "the real ledger lock must block reservation delivery"
+    );
+    ledger_lock.unlock()?;
+    // Deliberately do not poll the caller again: allow its real blocking
+    // reservation to persist, then cancel before it can claim the result.
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let request = loop {
+        if let Ok(rows) = journal(workspace.path())
+            && rows.iter().any(|row| row["event"] == "dispatched")
+        {
+            break serde_json::from_value::<EstimatedReservationRequest>(
+                rows.first().context("reservation row")?["request"].clone(),
+            )?;
+        }
+        anyhow::ensure!(
+            Instant::now() < wait_deadline,
+            "real reservation did not reach durable dispatch"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    drop(work);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?,
+        initial_money
+    );
+    assert_eq!(
+        journal(workspace.path())?.last().context("release row")?["event"],
+        "estimated_unsent_v1"
+    );
+    assert!(
+        tracker.reserve_dispatched_estimated_attempt(request, || true).is_err(),
+        "release must not authorize replay"
+    );
+
+    // An ordinary claimed receipt keeps its unknown liability on drop.
+    let cleanup = Arc::new(CleanupTracker::default());
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::clone(&config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [2; 32],
+        budgets,
+        deadline,
+    );
+    let claimed = scope
+        .begin_physical(PhysicalEstimate { deadline, ..estimate() })
+        .await?;
+    let claimed_money = claimed.reserved_micro_usd;
+    drop(claimed);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert_eq!(
+        journal(workspace.path())?.last().context("dispatch row")?["event"],
+        "dispatched"
+    );
+    assert_eq!(scope.remaining_budgets().tokens, 0, "claimed unknown usage stays held");
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?,
+        initial_money - claimed_money
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_request_above_the_retry_share_can_use_the_existing_owner_allowance() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.cost.prices.insert(
+        "openrouter/prx-share".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let config = Arc::new(config);
+    let cleanup = Arc::new(CleanupTracker::default());
+    let budgets = TurnBudgets {
+        tokens: 2059,
+        micro_usd: 5000,
+        latency_ms: 500,
+    };
+    let body = serde_json::to_vec(&json!({"input": "word ".repeat(1100)}))?;
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        config,
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [3; 32],
+        budgets,
+        deadline,
+    );
+    let binding = [0; 32];
+    let attempt = || PhysicalEstimate {
+        purpose: "decision",
+        provider: "openrouter",
+        model: "prx-share",
+        body: &body,
+        transport_binding: &binding,
+        request_id: "prx-share",
+        deadline,
+        remaining_attempts: 2,
+    };
+    let receipt = scope.begin_physical(attempt()).await?;
+    let input_tokens = crate::agent::context_budget::estimate_request_tokens(
+        crate::agent::context_budget::count_tokens_with_source(std::str::from_utf8(&body)?),
+        crate::agent::context_budget::TokenMeasurement::NONE,
+    );
+    let input_tokens = u64::try_from(input_tokens)?;
+    assert!(input_tokens >= budgets.tokens / 2 && input_tokens < budgets.tokens);
+    assert_eq!(receipt.reserved_tokens, input_tokens + 1);
+    let reserved_tokens = receipt.reserved_tokens;
+    let reserved_money = receipt.reserved_micro_usd;
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - reserved_tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd - reserved_money);
+    let rows = journal(workspace.path())?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.first()
+            .and_then(|row| row.get("request"))
+            .and_then(|request| request.get("reserved_tokens"))
+            .and_then(Value::as_u64),
+        Some(reserved_tokens)
+    );
+    assert_eq!(
+        rows.get(1).and_then(|row| row.get("event")).and_then(Value::as_str),
+        Some("dispatched")
+    );
+    // Delivery of this claimed receipt is not proof of a socket send. Once
+    // claimed, however, absent usage must retain the entire actual reservation.
+    drop(receipt);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert!(scope.begin_physical(attempt()).await.is_err());
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - reserved_tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd - reserved_money);
+    assert_eq!(
+        journal(workspace.path())?.len(),
+        2,
+        "unknown liability cannot fund a retry"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_price_or_money_claim_restores_only_the_acquired_allowance() -> anyhow::Result<()> {
+    for (priced, micro_usd) in [(false, 5000), (true, 0)] {
+        let workspace = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        if priced {
+            config.cost.prices.insert(
+                "openrouter/prx-refund".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+        }
+        let cleanup = Arc::new(CleanupTracker::default());
+        let budgets = TurnBudgets {
+            tokens: 2059,
+            micro_usd,
+            latency_ms: 500,
+        };
+        let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+        let scope = AccountingScope::new(
+            Arc::new(config),
+            DecisionKey::ephemeral(),
+            Arc::clone(&cleanup),
+            [4; 32],
+            budgets,
+            deadline,
+        );
+        assert!(
+            scope
+                .begin_physical(PhysicalEstimate {
+                    purpose: "decision",
+                    provider: "openrouter",
+                    model: "prx-refund",
+                    body: b"{}",
+                    transport_binding: &[0; 32],
+                    request_id: "prx-refund",
+                    deadline,
+                    remaining_attempts: 2,
+                })
+                .await
+                .is_err()
+        );
+        cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+        assert_eq!(scope.remaining_budgets().tokens, budgets.tokens);
+        assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
+        assert!(!workspace.path().join("state/costs.reservations.jsonl").exists());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum Case {
     FullRetry,
@@ -242,6 +500,7 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
                     key,
                     Arc::clone(&scope),
                     AuxiliaryPurpose::SignalVision,
+                    Default::default(),
                 )?;
                 let messages = [ChatMessage::user("Explain 2 + 2.")];
                 let result = crate::providers::attempt_accounting::chat_traced(

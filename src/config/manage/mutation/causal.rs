@@ -63,6 +63,12 @@ pub enum CausalMutation {
         pinned_snapshot: Option<String>,
         timeout_ms: Option<u32>,
     },
+    /// Go back to `kind = "auto"` (the factory's order: a configured
+    /// endpoint, else the builtin): clears the endpoint, model, pinned
+    /// snapshot and credential reference, and turns remote processing off in
+    /// the same plan. The stored credential is not deleted; it stays
+    /// unreferenced and `prx doctor` lists it as an orphaned decision credential.
+    ResetBackendToAuto,
     /// Allow or forbid decision state leaving this machine.
     SetRemote(bool),
     /// Set the credential reference (`""`, `"none"` or `cred-<name>`).
@@ -389,6 +395,14 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
     let section = &mut config.causal_tree;
     match mutation {
         CausalMutation::SetEnabled(enabled) => section.enabled = *enabled,
+        CausalMutation::ResetBackendToAuto => {
+            section.backend.kind = BackendSelection::Auto;
+            section.backend.endpoint.clear();
+            section.backend.model.clear();
+            section.backend.pinned_snapshot.clear();
+            section.backend.credential_ref = CredentialRefSetting::Unset;
+            section.backend.remote_enabled = false;
+        }
         CausalMutation::SetRemote(remote) => section.backend.remote_enabled = *remote,
         CausalMutation::SetCredentialRef(reference) => section.backend.credential_ref = reference.clone(),
         CausalMutation::SetBackend {
@@ -415,6 +429,36 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             }
             if let Some(selection) = crate::decision::factory::configured_selection(section) {
                 let model = section.backend.model.trim().to_string();
+                if let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                    && let Some(entry) = catalog.model(&crate::providers::ProviderId::of(&selection.provider), &model)
+                {
+                    if pinned_snapshot.is_none()
+                        && matches!(kind, BackendKind::TypeSafe | BackendKind::OpenRouter)
+                        && let Some(snapshot) = &entry.pinned_snapshot
+                    {
+                        section.backend.pinned_snapshot.clone_from(snapshot);
+                    }
+                    if timeout_ms.is_none()
+                        && let Some(recommended) = entry.transport.recommended_timeout_ms
+                        && let Ok(recommended) = u32::try_from(recommended)
+                    {
+                        section.backend.timeout_ms = recommended;
+                    }
+                    if let Some(recommended) = entry.transport.extra_latency_budget_ms {
+                        if !section.policy.extra_latency_budget_ms_explicit {
+                            section.policy.extra_latency_budget_ms = recommended;
+                            section.policy.extra_latency_budget_ms_explicit = true;
+                        } else if section.policy.extra_latency_budget_ms < recommended {
+                            tracing::warn!(
+                                configured_ms = section.policy.extra_latency_budget_ms,
+                                recommended_ms = recommended,
+                                provider = %selection.provider,
+                                model = %model,
+                                "the configured decision latency budget is below the release catalog recommendation"
+                            );
+                        }
+                    }
+                }
                 declare_decision_model(config, &selection.provider, &model);
             }
         }
@@ -428,6 +472,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             }
             if let Some(value) = patch.extra_latency_budget_ms {
                 policy.extra_latency_budget_ms = value;
+                policy.extra_latency_budget_ms_explicit = true;
             }
             if let Some(value) = patch.commit_threshold {
                 policy.commit_threshold = value;
@@ -658,6 +703,105 @@ mod tests {
             declarations(&again),
             "a switch never removes a declaration"
         );
+    }
+
+    #[test]
+    fn reset_backend_to_auto_clears_the_hosted_choice_and_remote() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let entry = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
+            .expect("hosted decision entry");
+        let hosted = CausalConfigService::mutate(
+            &Config::default(),
+            &[
+                CausalMutation::SetBackend {
+                    kind: BackendKind::OpenRouter,
+                    endpoint: None,
+                    model: Some(entry.api_model.clone()),
+                    pinned_snapshot: None,
+                    timeout_ms: None,
+                },
+                CausalMutation::SetCredentialRef(CredentialRefSetting::Profile("cred-decision-openrouter".to_string())),
+                CausalMutation::SetRemote(true),
+            ],
+        )
+        .expect("hosted backend");
+        assert!(matches!(hosted.causal_tree.backend.kind, BackendSelection::Fixed(_)));
+        let auto = CausalConfigService::mutate(&hosted, &[CausalMutation::ResetBackendToAuto]).expect("back to auto");
+        let backend = &auto.causal_tree.backend;
+        assert_eq!(backend.kind, BackendSelection::Auto);
+        assert!(backend.endpoint.is_empty() && backend.model.is_empty() && backend.pinned_snapshot.is_empty());
+        assert_eq!(backend.credential_ref, CredentialRefSetting::Unset);
+        assert!(!backend.remote_enabled);
+    }
+
+    #[test]
+    fn set_backend_applies_hosted_transport_defaults_from_release_catalog() {
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let entry = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
+            .expect("hosted decision entry");
+        let next = CausalConfigService::mutate(
+            &Config::default(),
+            &[CausalMutation::SetBackend {
+                kind: BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some(entry.api_model.clone()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            }],
+        )
+        .expect("catalog defaults produce a valid hosted backend");
+
+        assert_eq!(
+            next.causal_tree.backend.pinned_snapshot,
+            entry.pinned_snapshot.as_deref().expect("catalog snapshot")
+        );
+        assert_eq!(
+            u64::from(next.causal_tree.backend.timeout_ms),
+            entry.transport.recommended_timeout_ms.expect("catalog timeout")
+        );
+        assert_eq!(
+            next.causal_tree.policy.extra_latency_budget_ms,
+            entry.transport.extra_latency_budget_ms.expect("catalog latency budget")
+        );
+        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert!(next.cost.prices.is_empty(), "built-in prices stay in the catalog");
+        assert!(matches!(
+            crate::llm::route_decision::usage_cost_resolution(
+                "openrouter",
+                &entry.api_model,
+                1,
+                1,
+                0,
+                0,
+                &next.cost,
+            ),
+            crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+        ));
+    }
+
+    #[test]
+    fn set_backend_preserves_an_explicit_latency_budget_equal_to_the_default() {
+        let mut config = Config::default();
+        let default_budget = CausalPolicy::default().extra_latency_budget_ms;
+        config.causal_tree.policy.extra_latency_budget_ms = default_budget;
+        config.causal_tree.policy.extra_latency_budget_ms_explicit = true;
+
+        let next = CausalConfigService::mutate(
+            &config,
+            &[CausalMutation::SetBackend {
+                kind: BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_string()),
+                pinned_snapshot: None,
+                timeout_ms: Some(default_budget as u32),
+            }],
+        )
+        .expect("explicit operator budget remains valid");
+
+        assert_eq!(next.causal_tree.policy.extra_latency_budget_ms, default_budget);
+        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
     }
 
     /// D-094 C-2: a model-scoped entry without its own list (here one

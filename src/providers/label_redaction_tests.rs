@@ -5,7 +5,7 @@
 //! the credential into it (`custom:http://user:password@host/v1`). The label is
 //! redacted once, where the failover chain is built; the real URL stays inside
 //! the transport. Every test drives the production factory
-//! (`create_resilient_provider_with_options`) against a loopback stub, with a
+//! (`create_provider_for`) against a loopback stub, with a
 //! fixture credential that is not real, and asserts that the fixture never
 //! appears in what an operator or a user can read — while the request still
 //! reaches the endpoint the URL names.
@@ -13,7 +13,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::traits::{ChatMessage, ChatRequest};
-use super::{ProviderRuntimeOptions, create_resilient_provider_with_options};
+use super::{ProviderRuntimeOptions, create_provider_from_test_config};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -135,6 +135,25 @@ fn userinfo_label(addr: std::net::SocketAddr) -> String {
     format!("custom:http://alice:{SECRET}@{addr}/v1")
 }
 
+fn build(
+    provider: &str,
+    api_key: Option<&str>,
+    reliability: crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn super::Provider>> {
+    let mut config = crate::config::Config {
+        default_provider: Some(provider.to_string()),
+        default_model: Some("fixture-model".to_string()),
+        api_key: api_key.map(str::to_string),
+        reliability,
+        ..crate::config::Config::default()
+    };
+    if let Some(openprx_dir) = &options.openprx_dir {
+        config.workspace_dir = openprx_dir.join("workspace");
+    }
+    create_provider_from_test_config(&config, options)
+}
+
 /// R-1: every failed attempt, the all-failed summary and the retry and
 /// exhaustion log lines name the provider — none of them may carry the
 /// password, whatever its length. The request itself must still reach the
@@ -143,11 +162,10 @@ fn userinfo_label(addr: std::net::SocketAddr) -> String {
 async fn a_failing_chain_names_its_provider_without_url_userinfo() {
     let stub = spawn_fixed_status_stub("500 Internal Server Error", r#"{"error":"upstream down"}"#).await;
     let label = userinfo_label(stub.addr);
-    let provider = create_resilient_provider_with_options(
+    let provider = build(
         &label,
         Some("sk-fixture-not-real"),
-        None,
-        &reliability(1, &[]),
+        reliability(1, &[]),
         &ProviderRuntimeOptions::default(),
     )
     .expect("test: the userinfo-bearing endpoint constructs");
@@ -207,11 +225,10 @@ async fn a_failing_chain_names_its_provider_without_url_userinfo() {
 async fn warmup_names_the_endpoint_without_url_userinfo() {
     let stub = spawn_fixed_status_stub("200 OK", r#"{"data":[]}"#).await;
     let label = userinfo_label(stub.addr);
-    let provider = create_resilient_provider_with_options(
+    let provider = build(
         &label,
         Some("sk-fixture-not-real"),
-        None,
-        &reliability(0, &[]),
+        reliability(0, &[]),
         &ProviderRuntimeOptions::default(),
     )
     .expect("test: the userinfo-bearing endpoint constructs");
@@ -238,19 +255,18 @@ async fn warmup_names_the_endpoint_without_url_userinfo() {
 fn a_chain_with_no_usable_member_is_refused_without_url_userinfo() {
     // Port 99999 does not parse, so the endpoint is unavailable.
     let label = format!("custom:http://alice:{SECRET}@127.0.0.1:99999/v1");
-    let Err(error) = create_resilient_provider_with_options(
+    let Err(error) = build(
         &label,
         Some("sk-fixture-not-real"),
-        None,
-        &reliability(0, &[]),
+        reliability(0, &[]),
         &ProviderRuntimeOptions::default(),
     ) else {
         panic!("test: an unparseable endpoint cannot build a chain");
     };
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains("No available providers") || rendered.contains("unavailable"),
-        "not the availability refusal: {rendered}"
+        rendered.contains("is not one PRX can construct"),
+        "not the resolver refusal: {rendered}"
     );
     assert!(
         !rendered.contains(SECRET),
@@ -258,41 +274,28 @@ fn a_chain_with_no_usable_member_is_refused_without_url_userinfo() {
     );
 }
 
-/// R-1: a fallback that fails to initialize is logged and listed as
-/// unavailable in the summary; neither may carry its userinfo.
+/// R-1: a fallback the resolver cannot construct is refused before transport;
+/// neither the refusal nor its log may carry the fallback's userinfo.
 #[tokio::test]
-async fn an_unavailable_fallback_is_listed_without_url_userinfo() {
+async fn an_unconstructible_fallback_is_refused_without_url_userinfo() {
     let stub = spawn_fixed_status_stub("500 Internal Server Error", r#"{"error":"upstream down"}"#).await;
     let fallback = format!("custom:http://bob:{SECRET}@127.0.0.1:99999/v1");
     let (captured, guard) = capture_logs();
-    let provider = create_resilient_provider_with_options(
+    let error = match build(
         &format!("custom:http://{}/v1", stub.addr),
         Some("sk-fixture-not-real"),
-        None,
-        &reliability(0, &[fallback.as_str()]),
+        reliability(0, &[fallback.as_str()]),
         &ProviderRuntimeOptions::default(),
-    )
-    .expect("test: the primary constructs");
-    let messages = vec![ChatMessage::user("hello")];
-    let result = provider
-        .chat(
-            ChatRequest {
-                messages: &messages,
-                tools: None,
-            },
-            "fixture-model",
-            0.0,
-        )
-        .await;
+    ) {
+        Ok(_) => panic!("test: the unconstructible fallback must be refused"),
+        Err(error) => error,
+    };
     drop(guard);
 
-    let Err(error) = result else {
-        panic!("test: a 500 endpoint cannot serve the turn");
-    };
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains("Unavailable providers: custom:http://"),
-        "the fallback is not listed as unavailable: {rendered}"
+        rendered.contains("fallback provider 'custom:http://[redacted]@127.0.0.1:99999/v1'"),
+        "the fallback is not named in the refusal: {rendered}"
     );
     assert!(
         !rendered.contains(SECRET),
@@ -300,6 +303,7 @@ async fn an_unavailable_fallback_is_listed_without_url_userinfo() {
     );
     let logs = logged(&captured);
     assert!(!logs.contains(SECRET), "a log line leaked the password: {logs}");
+    assert_eq!(stub.hits.load(Ordering::SeqCst), 0, "the refusal must be pre-transport");
 }
 
 /// S-1: a password containing a literal `/` ends the authority early, so the
@@ -357,11 +361,10 @@ async fn a_clean_success_through_a_userinfo_endpoint_is_not_a_fallback() {
     )
     .await;
     let label = userinfo_label(stub.addr);
-    let provider = create_resilient_provider_with_options(
+    let provider = build(
         &label,
         Some("sk-fixture-not-real"),
-        None,
-        &reliability(0, &[]),
+        reliability(0, &[]),
         &ProviderRuntimeOptions::default(),
     )
     .expect("test: the userinfo-bearing endpoint constructs");
@@ -561,11 +564,10 @@ async fn hostile_passwords_never_reach_the_failover_chain_output() {
     for (label, secret) in HOSTILE_USERINFO {
         let label = label.replace("127.0.0.1:1", &stub.addr.to_string());
         let (captured, guard) = capture_logs();
-        let built = create_resilient_provider_with_options(
+        let built = build(
             &label,
             Some("sk-fixture-not-real"),
-            None,
-            &reliability(0, &[]),
+            reliability(0, &[]),
             &ProviderRuntimeOptions::default(),
         );
         let rendered = match built {

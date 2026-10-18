@@ -4,12 +4,13 @@ See [provider management](provider-management.md) for inspection, configuration
 transactions, credential references and recovery.
 
 OpenPRX supports native and OpenAI-compatible LLM providers with model routing,
-ordered fallback, token refresh, streaming, tools, and usage attribution. Model
-catalogs move faster than releases, so `prx doctor models` (read-only) or
-`prx models refresh --provider <id>` (cache-updating) is the runtime source of
-truth whenever the provider exposes a model-list API.
+ordered fallback, token refresh, streaming, tools, and usage attribution. Each
+binary embeds a validated [release model catalog](model-catalog.md) for offline
+defaults, listings, and model evidence. `prx doctor models` (read-only) or
+`prx models refresh --provider <id>` (cache-updating) adds current provider
+discovery evidence when the provider exposes a model-list API.
 
-## Verified catalog baseline (2026-07-18)
+## Embedded release catalog baseline (2026-07-18)
 
 | PRX provider | Curated default / current IDs | Endpoint and authoritative source | Live discovery |
 |---|---|---|---|
@@ -31,11 +32,18 @@ truth whenever the provider exposes a model-list API.
 | `huggingface` | router model ID | `https://router.huggingface.co/v1`; [chat completion](https://huggingface.co/docs/inference-providers/en/tasks/chat-completion) | `GET /v1/models`, bearer token |
 | `compatible` | endpoint-defined | configured OpenAI-compatible `/v1` base URL | `GET <base>/models`; capabilities are endpoint/model-dependent |
 
-Curated entries are onboarding defaults, not entitlement claims. Live discovery
+Release entries are onboarding defaults and model evidence within the adapter
+ceiling; they do not grant credentials or transport support. Live discovery
 also reads the active auth profile when `api_key` is absent, and custom
 llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
 discovery. Kimi Code rejects model strings outside its three documented IDs
 because that endpoint can silently accept or remap a mistyped model.
+
+Catalog lifecycle controls new selections: active and deprecated chat rows are
+listed, with deprecated rows labeled with their replacement when one exists;
+retired rows stay hidden. Ollama Cloud has no live model-list endpoint, so an
+authenticated onboarding fallback uses the release rows and places `:cloud`
+models before local-only ids.
 
 ## Capability contracts
 
@@ -78,23 +86,28 @@ operations the model executes (`chat`, `embedding`, `decision_endpoint`,
 chat features it has (`native_tools`, `vision_input`, `streaming`,
 `structured_output`), and the tool dialects it speaks. Every fact is
 `supported`, `unsupported` or `unverified`; an unverified fact never counts as
-support. The evidence comes from three places, combined in this order:
+support. Evidence uses this precedence:
 
 1. **The adapter table.** What the provider family's adapter can put on the
    wire at all. It is the upper bound: nothing can make an operation without an
    adapter executable. In this release chat has an adapter everywhere,
    embeddings only for `openai`, `openrouter` and `custom:` endpoints, and the
    decision endpoint, rerank and media generation have none.
-2. **Discovered catalog metadata.** `prx models refresh` and onboarding keep
+2. **Negative discovery evidence.** `prx models refresh` and onboarding keep
    what a provider's model list says about each model (OpenRouter
    `architecture` and `supported_parameters`, Gemini
-   `supportedGenerationMethods`). Negative evidence wins: a model whose record
-   lists no `tools` is not a tool model, whatever the provider does for others.
-   A model known by id only is unverified.
+   `supportedGenerationMethods`). A provider record that rules out an
+   operation or feature cannot be lifted by local configuration.
 3. **Operator declarations** in `[[providers.models]]` (see
-   [configuration.md](configuration.md#provider-model-descriptors)) settle what
-   discovery left unverified and set the tool dialects where the adapter reads
-   them.
+   [configuration.md](configuration.md#provider-model-descriptors)) override
+   positive or absent discovery facts and release-catalog facts. They also set
+   tool dialects where the adapter reads them.
+4. **Positive discovery evidence.** A current provider record outranks the
+   release baseline when no operator declaration settles the fact.
+5. **The embedded release catalog.** `catalog/models.json` supplies the offline
+   baseline and carries its release revision in descriptor provenance. A model
+   absent from every evidence source is known by id only and remains
+   unverified.
 
 The resolver checks a selection against its descriptor before any provider is
 constructed, so a refusal sends nothing: provider, then model, then
@@ -118,6 +131,27 @@ credential together. A process worker checks the sealed route against its
 pinned configuration before it sends a request. A direct-model override under
 a routed parent uses the selected provider's connection: a named agent's own
 credential stays with that agent, while a root child uses the root connection.
+At routed-surface startup, each non-default route is resolved and built
+independently. A refused or unbuildable route is skipped with a warning rather
+than disabling the default or another route; selecting its `hint:` returns the
+retained refusal without sending a provider request.
+
+A root connection may configure an `api_url` or rotation keys without an
+inline `api_key`. That is still an owner-bound Root selection: construction
+asks the configured provider's own credential store for the missing primary
+key, while the root URL and rotation material remain attached to that same
+provider identity. A route with its own key is a separate credential and does
+not inherit the root URL or root rotation keys. Each route is resolved and
+built independently, so a refused route is retained as that hint's refusal and
+does not disable the default provider or another route.
+
+For the configured default provider the credential is chosen in this order:
+any root connection material (the inline `api_key`, rotation keys, or an
+`api_url`), then the credential reference `cred-<provider>` that
+`prx providers credential set <provider>` stores under its default name (it
+must be owned by that provider), then the provider's own credential store. An
+unreadable credential store is logged as a warning and the provider's own store
+is used.
 
 Where the resolver runs. Every surface resolves before it builds a provider,
 so a refusal sends nothing and names the model, the provider (URL userinfo
@@ -125,11 +159,11 @@ redacted), the evidence and the fix:
 
 | Surface | What is resolved | Policy |
 | --- | --- | --- |
-| `prx chat` startup, `/model`, `/provider`; every `[[model_routes]]` destination | chat | invocation |
+| `prx chat` startup, `/model`, `/provider`; each `[[model_routes]]` destination is retained as either a ready route or a named refusal | chat | invocation |
 | channel runtime start-up, channel `/model` (the route is left unchanged on a refusal); under the daemon, every hot reload that changes the default provider or model, the provider tables or the routes restarts the channel runtime, which resolves again, so a reload to a model that cannot chat is refused and the previous configuration stays active. A standalone `prx channels start` applies such changes only on restart | chat | invocation |
 | gateway start-up and each configuration generation (a refused default rejects the generation; the previous one stays active) | chat | invocation |
 | `delegate`, `sessions_spawn` (task and process workers) | chat | invocation |
-| `prx agent` (`--provider`, `--model`), `prx go --message`, and cron and xin agent jobs, which run through it: the selection and every configured `[[model_routes]]` destination (whether or not the run uses it), once per run, before the runtime starts | chat | invocation |
+| `prx agent` (`--provider`, `--model`), `prx go --message`, and cron and xin agent jobs, which run through it: the selection and every configured `[[model_routes]]` destination, retained as ready or refused once per run | chat | invocation |
 | the evolution judge: judges with the resolved default model (the route destination for a `hint:`). A default that cannot be resolved or built leaves only the deterministic mock scorer, which sends nothing: its verdict is a deferral in every mode — a proposed Auto-mode change is not written — and the `evolution_judge` health component and a warning say so. A model judge whose call fails, whose reply is not a score, or that does not answer within `[self_system] evolution_judge_timeout_secs` (default 180) is deferred the same way (`judge_failed`). Evolution changes are written only after an accepted verdict; a deferred cycle is logged as `deferred` (see [evolution](evolution.md#judge-verdicts)). The memory layer's engine scores with the mock scorer, so it never applies in Auto mode | chat | invocation |
 | `prx go` (resolved by the agent entry with `--message`, by chat start-up otherwise) | chat | invocation |
 | memory embedders and `[[embedding_routes]]` (a refused embedder falls back to keyword recall) | embeddings | invocation |
@@ -140,9 +174,8 @@ redacted), the evidence and the fix:
 "Invocation" runs an id-only model with a warning. "Operator" is a durable
 choice the operator makes: it refuses only a model the evidence rules out
 (for example a decision-only model, or a model another provider's prefix
-names) and accepts an id-only model marked unverified, because a fresh
-install has no catalog yet; quick setup counts PRX's own curated models for
-the provider as declared, and `POST /api/config` answers with a `warning`
+names) and accepts an id-only model marked unverified. Quick setup reads PRX's
+embedded release models for the provider, and `POST /api/config` answers with a `warning`
 field. "Model-made durable" refuses an id-only model until it is declared in
 `[[providers.models]]` or confirmed by catalog metadata. `config.patch` never
 changes `[[providers.models]]` or `[[providers.tool_dialects]]`: any patch
@@ -171,10 +204,16 @@ model fallback 'model-b' of 'model-a' on provider 'custom:http://127.0.0.1:8080/
 
 Fix: declare the fallback's dialect (`[[providers.models]]` `model =
 "model-b"` `tool_schema_dialect = "no_root_combinators"`), or move it off the
-primary's `model_fallbacks`. In this release the surfaces above resolve and
-then build with their existing credential-scoped chains, so this refusal is
-reached only through `create_provider_for`; it becomes a start-up refusal for
-each surface that switches its construction to it.
+primary's `model_fallbacks`. Chat, CLI/cron/xin, channels, gateway, workers,
+spawned children and the evolution judge all construct through the resolved
+model factory, so the same configuration is refused on every entrypoint before
+transport. Routed providers construct the default and every `hint:` destination
+from separate resolved selections; two hints that name the same provider still
+keep their own credential, model facts and fallback admission. A bad
+non-default destination does not stop startup: its hint retains that exact
+refusal and returns it if selected. The CLI `--model hint:<name>` path and a
+channel `/models <provider>` switch while that hint is selected preserve the
+same route-named refusal text.
 
 At failover time, every fallback pair is checked against the primary turn's
 admission facts before a request is sent. A fallback needs a valid cost entry
@@ -353,7 +392,11 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
   was shown.
 - **Hot reload.** The declarations are part of the configuration generation
   providers are rebuilt from, so an edited entry applies to providers built
-  after the reload, like every other provider setting.
+  after the reload, like every other provider setting. The long-lived channel
+  `image` tool resolves the provider and model catalog owned by the invoking
+  generation; `sessions_spawn` uses the child provider binding admitted for
+  that invocation. Provider, model, temperature, credential and capability
+  declarations therefore move together after a reload.
 - **Consequence of `no_root_combinators`.** Tools whose published contract uses
   a conditional or alternative root combinator are refused on that endpoint,
   and a request that includes any of them fails before transport, naming every
@@ -628,15 +671,110 @@ the root `api_key` and `api_url` are reused only for the configured default
 provider. A different provider resolves its route credential or active auth
 profile unless the named delegate supplies an explicit `api_key`.
 
-Static prices are recorded only when the provider publishes token prices for a
-stable model ID. Current Anthropic, OpenAI GPT-5.6, and documented Gemini 3.1
-prices are included. Kimi Code is subscription/quota billed, so PRX deliberately
-does not invent a per-token cost for `k3` or the `kimi-for-coding*` aliases.
-OpenRouter and proxy pricing remains dynamic.
+Static prices are recorded in the embedded release catalog only when the
+provider publishes token prices for a stable model ID. Kimi Code is
+subscription/quota billed, so PRX deliberately does not invent a per-token cost
+for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
+recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
+OpenRouter and proxy pricing remains dynamic except for exact release rows with
+a published price. The release values are checked against the providers'
+published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
+[xAI pricing](https://docs.x.ai/developers/pricing), and
+[Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat).
+An uncertain model-specific price is omitted instead of inferred from another
+generation. Router ranking cost is a separate catalog hint and is never used as
+the input/output billing tariff.
 
-When a selected model has no matching `cost.prices` entry, only `ollama` is
-treated as zero-cost. LM Studio, llama.cpp, vLLM, and custom loopback endpoints
-need an explicit `cost.prices` entry before PRX can produce a cost estimate.
+OpenAI tariff snapshot (2026-10-17), USD per million tokens:
+
+| Exact catalog model | Input | Cached input | Output | Published source |
+| --- | ---: | ---: | ---: | --- |
+| `gpt-4o` | 2.50 | 1.25 | 10.00 | [GPT-4o](https://developers.openai.com/api/docs/models/gpt-4o) |
+| `gpt-4o-mini` | 0.15 | 0.075 | 0.60 | [GPT-4o Mini](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
+| `gpt-5.2-codex` | 1.75 | 0.175 | 14.00 | [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
+| `gpt-5.6`, `gpt-5.6-sol` | 4.00 | 0.40 | 20.00 | [GPT-5.6 Sol and its alias](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `gpt-5.6-luna` | 0.20 | 0.02 | 1.20 | [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+| `gpt-5.6-terra` | 2.00 | 0.20 | 12.00 | [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
+| `o1-preview` | 15.00 | 7.50 | 60.00 | [o1 Preview](https://developers.openai.com/api/docs/models/o1-preview) |
+
+For the GPT-5.6 family, the cited pages price requests above 272,000 input
+tokens at twice the input/cached-input rate and 1.5 times the output rate for
+the whole request. Cache writes cost 1.25 times the applicable uncached input
+rate. The catalog records both tiers; these are not Router ranking costs.
+Sol's published promotional tariff runs at least through 2026-11-21, so a later
+release must recheck it rather than treating it as permanent.
+
+The same 2026-10-17 check pins Gemini 3.1 Flash-Lite text/image/video input,
+cached input and text output at 0.25/0.025/1.50. Gemini 3.1 Pro Preview uses
+2.00/0.20/12.00 through 200,000 input tokens and 4.00/0.40/18.00 above that
+threshold, as published in [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing).
+The token catalog does not represent explicit-cache hourly storage or search
+fees. Kimi K2.6 uses the published 0.95 cache-miss input, 0.16 cache-hit input
+and 4.00 output tariff; its cache-write field uses the miss rate, not an extra
+charge on top of input. The Kimi page's rendered table is also published in its
+[Markdown source](https://platform.kimi.ai/docs/pricing/chat.md).
+
+Gemini 1.5 Pro, Gemini 2.0 Flash, Kimi K2.5 and Grok 3 are left unpriced in this
+release: the fetched official pricing pages did not establish their exact
+current tariffs. Old rates and zero cached-input placeholders are not reused as
+proof. Exact operator price overrides still take precedence; release lifecycle
+eligibility is unchanged by removing an unverified tariff.
+The same rule applies to the older Claude 3 Haiku aliases and Claude 3.5
+Sonnet, whose exact rates were absent from the fetched current table. Direct
+Claude Sonnet 5 now matches its separately verified 2.00/10.00/2.50/0.20
+input/output/default-cache-write/cache-read row on the cited Anthropic page.
+OpenRouter Kimi K2.5 is also left unpriced: its model page and public model
+metadata returned different input rates, so neither the old Moonshot rate nor
+one arbitrarily selected provider rate is substituted. OpenRouter
+[Jev 1.13](https://openrouter.ai/typesafe/jev-1.13) publishes 0.042 input and
+zero output per million tokens; the catalog no longer invents an output charge.
+
+Automatic Router candidates require an active release row, explicit Router
+hints and a context limit, plus the same effective billing-tariff check used by
+onboarding. This includes verified upstream tariffs for supported OpenRouter
+IDs; a ranking hint alone never makes a row priced. The release includes active
+[Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
+and [Gemini 3.1 Pro Preview](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview)
+candidates with their published limits. Direct OpenAI
+tariffs remain available, but automatic hints wait for the catalog parameter
+wire mapping: the current adapter always sends temperature and cannot choose
+the required reasoning settings. GPT-5.2-Codex additionally supports Responses,
+not that adapter's Chat Completions endpoint. Pricing is not transport proof.
+`prx doctor` now reports when the actual registry expansion and provider filter
+leave no Router candidates, including a direct-OpenAI-only configuration; the
+diagnostic does not change the selected default or invent a fallback. Explicit
+`[[router.models]]` entries remain operator choices and use the same filter.
+For the default OpenRouter provider, [Claude Sonnet 5](https://openrouter.ai/anthropic/claude-sonnet-5)
+has a 1,000,000-token context and a separately published 2.00/10.00 input/output
+tariff. Its [public model metadata](https://openrouter.ai/api/v1/models) lists
+0.20 cached input and 2.50 default cache writes per million tokens. One-hour
+cache writes and regional endpoint uplifts are separate tariffs and need a
+matching operator override; they are not silently treated as the default rate.
+Router latency, cost ranking and initial quality values are project-owned
+selection hints, not provider performance guarantees or billing prices.
+
+OpenRouter `:free` variants settle at zero token cost unless an operator override
+is present. The deprecated `:online` variant stays unpriced because its
+separately billed web-search component is not representable by PRX's token-only
+catalog tariff; use an exact `[cost.prices]` override or migrate to OpenRouter's
+server web-search tool. The variant and its extra search pricing are documented
+by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-search).
+
+`[cost.prices]` is an operator-override table and wins over the release catalog.
+When neither source has a matching price, only `ollama` is treated as zero-cost.
+LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
+`cost.prices` entry before PRX can produce a cost estimate.
+
+The Router's built-in candidates are limited to active release rows with a
+published billing tariff. Retired or unpriced rows remain available only through
+an explicit operator route; they are never automatic candidates. Onboarding
+labels a selectable catalog row when its effective token tariff is unavailable.
+
+The catalog's `ollama/*` entry seeds only the Router's conservative local
+candidate. It does not assert vision, context-window, or verification facts for
+an arbitrary local model; exact discovery or `[[providers.models]]` declarations
+remain authoritative for those models.
 
 The canonical routing, usage, and cost settlement boundary is described in
 [provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).
@@ -724,12 +862,11 @@ explicit signal from the upstream.
 - Stream idle timeout is controlled by
   `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default 45 seconds, minimum 5).
 
-A resolved keyless root connection for Ollama (non-cloud models) or an
-OpenAI-compatible `custom:` endpoint keeps its configured endpoint and
-provider-owned rotation keys. Its initial provider is constructed without
-looking up an auth profile. This applies to a PMM-resolved root connection;
-legacy provider-store lookup and explicit profile/OAuth flows keep their existing
-behavior. Key-required providers such as OpenAI still use their configured
-profile fallback when the root has no key, and that fallback cannot attest a
-root credential for CLI decision authority. A connection is never released to a
-different provider identity.
+A Root connection with `api_url` or `reliability.api_keys` but no `api_key`
+keeps that owner-bound endpoint and rotation material, then performs the same
+provider-store lookup as an otherwise unconfigured key: active auth profile,
+environment credential, OAuth cache or subscription login, according to the
+provider. Keyless providers still build when that lookup finds nothing. OpenAI
+Codex is the exception in the other direction: it always uses its own login and
+ignores Root API keys, URL and rotation keys. A Root connection is never
+released to a different provider identity.

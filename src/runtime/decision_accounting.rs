@@ -20,9 +20,13 @@ use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, D
 use crate::decision::protocol::DecisionUsage;
 use crate::decision::{DecisionError, DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
+use crate::providers::ProviderId;
 
 #[cfg(test)]
 pub(crate) mod timing;
+
+#[cfg(feature = "llm-router")]
+mod cl100k_prefix_bound;
 
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
@@ -80,11 +84,21 @@ impl AccountingScope {
 
 impl budget::sealed::AccountingOwner for AccountingScope {}
 
+/// The base URL a provider is reached at: the root connection's `api_url`
+/// when `provider` is the configured default provider, otherwise unset (the
+/// provider's own default).
+fn effective_api_url<'a>(config: &'a Config, provider: &str) -> Option<&'a str> {
+    (ProviderId::of(provider) == ProviderId::of(crate::providers::selection::default_provider(config)))
+        .then_some(config.api_url.as_deref())
+        .flatten()
+}
+
 /// Reserve the declared available decision allowance at the highest applicable
 /// PMM rate. This is a versioned local estimate, never a vendor billing cap.
 fn estimated_cost(
     config: &crate::config::schema::CostConfig,
     provider: &str,
+    api_url: Option<&str>,
     model: &str,
     tokens: u64,
 ) -> Result<u64, DecisionError> {
@@ -95,9 +109,14 @@ fn estimated_cost(
         (tokens, 0, tokens, 0),
         (tokens, 0, 0, tokens),
     ] {
-        let UsagePrice::Priced(cost) = usage_cost_resolution(provider, model, input, output, write, read, config)
-        else {
-            return Err(DecisionError::BudgetExceeded);
+        let cost = match usage_cost_resolution(provider, model, input, output, write, read, config) {
+            UsagePrice::Priced(cost) => cost,
+            UsagePrice::Missing
+                if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
+            {
+                0.0
+            }
+            UsagePrice::Missing | UsagePrice::Invalid => return Err(DecisionError::BudgetExceeded),
         };
         maximum = maximum.max(cost);
     }
@@ -155,7 +174,7 @@ impl AccountingScope {
     pub(super) async fn begin_physical(&self, attempt: PhysicalEstimate<'_>) -> Result<OwnedReceipt, DecisionError> {
         let auxiliary = matches!(
             attempt.purpose,
-            "signal_vision" | "automix_premium" | "router_embedding"
+            "signal_vision" | "smart_group_classifier" | "automix_premium" | "router_embedding"
         );
         let owner_deadline = self.deadline;
         let deadline = owner_deadline.min(attempt.deadline);
@@ -178,48 +197,11 @@ impl AccountingScope {
         if !(1..=2).contains(&planned) || (auxiliary && planned != 1) {
             return Err(DecisionError::BudgetExceeded);
         }
-        // Allocate the existing allowance across the transport's bounded plan.
-        // This estimate is not an output cap; unknown dispatched usage stays held.
-        let mut available = remaining.tokens.load(Ordering::Acquire);
-        let tokens = loop {
-            let tokens = available / planned;
-            if tokens == 0 {
-                return Err(DecisionError::BudgetExceeded);
-            }
-            match remaining.tokens.compare_exchange_weak(
-                available,
-                available - tokens,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break tokens,
-                Err(current) => available = current,
-            }
-        };
-        let maximum = match estimated_cost(&self.config.cost, attempt.provider, attempt.model, tokens) {
-            Ok(value) => value,
-            Err(error) => {
-                remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
-                return Err(error);
-            }
-        };
-        if remaining
-            .micro_usd
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(maximum))
-            .is_err()
-        {
-            remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
-            return Err(DecisionError::BudgetExceeded);
-        }
         let cancel = CancellationToken::new();
-        let ticket = match self.cleanup.register(cancel.clone()) {
-            Ok(ticket) => ticket,
-            Err(_) => {
-                remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
-                remaining.micro_usd.fetch_add(maximum, Ordering::AcqRel);
-                return Err(DecisionError::Cancelled);
-            }
-        };
+        let ticket = self
+            .cleanup
+            .register(cancel.clone())
+            .map_err(|_| DecisionError::Cancelled)?;
         let attempt_id = format!("{}:{}", attempt.purpose, uuid::Uuid::new_v4());
         let binding = self.key.hmac(
             KeyDomain::TerminalClaim,
@@ -234,18 +216,8 @@ impl AccountingScope {
                 attempt.body,
             ],
         );
-        let request = EstimatedReservationRequest {
-            reservation: ReservationRequest {
-                turn_id: hex::encode(self.scope_id),
-                attempt_id,
-                binding_sha256: hex::encode(binding),
-                maximum_micro_usd: maximum,
-                turn_limit_micro_usd: self.budgets.micro_usd,
-                security_daily_micro_usd: u64::from(self.config.autonomy.max_cost_per_day_cents) * 10_000,
-            },
-            reserved_tokens: tokens,
-            turn_token_limit: self.budgets.tokens,
-        };
+        let turn_id = hex::encode(self.scope_id);
+        let budgets = self.budgets;
         // Copy only on a real configured physical attempt; the same full
         // guarded bytes are measured without removing image or request data.
         let request_body = attempt.body.to_vec();
@@ -258,6 +230,8 @@ impl AccountingScope {
         if let Some(timing) = &mut diagnostic_timing {
             timing.mark("spawn_submitted");
         }
+        let runtime = tokio::runtime::Handle::current();
+        let claim_cancel = cancel.clone();
         let work = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(timing) = &mut diagnostic_timing {
@@ -266,6 +240,9 @@ impl AccountingScope {
             let mut ticket = Some(ticket);
             let mut confirmed = true;
             let mut restore_tokens = true;
+            let mut tokens = 0;
+            let mut maximum = 0;
+            let mut money_claimed = false;
             #[cfg(test)]
             let mut diagnostic_stage = "decode";
             let result = (|| -> anyhow::Result<OwnedReceipt> {
@@ -281,28 +258,12 @@ impl AccountingScope {
                 let token_timing = diagnostic_timing
                     .as_ref()
                     .map(|_| crate::agent::context_budget::token_timing::Scope::new());
-                let input_fits = input_token_preflight(text, tokens, auxiliary, || {
+                tokens = claim_input_tokens(&remaining.tokens, planned, text, || {
                     let measured = crate::agent::context_budget::count_tokens_with_source(text);
-                    let estimate = crate::agent::context_budget::estimate_request_tokens(
+                    crate::agent::context_budget::estimate_request_tokens(
                         measured,
                         crate::agent::context_budget::TokenMeasurement::NONE,
-                    );
-                    #[cfg(test)]
-                    if u64::try_from(estimate).is_ok_and(|estimate| estimate >= tokens) {
-                        let source = match measured.source {
-                            crate::agent::context_budget::TokenMeasurementSource::Cl100kProxy => "cl100k_proxy",
-                            crate::agent::context_budget::TokenMeasurementSource::Heuristic => "heuristic",
-                        };
-                        let _ = std::io::Write::write_fmt(
-                            &mut std::io::stderr().lock(),
-                            format_args!(
-                                "prx_accounting_input_rejected source={source} measured_tokens={} body_bytes={} estimate_tokens={estimate} allowance_tokens={tokens}\n",
-                                measured.tokens,
-                                text.len(),
-                            ),
-                        );
-                    }
-                    estimate
+                    )
                 })?;
                 #[cfg(test)]
                 if let Some(scope) = token_timing {
@@ -311,10 +272,21 @@ impl AccountingScope {
                         timing.mark("input_fit_finished");
                     }
                 }
+                maximum = estimated_cost(
+                    &config.cost,
+                    &provider,
+                    effective_api_url(&config, &provider),
+                    &model,
+                    tokens,
+                )?;
                 anyhow::ensure!(
-                    input_fits,
-                    "physical request exceeds estimated decision token allowance"
+                    remaining
+                        .micro_usd
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(maximum))
+                        .is_ok(),
+                    "physical request exceeds the remaining monetary allowance"
                 );
+                money_claimed = true;
                 #[cfg(test)]
                 {
                     diagnostic_stage = "deadline_after_estimation";
@@ -326,6 +298,18 @@ impl AccountingScope {
                     !cancel.is_cancelled() && Instant::now() < deadline,
                     "physical accounting deadline elapsed during estimation"
                 );
+                let request = EstimatedReservationRequest {
+                    reservation: ReservationRequest {
+                        turn_id,
+                        attempt_id,
+                        binding_sha256: hex::encode(binding),
+                        maximum_micro_usd: maximum,
+                        turn_limit_micro_usd: budgets.micro_usd,
+                        security_daily_micro_usd: u64::from(config.autonomy.max_cost_per_day_cents) * 10_000,
+                    },
+                    reserved_tokens: tokens,
+                    turn_token_limit: budgets.tokens,
+                };
                 #[cfg(test)]
                 {
                     diagnostic_stage = "tracker_open";
@@ -341,7 +325,9 @@ impl AccountingScope {
                         timing.mark("reserve");
                     }
                 }
-                let receipt = match tracker.reserve_estimated_attempt(request) {
+                let receipt = match tracker.reserve_dispatched_estimated_attempt(request, || {
+                    !cancel.is_cancelled() && Instant::now() < deadline
+                }) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -351,41 +337,9 @@ impl AccountingScope {
                         return Err(error);
                     }
                 };
-                // From this point a durable liability exists. Only a confirmed
-                // unsent release can restore the prospective token allowance.
+                // From this point the reservation and its one-use dispatched
+                // state are durable. Unknown send/usage retains the liability.
                 restore_tokens = false;
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "deadline_before_dispatch";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("deadline_before_dispatch");
-                    }
-                }
-                if cancel.is_cancelled() || Instant::now() >= deadline {
-                    if let Err(error) = tracker.release_unsent_attempt(&receipt) {
-                        confirmed = false;
-                        return Err(error);
-                    }
-                    restore_tokens = true;
-                    anyhow::bail!("decision accounting deadline elapsed before dispatch");
-                }
-                #[cfg(test)]
-                {
-                    diagnostic_stage = "mark_dispatched";
-                    if let Some(timing) = &mut diagnostic_timing {
-                        timing.mark("mark_dispatched");
-                    }
-                }
-                if let Err(error) = tracker.mark_attempt_dispatched(&receipt) {
-                    if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
-                        confirmed = false;
-                    } else if tracker.release_unsent_attempt(&receipt).is_ok() {
-                        restore_tokens = true;
-                    } else {
-                        confirmed = false;
-                    }
-                    return Err(error);
-                }
                 Ok(OwnedReceipt {
                     tracker,
                     receipt,
@@ -411,7 +365,9 @@ impl AccountingScope {
             drop(diagnostic_timing);
             if restore_tokens {
                 remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
-                remaining.micro_usd.fetch_add(maximum, Ordering::AcqRel);
+                if money_claimed {
+                    remaining.micro_usd.fetch_add(maximum, Ordering::AcqRel);
+                }
             }
             if let Some(ticket) = ticket {
                 ticket.finish(confirmed);
@@ -423,7 +379,12 @@ impl AccountingScope {
                     format_args!("prx_accounting_failure stage={diagnostic_stage} allowance_tokens={tokens}\n"),
                 );
             }
-            result.map_err(|_| DecisionError::BudgetExceeded)
+            result
+                .map(|receipt| UnclaimedReceipt {
+                    receipt: Some(receipt),
+                    runtime,
+                })
+                .map_err(|_| DecisionError::BudgetExceeded)
         });
         let receipt = tokio::time::timeout_at(deadline.into(), work)
             .await
@@ -437,7 +398,51 @@ impl AccountingScope {
                 accounting_diagnostic_failure("blocking_join");
                 DecisionError::BudgetExceeded
             })??;
-        Ok(receipt)
+        if claim_cancel.is_cancelled() || Instant::now() >= deadline {
+            return Err(DecisionError::BudgetExceeded);
+        }
+        // No await separates receipt delivery from ownership transfer. Dropping
+        // the join result before here releases an attempt that cannot be sent.
+        receipt.claim()
+    }
+}
+
+struct UnclaimedReceipt {
+    receipt: Option<OwnedReceipt>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl UnclaimedReceipt {
+    fn claim(mut self) -> Result<OwnedReceipt, DecisionError> {
+        self.receipt.take().ok_or(DecisionError::BudgetExceeded)
+    }
+}
+
+impl Drop for UnclaimedReceipt {
+    fn drop(&mut self) {
+        let Some(mut receipt) = self.receipt.take() else {
+            return;
+        };
+        // The cleanup ticket stays owned until the compensating journal write
+        // finishes, including when the caller timed out during the first fsync.
+        self.runtime.spawn_blocking(move || {
+            let released = receipt.tracker.release_unclaimed_estimated_attempt(&receipt.receipt);
+            if released.is_ok() {
+                receipt
+                    .remaining
+                    .tokens
+                    .fetch_add(receipt.reserved_tokens, Ordering::AcqRel);
+                receipt
+                    .remaining
+                    .micro_usd
+                    .fetch_add(receipt.reserved_micro_usd, Ordering::AcqRel);
+            } else {
+                tracing::warn!("unclaimed decision reservation release was not confirmed");
+            }
+            if let Some(ticket) = receipt.ticket.take() {
+                ticket.finish(released.is_ok());
+            }
+        });
     }
 }
 
@@ -504,7 +509,7 @@ impl OwnedReceipt {
                 let output = u64::from(output);
                 let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
                 let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-                let UsagePrice::Priced(cost) = usage_cost_resolution(
+                let cost = match usage_cost_resolution(
                     &self.provider,
                     &self.model,
                     input,
@@ -512,8 +517,19 @@ impl OwnedReceipt {
                     cache_write,
                     cache_read,
                     &self.config.cost,
-                ) else {
-                    anyhow::bail!("decision usage has no valid pinned PMM price");
+                ) {
+                    UsagePrice::Priced(cost) => cost,
+                    UsagePrice::Missing
+                        if super::turn_cost::provider_is_zero_price_exempt(
+                            &ProviderId::of(&self.provider),
+                            effective_api_url(&self.config, &self.provider),
+                        ) =>
+                    {
+                        0.0
+                    }
+                    UsagePrice::Missing | UsagePrice::Invalid => {
+                        anyhow::bail!("decision usage has no valid pinned PMM price")
+                    }
                 };
                 let total = input + output;
                 let record = MeteredTokenUsageRecord {
@@ -573,6 +589,92 @@ mod tranche_tests {
     use super::*;
 
     #[test]
+    fn a_proven_small_input_keeps_the_equal_retry_share_without_tokenizing() -> anyhow::Result<()> {
+        let remaining = AtomicU64::new(2059);
+        let calls = std::cell::Cell::new(0);
+        let tokens = claim_input_tokens(&remaining, 2, "{}", || {
+            calls.set(calls.get() + 1);
+            2
+        })?;
+        assert_eq!(tokens, 1029);
+        assert_eq!(remaining.load(Ordering::Acquire), 1030);
+        assert_eq!(calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_input_above_the_share_claims_only_the_required_larger_share_and_measures_once() -> anyhow::Result<()> {
+        let remaining = AtomicU64::new(2059);
+        let calls = std::cell::Cell::new(0);
+        let tokens = claim_input_tokens(&remaining, 2, &"large input ".repeat(1024), || {
+            calls.set(calls.get() + 1);
+            1036
+        })?;
+        assert_eq!(tokens, 1037);
+        assert_eq!(remaining.load(Ordering::Acquire), 1022);
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn input_equal_to_the_total_still_refuses_without_claiming_tokens() {
+        let remaining = AtomicU64::new(2059);
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            claim_input_tokens(&remaining, 2, &"large input ".repeat(2048), || {
+                calls.set(calls.get() + 1);
+                2059
+            })
+            .is_err()
+        );
+        assert_eq!(remaining.load(Ordering::Acquire), 2059);
+        assert_eq!(calls.get(), 1);
+        assert!(claim_input_tokens(&remaining, 0, "{}", || 2).is_err());
+        assert!(claim_input_tokens(&remaining, 3, "{}", || 2).is_err());
+    }
+
+    #[test]
+    fn concurrent_large_inputs_cannot_claim_the_same_total_twice() {
+        let remaining = AtomicU64::new(2059);
+        let barrier = std::sync::Barrier::new(2);
+        let text = "large input ".repeat(1024);
+        std::thread::scope(|scope| {
+            let claim = || {
+                barrier.wait();
+                claim_input_tokens(&remaining, 2, &text, || 1036)
+            };
+            let first = scope.spawn(claim);
+            let second = scope.spawn(claim);
+            let results = [
+                first.join().expect("test: first claimant"),
+                second.join().expect("test: second claimant"),
+            ];
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(results.into_iter().filter_map(Result::ok).sum::<u64>(), 1037);
+        });
+        assert_eq!(remaining.load(Ordering::Acquire), 1022);
+    }
+
+    #[test]
+    fn a_changed_allowance_rechecks_fit_without_repeating_the_estimator() {
+        for (other_claim, expected) in [(10, Some(1037)), (1030, None)] {
+            let remaining = AtomicU64::new(2059);
+            let calls = std::cell::Cell::new(0);
+            let result = claim_input_tokens(&remaining, 2, &"large input ".repeat(1024), || {
+                calls.set(calls.get() + 1);
+                remaining.fetch_sub(other_claim, Ordering::AcqRel);
+                1036
+            });
+            assert_eq!(result.ok(), expected);
+            assert_eq!(
+                remaining.load(Ordering::Acquire),
+                2059 - other_claim - expected.unwrap_or(0)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
     fn reported_usage_above_tranche_consumes_unallocated_tokens() {
         let remaining = AtomicU64::new(2048);
         reconcile_token_allowance(&remaining, 2048, 3000);
@@ -584,6 +686,49 @@ mod tranche_tests {
         let remaining = AtomicU64::new(2048);
         reconcile_token_allowance(&remaining, 2048, 5000);
         assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn only_a_local_unpriced_ollama_reserves_zero_money() {
+        let config = crate::config::schema::CostConfig::default();
+        let reserve =
+            |provider: &str, url: Option<&str>| estimated_cost(&config, provider, url, "prx-local-model", 1000);
+        assert_eq!(reserve("ollama", None).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://127.0.0.1:11434")).ok(), Some(0));
+        assert_eq!(reserve("ollama", Some("http://localhost:11434")).ok(), Some(0));
+        assert!(matches!(
+            reserve("ollama", Some("https://ollama.com")),
+            Err(DecisionError::BudgetExceeded)
+        ));
+        assert!(matches!(
+            reserve("ollama", Some("http://192.168.1.20:11434")),
+            Err(DecisionError::BudgetExceeded)
+        ));
+        assert!(matches!(
+            reserve("acme-unpriced", None),
+            Err(DecisionError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn the_settlement_exemption_follows_the_effective_endpoint() {
+        let mut config = Config::default();
+        config.default_provider = Some("ollama".to_string());
+        assert_eq!(effective_api_url(&config, "ollama"), None);
+        config.api_url = Some("https://ollama.com".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(!super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        config.api_url = Some("http://localhost:11434".to_string());
+        let url = effective_api_url(&config, "ollama");
+        assert!(super::super::turn_cost::provider_is_zero_price_exempt(
+            &ProviderId::of("ollama"),
+            url
+        ));
+        // Another provider never inherits the root URL.
+        assert_eq!(effective_api_url(&config, "openai"), None);
     }
 
     #[test]
@@ -601,7 +746,7 @@ mod transport_tests;
 // or a vendor token cap. cl100k emits at most one token per nonempty byte
 // span; the fallback uses the existing scaled character heuristic. Keep the
 // full serialized body. An inconclusive upper bound MUST run the old proxy.
-fn auxiliary_input_upper_bound(text: &str) -> usize {
+fn input_token_upper_bound(text: &str) -> usize {
     use crate::agent::context_budget::{TokenMeasurement, TokenMeasurementSource, estimate_request_tokens};
     text.len().max(estimate_request_tokens(
         TokenMeasurement {
@@ -612,13 +757,56 @@ fn auxiliary_input_upper_bound(text: &str) -> usize {
     ))
 }
 
+/// Prefer a fair retry share, but do not reject the first request merely
+/// because its input needs more than that share. The existing owner allowance
+/// is the hard limit; a claimed unknown attempt keeps everything it reserved.
+fn claim_input_tokens(
+    remaining: &AtomicU64,
+    planned: u64,
+    text: &str,
+    mut estimate: impl FnMut() -> usize,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!((1..=2).contains(&planned), "invalid physical attempt plan");
+    let mut measured = None;
+    let mut measure = || *measured.get_or_insert_with(&mut estimate);
+    let mut available = remaining.load(Ordering::Acquire);
+    loop {
+        let share = available / planned;
+        let tokens = if input_token_preflight(text, share, &mut measure)? {
+            share
+        } else {
+            // The failed preflight has already measured the input.
+            // Keep the existing strict input < reservation rule while leaving
+            // all unnecessary tokens available to the bounded remaining plan.
+            let required = u64::try_from(measure())?
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("physical input token estimate overflow"))?;
+            anyhow::ensure!(
+                required <= available,
+                "physical request exceeds the remaining decision token allowance"
+            );
+            required
+        };
+        match remaining.compare_exchange_weak(available, available - tokens, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(tokens),
+            Err(current) => available = current,
+        }
+    }
+}
+
 fn input_token_preflight(
     text: &str,
     allowance: u64,
-    auxiliary: bool,
     estimate: impl FnOnce() -> usize,
 ) -> Result<bool, std::num::TryFromIntError> {
-    if auxiliary && u64::try_from(auxiliary_input_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
+    #[cfg(feature = "llm-router")]
+    if text.len() >= cl100k_prefix_bound::MIN_INPUT_BYTES
+        && u64::try_from(cl100k_prefix_bound::upper_bound(text).unwrap_or(usize::MAX))
+            .is_ok_and(|upper| upper < allowance)
+    {
+        return Ok(true);
+    }
+    if u64::try_from(input_token_upper_bound(text)).is_ok_and(|upper| upper < allowance) {
         return Ok(true);
     }
     Ok(u64::try_from(estimate())? < allowance)

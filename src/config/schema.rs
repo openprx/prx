@@ -1794,183 +1794,11 @@ impl Default for CostConfig {
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
             allow_override: false,
-            prices: get_default_pricing(),
+            // Operator overrides only. Built-in prices come from the embedded
+            // release catalog at the point of use.
+            prices: std::collections::HashMap::new(),
         }
     }
-}
-
-/// Default pricing for popular models (USD per 1M tokens)
-fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
-    let mut prices = std::collections::HashMap::new();
-
-    // Anthropic models
-    prices.insert(
-        "anthropic/claude-sonnet-5".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-8".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 25.0,
-            cache_write: 6.25,
-            cache_read: 0.50,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-haiku-4-5-20251001".into(),
-        ModelPricing {
-            input: 1.0,
-            output: 5.0,
-            cache_write: 1.25,
-            cache_read: 0.10,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-sonnet-4-20250514".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-20250514".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.50,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3.5-sonnet".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3-haiku".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.25,
-            cache_write: 0.3125,
-            cache_read: 0.03,
-        },
-    );
-
-    // OpenAI models
-    for (model, input, output) in [
-        ("gpt-5.6", 5.0, 30.0),
-        ("gpt-5.6-sol", 5.0, 30.0),
-        ("gpt-5.6-terra", 2.5, 15.0),
-        ("gpt-5.6-luna", 1.0, 6.0),
-    ] {
-        prices.insert(
-            format!("openai/{model}"),
-            ModelPricing {
-                input,
-                output,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-        );
-    }
-    prices.insert(
-        "openai/gpt-4o".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 15.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "openai/gpt-4o-mini".into(),
-        ModelPricing {
-            input: 0.15,
-            output: 0.60,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "openai/o1-preview".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 60.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-
-    // Google models
-    prices.insert(
-        "google/gemini-3.1-pro-preview".into(),
-        ModelPricing {
-            input: 2.0,
-            output: 12.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-3.1-flash-lite".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.50,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-2.0-flash".into(),
-        ModelPricing {
-            input: 0.10,
-            output: 0.40,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-    prices.insert(
-        "google/gemini-1.5-pro".into(),
-        ModelPricing {
-            input: 1.25,
-            output: 5.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-    );
-
-    // Kimi API Platform models. Kimi publishes a cache-hit input price, but no
-    // separate cache-write tier; treat cache writes as ordinary cache-miss input.
-    let mut insert_kimi = |provider: &str, model: &str, input: f64, output: f64, cache_read: f64| {
-        prices.insert(
-            format!("{provider}/{model}"),
-            ModelPricing {
-                input,
-                output,
-                cache_write: input,
-                cache_read,
-            },
-        );
-    };
-    // Kimi Code is subscription/quota billed. Do not synthesize token prices
-    // for the coding endpoint aliases; Moonshot API-platform prices remain
-    // separate below.
-    insert_kimi("moonshot", "kimi-k2.6", 0.95, 4.0, 0.16);
-    insert_kimi("moonshot", "kimi-k2.5", 0.60, 3.0, 0.10);
-
-    prices
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -4613,24 +4441,23 @@ const fn default_pre_gate_max_context_messages() -> usize {
 
 /// Token-saving pre-gate for smart group-reply (`[smart_group]`).
 ///
-/// The pre-gate runs *before* the full agent loop for smart-mode group messages
-/// that do NOT explicitly @-mention the bot. It cheaply triages each such
-/// message into one of three buckets via a 0-token heuristic:
-///   - clearly relevant  → enter the loop,
-///   - obvious noise      → stay silent (skip the loop entirely),
-///   - uncertain          → ask a cheap-tier classifier model for a yes/no.
+/// The pre-gate runs after source decision admission and before the full agent
+/// loop for smart-mode group messages that do NOT explicitly @-mention the bot.
+/// A 0-token heuristic sends clearly relevant messages straight to the loop;
+/// obvious noise and uncertain messages require a yes/no confirmation from a
+/// resolver-built, physically accounted classifier before silence is allowed.
 ///
 /// @-mentions, DMs, and non-smart modes NEVER reach the pre-gate. The pre-gate
 /// is fail-open: any classifier error/timeout enters the loop (it must never
 /// silently drop a message that should have been answered).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SmartGroupConfig {
-    /// Provider id/alias for the Tier-2 classifier. When empty, the channel's
-    /// own routed provider is reused (no extra provider construction).
+    /// Provider id/alias for the Tier-2 classifier. When empty, the admitted
+    /// channel route's provider is resolved for this auxiliary call.
     #[serde(default)]
     pub classifier_provider: String,
-    /// Model id for the Tier-2 classifier. When empty, the channel's routed
-    /// model is reused. Set this to a cheap-tier model id (e.g. one listed in
+    /// Model id for the Tier-2 classifier. When empty, the admitted channel
+    /// route's model is resolved. Set this to a cheap-tier model id (e.g. one listed in
     /// `router.automix.cheap_model_tiers`) to minimize cost.
     #[serde(default)]
     pub classifier_model: String,
@@ -6056,14 +5883,17 @@ impl Default for Config {
     fn default() -> Self {
         let home = user_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let openprx_dir = preferred_user_config_dir(&home);
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().ok();
 
         Self {
             workspace_dir: openprx_dir.join("workspace"),
             config_path: openprx_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            default_provider: release.map(|catalog| catalog.default_provider().to_string()),
+            default_model: release
+                .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
+                .map(str::to_string),
             default_temperature: 0.7,
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -6828,6 +6658,31 @@ impl Config {
         Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
     }
 
+    /// Advisory only: retain the configured ceiling while exposing the
+    /// release catalog recommendation outside the causal policy domain.
+    pub(crate) fn decision_latency_budget_warning(&self) -> Option<String> {
+        let section = &self.causal_tree;
+        if !section.enabled {
+            return None;
+        }
+        let selection = crate::decision::factory::configured_selection(section)?;
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+            .inspect_err(|error| tracing::warn!(%error, "cannot read the catalog latency recommendation"))
+            .ok()?;
+        let entry = catalog.model(
+            &crate::providers::ProviderId::of(&selection.provider),
+            section.backend.model.trim(),
+        )?;
+        let recommended = entry.transport.extra_latency_budget_ms?;
+        let configured = section.policy.extra_latency_budget_ms;
+        (configured < recommended).then(|| {
+            format!(
+                "causal_tree.policy.extra_latency_budget_ms={configured} is below the catalog recommendation {recommended} ms for {}; the configured ceiling is unchanged",
+                entry.id
+            )
+        })
+    }
+
     /// Turn a merged TOML tree into a `Config`.
     ///
     /// `config_path` is only used to tell an operator which file and line a
@@ -6854,6 +6709,9 @@ impl Config {
                  likely a typo); configuration is never silently ignored.",
                 unknown_paths.join(", ")
             );
+        }
+        if let Some(warning) = config.decision_latency_budget_warning() {
+            tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
         }
         Ok(config)
     }
@@ -8801,6 +8659,100 @@ max_context = 1000000
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
         assert!(loaded.agent.compaction.max_context_tokens_explicit);
         assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
+    }
+
+    #[test]
+    async fn hosted_latency_warning_does_not_change_the_configured_ceiling() {
+        let mut config = Config::default();
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        let warning = config
+            .decision_latency_budget_warning()
+            .expect("test: below catalog recommendation");
+        assert!(warning.contains("500") && warning.contains("3000"), "{warning}");
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        config.causal_tree.policy.extra_latency_budget_ms = 3_000;
+        assert!(config.decision_latency_budget_warning().is_none());
+        config.causal_tree.policy.extra_latency_budget_ms = 500;
+        config.causal_tree.enabled = false;
+        assert!(config.decision_latency_budget_warning().is_none());
+    }
+
+    #[test]
+    async fn schema_one_hosted_backend_warns_on_load_without_raising_the_latency_budget() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().expect("test: private config directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_temperature = 0.7\n\
+             [auth]\ncodex_auth_json_auto_import = false\n\
+             [causal_tree]\nschema_version = 1\nenabled = true\n\
+             [causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\n\
+             pinned_snapshot = \"typesafe/jev-1.13-20260917\"\n\
+             [causal_tree.policy]\nextra_latency_budget_ms = 500\n",
+        )
+        .expect("test: write old hosted configuration");
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        let loaded = loaded.expect("test: old hosted config loads");
+        assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert!(logs.contains("below the catalog recommendation"), "{logs}");
+        assert!(logs.contains("500") && logs.contains("3000"), "{logs}");
+    }
+
+    #[test]
+    async fn load_path_treats_the_pre_catalog_serialized_latency_default_as_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[causal_tree]
+schema_version = 1
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[causal_tree]
+schema_version = 1
+enabled = true
+
+[causal_tree.policy]
+extra_latency_budget_ms = 500
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
+
+        let upgraded = crate::config::manage::mutation::causal::CausalConfigService::mutate(
+            &loaded,
+            &[crate::config::manage::mutation::causal::CausalMutation::SetBackend {
+                kind: crate::decision::BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_owned()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            }],
+        )
+        .expect("a stored old default adopts the hosted catalog budget");
+        assert_eq!(upgraded.causal_tree.policy.extra_latency_budget_ms, 3_000);
+        assert!(upgraded.causal_tree.policy.extra_latency_budget_ms_explicit);
     }
 
     #[test]
@@ -12374,7 +12326,7 @@ circuit_breaker_cooldown_secs = 60
         assert!(saved.contains("enabled = true"), "`enabled` is always written: {saved}");
 
         assert!(
-            saved.contains("schema_version = 1"),
+            saved.contains("schema_version = 2"),
             "the version is always written: {saved}"
         );
 
@@ -12463,7 +12415,7 @@ circuit_breaker_cooldown_secs = 60
             .expect("test: save");
         let saved = saved_text(dir.path());
         assert!(
-            saved.contains("schema_version = 1") && saved.contains("enabled = true"),
+            saved.contains("schema_version = 2") && saved.contains("enabled = true"),
             "{saved}"
         );
     }

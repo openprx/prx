@@ -19,6 +19,7 @@ pub mod adapters;
 pub mod descriptor;
 pub mod discovery;
 pub(crate) mod process_snapshot;
+pub mod release;
 pub mod resolver;
 
 use std::sync::Arc;
@@ -27,6 +28,11 @@ pub use adapters::{AdapterBound, AdapterFamily, DecisionAdapterKind, adapter_bou
 pub use descriptor::{
     DescriptorSource, Dialects, Feature, FeatureSet, ModelDescriptor, ModelOperation, RequiredFeatures, Requirement,
     Support,
+};
+pub use release::{
+    CatalogFeatures, CatalogLimits, CatalogOperation, CatalogParameter, CatalogPriceTier, CatalogPricing,
+    CatalogRouterHints, CatalogTransport, ModelLifecycle, ModelLifecycleStatus, ModelParameter, ReleaseCatalog,
+    ReleaseCatalogError, ReleaseDefaults, ReleaseModel, ReleaseProvider,
 };
 pub use resolver::{
     ResolutionError, ResolvedCredential, ResolvedModel, Selection, UnknownPolicy, Verification, resolve,
@@ -129,11 +135,25 @@ fn reads_dialect_declarations(provider: &ProviderId) -> bool {
 /// Built from configuration (operator declarations) and, optionally,
 /// discovered catalog metadata. It is local: building or reading it never
 /// touches the network.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CatalogView {
     curated: Vec<CuratedModel>,
     discovered: Vec<ModelDescriptor>,
     routes: Vec<RouteTarget>,
+    release: Option<Arc<ReleaseCatalog>>,
+    release_error: Option<ReleaseCatalogError>,
+}
+
+impl Default for CatalogView {
+    fn default() -> Self {
+        Self {
+            curated: Vec::new(),
+            discovered: Vec::new(),
+            routes: Vec::new(),
+            release: None,
+            release_error: None,
+        }
+    }
 }
 
 /// One `[[model_routes]]` destination: what a `hint:<hint>` model names.
@@ -162,10 +182,30 @@ impl std::fmt::Debug for RouteTarget {
 }
 
 impl CatalogView {
+    /// Release evidence without operator declarations or discovery state.
+    #[must_use]
+    pub fn release_only() -> Self {
+        let (release, release_error) = match ReleaseCatalog::embedded() {
+            Ok(catalog) => (Some(catalog), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            curated: Vec::new(),
+            discovered: Vec::new(),
+            routes: Vec::new(),
+            release,
+            release_error,
+        }
+    }
+
     /// The operator declarations in `config`: `[[providers.models]]` and
     /// `[[providers.tool_dialects]]`.
     #[must_use]
     pub fn from_config(config: &crate::config::Config) -> Self {
+        let (release, release_error) = match ReleaseCatalog::embedded() {
+            Ok(catalog) => (Some(catalog), None),
+            Err(error) => (None, Some(error)),
+        };
         Self {
             curated: curated_from_config(config),
             discovered: Vec::new(),
@@ -185,7 +225,37 @@ impl CatalogView {
                         .map(str::to_string),
                 })
                 .collect(),
+            release,
+            release_error,
         }
+    }
+
+    /// The release catalog this view pins.
+    ///
+    /// # Errors
+    ///
+    /// The catalog embedded in this binary did not pass semantic validation.
+    pub fn release_catalog(&self) -> Result<&ReleaseCatalog, ReleaseCatalogError> {
+        self.release.as_deref().ok_or_else(|| {
+            self.release_error
+                .clone()
+                .unwrap_or_else(ReleaseCatalogError::missing_embedded_catalog)
+        })
+    }
+
+    /// The embedded revision pinned by this view.
+    #[must_use]
+    pub fn release_revision(&self) -> Option<&str> {
+        self.release.as_ref().map(|catalog| catalog.revision.as_str())
+    }
+
+    /// Replace the release evidence for a focused test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_release_catalog(mut self, catalog: ReleaseCatalog) -> Self {
+        self.release = Some(Arc::new(catalog));
+        self.release_error = None;
+        self
     }
 
     /// The `[[model_routes]]` destination `hint` names.
@@ -229,33 +299,35 @@ impl CatalogView {
     ///
     /// 1. The adapter table is the upper bound: nothing lifts an adapter
     ///    `Unsupported`.
-    /// 2. Negative evidence from any source wins over positive evidence.
-    /// 3. An operator declaration settles what discovery left `Unknown`, and
-    ///    sets the dialects where the adapter reads them.
-    /// 4. With no evidence at all, every operation and feature is `Unknown`
+    /// 2. Negative discovery evidence outranks an operator declaration.
+    /// 3. An operator declaration outranks positive discovery and the release
+    ///    catalog, and sets dialects where the adapter reads them.
+    /// 4. Positive discovery outranks the release catalog.
+    /// 5. With no evidence at all, every operation and feature is `Unknown`
     ///    and the source is [`DescriptorSource::LegacyIdOnly`].
     #[must_use]
     pub fn describe(&self, provider: &ProviderId, model: &str) -> ModelDescriptor {
         let model = model.trim();
         let bound = adapter_bound(provider);
-        let mut descriptor = ModelDescriptor::id_only(provider.clone(), model);
+        let mut descriptor = self
+            .release
+            .as_ref()
+            .and_then(|catalog| catalog.descriptor(provider, model))
+            .unwrap_or_else(|| ModelDescriptor::id_only(provider.clone(), model));
 
         // Several records can describe one model (refreshes under different
         // spellings of one provider); the newest is the evidence.
-        if let Some(found) = self
+        let found = self
             .discovered
             .iter()
             .filter(|found| found.provider == *provider && found.model_id.eq_ignore_ascii_case(model))
-            .max_by_key(|found| match found.source {
-                DescriptorSource::Discovery { fetched_at_unix } => fetched_at_unix,
-                DescriptorSource::AdapterStatic | DescriptorSource::Curated | DescriptorSource::LegacyIdOnly => 0,
-            })
-        {
-            descriptor.operations.clone_from(&found.operations);
-            descriptor.features = found.features.clone();
-            descriptor.context_window = found.context_window;
-            descriptor.source = found.source;
-        }
+            .max_by_key(|found| match &found.source {
+                DescriptorSource::Discovery { fetched_at_unix } => *fetched_at_unix,
+                DescriptorSource::AdapterStatic
+                | DescriptorSource::Catalog { .. }
+                | DescriptorSource::Curated
+                | DescriptorSource::LegacyIdOnly => 0,
+            });
 
         // Provider-wide declarations first, then the model's own, so a
         // model-scoped field overrides the provider-wide one.
@@ -279,31 +351,62 @@ impl CatalogView {
             curated.tool_schema = entry.tool_schema.or(curated.tool_schema);
             curated.context_window = entry.context_window.or(curated.context_window);
         }
-        if declared.iter().any(|entry| entry.describes_capabilities()) {
-            if let Some(listed) = &curated.operations {
-                for operation in ModelOperation::ALL {
-                    let declared = if listed.contains(&operation) {
-                        Support::Supported
-                    } else {
-                        Support::unsupported(NOT_DECLARED)
-                    };
-                    let current = descriptor.operation(operation);
-                    descriptor.operations.insert(operation, current.and(declared));
+        let has_capability_declaration = declared.iter().any(|entry| entry.describes_capabilities());
+        let declared_features = FeatureSet {
+            native_tools: Support::from_declared(curated.native_tools, "declared without native tools"),
+            vision_input: Support::from_declared(curated.vision_input, "declared without image input"),
+            streaming: Support::from_declared(curated.streaming, "declared without streaming"),
+            structured_output: Support::from_declared(curated.structured_output, "declared without structured output"),
+        };
+        for operation in ModelOperation::ALL {
+            let catalog = descriptor.operation(operation);
+            let discovered = found.map_or(Support::Unknown, |found| found.operation(operation));
+            let declared = curated.operations.as_ref().map_or(Support::Unknown, |listed| {
+                if listed.contains(&operation) {
+                    Support::Supported
+                } else {
+                    Support::unsupported(NOT_DECLARED)
                 }
-            }
-            let declared_features = FeatureSet {
-                native_tools: Support::from_declared(curated.native_tools, "declared without native tools"),
-                vision_input: Support::from_declared(curated.vision_input, "declared without image input"),
-                streaming: Support::from_declared(curated.streaming, "declared without streaming"),
-                structured_output: Support::from_declared(
-                    curated.structured_output,
-                    "declared without structured output",
-                ),
-            };
-            descriptor.features = descriptor.features.and(declared_features);
-            descriptor.source = DescriptorSource::Curated;
+            });
+            descriptor
+                .operations
+                .insert(operation, choose_capability(catalog, discovered, declared));
         }
-        descriptor.context_window = curated.context_window.or(descriptor.context_window);
+        for feature in Feature::ALL {
+            let catalog = descriptor.features.get(feature).clone();
+            let discovered = found.map_or(Support::Unknown, |found| found.features.get(feature).clone());
+            let declared = declared_features.get(feature).clone();
+            *descriptor.features.slot(feature) = choose_capability(catalog, discovered, declared);
+        }
+        descriptor.context_window = curated
+            .context_window
+            .or_else(|| found.and_then(|found| found.context_window))
+            .or(descriptor.context_window);
+
+        let discovery_has_negative = found.is_some_and(|found| {
+            ModelOperation::ALL
+                .into_iter()
+                .any(|operation| found.operation(operation).is_unsupported())
+                || Feature::ALL
+                    .into_iter()
+                    .any(|feature| found.features.get(feature).is_unsupported())
+        });
+        let discovery_has_evidence = found.is_some_and(|found| {
+            found.context_window.is_some()
+                || ModelOperation::ALL
+                    .into_iter()
+                    .any(|operation| !matches!(found.operation(operation), Support::Unknown))
+                || Feature::ALL
+                    .into_iter()
+                    .any(|feature| !matches!(found.features.get(feature), Support::Unknown))
+        });
+        if discovery_has_negative {
+            descriptor.source = found.map_or(DescriptorSource::LegacyIdOnly, |found| found.source.clone());
+        } else if has_capability_declaration {
+            descriptor.source = DescriptorSource::Curated;
+        } else if discovery_has_evidence {
+            descriptor.source = found.map_or(DescriptorSource::LegacyIdOnly, |found| found.source.clone());
+        }
 
         for operation in ModelOperation::ALL {
             let current = descriptor.operation(operation);
@@ -325,6 +428,41 @@ impl CatalogView {
             }
         }
         descriptor
+    }
+
+    /// Intersect a concrete adapter's ceiling with the effective model facts.
+    #[must_use]
+    pub fn effective_provider_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        adapter: crate::providers::ProviderCapabilities,
+    ) -> crate::providers::ProviderCapabilities {
+        let descriptor = self.describe(&ProviderId::of(provider), model);
+        let effective = |feature: Feature, ceiling: bool| match descriptor.features.get(feature) {
+            Support::Supported => ceiling,
+            Support::Unsupported(_) => false,
+            Support::Unknown => ceiling,
+        };
+        crate::providers::ProviderCapabilities {
+            native_tool_calling: effective(Feature::NativeTools, adapter.native_tool_calling),
+            vision: effective(Feature::VisionInput, adapter.vision),
+        }
+    }
+}
+
+/// Apply the catalog evidence precedence for one operation or feature.
+fn choose_capability(catalog: Support, discovered: Support, declared: Support) -> Support {
+    match discovered {
+        Support::Unsupported(reason) => Support::Unsupported(reason),
+        Support::Supported => match declared {
+            Support::Unknown => Support::Supported,
+            declared => declared,
+        },
+        Support::Unknown => match declared {
+            Support::Unknown => catalog,
+            declared => declared,
+        },
     }
 }
 

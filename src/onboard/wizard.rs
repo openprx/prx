@@ -22,7 +22,7 @@ use crate::providers::{
 };
 use anyhow::{Context, Result, bail};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -234,6 +234,10 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         style(spec.name()).cyan()
     );
 
+    if let Some((decision, Some(_))) = &decision {
+        decision.ensure_hosted_credential_free(&config.config_path)?;
+    }
+
     // The chosen default is an operator selection (D-034): a model the
     // evidence rules out is refused before anything is written; an
     // unverified one is accepted with a warning.
@@ -250,8 +254,13 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     persist_workspace_selection(&config.config_path).await?;
 
     // ── Decision plane: the shared setup service, then a local test ──
-    if let Some(decision) = &decision {
-        decision.apply(config.clone()).await?;
+    if let Some((decision, secret)) = decision {
+        match secret {
+            Some(secret) => print!("{}", decision.apply_hosted(config.clone(), secret).await?),
+            None => {
+                decision.apply(config.clone()).await?;
+            }
+        }
         let written = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
         let outcome = crate::causal_cli::test_configured_locally(&written).await?;
         println!(
@@ -687,414 +696,98 @@ fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> R
                     unproven.join(", ")
                 );
             }
+            if let Ok(release) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                && let Some(model) = release.model(
+                    &crate::providers::ProviderId::of(resolved.provider_label()),
+                    resolved.model(),
+                )
+                && model_has_no_billing_tariff(resolved.provider_label(), model, &config.cost)
+            {
+                println!(
+                    "  {} model '{}' has no published token tariff; add an exact `[cost.prices]` entry before \
+                     cost-admitted use.",
+                    style("!").yellow().bold(),
+                    resolved.model()
+                );
+            }
             Ok(())
         }
         Err(refusal) => bail!("{refusal}. Nothing was written."),
     }
 }
 
-/// Pick a sensible default model for the given provider.
-fn default_model_for_provider(provider: &str) -> String {
-    match canonical_provider_name(provider) {
-        "anthropic" => "claude-sonnet-5".into(),
-        "openrouter" => "anthropic/claude-sonnet-5".into(),
-        "openai" => "gpt-5.6".into(),
-        "openai-codex" => "gpt-5.2-codex".into(),
-        "venice" => "zai-org-glm-5".into(),
-        "groq" => "llama-3.3-70b-versatile".into(),
-        "mistral" => "mistral-large-latest".into(),
-        "deepseek" => "deepseek-chat".into(),
-        "xai" => "grok-4.20".into(),
-        "perplexity" => "sonar-pro".into(),
-        "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
-        "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-        "cohere" => "command-a-03-2025".into(),
-        "moonshot" => "kimi-k2.5".into(),
-        "glm" | "zai" => "glm-5".into(),
-        "minimax" => "MiniMax-M2.5".into(),
-        "qwen" => "qwen3.7-plus".into(),
-        "qwen-code" => "qwen3-coder-plus".into(),
-        "ollama" => "llama3.2".into(),
-        "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "gemini" => "gemini-3.5-flash".into(),
-        "kimi-code" => "k3".into(),
-        "bedrock" => "anthropic.claude-sonnet-5".into(),
-        "copilot" => "gpt-5.4".into(),
-        "litellm" => "default".into(),
-        "vllm" | "huggingface" | "compatible" => "default".into(),
-        "nvidia" => "meta/llama-3.3-70b-instruct".into(),
-        "astrai" => "anthropic/claude-sonnet-4.6".into(),
-        _ => "anthropic/claude-sonnet-5".into(),
+fn model_has_no_billing_tariff(
+    provider: &str,
+    model: &crate::providers::catalog::ReleaseModel,
+    cost: &crate::config::schema::CostConfig,
+) -> bool {
+    matches!(
+        crate::llm::route_decision::usage_cost_resolution(provider, &model.api_model, 1, 1, 0, 0, cost,),
+        crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid
+    )
+}
+
+fn onboarding_model_warning(provider: &str, model: &crate::providers::catalog::ReleaseModel) -> Option<String> {
+    let lifecycle = model.selection_warning();
+    let pricing = model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
+        .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned());
+    match (lifecycle, pricing) {
+        (Some(lifecycle), Some(pricing)) => Some(format!("{lifecycle}; {pricing}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
     }
 }
 
-fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
-    match canonical_provider_name(provider_name) {
-        "openrouter" => vec![
-            (
-                "anthropic/claude-sonnet-5".to_string(),
-                "Claude Sonnet 5 (balanced, recommended)".to_string(),
-            ),
-            ("openai/gpt-5.6".to_string(), "GPT-5.6 (latest flagship)".to_string()),
-            (
-                "openai/gpt-5-mini".to_string(),
-                "GPT-5 mini (fast, cost-efficient)".to_string(),
-            ),
-            (
-                "google/gemini-3.5-flash".to_string(),
-                "Gemini 3.5 Flash (stable agentic model)".to_string(),
-            ),
-            (
-                "x-ai/grok-4.20".to_string(),
-                "Grok 4.20 (reasoning + tools)".to_string(),
-            ),
-            (
-                "deepseek/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (agentic + affordable)".to_string(),
-            ),
-            (
-                "meta-llama/llama-4-maverick".to_string(),
-                "Llama 4 Maverick (open model)".to_string(),
-            ),
-        ],
-        "anthropic" => vec![
-            (
-                "claude-sonnet-5".to_string(),
-                "Claude Sonnet 5 (balanced, recommended)".to_string(),
-            ),
-            (
-                "claude-opus-4-8".to_string(),
-                "Claude Opus 4.8 (best quality)".to_string(),
-            ),
-            (
-                "claude-haiku-4-5-20251001".to_string(),
-                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
-            ),
-        ],
-        "openai" => vec![
-            ("gpt-5.6".to_string(), "GPT-5.6 (latest agentic flagship)".to_string()),
-            ("gpt-5.6-terra".to_string(), "GPT-5.6 Terra (balanced)".to_string()),
-            (
-                "gpt-5.6-luna".to_string(),
-                "GPT-5.6 Luna (fast, cost-efficient)".to_string(),
-            ),
-            (
-                "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (agentic coding)".to_string(),
-            ),
-        ],
-        "openai-codex" => vec![
-            (
-                "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (recommended agentic coding)".to_string(),
-            ),
-            ("gpt-5-codex".to_string(), "GPT-5 Codex (stable fallback)".to_string()),
-            ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
-        ],
-        "venice" => vec![
-            (
-                "zai-org-glm-5".to_string(),
-                "GLM-5 via Venice (agentic flagship)".to_string(),
-            ),
-            (
-                "claude-sonnet-4-6".to_string(),
-                "Claude Sonnet 4.6 via Venice (best quality)".to_string(),
-            ),
-            (
-                "deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 via Venice (strong value)".to_string(),
-            ),
-            (
-                "grok-41-fast".to_string(),
-                "Grok 4.1 Fast via Venice (low latency)".to_string(),
-            ),
-        ],
-        "groq" => vec![
-            (
-                "llama-3.3-70b-versatile".to_string(),
-                "Llama 3.3 70B (fast, recommended)".to_string(),
-            ),
-            (
-                "openai/gpt-oss-120b".to_string(),
-                "GPT-OSS 120B (strong open-weight)".to_string(),
-            ),
-            (
-                "openai/gpt-oss-20b".to_string(),
-                "GPT-OSS 20B (cost-efficient open-weight)".to_string(),
-            ),
-        ],
-        "mistral" => vec![
-            (
-                "mistral-large-latest".to_string(),
-                "Mistral Large (latest flagship)".to_string(),
-            ),
-            (
-                "mistral-medium-latest".to_string(),
-                "Mistral Medium (balanced)".to_string(),
-            ),
-            ("codestral-latest".to_string(), "Codestral (code-focused)".to_string()),
-            (
-                "devstral-latest".to_string(),
-                "Devstral (software engineering specialist)".to_string(),
-            ),
-        ],
-        "deepseek" => vec![
-            (
-                "deepseek-chat".to_string(),
-                "DeepSeek Chat (mapped to V3.2 non-thinking)".to_string(),
-            ),
-            (
-                "deepseek-reasoner".to_string(),
-                "DeepSeek Reasoner (mapped to V3.2 thinking)".to_string(),
-            ),
-        ],
-        "xai" => vec![
-            (
-                "grok-4.20".to_string(),
-                "Grok 4.20 (recommended reasoning alias)".to_string(),
-            ),
-            (
-                "grok-4.20-non-reasoning-latest".to_string(),
-                "Grok 4.20 Non-Reasoning (low latency)".to_string(),
-            ),
-            (
-                "grok-code-fast-1".to_string(),
-                "Grok Code Fast 1 (coding specialist)".to_string(),
-            ),
-            ("grok-4".to_string(), "Grok 4 (max quality)".to_string()),
-        ],
-        "perplexity" => vec![
-            (
-                "sonar-pro".to_string(),
-                "Sonar Pro (flagship web-grounded model)".to_string(),
-            ),
-            (
-                "sonar-reasoning-pro".to_string(),
-                "Sonar Reasoning Pro (complex multi-step reasoning)".to_string(),
-            ),
-            (
-                "sonar-deep-research".to_string(),
-                "Sonar Deep Research (long-form research)".to_string(),
-            ),
-            ("sonar".to_string(), "Sonar (search, fast)".to_string()),
-        ],
-        "fireworks" => vec![
-            (
-                "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
-                "Llama 3.3 70B".to_string(),
-            ),
-            (
-                "accounts/fireworks/models/mixtral-8x22b-instruct".to_string(),
-                "Mixtral 8x22B".to_string(),
-            ),
-        ],
-        "together-ai" => vec![
-            (
-                "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
-                "Llama 3.3 70B Instruct Turbo (recommended)".to_string(),
-            ),
-            (
-                "moonshotai/Kimi-K2.5".to_string(),
-                "Kimi K2.5 (reasoning + coding)".to_string(),
-            ),
-            (
-                "deepseek-ai/DeepSeek-V3.1".to_string(),
-                "DeepSeek V3.1 (strong value)".to_string(),
-            ),
-        ],
-        "cohere" => vec![
-            (
-                "command-a-03-2025".to_string(),
-                "Command A (flagship enterprise model)".to_string(),
-            ),
-            (
-                "command-a-reasoning-08-2025".to_string(),
-                "Command A Reasoning (agentic reasoning)".to_string(),
-            ),
-            (
-                "command-r-08-2024".to_string(),
-                "Command R (stable fast baseline)".to_string(),
-            ),
-        ],
-        "kimi-code" => vec![
-            ("k3".to_string(), "Kimi K3 (latest, live-verified default)".to_string()),
-            (
-                "kimi-for-coding-highspeed".to_string(),
-                "Kimi for Coding Highspeed (K2.7, faster inference)".to_string(),
-            ),
-            (
-                "kimi-for-coding".to_string(),
-                "Kimi for Coding (official coding-agent model)".to_string(),
-            ),
-        ],
-        "moonshot" => vec![
-            (
-                "kimi-k2.5".to_string(),
-                "Kimi K2.5 (latest flagship, recommended)".to_string(),
-            ),
-            (
-                "kimi-k2-thinking".to_string(),
-                "Kimi K2 Thinking (deep reasoning + tool use)".to_string(),
-            ),
-            (
-                "kimi-k2-0905-preview".to_string(),
-                "Kimi K2 0905 Preview (strong coding)".to_string(),
-            ),
-        ],
-        "glm" | "zai" => vec![
-            ("glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
-            (
-                "glm-4.7".to_string(),
-                "GLM-4.7 (strong general-purpose quality)".to_string(),
-            ),
-            ("glm-4.5-air".to_string(), "GLM-4.5 Air (lower latency)".to_string()),
-        ],
-        "minimax" => vec![
-            ("MiniMax-M2.5".to_string(), "MiniMax M2.5 (latest flagship)".to_string()),
-            (
-                "MiniMax-M2.5-highspeed".to_string(),
-                "MiniMax M2.5 High-Speed (fast)".to_string(),
-            ),
-            (
-                "MiniMax-M2.1".to_string(),
-                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
-            ),
-        ],
-        "qwen" => vec![
-            ("qwen3.7-max".to_string(), "Qwen 3.7 Max (highest quality)".to_string()),
-            (
-                "qwen3.7-plus".to_string(),
-                "Qwen 3.7 Plus (balanced default)".to_string(),
-            ),
-            (
-                "qwen3.6-flash".to_string(),
-                "Qwen 3.6 Flash (fast and cost-efficient)".to_string(),
-            ),
-        ],
-        "qwen-code" => vec![
-            (
-                "qwen3-coder-plus".to_string(),
-                "Qwen3 Coder Plus (recommended for coding workflows)".to_string(),
-            ),
-            (
-                "qwen3.5-plus".to_string(),
-                "Qwen3.5 Plus (reasoning + coding)".to_string(),
-            ),
-            (
-                "qwen3-max-2026-01-23".to_string(),
-                "Qwen3 Max (high-capability coding model)".to_string(),
-            ),
-        ],
-        "nvidia" => vec![
-            (
-                "meta/llama-3.3-70b-instruct".to_string(),
-                "Llama 3.3 70B Instruct (balanced default)".to_string(),
-            ),
-            (
-                "deepseek-ai/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (advanced reasoning + coding)".to_string(),
-            ),
-            (
-                "nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string(),
-                "Llama 3.3 Nemotron Super 49B v1.5 (NVIDIA-tuned)".to_string(),
-            ),
-            (
-                "nvidia/llama-3.1-nemotron-ultra-253b-v1".to_string(),
-                "Llama 3.1 Nemotron Ultra 253B v1 (max quality)".to_string(),
-            ),
-        ],
-        "astrai" => vec![
-            (
-                "anthropic/claude-sonnet-4.6".to_string(),
-                "Claude Sonnet 4.6 (balanced default)".to_string(),
-            ),
-            ("openai/gpt-5.2".to_string(), "GPT-5.2 (latest flagship)".to_string()),
-            (
-                "deepseek/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (agentic + affordable)".to_string(),
-            ),
-            ("z-ai/glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
-        ],
-        "ollama" => vec![
-            ("llama3.2".to_string(), "Llama 3.2 (recommended local)".to_string()),
-            ("mistral".to_string(), "Mistral 7B".to_string()),
-            ("codellama".to_string(), "Code Llama".to_string()),
-            ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
-        ],
-        "llamacpp" => vec![
-            (
-                "ggml-org/gpt-oss-20b-GGUF".to_string(),
-                "GPT-OSS 20B GGUF (llama.cpp server example)".to_string(),
-            ),
-            (
-                "bartowski/Llama-3.3-70B-Instruct-GGUF".to_string(),
-                "Llama 3.3 70B GGUF (high quality)".to_string(),
-            ),
-            (
-                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_string(),
-                "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
-            ),
-        ],
-        "bedrock" => vec![
-            (
-                "anthropic.claude-sonnet-5".to_string(),
-                "Claude Sonnet 5 (latest, recommended)".to_string(),
-            ),
-            (
-                "anthropic.claude-opus-4-8".to_string(),
-                "Claude Opus 4.8 (strongest)".to_string(),
-            ),
-            (
-                "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
-                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
-            ),
-            (
-                "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
-                "Claude Sonnet 4.5".to_string(),
-            ),
-        ],
-        "gemini" => vec![
-            (
-                "gemini-3.5-flash".to_string(),
-                "Gemini 3.5 Flash (stable, recommended)".to_string(),
-            ),
-            (
-                "gemini-3.1-pro-preview".to_string(),
-                "Gemini 3.1 Pro Preview (frontier reasoning)".to_string(),
-            ),
-            (
-                "gemini-3.1-flash-lite".to_string(),
-                "Gemini 3.1 Flash-Lite (lowest cost)".to_string(),
-            ),
-        ],
-        "copilot" => vec![
-            ("gpt-5.4".to_string(), "GPT-5.4 (recommended)".to_string()),
-            (
-                "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (coding specialist)".to_string(),
-            ),
-            (
-                "claude-sonnet-4.6".to_string(),
-                "Claude Sonnet 4.6 (balanced alternative)".to_string(),
-            ),
-        ],
-        "litellm" => vec![(
-            "default".to_string(),
-            "Use a model or alias exposed by the LiteLLM proxy".to_string(),
-        )],
-        "vllm" => vec![(
-            "default".to_string(),
-            "Use the served model ID returned by /v1/models".to_string(),
-        )],
-        "huggingface" => vec![(
-            "default".to_string(),
-            "Use a model ID returned by the Hugging Face router".to_string(),
-        )],
-        "compatible" => vec![(
-            "default".to_string(),
-            "Use a model ID exposed by the configured OpenAI-compatible endpoint".to_string(),
-        )],
-        _ => vec![("default".to_string(), "Default model".to_string())],
+/// Pick a sensible default model for the given provider.
+fn default_model_for_provider(provider: &str) -> String {
+    let provider = canonical_provider_name(provider);
+    match crate::providers::catalog::ReleaseCatalog::embedded() {
+        Ok(catalog) => catalog
+            .default_model(provider)
+            .or_else(|| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.id == catalog.defaults.model)
+                    .map(|model| model.api_model.as_str())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_string()),
+        Err(error) => {
+            tracing::error!(error = %error, "embedded model catalog is invalid");
+            crate::providers::selection::default_model_for_unset().to_string()
+        }
+    }
+}
+
+fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+    let provider = canonical_provider_name(provider_name);
+    match crate::providers::catalog::ReleaseCatalog::embedded() {
+        Ok(catalog) => catalog
+            .listed_models(provider)
+            .into_iter()
+            .map(|model| {
+                let label = onboarding_model_warning(provider, model).map_or_else(
+                    || model.display_name.clone(),
+                    |warning| format!("{} ({warning})", model.display_name),
+                );
+                (model.api_model.clone(), label)
+            })
+            .collect(),
+        Err(error) => {
+            tracing::error!(error = %error, "embedded model catalog is invalid");
+            Vec::new()
+        }
+    }
+}
+
+fn prioritize_default_model(provider_name: &str, models: &mut Vec<(String, String)>) {
+    let default = default_model_for_provider(provider_name);
+    if let Some(index) = models.iter().position(|(model, _)| model == &default)
+        && index != 0
+    {
+        let entry = models.remove(index);
+        models.insert(0, entry);
     }
 }
 
@@ -1342,21 +1035,20 @@ fn fetch_live_models_for_provider(
                 // Key is None or empty, assume local Ollama
                 fetch_ollama_models()?
             } else {
-                // Key is present, assume Ollama Cloud and return hardcoded list
-                [
-                    "glm-5:cloud",
-                    "glm-4.7:cloud",
-                    "gpt-oss:cloud",
-                    "gemini-3-flash-preview:cloud",
-                    "qwen2.5-coder:1.5b",
-                    "qwen2.5-coder:3b",
-                    "qwen2.5:cloud",
-                    "minimax-m2.5:cloud",
-                    "deepseek-v3.1:cloud",
-                ]
-                .into_iter()
-                .map(DiscoveredModel::id_only)
-                .collect()
+                // Ollama Cloud does not expose a model-list endpoint. Its
+                // release-owned fallback comes from the same catalog as every
+                // other offline model surface.
+                let mut models = crate::providers::catalog::ReleaseCatalog::embedded()
+                    .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?
+                    .listed_models("ollama")
+                    .into_iter()
+                    .map(|model| DiscoveredModel::id_only(&model.api_model))
+                    .collect::<Vec<_>>();
+                // The credential means this is Ollama Cloud discovery. Keep
+                // the release catalog as the source, but offer hosted ids
+                // before local-only defaults.
+                models.sort_by_key(|model| !model.id.ends_with(":cloud"));
+                models
             }
         }
         _ => {
@@ -1408,7 +1100,7 @@ struct DiscoveryConnection<'a> {
 /// probed with its own auth profile (or its own environment variable, read by
 /// the fetcher), or without a credential.
 fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
-    let configured_provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let configured_provider = crate::providers::selection::default_provider(config);
     let root = crate::providers::configured_connection_for(
         provider_name,
         configured_provider,
@@ -1521,11 +1213,31 @@ fn humanize_age(age_secs: u64) -> String {
     }
 }
 
-fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+    let provider_name = canonical_provider_name(provider_name);
+    let provider = crate::providers::ProviderId::of(provider_name);
+    let release = crate::providers::catalog::ReleaseCatalog::embedded().ok();
+    build_model_options_with_warnings(model_ids, source, |model_id| {
+        release
+            .as_ref()
+            .and_then(|catalog| catalog.model(&provider, model_id))
+            .and_then(|model| onboarding_model_warning(provider_name, model))
+    })
+}
+
+fn build_model_options_with_warnings(
+    model_ids: Vec<String>,
+    source: &str,
+    mut warning_for: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     model_ids
         .into_iter()
         .map(|model_id| {
-            let label = format!("{model_id} ({source})");
+            let warning = warning_for(&model_id);
+            let label = warning.map_or_else(
+                || format!("{model_id} ({source})"),
+                |warning| format!("{model_id} ({source}; {warning})"),
+            );
             (model_id, label)
         })
         .collect()
@@ -1551,6 +1263,7 @@ fn apply_wizard_model_fetch(
             let fetched_count = live_model_ids.len();
             let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
             *live_options = Some(build_model_options(
+                provider_name,
                 live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                 "live",
             ));
@@ -1567,6 +1280,7 @@ fn apply_wizard_model_fetch(
             {
                 stale_age_secs = Some(stale.age_secs);
                 *live_options = Some(build_model_options(
+                    provider_name,
                     stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "stale-cache",
                 ));
@@ -1608,7 +1322,9 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
             .ok()
             .flatten()
     });
-    let curated = curated_models_for_provider(&canonical);
+    let release_catalog = crate::providers::catalog::ReleaseCatalog::embedded()
+        .map_err(|error| anyhow::anyhow!("embedded model catalog is invalid: {error}"))?;
+    let catalog_models = catalog_models_for_provider(&canonical);
 
     println!("Model catalog for '{}':", shown);
     if provider_override.is_none() {
@@ -1626,15 +1342,18 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
         if cached.models.len() > MODEL_PREVIEW_LIMIT {
             println!("  Tip: use `prx models refresh --provider {shown} --force` to refresh this cache.");
         }
-    } else if !curated.is_empty() {
-        println!("  Source: curated defaults (no live cache found)");
-        println!("  Models: {}", curated.len());
-        for (model, label) in curated.iter().take(MODEL_PREVIEW_LIMIT) {
+    } else if !catalog_models.is_empty() {
+        println!(
+            "  Source: embedded release catalog {} (no live cache found)",
+            release_catalog.revision
+        );
+        println!("  Models: {}", catalog_models.len());
+        for (model, label) in catalog_models.iter().take(MODEL_PREVIEW_LIMIT) {
             println!("  {} {model} — {label}", style("-"));
         }
         println!("  Tip: run `prx models refresh --provider {shown}` to cache a live catalog when supported.");
     } else {
-        println!("  No cached or curated models found.");
+        println!("  No cached or embedded models found.");
         println!(
             "  Tip: run `prx providers` to see supported providers, then `prx models refresh --provider <provider>`."
         );
@@ -1852,6 +1571,18 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     );
 
     Ok((workspace_dir, config_path))
+}
+
+/// The `config.toml` path quick setup writes for `config_dir`.
+///
+/// # Errors
+///
+/// When no home directory can be found.
+pub fn quick_setup_config_path(config_dir: Option<&str>) -> Result<PathBuf> {
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
+    Ok(config_dir
+        .map_or_else(|| default_user_config_dir(&home), PathBuf::from)
+        .join("config.toml"))
 }
 
 fn default_user_config_dir(home: &Path) -> PathBuf {
@@ -2252,7 +1983,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
     // ── Model selection ──
     let canonical_provider = canonical_provider_name(provider_name);
-    let mut model_options: Vec<(String, String)> = curated_models_for_provider(canonical_provider);
+    let mut model_options: Vec<(String, String)> = catalog_models_for_provider(canonical_provider);
 
     let mut live_options: Option<Vec<(String, String)>> = None;
 
@@ -2274,6 +2005,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 ));
 
                 live_options = Some(build_model_options(
+                    provider_name,
                     cached.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "cached",
                 ));
@@ -2321,7 +2053,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 }
             }
         } else {
-            print_bullet("No API key detected, so using curated model list.");
+            print_bullet("No API key detected, so using the embedded release catalog.");
             print_bullet("Tip: add an API key and rerun onboarding to fetch live models.");
         }
     }
@@ -2349,6 +2081,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "Provider default model".to_string(),
         ));
     }
+    prioritize_default_model(provider_name, &mut model_options);
 
     model_options.push((
         CUSTOM_MODEL_SENTINEL.to_string(),
@@ -2410,7 +2143,7 @@ fn quick_summary_provider_line(config: &Config) -> String {
     format!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        crate::providers::redact_endpoint_userinfo(config.default_provider.as_deref().unwrap_or("openrouter"))
+        crate::providers::redact_endpoint_userinfo(crate::providers::selection::default_provider(config))
     )
 }
 
@@ -2748,16 +2481,22 @@ fn setup_memory() -> Result<MemoryConfig> {
 /// decision on this machine and changes nothing. A local System One
 /// endpoint is checked by the one decision check before anything is
 /// written, and tested locally once the configuration is written. A hosted
-/// service needs a credential and sends decision state off the machine, so
-/// it is set up with `prx causal config` after onboarding.
-fn setup_decision_plane() -> Result<Option<crate::causal_cli::DecisionSetup>> {
+/// service needs a credential: it is read hidden, stored as a credential
+/// reference and referenced in the same setup; remote processing stays off
+/// until `prx causal config enable-remote`.
+fn setup_decision_plane() -> Result<
+    Option<(
+        crate::causal_cli::DecisionSetup,
+        Option<crate::config::manage::credentials::SecretString>,
+    )>,
+> {
     print_bullet("The decision plane chooses between candidate actions before the model answers.");
     print_bullet("The builtin decides locally; nothing is sent anywhere.");
     println!();
     let options = [
         "Builtin (default): decisions stay on this machine",
         "A local System One endpoint (loopback)",
-        "A hosted service (TypeSafe or OpenRouter): set up after onboarding",
+        "A hosted service (TypeSafe or OpenRouter): needs a credential; remote stays off until enabled",
     ];
     let choice = Select::new()
         .with_prompt("  Decision backend")
@@ -2781,23 +2520,50 @@ fn setup_decision_plane() -> Result<Option<crate::causal_cli::DecisionSetup>> {
                 enable,
             };
             setup.check()?;
-            Ok(Some(setup))
+            Ok(Some((setup, None)))
         }
         2 => {
-            print_bullet("A hosted service receives decision state off this machine and needs a credential.");
-            for kind in [
+            print_bullet("A hosted service needs a credential. Decision state is sent to it only after you run");
+            print_bullet("`prx causal config enable-remote`; until then the builtin decides locally.");
+            let kinds = [
                 crate::decision::BackendKind::TypeSafe,
                 crate::decision::BackendKind::OpenRouter,
-            ] {
-                if let Some(owner) = crate::causal_cli::hosted_owner(kind) {
-                    print_bullet(&crate::causal_cli::hosted_setup_steps(kind, owner, None));
-                }
-            }
-            print_bullet(
-                "Each change prints its plan; apply it with --yes (and --confirm-high-risk <REVISION> when it \
-                 asks), then `prx causal config enable-remote`; `prx causal test --live` asks the service once.",
+            ];
+            let kind_labels = ["TypeSafe", "OpenRouter (Decisions API)"];
+            let kind = Select::new()
+                .with_prompt("  Hosted service")
+                .items(&kind_labels)
+                .default(0)
+                .interact()?;
+            let kind = kinds
+                .get(kind)
+                .copied()
+                .unwrap_or(crate::decision::BackendKind::TypeSafe);
+            let model: String = Input::new().with_prompt("  Model, one exact version").interact_text()?;
+            let enable = Confirm::new()
+                .with_prompt("  Turn the decision plane on now?")
+                .default(true)
+                .interact()?;
+            let secret = crate::config::manage::credentials::SecretString::new(
+                Password::new()
+                    .with_prompt("  Service credential (input hidden)")
+                    .interact()?,
             );
-            Ok(None)
+            if secret.expose().trim().is_empty() {
+                println!(
+                    "  {} No credential entered; the hosted backend is not set up.",
+                    style("→").dim()
+                );
+                return Ok(None);
+            }
+            let setup = crate::causal_cli::DecisionSetup {
+                kind,
+                endpoint: None,
+                model: Some(model.trim().to_string()),
+                enable,
+            };
+            setup.check_hosted()?;
+            Ok(Some((setup, Some(secret))))
         }
         _ => Ok(None),
     }
@@ -4718,7 +4484,7 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = crate::providers::selection::default_provider(config);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if provider == "openai-codex" {
             println!(
@@ -4861,7 +4627,7 @@ mod tests {
         assert_eq!(config.default_provider.as_deref(), Some("llamacpp"));
         let model = config.default_model.unwrap_or_default();
         assert_eq!(model, default_model_for_provider("llamacpp"));
-        for (curated, _) in curated_models_for_provider("llamacpp") {
+        for (curated, _) in catalog_models_for_provider("llamacpp") {
             crate::providers::validate_provider_model("llamacpp", &curated)
                 .unwrap_or_else(|error| panic!("curated llama.cpp model {curated} is refused: {error:#}"));
         }
@@ -5398,8 +5164,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_openai_include_latest_choices() {
-        let ids: Vec<String> = curated_models_for_provider("openai")
+    fn catalog_models_for_openai_include_latest_choices() {
+        let ids: Vec<String> = catalog_models_for_provider("openai")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5409,8 +5175,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_glm_removes_deprecated_flash_plus_aliases() {
-        let ids: Vec<String> = curated_models_for_provider("glm")
+    fn catalog_models_for_glm_removes_deprecated_flash_plus_aliases() {
+        let ids: Vec<String> = catalog_models_for_provider("glm")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5423,8 +5189,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_openai_codex_include_codex_family() {
-        let ids: Vec<String> = curated_models_for_provider("openai-codex")
+    fn catalog_models_for_openai_codex_include_codex_family() {
+        let ids: Vec<String> = catalog_models_for_provider("openai-codex")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5434,8 +5200,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_openrouter_use_valid_anthropic_id() {
-        let ids: Vec<String> = curated_models_for_provider("openrouter")
+    fn catalog_models_for_openrouter_use_valid_anthropic_id() {
+        let ids: Vec<String> = catalog_models_for_provider("openrouter")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5444,8 +5210,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_bedrock_include_verified_model_ids() {
-        let ids: Vec<String> = curated_models_for_provider("bedrock")
+    fn catalog_models_for_bedrock_include_verified_model_ids() {
+        let ids: Vec<String> = catalog_models_for_provider("bedrock")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5457,8 +5223,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_moonshot_drop_deprecated_aliases() {
-        let ids: Vec<String> = curated_models_for_provider("moonshot")
+    fn catalog_models_for_moonshot_drop_deprecated_aliases() {
+        let ids: Vec<String> = catalog_models_for_provider("moonshot")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5485,8 +5251,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_kimi_code_include_official_agent_model() {
-        let ids: Vec<String> = curated_models_for_provider("kimi-code")
+    fn catalog_models_for_kimi_code_include_official_agent_model() {
+        let ids: Vec<String> = catalog_models_for_provider("kimi-code")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5502,8 +5268,8 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_qwen_code_include_coding_plan_models() {
-        let ids: Vec<String> = curated_models_for_provider("qwen-code")
+    fn catalog_models_for_qwen_code_include_coding_plan_models() {
+        let ids: Vec<String> = catalog_models_for_provider("qwen-code")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5763,57 +5529,158 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_provider_aliases_share_same_catalog() {
-        assert_eq!(curated_models_for_provider("xai"), curated_models_for_provider("grok"));
+    fn catalog_provider_aliases_share_the_same_release_rows() {
+        assert_eq!(catalog_models_for_provider("xai"), catalog_models_for_provider("grok"));
         assert_eq!(
-            curated_models_for_provider("together-ai"),
-            curated_models_for_provider("together")
+            catalog_models_for_provider("together-ai"),
+            catalog_models_for_provider("together")
         );
         assert_eq!(
-            curated_models_for_provider("gemini"),
-            curated_models_for_provider("google")
+            catalog_models_for_provider("gemini"),
+            catalog_models_for_provider("google")
         );
         assert_eq!(
-            curated_models_for_provider("gemini"),
-            curated_models_for_provider("google-gemini")
+            catalog_models_for_provider("gemini"),
+            catalog_models_for_provider("google-gemini")
         );
         assert_eq!(
-            curated_models_for_provider("qwen"),
-            curated_models_for_provider("qwen-intl")
+            catalog_models_for_provider("qwen"),
+            catalog_models_for_provider("qwen-intl")
         );
         assert_eq!(
-            curated_models_for_provider("qwen"),
-            curated_models_for_provider("dashscope-us")
+            catalog_models_for_provider("qwen"),
+            catalog_models_for_provider("dashscope-us")
         );
         assert_eq!(
-            curated_models_for_provider("minimax"),
-            curated_models_for_provider("minimax-cn")
+            catalog_models_for_provider("minimax"),
+            catalog_models_for_provider("minimax-cn")
         );
         assert_eq!(
-            curated_models_for_provider("zai"),
-            curated_models_for_provider("zai-cn")
+            catalog_models_for_provider("zai"),
+            catalog_models_for_provider("zai-cn")
         );
         assert_eq!(
-            curated_models_for_provider("nvidia"),
-            curated_models_for_provider("nvidia-nim")
+            catalog_models_for_provider("nvidia"),
+            catalog_models_for_provider("nvidia-nim")
         );
         assert_eq!(
-            curated_models_for_provider("nvidia"),
-            curated_models_for_provider("build.nvidia.com")
+            catalog_models_for_provider("nvidia"),
+            catalog_models_for_provider("build.nvidia.com")
         );
         assert_eq!(
-            curated_models_for_provider("llamacpp"),
-            curated_models_for_provider("llama.cpp")
+            catalog_models_for_provider("llamacpp"),
+            catalog_models_for_provider("llama.cpp")
         );
         assert_eq!(
-            curated_models_for_provider("bedrock"),
-            curated_models_for_provider("aws-bedrock")
+            catalog_models_for_provider("bedrock"),
+            catalog_models_for_provider("aws-bedrock")
         );
     }
 
     #[test]
-    fn curated_models_for_nvidia_include_nim_catalog_entries() {
-        let ids: Vec<String> = curated_models_for_provider("nvidia")
+    fn catalog_and_live_options_preselect_the_release_default() {
+        for (provider, expected) in [
+            ("anthropic", "claude-sonnet-5"),
+            ("openai", "gpt-5.6"),
+            ("gemini", "gemini-3.5-flash"),
+            ("xai", "grok-4.20"),
+            ("mistral", "mistral-large-latest"),
+            ("ollama", "llama3.2"),
+        ] {
+            let catalog = catalog_models_for_provider(provider);
+            assert_eq!(catalog.first().map(|(model, _)| model.as_str()), Some(expected));
+
+            let mut live = vec![
+                ("alphabetical-first".to_string(), "First".to_string()),
+                (expected.to_string(), "Provider default".to_string()),
+            ];
+            prioritize_default_model(provider, &mut live);
+            assert_eq!(live.first().map(|(model, _)| model.as_str()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ollama_cloud_fallback_is_served_from_active_release_rows() {
+        let discovered = fetch_live_models_for_provider("ollama", "fixture-key", None)
+            .expect("test: embedded Ollama fallback must load");
+        let ids: Vec<_> = discovered.iter().map(|model| model.id.as_str()).collect();
+        assert!(ids.first().is_some_and(|model| model.ends_with(":cloud")));
+        assert!(ids.contains(&"glm-5:cloud"));
+        assert!(ids.contains(&"qwen2.5-coder:3b"));
+        assert!(!ids.contains(&"*"));
+    }
+
+    #[test]
+    fn model_options_label_deprecated_rows_without_hiding_them() {
+        let options = build_model_options_with_warnings(
+            vec!["prx-current".to_owned(), "prx-legacy".to_owned()],
+            "live",
+            |model| (model == "prx-legacy").then(|| "deprecated; use ollama/prx-current".to_owned()),
+        );
+        assert_eq!(
+            options,
+            vec![
+                ("prx-current".to_owned(), "prx-current (live)".to_owned()),
+                (
+                    "prx-legacy".to_owned(),
+                    "prx-legacy (live; deprecated; use ollama/prx-current)".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn onboarding_labels_catalog_rows_that_have_no_billing_tariff() {
+        for (provider, model) in [
+            ("openrouter", "deepseek/deepseek-v3.2"),
+            ("openrouter", "google/gemini-3.5-flash"),
+            ("openrouter", "meta-llama/llama-4-maverick"),
+            ("openrouter", "openai/gpt-5-mini"),
+            ("openrouter", "x-ai/grok-4.20"),
+            ("gemini", "gemini-3.5-flash"),
+            ("xai", "grok-4.20"),
+        ] {
+            let option = catalog_models_for_provider(provider)
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing onboarding row {provider}/{model}"));
+            assert!(option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        for model in ["anthropic/claude-sonnet-5", "openai/gpt-5.6"] {
+            let option = catalog_models_for_provider("openrouter")
+                .into_iter()
+                .find(|(id, _)| id == model)
+                .unwrap_or_else(|| panic!("missing priced upstream row {model}"));
+            assert!(!option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
+        }
+
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
+        let row = release
+            .model(
+                &crate::providers::ProviderId::of("openrouter"),
+                "deepseek/deepseek-v3.2",
+            )
+            .expect("unpriced onboarding row");
+        let mut cost = crate::config::schema::CostConfig::default();
+        cost.prices.insert(
+            "deepseek/deepseek-v3.2".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 0.1,
+                output: 0.2,
+                cache_write: 0.1,
+                cache_read: 0.01,
+            },
+        );
+        assert!(
+            !model_has_no_billing_tariff("openrouter", row, &cost),
+            "an exact operator override must clear the selected-model warning"
+        );
+    }
+
+    #[test]
+    fn catalog_models_for_nvidia_include_nim_entries() {
+        let ids: Vec<String> = catalog_models_for_provider("nvidia")
             .into_iter()
             .map(|(id, _)| id)
             .collect();

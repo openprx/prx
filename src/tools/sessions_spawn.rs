@@ -28,7 +28,6 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
-use crate::router::CompactionResolver;
 use crate::runtime::chat_sessions::{AssignPrincipal, Disposition};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -1295,8 +1294,10 @@ pub struct SessionsSpawnTool {
     /// processing (the channels JoinSet) would otherwise cause. Empty in unit
     /// tests / single-channel paths, where the shared `channel` fallback applies.
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
-    /// Provider for sub-agent LLM calls.
-    provider: Arc<dyn Provider>,
+    /// Test-only parent provider injected at the admitted-source seam. Child
+    /// providers always come from the production admitted binding.
+    #[cfg(test)]
+    test_parent_provider: Arc<dyn Provider>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.
@@ -1314,8 +1315,6 @@ pub struct SessionsSpawnTool {
     tools: Arc<ParentToolRegistry>,
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
-    /// Model-aware compaction resolver for sub-agent tool call loops.
-    compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     /// Credential issued for `provider_name` (the gateway provider): released
@@ -1332,11 +1331,6 @@ pub struct SessionsSpawnTool {
     default_route_source: Option<(String, providers::credentials::CredentialRef)>,
     fallback_api_key_owner: String,
     fallback_uses_root_connection: bool,
-    /// Reliability settings applied when a sub-agent overrides the provider.
-    ///
-    /// Without this the override path built a bare provider with no retry,
-    /// backoff or rate-limit handling at all — see [`Self::build_override_provider`].
-    reliability: crate::config::ReliabilityConfig,
     /// Pricing table used only for recording/displaying child-agent token cost.
     cost_config: crate::config::schema::CostConfig,
     /// Shared memory backend for normalized spawn lifecycle events.
@@ -1466,19 +1460,6 @@ mod credential_tests {
     }
 }
 
-/// How a task-mode child gets its provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChildProvider {
-    /// The spawning tool's own chain, built with the connection it was
-    /// configured with (credential, base URL and rotation keys together).
-    Gateway,
-    /// The parent is a routed hint, so its chain is not the configured root
-    /// connection even when a direct child names the root provider.
-    Root,
-    /// A fresh chain with this credential and no base URL.
-    Build { api_key: Option<String> },
-}
-
 /// One member of a fan-out, as it was launched.
 #[derive(Debug, Clone)]
 struct BatchMember {
@@ -1506,6 +1487,22 @@ struct BatchRoster {
 /// this field replaced — the pre-existing behaviour, not a new failure.
 const MAX_TRACKED_BATCH_ROSTERS: usize = 256;
 
+fn resolve_pinned_child_compaction(
+    config: &crate::config::Config,
+    catalog: &providers::catalog::CatalogView,
+    provider: &str,
+    model: &str,
+) -> crate::router::context::EffectiveCompactionConfig {
+    crate::router::context::resolve_effective_compaction_config_with_catalog(
+        &config.agent.compaction,
+        provider,
+        model,
+        &config.router,
+        &config.model_routes,
+        catalog,
+    )
+}
+
 impl SessionsSpawnTool {
     fn resolved_process_config_source(
         options: &providers::ProviderRuntimeOptions,
@@ -1531,7 +1528,8 @@ impl SessionsSpawnTool {
         Ok((config_dir, generation))
     }
 
-    /// Create a new `SessionsSpawnTool` with the given channel and provider.
+    /// Create a new `SessionsSpawnTool` with the given channel and provider
+    /// selection metadata. The admitted binding owns actual child providers.
     ///
     /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
     /// `active_runs` registry owned solely by this tool. Behaviour is identical to
@@ -1540,14 +1538,13 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         temperature: f64,
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
@@ -1555,6 +1552,7 @@ impl SessionsSpawnTool {
     ) -> Self {
         Self::new_with_registry(
             channel,
+            #[cfg(test)]
             provider,
             provider_name,
             model,
@@ -1562,7 +1560,6 @@ impl SessionsSpawnTool {
             security,
             workspace_dir,
             multimodal_config,
-            compaction_config,
             agents,
             fallback_api_key,
             provider_runtime_options,
@@ -1582,22 +1579,19 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_registry(
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         _temperature: f64,
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         _multimodal_config: MultimodalConfig,
-        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_api_key: Option<String>,
         _provider_runtime_options: providers::ProviderRuntimeOptions,
         _spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
-        let compaction_resolver = CompactionResolver::from_base(compaction_config);
-        tracing::debug!("sessions_spawn initialized child compaction resolver");
         let provider_name: String = provider_name.into();
         let configured_providers = providers::ConfiguredProviders::default()
             .with_providers(std::iter::once(provider_name.as_str()))
@@ -1607,7 +1601,8 @@ impl SessionsSpawnTool {
             #[cfg(test)]
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
-            provider,
+            #[cfg(test)]
+            test_parent_provider: provider,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,
@@ -1617,14 +1612,12 @@ impl SessionsSpawnTool {
             active_runs,
             tools: Arc::new(ParentToolRegistry::default()),
             workspace_dir,
-            compaction_resolver,
             configured_providers,
             model_catalog: Arc::default(),
             hint_config: None,
             default_route_source: None,
             agents: Arc::new(agents),
             fallback_api_key,
-            reliability: crate::config::ReliabilityConfig::default(),
             cost_config: crate::config::schema::CostConfig::default(),
             memory: None,
             source_fabric: None,
@@ -1707,11 +1700,6 @@ impl SessionsSpawnTool {
         Ok(self)
     }
 
-    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
-        self.compaction_resolver = resolver;
-        self
-    }
-
     #[must_use]
     pub fn with_cost_config(mut self, cost_config: crate::config::schema::CostConfig) -> Self {
         self.cost_config = cost_config;
@@ -1763,94 +1751,23 @@ impl SessionsSpawnTool {
         self
     }
 
-    /// Supply the deployment's reliability settings.
-    ///
-    /// Only consumed when a sub-agent overrides the provider and this tool has
-    /// to build a fresh chain; without it the retry budget falls back to
-    /// [`ReliabilityConfig::default`](crate::config::ReliabilityConfig::default)
-    /// rather than to "no retries at all".
-    #[must_use]
-    pub fn with_reliability(mut self, reliability: crate::config::ReliabilityConfig) -> Self {
-        self.reliability = reliability;
-        self
-    }
-
-    /// Reliability settings for a sub-agent that pinned its own provider.
-    ///
-    /// Retry budget, backoff and per-model fallbacks carry over unchanged; the
-    /// two chain-widening knobs are deliberately dropped:
-    ///
-    /// * `fallback_providers` — the caller named a provider on purpose (the
-    ///   canonical use is "audit this with a second, different model"), so
-    ///   silently serving the request from another vendor would defeat the
-    ///   request while looking like success.
-    /// * `api_keys` — those rotation credentials belong to the *gateway's*
-    ///   provider. Replaying them against a different vendor only buys a run of
-    ///   guaranteed 401s inside the retry budget.
-    fn override_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
-        crate::config::ReliabilityConfig {
-            fallback_providers: Vec::new(),
-            api_keys: Vec::new(),
-            ..base.clone()
-        }
-    }
-
-    /// Build the provider for a sub-agent that overrides the gateway provider.
-    ///
-    /// Goes through `create_resilient_provider_with_options` so the sub-agent
-    /// gets the retry loop, the exponential backoff, `Retry-After` handling, the
-    /// shared rate-limit gate and the aggregated `All providers/models failed`
-    /// diagnostics. The previous `create_provider_with_options` call returned a
-    /// **bare** provider: a single 429 killed the sub-agent in under a second,
-    /// with zero retries and an error message that carried no attempt trail.
-    fn build_override_provider(
-        provider_name: &str,
-        api_key: Option<&str>,
-        reliability: &crate::config::ReliabilityConfig,
-        options: &providers::ProviderRuntimeOptions,
-    ) -> anyhow::Result<Arc<dyn Provider>> {
-        let reliability = Self::override_reliability(reliability);
-        // `api_url` stays `None`: the gateway's base URL belongs to the gateway's
-        // provider, and pointing an overridden vendor at it would be wrong.
-        let provider =
-            providers::create_resilient_provider_with_options(provider_name, api_key, None, &reliability, options)?;
-        Ok(Arc::from(provider))
-    }
-
-    /// How a task-mode child on `child_provider` gets its provider.
-    ///
-    /// Any spelling of the gateway's own provider identity reuses the gateway
-    /// chain, which was built with the credential, base URL and rotation keys
-    /// that belong together. A rebuilt chain never receives the gateway key:
-    /// only a named agent's own key for the agent's own provider, or nothing.
-    fn child_provider_plan(&self, selected_agent: Option<&DelegateAgentConfig>, child_provider: &str) -> ChildProvider {
-        if let Some(agent) = selected_agent.filter(|agent| {
+    /// Whether an ordinary child request names the already-admitted parent
+    /// connection. A named agent with its own credential and a routed parent
+    /// both require their separately admitted binding.
+    fn reuses_parent_provider_identity(
+        &self,
+        selected_agent: Option<&DelegateAgentConfig>,
+        child_provider: &str,
+    ) -> bool {
+        if selected_agent.is_some_and(|agent| {
             providers::ProviderId::of(&agent.provider) == providers::ProviderId::of(child_provider)
                 && (agent.credential_ref.is_some()
                     || agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))
         }) {
-            return ChildProvider::Build {
-                api_key: agent.api_key.clone(),
-            };
+            return false;
         }
-        if providers::canonical_provider_key(child_provider) == providers::canonical_provider_key(&self.provider_name) {
-            if self.model.trim().starts_with("hint:") {
-                return ChildProvider::Root;
-            }
-            return ChildProvider::Gateway;
-        }
-        ChildProvider::Build {
-            api_key: resolve_child_provider_api_key(selected_agent, None, child_provider, &self.provider_name),
-        }
-    }
-
-    #[cfg(test)]
-    fn resolve_child_compaction(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
-        self.compaction_resolver.resolve(provider, model)
+        providers::canonical_provider_key(child_provider) == providers::canonical_provider_key(&self.provider_name)
+            && !self.model.trim().starts_with("hint:")
     }
 
     /// Attach a `SpawnEventSink` so task-mode sub-agents spawned by this tool
@@ -4251,7 +4168,6 @@ impl SessionsSpawnTool {
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
         let provider_options = providers::provider_runtime_options_from_config(child_model_config);
         let provider_options = &provider_options;
-        let provider_reliability = &child_model_config.reliability;
         let spawn_config = &child_model_config.sessions_spawn;
         let agents = &child_model_config.agents;
         let task = args
@@ -4582,45 +4498,38 @@ impl SessionsSpawnTool {
         }
         let child_credential = operator_source.as_ref().map_or_else(
             || {
-                (child_grant.is_some() || ordinary_publication.is_some() || resolved_model.trim().starts_with("hint:"))
-                    .then_some(child_model_config)
-                    .map(|config| {
-                        let credential = if inherits_default_route {
-                            (providers::ProviderId::of(inherited_model.0)
-                                == providers::ProviderId::of(&resolved_provider_name))
-                            .then(|| inherited_model.2.clone())
-                        } else {
-                            None
-                        };
-                        credential.unwrap_or_else(|| {
-                            selected_agent
-                                .as_ref()
-                                .filter(|(_, agent)| {
-                                    providers::ProviderId::of(&agent.provider)
-                                        == providers::ProviderId::of(&resolved_provider_name)
-                                })
-                                .map_or_else(
-                                    || providers::selection::credential_for(config, &resolved_provider_name),
-                                    |(name, agent)| {
-                                        agent.credential_ref.as_deref().map_or_else(
-                                            || {
-                                                if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-                                                    providers::credentials::CredentialRef::LegacyInline(
-                                                        providers::credentials::LegacySlot::Agent(name.clone()),
-                                                    )
-                                                } else {
-                                                    providers::selection::credential_for(
-                                                        config,
-                                                        &resolved_provider_name,
-                                                    )
-                                                }
-                                            },
-                                            |id| providers::credentials::CredentialRef::Profile { id: id.to_string() },
-                                        )
-                                    },
-                                )
+                let config = child_model_config;
+                let credential = if inherits_default_route {
+                    (providers::ProviderId::of(inherited_model.0) == providers::ProviderId::of(&resolved_provider_name))
+                        .then(|| inherited_model.2.clone())
+                } else {
+                    None
+                };
+                Some(credential.unwrap_or_else(|| {
+                    selected_agent
+                        .as_ref()
+                        .filter(|(_, agent)| {
+                            providers::ProviderId::of(&agent.provider)
+                                == providers::ProviderId::of(&resolved_provider_name)
                         })
-                    })
+                        .map_or_else(
+                            || providers::selection::credential_for(config, &resolved_provider_name),
+                            |(name, agent)| {
+                                agent.credential_ref.as_deref().map_or_else(
+                                    || {
+                                        if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                                            providers::credentials::CredentialRef::LegacyInline(
+                                                providers::credentials::LegacySlot::Agent(name.clone()),
+                                            )
+                                        } else {
+                                            providers::selection::credential_for(config, &resolved_provider_name)
+                                        }
+                                    },
+                                    |id| providers::credentials::CredentialRef::Profile { id: id.to_string() },
+                                )
+                            },
+                        )
+                }))
             },
             |source| Some(source.resolved().credential().reference().clone()),
         );
@@ -4706,12 +4615,11 @@ impl SessionsSpawnTool {
                     )
             },
         );
-        let resolved_compaction = crate::router::context::resolve_effective_compaction_config(
-            &child_model_config.agent.compaction,
+        let resolved_compaction = resolve_pinned_child_compaction(
+            child_model_config,
+            child_model_catalog,
             &resolved_provider_name,
             &resolved_model,
-            &child_model_config.router,
-            &child_model_config.model_routes,
         );
         tracing::debug!(
             mode = mode.as_str(),
@@ -4741,14 +4649,14 @@ impl SessionsSpawnTool {
             },
             |resolved| resolved.credential().api_key().map(str::to_string),
         );
-        let task_provider_plan =
-            self.child_provider_plan(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
+        let reuses_parent_provider =
+            self.reuses_parent_provider_identity(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
         // A spelling alias of the already-configured gateway is the same
         // connection, credential, and catalog identity. Issue its ordinary
         // child proof under the configured spelling so the decision service
         // sees the catalog row it actually published. Route hints retain their
         // requested source spelling because that spelling selects the route.
-        if matches!(&task_provider_plan, ChildProvider::Gateway)
+        if reuses_parent_provider
             && selected_route_hint.is_none()
             && let Some((provider, _)) = child_requested_model.as_mut()
         {
@@ -4774,6 +4682,16 @@ impl SessionsSpawnTool {
                 ))
             })
             .transpose()?;
+        let process_child_grant = (mode == "process")
+            .then(|| {
+                child_grant
+                    .as_deref()
+                    .map(crate::runtime::child_source::IssuedChildGrant::for_process_worker)
+                    .transpose()
+                    .map(|grant| grant.map(Arc::new))
+            })
+            .transpose()?
+            .flatten();
         let event_workspace = memory_fabric.workspace_id();
         let mut spawn_scope_for_event = spawn_event_scope(
             event_workspace,
@@ -4783,7 +4701,7 @@ impl SessionsSpawnTool {
             agent_name.as_deref(),
             spawn_scope.as_ref(),
         );
-        if let Some(grant) = child_grant.as_ref() {
+        if let Some(grant) = process_child_grant.as_ref().or(child_grant.as_ref()) {
             grant.bind_event_scope(&mut spawn_scope_for_event)?;
         }
         if let Some(binding) = &ordinary_binding {
@@ -4983,7 +4901,7 @@ impl SessionsSpawnTool {
             let process_execution_ctx = SpawnExecutionContext {
                 operator_authority: None,
                 ordinary_authority: None,
-                incoming_grant: child_grant.clone(),
+                incoming_grant: process_child_grant.clone(),
                 provider_binding: None,
                 terminal_usage: None,
                 input_receipt: source_receipt.clone(),
@@ -5028,7 +4946,7 @@ impl SessionsSpawnTool {
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
             sub_agent_work.require_cleanup_acknowledgement();
             let process_work_id = sub_agent_work.id();
-            let process_recovery = child_grant.as_ref().map(|grant| {
+            let process_recovery = process_child_grant.as_ref().map(|grant| {
                 Arc::new(process_terminal::ProcessRecovery::new(
                     process_memory_fabric.clone(),
                     Arc::clone(grant),
@@ -5461,7 +5379,7 @@ impl SessionsSpawnTool {
         let mut provider_name = resolved_provider_name;
         let mut model = resolved_model;
         let child_provider_binding = if let Some(grant) = child_grant.as_ref() {
-            let credential = child_credential.context("child credential selection missing")?;
+            let credential = child_credential.clone().context("child credential selection missing")?;
             let (requested_child_provider, requested_child_model) =
                 child_requested_model.as_ref().context("child model request missing")?;
             let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build(
@@ -5501,65 +5419,10 @@ impl SessionsSpawnTool {
                 "operator child provider differs from captured ingress"
             );
         }
-        let provider_result = if let Some(binding) = child_provider_binding.as_ref() {
-            Ok(binding.provider())
-        } else if let Some(resolved) = selected_hint.as_ref() {
-            let reliability = crate::config::ReliabilityConfig {
-                fallback_providers: Vec::new(),
-                ..provider_reliability.clone()
-            };
-            providers::create_provider_for(
-                resolved,
-                child_model_catalog,
-                &reliability,
-                &child_model_config.cost,
-                provider_options,
-            )
-            .map(Arc::from)
-        } else {
-            match task_provider_plan {
-                ChildProvider::Root => {
-                    let config = child_model_config;
-                    let resolved = match providers::selection::check_with(
-                        config,
-                        child_model_catalog,
-                        &provider_name,
-                        &model,
-                        providers::selection::credential_for(config, &provider_name),
-                        &providers::catalog::Requirement::chat(),
-                        providers::catalog::UnknownPolicy::Invocation,
-                    ) {
-                        Ok(resolved) => resolved,
-                        Err(refusal) => return Ok(SpawnOutcome::rejected(format!("Cannot spawn this run: {refusal}"))),
-                    };
-                    providers::create_provider_for(
-                        &resolved,
-                        child_model_catalog,
-                        provider_reliability,
-                        &child_model_config.cost,
-                        provider_options,
-                    )
-                    .map(Arc::from)
-                }
-                ChildProvider::Build { api_key } => Self::build_override_provider(
-                    &provider_name,
-                    api_key.as_deref(),
-                    provider_reliability,
-                    provider_options,
-                ),
-                ChildProvider::Gateway => Ok(self.provider.clone()),
-            }
-        };
-        let provider = match provider_result {
-            Ok(provider) => provider,
-            Err(error) => {
-                return Ok(SpawnOutcome::rejected(format!(
-                    "Failed to create provider '{}' for sessions_spawn: {}",
-                    providers::redact_endpoint_userinfo(&provider_name),
-                    providers::sanitize_api_error(&providers::redact_endpoint_userinfo(&error.to_string()))
-                )));
-            }
-        };
+        let provider = child_provider_binding
+            .as_ref()
+            .context("admitted sessions_spawn child model binding missing")?
+            .provider();
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
         // Event bridge (v1.1a): if a chat-side sink is attached, create this
@@ -9586,126 +9449,6 @@ mod tests {
         );
     }
 
-    // ── Sub-agent provider override: resilience evidence ─────────
-
-    /// Serializes the tests that drive the mock provider through
-    /// `OPENPRX_MOCK_ERROR`, since env vars are process-global.
-    fn mock_error_env_lock() -> &'static parking_lot::Mutex<()> {
-        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
-    }
-
-    struct MockErrorEnvGuard {
-        original: Option<String>,
-    }
-
-    impl MockErrorEnvGuard {
-        #[allow(unsafe_code)]
-        fn set(value: &str) -> Self {
-            let original = std::env::var("OPENPRX_MOCK_ERROR").ok();
-            // SAFETY: test-only env mutation, serialized by `mock_error_env_lock`
-            // and restored on drop.
-            unsafe { std::env::set_var("OPENPRX_MOCK_ERROR", value) };
-            Self { original }
-        }
-    }
-
-    impl Drop for MockErrorEnvGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            // SAFETY: paired with the mutation above, under the same lock.
-            unsafe {
-                match &self.original {
-                    Some(value) => std::env::set_var("OPENPRX_MOCK_ERROR", value),
-                    None => std::env::remove_var("OPENPRX_MOCK_ERROR"),
-                }
-            }
-        }
-    }
-
-    /// A sub-agent that pins its own provider must still get the reliability
-    /// layer. This path used to build a **bare** provider: an upstream 429 ended
-    /// the sub-agent in well under a second with zero retries, and the surfaced
-    /// error carried no attempt trail at all — the signature of the 2026-08-21
-    /// incident. Reverting `build_override_provider` to
-    /// `create_provider_with_options` turns this test red on both assertions.
-    #[tokio::test]
-    async fn provider_override_goes_through_the_reliability_layer() {
-        // The env lock and the env mutation are both released before the first
-        // await: the mock captured its error at construction time, so nothing
-        // after this block depends on the variable still being set.
-        let provider = {
-            let _serialized = mock_error_env_lock().lock();
-            let _env = MockErrorEnvGuard::set("Mock API error (429 Too Many Requests): rate_limit_error");
-            SessionsSpawnTool::build_override_provider(
-                "mock",
-                None,
-                &crate::config::ReliabilityConfig {
-                    provider_retries: 2,
-                    provider_backoff_ms: 200,
-                    ..crate::config::ReliabilityConfig::default()
-                },
-                &providers::ProviderRuntimeOptions::default(),
-            )
-            .expect("test: mock provider must build")
-        };
-
-        let started = std::time::Instant::now();
-        let error = provider
-            .chat_with_system(None, "audit this module", "mock-model", 0.0)
-            .await
-            .expect_err("test: the mock is configured to fail");
-        let elapsed = started.elapsed();
-        let text = error.to_string();
-
-        assert!(
-            text.contains("All providers/models failed"),
-            "the override path must produce the aggregated reliability error, got: {text}"
-        );
-        assert!(
-            text.contains("attempt 1/3") && text.contains("attempt 3/3"),
-            "every attempt must be in the trail, got: {text}"
-        );
-        assert!(
-            text.contains("rate_limited"),
-            "the failure reason must be classified as a rate limit, got: {text}"
-        );
-        // Two jittered backoffs: [100,200] + [200,400].
-        assert!(
-            elapsed >= std::time::Duration::from_millis(280),
-            "the override path did not back off (bare provider fails instantly): {elapsed:?}"
-        );
-    }
-
-    /// The pinned provider must stay pinned: widening the chain would silently
-    /// answer "run this with a different model" from the wrong vendor, and would
-    /// replay the gateway's rotation credentials against it.
-    #[test]
-    fn override_reliability_drops_chain_widening_knobs() {
-        let base = crate::config::ReliabilityConfig {
-            provider_retries: 5,
-            provider_backoff_ms: 900,
-            fallback_providers: vec!["openai".to_string()],
-            api_keys: vec!["sk-gateway-key".to_string()],
-            model_fallbacks: std::collections::HashMap::from([("k3".to_string(), vec!["k3-mini".to_string()])]),
-            ..crate::config::ReliabilityConfig::default()
-        };
-
-        let scoped = SessionsSpawnTool::override_reliability(&base);
-
-        assert_eq!(scoped.provider_retries, 5, "retry budget must carry over");
-        assert_eq!(scoped.provider_backoff_ms, 900, "backoff must carry over");
-        assert_eq!(scoped.model_fallbacks, base.model_fallbacks, "model chain carries over");
-        assert!(
-            scoped.fallback_providers.is_empty(),
-            "a pinned provider must not fail over"
-        );
-        assert!(
-            scoped.api_keys.is_empty(),
-            "gateway rotation keys belong to another vendor"
-        );
-    }
-
     /// A channel that records sent messages.
     struct RecordingChannel {
         sent: Arc<Mutex<Vec<String>>>,
@@ -9801,11 +9544,15 @@ mod tests {
     /// observe many simultaneously live runs rather than a fast serial trickle.
     struct GatedProvider {
         gate: Arc<tokio::sync::Semaphore>,
+        entered: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl GatedProvider {
         /// Park until the test releases this run.
         async fn wait_for_release(&self) {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
             if let Ok(permit) = self.gate.acquire().await {
                 drop(permit);
             }
@@ -10128,7 +9875,7 @@ mod tests {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
         cleanup
             .run(Box::pin(async move {
-                let provider = Arc::clone(&tool.provider);
+                let provider = Arc::clone(&tool.test_parent_provider);
                 let security = Arc::clone(&tool.security);
                 let workspace = config.workspace_dir.clone();
                 // Q71 hybrid is deliberately invalid for persistence; publish the
@@ -10189,7 +9936,6 @@ mod tests {
             security,
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             HashMap::new(),
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -10253,25 +9999,21 @@ mod tests {
         }
     }
 
-    fn compaction_resolver_with_models(
-        models: Vec<crate::config::RouterModelConfig>,
-    ) -> crate::router::CompactionResolver {
-        let mut router = crate::config::RouterConfig::default();
-        router.models = models;
-        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
+    fn child_compaction_config(models: Vec<crate::config::RouterModelConfig>) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.router.models = models;
+        config
     }
 
     #[test]
     fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-            compaction_resolver_with_models(vec![
-                router_model("anthropic", "claude-opus-4-8", 1_000_000),
-                router_model("openrouter", "small-child", 200_000),
-            ]),
-        );
+        let config = child_compaction_config(vec![
+            router_model("anthropic", "claude-opus-4-8", 1_000_000),
+            router_model("openrouter", "small-child", 200_000),
+        ]);
+        let catalog = providers::selection::catalog_for(&config);
 
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
 
         assert_eq!(resolved.config.max_context_tokens, 200_000);
         assert_eq!(
@@ -10282,14 +10024,12 @@ mod tests {
 
     #[test]
     fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
-            compaction_resolver_with_models(vec![
-                router_model("anthropic", "claude-opus-4-8", 1_000_000),
-                router_model("openrouter", "small-child", 200_000),
-            ]),
-        );
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let config = child_compaction_config(vec![
+            router_model("anthropic", "claude-opus-4-8", 1_000_000),
+            router_model("openrouter", "small-child", 200_000),
+        ]);
+        let catalog = providers::selection::catalog_for(&config);
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
@@ -10373,9 +10113,9 @@ mod tests {
         // boundary: the manifest had no field for it, so the worker started
         // with the whole operations surface back. The list travels in the
         // manifest now, and the manifest is what the capability seals.
-        let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let config = crate::config::Config::default();
+        let catalog = providers::selection::catalog_for(&config);
+        let resolved = resolve_pinned_child_compaction(&config, &catalog, "openrouter", "small-child");
         let temp = tempfile::TempDir::new().expect("tempdir");
         let lineage = SpawnLineage {
             owner_id: None,
@@ -10500,7 +10240,7 @@ mod tests {
             channel: Arc::clone(&tool.channel),
             test_worker_executable: tool.test_worker_executable.clone(),
             channels: Arc::clone(&tool.channels),
-            provider: Arc::clone(&tool.provider),
+            test_parent_provider: Arc::clone(&tool.test_parent_provider),
             provider_name: tool.provider_name.clone(),
             model: tool.model.clone(),
             security: Arc::clone(&tool.security),
@@ -10508,7 +10248,6 @@ mod tests {
             active_runs: Arc::clone(&tool.active_runs),
             tools: Arc::clone(&tool.tools),
             workspace_dir: tool.workspace_dir.clone(),
-            compaction_resolver: tool.compaction_resolver.clone(),
             agents: Arc::clone(&tool.agents),
             fallback_api_key: tool.fallback_api_key.clone(),
             configured_providers: tool.configured_providers.clone(),
@@ -10517,7 +10256,6 @@ mod tests {
             default_route_source: tool.default_route_source.clone(),
             fallback_api_key_owner: tool.fallback_api_key_owner.clone(),
             fallback_uses_root_connection: tool.fallback_uses_root_connection,
-            reliability: tool.reliability.clone(),
             cost_config: tool.cost_config.clone(),
             memory: tool.memory.clone(),
             source_fabric: tool.source_fabric.clone(),
@@ -10538,6 +10276,21 @@ mod tests {
     async fn execute_admitted_spawn(
         tool: &SessionsSpawnTool,
         arguments: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        execute_admitted_spawn_with_plane(tool, arguments, false).await
+    }
+
+    async fn execute_enabled_admitted_spawn(
+        tool: &SessionsSpawnTool,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        execute_admitted_spawn_with_plane(tool, arguments, true).await
+    }
+
+    async fn execute_admitted_spawn_with_plane(
+        tool: &SessionsSpawnTool,
+        arguments: serde_json::Value,
+        decision_enabled: bool,
     ) -> anyhow::Result<ToolResult> {
         fn fixture_price() -> crate::config::schema::ModelPricing {
             crate::config::schema::ModelPricing {
@@ -10586,7 +10339,7 @@ mod tests {
         config.config_path = workspace.join("config.toml");
         config.default_provider = Some(tool.provider_name.clone());
         config.default_model = Some(tool.model.clone());
-        config.causal_tree.enabled = false;
+        config.causal_tree.enabled = decision_enabled;
         config.autonomy.level = tool.security.autonomy;
         config.autonomy.workspace_only = tool.security.workspace_only;
         config
@@ -10607,7 +10360,6 @@ mod tests {
             .clone_from(&tool.security.assign_owners);
         config.security.audit = tool.security.audit_config.clone();
         config.agents = tool.agents.as_ref().clone();
-        config.reliability = tool.reliability.clone();
         config.cost = tool.cost_config.clone();
         if !config
             .providers
@@ -10673,7 +10425,7 @@ mod tests {
             .entry("ollama/prx-local-model".to_owned())
             .or_insert_with(fixture_price);
         let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
-        let provider = Arc::clone(&tool.provider);
+        let provider = Arc::clone(&tool.test_parent_provider);
         let provider_name = tool.provider_name.clone();
         let model_name = tool.model.clone();
         let registry =
@@ -10689,7 +10441,15 @@ mod tests {
                 .to_owned(),
             sender: field("sender").unwrap_or("prx_user").to_owned(),
             reply_target: field("chat_id").unwrap_or_default().to_owned(),
-            content: "sessions_spawn admitted fixture".to_owned(),
+            content: if decision_enabled {
+                arguments
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("complete the requested child task")
+                    .to_owned()
+            } else {
+                "sessions_spawn admitted fixture".to_owned()
+            },
             channel: field("channel").unwrap_or("wacli").to_owned(),
             timestamp: 0,
             chat_kind,
@@ -10704,14 +10464,25 @@ mod tests {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
         cleanup
             .run(Box::pin(async move {
-                let admitted = crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
-                    config,
-                    message,
-                    registry,
-                    admission_memory,
-                    (&provider_name, &model_name),
-                )
-                .await;
+                let admitted = if decision_enabled {
+                    crate::agent::test_admission::AdmittedTurn::enabled_builtin_channel_with_memory(
+                        config,
+                        message,
+                        registry,
+                        admission_memory,
+                        (&provider_name, &model_name),
+                    )
+                    .await
+                } else {
+                    crate::agent::test_admission::AdmittedTurn::ordinary_controlled_channel_with_memory(
+                        config,
+                        message,
+                        registry,
+                        admission_memory,
+                        (&provider_name, &model_name),
+                    )
+                    .await
+                };
                 crate::runtime::child_source::scope_ordinary_provider_fixture(
                     provider,
                     provider_name.clone(),
@@ -11742,27 +11513,73 @@ mod tests {
     /// deny the spawn outright — no run is registered and no announcement fires.
     #[tokio::test]
     async fn spawn_denied_without_grant_under_supervised() {
+        let workspace = tempfile::tempdir().expect("test: isolated gate workspace");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let task = json!({"task": "sessions_spawn: tell a joke in a child task"});
+        let (control_channel, _) = RecordingChannel::new();
+        let mut control = make_tool_with_security_and_spawn_config(
+            Arc::new(control_channel),
+            Arc::new(EchoProvider {
+                response: "control completed".into(),
+            }),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            crate::config::SessionsSpawnConfig::default(),
+        );
+        control.workspace_dir = workspace.path().to_path_buf();
+        control.provider_name = probe.custom_provider();
+        control.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+        control.configured_providers =
+            providers::ConfiguredProviders::default().with_providers([control.provider_name.as_str()]);
+        let allowed = execute_enabled_admitted_spawn(&control, task.clone())
+            .await
+            .expect("the same task must reach the enabled spawn path without the supervised gate");
+        assert!(allowed.success, "ungated control did not execute: {:?}", allowed.error);
+        let runs = control.active_runs_arc();
+        let run_id = runs
+            .read()
+            .await
+            .first()
+            .expect("test: control registered a child")
+            .id
+            .clone();
+        assert_eq!(
+            await_terminal_reason(&runs, &run_id).await,
+            crate::providers::credential_probe::PROBE_REPLY
+        );
+        assert_eq!(probe.requests().len(), 1, "test: control reached the child provider");
+
         let (ch, sent) = RecordingChannel::new();
-        let tool = make_tool_with_security_and_spawn_config(
+        let mut tool = make_tool_with_security_and_spawn_config(
             Arc::new(ch),
             Arc::new(EchoProvider {
                 response: "should never run".into(),
             }),
             Arc::new(SecurityPolicy {
                 autonomy: crate::security::AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
                 ..SecurityPolicy::default()
             }),
             crate::config::SessionsSpawnConfig::default(),
         );
+        tool.workspace_dir = workspace.path().to_path_buf();
+        tool.provider_name = probe.custom_provider();
+        tool.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+        tool.configured_providers =
+            providers::ConfiguredProviders::default().with_providers([tool.provider_name.as_str()]);
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         // No grant injected → Medium-risk gate denies under supervised autonomy.
-        let denied = execute_admitted_spawn(&tool, json!({"task": "Tell me a joke"}))
+        let denied = execute_enabled_admitted_spawn(&tool, task)
             .await
             .expect_err("an unapproved side-effect tool must not be offered for execution");
-        assert!(
-            denied.to_string().contains("did not select tool 'sessions_spawn'"),
-            "the admitted surface must exclude the unapproved tool: {denied}"
+        assert_eq!(
+            denied.to_string(),
+            "admitted fixture did not select tool 'sessions_spawn'",
+            "the admitted surface must exclude the unapproved tool"
         );
 
         // No run should have been registered.
@@ -11771,6 +11588,11 @@ mod tests {
         // Give any (non-existent) async work a chance; nothing should be sent.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(sent.lock().await.len(), 0);
+        assert_eq!(
+            probe.requests().len(),
+            1,
+            "gated turn must not contact the child provider"
+        );
     }
 
     #[tokio::test]
@@ -12137,6 +11959,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
@@ -12200,6 +12023,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
@@ -12479,7 +12303,6 @@ mod tests {
                     Arc::clone(&security),
                     workspace.path().to_path_buf(),
                     config.multimodal.clone(),
-                    config.agent.compaction.clone(),
                     config.agents_with_references().into_owned(),
                     None,
                     crate::providers::provider_runtime_options_from_config(config),
@@ -12582,7 +12405,6 @@ mod tests {
                     Arc::clone(&security),
                     workspace.path().to_path_buf(),
                     config.multimodal.clone(),
-                    config.agent.compaction.clone(),
                     config.agents_with_references().into_owned(),
                     None,
                     crate::providers::provider_runtime_options_from_config(config),
@@ -12638,9 +12460,49 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_action_obeys_readonly_resource_gate() {
+        let workspace = tempfile::tempdir().expect("test: isolated gate workspace");
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let task = json!({"task": "sessions_spawn: run the blocked child task"});
+        let (control_channel, _) = RecordingChannel::new();
+        let mut control = make_tool_with_security_and_spawn_config(
+            Arc::new(control_channel),
+            Arc::new(EchoProvider {
+                response: "control completed".into(),
+            }),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            crate::config::SessionsSpawnConfig::default(),
+        );
+        control.workspace_dir = workspace.path().to_path_buf();
+        control.provider_name = probe.custom_provider();
+        control.model = crate::providers::credential_probe::PROBE_MODEL.to_owned();
+        control.configured_providers =
+            providers::ConfiguredProviders::default().with_providers([control.provider_name.as_str()]);
+        let allowed = execute_enabled_admitted_spawn(&control, task.clone())
+            .await
+            .expect("the same task must reach the enabled spawn path without the read-only gate");
+        assert!(allowed.success, "ungated control did not execute: {:?}", allowed.error);
+        let runs = control.active_runs_arc();
+        let run_id = runs
+            .read()
+            .await
+            .first()
+            .expect("test: control registered a child")
+            .id
+            .clone();
+        assert_eq!(
+            await_terminal_reason(&runs, &run_id).await,
+            crate::providers::credential_probe::PROBE_REPLY
+        );
+        assert_eq!(probe.requests().len(), 1, "test: control reached the child provider");
+
         let (ch, _) = RecordingChannel::new();
         let readonly_security = Arc::new(SecurityPolicy {
             autonomy: crate::security::policy::AutonomyLevel::ReadOnly,
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = SessionsSpawnTool::new(
@@ -12648,24 +12510,32 @@ mod tests {
             Arc::new(EchoProvider {
                 response: "done".into(),
             }),
-            "ollama",
-            "prx-local-model",
+            probe.custom_provider(),
+            crate::providers::credential_probe::PROBE_MODEL,
             0.7,
             readonly_security,
-            std::path::PathBuf::from("/tmp"),
+            workspace.path().to_path_buf(),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             HashMap::new(),
             None,
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
 
-        let error = execute_admitted_spawn(&tool, json!({"task": "blocked"}))
+        let error = execute_enabled_admitted_spawn(&tool, task)
             .await
             .expect_err("a side-effect tool must not be offered on a read-only surface");
-        assert!(error.to_string().contains("did not select tool 'sessions_spawn'"));
+        assert_eq!(
+            error.to_string(),
+            "admitted fixture did not select tool 'sessions_spawn'",
+            "a read-only turn must close before publishing an executable spawn selection"
+        );
         assert!(tool.active_runs_snapshot().await.is_empty());
+        assert_eq!(
+            probe.requests().len(),
+            1,
+            "gated turn must not contact the child provider"
+        );
     }
 
     #[tokio::test]
@@ -13528,7 +13398,6 @@ mod tests {
                     Arc::clone(&security),
                     std::path::PathBuf::from("/tmp"),
                     crate::config::MultimodalConfig::default(),
-                    crate::config::AgentCompactionConfig::default(),
                     agents,
                     None,
                     crate::providers::ProviderRuntimeOptions::default(),
@@ -13578,7 +13447,6 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -13622,7 +13490,6 @@ mod tests {
             test_security(),
             ws.path().to_path_buf(),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -14733,6 +14600,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
@@ -14831,10 +14699,12 @@ mod tests {
     async fn a_spawned_run_row_tracks_its_own_real_progress() {
         let (ch, _) = RecordingChannel::new();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
         let tool = make_tool(
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: Some(Arc::clone(&entered)),
             }),
         );
 
@@ -14843,6 +14713,9 @@ mod tests {
             .expect("spawn tool call");
         assert!(spawned.success, "{spawned:?}");
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the real provider must be parked before measuring silence");
         // While parked in the provider the run really has made no progress, and
         // the row must say so instead of inventing activity.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -14854,7 +14727,7 @@ mod tests {
         };
         assert_eq!(
             events_before, 1,
-            "only the admitted turn start may precede provider output"
+            "only completed request preparation may precede provider output"
         );
         assert!(
             idle_before >= std::time::Duration::from_millis(150),
@@ -14868,7 +14741,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let runs = tool.active_runs_snapshot().await;
             let Some(run) = runs.first() else { continue };
-            if run.progress.events() > 0 {
+            if run.progress.events() > events_before {
                 observed = Some((run.progress.events(), run.idle_for(), run.last_progress_at()));
                 break;
             }
@@ -14876,6 +14749,10 @@ mod tests {
         let (events_after, idle_after, stamp_after) =
             observed.expect("a released run must record progress on its own row");
         assert!(events_after >= 1);
+        assert!(
+            events_after > events_before,
+            "provider release must produce a new progress event"
+        );
         assert!(
             idle_after < idle_before,
             "real progress must reset the run's silence: {idle_after:?} vs {idle_before:?}"
@@ -15097,6 +14974,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
@@ -15162,7 +15040,6 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
-            crate::config::AgentCompactionConfig::default(),
             agents,
             None,
             crate::providers::ProviderRuntimeOptions::default(),
@@ -15534,6 +15411,7 @@ mod tests {
             Arc::new(ch),
             Arc::new(GatedProvider {
                 gate: Arc::clone(&gate),
+                entered: None,
             }),
         );
 
@@ -17345,7 +17223,6 @@ mod tests {
             }),
             temp.path().to_path_buf(),
             MultimodalConfig::default(),
-            AgentCompactionConfig::default(),
             agents,
             fallback_api_key.map(str::to_string),
             providers::ProviderRuntimeOptions {
@@ -17356,6 +17233,192 @@ mod tests {
             },
             crate::config::SessionsSpawnConfig::default(),
         )
+    }
+
+    /// Finding 71: a named-agent override must retain the model fallback
+    /// contract when the admitted spawn builds its child provider. The
+    /// incompatible fallback is refused before the run or transport exists.
+    #[tokio::test]
+    async fn admitted_named_agent_spawn_refuses_a_cross_dialect_fallback_before_transport() {
+        use crate::providers::credential_probe::CredentialProbe;
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start().await;
+        let agent_provider = probe.custom_provider();
+        let mut agent = containment_agent(&agent_provider, Some(SPAWN_AGENT_SENTINEL));
+        agent.model = crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL.to_string();
+        let agents = HashMap::from([("prx_agent".to_string(), agent)]);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.config_path = temp.path().join("config.toml");
+        config.auth.codex_auth_json_auto_import = false;
+        config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
+        config.secrets.encrypt = false;
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut config, &agent_provider);
+        let catalog = providers::selection::catalog_for(&config);
+        let configured = providers::ConfiguredProviders::from_config(&config);
+        let tool = containment_tool(&temp, agents, "ollama", None)
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&configured);
+
+        let refusal =
+            match execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"}))).await
+            {
+                Ok(result) => {
+                    assert!(!result.success, "the incompatible agent fallback was spawned");
+                    result.error.unwrap_or_default()
+                }
+                Err(error) => format!("{error:#}"),
+            };
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal(
+            "sessions_spawn named agent",
+            &refusal,
+        );
+        assert!(probe.requests().is_empty(), "a refused fallback reached transport");
+        assert!(
+            tool.active_runs_snapshot().await.is_empty(),
+            "a refused fallback created a run"
+        );
+    }
+
+    /// The admitted child binding, rather than the removed local reconstruction
+    /// shim, owns retries for a named provider override.
+    #[tokio::test]
+    async fn provider_override_goes_through_the_reliability_layer() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let probe = CredentialProbe::start_with_statuses(vec![429, 429]).await;
+        let provider_name = probe.custom_provider();
+        let agents = HashMap::from([(
+            "prx_agent".to_string(),
+            containment_agent(&provider_name, Some("PRX-CHILD-RETRY-CREDENTIAL")),
+        )]);
+        let mut tool = containment_tool(&temp, agents, "ollama", None);
+        let mut config = preconstruction_parent_config(&tool, temp.path());
+        config.reliability.provider_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.push(
+            serde_json::from_value(json!({
+                "provider": provider_name, "model": PROBE_MODEL,
+                "operations": ["chat"], "native_tools": true
+            }))
+            .expect("test: child model declaration"),
+        );
+        config.cost.prices.insert(
+            format!("{provider_name}/{PROBE_MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        let catalog = providers::selection::catalog_for(&config);
+        tool = tool
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        let runs = tool.active_runs_arc();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+        )
+        .await
+        .expect("test: admitted retry spawn");
+        assert!(result.success, "named child was not started: {:?}", result.error);
+        assert_eq!(probe.wait_for_requests(3, std::time::Duration::from_secs(10)).await, 3);
+        let run_id = runs.read().await.first().expect("test: child run").id.clone();
+        assert_eq!(
+            await_terminal_reason(&runs, &run_id).await,
+            crate::providers::credential_probe::PROBE_REPLY
+        );
+        assert!(probe.requests().iter().all(|request| {
+            request
+                .authorization()
+                .is_some_and(|value| value.contains("PRX-CHILD-RETRY-CREDENTIAL"))
+        }));
+    }
+
+    /// Provider fallbacks and root rotation keys belong to the parent chain;
+    /// an admitted named child keeps only its selected vendor and credential.
+    #[tokio::test]
+    async fn override_reliability_drops_chain_widening_knobs() {
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let selected = CredentialProbe::start_failing(429, "selected child refused").await;
+        let fallback = CredentialProbe::start().await;
+        let selected_provider = selected.custom_provider();
+        let fallback_provider = fallback.custom_provider();
+        let agents = HashMap::from([(
+            "prx_agent".to_string(),
+            containment_agent(&selected_provider, Some("PRX-CHILD-ONLY-CREDENTIAL")),
+        )]);
+        let mut tool = containment_tool(&temp, agents, "ollama", Some("PRX-PARENT-ROOT-CREDENTIAL"));
+        let mut config = preconstruction_parent_config(&tool, temp.path());
+        config.reliability.provider_retries = 0;
+        config.reliability.fallback_providers = vec![fallback_provider.clone()];
+        config.reliability.api_keys = vec!["PRX-PARENT-ROTATION-CREDENTIAL".to_string()];
+        for provider in [&selected_provider, &fallback_provider] {
+            config.providers.models.push(
+                serde_json::from_value(json!({
+                    "provider": provider, "model": PROBE_MODEL,
+                    "operations": ["chat"], "native_tools": true
+                }))
+                .expect("test: child model declaration"),
+            );
+            config.cost.prices.insert(
+                format!("{provider}/{PROBE_MODEL}"),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+        }
+        let catalog = providers::selection::catalog_for(&config);
+        tool = tool
+            .with_hint_config(&config)
+            .with_model_catalog(catalog)
+            .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
+        let runs = tool.active_runs_arc();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: parent memory"));
+        let result = dispatch_preconstruction_parent(
+            tool,
+            config,
+            memory,
+            with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})),
+        )
+        .await
+        .expect("test: admitted contained spawn");
+        assert!(result.success, "named child was not started: {:?}", result.error);
+        assert_eq!(
+            selected.wait_for_requests(1, std::time::Duration::from_secs(10)).await,
+            1
+        );
+        let run_id = runs.read().await.first().expect("test: child run").id.clone();
+        let failure = await_terminal_reason(&runs, &run_id).await;
+        assert!(failure.contains("selected child refused"), "{failure}");
+        let requests = selected.requests();
+        assert_eq!(requests.len(), 1, "rotation credentials widened the child chain");
+        assert!(requests.first().is_some_and(|request| {
+            request
+                .authorization()
+                .is_some_and(|value| value.contains("PRX-CHILD-ONLY-CREDENTIAL"))
+        }));
+        assert!(!selected.saw("PRX-PARENT-ROOT-CREDENTIAL"));
+        assert!(!selected.saw("PRX-PARENT-ROTATION-CREDENTIAL"));
+        assert!(
+            fallback.requests().is_empty(),
+            "parent fallback provider received child traffic"
+        );
     }
 
     /// R-PMMC F-5: every production construction of the spawn tool hands it
@@ -17443,10 +17506,16 @@ mod tests {
         let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
         // The value the compaction line prints, checked directly
         // (deterministic); the log capture is checked for absence only.
-        let shown = tool
-            .resolve_child_compaction("custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1", "m")
-            .shown_provider()
-            .into_owned();
+        let config = crate::config::Config::default();
+        let catalog = providers::selection::catalog_for(&config);
+        let shown = resolve_pinned_child_compaction(
+            &config,
+            &catalog,
+            "custom:http://u:SPAWN-SECRET-pw@127.0.0.1:99999/v1",
+            "m",
+        )
+        .shown_provider()
+        .into_owned();
         assert_eq!(shown, "custom:http://[redacted]@127.0.0.1:99999/v1");
         assert!(!logs.contains("SPAWN-SECRET-pw"), "{logs}");
     }
@@ -17546,7 +17615,10 @@ mod tests {
             ),
             ("b".to_string(), containment_agent(&other.custom_provider(), None)),
         ]);
-        let tool = containment_tool(&temp, agents, "ollama", None);
+        let mut tool = containment_tool(&temp, agents, &own.custom_provider(), Some(SPAWN_ROOT_SENTINEL));
+        let mut root_config = preconstruction_parent_config(&tool, temp.path());
+        root_config.api_key = Some(SPAWN_ROOT_SENTINEL.to_owned());
+        tool = tool.with_hint_config(&root_config);
 
         let result = execute_admitted_spawn(
             &tool,
@@ -17565,6 +17637,10 @@ mod tests {
             "agent a's key reached another provider"
         );
         assert!(other.requests().iter().all(|request| request.authorization().is_none()));
+        assert!(
+            !other.saw(SPAWN_ROOT_SENTINEL),
+            "root key reached an independently selected provider"
+        );
         assert!(own.requests().is_empty());
     }
 
@@ -17582,21 +17658,22 @@ mod tests {
             &gateway.custom_provider(),
             Some(SPAWN_ROOT_SENTINEL),
         );
-        tool.provider = Arc::from(
-            providers::create_resilient_provider_with_options(
-                &gateway.custom_provider(),
-                Some(SPAWN_ROOT_SENTINEL),
-                None,
-                &crate::config::ReliabilityConfig::default(),
-                &providers::ProviderRuntimeOptions::default(),
-            )
-            .expect("test: gateway chain builds"),
+        let gateway_config = crate::config::Config {
+            default_provider: Some(gateway.custom_provider()),
+            default_model: Some(crate::providers::credential_probe::PROBE_MODEL.to_string()),
+            api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
+            ..crate::config::Config::default()
+        };
+        tool.test_parent_provider = Arc::from(
+            providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
+                .expect("test: gateway chain builds"),
         );
+        tool = tool.with_hint_config(&gateway_config);
 
-        let result = execute_admitted_spawn(
+        let result = execute_enabled_admitted_spawn(
             &tool,
             with_spawn_grant(json!({
-                "task": "probe", "provider": format!("{}/", gateway.custom_provider())
+                "task": "sessions_spawn: probe", "provider": format!("{}/", gateway.custom_provider())
             })),
         )
         .await
@@ -17611,56 +17688,10 @@ mod tests {
 
     const F1_SPAWN_ROOT_SENTINEL: &str = "C0F-SPAWN-ROOT-SENTINEL";
 
-    /// Reviewer scenario: a `litellm` gateway whose root key belongs to its own
-    /// base URL. A model-chosen spelling of the same provider reuses the
-    /// gateway chain (key, URL and rotation keys together) instead of
-    /// rebuilding on the catalog default host with the key alone.
-    #[test]
-    fn a_respelled_gateway_provider_reuses_the_gateway_chain() {
-        let temp = tempfile::tempdir().expect("test: temp dir");
-        let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-        for spelling in ["litellm", "lite-llm", "LiteLLM"] {
-            assert_eq!(
-                tool.child_provider_plan(None, spelling),
-                ChildProvider::Gateway,
-                "{spelling}"
-            );
-        }
-
-        let openai = containment_tool(&temp, HashMap::new(), "openai", Some(F1_SPAWN_ROOT_SENTINEL));
-        for spelling in ["openai", "OpenAI"] {
-            assert_eq!(
-                openai.child_provider_plan(None, spelling),
-                ChildProvider::Gateway,
-                "{spelling}"
-            );
-        }
-    }
-
-    /// A rebuild never carries the gateway key: only a named agent's own key
-    /// for the agent's own provider, or nothing.
-    #[test]
-    fn a_rebuilt_child_never_carries_the_gateway_key() {
-        let temp = tempfile::tempdir().expect("test: temp dir");
-        let tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-        let agent = containment_agent("groq", Some(SPAWN_AGENT_SENTINEL));
-
-        assert_eq!(
-            tool.child_provider_plan(Some(&agent), "GROQ"),
-            ChildProvider::Build {
-                api_key: Some(SPAWN_AGENT_SENTINEL.to_string())
-            }
-        );
-        assert_eq!(
-            tool.child_provider_plan(Some(&agent), "mistral"),
-            ChildProvider::Build { api_key: None }
-        );
-    }
-
     /// A routed parent keeps its route key for an inherited child, while a
     /// direct-model child returns to the configured root connection.
     #[tokio::test]
-    async fn default_hint_child_and_direct_override_use_their_own_wire_keys() {
+    async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
         use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
@@ -17706,8 +17737,7 @@ mod tests {
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
             .with_cost_config(config.cost.clone());
         tool.model = "hint:fast".to_string();
-        tool.provider = Arc::from(routed_provider);
-
+        tool.test_parent_provider = Arc::from(routed_provider);
         let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
             .await
             .expect("test: inherited spawn result");
@@ -17730,7 +17760,7 @@ mod tests {
     /// A named direct agent on the hinted parent's source provider owns a
     /// separate key. Task mode must select it just as process mode does.
     #[tokio::test]
-    async fn hinted_parent_direct_agent_child_uses_agent_key_on_wire() {
+    async fn child_provider_build_branch_uses_named_agent_credential_on_wire() {
         use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
@@ -17768,11 +17798,9 @@ mod tests {
         let mut profile_agent = containment_agent(&root_provider, None);
         profile_agent.credential_ref = Some(profile.id.clone());
         config.agents.insert("prx_profile".to_string(), profile_agent);
+        let inline_agent = containment_agent(&root_provider, Some("PRX-HINT-AGENT-WIRE"));
         let agents = HashMap::from([
-            (
-                "prx_agent".to_string(),
-                containment_agent(&root_provider, Some("PRX-HINT-AGENT-WIRE")),
-            ),
+            ("prx_agent".to_string(), inline_agent.clone()),
             (
                 "prx_profile".to_string(),
                 config
@@ -17787,8 +17815,7 @@ mod tests {
             .with_model_catalog(catalog)
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
         tool.model = "hint:fast".to_string();
-        tool.provider = Arc::from(routed_provider);
-
+        tool.test_parent_provider = Arc::from(routed_provider);
         let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
             .await
             .expect("test: direct agent child result");
@@ -17834,15 +17861,21 @@ mod tests {
         use crate::providers::credential_probe::CredentialProbe;
         let temp = tempfile::tempdir().expect("test: temp dir");
         let root = CredentialProbe::start().await;
-        let gateway = providers::create_resilient_provider_with_options(
-            "litellm",
-            Some(F1_SPAWN_ROOT_SENTINEL),
-            Some(&root.base_url()),
-            &crate::config::ReliabilityConfig {
+        let gateway_config = crate::config::Config {
+            default_provider: Some("litellm".to_string()),
+            default_model: Some("probe-model".to_string()),
+            api_key: Some(F1_SPAWN_ROOT_SENTINEL.to_string()),
+            api_url: Some(root.base_url()),
+            reliability: crate::config::ReliabilityConfig {
                 provider_retries: 0,
                 provider_backoff_ms: 0,
                 ..crate::config::ReliabilityConfig::default()
             },
+            workspace_dir: temp.path().join("workspace"),
+            ..crate::config::Config::default()
+        };
+        let gateway = providers::create_provider_from_test_config(
+            &gateway_config,
             &providers::ProviderRuntimeOptions {
                 openprx_dir: Some(temp.path().to_path_buf()),
                 codex_auth_json_path: Some(temp.path().join("no-codex-auth.json")),
@@ -17851,20 +17884,29 @@ mod tests {
             },
         )
         .expect("test: litellm gateway builds");
-        let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL));
-        tool.provider = Arc::from(gateway);
+        let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL))
+            .with_hint_config(&gateway_config);
+        tool.test_parent_provider = Arc::from(gateway);
 
-        let result = execute_admitted_spawn(
-            &tool,
-            with_spawn_grant(json!({"task": "probe", "provider": "lite-llm"})),
-        )
-        .await
-        .expect("test: spawn returns a tool result");
-        assert!(result.success, "{:?}", result.error);
-
-        let seen = root.wait_for_requests(1, std::time::Duration::from_secs(10)).await;
-        let runs = tool.active_runs_snapshot().await;
-        assert_eq!(seen, 1, "gateway child did not reach root endpoint: {runs:?}");
+        for (index, spelling) in ["litellm", "lite-llm", "LiteLLM"].into_iter().enumerate() {
+            let result = execute_enabled_admitted_spawn(
+                &tool,
+                with_spawn_grant(json!({"task": "sessions_spawn: probe", "provider": spelling})),
+            )
+            .await
+            .expect("test: spawn returns a tool result");
+            assert!(result.success, "{spelling}: {:?}", result.error);
+            let seen = root
+                .wait_for_requests(index + 1, std::time::Duration::from_secs(10))
+                .await;
+            let runs = tool.active_runs_snapshot().await;
+            assert_eq!(seen, index + 1, "gateway child did not reach root endpoint: {runs:?}");
+        }
         assert!(root.saw(F1_SPAWN_ROOT_SENTINEL));
+        assert!(root.requests().iter().all(|request| {
+            request
+                .authorization()
+                .is_some_and(|header| header.contains(F1_SPAWN_ROOT_SENTINEL))
+        }));
     }
 }

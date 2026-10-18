@@ -292,16 +292,54 @@ fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
     // call. Make that one fixture capability part of the configured Direct
     // surface; an absent registry entry still publishes nothing.
     config.tool_tiering.always_include.push(FIXTURE_TOOL.to_owned());
-    config.cost.prices.insert(
-        FIXTURE_MODEL.to_owned(),
-        crate::config::schema::ModelPricing {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 1.0,
-            cache_read: 1.0,
-        },
-    );
+    let pricing = crate::config::schema::ModelPricing {
+        input: 1.0,
+        output: 1.0,
+        cache_write: 1.0,
+        cache_read: 1.0,
+    };
     config
+        .cost
+        .prices
+        .insert(format!("{FIXTURE_PROVIDER}/{FIXTURE_MODEL}"), pricing.clone());
+    config.cost.prices.insert("ollama/prx-local-model".to_owned(), pricing);
+    config
+}
+
+fn enabled_builtin_admission_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut config = admission_config(workspace);
+    config.causal_tree.enabled = true;
+    config
+}
+
+fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDecision<'_>) {
+    assert!(
+        decision.service.status().backend.enabled,
+        "step 7.1 decision service must keep the causal tree enabled"
+    );
+    let prediction = decision
+        .context
+        .engine()
+        .prediction
+        .as_ref()
+        .expect("step 7.1 must execute the enabled decision plane");
+    assert_eq!(prediction.served_by, crate::decision::factory::ServedBy::Builtin);
+    assert_eq!(
+        prediction.reason, None,
+        "step 7.1 must use the enabled builtin path, not disabled-mode fallback"
+    );
+    assert_eq!(
+        decision.context.terminal_outcome_action(),
+        Some(crate::causal_tree::branch::CausalActionKind::Answer),
+        "step 7.1 must select the intended Answer action"
+    );
+    assert!(
+        matches!(
+            decision.context.directive(),
+            crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+        ),
+        "step 7.1 must issue the intended direct-answer directive"
+    );
 }
 
 fn fixture_tool(calls: Arc<AtomicUsize>, arguments: Arc<Mutex<Vec<serde_json::Value>>>) -> Box<dyn Tool> {
@@ -313,8 +351,12 @@ fn initial_history() -> Vec<ChatMessage> {
 }
 
 fn overflow_history() -> Vec<ChatMessage> {
-    let mut history = initial_history();
-    history.extend((0..30).map(|index| ChatMessage::user(format!("fixture overflow turn {index}"))));
+    let mut history = vec![ChatMessage::system("fixture system")];
+    for index in 0..15 {
+        history.push(ChatMessage::user(format!("fixture question {index}")));
+        history.push(ChatMessage::assistant(format!("fixture answer {index}")));
+    }
+    history.push(ChatMessage::user("Explain the current fixture result."));
     history
 }
 
@@ -343,16 +385,18 @@ pub(super) async fn admit_chat_fixture(
     action_tx: mpsc::Sender<Action>,
     cancellation: CancellationToken,
 ) -> ChatFixtureAdmission {
-    admit_chat_fixture_with_config(
+    let admitted = admit_chat_fixture_with_config(
         provider,
         registry,
-        admission_config(workspace),
+        enabled_builtin_admission_config(workspace),
         selection,
         source_input,
         action_tx,
         cancellation,
     )
-    .await
+    .await;
+    assert_enabled_builtin_selection(admitted.binding.decision_routing().expect("chat decision routing"));
+    admitted
 }
 
 pub(super) async fn admit_chat_fixture_with_config(
@@ -689,8 +733,8 @@ async fn run_agent_fixture_with_history(
         Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
     let mut history = history;
     let tools = crate::agent::test_admission::registry_with_search(tools);
-    let admission = crate::agent::test_admission::AdmittedTurn::with_model(
-        admission_config(temp.path()),
+    let admission = crate::agent::test_admission::AdmittedTurn::with_enabled_builtin_model(
+        enabled_builtin_admission_config(temp.path()),
         &history
             .iter()
             .rev()
@@ -702,6 +746,7 @@ async fn run_agent_fixture_with_history(
         (FIXTURE_PROVIDER, FIXTURE_MODEL),
     )
     .await;
+    assert_enabled_builtin_selection(admission.decision());
     let result = crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
@@ -938,7 +983,11 @@ async fn step_7_1_same_overflow_fixture_characterizes_recovery_signals() {
     .await;
 
     assert_eq!(chat_provider.stream_calls(), 2);
-    assert_eq!(agent_provider.traced_calls(), 2);
+    assert_eq!(
+        agent_provider.traced_calls(),
+        2,
+        "buffered engine result: {agent_result:?}; history: {agent_history:?}"
+    );
     assert!(chat_actions.iter().any(|action| matches!(
         action,
         Action::HistoryCompacted {

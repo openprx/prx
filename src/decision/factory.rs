@@ -24,11 +24,14 @@
 //!   cache (a hit carries the current request id, D-079 L-9), the breaker
 //!   (a cancelled half-open probe is released, D-079 M-1), the remaining
 //!   deadline, the outbound guard, whose checked bytes are exactly what the
-//!   backend sends (D-079 M-3), the attempt bounded by the slot timeout and
-//!   the request deadline (a timeout the turn's deadline forced is not the
-//!   backend's failure, D-079 L-6), and validation. Any failure falls to the next slot; when every slot fails
-//!   or time runs out, the builtin shadow is the answer. The factory has no
-//!   API that changes a candidate, a state or a gate.
+//!   backend sends (D-079 M-3), and validation. A backend without its own
+//!   transport bound has its whole attempt bounded by the slot timeout and
+//!   request deadline. The HTTP adapter instead gives source-owned accounting
+//!   the request deadline and retains the slot timeout on its client I/O. A
+//!   timeout the turn's deadline forced is not the backend's failure (D-079
+//!   L-6). Any failure falls to the next slot; when every slot fails or time
+//!   runs out, the builtin shadow is the answer. The factory has no API that
+//!   changes a candidate, a state or a gate.
 //! - An unavailable decision key (D-057) leaves only the builtin.
 
 use std::sync::Arc;
@@ -276,6 +279,39 @@ pub struct PredictionResult {
     pub reason: Option<FallbackReason>,
 }
 
+impl PredictionResult {
+    /// True only when every configured backend reached response validation and
+    /// every such response failed it. Transport, service, circuit and budget
+    /// failures keep the deterministic builtin eligible.
+    pub(crate) fn all_configured_attempts_failed_semantic_validation(&self) -> bool {
+        self.reason == Some(FallbackReason::AllFailed)
+            && !self.attempts.is_empty()
+            && self.attempts.iter().all(|attempt| {
+                matches!(
+                    &attempt.outcome,
+                    AttemptOutcome::Failed(error) if error.is_semantic_validation_failure()
+                )
+            })
+    }
+
+    /// The serving result can authorize terminal continuation. A builtin
+    /// shadow remains usable after infrastructure fallback, but not after all
+    /// configured responses failed semantic validation.
+    pub(crate) fn served_attempt_succeeded(&self) -> bool {
+        match self.served_by {
+            ServedBy::Builtin => !self.all_configured_attempts_failed_semantic_validation(),
+            ServedBy::Primary | ServedBy::Fallback => self
+                .attempts
+                .iter()
+                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Served)),
+            ServedBy::Cache => self
+                .attempts
+                .iter()
+                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Cached)),
+        }
+    }
+}
+
 impl std::fmt::Debug for PredictionResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PredictionResult")
@@ -352,6 +388,20 @@ impl crate::causal_tree::decision_engine::prediction_sealed::Producer for Accoun
 impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction<'_> {
     fn remaining_budget(&self) -> Option<(u64, u64)> {
         self.accounting.map(|owner| owner.remaining_budget())
+    }
+    fn terminal_fallback_cause(
+        &self,
+        result: &PredictionResult,
+    ) -> Option<crate::causal_tree::decision_engine::FallbackCause> {
+        use crate::causal_tree::decision_engine::FallbackCause;
+        match result.reason {
+            Some(FallbackReason::AllFailed) if result.all_configured_attempts_failed_semantic_validation() => {
+                Some(FallbackCause::DecisionFailed)
+            }
+            Some(FallbackReason::AllFailed) => None,
+            Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
+            Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
+        }
     }
     async fn predict<'a>(
         &'a self,
@@ -1068,10 +1118,19 @@ impl DecisionBackendFactory {
                 body.bytes(),
             );
             events.emit(CausalEventKind::PredictionStarted, Emitter::slot_fields(slot));
-            // The attempt is bounded by the slot timeout, or by the turn's
-            // deadline when that comes first.
+            // Ordinarily the whole attempt is bounded by the slot timeout or
+            // the turn deadline, whichever comes first.
             let slot_bound = now + slot.timeout <= deadline;
-            let attempt_deadline = deadline.min(now + slot.timeout);
+            // The HTTP adapter's client owns the configured transport timeout.
+            // Give its source-owned durable accounting the rest of the sealed
+            // turn deadline instead of charging local journal latency to the
+            // narrower network allowance. The factory still bounds the whole
+            // call at the manifest deadline.
+            let attempt_deadline = if accounting.is_some() && slot.backend.bounds_transport_independently() {
+                deadline
+            } else {
+                deadline.min(now + slot.timeout)
+            };
             let observed_accounting = accounting.map(super::budget::ObservedAccounting::new);
             let outcome = tokio::time::timeout_at(
                 attempt_deadline.into(),
@@ -1380,6 +1439,109 @@ mod tests {
         mock: Arc<MockDecisionBackend>,
         identity: BackendIdentity,
         received: Received,
+    }
+
+    struct IndependentAccounted {
+        identity: BackendIdentity,
+    }
+
+    struct DeadlineAccounting {
+        minimum_attempt_deadline: Instant,
+        owner_deadline: Instant,
+    }
+
+    struct DeadlineReceipt {
+        owner_deadline: Instant,
+    }
+
+    impl crate::decision::budget::sealed::AccountingOwner for DeadlineAccounting {}
+    impl crate::decision::budget::sealed::AttemptReceipt for DeadlineReceipt {}
+
+    #[async_trait]
+    impl crate::decision::budget::DecisionAttemptAccounting for DeadlineAccounting {
+        fn remaining_budget(&self) -> (u64, u64) {
+            (u64::MAX, u64::MAX)
+        }
+
+        async fn begin(
+            &self,
+            attempt: crate::decision::budget::AttemptBinding<'_>,
+        ) -> Result<Box<dyn crate::decision::budget::DecisionAttemptReceipt>, DecisionError> {
+            if attempt.deadline() < self.minimum_attempt_deadline {
+                return Err(DecisionError::BudgetExceeded);
+            }
+            Ok(Box::new(DeadlineReceipt {
+                owner_deadline: self.owner_deadline,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl crate::decision::budget::DecisionAttemptReceipt for DeadlineReceipt {
+        fn deadline(&self) -> Instant {
+            self.owner_deadline
+        }
+
+        async fn settle(
+            self: Box<Self>,
+            _usage: crate::decision::protocol::DecisionUsage,
+        ) -> Result<(), DecisionError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl DecisionBackend for IndependentAccounted {
+        fn identity(&self) -> &BackendIdentity {
+            &self.identity
+        }
+
+        fn locality(&self) -> BackendLocality {
+            BackendLocality::Loopback
+        }
+
+        fn version_policy(&self) -> ModelVersionPolicy {
+            ModelVersionPolicy::Unpinned
+        }
+
+        fn bounds_transport_independently(&self) -> bool {
+            true
+        }
+
+        async fn evaluate(
+            &self,
+            _request: &DecisionRequest,
+            _body: &GuardedBody,
+            _deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            Err(DecisionError::BudgetExceeded)
+        }
+
+        async fn evaluate_with_accounting(
+            &self,
+            request: &DecisionRequest,
+            body: &GuardedBody,
+            deadline: Instant,
+            accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        ) -> Result<DecisionResponse, DecisionError> {
+            const TRANSPORT_BINDING: [u8; 32] = [7; 32];
+            let receipt = accounting
+                .ok_or(DecisionError::BudgetExceeded)?
+                .begin(crate::decision::budget::AttemptBinding {
+                    backend: &self.identity,
+                    provider: "test",
+                    model: MODEL,
+                    transport_binding: &TRANSPORT_BINDING,
+                    guarded_body: body.bytes(),
+                    request_id: request.request_id(),
+                    deadline,
+                    remaining_attempts: 1,
+                })
+                .await?;
+            let response = answer_as(request, "independent-accounted");
+            receipt.settle(response.usage).await?;
+            Ok(response)
+        }
     }
 
     type Received = Arc<parking_lot::Mutex<Vec<Vec<u8>>>>;
@@ -2281,6 +2443,47 @@ mod tests {
         assert_eq!(second_mock.calls(), 0);
     }
 
+    #[tokio::test]
+    async fn independently_bounded_transport_does_not_charge_accounting_to_its_io_timeout() {
+        let temp = tempfile::TempDir::new().expect("test: temp dir");
+        let key = key(&temp);
+        let request = request_with(
+            &key,
+            serde_json::json!({"goal": "list files"}),
+            Duration::from_secs(60),
+            false,
+        );
+        let owner_deadline = request.manifest().expires_at();
+        let accounting = DeadlineAccounting {
+            minimum_attempt_deadline: Instant::now() + Duration::from_secs(30),
+            owner_deadline,
+        };
+        let backend = IndependentAccounted {
+            identity: BackendIdentity {
+                kind: BackendKind::CompatibleHttp,
+                provider: Some(ProviderId::of("custom:http://127.0.0.1:1/accounted")),
+                configured_model: Arc::from(MODEL),
+            },
+        };
+        let factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(backend)],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits {
+                timeout: Duration::from_millis(50),
+                ..SlotLimits::default()
+            },
+        );
+
+        let result = factory
+            .decide_with_accounting(&request, &CausalLineage::default(), Some(&accounting))
+            .await
+            .expect("accounted configured decision");
+
+        assert_eq!(result.served_by, ServedBy::Primary);
+        assert!(matches!(result.attempts[0].outcome, AttemptOutcome::Served));
+    }
+
     /// D-079 L-6: a timeout forced by the turn's deadline is not the
     /// backend's failure: its breaker does not count it. The 300 ms slot
     /// timeout outlasts the 100 ms turn deadline, which bounds the attempt
@@ -2385,6 +2588,144 @@ mod tests {
         let question = QuestionId::global(GlobalQuestion::EvidenceSufficient);
         assert_eq!(result.served.answer(&question), result.builtin_shadow.answer(&question));
         assert_eq!(request.state().as_json(), &state_before);
+    }
+
+    #[tokio::test]
+    async fn only_all_semantic_validation_failures_close_the_configured_decision_path() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let key = key(&temp);
+
+        for error in [
+            DecisionError::Transport,
+            DecisionError::Unavailable,
+            DecisionError::BudgetExceeded,
+        ] {
+            let request = request(&key);
+            let (backend, _) = scripted(&key, "fallback", vec![MockStep::now(MockOutcome::Fail(error.clone()))]);
+            let factory = DecisionBackendFactory::from_slots(
+                vec![backend],
+                Arc::clone(&key),
+                OutboundSecrets::default(),
+                SlotLimits::default(),
+            );
+            let result = factory
+                .decide(&request, &CausalLineage::default())
+                .await
+                .expect("builtin fallback");
+            assert_eq!(result.served_by, ServedBy::Builtin);
+            assert!(result.served_attempt_succeeded());
+            assert!(!result.all_configured_attempts_failed_semantic_validation());
+            assert_eq!(
+                crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                    &factory.prediction_port(None),
+                    &result,
+                ),
+                None,
+                "{error:?} must fall back to the builtin"
+            );
+        }
+
+        let semantic_request = request(&key);
+        let mut invalid = answer_as(&semantic_request, "semantic");
+        invalid.answers.clear();
+        let (backend, _) = scripted(&key, "semantic", vec![MockStep::now(MockOutcome::Respond(invalid))]);
+        let factory = DecisionBackendFactory::from_slots(
+            vec![backend],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let result = factory
+            .decide(&semantic_request, &CausalLineage::default())
+            .await
+            .expect("semantic failure record");
+        assert!(result.all_configured_attempts_failed_semantic_validation());
+        assert!(
+            !result.served_attempt_succeeded(),
+            "the builtin shadow cannot turn an all-semantic rejection into a served decision"
+        );
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            Some(crate::causal_tree::decision_engine::FallbackCause::DecisionFailed)
+        );
+
+        let served_request = request(&key);
+        let (first, _) = scripted(
+            &key,
+            "first",
+            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
+        );
+        let (second, _) = scripted(
+            &key,
+            "second",
+            vec![MockStep::now(MockOutcome::Respond(answer_as(
+                &served_request,
+                "second",
+            )))],
+        );
+        let factory = DecisionBackendFactory::from_slots(
+            vec![first, second],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let result = factory
+            .decide(&served_request, &CausalLineage::default())
+            .await
+            .expect("second backend serves");
+        assert_eq!(result.served_by, ServedBy::Fallback);
+        assert!(matches!(
+            &result.attempts[0].outcome,
+            AttemptOutcome::Failed(DecisionError::Transport)
+        ));
+        assert!(matches!(&result.attempts[1].outcome, AttemptOutcome::Served));
+        assert!(result.served_attempt_succeeded());
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            None
+        );
+
+        let circuit_request = request(&key);
+        let (backend, _) = scripted(
+            &key,
+            "circuit",
+            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
+        );
+        let factory = DecisionBackendFactory::from_slots(
+            vec![backend],
+            Arc::clone(&key),
+            OutboundSecrets::default(),
+            SlotLimits {
+                failure_threshold: 1,
+                ..SlotLimits::default()
+            },
+        );
+        factory
+            .decide(&circuit_request, &CausalLineage::default())
+            .await
+            .expect("circuit-opening fallback");
+        let result = factory
+            .decide(&circuit_request, &CausalLineage::default())
+            .await
+            .expect("open-circuit fallback");
+        assert!(matches!(
+            &result.attempts[0].outcome,
+            AttemptOutcome::Skipped(DecisionError::CircuitOpen)
+        ));
+        assert!(result.served_attempt_succeeded());
+        assert_eq!(
+            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
+                &factory.prediction_port(None),
+                &result,
+            ),
+            None
+        );
     }
 
     /// Invariant 16.2: a request whose state carries a configured secret is

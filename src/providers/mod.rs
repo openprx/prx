@@ -9,7 +9,7 @@
 //! The subsystem supports resilient multi-provider configurations through the
 //! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
-//! [`create_routed_provider`].
+//! [`create_routed_provider_for`].
 //!
 //! # Extension
 //!
@@ -25,6 +25,7 @@ pub mod connection_test;
 pub mod copilot;
 pub mod credentials;
 pub mod gemini;
+pub(crate) mod generation;
 mod identity;
 pub mod ollama;
 pub mod openai;
@@ -39,6 +40,8 @@ pub mod utf8_stream;
 
 #[cfg(test)]
 pub(crate) mod credential_probe;
+#[cfg(test)]
+pub(crate) mod entrypoint_consistency_tests;
 #[cfg(test)]
 pub(crate) mod label_redaction_tests;
 #[cfg(test)]
@@ -56,12 +59,12 @@ pub use traits::{
 };
 
 pub(crate) use identity::canonical_auth_profile_provider;
+use identity::split_byo_provider;
 pub(crate) use identity::{
     ByoDialect, ProviderConnection, ProviderIdentity, byo_dialect_of, canonical_provider_key, classify_provider,
     configured_connection_for, credential_for_provider_identity, scoped_reliability,
 };
-pub use identity::{DEFAULT_PROVIDER_FOR_UNSET, ProviderId, ProviderNamespace};
-use identity::{split_byo_provider, without_rotation_keys};
+pub use identity::{ProviderId, ProviderNamespace, default_provider_for_unset};
 
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
@@ -969,17 +972,6 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>, refresh: OauthR
 
 fn is_claude_code_oauth_placeholder(value: &str) -> bool {
     is_claude_code_alias(value)
-}
-
-/// Whether construction interprets a configured key as an instruction to
-/// obtain different credential material (and possibly a different endpoint).
-/// Such a key cannot attest to wire material through the configured
-/// credential slot alone, whether Root or a model route.
-pub(crate) fn credential_override_is_runtime_indirection(provider: &str, value: &str) -> bool {
-    let value = value.trim();
-    (is_qwen_oauth_alias(provider) && value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
-        || (is_minimax_alias(provider) && is_minimax_oauth_placeholder(value))
-        || ((is_claude_code_alias(provider) || provider == "anthropic") && is_claude_code_oauth_placeholder(value))
 }
 
 fn resolve_claude_code_context(credential_override: Option<&str>, refresh: OauthRefresh) -> ClaudeCodeProviderContext {
@@ -2490,7 +2482,10 @@ impl ConfiguredProviders {
     /// Every provider the operator configured in `config`.
     #[must_use]
     pub fn from_config(config: &crate::config::Config) -> Self {
-        let default_provider = config.default_provider.as_deref().unwrap_or(DEFAULT_PROVIDER_FOR_UNSET);
+        let default_provider = config
+            .default_provider
+            .as_deref()
+            .unwrap_or_else(default_provider_for_unset);
         Self::default()
             .with_providers(std::iter::once(default_provider))
             .with_providers(config.reliability.fallback_providers.iter().map(String::as_str))
@@ -2628,6 +2623,7 @@ fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &
 }
 
 /// Factory: create the right provider from config (without custom URL)
+#[cfg(test)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
@@ -2650,6 +2646,7 @@ pub fn create_provider_with_options(
 }
 
 /// Factory: create the right provider from config with optional custom base URL
+#[cfg(test)]
 pub fn create_provider_with_url(
     name: &str,
     api_key: Option<&str>,
@@ -2678,12 +2675,7 @@ fn create_provider_with_url_and_options(
     }
     let resolved = match credential {
         ProviderCredentialInput::Legacy(api_key) => resolve_provider_credentials(name, api_key, options),
-        ProviderCredentialInput::PinnedKeyless(owned) => {
-            if !owned.matches_connection(name, None, api_url, owned.resolved.credential().rotation_keys()) {
-                anyhow::bail!("resolved keyless connection changed before construction");
-            }
-            ResolvedProviderCredentials::default()
-        }
+        ProviderCredentialInput::Resolved(owned) => owned.resolve_credentials(name, api_url, options)?,
     };
     // Break static-analysis taint chain from the sensitive-named input before
     // downstream provider storage.
@@ -3151,7 +3143,14 @@ pub fn create_provider_for(
         model_fallbacks.insert(primary.to_string(), siblings.clone());
     }
     let reliability = crate::config::ReliabilityConfig {
-        api_keys: resolved.credential().rotation_keys().to_vec(),
+        // OpenAI Codex authenticates from its own login store. Root rotation
+        // keys are configuration for ordinary API-key providers and must not
+        // create duplicate Codex provider instances.
+        api_keys: if is_openai_codex_alias(label) {
+            Vec::new()
+        } else {
+            resolved.credential().rotation_keys().to_vec()
+        },
         model_fallbacks,
         ..reliability.clone()
     };
@@ -3185,15 +3184,86 @@ pub fn create_provider_for(
         }
     }
     let credential = resolved.credential();
-    create_resilient_provider_with_pinned_root(
+    create_resilient_provider_from_resolved(
         label,
         credential.api_key(),
         credential.api_url(),
         &reliability,
         &scoped,
-        KeylessRoot::from_resolved(resolved),
-        Some(fallback_admission),
+        ResolvedPrimary::new(resolved),
+        fallback_admission,
     )
+}
+
+/// Build the routed chat provider for one resolver-released default selection.
+///
+/// The default and every `[[model_routes]]` destination are constructed only
+/// from their [`catalog::ResolvedModel`] and owner-bound credential. A route
+/// therefore cannot inherit another route's key, dialect or fallback facts,
+/// including when two hints name the same provider label.
+///
+/// A refused or unbuildable route is retained as a refusal attached to its
+/// hint. Other routes and the default remain available; selecting that hint
+/// returns the original refusal.
+///
+/// # Errors
+///
+/// When the default provider chain cannot be constructed.
+pub fn create_routed_provider_for(
+    resolved: &catalog::ResolvedModel,
+    catalog: &catalog::CatalogView,
+    config: &crate::config::Config,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let default = create_provider_for(resolved, catalog, &config.reliability, &config.cost, options)?;
+    if config.model_routes.is_empty() {
+        return Ok(default);
+    }
+    let mut routes = Vec::with_capacity(config.model_routes.len());
+    let mut refused_routes = Vec::new();
+    for configured in &config.model_routes {
+        let built = selection::resolve_route(config, catalog, configured, catalog::UnknownPolicy::Invocation).and_then(
+            |route| {
+                create_provider_for(&route, catalog, &config.reliability, &config.cost, options)
+                    .map(|provider| (route, provider))
+                    .map_err(|error| {
+                        anyhow::anyhow!("model route `hint:{}` could not be built: {error}", configured.hint)
+                    })
+            },
+        );
+        match built {
+            Ok((route, provider)) => routes.push((
+                configured.hint.clone(),
+                route.provider_label().to_string(),
+                route.model().to_string(),
+                provider,
+            )),
+            Err(error) => {
+                let refusal = redact_endpoint_userinfo(&error.to_string()).into_owned();
+                tracing::warn!(hint = %configured.hint, "Skipping refused model route: {refusal}");
+                refused_routes.push((configured.hint.clone(), refusal));
+            }
+        }
+    }
+    Ok(Box::new(router::RouterProvider::from_resolved(
+        (resolved.provider_label().to_string(), default),
+        routes,
+        refused_routes,
+        resolved.model().to_string(),
+    )))
+}
+
+/// Resolve and construct the configured default exactly as production
+/// entrypoints do. Test fixtures use this instead of bypassing PMM with raw
+/// factory arguments.
+#[cfg(test)]
+pub(crate) fn create_provider_from_test_config(
+    config: &crate::config::Config,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let catalog = selection::catalog_for(config);
+    let resolved = selection::check_default(config, catalog::UnknownPolicy::Invocation)?;
+    create_routed_provider_for(&resolved, &catalog, config, options)
 }
 
 pub(crate) fn fallback_admission_for(
@@ -3219,7 +3289,17 @@ pub(crate) fn fallback_admission_for(
             let cost_admitted =
                 match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
                     crate::llm::route_decision::UsagePrice::Priced(_) => true,
-                    crate::llm::route_decision::UsagePrice::Missing => provider_id.catalog_name() == Some("ollama"),
+                    crate::llm::route_decision::UsagePrice::Missing => {
+                        crate::runtime::turn_cost::provider_is_zero_price_exempt(
+                            &provider_id,
+                            // Sibling models and a deduplicated fallback entry of the primary
+                            // provider run on the primary connection; other providers use
+                            // their own default endpoint.
+                            (provider_id == *resolved.provider())
+                                .then(|| resolved.credential().api_url())
+                                .flatten(),
+                        )
+                    }
                     crate::llm::route_decision::UsagePrice::Invalid => false,
                 };
             admission.insert(
@@ -3237,8 +3317,15 @@ pub(crate) fn fallback_admission_for(
 
 enum ProviderCredentialInput<'a> {
     Legacy(Option<&'a str>),
-    PinnedKeyless(KeylessRoot<'a>),
+    Resolved(ResolvedPrimary<'a>),
 }
+
+/// The selected provider requires an explicit credential and none resolved.
+/// Typed so callers (for example `prx doctor`) classify it without matching
+/// message text.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("missing credential/api key")]
+pub(crate) struct MissingProviderCredential;
 
 impl<'a> From<Option<&'a str>> for ProviderCredentialInput<'a> {
     fn from(key: Option<&'a str>) -> Self {
@@ -3246,124 +3333,102 @@ impl<'a> From<Option<&'a str>> for ProviderCredentialInput<'a> {
     }
 }
 
-/// A concrete Root connection whose supported provider can run without auth.
-/// Only resolver-owned identity/material can create this factory witness.
+/// A resolver-owned primary connection. Construction may consult a provider's
+/// store when the resolver selected [`credentials::CredentialRef::ProviderStore`]
+/// or when the Root owns only URL/rotation material and its key is absent.
+/// Every other reference uses exactly the released material.
 #[derive(Clone, Copy)]
-pub(crate) struct KeylessRoot<'a> {
+pub(crate) struct ResolvedPrimary<'a> {
     resolved: &'a catalog::ResolvedModel,
 }
 
-impl<'a> KeylessRoot<'a> {
-    pub(crate) fn from_resolved(resolved: &'a catalog::ResolvedModel) -> Option<Self> {
-        let credential = resolved.credential();
-        let endpoint = reqwest::Url::parse(credential.api_url()?).ok()?;
-        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-            return None;
-        }
-        let supported = match classify_provider(resolved.provider_label()) {
-            ProviderIdentity::Catalog(name) => name == "ollama" && !resolved.model().ends_with(":cloud"),
-            ProviderIdentity::ByoEndpoint {
-                dialect: ByoDialect::OpenAiCompatible,
-                ..
-            } => true,
-            _ => false,
-        };
-        (supported
-            && resolved.provider_label().trim() == resolved.provider_label()
-            && matches!(
-                credential.reference(),
-                credentials::CredentialRef::LegacyInline(credentials::LegacySlot::Root)
-            )
-            && credential.api_key().is_none()
-            && credential.api_url().is_some())
-        .then_some(Self { resolved })
+impl<'a> ResolvedPrimary<'a> {
+    const fn new(resolved: &'a catalog::ResolvedModel) -> Self {
+        Self { resolved }
     }
 
-    pub(crate) fn matches_connection(
+    fn matches_connection(self, name: &str, key: Option<&str>, url: Option<&str>, rotation: &[String]) -> bool {
+        let same_provider = name == self.resolved.provider_label() && ProviderId::of(name) == *self.resolved.provider();
+        same_provider
+            && (is_openai_codex_alias(name)
+                || (key == self.resolved.credential().api_key()
+                    && url == self.resolved.credential().api_url()
+                    && rotation == self.resolved.credential().rotation_keys()))
+    }
+
+    fn resolve_credentials(
         self,
         name: &str,
-        key: Option<&str>,
         url: Option<&str>,
-        rotation: &[String],
-    ) -> bool {
-        name == self.resolved.provider_label()
-            && ProviderId::of(name) == *self.resolved.provider()
-            && key.is_none()
-            && url == self.resolved.credential().api_url()
-            && rotation == self.resolved.credential().rotation_keys()
+        options: &ProviderRuntimeOptions,
+    ) -> anyhow::Result<ResolvedProviderCredentials> {
+        let credential = self.resolved.credential();
+        if !self.matches_connection(name, credential.api_key(), url, credential.rotation_keys()) {
+            anyhow::bail!("resolved provider connection changed before construction");
+        }
+        let resolved = match credential.reference() {
+            credentials::CredentialRef::ProviderStore => resolve_provider_credentials(name, None, options),
+            credentials::CredentialRef::None => ResolvedProviderCredentials::default(),
+            credentials::CredentialRef::LegacyInline(credentials::LegacySlot::Root)
+                if credential.api_key().is_none() =>
+            {
+                resolve_provider_credentials(name, None, options)
+            }
+            credentials::CredentialRef::Profile { .. } | credentials::CredentialRef::LegacyInline(_) => credential
+                .api_key()
+                .map_or_else(ResolvedProviderCredentials::default, |key| {
+                    resolve_provider_credentials(name, Some(key), options)
+                }),
+        };
+        if provider_requires_explicit_credential(name) && !resolved.is_usable_for(name) {
+            return Err(anyhow::Error::new(MissingProviderCredential));
+        }
+        Ok(resolved)
     }
 
     fn construct(self, options: &ProviderRuntimeOptions) -> anyhow::Result<Box<dyn Provider>> {
+        if is_openai_codex_alias(self.resolved.provider_label()) {
+            // Codex owns an OAuth/subscription login. Legacy Root material can
+            // select this provider, but it never becomes Codex wire material.
+            return create_provider_with_options(self.resolved.provider_label(), None, options);
+        }
         create_provider_with_url_and_options(
             self.resolved.provider_label(),
-            ProviderCredentialInput::PinnedKeyless(self),
+            ProviderCredentialInput::Resolved(self),
             self.resolved.credential().api_url(),
             options,
         )
     }
 }
 
-/// Create provider chain with retry and fallback behavior.
-pub fn create_resilient_provider(
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &crate::config::ReliabilityConfig,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_resilient_provider_with_options(
-        primary_name,
-        api_key,
-        api_url,
-        reliability,
-        &ProviderRuntimeOptions::default(),
-    )
-}
-
-/// Create provider chain with retry/fallback behavior and auth runtime options.
-pub fn create_resilient_provider_with_options(
+fn create_resilient_provider_from_resolved(
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_resilient_provider_with_pinned_root(primary_name, api_key, api_url, reliability, options, None, None)
-}
-
-fn create_resilient_provider_with_pinned_root(
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &crate::config::ReliabilityConfig,
-    options: &ProviderRuntimeOptions,
-    pinned: Option<KeylessRoot<'_>>,
-    fallback_admission: Option<reliable::FallbackAdmission>,
+    resolved_primary: ResolvedPrimary<'_>,
+    fallback_admission: reliable::FallbackAdmission,
 ) -> anyhow::Result<Box<dyn Provider>> {
     #[cfg(feature = "wasm-plugins")]
     if primary_name.starts_with("wasm:") {
         return crate::plugins::runtime::resolve_process_provider(primary_name)
             .ok_or_else(|| anyhow::anyhow!("WASM provider '{primary_name}' is not loaded in this process"));
     }
-    if pinned.is_some_and(|owned| !owned.matches_connection(primary_name, api_key, api_url, &reliability.api_keys)) {
-        anyhow::bail!("resolved keyless connection changed before construction");
+    if !resolved_primary.matches_connection(primary_name, api_key, api_url, &reliability.api_keys) {
+        anyhow::bail!("resolved provider connection changed before construction");
     }
-    let mut prepared = pinned.map(|owned| owned.construct(options)).transpose()?;
-    let availability = summarize_provider_availability_inner(primary_name, api_key, reliability, options, pinned);
+    let mut prepared = Some(resolved_primary.construct(options)?);
+    let availability =
+        summarize_provider_availability_inner(primary_name, api_key, reliability, options, Some(resolved_primary));
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     let mut unavailable = availability.unavailable.clone();
 
     for provider_name in &availability.available {
-        let explicit_key = (provider_name == primary_name).then_some(api_key).flatten();
         let creation_result = if provider_name == primary_name {
-            prepared.take().map_or_else(
-                || match primary_name {
-                    "openai-codex" | "openai_codex" | "codex" => {
-                        create_provider_with_options(provider_name, explicit_key, options)
-                    }
-                    _ => create_provider_with_url_and_options(provider_name, explicit_key.into(), api_url, options),
-                },
-                Ok,
-            )
+            prepared
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("resolved primary provider was constructed more than once"))
         } else {
             create_provider_with_options(provider_name, None, options)
         };
@@ -3381,11 +3446,12 @@ fn create_resilient_provider_with_pinned_root(
                 // before falling through to unrelated fallback providers.
                 if provider_name == primary_name {
                     for extra_key in extra_api_keys(reliability, api_key) {
-                        let rotated = if is_openai_codex_alias(primary_name) {
-                            create_provider_with_options(primary_name, Some(extra_key), options)
-                        } else {
-                            create_provider_with_url_and_options(primary_name, Some(extra_key).into(), api_url, options)
-                        };
+                        let rotated = create_provider_with_url_and_options(
+                            primary_name,
+                            Some(extra_key).into(),
+                            api_url,
+                            options,
+                        );
                         match rotated {
                             Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
                             Err(error) => {
@@ -3435,205 +3501,15 @@ fn create_resilient_provider_with_pinned_root(
         anyhow::bail!("No available providers after credential/initialization checks: {reasons}");
     }
 
-    let mut reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
+    let reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
         .with_model_fallbacks(reliability.model_fallbacks.clone())
         .with_unavailable_providers(unavailable)
         // Every chain built through the factory observes the same per-provider
         // cool-down, so one request's 429 defers the others already in flight.
-        .with_rate_limit_gate(rate_limit::shared_gate());
-    if let Some(admission) = fallback_admission {
-        reliable = reliable.with_fallback_admission(admission);
-    }
+        .with_rate_limit_gate(rate_limit::shared_gate())
+        .with_fallback_admission(fallback_admission);
 
     Ok(Box::new(reliable))
-}
-
-/// Create a RouterProvider if model routes are configured, otherwise return a
-/// standard resilient provider. The router wraps individual providers per route,
-/// each with its own retry/fallback chain.
-pub fn create_routed_provider(
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &crate::config::ReliabilityConfig,
-    model_routes: &[crate::config::ModelRouteConfig],
-    default_model: &str,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_routed_provider_with_options(
-        primary_name,
-        api_key,
-        api_url,
-        reliability,
-        model_routes,
-        default_model,
-        &ProviderRuntimeOptions::default(),
-    )
-}
-
-/// Create a routed provider using explicit runtime options.
-pub fn create_routed_provider_with_options(
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &crate::config::ReliabilityConfig,
-    model_routes: &[crate::config::ModelRouteConfig],
-    default_model: &str,
-    options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
-    ProviderConnection::create_routed_provider_with_options(
-        primary_name,
-        &ProviderConnection {
-            api_key,
-            api_url,
-            released: false,
-        },
-        reliability,
-        model_routes,
-        default_model,
-        options,
-        None,
-    )
-}
-
-impl ProviderConnection<'_> {
-    pub(crate) fn create_routed_provider_with_options(
-        primary_name: &str,
-        connection: &Self,
-        reliability: &crate::config::ReliabilityConfig,
-        model_routes: &[crate::config::ModelRouteConfig],
-        default_model: &str,
-        options: &ProviderRuntimeOptions,
-        pinned: Option<KeylessRoot<'_>>,
-    ) -> anyhow::Result<Box<dyn Provider>> {
-        let (api_key, api_url) = (connection.api_key, connection.api_url);
-        if model_routes.is_empty() {
-            return create_resilient_provider_with_pinned_root(
-                primary_name,
-                api_key,
-                api_url,
-                reliability,
-                options,
-                pinned,
-                None,
-            );
-        }
-
-        // Collect unique provider names needed
-        let mut needed: Vec<String> = vec![primary_name.to_string()];
-        for route in model_routes {
-            if !needed.iter().any(|n| n == &route.provider) {
-                needed.push(route.provider.clone());
-            }
-        }
-
-        // Rotation keys are extra credentials for the primary's root key. A route
-        // to a different provider identity gets the same retry settings without
-        // them, so one vendor's keys are never replayed against another.
-        // Create each provider (with its own resilience wrapper)
-        let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-        for name in &needed {
-            let routed_credential = model_routes.iter().find(|r| &r.provider == name).and_then(|r| {
-                r.api_key.as_ref().and_then(|raw_key| {
-                    let trimmed_key = raw_key.trim();
-                    (!trimmed_key.is_empty()).then_some(trimmed_key)
-                })
-            });
-            let (connection, chain_reliability) =
-                routed_connection(name, primary_name, routed_credential, api_key, api_url, reliability);
-            let (key, url) = (connection.api_key, connection.api_url);
-            match create_resilient_provider_with_pinned_root(
-                name,
-                key,
-                url,
-                &chain_reliability,
-                options,
-                if name == primary_name { pinned } else { None },
-                None,
-            ) {
-                Ok(provider) => providers.push((name.clone(), provider)),
-                Err(e) => {
-                    if name == primary_name {
-                        return Err(e);
-                    }
-                    tracing::warn!(
-                        provider = %redact_endpoint_userinfo(name),
-                        "Ignoring routed provider that failed to initialize"
-                    );
-                }
-            }
-        }
-
-        // Build route table
-        let routes: Vec<(String, router::Route)> = model_routes
-            .iter()
-            .map(|r| {
-                (
-                    r.hint.clone(),
-                    router::Route {
-                        provider_name: r.provider.clone(),
-                        model: r.model.clone(),
-                    },
-                )
-            })
-            .collect();
-
-        Ok(Box::new(router::RouterProvider::new(
-            providers,
-            routes,
-            default_model.to_string(),
-        )))
-    }
-}
-
-/// The connection and reliability a routed provider's chain is built with.
-///
-/// Key, base URL and rotation keys are decided together, so no route ever
-/// receives one of them without the others.
-fn routed_connection<'a, 'r>(
-    name: &str,
-    primary_name: &str,
-    routed_credential: Option<&'a str>,
-    api_key: Option<&'a str>,
-    api_url: Option<&'a str>,
-    reliability: &'r crate::config::ReliabilityConfig,
-) -> (
-    ProviderConnection<'a>,
-    std::borrow::Cow<'r, crate::config::ReliabilityConfig>,
-) {
-    // The exact primary keeps its historical connection: a route entry for it
-    // may override its key, and it keeps the root URL and rotation keys.
-    if name == primary_name {
-        let connection = ProviderConnection {
-            api_key: select_routed_credential(name, primary_name, routed_credential, api_key),
-            api_url,
-            released: true,
-        };
-        return (connection, std::borrow::Cow::Borrowed(reliability));
-    }
-    // A route's own key is that route's credential: presented alone, with
-    // neither the root URL nor the root rotation keys.
-    if let Some(route_key) = routed_credential {
-        let connection = ProviderConnection {
-            api_key: Some(route_key),
-            api_url: None,
-            released: false,
-        };
-        return (connection, std::borrow::Cow::Owned(without_rotation_keys(reliability)));
-    }
-    // Any other spelling gets the root connection (key, URL and rotation keys)
-    // as one unit on a provider-identity match, and nothing otherwise.
-    let connection = configured_connection_for(name, primary_name, api_key, api_url);
-    let chain_reliability = scoped_reliability(reliability, &connection);
-    (connection, chain_reliability)
-}
-
-fn select_routed_credential<'a>(
-    provider_name: &str,
-    primary_name: &str,
-    routed_credential: Option<&'a str>,
-    primary_credential: Option<&'a str>,
-) -> Option<&'a str> {
-    routed_credential.or_else(|| (provider_name == primary_name).then_some(primary_credential).flatten())
 }
 
 /// Information about a supported provider for display purposes.
@@ -3903,7 +3779,7 @@ fn summarize_provider_availability_inner(
     api_key: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
-    validated_primary: Option<KeylessRoot<'_>>,
+    validated_primary: Option<ResolvedPrimary<'_>>,
 ) -> ProviderAvailabilitySummary {
     let mut configured = vec![primary_name.to_string()];
     for fallback in &reliability.fallback_providers {
@@ -3917,7 +3793,7 @@ fn summarize_provider_availability_inner(
 
     for provider in &configured {
         if provider == primary_name && validated_primary.is_some() {
-            // The same pinned primary has already passed its real constructor.
+            // The same resolver-owned primary has already passed its real constructor.
             available.push(provider.clone());
             continue;
         }
@@ -4264,19 +4140,21 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
-    #[test]
-    fn routed_factory_retains_public_function_pointer_signature() {
-        type OriginalFactory = for<'a, 'b, 'c, 'd, 'e, 'f, 'g> fn(
-            &'a str,
-            Option<&'b str>,
-            Option<&'c str>,
-            &'d crate::config::ReliabilityConfig,
-            &'e [crate::config::ModelRouteConfig],
-            &'f str,
-            &'g ProviderRuntimeOptions,
-        ) -> anyhow::Result<Box<dyn Provider>>;
-        fn assert_original_signature(_: OriginalFactory) {}
-        assert_original_signature(create_routed_provider_with_options);
+    fn factory_config(
+        provider: &str,
+        model: &str,
+        api_key: Option<&str>,
+        api_url: Option<&str>,
+        reliability: crate::config::ReliabilityConfig,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            default_provider: Some(provider.to_string()),
+            default_model: Some(model.to_string()),
+            api_key: api_key.map(str::to_string),
+            api_url: api_url.map(str::to_string),
+            reliability,
+            ..crate::config::Config::default()
+        }
     }
 
     // ── Retry-After capture on the non-streaming error path ──────
@@ -4409,19 +4287,51 @@ Connection: close\r\n\
     }
 
     #[test]
-    fn routed_provider_never_inherits_primary_credential() {
-        assert_eq!(
-            select_routed_credential("anthropic", "openai", None, Some("openai-secret")),
-            None
+    fn resolved_routes_never_inherit_the_primary_credential() {
+        let mut config = factory_config(
+            "openai",
+            "gpt-4o",
+            Some("openai-secret"),
+            None,
+            crate::config::ReliabilityConfig::default(),
         );
-        assert_eq!(
-            select_routed_credential("openai", "openai", None, Some("openai-secret")),
-            Some("openai-secret")
-        );
-        assert_eq!(
-            select_routed_credential("anthropic", "openai", Some("anthropic-secret"), Some("openai-secret")),
-            Some("anthropic-secret")
-        );
+        config.model_routes = vec![
+            crate::config::ModelRouteConfig {
+                hint: "foreign".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-3-5-sonnet-20241022".to_string(),
+                api_key: None,
+                credential_ref: None,
+            },
+            crate::config::ModelRouteConfig {
+                hint: "owned".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-3-5-sonnet-20241022".to_string(),
+                api_key: Some("anthropic-secret".to_string()),
+                credential_ref: None,
+            },
+        ];
+        let catalog = selection::catalog_for(&config);
+        let default = selection::check_default(&config, catalog::UnknownPolicy::Invocation)
+            .expect("test: the configured default resolves");
+        let foreign = selection::resolve_route(
+            &config,
+            &catalog,
+            &config.model_routes[0],
+            catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: the keyless route resolves");
+        let owned = selection::resolve_route(
+            &config,
+            &catalog,
+            &config.model_routes[1],
+            catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: the keyed route resolves");
+
+        assert_eq!(foreign.credential().api_key(), None);
+        assert_eq!(default.credential().api_key(), Some("openai-secret"));
+        assert_eq!(owned.credential().api_key(), Some("anthropic-secret"));
     }
 
     #[test]
@@ -5152,7 +5062,7 @@ Connection: close\r\n\
         );
 
         let wrapped = create_provider("gemini", Some("test-key")).expect("test: gemini constructs");
-        let router = router::RouterProvider::new(
+        let router = router::RouterProvider::from_test_parts(
             vec![("gemini".to_string(), wrapped)],
             Vec::new(),
             "gemini-2.0-flash".to_string(),
@@ -5198,7 +5108,7 @@ Connection: close\r\n\
         );
         assert_eq!(reliable.tool_schema_dialect_of_member("anthropic", "x"), None);
 
-        let router = router::RouterProvider::new(
+        let router = router::RouterProvider::from_test_parts(
             vec![("gemini".to_string(), Box::new(chain()) as Box<dyn Provider>)],
             Vec::new(),
             "gemini-2.0-flash".to_string(),
@@ -5266,7 +5176,7 @@ Connection: close\r\n\
             "a mixed-family chain must not enforce one member's rewrite on the other member's turns"
         );
 
-        let routed = router::RouterProvider::new(
+        let routed = router::RouterProvider::from_test_parts(
             vec![
                 (
                     "gemini".to_string(),
@@ -5720,7 +5630,7 @@ Connection: close\r\n\
     }
 
     #[test]
-    fn resilient_provider_ignores_duplicate_and_invalid_fallbacks() {
+    fn resolved_provider_refuses_an_invalid_fallback() {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
@@ -5739,15 +5649,27 @@ Connection: close\r\n\
             scheduler_retries: 2,
         };
 
-        let provider = create_resilient_provider("openrouter", Some("provider-test-credential"), None, &reliability);
-        assert!(provider.is_ok());
+        let config = factory_config(
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            Some("provider-test-credential"),
+            None,
+            reliability,
+        );
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
+        assert!(provider.is_err());
     }
 
     #[test]
     fn resilient_provider_errors_for_invalid_primary() {
-        let reliability = crate::config::ReliabilityConfig::default();
-        let provider =
-            create_resilient_provider("totally-invalid", Some("provider-test-credential"), None, &reliability);
+        let config = factory_config(
+            "totally-invalid",
+            "fixture-model",
+            Some("provider-test-credential"),
+            None,
+            crate::config::ReliabilityConfig::default(),
+        );
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
         assert!(provider.is_err());
     }
 
@@ -6059,7 +5981,8 @@ Connection: close\r\n\
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
         // receive this key; they resolve their own credentials independently.
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        let config = factory_config("zai", "glm-4.7", Some("zai-test-key"), None, reliability);
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
         assert!(provider.is_ok());
     }
 
@@ -6080,14 +6003,15 @@ Connection: close\r\n\
             scheduler_retries: 2,
         };
 
-        let provider = create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
+        let config = factory_config("openai", "gpt-4o", Some("openai-test-key"), None, reliability);
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
         assert!(provider.is_ok());
     }
 
     /// Mixed fallback chain: named providers, custom URLs, and invalid entries
     /// all coexist.  Invalid entries are silently ignored; valid ones initialize.
     #[test]
-    fn resilient_fallback_mixed_chain() {
+    fn resolved_provider_refuses_a_mixed_chain_with_an_invalid_member() {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
@@ -6106,8 +6030,9 @@ Connection: close\r\n\
             scheduler_retries: 2,
         };
 
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
+        let config = factory_config("zai", "glm-4.7", Some("zai-test-key"), None, reliability);
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
+        assert!(provider.is_err());
     }
 
     #[test]
@@ -6393,7 +6318,8 @@ Connection: close\r\n\
             "openai-extra-2".into(),
             "openai-extra-2".into(),
         ]);
-        let provider = create_resilient_provider("openai", Some("openai-primary"), None, &reliability);
+        let config = factory_config("openai", "gpt-4o", Some("openai-primary"), None, reliability);
+        let provider = create_provider_from_test_config(&config, &ProviderRuntimeOptions::default());
         assert!(
             provider.is_ok(),
             "resilient provider with rotation keys should build: {:?}",
@@ -6725,16 +6651,8 @@ Connection: close\r\n\
         let options = byo_isolated_options(&temp);
         let reliability = byo_reliability_without_fallbacks();
         let provider_name = endpoint.provider_name();
-
-        let outcome = create_routed_provider_with_options(
-            &provider_name,
-            None,
-            None,
-            &reliability,
-            &[],
-            BYO_BARE_MODEL,
-            &options,
-        );
+        let config = factory_config(&provider_name, BYO_BARE_MODEL, None, None, reliability.clone());
+        let outcome = create_provider_from_test_config(&config, &options);
 
         assert!(
             reliability.fallback_providers.is_empty(),
@@ -6966,20 +6884,16 @@ Connection: close\r\n\
         let options = byo_isolated_options(&temp);
         let reliability = byo_reliability_without_fallbacks();
 
-        let error = create_routed_provider_with_options(
-            "custom:not-a-url",
-            None,
-            None,
-            &reliability,
-            &[],
-            BYO_BARE_MODEL,
-            &options,
-        )
-        .err()
-        .map(|error| format!("{error:#}"))
-        .expect("test: an unparseable BYO URL must be refused");
+        let config = factory_config("custom:not-a-url", BYO_BARE_MODEL, None, None, reliability);
+        let error = create_provider_from_test_config(&config, &options)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .expect("test: an unparseable BYO URL must be refused");
 
-        assert!(error.contains("requires a valid URL"), "unexpected error: {error}");
+        assert!(
+            error.contains("is not one PRX can construct"),
+            "unexpected error: {error}"
+        );
         assert!(
             provider_requires_explicit_credential("custom:not-a-url"),
             "an unparseable BYO string must not inherit the credential-free arm"
@@ -7087,6 +7001,49 @@ Connection: close\r\n\
     }
 }
 
+#[cfg(test)]
+mod fallback_zero_price_tests {
+    use super::*;
+    use crate::providers::catalog::{Requirement, Selection, UnknownPolicy, resolve};
+    use crate::providers::credentials::{ConfigCredentialSource, CredentialRef, LegacySlot};
+
+    fn sibling_is_cost_admitted(api_url: Option<&str>) -> bool {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("ollama".to_string());
+        config.api_url = api_url.map(str::to_string);
+        config.api_key = Some("test-ollama-root-key".to_string());
+        let catalog = catalog::CatalogView::from_config(&config);
+        let resolved = resolve(
+            &Selection {
+                provider: "ollama",
+                model: "prx-local-model",
+                credential: CredentialRef::LegacyInline(LegacySlot::Root),
+            },
+            &Requirement::chat(),
+            &catalog,
+            &ConfigCredentialSource::new(&config),
+            UnknownPolicy::Invocation,
+        )
+        .expect("test: ollama primary resolves");
+        let mut reliability = config.reliability.clone();
+        reliability
+            .model_fallbacks
+            .insert("prx-local-model".to_string(), vec!["prx-unpriced-sibling".to_string()]);
+        let admission = fallback_admission_for(&resolved, &catalog, &reliability, &config.cost);
+        admission
+            .eligibility(&ProviderId::of("ollama"), "prx-unpriced-sibling")
+            .expect("test: sibling is described")
+            .cost_admitted
+    }
+
+    #[test]
+    fn an_unpriced_sibling_is_free_only_on_a_local_ollama_primary() {
+        assert!(sibling_is_cost_admitted(None));
+        assert!(sibling_is_cost_admitted(Some("http://localhost:11434")));
+        assert!(!sibling_is_cost_admitted(Some("https://ollama.com")));
+    }
+}
+
 /// Credential containment across provider identities: the root connection and
 /// its rotation keys (`reliability.api_keys`) reach only the provider they were
 /// configured for, whatever path builds the chain.
@@ -7118,6 +7075,24 @@ mod credential_containment_tests {
         }
     }
 
+    fn routed_config(
+        provider: &str,
+        model: &str,
+        api_key: Option<&str>,
+        api_url: Option<&str>,
+        routes: Vec<crate::config::ModelRouteConfig>,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            default_provider: Some(provider.to_string()),
+            default_model: Some(model.to_string()),
+            api_key: api_key.map(str::to_string),
+            api_url: api_url.map(str::to_string),
+            reliability: rotating_reliability(),
+            model_routes: routes,
+            ..crate::config::Config::default()
+        }
+    }
+
     /// T7: a `model_routes` entry for another provider must not inherit the
     /// root's rotation keys. The loopback answers 429 first, which is exactly
     /// what makes the chain rotate to its next member.
@@ -7133,16 +7108,9 @@ mod credential_containment_tests {
             credential_ref: None,
         }];
 
-        let provider = create_routed_provider_with_options(
-            "openai",
-            Some(ROOT_SENTINEL),
-            None,
-            &rotating_reliability(),
-            &routes,
-            "gpt-4o",
-            &isolated_options(&temp),
-        )
-        .expect("test: routed chain builds");
+        let config = routed_config("openai", "gpt-4o", Some(ROOT_SENTINEL), None, routes);
+        let provider =
+            create_provider_from_test_config(&config, &isolated_options(&temp)).expect("test: routed chain builds");
 
         let _reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
 
@@ -7173,16 +7141,9 @@ mod credential_containment_tests {
             credential_ref: None,
         }];
 
-        let provider = create_routed_provider_with_options(
-            &probe.custom_provider(),
-            Some(ROOT_SENTINEL),
-            None,
-            &rotating_reliability(),
-            &routes,
-            PROBE_MODEL,
-            &isolated_options(&temp),
-        )
-        .expect("test: routed chain builds");
+        let config = routed_config(&probe.custom_provider(), PROBE_MODEL, Some(ROOT_SENTINEL), None, routes);
+        let provider =
+            create_provider_from_test_config(&config, &isolated_options(&temp)).expect("test: routed chain builds");
 
         let reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
 
@@ -7218,16 +7179,9 @@ mod credential_containment_tests {
             credential_ref: None,
         }];
 
-        let provider = create_routed_provider_with_options(
-            "openai",
-            Some(ROOT_SENTINEL),
-            None,
-            &rotating_reliability(),
-            &routes,
-            "gpt-4o",
-            &isolated_options(&temp),
-        )
-        .expect("test: routed chain builds");
+        let config = routed_config("openai", "gpt-4o", Some(ROOT_SENTINEL), None, routes);
+        let provider =
+            create_provider_from_test_config(&config, &isolated_options(&temp)).expect("test: routed chain builds");
 
         let reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
 
@@ -7265,16 +7219,24 @@ mod credential_containment_tests {
     async fn a_withheld_connection_builds_a_chain_without_rotation_keys() {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start_with_statuses(vec![429]).await;
-        let reliability = rotating_reliability();
         let selected = probe.custom_provider();
-        let connection = configured_connection_for(&selected, "openai", Some(ROOT_SENTINEL), None);
-        let scoped = scoped_reliability(&reliability, &connection);
-
-        let provider = create_resilient_provider_with_options(
+        let config = routed_config("openai", "gpt-4o", Some(ROOT_SENTINEL), None, Vec::new());
+        let catalog = selection::catalog_for(&config);
+        let resolved = selection::check_with(
+            &config,
+            &catalog,
             &selected,
-            connection.api_key,
-            connection.api_url,
-            &scoped,
+            PROBE_MODEL,
+            selection::credential_for(&config, &selected),
+            &catalog::Requirement::chat(),
+            catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: keyless BYO selection resolves");
+        let provider = create_provider_for(
+            &resolved,
+            &catalog,
+            &config.reliability,
+            &config.cost,
             &isolated_options(&temp),
         )
         .expect("test: keyless BYO chain builds");
@@ -7411,66 +7373,90 @@ mod credential_containment_tests {
 
     #[test]
     fn a_respelled_primary_route_gets_the_root_connection_as_a_unit() {
-        let reliability = rotating_reliability();
-        let (connection, chain) = routed_connection(
-            "OpenAI",
+        let config = routed_config(
             "openai",
-            None,
+            "gpt-4o",
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
-            &reliability,
+            vec![crate::config::ModelRouteConfig {
+                hint: "primary".to_string(),
+                provider: "OpenAI".to_string(),
+                model: "gpt-4o".to_string(),
+                api_key: None,
+                credential_ref: None,
+            }],
         );
-        assert_eq!(connection.api_key, Some(ROOT_SENTINEL));
-        assert_eq!(connection.api_url, Some("https://gateway.corp.example/v1"));
-        assert_eq!(chain.api_keys, vec![ROTATION_SENTINEL.to_string()]);
+        let catalog = selection::catalog_for(&config);
+        let route = config.model_routes.first().expect("test: primary route");
+        let resolved = selection::resolve_route(&config, &catalog, route, catalog::UnknownPolicy::Invocation)
+            .expect("test: respelled primary resolves");
+        assert_eq!(resolved.credential().api_key(), Some(ROOT_SENTINEL));
+        assert_eq!(resolved.credential().api_url(), Some("https://gateway.corp.example/v1"));
+        assert_eq!(resolved.credential().rotation_keys(), &[ROTATION_SENTINEL.to_string()]);
     }
 
     #[test]
     fn a_route_with_its_own_key_gets_neither_root_url_nor_rotation_keys() {
-        let reliability = rotating_reliability();
-        let (connection, chain) = routed_connection(
-            "OpenAI",
+        let config = routed_config(
             "openai",
-            Some("route-own-key"),
+            "gpt-4o",
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
-            &reliability,
+            vec![crate::config::ModelRouteConfig {
+                hint: "owned".to_string(),
+                provider: "OpenAI".to_string(),
+                model: "gpt-4o".to_string(),
+                api_key: Some("route-own-key".to_string()),
+                credential_ref: None,
+            }],
         );
-        assert_eq!(connection.api_key, Some("route-own-key"));
-        assert_eq!(connection.api_url, None);
+        let catalog = selection::catalog_for(&config);
+        let route = config.model_routes.first().expect("test: owned route");
+        let resolved = selection::resolve_route(&config, &catalog, route, catalog::UnknownPolicy::Invocation)
+            .expect("test: owned route resolves");
+        assert_eq!(resolved.credential().api_key(), Some("route-own-key"));
+        assert_eq!(resolved.credential().api_url(), None);
         assert!(
-            chain.api_keys.is_empty(),
+            resolved.credential().rotation_keys().is_empty(),
             "the root's rotation keys are not the route's"
         );
     }
 
     #[test]
     fn the_exact_primary_and_foreign_routes_are_unchanged() {
-        let reliability = rotating_reliability();
-        let (primary, chain) = routed_connection(
+        let config = routed_config(
             "openai",
-            "openai",
-            None,
+            "gpt-4o",
             Some(ROOT_SENTINEL),
             Some("https://gw/v1"),
-            &reliability,
+            vec![crate::config::ModelRouteConfig {
+                hint: "foreign".to_string(),
+                provider: "groq".to_string(),
+                model: "llama-3.3-70b-versatile".to_string(),
+                api_key: None,
+                credential_ref: None,
+            }],
         );
+        let catalog = selection::catalog_for(&config);
+        let primary =
+            selection::check_default(&config, catalog::UnknownPolicy::Invocation).expect("test: primary resolves");
         assert_eq!(
-            (primary.api_key, primary.api_url),
+            (primary.credential().api_key(), primary.credential().api_url()),
             (Some(ROOT_SENTINEL), Some("https://gw/v1"))
         );
-        assert_eq!(chain.api_keys.len(), 1);
+        assert_eq!(primary.credential().rotation_keys().len(), 1);
 
-        let (foreign, chain) = routed_connection(
-            "groq",
-            "openai",
-            None,
-            Some(ROOT_SENTINEL),
-            Some("https://gw/v1"),
-            &reliability,
+        let route = config.model_routes.first().expect("test: foreign route");
+        let foreign = selection::resolve_route(&config, &catalog, route, catalog::UnknownPolicy::Invocation)
+            .expect("test: foreign route resolves");
+        assert_eq!(
+            (foreign.credential().api_key(), foreign.credential().api_url()),
+            (None, None)
         );
-        assert_eq!((foreign.api_key, foreign.api_url), (None, None));
-        assert!(chain.api_keys.is_empty(), "expected an empty value");
+        assert!(
+            foreign.credential().rotation_keys().is_empty(),
+            "expected an empty value"
+        );
     }
 
     /// On the wire: a route spelling the primary endpoint differently is
@@ -7489,16 +7475,9 @@ mod credential_containment_tests {
             credential_ref: None,
         }];
 
-        let provider = create_routed_provider_with_options(
-            &primary,
-            Some(ROOT_SENTINEL),
-            None,
-            &rotating_reliability(),
-            &routes,
-            PROBE_MODEL,
-            &isolated_options(&temp),
-        )
-        .expect("test: routed chain builds");
+        let config = routed_config(&primary, PROBE_MODEL, Some(ROOT_SENTINEL), None, routes);
+        let provider =
+            create_provider_from_test_config(&config, &isolated_options(&temp)).expect("test: routed chain builds");
         let _reply = provider.simple_chat("ping", "hint:probe", 0.0).await;
 
         let requests = probe.requests();

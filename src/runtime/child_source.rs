@@ -546,6 +546,7 @@ pub(crate) struct ChildGrantRuntime {
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
 }
 
+#[derive(Clone)]
 struct ParentModelSelection {
     provider: String,
     model: String,
@@ -816,6 +817,44 @@ impl IssuedChildGrant {
         &self.0.scope
     }
 
+    /// A process worker cannot own tools whose backend lives only in the
+    /// interactive parent's event loop. Re-derive a sibling child scope from
+    /// the same authenticated parent so the transport carries only executable
+    /// worker capabilities, without consuming another delegation depth.
+    pub(crate) fn for_process_worker(&self) -> anyhow::Result<Self> {
+        let (manifest, parent) = self.scope().gate_inputs();
+        let catalog = self.catalog().view(&Default::default());
+        let requested = manifest
+            .allowed
+            .iter()
+            .filter(|reference| {
+                catalog
+                    .entry_any(&reference.id)
+                    .is_some_and(|entry| entry.process_worker_compatible)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if requested.len() == manifest.allowed.len() {
+            return Ok(self.clone());
+        }
+        let narrowed =
+            crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(parent, &requested)?;
+        let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
+            narrowed, parent,
+        )?);
+        Ok(Self(Arc::new(ChildGrantData {
+            parent_model: self.0.parent_model.clone(),
+            source_fabric: self.0.source_fabric.clone(),
+            security: Arc::clone(&self.0.security),
+            parent_record_binding: self.0.parent_record_binding.clone(),
+            provider_catalog: Arc::clone(&self.0.provider_catalog),
+            catalog: Arc::clone(&self.0.catalog),
+            generation: Arc::clone(&self.0.generation),
+            scope,
+            parent: self.0.parent.clone(),
+        })))
+    }
+
     pub(crate) fn source_fabric(&self) -> &MemoryFabric {
         &self.0.source_fabric
     }
@@ -909,6 +948,27 @@ impl IssuedChildGrant {
 // None deliberately shadows ambient authority on every service dispatch.
 tokio::task_local! {
     static OUTGOING_GRANT: Option<Arc<IssuedChildGrant>>;
+}
+
+/// Reliability settings for a child whose provider was pinned on purpose
+/// (an override, a model hint or a delegated selection). Every path that
+/// builds such a child uses this one policy.
+///
+/// Retry budget, backoff and per-model fallbacks carry over unchanged; the two
+/// chain-widening knobs are dropped:
+///
+/// * `fallback_providers` -- the caller named the provider, so serving the
+///   request from another vendor would defeat it while looking like success.
+/// * `api_keys` -- cleared defensively so no root rotation credential is
+///   visible to the child's settings. The provider factory takes the rotation
+///   keys from the resolved credential (`create_provider_for`) and overwrites
+///   this field either way, so this does not change what the factory builds.
+pub(crate) fn pinned_provider_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
+    crate::config::ReliabilityConfig {
+        fallback_providers: Vec::new(),
+        api_keys: Vec::new(),
+        ..base.clone()
+    }
 }
 
 #[cfg(test)]
@@ -1171,10 +1231,7 @@ impl ChildProviderBinding {
         let config = &generation.effective;
         // A delegated provider remains pinned to its selected vendor, matching
         // the existing child contract. The factory validates model fallbacks.
-        let reliability = crate::config::ReliabilityConfig {
-            fallback_providers: Vec::new(),
-            ..config.reliability.clone()
-        };
+        let reliability = pinned_provider_reliability(&config.reliability);
         let options = crate::providers::provider_runtime_options_from_config(config);
         let provider = Arc::from(crate::providers::create_provider_for(
             &resolved,
@@ -1459,5 +1516,26 @@ impl ChildProviderBinding {
             resolved: &self.resolved,
             route: self.route.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod pinned_reliability_tests {
+    use super::pinned_provider_reliability;
+
+    #[test]
+    fn pinned_child_reliability_clears_both_fields_and_keeps_the_rest() {
+        let base = crate::config::ReliabilityConfig {
+            fallback_providers: vec!["openai".to_string()],
+            api_keys: vec!["root-rotation-key".to_string()],
+            provider_retries: 7,
+            model_fallbacks: std::collections::HashMap::from([("k3".to_string(), vec!["k3-mini".to_string()])]),
+            ..crate::config::ReliabilityConfig::default()
+        };
+        let pinned = pinned_provider_reliability(&base);
+        assert_eq!(pinned.fallback_providers, Vec::<String>::new());
+        assert_eq!(pinned.api_keys, Vec::<String>::new());
+        assert_eq!(pinned.provider_retries, 7);
+        assert_eq!(pinned.model_fallbacks, base.model_fallbacks);
     }
 }

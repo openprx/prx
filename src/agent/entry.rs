@@ -16,7 +16,6 @@ use crate::providers::{ChatMessage, Provider};
 use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::tools::Tool;
 use anyhow::Result;
-use std::borrow::Cow;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -1236,22 +1235,6 @@ mod agent_turn_origin_tests {
 
     #[test]
     fn oauth_placeholder_cannot_attest_to_root_wire_material() {
-        for (provider, value) in [
-            ("qwen-code", "qwen-oauth"),
-            ("minimax", "minimax-oauth"),
-            ("minimax-cn", "minimax-oauth-cn"),
-            ("claude-code", "claude-code"),
-            ("anthropic", "claude-cli"),
-        ] {
-            assert!(
-                providers::credential_override_is_runtime_indirection(provider, value),
-                "factory indirection must be visible to the proof guard"
-            );
-        }
-        assert!(!providers::credential_override_is_runtime_indirection(
-            "openai",
-            "prx-literal-key"
-        ));
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -1279,6 +1262,7 @@ pub(crate) struct AgentModelChoice {
     model_name: String,
     model_binding: AgentModelBinding,
     resolved: crate::providers::catalog::ResolvedModel,
+    catalog: crate::providers::catalog::CatalogView,
 }
 
 impl AgentModelChoice {
@@ -1294,6 +1278,10 @@ impl AgentModelChoice {
         &self.model_name
     }
 
+    pub(crate) const fn catalog(&self) -> &crate::providers::catalog::CatalogView {
+        &self.catalog
+    }
+
     /// An injected provider may switch model IDs only within the connection
     /// identity already owned by that instance and pinned configuration.
     pub(crate) fn same_provider_connection(&self, other: &Self) -> bool {
@@ -1307,116 +1295,31 @@ impl AgentModelChoice {
         (&self.model_binding.provider_label, &self.model_binding.model)
     }
 
-    /// The routed factory builds one provider per exact name and takes the
-    /// first route for that provider, whether keyed or not. Deny a decision proof whenever
-    /// that source could differ from the PMM selection's credential slot.
-    fn pinned_keyless_root<'a>(&'a self, config: &Config) -> Option<providers::KeylessRoot<'a>> {
-        // Keyed/profile routes retain their existing provenance/refusal path.
-        if self.model_binding.route.is_some()
-            || config.model_routes.iter().any(|route| {
-                route.provider == self.provider_name
-                    && (route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
-                        || route.credential_ref.as_deref().is_some_and(|id| !id.trim().is_empty()))
-            })
-        {
-            return None;
-        }
-        let owned = providers::KeylessRoot::from_resolved(&self.resolved)?;
-        let connection = providers::configured_connection_for(
-            &self.provider_name,
-            providers::selection::default_provider(config),
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
-        );
-        let reliability = providers::scoped_reliability(&config.reliability, &connection);
-        owned
-            .matches_connection(
-                &self.provider_name,
-                connection.api_key,
-                connection.api_url,
-                &reliability.api_keys,
-            )
-            .then_some(owned)
-    }
-
+    /// Re-resolve the selected source against the pinned configuration and
+    /// require the complete resolver release, including credential material,
+    /// to be unchanged. Provider construction consumes `self.resolved`
+    /// directly, so unrelated routes no longer affect this attestation.
     pub(crate) fn factory_credential_source_matches(&self, config: &Config) -> bool {
-        // A URL or rotation list makes PMM label the root slot as present,
-        // yet a missing primary key lets the provider factory look up a key
-        // from another source. That is not a Root wire-key attestation.
-        if matches!(
-            self.model_binding.credential_ref,
-            crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
-        ) && config.api_key.as_deref().is_none_or(|key| key.trim().is_empty())
-            && self.pinned_keyless_root(config).is_none()
-        {
-            return false;
-        }
-        if matches!(
-            self.model_binding.credential_ref,
-            crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
-        ) && config
-            .api_key
-            .as_deref()
-            .is_some_and(|key| providers::credential_override_is_runtime_indirection(&self.provider_name, key))
-        {
-            return false;
-        }
-        // PMM trims labels, while the provider factory uses exact raw names.
-        // Refuse spelling differences before comparing its route list.
         if self.provider_name.trim() != self.provider_name {
             return false;
         }
-        let factory_name = if let Some(selected) = self.model_binding.route.as_ref() {
-            let Some(route) = config
-                .model_routes
-                .iter()
-                .find(|route| route.hint.trim() == selected.hint)
-            else {
-                return false;
-            };
-            if route.model != self.model_binding.model.as_ref() {
-                return false;
-            }
-            route.provider.as_str()
-        } else {
-            if self.model_name != self.model_binding.model.as_ref() {
-                return false;
-            }
-            self.provider_name.as_str()
+        let route = match providers::selection::route_target(&self.catalog, &self.provider_name, &self.model_name) {
+            Ok(route) => route.cloned(),
+            Err(_) => return false,
         };
-        if factory_name.trim() != factory_name || factory_name != self.model_binding.provider_label.as_ref() {
+        if route != self.model_binding.route {
             return false;
         }
-        let same_provider_routes: Vec<_> = config
-            .model_routes
-            .iter()
-            .filter(|route| route.provider == factory_name)
-            .collect();
-        let is_keyed = |route: &crate::config::ModelRouteConfig| {
-            route.api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
-                || route.credential_ref.as_deref().is_some_and(|id| !id.trim().is_empty())
-        };
-        match self.model_binding.route.as_ref() {
-            Some(selected) if selected.has_own_key || selected.credential_ref.is_some() => {
-                same_provider_routes.first().is_some_and(|first| {
-                    first.hint.trim() == selected.hint
-                        && !first.api_key.as_deref().is_some_and(|key| {
-                            providers::credential_override_is_runtime_indirection(factory_name, key)
-                        })
-                })
-                    && same_provider_routes.iter().filter(|route| is_keyed(route)).count() == 1
-                    && self.model_binding.credential_has_key
-                    // Auth profiles are reread when the provider is built.
-                    // Their material can disappear or change in between.
-                    && selected.credential_ref.is_none()
-                    // The primary routed connection also carries the root URL
-                    // and rotation keys; PMM checked only this route's key.
-                    && (factory_name != self.provider_name
-                        || (config.api_url.as_deref().is_none_or(|url| url.trim().is_empty())
-                            && config.reliability.api_keys.is_empty()))
-            }
-            _ => !same_provider_routes.iter().any(|route| is_keyed(route)),
-        }
+        providers::selection::check_with(
+            config,
+            &self.catalog,
+            &self.provider_name,
+            &self.model_name,
+            self.resolved.credential().reference().clone(),
+            &providers::catalog::Requirement::chat(),
+            providers::catalog::UnknownPolicy::Invocation,
+        )
+        .is_ok_and(|fresh| fresh == self.resolved)
     }
 }
 
@@ -1482,8 +1385,8 @@ impl AgentModelBinding {
 /// This is the one resolution of the entry. An operator's invocation runs an
 /// id-only model with a warning and refuses one the evidence rules out
 /// (D-034). The chain the entry builds is routed, so every `[[model_routes]]`
-/// destination is resolved too, on every run, and a `hint:` model is checked
-/// as the destination it names (D-035).
+/// destination is resolved when the routed provider is built, and a `hint:`
+/// model is checked as the destination it names (D-035).
 pub(crate) fn resolve_agent_model_choice(
     config: &Config,
     provider_override: Option<&str>,
@@ -1492,6 +1395,7 @@ pub(crate) fn resolve_agent_model_choice(
     let provider_name = provider_override.unwrap_or_else(|| providers::selection::default_provider(config));
     let model_name = model_override.unwrap_or_else(|| providers::selection::default_model(config));
     let catalog = providers::selection::catalog_for(config);
+    let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
     let resolved = providers::selection::check_with(
         config,
         &catalog,
@@ -1500,14 +1404,14 @@ pub(crate) fn resolve_agent_model_choice(
         providers::selection::credential_for(config, provider_name),
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    providers::selection::check_routes(config, &catalog, providers::catalog::UnknownPolicy::Invocation)?;
-    let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
+    )
+    .map_err(|refusal| providers::selection::route_refusal(route.as_ref(), refusal))?;
     Ok(AgentModelChoice {
         provider_name: provider_name.to_string(),
         model_name: model_name.to_string(),
         model_binding: AgentModelBinding::from_resolved(&resolved, route),
         resolved,
+        catalog,
     })
 }
 
@@ -1521,49 +1425,29 @@ pub(crate) fn resolve_agent_model_choice(
 pub(crate) struct AgentProviderSelection<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) model_name: &'a str,
-    pub(crate) connection: providers::ProviderConnection<'a>,
-    pub(crate) reliability: Cow<'a, crate::config::ReliabilityConfig>,
-    pinned_keyless_root: Option<providers::KeylessRoot<'a>>,
+    resolved: &'a crate::providers::catalog::ResolvedModel,
+    catalog: &'a crate::providers::catalog::CatalogView,
 }
 
 /// Scope the connection for a resolved selection. Resolution already ran in
 /// [`resolve_agent_model_choice`]; this does not resolve again.
-pub(crate) fn agent_provider_selection<'a>(
-    config: &'a Config,
-    choice: &'a AgentModelChoice,
-) -> AgentProviderSelection<'a> {
-    let connection = providers::configured_connection_for(
-        &choice.provider_name,
-        providers::selection::default_provider(config),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-    );
-    let reliability = providers::scoped_reliability(&config.reliability, &connection);
+pub(crate) fn agent_provider_selection(choice: &AgentModelChoice) -> AgentProviderSelection<'_> {
     AgentProviderSelection {
         provider_name: &choice.provider_name,
         model_name: &choice.model_name,
-        connection,
-        reliability,
-        pinned_keyless_root: choice.pinned_keyless_root(config),
+        resolved: &choice.resolved,
+        catalog: &choice.catalog,
     }
 }
 
 impl AgentProviderSelection<'_> {
-    /// Build the routed provider chain for this selection.
+    /// Build the routed provider chain from the resolver-owned selection.
     pub(crate) fn build_provider(
         &self,
         config: &Config,
         options: &providers::ProviderRuntimeOptions,
     ) -> Result<Box<dyn Provider>> {
-        providers::ProviderConnection::create_routed_provider_with_options(
-            self.provider_name,
-            &self.connection,
-            &self.reliability,
-            &config.model_routes_with_references(),
-            self.model_name,
-            options,
-            self.pinned_keyless_root,
-        )
+        providers::create_routed_provider_for(self.resolved, self.catalog, config, options)
     }
 }
 
@@ -1728,19 +1612,20 @@ pub(crate) async fn run_with_runtime_envelope(
             .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
 
         // ── Provider (resolved before the bootstrap) ─────────────────
-        let selection = agent_provider_selection(&config, choice);
+        let selection = agent_provider_selection(choice);
         let provider_name = selection.provider_name;
         let model_name = selection.model_name;
 
         let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
         let provider: Box<dyn Provider> = selection.build_provider(&config, &provider_runtime_options)?;
-        let effective_compaction = crate::router::resolve_effective_compaction_config(
+        let effective_compaction = crate::router::context::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider_name,
             model_name,
             &config.router,
             &config.model_routes,
+            choice.catalog(),
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
 

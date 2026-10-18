@@ -657,16 +657,19 @@ impl TurnDecisionService {
             parts.budgets.tokens = parts.budgets.tokens.min(remaining.tokens);
             parts.budgets.micro_usd = parts.budgets.micro_usd.min(remaining.micro_usd);
             parts.budgets.latency_ms = parts.budgets.latency_ms.min(remaining.latency_ms);
-            let effective = crate::router::resolve_effective_compaction_config(
+            let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(
                 &config.agent.compaction,
                 admitted.provider_name(),
                 admitted.model_name(),
                 &config.router,
                 &config.model_routes,
+                &self.provider_catalog,
             );
-            let reservation = DecisionTokenReservation::from_effective_compaction(&effective.config)?;
+            let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
+            let reservation =
+                DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
             parts.budgets.tokens = parts.budgets.tokens.min(u64::try_from(reservation.decision_tokens)?);
-            let main_compaction = reservation.reserved_compaction(&effective.config)?;
+            let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
             let remaining_budget = parts.budgets;
             let mut next = state.clone();
             next.trusted = TrustedState::from_runtime(parts);

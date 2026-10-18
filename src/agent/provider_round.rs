@@ -38,29 +38,17 @@ pub(crate) fn tool_loop_error_is_retryable(err: &anyhow::Error) -> bool {
 
 fn streaming_error_is_context_overflow(err: &crate::providers::traits::StreamError) -> bool {
     use crate::providers::traits::StreamError;
-    let message = match err {
-        StreamError::Provider(message) => message.as_str(),
+    match err {
+        StreamError::Provider(message) => {
+            crate::recovery::overflow::is_context_overflow_error(&anyhow::anyhow!(message.clone()))
+        }
         StreamError::Http(http_error) => {
-            return matches!(http_error.status(), Some(status) if status.as_u16() == 413);
+            matches!(http_error.status(), Some(status) if status.as_u16() == 413)
         }
         StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) | StreamError::RateLimited { .. } => {
-            return false;
+            false
         }
-    };
-    let lower = message.to_ascii_lowercase();
-    [
-        "context_length_exceeded",
-        "context length exceeded",
-        "maximum context",
-        "exceeds maximum",
-        "prompt is too long",
-        "input token count",
-        "exceed the maximum",
-        "too many tokens",
-        "token limit",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    }
 }
 
 fn streaming_error_is_network_timeout(err: &crate::providers::traits::StreamError) -> bool {

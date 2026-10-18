@@ -3,16 +3,48 @@
 //! Prevents: Pattern 1 — Provider configuration & resolution bugs (27% of user bugs).
 //! Issues: #831, #834, #721, #580, #452, #451, #796, #843
 //!
-//! Tests the full pipeline from config values through `create_provider_with_url()`
-//! to provider construction, verifying factory resolution, URL construction,
+//! Tests the full pipeline from config values through PMM selection and the
+//! typed provider factory, verifying provider resolution, URL construction,
 //! credential wiring, and auth header format.
 
+use openprx::config::Config;
 use openprx::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
-use openprx::providers::{create_provider, create_provider_with_url};
+use openprx::providers::{self, create_provider_for};
 
-/// Helper: assert provider creation succeeds
+fn typed_provider_result(name: &str, key: Option<&str>, url: Option<&str>) -> anyhow::Result<()> {
+    let workspace = tempfile::TempDir::new()?;
+    let mut config = Config {
+        workspace_dir: workspace.path().to_path_buf(),
+        config_path: workspace.path().join("config.toml"),
+        ..Config::default()
+    };
+    config.default_provider = Some(name.to_string());
+    config.default_model = Some("prx-provider-resolution-model".to_string());
+    config.api_key = key.map(str::to_string);
+    config.api_url = url.map(str::to_string);
+    let catalog = providers::selection::catalog_for(&config);
+    let resolved = providers::selection::check_with(
+        &config,
+        &catalog,
+        name,
+        "prx-provider-resolution-model",
+        providers::selection::credential_for(&config, name),
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    create_provider_for(
+        &resolved,
+        &catalog,
+        &config.reliability,
+        &config.cost,
+        &providers::provider_runtime_options_from_config(&config),
+    )?;
+    Ok(())
+}
+
+/// Helper: assert typed provider creation succeeds.
 fn assert_provider_ok(name: &str, key: Option<&str>, url: Option<&str>) {
-    let result = create_provider_with_url(name, key, url);
+    let result = typed_provider_result(name, key, url);
     assert!(
         result.is_ok(),
         "{name} provider should resolve: {}",
@@ -109,7 +141,7 @@ fn factory_custom_https_url_resolves() {
 
 #[test]
 fn factory_custom_ftp_url_rejected() {
-    let result = create_provider_with_url("custom:ftp://example.com", None, None);
+    let result = typed_provider_result("custom:ftp://example.com", None, None);
     assert!(result.is_err(), "ftp scheme should be rejected");
     let err_msg = result.err().unwrap().to_string();
     assert!(
@@ -120,13 +152,13 @@ fn factory_custom_ftp_url_rejected() {
 
 #[test]
 fn factory_custom_empty_url_rejected() {
-    let result = create_provider_with_url("custom:", None, None);
+    let result = typed_provider_result("custom:", None, None);
     assert!(result.is_err(), "empty custom URL should be rejected");
 }
 
 #[test]
 fn factory_unknown_provider_rejected() {
-    let result = create_provider_with_url("nonexistent_provider_xyz", None, None);
+    let result = typed_provider_result("nonexistent_provider_xyz", None, None);
     assert!(result.is_err(), "unknown provider name should be rejected");
 }
 
@@ -140,7 +172,7 @@ fn compatible_provider_bearer_auth_style() {
     let _provider = OpenAiCompatibleProvider::new(
         "TestProvider",
         "https://api.test.com",
-        Some("sk-test-key-12345"),
+        Some("provider-test-credential"),
         AuthStyle::Bearer,
     );
 }
@@ -151,7 +183,7 @@ fn compatible_provider_xapikey_auth_style() {
     let _provider = OpenAiCompatibleProvider::new(
         "TestProvider",
         "https://api.test.com",
-        Some("sk-test-key-12345"),
+        Some("provider-test-credential"),
         AuthStyle::XApiKey,
     );
 }
@@ -162,7 +194,7 @@ fn compatible_provider_custom_auth_header() {
     let _provider = OpenAiCompatibleProvider::new(
         "TestProvider",
         "https://api.test.com",
-        Some("sk-test-key-12345"),
+        Some("provider-test-credential"),
         AuthStyle::Custom("X-Custom-Auth".into()),
     );
 }
@@ -219,7 +251,7 @@ fn convenience_factory_resolves_major_providers() {
         "fireworks",
         "perplexity",
     ] {
-        let result = create_provider(provider_name, Some("test-key"));
+        let result = typed_provider_result(provider_name, Some("test-key"), None);
         assert!(
             result.is_ok(),
             "convenience factory should resolve {provider_name}: {}",
@@ -230,7 +262,7 @@ fn convenience_factory_resolves_major_providers() {
 
 #[test]
 fn convenience_factory_ollama_no_key() {
-    let result = create_provider("ollama", None);
+    let result = typed_provider_result("ollama", None, None);
     assert!(
         result.is_ok(),
         "ollama should not require api key: {}",

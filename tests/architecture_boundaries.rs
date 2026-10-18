@@ -3425,8 +3425,8 @@ fn production_turns_pass_a_context_budget_to_the_loop_engine() {
 /// source text shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionSource {
-    /// The call reaches `resolve_effective_compaction_config` or a
-    /// `CompactionResolver`: the served model's effective window.
+    /// The call reaches a reviewed effective-window resolver or owner:
+    /// the served model's effective window.
     Effective,
     /// The call reaches the raw `[agent.compaction]` table (or a default one)
     /// without passing through a resolver: the base window.
@@ -3437,7 +3437,15 @@ enum CompactionSource {
 }
 
 /// Text that proves the value went through the effective-window resolution.
-const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &["resolve_effective_compaction_config(", "compaction_resolver.resolve("];
+const EFFECTIVE_COMPACTION_MARKERS: &[&str] = &[
+    "resolve_effective_compaction_config(",
+    "resolve_effective_compaction_config_with_catalog(",
+    "admitted_binding.effective_compaction()",
+    "self.effective_compaction(",
+    "decided.service.effective_compaction(",
+    "decision.service.effective_compaction(",
+    "service.effective_compaction(",
+];
 
 /// Text that names the base window directly.
 const BASE_COMPACTION_MARKERS: &[&str] = &[
@@ -3452,7 +3460,19 @@ const BASE_COMPACTION_MARKERS: &[&str] = &[
 fn classify_compaction_argument(production: &str, expression: &str, call_start: usize) -> CompactionSource {
     let mut text = expression.to_string();
     for _ in 0..4 {
-        if EFFECTIVE_COMPACTION_MARKERS.iter().any(|marker| text.contains(marker)) {
+        let compact = compact_rust_tokens(&text);
+        let pinned_provider_binding = compact.starts_with("provider_binding.as_ref().ok_or_else(")
+            && compact.ends_with(")?.effective_compaction()");
+        if pinned_provider_binding
+            || EFFECTIVE_COMPACTION_MARKERS.iter().any(|marker| {
+                compact.match_indices(marker).any(|(start, _)| {
+                    compact[..start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|previous| !previous.is_alphanumeric() && previous != '_' && previous != '.')
+                })
+            })
+        {
             return CompactionSource::Effective;
         }
         if BASE_COMPACTION_MARKERS.iter().any(|marker| text.contains(marker)) {
@@ -3663,25 +3683,22 @@ fn sub_agent_constructor_scan_sees_aliases_and_self() {
 }
 
 /// Every production sub-agent tool resolves its children's compaction window
-/// through a `CompactionResolver` built from the whole configuration
-/// (INT-2B a46).
+/// from the child's admitted configuration generation (INT-2B a46).
 ///
-/// `CompactionResolver::from_base` ignores `[[router.models]]` and the model
-/// routes, so a sub-agent tool left with it budgets every child on the
-/// `[agent.compaction]` table whatever the model. The constructors start from
-/// it as a placeholder; every production construction of `DelegateTool` or
-/// `SessionsSpawnTool` must replace it with `.with_compaction_resolver(` in
-/// the same expression. `EFFECTIVE_COMPACTION_MARKERS` counts any
-/// `compaction_resolver.resolve(` as effective, so it cannot see this.
+/// A startup `CompactionResolver` is stale after configuration reload and its
+/// `from_base` constructor also ignores `[[router.models]]` and model routes.
+/// The production tools therefore resolve at child admission, using the
+/// admitted generation's whole configuration and catalog. The constructor
+/// inventory pins the reviewed creation sites so a new site cannot bypass
+/// that internal admission path.
 ///
-/// MUTATION GUARD: drop `.with_compaction_resolver(` from the delegate
-/// registration in `src/tools/mod.rs` and the second inventory gains
-/// `src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions`.
+/// MUTATION GUARD: add an unreviewed `DelegateTool` or `SessionsSpawnTool`
+/// construction and the constructor inventory gains that site.
 #[test]
 fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
     let mut from_base = Vec::new();
-    let mut without_resolver = Vec::new();
-    let mut with_resolver = Vec::new();
+    let mut constructor_sites = Vec::new();
+    let mut admitted_resolution_sites = Vec::new();
     let test_modules = test_module_files();
     for path in rust_source_files() {
         let relative = relative_path(&path);
@@ -3700,62 +3717,37 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         }
         for (tool, constructors) in SUB_AGENT_TOOL_CONSTRUCTORS {
             for at in sub_agent_calls(&production, &lines, tool, constructors) {
-                // The rest of the expression: up to its `;` or the end of the
-                // enclosing block (a tail expression).
-                let bytes = production.as_bytes();
-                let mut depth = 0i32;
-                let mut end = production.len();
-                for (offset, byte) in bytes[at..].iter().enumerate() {
-                    match byte {
-                        b'(' | b'[' | b'{' => depth += 1,
-                        b')' | b']' | b'}' => {
-                            depth -= 1;
-                            if depth < 0 {
-                                end = at + offset;
-                                break;
-                            }
-                        }
-                        b';' if depth == 0 => {
-                            end = at + offset;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                if production[at..end].contains(".with_compaction_resolver(") {
-                    with_resolver.push(site(at));
-                } else {
-                    without_resolver.push(site(at));
-                }
+                constructor_sites.push(site(at));
+            }
+        }
+        if matches!(
+            relative.as_str(),
+            "src/tools/delegate.rs" | "src/tools/sessions_spawn.rs"
+        ) {
+            for (at, _) in production.match_indices("resolve_effective_compaction_config_with_catalog(") {
+                admitted_resolution_sites.push(site(at));
             }
         }
     }
 
-    // The placeholders the constructors start from; each is replaced by
-    // every production construction below.
+    assert_inventory("production CompactionResolver::from_base calls", from_base, &[]);
     assert_inventory(
-        "production CompactionResolver::from_base calls",
-        from_base,
-        &[
-            "src/tools/delegate.rs::new",
-            "src/tools/delegate.rs::with_depth",
-            "src/tools/sessions_spawn.rs::new_with_registry",
-        ],
-    );
-    assert_inventory(
-        "production sub-agent tool constructions without .with_compaction_resolver(",
-        without_resolver,
-        &[],
-    );
-    assert_inventory(
-        "production sub-agent tool constructions with .with_compaction_resolver(",
-        with_resolver,
+        "reviewed production sub-agent tool constructions",
+        constructor_sites,
         &[
             "src/channels/mod.rs::start_channels_with_config",
             "src/chat/mod.rs::run",
             "src/gateway/mod.rs::register_gateway_turn_tools",
             "src/session_worker/runner.rs::worker_spawn_tool",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
+        ],
+    );
+    assert_inventory(
+        "admitted-generation sub-agent compaction resolution sites",
+        admitted_resolution_sites,
+        &[
+            "src/tools/delegate.rs::resolve_pinned_child_compaction",
+            "src/tools/sessions_spawn.rs::resolve_pinned_child_compaction",
         ],
     );
 }
@@ -3831,40 +3823,43 @@ fn forwarded_compaction_values_are_produced_from_the_effective_window() {
     // Decision-owned windows have two concrete producers: initial admission
     // and the purpose-granted Router readmission. Neither may substitute base
     // configuration for the resolved model's window or omit its reservation.
-    for (relative, function, provider, model) in [
+    for (relative, function, resolver) in [
         (
             "src/runtime/turn_decision.rs",
             "agent_budget_snapshot",
-            "proof.provider_name()",
-            "proof.model_name()",
+            compact_rust_tokens(
+                "let effective = self.effective_compaction(proof.provider_name(), proof.model_name());",
+            ),
         ),
         (
             "src/runtime/turn_decision/routing.rs",
             "router_history_hop_inner",
-            "admitted.provider_name()",
-            "admitted.model_name()",
+            compact_rust_tokens(
+                "let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(\
+                    &config.agent.compaction, admitted.provider_name(), admitted.model_name(), &config.router, \
+                    &config.model_routes, &self.provider_catalog,);",
+            ),
         ),
     ] {
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
             &repository_root().join(relative),
         )));
         let body = compact_rust_tokens(&function_body(&production, function));
-        let resolver = format!(
-            "let effective=crate::router::resolve_effective_compaction_config(&config.agent.compaction,{provider},{model},&config.router,&config.model_routes,);"
-        );
         assert_eq!(
-            body.matches(&compact_rust_tokens(&resolver)).count(),
+            body.matches(&resolver).count(),
             1,
             "{relative}: resolved producer changed"
         );
         assert_eq!(
-            body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config)?;")
+            body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config,extra_token_ratio_limit)?;")
                 .count(),
             1
         );
         assert_eq!(
-            body.matches("letmain_compaction=reservation.reserved_compaction(&effective.config)?;")
-                .count(),
+            body.matches(
+                "letmain_compaction=reservation.reserved_compaction(&effective.config,extra_token_ratio_limit)?;"
+            )
+            .count(),
             1
         );
     }
@@ -5150,11 +5145,6 @@ fn provider_label_sinks_redact_url_userinfo() {
             "src/agent/embedded_source.rs",
             "pub(super) async fn record_automix_budget_refusal(",
             "redact_endpoint_userinfo(premium)",
-        ),
-        (
-            "src/tools/sessions_spawn.rs",
-            "async fn execute_spawn_with_id(",
-            "sanitize_api_error(",
         ),
         (
             "src/router/context.rs",
@@ -7695,11 +7685,10 @@ fn the_owner_isolation_bit_is_never_asserted_by_memory_production_code() {
 /// Every provider-factory call in already-stripped production source, as the
 /// call's byte offset, the factory name and its top-level argument expressions.
 ///
-/// A factory is `create_provider`, `create_resilient_provider` or
-/// `create_routed_provider`, with or without a `_with_*` suffix, called as a
-/// free function (a method call such as `.build_provider(` is not a factory).
+/// A factory is the low-level `create_provider` family or one of the typed
+/// `create_provider_for` / `create_routed_provider_for` entrypoints, called as
+/// a free function (a method call such as `.build_provider(` is not a factory).
 fn provider_factory_calls(production: &str) -> Vec<(usize, String, Vec<String>)> {
-    const FACTORY_STEMS: [&str; 3] = ["create_provider", "create_resilient_provider", "create_routed_provider"];
     let bytes = production.as_bytes();
     let mut calls = Vec::new();
     let mut search = 0usize;
@@ -7714,9 +7703,12 @@ fn provider_factory_calls(production: &str) -> Vec<(usize, String, Vec<String>)>
             end += 1;
         }
         let name = &production[start..end];
-        let is_factory = FACTORY_STEMS
-            .iter()
-            .any(|stem| name == *stem || name.strip_prefix(stem).is_some_and(|rest| rest.starts_with("_with")));
+        let is_factory = name == "create_provider"
+            || name == "create_provider_for"
+            || name == "create_routed_provider_for"
+            || name
+                .strip_prefix("create_provider_with")
+                .is_some_and(|rest| rest.starts_with('_'));
         if !is_factory || production[..start].trim_end().ends_with("fn") {
             continue;
         }
@@ -7770,7 +7762,7 @@ fn agent_entries_reach_provider_factories_only_through_the_scoped_selection() {
     }
     assert_eq!(
         sites,
-        vec!["src/agent/entry.rs:build_provider:create_routed_provider_with_options".to_string()],
+        vec!["src/agent/entry.rs:build_provider:create_routed_provider_for".to_string()],
         "agent entries must build their provider through `AgentProviderSelection::build_provider`"
     );
 }
@@ -7967,13 +7959,19 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
                         .into_iter()
                         .rev()
                         .collect();
-                    let owner_checked_selection = function == "validate_worker_route"
-                        && ["selected.credential()", "resolved.credential()"]
-                            .iter()
-                            .any(|source| normalized[..at].ends_with(source));
+                    let owner_checked_selection = match function.as_str() {
+                        "validate_worker_route" => ["selected.credential()", "resolved.credential()"],
+                        "build_worker_provider_selection" => ["resolved.credential()", "sealed_connection"],
+                        _ => ["", ""],
+                    }
+                    .iter()
+                    .any(|source| !source.is_empty() && normalized[..at].ends_with(source));
+                    let owner_checked_agent = matches!(function.as_str(), "validate_worker_route" | "worker_provider")
+                        && receiver.ends_with("agent")
+                        && field == ".api_key";
                     assert!(
                         matches!(receiver.as_str(), "credentials.provider" | "config.composio")
-                            || (function == "validate_worker_route" && receiver == "agent" && field == ".api_key")
+                            || owner_checked_agent
                             || owner_checked_selection
                             || (relative == "src/session_worker/runner/ordinary_source.rs"
                                 && function == "restore"
@@ -7992,13 +7990,13 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner.rs:worker_provider:create_resilient_provider_with_options".to_string()],
+        vec!["src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for".to_string()],
         "a session worker builds its provider only through `worker_provider`"
     );
 }
 
 /// The factory stems a provider chain is built through.
-const PROVIDER_FACTORY_STEMS: [&str; 3] = ["create_provider", "create_resilient_provider", "create_routed_provider"];
+const PROVIDER_FACTORY_STEMS: [&str; 2] = ["create_provider", "create_routed_provider_for"];
 
 /// Concrete provider and chain constructors. Outside `src/providers/**` a
 /// provider is built only through the factories, which apply the credential
@@ -8021,7 +8019,7 @@ const PROVIDER_CONSTRUCTOR_TYPES: [&str; 11] = [
 /// directory. Three shapes would slip past them, and this guard closes each
 /// as far as a textual check can:
 ///
-/// - an import alias (`use …::create_resilient_provider_with_options as build;`)
+/// - an import alias (`use …::create_provider_for as build;`)
 ///   anywhere in production code;
 /// - a concrete provider or chain constructor (`ReliableProvider::new`,
 ///   `OpenAiCompatibleProvider::new_optional_credential`, …) outside
@@ -8102,24 +8100,18 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
 
     // Each site's credential source, as reviewed in C0 / R-C0:
     let expected: BTreeSet<String> = [
-        // `agent_provider_selection`: identity-scoped key and URL, scoped rotation keys.
-        "src/agent/entry.rs:build_provider:create_routed_provider_with_options",
-        // `/models` switch: `configured_connection_for` plus `scoped_reliability`.
-        "src/channels/mod.rs:get_or_create_provider_for_generation:create_resilient_provider_with_options",
-        // The configured default provider with the root connection.
-        "src/channels/mod.rs:start_channels_with_config:create_resilient_provider_with_options",
-        // Chat's own resolver plus `scoped_reliability` (P1-C).
-        "src/chat/mod.rs:chat_provider_chain:create_routed_provider_with_options",
-        // The configured default provider with the root connection.
-        "src/daemon/mod.rs:build_evolution_judge_model:create_resilient_provider_with_options",
-        // Keyless construction for validation only.
-        "src/doctor/mod.rs:provider_validation_error:create_provider",
-        // The exact selected route or direct provider, with owner-scoped credentials.
-        // `worker_credentials`: key and URL together, scoped rotation keys.
-        "src/session_worker/runner.rs:worker_provider:create_resilient_provider_with_options",
-        // `child_connection`: an agent's own key, or the root key with its URL.
-        // `child_provider_plan`: only an agent's own key; never the gateway key.
-        "src/tools/sessions_spawn.rs:build_override_provider:create_resilient_provider_with_options",
+        "src/agent/entry.rs:build_provider:create_routed_provider_for",
+        "src/channels/decision_turn.rs:build_provider:create_provider_for",
+        "src/channels/mod.rs:build_channel_hint_provider:create_provider_for",
+        "src/channels/mod.rs:build_channel_startup_provider:create_routed_provider_for",
+        "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
+        "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
+        "src/doctor/mod.rs:provider_validation_error:create_provider_for",
+        "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
+        "src/runtime/child_source.rs:from_selection:create_provider_for",
+        "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
+        "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
+        "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())
@@ -8174,7 +8166,10 @@ fn resolver_imports(production: &str) -> Vec<String> {
 /// PMM-C-L / D-065: the agent loop's entries (`prx agent`, cron and xin agent
 /// jobs, `prx go --message`) resolve their provider and model exactly once,
 /// in `agent::entry::resolve_agent_model_choice`, and before the runtime
-/// bootstrap; the callers do not resolve it again under any name.
+/// bootstrap. The only later re-resolution is the explicit credential-source
+/// attestation immediately before construction. Each configured route is then
+/// resolved once, from its own credential, inside the typed routed factory;
+/// callers do not resolve either selection again under any name.
 #[test]
 fn agent_loop_entries_resolve_the_model_once() {
     let entry = production_part(&read_source(&repository_root().join("src/agent/entry.rs")));
@@ -8184,12 +8179,20 @@ fn agent_loop_entries_resolve_the_model_once() {
         1,
         "resolve_agent_model_choice resolves the selection once"
     );
+    let providers = production_part(&read_source(&repository_root().join("src/providers/mod.rs")));
+    let routed_factory = function_body(&providers, "create_routed_provider_for");
     assert_eq!(
-        resolution.matches("providers::selection::check_routes(").count(),
+        routed_factory.matches("selection::resolve_route(").count(),
         1,
-        "resolve_agent_model_choice resolves the routed destinations once"
+        "create_routed_provider_for resolves every configured route through the typed resolver"
     );
-    let outside = entry.replacen(&resolution, "", 1);
+    let attestation = function_body(&entry, "factory_credential_source_matches");
+    assert_eq!(
+        attestation.matches("providers::selection::check_with(").count(),
+        1,
+        "the construction-time credential-source attestation re-resolves exactly once"
+    );
+    let outside = entry.replacen(&resolution, "", 1).replacen(&attestation, "", 1);
     for needle in RESOLVER_NEEDLES {
         assert!(
             !outside.contains(needle),
@@ -10171,10 +10174,30 @@ fn mutation_proof_execution_binding_guard() {
     );
 }
 fn mutation_proof_compaction_producer_guard() {
+    for expression in [
+        "unreviewed.effective_compaction()",
+        "unreviewed.admitted_binding.effective_compaction()",
+        "compaction_resolver.resolve(provider, model)",
+    ] {
+        assert_eq!(
+            classify_compaction_argument("", expression, 0),
+            CompactionSource::Forwarded
+        );
+    }
+    for expression in [
+        "admitted_binding.effective_compaction()?",
+        "self.effective_compaction(provider, model)",
+        "decided.service.effective_compaction(provider, model)",
+    ] {
+        assert_eq!(
+            classify_compaction_argument("", expression, 0),
+            CompactionSource::Effective
+        );
+    }
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
         "src/runtime/turn_decision.rs",
-        "let main_compaction = reservation.reserved_compaction(&effective.config)?;",
+        "let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;",
         "let main_compaction = config.agent.compaction.clone();",
     );
 }

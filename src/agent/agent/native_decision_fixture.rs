@@ -9,6 +9,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 const DECISION_MODEL: &str = "prx-native-decision";
+/// Leave the production turn budget unchanged while giving this local HTTP
+/// fixture enough of that budget to run under full-suite CPU contention.
+pub(crate) const REHEARSAL_TIMEOUT_MS: u32 = 450;
 struct State {
     action: &'static str,
     target: &'static str,
@@ -229,6 +232,7 @@ pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> R
     config.causal_tree.backend.endpoint = endpoint.to_owned();
     config.causal_tree.backend.model = DECISION_MODEL.to_owned();
     config.causal_tree.backend.remote_enabled = false;
+    config.causal_tree.rehearsal.timeout_ms = REHEARSAL_TIMEOUT_MS;
     let provider = format!("custom:{endpoint}");
     config.providers.models.push(serde_json::from_value(json!({
         "provider":provider,"model":DECISION_MODEL,"operations":["decision_endpoint"]

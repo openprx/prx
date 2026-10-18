@@ -1401,13 +1401,32 @@ impl SecretScan {
         self.values.iter().map(|(path, value)| (path.as_str(), value.as_str()))
     }
 
-    /// Replace every secret value the scan found in `message` with the mask.
+    /// Replace every secret value the scan found in `message` with the mask,
+    /// then apply the shape-based redactor. The one error scrubber:
+    /// [`scrub_message`].
     #[must_use]
     pub fn scrub(&self, message: &str) -> String {
-        self.values.iter().fold(message.to_string(), |scrubbed, (_, value)| {
-            scrubbed.replace(value.as_str(), REDACTION_MASK)
-        })
+        scrub_message(Some(self), message)
     }
+}
+
+/// The single scrubber for an error message a surface may show. With a
+/// [`SecretScan`] every secret value the scan holds is replaced by the mask
+/// first; a caller that holds no scan (a credential endpoint, where replacing
+/// a short submitted value would garble unrelated words) passes `None`. Both
+/// then go through the shape-based redactor, so a surface never differs from
+/// another in what it treats as a secret.
+#[must_use]
+pub fn scrub_message(scan: Option<&SecretScan>, message: &str) -> String {
+    let masked = scan.map_or_else(
+        || message.to_string(),
+        |scan| {
+            scan.values.iter().fold(message.to_string(), |scrubbed, (_, value)| {
+                scrubbed.replace(value.as_str(), REDACTION_MASK)
+            })
+        },
+    );
+    crate::security::redaction::redact_secrets(&masked)
 }
 
 fn scan_secret_subtree<T: SecretTree>(node: &T, path: &mut Vec<PathElem>, scan: &mut SecretScan) {
@@ -1862,6 +1881,25 @@ endpoint = "https://decider:userinfo-sentinel-decision@127.0.0.1:27/v1"
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn one_scrubber_masks_by_value_and_by_shape_with_or_without_a_scan() {
+        let message = "bad key sk-proj-abcdefghijklmnop12345 near sentinel-route";
+        let tree: toml::Value = toml::from_str(
+            "[[model_routes]]\nhint = \"fast\"\nprovider = \"p\"\nmodel = \"m\"\napi_key = \"sentinel-route\"\n",
+        )
+        .expect("test: parse");
+        let found = scan(&tree);
+        let with_scan = scrub_message(Some(&found), message);
+        assert!(!with_scan.contains("sk-proj-abcdefghijklmnop12345"), "{with_scan}");
+        assert!(!with_scan.contains("sentinel-route"), "{with_scan}");
+        let without_scan = scrub_message(None, message);
+        assert!(
+            !without_scan.contains("sk-proj-abcdefghijklmnop12345"),
+            "{without_scan}"
+        );
+        assert_eq!(found.scrub(message), with_scan);
+    }
 
     fn fixture_tree() -> toml::Value {
         toml::from_str(fixture::TOML).expect("test: fixture parses")
@@ -2490,19 +2528,14 @@ mod tests {
             Some(ROUTE_SECRET)
         );
 
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &loaded.model_routes,
-            "route-model",
-            &isolated_provider_options(dir.path()),
-        )
-        .expect("test: routed provider");
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
+        let provider =
+            crate::providers::create_provider_from_test_config(&runtime_config, &isolated_provider_options(dir.path()))
+                .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(
@@ -2626,19 +2659,15 @@ mod tests {
         assert_eq!(routes[0].api_key.as_deref(), Some(ROUTE_SECRET));
         assert_eq!(routes[1].api_key, None, "another provider's reference was released");
 
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &routes,
-            "route-model",
-            &isolated_provider_options(dir.path()),
-        )
-        .expect("test: routed provider");
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.model_routes = routes.to_vec();
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
+        let provider =
+            crate::providers::create_provider_from_test_config(&runtime_config, &isolated_provider_options(dir.path()))
+                .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(
@@ -2664,20 +2693,14 @@ mod tests {
 
         let loaded = crate::config::Config::load_from_path(&config.config_path, config.workspace_dir.clone())
             .expect("test: load");
-        let mut reliability = loaded.reliability.clone();
-        reliability.provider_retries = 0;
-        reliability.fallback_providers = Vec::new();
+        let mut runtime_config = loaded.clone();
+        runtime_config.default_provider = Some(route_provider.clone());
+        runtime_config.default_model = Some("route-model".to_string());
+        runtime_config.reliability.provider_retries = 0;
+        runtime_config.reliability.fallback_providers = Vec::new();
         let options = isolated_provider_options(dir.path());
-        let provider = crate::providers::create_routed_provider_with_options(
-            &route_provider,
-            None,
-            None,
-            &reliability,
-            &loaded.model_routes,
-            "route-model",
-            &options,
-        )
-        .expect("test: routed provider");
+        let provider = crate::providers::create_provider_from_test_config(&runtime_config, &options)
+            .expect("test: routed provider");
         let reply = provider.chat_with_system(None, "ping", "hint:fast", 0.0).await;
         assert_eq!(reply.as_deref().ok(), Some("ok"), "unexpected reply: {reply:?}");
         assert_eq!(

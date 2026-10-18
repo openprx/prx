@@ -1746,9 +1746,11 @@ async fn insufficient_retry_money_refuses_second_decision_socket() {
             &plane.factory.config.router,
             &plane.factory.config.model_routes,
         );
-        let reserve =
-            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(&effective.config)
-                .expect("real configured token reservation");
+        let reserve = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+            &effective.config,
+            plane.factory.config.causal_tree.policy.extra_token_ratio_limit,
+        )
+        .expect("real configured token reservation");
         let total = u64::try_from(reserve.decision_tokens).expect("token allowance");
         assert!(total >= 2);
         let first = total / 2;

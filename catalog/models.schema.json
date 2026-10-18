@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openprx.dev/schema/models-v1.json",
+  "title": "PRX embedded model catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "published_at",
+    "providers",
+    "defaults",
+    "models"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "revision": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "published_at": { "type": "string", "format": "date-time" },
+    "providers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/provider" }
+    },
+    "defaults": { "$ref": "#/$defs/defaults" },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/model" }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_model", "display_name"],
+      "properties": {
+        "default_model": { "$ref": "#/$defs/id" },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "model": { "$ref": "#/$defs/id" }
+      }
+    },
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^\\S+/\\S+$"
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provider",
+        "api_model",
+        "display_name",
+        "aliases",
+        "lifecycle",
+        "operations",
+        "features",
+        "limits",
+        "parameters",
+        "levels"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "api_model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "uniqueItems": true
+        },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "chat",
+              "embedding",
+              "decision_endpoint",
+              "rerank",
+              "image_generation",
+              "audio_generation",
+              "video_generation"
+            ]
+          }
+        },
+        "features": { "$ref": "#/$defs/features" },
+        "limits": { "$ref": "#/$defs/limits" },
+        "tokenizer": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "pricing": { "$ref": "#/$defs/pricing" },
+        "parameters": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/parameterName" },
+          "additionalProperties": { "$ref": "#/$defs/parameter" }
+        },
+        "levels": {
+          "type": "object",
+          "propertyNames": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": { "$ref": "#/$defs/parameterName" },
+            "additionalProperties": {}
+          }
+        },
+        "default_level": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "router": { "$ref": "#/$defs/router" },
+        "pinned_snapshot": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "transport": { "$ref": "#/$defs/transport" }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["active", "deprecated", "retired"] },
+        "deprecated_at": { "type": ["string", "null"], "format": "date-time" },
+        "retire_at": { "type": ["string", "null"], "format": "date-time" },
+        "replacement": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "native_tools": { "type": "boolean" },
+        "vision_input": { "type": "boolean" },
+        "streaming": { "type": "boolean" },
+        "structured_output": { "type": "boolean" },
+        "prompt_cache": { "type": "boolean" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "context_window": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 10000000 }
+      }
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "input", "output"],
+      "properties": {
+        "unit": { "const": "usd_per_1m_tokens" },
+        "input": { "type": "number", "minimum": 0 },
+        "output": { "type": "number", "minimum": 0 },
+        "cache_write": { "type": "number", "minimum": 0 },
+        "cache_read": { "type": "number", "minimum": 0 },
+        "tiers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pricingTier" }
+        }
+      }
+    },
+    "pricingTier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["above_input_tokens", "input", "output"],
+      "properties": {
+        "above_input_tokens": { "type": "integer", "minimum": 1 },
+        "input": { "type": "number", "minimum": 0 },
+        "output": { "type": "number", "minimum": 0 },
+        "cache_write": { "type": "number", "minimum": 0 },
+        "cache_read": { "type": "number", "minimum": 0 }
+      }
+    },
+    "parameterName": {
+      "enum": [
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+        "reasoning_effort",
+        "thinking_budget",
+        "verbosity",
+        "service_tier",
+        "seed"
+      ]
+    },
+    "parameter": {
+      "oneOf": [
+        { "$ref": "#/$defs/rangeParameter" },
+        { "$ref": "#/$defs/levelsParameter" },
+        { "$ref": "#/$defs/boolParameter" },
+        { "$ref": "#/$defs/unsupportedParameter" }
+      ]
+    },
+    "rangeParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "min", "max"],
+      "properties": {
+        "kind": { "const": "range" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "default": { "type": ["number", "null"] },
+        "step": { "type": "number", "exclusiveMinimum": 0 },
+        "excludes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parameterName" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "levelsParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "levels"],
+      "properties": {
+        "kind": { "const": "levels" },
+        "levels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+        },
+        "default": { "type": ["string", "null"] },
+        "excludes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parameterName" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "boolParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "bool" },
+        "default": { "type": ["boolean", "null"] },
+        "excludes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parameterName" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "unsupportedParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "unsupported" } }
+    },
+    "router": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "cost_per_million_tokens", "latency_ms", "quality_rank"],
+      "properties": {
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+        },
+        "cost_per_million_tokens": { "type": "number", "minimum": 0 },
+        "latency_ms": { "type": "integer", "minimum": 1 },
+        "quality_rank": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "recommended_timeout_ms": { "type": "integer", "minimum": 1 },
+        "extra_latency_budget_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

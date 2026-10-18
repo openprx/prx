@@ -136,15 +136,11 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
-/// 🟡 Behavior-limits Phase 1: raised 320 -> 1280 (4x).
-const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 1_280;
-/// 🟡 Behavior-limits Phase 1: raised 2400 -> 9600 (4x).
-const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 9_600;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str =
     "I could not identify this image with confidence. Please send a clearer picture or add some context.";
 
-type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
+type ProviderCacheKey = providers::generation::GenerationProviderCacheKey;
+type ProviderCacheMap = providers::generation::GenerationProviderCache;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,9 +181,6 @@ struct ChannelRuntimeDefaults {
     default_provider: String,
     model: String,
     temperature: f64,
-    api_key: Option<String>,
-    api_url: Option<String>,
-    reliability: crate::config::ReliabilityConfig,
 }
 
 #[derive(Clone)]
@@ -219,7 +212,9 @@ struct ChannelRuntimeContext {
     #[cfg(test)]
     config_generation: Arc<crate::config::ConfigGeneration>,
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    #[cfg(test)]
     provider: Arc<dyn Provider>,
+    #[cfg(test)]
     default_provider: Arc<String>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
@@ -268,10 +263,6 @@ struct ChannelRuntimeContext {
     /// Per-group cooldown tracker for proactive (non-@) smart replies, to avoid
     /// the bot dominating a busy group. Keyed by `channel:group_id`.
     smart_reply_cooldown: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
-    /// Smart group-reply pre-gate config (heuristics + cheap-tier classifier).
-    /// Only consulted on smart-mode group turns where the bot was NOT explicitly
-    /// @-mentioned (the token-saving triage that runs before the agent loop).
-    smart_group: crate::config::SmartGroupConfig,
     /// Test-only seam: when present, `process_channel_message` routes the inbound
     /// gate through this authorizer instead of the production `for_policy` path,
     /// so tests can express an operation-selective deny (e.g. autosave only) that
@@ -1048,10 +1039,7 @@ fn resolved_default_provider(config: &Config) -> String {
 }
 
 fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    providers::selection::default_model(config).to_string()
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -1059,9 +1047,6 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
         temperature: config.default_temperature,
-        api_key: config.api_key.clone(),
-        api_url: config.api_url.clone(),
-        reliability: config.reliability.clone(),
     }
 }
 
@@ -1080,9 +1065,6 @@ fn runtime_defaults_for_generation(
             default_provider: ctx.default_provider.as_str().to_string(),
             model: ctx.model.as_str().to_string(),
             temperature: ctx.temperature,
-            api_key: ctx.api_key.clone(),
-            api_url: ctx.api_url.clone(),
-            reliability: ctx.reliability.as_ref().clone(),
         };
     }
     #[cfg(not(test))]
@@ -1242,73 +1224,6 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {
     // canonical conversation only; the legacy pre-history is left intact and will
     // naturally age out of the merged read window as new canonical turns fill it.
     ctx.conversation_histories.lock().remove(&key.canonical);
-}
-
-fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> bool {
-    let mut histories = ctx.conversation_histories.lock();
-
-    // Compact ONLY the canonical session, never the legacy entry. Legacy is the
-    // immutable, cross-recipient shared pre-cutover history; mutating or dropping
-    // it here would corrupt the pre-history of every other recipient of the same
-    // sender. Legacy is also already bounded (it was capped at MAX_CHANNEL_HISTORY
-    // when written, ≤ 50 turns), and `merged_history` re-applies that window
-    // across the union on every read — so the merged length the model sees stays
-    // bounded (≤ legacy_cap + compacted_canonical, then truncated to the window)
-    // without compaction needing to touch legacy at all. This is an in-memory
-    // cache operation only: durable rows are untouched and re-hydrate on restart.
-    let Some(canonical_turns) = histories.get(&key.canonical) else {
-        return false;
-    };
-    if canonical_turns.is_empty() {
-        return false;
-    }
-    let before_len = canonical_turns.len();
-    let before_chars = canonical_turns
-        .iter()
-        .map(|turn| turn.content.chars().count())
-        .sum::<usize>();
-
-    let keep_from = canonical_turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(
-        canonical_turns
-            .get(keep_from..)
-            .map(<[ChatMessage]>::to_vec)
-            .unwrap_or_default(),
-    );
-
-    for turn in &mut compacted {
-        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            // These turns are replayed to the provider verbatim, so the cut must
-            // not slice a media marker in half: a half marker either loses the
-            // attachment or forges a reference to a path that never existed.
-            turn.content = crate::multimodal::truncate_preserving_media_markers(
-                &turn.content,
-                CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
-            )
-            .into_owned();
-        }
-    }
-
-    // Enforce a hard total character budget to avoid repeated context overflow.
-    while compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>() > CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
-        && compacted.len() > 1
-    {
-        compacted.remove(0);
-    }
-
-    // Write the compacted result back under the canonical key only; the legacy
-    // entry is never removed or rewritten.
-    if compacted.is_empty() {
-        histories.remove(&key.canonical);
-        return true;
-    }
-
-    let after_len = compacted.len();
-    let after_chars = compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>();
-    histories.insert(key.canonical.clone(), compacted);
-    after_len < before_len || after_chars < before_chars
 }
 
 /// Resolve the inbound gate for this message. Production always uses the
@@ -1559,97 +1474,18 @@ async fn load_persisted_histories(
     }
 }
 
-/// The mid-turn record of tool calls that have **already executed** in the
-/// current attempt, ready to be carried into a replayed history.
-///
-/// A replay rebuilds the conversation from `conversation_histories`, and that
-/// cache holds only completed user/assistant turns — `append_sender_turn` is
-/// never called for a mid-turn tool call or tool result. Handing the model a
-/// history with the tool evidence erased is an instruction to run everything
-/// again, and the tools on this path have real side effects: files written,
-/// messages sent, external APIs called. Nothing downstream catches the repeat
-/// either — the durable idempotency ledger keys on the provider-generated
-/// `tool_call_id`, which is freshly minted by the replayed response.
-///
-/// So the replay must re-ask the *model* without re-doing the *work*. The
-/// terminal chat retry (`chat::run`) gets this for free by never rebuilding its
-/// history; this is the channel path's equivalent.
-///
-/// The record is located by the first tool-result message rather than by an
-/// index into the previous history, so a mid-turn trim inside the tool loop
-/// cannot shift it out from under us. Everything from the assistant turn that
-/// requested those tools onwards is carried, which keeps the
-/// `assistant(tool_calls) → tool result` pairing that native-tool providers
-/// require. Mid-turn `system` messages (compaction and corrective-retry
-/// artifacts) are dropped: the rebuilt prefix already carries the real system
-/// prompt.
-fn executed_tool_records(history: &[ChatMessage]) -> Vec<ChatMessage> {
-    let Some(first_result) = history.iter().position(is_tool_result_message) else {
-        return Vec::new();
-    };
-    let start = history
-        .get(..first_result)
-        .and_then(|before| before.iter().rposition(|message| message.role == "assistant"))
-        .unwrap_or(first_result);
-    history
-        .get(start..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|message| message.role != "system")
-        .cloned()
-        .collect()
-}
-
-/// Rebuild the turn history for a replay while keeping the record of whatever
-/// the aborted attempt already executed.
-///
-/// See [`executed_tool_records`] for why the record has to survive: a replay is
-/// meant to re-ask the model, not to re-run the side effects it already caused.
-fn replayed_history(previous: &[ChatMessage], rebuild: &impl Fn() -> Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let carried = executed_tool_records(previous);
-    let mut next = rebuild();
-    if carried.is_empty() {
-        return next;
-    }
-    tracing::warn!(
-        carried_messages = carried.len(),
-        "channel turn replay: carrying already-executed tool records into the rebuilt history so the \
-         replay cannot repeat their side effects"
-    );
-    next.extend(carried);
-    next
-}
-
 /// Whether a history message carries the result of an executed tool call.
 ///
 /// Native-tool mode emits a dedicated `tool` role message per call; prompt mode
 /// folds every result of the iteration into one `user` message behind
 /// [`crate::agent::turn_contracts::TOOL_RESULTS_PREFIX`].
+#[cfg(test)]
 fn is_tool_result_message(message: &ChatMessage) -> bool {
     message.role == "tool"
         || (message.role == "user"
             && message
                 .content
                 .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX))
-}
-
-/// Wordings upstreams use to say "the prompt no longer fits". Shared by the
-/// overflow retry predicate and the user-facing failure classifier so the two
-/// cannot drift apart.
-const CONTEXT_WINDOW_OVERFLOW_HINTS: [&str; 8] = [
-    "exceeds the context window",
-    "context window of this model",
-    "maximum context length",
-    "context length exceeded",
-    "too many tokens",
-    "token limit exceeded",
-    "prompt is too long",
-    "input is too long",
-];
-
-pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    CONTEXT_WINDOW_OVERFLOW_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
 /// Number of hex digits in the short failure code shown to the user.
@@ -1792,6 +1628,9 @@ pub(crate) fn classify_turn_failure(err: &anyhow::Error) -> TurnFailureKind {
     {
         return TurnFailureKind::ToolSchemaRefused;
     }
+    if crate::recovery::overflow::is_context_overflow_error(err) {
+        return TurnFailureKind::ContextTooLong;
+    }
     let mut chain_text = String::new();
     for cause in err.chain() {
         use std::fmt::Write as _;
@@ -1823,14 +1662,6 @@ fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
         "image url targets a private/local address",
         "media artifact i/o failed",
         "media source is not a regular readable file",
-    ];
-    /// Extra overflow wordings that the retry predicate does not look for.
-    /// Kept separate so the predicate's behaviour is untouched.
-    const CONTEXT_EXTRA_HINTS: [&str; 4] = [
-        "context_length_exceeded",
-        "input token count",
-        "exceeds maximum context",
-        "exceed the maximum context",
     ];
     /// Billing / entitlement refusals: retrying cannot clear these.
     const QUOTA_HINTS: [&str; 9] = [
@@ -1920,8 +1751,6 @@ fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
     // bodies are part of this text.
     if hit(&ATTACHMENT_HINTS) {
         TurnFailureKind::Attachment
-    } else if hit(&CONTEXT_WINDOW_OVERFLOW_HINTS) || hit(&CONTEXT_EXTRA_HINTS) {
-        TurnFailureKind::ContextTooLong
     } else if hit(&QUOTA_HINTS) {
         TurnFailureKind::QuotaExhausted
     } else if hit(&CREDENTIAL_HINTS) {
@@ -1965,56 +1794,18 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
 async fn get_or_create_provider_for_generation(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    model_name: &str,
     generation: &Arc<crate::config::ConfigGeneration>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
-        return Ok(existing);
-    }
-    if provider_name == ctx.default_provider.as_str()
-        && !resolved_default_model(&generation.effective)
-            .trim()
-            .starts_with("hint:")
-    {
-        return Ok(Arc::clone(&ctx.provider));
-    }
-    let defaults = runtime_defaults_for_generation(ctx, generation);
-    // The root credential and base URL belong to the configured default
-    // provider. A `/models <other>` switch must not hand them to anyone else,
-    // so they are released only on a provider-identity match — which also
-    // covers the alias spellings a plain string comparison missed. A selection
-    // left without a credential is refused by the availability gate, before
-    // any transport exists, and that error is propagated unchanged.
-    let connection = providers::configured_connection_for(
-        provider_name,
-        &defaults.default_provider,
-        defaults.api_key.as_deref(),
-        defaults.api_url.as_deref(),
-    );
-
-    // The rotation keys are extra credentials for that same root key, so they
-    // follow the connection and are cleared when it is withheld.
-    let reliability = providers::scoped_reliability(&defaults.reliability, &connection);
-    let provider = providers::create_resilient_provider_with_options(
-        provider_name,
-        connection.api_key,
-        connection.api_url,
-        &reliability,
+    providers::generation::get_or_create_provider_for_generation(
+        &ctx.config,
+        &ctx.provider_cache,
         &ctx.provider_runtime_options,
-    )?;
-    let provider: Arc<dyn Provider> = Arc::from(provider);
-
-    if let Err(err) = provider.warmup().await {
-        tracing::warn!(
-            provider = %providers::redact_endpoint_userinfo(provider_name),
-            "Provider warmup failed: {}",
-            providers::redact_endpoint_userinfo(&err.to_string())
-        );
-    }
-
-    ctx.provider_cache
-        .lock()
-        .insert(provider_name.to_string(), Arc::clone(&provider));
-    Ok(provider)
+        provider_name,
+        model_name,
+        generation,
+    )
+    .await
 }
 
 /// A hint is one selected route, not a provider-wide chain. Constructing the
@@ -2045,6 +1836,25 @@ fn build_channel_hint_provider(
         model: resolved.model().to_string(),
     };
     Ok(Some((route, Arc::from(provider))))
+}
+
+/// Build the default channel provider from the exact resolver release used by
+/// channel turns. The returned names are the wire destination after a route
+/// hint has been resolved.
+pub(crate) fn build_channel_startup_provider(
+    config: &Config,
+    options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<(Arc<dyn Provider>, String, String)> {
+    let catalog = providers::selection::catalog_for(config);
+    let resolved = providers::selection::check_default(config, providers::catalog::UnknownPolicy::Invocation)?;
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_for(
+        &resolved, &catalog, config, options,
+    )?);
+    Ok((
+        provider,
+        resolved.provider_label().to_string(),
+        resolved.model().to_string(),
+    ))
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -2124,14 +1934,22 @@ async fn handle_runtime_command_if_needed(
             Some(provider_name) => {
                 // The new provider is resolved with the sender's current model
                 // before anything is built or switched.
-                let refusal = providers::selection::check(
-                    &config_generation.effective,
-                    &provider_name,
-                    &current.model,
-                    &providers::catalog::Requirement::chat(),
-                    providers::catalog::UnknownPolicy::Invocation,
-                )
-                .err();
+                let catalog = providers::selection::catalog_for(&config_generation.effective);
+                let refusal = match providers::selection::route_target(&catalog, &provider_name, &current.model) {
+                    Err(error) => Some(error.to_string()),
+                    Ok(route) => providers::selection::check_with(
+                        &config_generation.effective,
+                        &catalog,
+                        &provider_name,
+                        &current.model,
+                        providers::selection::credential_for(&config_generation.effective, &provider_name),
+                        &providers::catalog::Requirement::chat(),
+                        providers::catalog::UnknownPolicy::Invocation,
+                    )
+                    .map_err(|refusal| providers::selection::route_refusal(route, refusal))
+                    .err()
+                    .map(|refusal| refusal.to_string()),
+                };
                 if let Some(refusal) = refusal {
                     format!(
                         "{refusal}. Route unchanged; switch the model first with `/model <model-id>` or pick \
@@ -2147,7 +1965,7 @@ async fn handle_runtime_command_if_needed(
                         )
                         .map(|_| ())
                     } else {
-                        get_or_create_provider_for_generation(ctx, &provider_name, config_generation)
+                        get_or_create_provider_for_generation(ctx, &provider_name, &current.model, config_generation)
                             .await
                             .map(|_| ())
                     };
@@ -2217,6 +2035,76 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+/// Exercise the production `/models` handler with a retained route refusal.
+/// Kept test-only because the runtime owns its context and outbound channel.
+#[cfg(test)]
+pub(crate) async fn broken_route_models_command_response(config: &Config) -> String {
+    route_command_response(config, "/models openai", "hint:broken").await.0
+}
+
+/// Send `command` for a sender whose current model is `model` and return the
+/// reply plus the sender's selected model afterwards.
+#[cfg(test)]
+pub(crate) async fn route_command_response(config: &Config, command: &str, model: &str) -> (String, String) {
+    #[derive(Default)]
+    struct RefusalChannel {
+        sent: tokio::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Channel for RefusalChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.content.clone());
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let shared = crate::config::new_shared(config.clone());
+    let generation = shared.pin();
+    let channel_impl = Arc::new(RefusalChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut ctx = tests::ctx_with_histories(HashMap::new());
+    ctx.config = shared;
+    ctx.config_generation = Arc::clone(&generation);
+
+    let msg = traits::ChannelMessage {
+        id: "prx-broken-route-command".to_string(),
+        sender: "prx_user".to_string(),
+        reply_target: "prx_channel".to_string(),
+        content: command.to_string(),
+        channel: "telegram".to_string(),
+        ..traits::ChannelMessage::default()
+    };
+    let key = ConversationKey::from_message(&msg);
+    set_route_selection(
+        &ctx,
+        &generation,
+        &key,
+        ChannelRouteSelection {
+            provider: providers::selection::default_provider(config).to_string(),
+            model: model.to_string(),
+        },
+    );
+    assert!(
+        handle_runtime_command_if_needed(&ctx, &generation, &msg, Some(&channel)).await,
+        "the production /models handler did not claim the command"
+    );
+    let reply = channel_impl
+        .sent
+        .lock()
+        .await
+        .last()
+        .cloned()
+        .expect("the production runtime command did not send a reply");
+    let after = get_route_selection_for_generation(&ctx, &key, &generation);
+    (reply, after.model)
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
@@ -2308,6 +2196,7 @@ struct SignalVisionProvider<'a> {
     provider: &'a dyn Provider,
     model: &'a str,
     temperature: f64,
+    capabilities: crate::providers::ProviderCapabilities,
 }
 
 struct SignalVisionScope {
@@ -2327,6 +2216,7 @@ async fn run_signal_vision_preflight(
         provider,
         model,
         temperature,
+        capabilities,
     } = target;
     if !is_signal_image_message(msg) {
         return SignalVisionPreflightOutcome::NotRequired;
@@ -2339,10 +2229,7 @@ async fn run_signal_vision_preflight(
     else {
         return fallback("auxiliary vision source or accounting admission refused");
     };
-    if !provider
-        .capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-        .vision
-    {
+    if !capabilities.vision {
         return fallback("auxiliary vision unsupported by selected provider");
     }
     let deadline = tokio::time::Instant::from_std(accounting.deadline());
@@ -3341,42 +3228,20 @@ async fn run_channel_turn(
             admission_guard.finish_without_decision();
             return;
         }
-
-        // ── Token-saving pre-gate (Tier 1 heuristic + Tier 2 cheap classifier) ─
-        // Runs ONLY here: smart-mode + group + NOT @-mentioned. @-mentions, DMs,
-        // and non-smart modes never reach this branch, so they never pay the
-        // pre-gate cost and are never suppressed by it (invariant). Fail-open:
-        // any classifier fault enters the loop.
-        let pre_gate_outcome = run_smart_pre_gate(
-            ctx.as_ref(),
-            &config_generation,
-            &history_key,
-            &user_text_for_mention,
-            route.provider.as_str(),
-            route.model.as_str(),
-            None,
-        )
-        .await;
-        tracing::debug!(
-            channel = %msg.channel,
-            path = pre_gate_outcome.path.as_str(),
-            enter_loop = pre_gate_outcome.should_enter_loop(),
-            "smart pre-gate decision"
-        );
-        if !pre_gate_outcome.should_enter_loop() {
-            // Stay silent: do not enter the loop, do not send, do not write an
-            // assistant turn (equivalent to the MVP-B Silent outcome). The
-            // inbound user turn was already persisted above; we leave it.
-            println!(
-                "  🤫 Smart pre-gate: staying silent (no LLM loop) [{}]",
-                pre_gate_outcome.path.as_str()
-            );
-            admission_guard.finish_without_decision();
-            return;
-        }
     }
 
-    let decision_turn = match decision_turn::ChannelDecisionTurn::admit(
+    // Heuristics may prepare the admitted pre-gate path, but never terminate a
+    // turn. A possible Skip is confirmed only by the resolver-built auxiliary
+    // classifier after source decision admission below.
+    let smart_pre_gate_input = (smart_group && !mentioned).then(|| {
+        let cfg = &config_generation.effective.smart_group;
+        let (recent_context, bot_recently_active) =
+            gather_pre_gate_history(ctx.as_ref(), &history_key, cfg.classifier_max_context_messages);
+        let heuristic = pre_gate::classify_heuristic(&user_text_for_mention, &ctx.bot_names, bot_recently_active);
+        (recent_context, heuristic)
+    });
+
+    let mut decision_turn = match decision_turn::ChannelDecisionTurn::admit(
         ctx.as_ref(),
         &channel_source,
         &config_generation,
@@ -3403,6 +3268,59 @@ async fn run_channel_turn(
             return;
         }
     };
+    if let Some((recent_context, heuristic)) = smart_pre_gate_input {
+        let mut pre_gate = run_admitted_smart_pre_gate(
+            ctx.as_ref(),
+            &config_generation,
+            &mut decision_turn,
+            heuristic,
+            &recent_context,
+            &user_text_for_mention,
+            &cancellation_token,
+        )
+        .await;
+        tracing::debug!(
+            channel = %msg.channel,
+            path = pre_gate.outcome.path.as_str(),
+            enter_loop = pre_gate.outcome.should_enter_loop(),
+            "admitted smart pre-gate decision"
+        );
+        if let Some(provider_outcome) = pre_gate.silence_provider_outcome() {
+            if let Err(error) = decision_turn
+                .commit(crate::agent::terminal::TurnTerminalDraft {
+                    decision: None,
+                    terminal_id: turn_run_id.clone(),
+                    scope: channel_source.envelope().message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Silent,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: "smart-group classifier declined a proactive reply".to_owned(),
+                        started_at: pre_gate.started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress {
+                        reason: "smart-group classifier declined a proactive reply".to_owned(),
+                    },
+                })
+                .await
+            {
+                tracing::warn!(%error, "smart pre-gate silent terminal failed");
+                return;
+            }
+            println!(
+                "  🤫 Smart pre-gate: staying silent (no agent loop) [{}]",
+                pre_gate.outcome.path.as_str()
+            );
+            return;
+        }
+        if !pre_gate.outcome.should_enter_loop() {
+            tracing::warn!(
+                "smart pre-gate skip lacks a completed classifier outcome; failing open into the agent loop"
+            );
+        }
+    }
     match decision_turn.close_reply() {
         Ok(Some(reply)) => {
             if let Err(error) = decision_turn
@@ -3452,29 +3370,30 @@ async fn run_channel_turn(
         }
     }
     let mut vision_scope = None;
-    let decision_turn = if vision_required {
-        match decision_turn.vision_accounting() {
-            Ok(accounting) => {
-                let (turn, observation) = decision_turn.with_vision_observation(&accounting);
+    if vision_required && let Ok(accounting) = decision_turn.vision_accounting() {
+        match decision_turn.register_vision_observation(&accounting) {
+            Ok(observation) => {
                 vision_scope = Some(SignalVisionScope {
                     accounting,
                     observation,
                 });
-                turn
             }
-            Err(_) => decision_turn,
+            Err(error) => tracing::warn!(%error, "channel vision observation refused; using the uncertainty fallback"),
         }
-    } else {
-        decision_turn
-    };
+    }
     let preflight = if vision_required {
         if let Some(scope) = vision_scope.as_ref() {
             let provider = scope.accounting.provider();
+            let model = scope.accounting.selected_model().model();
+            let adapter = provider.capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = providers::selection::catalog_for(&config_generation.effective)
+                .effective_provider_capabilities(scope.accounting.selected_model().provider_label(), model, adapter);
             run_signal_vision_preflight(
                 SignalVisionProvider {
                     provider: provider.as_ref(),
-                    model: scope.accounting.selected_model().model(),
+                    model,
                     temperature: runtime_defaults.temperature,
+                    capabilities,
                 },
                 &msg,
                 &message_runtime.multimodal,
@@ -3703,7 +3622,7 @@ async fn run_channel_turn(
     let mut history = rebuild_history();
     let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
 
-    let (mut delta_tx, delta_rx) = if use_streaming {
+    let (delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -3730,7 +3649,7 @@ async fn run_channel_turn(
     };
 
     let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
+    let draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
         (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
     {
         Some(spawn_channel_draft_updater(
@@ -3865,7 +3784,6 @@ async fn run_channel_turn(
             trace: crate::agent::turn_contracts::ToolLoopTrace,
         },
         Error(anyhow::Error),
-        ContextOverflowExhausted,
     }
 
     let scope_owner_id = runtime_envelope.resolved_owner_id();
@@ -3909,13 +3827,14 @@ async fn run_channel_turn(
         )
     });
 
-    // No wall clock wraps this loop. A turn runs for as long as it keeps
+    // No wall clock wraps this turn. It runs for as long as it keeps
     // working; the only automatic end is the stall detector inside
     // `run_turn` (see `crate::agent::idle`), and the only
     // manual one is cancellation — a newer message or `prx tasks kill`.
-    // This scope encloses every retry, while the terminal guard remains owned
-    // outside it. Forced drop must acknowledge descendant cleanup before the
-    // guard may persist the parent outcome.
+    // `run_turn` owns provider overflow compaction and replay. This outer scope
+    // owns descendant cleanup only, while the terminal guard remains outside
+    // it. Forced drop must acknowledge descendant cleanup before the guard may
+    // persist the parent outcome.
     let child_owner = crate::runtime::turn_cleanup::current_tracker();
     let (child_cleanup_tx, child_cleanup_rx) = tokio::sync::oneshot::channel();
     let channel_child_cleanup =
@@ -3927,7 +3846,7 @@ async fn run_channel_turn(
             }
         };
     let decision_turn = decision_turn.with_child_cleanup(child_cleanup_rx);
-    let final_outcome = channel_child_cleanup.run(async { Ok(loop {
+    let final_outcome = channel_child_cleanup.run(async { Ok({
         let llm_work = async {
             tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -4009,78 +3928,29 @@ async fn run_channel_turn(
         };
 
         match llm_result {
-            LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
+            LlmExecutionResult::Cancelled => LlmFinalOutcome::Cancelled,
             LlmExecutionResult::Completed(result) => match *result {
                 Ok((outcome, trace)) => match outcome {
                     crate::agent::turn_contracts::ToolLoopOutcome::Text(response)
                     | crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { reply: response } => {
-                        break LlmFinalOutcome::Success { response, trace };
+                        LlmFinalOutcome::Success { response, trace }
                     }
                     crate::agent::turn_contracts::ToolLoopOutcome::Silent { reason } => {
-                        break LlmFinalOutcome::Silent { reason, trace };
+                        LlmFinalOutcome::Silent { reason, trace }
                     }
                 },
                 Err(e) => {
                     if e.downcast_ref::<crate::runtime::turn_cleanup::CleanupIncomplete>()
                         .is_some()
                     {
-                        break LlmFinalOutcome::Error(e);
+                        LlmFinalOutcome::Error(e)
+                    } else if crate::agent::turn_contracts::is_tool_loop_cancelled(&e)
+                        || cancellation_token.is_cancelled()
+                    {
+                        LlmFinalOutcome::Cancelled
+                    } else {
+                        LlmFinalOutcome::Error(e)
                     }
-                    if crate::agent::turn_contracts::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
-                        break LlmFinalOutcome::Cancelled;
-                    }
-
-                    if is_context_window_overflow_error(&e) {
-                        let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                        // Report the merged-view char count; compaction folds legacy
-                        // into canonical, but reading the union keeps the figure honest
-                        // regardless of which keys remain populated.
-                        let compacted_chars = merged_history(&ctx.conversation_histories.lock(), &history_key)
-                            .iter()
-                            .map(|t| t.content.chars().count())
-                            .sum::<usize>();
-                        eprintln!(
-                            "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
-                            started_at.elapsed().as_millis(),
-                            compacted,
-                            compacted_chars
-                        );
-
-                        if compacted {
-                            // Restart the draft accumulator for the retried
-                            // attempt. The accumulator used to live for the whole
-                            // turn, so a retry's deltas were appended to the
-                            // half-finished text of the attempt that failed and
-                            // the user read "half a sentence + the whole answer
-                            // again". Closing the delta channel and waiting for
-                            // the old task to drain it means no stale delta can
-                            // arrive after the fresh accumulator starts.
-                            if let (Some(channel), Some(draft_id)) =
-                                (target_channel.as_ref(), draft_message_id.as_deref())
-                            {
-                                drop(delta_tx.take());
-                                if let Some(handle) = draft_updater.take() {
-                                    log_worker_join_result(handle.await);
-                                }
-                                draft_has_text.store(false, std::sync::atomic::Ordering::Release);
-                                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-                                delta_tx = Some(tx);
-                                draft_updater = Some(spawn_channel_draft_updater(
-                                    Arc::clone(channel),
-                                    msg.reply_target.clone(),
-                                    draft_id.to_string(),
-                                    rx,
-                                    Arc::clone(&draft_has_text),
-                                ));
-                            }
-                            history = replayed_history(&history, &rebuild_history);
-                            continue;
-                        }
-
-                        break LlmFinalOutcome::ContextOverflowExhausted;
-                    }
-
-                    break LlmFinalOutcome::Error(e);
                 }
             },
         }
@@ -4307,28 +4177,6 @@ async fn run_channel_turn(
                 }
             }
         }
-        LlmFinalOutcome::ContextOverflowExhausted => {
-            let summary = "channel context overflow exhausted";
-            let overflow_error = anyhow::anyhow!(summary);
-            if let Err(error) = decision_turn.fail(&overflow_error, false).await {
-                tracing::warn!(error = %error, "Failed to commit shared overflow channel terminal event");
-                return;
-            }
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text = "Session context was too long and has been reset. Please resend your message.";
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ =
-                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, error_text)
-                            .await;
-                } else {
-                    let _ = send_recording_activity(
-                        channel.as_ref(),
-                        &SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
-                }
-            }
-        }
     }
 }
 
@@ -4461,122 +4309,135 @@ fn gather_pre_gate_history(
     (recent_context, bot_recently_active)
 }
 
-/// Resolve the (provider, model) the pre-gate Tier-2 classifier should use.
-///
-/// Preference order: explicit `smart_group.classifier_provider/model` config →
-/// the channel route, constructed only when the heuristic needs a classifier.
-/// Returns the shared provider `Arc` plus the model id to use.
-async fn resolve_pre_gate_classifier(
-    ctx: &ChannelRuntimeContext,
-    config_generation: &Arc<crate::config::ConfigGeneration>,
-    route_provider: &str,
-    route_model: &str,
-    fallback_provider: Option<&Arc<dyn Provider>>,
-) -> anyhow::Result<(Arc<dyn Provider>, String)> {
-    let cfg = &ctx.smart_group;
-    let model = if cfg.classifier_model.trim().is_empty() {
-        if route_model.trim().starts_with("hint:") {
-            let config = &config_generation.effective;
-            let catalog = providers::selection::catalog_for(config);
-            providers::selection::check_with(
-                config,
-                &catalog,
-                route_provider,
-                route_model,
-                providers::selection::credential_for(config, route_provider),
-                &providers::catalog::Requirement::chat(),
-                providers::catalog::UnknownPolicy::Invocation,
-            )?
-            .model()
-            .to_string()
-        } else {
-            route_model.to_string()
-        }
-    } else {
-        cfg.classifier_model.trim().to_string()
-    };
-
-    if !cfg.classifier_provider.trim().is_empty() && cfg.classifier_provider.trim() != route_provider {
-        match get_or_create_provider_for_generation(ctx, cfg.classifier_provider.trim(), config_generation).await {
-            Ok(provider) => return Ok((provider, model)),
-            Err(error) => {
-                tracing::warn!(
-                    "pre-gate classifier provider unavailable; resolving channel route: {}",
-                    providers::sanitize_api_error(&error.to_string())
-                );
-            }
-        }
-    }
-    if let Some(provider) = fallback_provider {
-        return Ok((Arc::clone(provider), model));
-    }
-    if let Some((resolved, provider)) = build_channel_hint_provider(
-        &config_generation.effective,
-        route_provider,
-        route_model,
-        &providers::provider_runtime_options_from_config(&config_generation.effective),
-    )? {
-        let model = if cfg.classifier_model.trim().is_empty() {
-            resolved.model
-        } else {
-            model
-        };
-        return Ok((provider, model));
-    }
-    let provider = get_or_create_provider_for_generation(ctx, route_provider, config_generation).await?;
-    Ok((provider, model))
+struct AdmittedSmartPreGate {
+    outcome: pre_gate::PreGateOutcome,
+    provider_outcome: Option<crate::llm::route_decision::ProviderExecutionOutcome>,
+    started_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Run the smart-group pre-gate for a non-@ group message: a cheap two-tier
-/// triage that decides whether to spend a full agent loop on this message.
-///
-/// 🔴 Invariant: this is only ever called for `smart_group && !mentioned` turns;
-/// the caller guarantees @-mentions / DMs / non-smart never reach here.
-/// 🔴 Fail-open: any classifier fault enters the loop (see `pre_gate` module).
-async fn run_smart_pre_gate(
+impl AdmittedSmartPreGate {
+    /// The completed classifier outcome that authorizes silence, or `None`
+    /// when the message must enter the loop (fail-open): either the gate
+    /// chose to enter, or it skipped without a settled classifier receipt.
+    const fn silence_provider_outcome(&mut self) -> Option<crate::llm::route_decision::ProviderExecutionOutcome> {
+        if self.outcome.should_enter_loop() {
+            return None;
+        }
+        self.provider_outcome.take()
+    }
+}
+
+/// Run the smart-group classifier only after the source decision exists. A
+/// heuristic may enter the main loop directly, but neither heuristic nor a
+/// caller-owned provider can authorize silence.
+async fn run_admitted_smart_pre_gate(
     ctx: &ChannelRuntimeContext,
     config_generation: &Arc<crate::config::ConfigGeneration>,
-    history_key: &ConversationKey,
+    decision_turn: &mut decision_turn::ChannelDecisionTurn,
+    heuristic: pre_gate::Heuristic,
+    recent_context: &[String],
     user_text: &str,
-    route_provider: &str,
-    route_model: &str,
-    active_provider: Option<&Arc<dyn Provider>>,
-) -> pre_gate::PreGateOutcome {
-    let cfg = &ctx.smart_group;
-    let (recent_context, bot_recently_active) =
-        gather_pre_gate_history(ctx, history_key, cfg.classifier_max_context_messages);
-
-    let heuristic = pre_gate::classify_heuristic(user_text, &ctx.bot_names, bot_recently_active);
-
-    // Decisive heuristic buckets short-circuit (0 tokens). Only the genuinely
-    // uncertain bucket consults the cheap classifier — that is the token-saving
-    // sweet spot: obvious-relevant and obvious-noise never pay for a model call.
-    match heuristic {
-        pre_gate::Heuristic::EnterLoop => pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::HeuristicEnter),
-        pre_gate::Heuristic::Skip => pre_gate::PreGateOutcome::skip(pre_gate::PreGatePath::HeuristicSkip),
-        pre_gate::Heuristic::Uncertain => {
-            let (provider, model) =
-                match resolve_pre_gate_classifier(ctx, config_generation, route_provider, route_model, active_provider)
-                    .await
-                {
-                    Ok(classifier) => classifier,
-                    Err(error) => {
-                        tracing::warn!(
-                            "pre-gate classifier initialization failed: {}",
-                            providers::sanitize_api_error(&error.to_string())
-                        );
-                        return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen);
-                    }
+    cancellation: &CancellationToken,
+) -> AdmittedSmartPreGate {
+    let started_at = chrono::Utc::now();
+    if heuristic == pre_gate::Heuristic::EnterLoop {
+        return AdmittedSmartPreGate {
+            outcome: pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::HeuristicEnter),
+            provider_outcome: None,
+            started_at,
+        };
+    }
+    let classifier = match decision_turn.smart_group_classifier() {
+        Ok(classifier) => classifier,
+        Err(error) => {
+            tracing::warn!(
+                "admitted smart-group classifier unavailable; failing open: {}",
+                providers::sanitize_api_error(&error.to_string())
+            );
+            return AdmittedSmartPreGate {
+                outcome: pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen),
+                provider_outcome: None,
+                started_at,
+            };
+        }
+    };
+    let pending = match classifier.begin() {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(
+                "admitted smart-group classifier observation refused; failing open: {}",
+                providers::sanitize_api_error(&error.to_string())
+            );
+            return AdmittedSmartPreGate {
+                outcome: pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen),
+                provider_outcome: None,
+                started_at,
+            };
+        }
+    };
+    let provider = classifier.provider();
+    let model = classifier.model().to_owned();
+    let accounting = classifier.accounting();
+    let cfg = &config_generation.effective.smart_group;
+    let result = pre_gate::classify_with_model(
+        provider.as_ref(),
+        &model,
+        cfg,
+        recent_context,
+        user_text,
+        &ctx.bot_names,
+        accounting,
+        cancellation,
+    )
+    .await;
+    match result.call {
+        pre_gate::ClassifierCall::Completed(trace) => {
+            if let Err(error) = classifier.complete(pending, &trace) {
+                tracing::warn!(
+                    "admitted smart-group classifier settlement failed; failing open: {}",
+                    providers::sanitize_api_error(&error.to_string())
+                );
+                return AdmittedSmartPreGate {
+                    outcome: pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen),
+                    provider_outcome: None,
+                    started_at,
                 };
-            pre_gate::classify_with_model(
-                provider.as_ref(),
-                &model,
-                cfg,
-                &recent_context,
-                user_text,
-                &ctx.bot_names,
-            )
-            .await
+            }
+            let provider_outcome = classifier.provider_outcome(&trace, started_at);
+            if !result.outcome.should_enter_loop()
+                && let Err(error) = classifier.authorize_silence()
+            {
+                tracing::warn!(
+                    "admitted smart-group classifier silence authorization failed; failing open: {}",
+                    providers::sanitize_api_error(&error.to_string())
+                );
+                return AdmittedSmartPreGate {
+                    outcome: pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen),
+                    provider_outcome: None,
+                    started_at,
+                };
+            }
+            AdmittedSmartPreGate {
+                outcome: result.outcome,
+                provider_outcome: Some(provider_outcome),
+                started_at,
+            }
+        }
+        pre_gate::ClassifierCall::Failed => {
+            classifier.fail(pending, false);
+            AdmittedSmartPreGate {
+                outcome: result.outcome,
+                provider_outcome: None,
+                started_at,
+            }
+        }
+        pre_gate::ClassifierCall::Cancelled => {
+            classifier.fail(pending, true);
+            AdmittedSmartPreGate {
+                outcome: result.outcome,
+                provider_outcome: None,
+                started_at,
+            }
         }
     }
 }
@@ -4759,8 +4620,18 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
     let fixture_provider_name = ctx.default_provider.as_str().to_owned();
     let provider_cache = ctx.provider_cache.lock().clone();
     let fixture_provider = provider_cache
-        .get(&fixture_provider_name)
+        .get(&(
+            ctx.config_generation.id.0,
+            fixture_provider_name.clone(),
+            ctx.model.as_str().to_owned(),
+        ))
         .cloned()
+        .or_else(|| {
+            provider_cache
+                .iter()
+                .find(|((_, provider, _), _)| provider == &fixture_provider_name)
+                .map(|(_, provider)| Arc::clone(provider))
+        })
         .unwrap_or_else(|| Arc::clone(&ctx.provider));
     let fixture_label_for = |provider: &Arc<dyn Provider>| {
         let identity = Arc::as_ptr(provider).cast::<()>() as usize;
@@ -4771,7 +4642,7 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         fixture_provider_name.clone(),
         (fixture_label_for(&fixture_provider), Arc::clone(&fixture_provider)),
     );
-    for (name, provider) in provider_cache {
+    for ((_, name, _), provider) in provider_cache {
         fixture_providers
             .entry(name)
             .or_insert_with(|| (fixture_label_for(&provider), provider));
@@ -4892,9 +4763,7 @@ fn normalize_legacy_channel_fixture(mut ctx: Arc<ChannelRuntimeContext>) -> Arc<
         recording_fixture::attach_ledger_only(owned);
     }
     let shared = crate::config::new_shared(config);
-    if !split_generation {
-        owned.config_generation = shared.pin();
-    }
+    owned.config_generation = shared.pin();
     owned.config = shared;
     ctx
 }
@@ -5533,30 +5402,8 @@ pub async fn start_channels_with_config(
     };
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     check_channel_startup_default(&config)?;
-    let selected_hint = build_channel_hint_provider(
-        &config,
-        &provider_name,
-        &resolved_default_model(&config),
-        &provider_runtime_options,
-    )?;
-    let default_is_hint = selected_hint.is_some();
-    let (provider, turn_provider_name, model): (Arc<dyn Provider>, String, String) =
-        if let Some((route, provider)) = selected_hint {
-            (provider, route.provider, route.model)
-        } else {
-            let provider = providers::create_resilient_provider_with_options(
-                &provider_name,
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-                &config.reliability,
-                &provider_runtime_options,
-            )?;
-            (
-                Arc::from(provider),
-                provider_name.clone(),
-                resolved_default_model(&config),
-            )
-        };
+    let default_is_hint = resolved_default_model(&config).trim().starts_with("hint:");
+    let (provider, turn_provider_name, model) = build_channel_startup_provider(&config, &provider_runtime_options)?;
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
     // so the first real message doesn't hit a cold-start timeout.
@@ -5903,6 +5750,20 @@ pub async fn start_channels_with_config(
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+    if !default_is_hint {
+        provider_cache_seed.insert(
+            (config_generation.id.0, provider_name.clone(), model.clone()),
+            Arc::clone(&provider),
+        );
+    }
+    let provider_cache: ProviderCacheMap = Arc::new(Mutex::new(provider_cache_seed));
+    let pinned_provider_resolver: Arc<dyn providers::generation::PinnedProviderResolver> =
+        Arc::new(providers::generation::ConfigGenerationProviderResolver::with_cache(
+            Arc::clone(&shared_config),
+            provider_runtime_options.clone(),
+            Arc::clone(&provider_cache),
+        ));
     // Publish the same registry process-wide for as long as these channels are
     // running, so the gateway control plane (`POST /api/channels/{name}/send`)
     // can reach the very channel objects that own the live connections. The
@@ -5960,6 +5821,7 @@ pub async fn start_channels_with_config(
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
+            #[cfg(test)]
             Arc::clone(&provider),
             &provider_name,
             &resolved_default_model(&config),
@@ -5967,18 +5829,11 @@ pub async fn start_channels_with_config(
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
-            config.agent.compaction.clone(),
             config.agents_with_references().into_owned(),
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)
@@ -6026,13 +5881,16 @@ pub async fn start_channels_with_config(
         ));
 
         // image: vision tool backed by the active provider (OpenClaw alignment)
-        tools_list.push(Box::new(tools::ImageTool::new(
-            Arc::clone(&provider),
-            &model,
-            temperature,
-            security.clone(),
-            config.multimodal.clone(),
-        )));
+        tools_list.push(Box::new(
+            tools::ImageTool::new(
+                Arc::clone(&provider),
+                &model,
+                temperature,
+                security.clone(),
+                config.multimodal.clone(),
+            )
+            .with_pinned_provider_resolver(Arc::clone(&pinned_provider_resolver)),
+        ));
 
         tools_list.push(Box::new(spawn_tool));
         Some(handle)
@@ -6116,10 +5974,6 @@ pub async fn start_channels_with_config(
     // receiving. `prx tasks list` is where in-flight turns are counted now.
     println!("  🚦 In-flight messages: unbounded (inspect with `prx tasks list`)");
 
-    let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-    if !default_is_hint {
-        provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
-    }
     let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
         let allowed_from = normalize_allowlist(&signal.allowed_from);
         let group_allow_from = normalize_allowlist(&signal.group_allow_from);
@@ -6182,7 +6036,9 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         config_generation,
         channels_by_name,
+        #[cfg(test)]
         provider: Arc::clone(&provider),
+        #[cfg(test)]
         default_provider: Arc::new(provider_name),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
@@ -6201,7 +6057,7 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         low_priority_tools: config.agent.low_priority_tools.clone(),
         conversation_histories,
-        provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+        provider_cache,
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         #[cfg(test)]
         api_key: config.api_key.clone(),
@@ -6229,10 +6085,11 @@ pub async fn start_channels_with_config(
         mention_only_by_channel,
         group_reply_mode_by_channel,
         smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        smart_group: config.smart_group.clone(),
         #[cfg(test)]
         test_inbound_authorizer: None,
     });
+    #[cfg(not(test))]
+    drop(provider);
 
     let dispatch_result = run_message_dispatch_loop_with_cleanup(rx, runtime_ctx, shutdown.clone()).await;
     if dispatch_result.is_err() {
@@ -6264,7 +6121,9 @@ mod tests {
         clippy::unreadable_literal
     )]
     mod factory_reload_fixture;
+    mod provider_tool_reload;
     mod signal_accounted;
+    mod smart_group_accounted;
 
     use super::*;
     use crate::memory::{Memory, MemoryCategory, MemoryPrincipal, SqliteMemory};
@@ -6276,6 +6135,36 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::TempDir;
+
+    struct ProviderReloadPermit;
+
+    struct PreparedProviderReloadPermit;
+
+    impl crate::config::ConfigGenerationParticipant for ProviderReloadPermit {
+        fn name(&self) -> &'static str {
+            "channel-provider-reload-proof"
+        }
+
+        fn supports_rebuild_field(&self, field: &str) -> bool {
+            matches!(field, "api_key" | "api_url")
+        }
+
+        fn prepare(
+            &self,
+            _generation: Arc<crate::config::ConfigGeneration>,
+            _changed_fields: &[String],
+        ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+            Ok(Box::new(PreparedProviderReloadPermit))
+        }
+    }
+
+    impl crate::config::PreparedConfigGeneration for PreparedProviderReloadPermit {
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
 
     #[test]
     fn channel_configuration_statuses_include_wacli() {
@@ -6611,170 +6500,6 @@ mod tests {
         assert!(!signal_mode.is_smart(), "signal is never smart here");
     }
 
-    /// Provider that returns a fixed string, recording how many classifier calls
-    /// were made — lets the pre-gate "token path" tests assert that the cheap
-    /// model is consulted ONLY for the uncertain bucket.
-    struct CountingProvider {
-        answer: String,
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for CountingProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.answer.clone())
-        }
-    }
-
-    fn pre_gate_history_key() -> ConversationKey {
-        ConversationKey {
-            canonical: "channel:telegram:alice:teamchat".to_string(),
-            legacy: "telegram_alice".to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn pre_gate_is_always_active() {
-        let ctx = ctx_with_histories(HashMap::new());
-        let provider: Arc<dyn Provider> = Arc::new(CountingProvider {
-            answer: "NO".into(),
-            calls: AtomicUsize::new(0),
-        });
-        let generation = ctx.config.pin();
-        let outcome = run_smart_pre_gate(
-            &ctx,
-            &generation,
-            &pre_gate_history_key(),
-            "lol",
-            "test-provider",
-            "test-model",
-            Some(&provider),
-        )
-        .await;
-        assert!(!outcome.should_enter_loop());
-        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicSkip);
-    }
-
-    #[tokio::test]
-    async fn pre_gate_heuristic_skip_never_calls_model() {
-        // Token path: obvious noise is skipped by the 0-token heuristic; the cheap
-        // classifier is NEVER invoked.
-        let ctx = ctx_with_histories(HashMap::new());
-        let counting = Arc::new(CountingProvider {
-            answer: "YES".into(),
-            calls: AtomicUsize::new(0),
-        });
-        let provider: Arc<dyn Provider> = counting.clone();
-        let generation = ctx.config.pin();
-        let outcome = run_smart_pre_gate(
-            &ctx,
-            &generation,
-            &pre_gate_history_key(),
-            "😂😂",
-            "test-provider",
-            "test-model",
-            Some(&provider),
-        )
-        .await;
-        assert!(!outcome.should_enter_loop(), "pure emoji must be skipped");
-        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicSkip);
-        assert_eq!(
-            counting.calls.load(Ordering::SeqCst),
-            0,
-            "heuristic skip must not consult the classifier (token saving)"
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_gate_heuristic_enter_never_calls_model() {
-        // Token path: a clear question enters the loop via the heuristic with no
-        // classifier call.
-        let ctx = ctx_with_histories(HashMap::new());
-        let counting = Arc::new(CountingProvider {
-            answer: "NO".into(),
-            calls: AtomicUsize::new(0),
-        });
-        let provider: Arc<dyn Provider> = counting.clone();
-        let generation = ctx.config.pin();
-        let outcome = run_smart_pre_gate(
-            &ctx,
-            &generation,
-            &pre_gate_history_key(),
-            "what is the deploy status?",
-            "test-provider",
-            "test-model",
-            Some(&provider),
-        )
-        .await;
-        assert!(outcome.should_enter_loop());
-        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicEnter);
-        assert_eq!(
-            counting.calls.load(Ordering::SeqCst),
-            0,
-            "heuristic enter must not consult the classifier (token saving)"
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_gate_uncertain_consults_classifier_and_can_skip() {
-        // Token path: only the genuinely uncertain bucket pays for the cheap model.
-        let ctx = ctx_with_histories(HashMap::new());
-        let counting = Arc::new(CountingProvider {
-            answer: "NO".into(),
-            calls: AtomicUsize::new(0),
-        });
-        let provider: Arc<dyn Provider> = counting.clone();
-        let generation = ctx.config.pin();
-        let outcome = run_smart_pre_gate(
-            &ctx,
-            &generation,
-            &pre_gate_history_key(),
-            "the deploy went out an hour ago to all prod servers",
-            "test-provider",
-            "test-model",
-            Some(&provider),
-        )
-        .await;
-        assert!(!outcome.should_enter_loop(), "classifier NO should skip");
-        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierSkip);
-        assert_eq!(
-            counting.calls.load(Ordering::SeqCst),
-            1,
-            "uncertain bucket consults the classifier exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_gate_uncertain_uses_classifier() {
-        let ctx = ctx_with_histories(HashMap::new());
-        let counting = Arc::new(CountingProvider {
-            answer: "NO".into(),
-            calls: AtomicUsize::new(0),
-        });
-        let provider: Arc<dyn Provider> = counting.clone();
-        let generation = ctx.config.pin();
-        let outcome = run_smart_pre_gate(
-            &ctx,
-            &generation,
-            &pre_gate_history_key(),
-            "the deploy went out an hour ago to all prod servers",
-            "test-provider",
-            "test-model",
-            Some(&provider),
-        )
-        .await;
-        assert!(!outcome.should_enter_loop());
-        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierSkip);
-        assert_eq!(counting.calls.load(Ordering::SeqCst), 1, "classifier is always active");
-    }
-
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
         // Create minimal workspace files
@@ -6786,16 +6511,6 @@ mod tests {
         std::fs::write(tmp.path().join("HEARTBEAT.md"), "# Heartbeat\nCheck status.").unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
-    }
-
-    #[test]
-    fn context_window_overflow_error_detector_matches_known_messages() {
-        let overflow_err =
-            anyhow::anyhow!("OpenAI Codex stream error: Your input exceeds the context window of this model.");
-        assert!(is_context_window_overflow_error(&overflow_err));
-
-        let other_err = anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
-        assert!(!is_context_window_overflow_error(&other_err));
     }
 
     #[test]
@@ -6830,95 +6545,9 @@ mod tests {
         assert!(normalized[1].content.contains("assistant part 2"));
     }
 
-    #[test]
-    fn compact_sender_history_keeps_recent_truncated_messages() {
-        let mut histories = HashMap::new();
-        let sender = ConversationKey {
-            canonical: "channel:telegram:u1:chat-1".to_string(),
-            legacy: "telegram_u1".to_string(),
-        };
-        histories.insert(
-            sender.canonical.clone(),
-            (0..20)
-                .map(|idx| {
-                    let content = format!("msg-{idx}-{}", "x".repeat(700));
-                    if idx % 2 == 0 {
-                        ChatMessage::user(content)
-                    } else {
-                        ChatMessage::assistant(content)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        let ctx = ChannelRuntimeContext {
-            decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
-            channels_by_name: Arc::new(HashMap::new()),
-            provider: Arc::new(DummyProvider),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            memory_event_recording: MemoryEventRecording::default(),
-            read_only_tool_concurrency_window: 2,
-            priority_scheduling_enabled: false,
-            low_priority_tools: Vec::new(),
-
-            conversation_histories: Arc::new(Mutex::new(histories)),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
-                security: Arc::new(crate::security::SecurityPolicy::default()),
-            })),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-
-            tool_tiering: crate::config::ToolTieringConfig::default(),
-            signal_inbound_policy: None,
-            whatsapp_inbound_policy: None,
-            bot_names: vec!["prx".to_string()],
-            bot_uuids: vec![],
-            mention_only_by_channel: HashMap::new(),
-            group_reply_mode_by_channel: HashMap::new(),
-            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
-            test_inbound_authorizer: None,
-        };
-
-        assert!(compact_sender_history(&ctx, &sender));
-
-        let histories = ctx.conversation_histories.lock();
-        let kept = histories.get(&sender.canonical).expect("sender history should remain");
-        assert!(!kept.is_empty());
-        assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        assert!(kept.iter().all(|turn| {
-            let len = turn.content.chars().count();
-            len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
-                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3 && turn.content.ends_with("..."))
-        }));
-        let total_chars: usize = kept.iter().map(|turn| turn.content.chars().count()).sum();
-        assert!(
-            total_chars <= CHANNEL_HISTORY_COMPACT_TOTAL_CHARS,
-            "total chars {} exceeds budget {}",
-            total_chars,
-            CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
-        );
-    }
-
     /// Build a minimal `ChannelRuntimeContext` whose conversation history map is
     /// seeded with `histories`, for exercising compact/clear in isolation.
-    fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
+    pub(super) fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
         ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
             config: crate::config::new_shared(Config::default()),
@@ -6960,7 +6589,6 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             test_inbound_authorizer: None,
         }
     }
@@ -7101,7 +6729,13 @@ mod tests {
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
         let generation = Arc::clone(&ctx.config_generation);
 
-        let outcome = get_or_create_provider_for_generation(&ctx, &endpoint.provider_name(), &generation).await;
+        let outcome = get_or_create_provider_for_generation(
+            &ctx,
+            &endpoint.provider_name(),
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
 
         assert!(
             outcome.is_ok(),
@@ -7144,7 +6778,7 @@ mod tests {
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
         let generation = Arc::clone(&ctx.config_generation);
 
-        let provider = get_or_create_provider_for_generation(&ctx, &probe.custom_provider(), &generation)
+        let provider = get_or_create_provider_for_generation(&ctx, &probe.custom_provider(), PROBE_MODEL, &generation)
             .await
             .expect("test: a keyless BYO endpoint is usable on its own");
         let _reply = provider.simple_chat("ping", PROBE_MODEL, 0.0).await;
@@ -7177,14 +6811,28 @@ mod tests {
         let trailing_slash_spelling = format!("{configured}/");
         let selected = format!("CUSTOM:{}", configured.trim_start_matches("custom:"));
         let mut ctx = ctx_with_histories(HashMap::new());
-        ctx.default_provider = Arc::new(configured);
+        ctx.default_provider = Arc::new(configured.clone());
         ctx.api_key = Some(BYO_CONNECTION_SENTINEL.to_string());
         ctx.api_url = None;
         ctx.reliability = Arc::new(channel_reliability_without_fallbacks());
         ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        let mut effective = Config::default();
+        effective.workspace_dir = temp.path().to_path_buf();
+        effective.default_provider = Some(configured);
+        effective.api_key = Some(BYO_CONNECTION_SENTINEL.to_string());
+        effective.reliability = channel_reliability_without_fallbacks();
+        let manager = crate::config::new_shared(effective);
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = manager.pin();
         let generation = Arc::clone(&ctx.config_generation);
 
-        let outcome = get_or_create_provider_for_generation(&ctx, &selected, &generation).await;
+        let outcome = get_or_create_provider_for_generation(
+            &ctx,
+            &selected,
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
 
         assert!(
             outcome.is_ok(),
@@ -7201,7 +6849,13 @@ mod tests {
         // second is proven only by a request of its own that carries it
         // (SP-INT2 a29): `carried` alone stays true whatever this call sends.
         let requests_before_trailing_slash = endpoint.requests().len();
-        let trailing_slash = get_or_create_provider_for_generation(&ctx, &trailing_slash_spelling, &generation).await;
+        let trailing_slash = get_or_create_provider_for_generation(
+            &ctx,
+            &trailing_slash_spelling,
+            providers::selection::default_model(&generation.effective),
+            &generation,
+        )
+        .await;
         assert!(
             trailing_slash.is_ok(),
             "one endpoint spelled with a trailing slash is the same endpoint: {:?}",
@@ -7598,58 +7252,6 @@ mod tests {
                 .iter()
                 .any(|message| message.role == "user" && message.content.contains(IM_BUDGET_REQUEST)),
             "the turn's own request must survive the budget (D-011)"
-        );
-    }
-
-    #[test]
-    fn compact_sender_history_never_removes_shared_legacy() {
-        // FIX-P1-25b bug 2: compaction must operate on the canonical session only.
-        // The legacy entry is the immutable, cross-recipient shared pre-history;
-        // compacting one recipient's session must not delete or mutate it, so the
-        // sender's other recipients still read the legacy pre-history afterwards.
-        let legacy = "telegram_alice".to_string();
-        let key_a = ConversationKey {
-            canonical: "channel:telegram:alice:chat-a".to_string(),
-            legacy: legacy.clone(),
-        };
-        let key_b = ConversationKey {
-            canonical: "channel:telegram:alice:chat-b".to_string(),
-            legacy: legacy.clone(),
-        };
-
-        let mut histories = HashMap::new();
-        histories.insert(legacy.clone(), vec![ChatMessage::user("legacy-prehistory")]);
-        // A canonical session long enough to actually compact.
-        histories.insert(
-            key_a.canonical.clone(),
-            (0..20)
-                .map(|idx| ChatMessage::user(format!("a-{idx}")))
-                .collect::<Vec<_>>(),
-        );
-        let ctx = ctx_with_histories(histories);
-
-        assert!(compact_sender_history(&ctx, &key_a));
-
-        let histories = ctx.conversation_histories.lock();
-        // Legacy untouched.
-        assert_eq!(
-            histories
-                .get(&legacy)
-                .map(|t| t.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()),
-            Some(vec!["legacy-prehistory"]),
-            "compaction must not delete or mutate the shared legacy entry"
-        );
-        // Recipient A's canonical was compacted.
-        let kept_a = histories.get(&key_a.canonical).expect("canonical A remains");
-        assert!(kept_a.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        drop(histories);
-
-        // Recipient B (same sender) still reads the legacy pre-history via merge.
-        let merged_b = merged_history(&ctx.conversation_histories.lock(), &key_b);
-        assert_eq!(
-            merged_b.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
-            vec!["legacy-prehistory"],
-            "other recipient still sees shared legacy after compaction of recipient A"
         );
     }
 
@@ -8152,7 +7754,6 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             test_inbound_authorizer: None,
         };
 
@@ -8913,7 +8514,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9013,17 +8613,13 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Stands in for a real model on the replay path: it asks for the tool while
+    /// Stands in for a real model on the engine recovery path: it asks for the tool while
     /// the history shows no tool has run, and once the history *does* show the
-    /// result it fails the call with a context-window error, which is what makes
-    /// the channel loop replay the turn.
-    ///
-    /// The error text matches the channel-level classifier but deliberately not
-    /// the tool loop's own overflow classifier, so the failure propagates
-    /// straight to the replay instead of being absorbed by the in-loop
-    /// compaction retry.
+    /// result it fails with a context-window error. The canonical engine
+    /// classifier must recognize this provider wording and retain the executed
+    /// tool record across every compaction retry.
     #[derive(Default)]
-    struct ReplayProbeProvider {
+    struct EngineOverflowProbeProvider {
         /// Whether each `chat_with_history` call saw evidence of an executed tool.
         saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
     }
@@ -9036,7 +8632,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[async_trait::async_trait]
-    impl Provider for ReplayProbeProvider {
+    impl Provider for EngineOverflowProbeProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -9077,10 +8673,10 @@ BTC is currently around $65,000 based on latest tool output."#
         ctx.conversation_histories.lock().insert(key.canonical, turns);
     }
 
-    /// A replayed channel turn must re-ask the model without re-running the
-    /// tools the aborted attempt already executed.
+    /// A channel turn must leave overflow recovery to the engine without
+    /// re-running tools the failed attempt already executed.
     #[tokio::test]
-    async fn channel_turn_replay_does_not_re_execute_already_executed_tools() {
+    async fn channel_turn_engine_overflow_recovery_does_not_re_execute_already_executed_tools() {
         let dir = TempDir::new().expect("test: tempdir");
         let audit = dir.path().join("audit.log");
 
@@ -9089,7 +8685,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let provider = Arc::new(ReplayProbeProvider::default());
+        let provider = Arc::new(EngineOverflowProbeProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
@@ -9101,7 +8697,7 @@ BTC is currently around $65,000 based on latest tool output."#
             // A real SQLite backend, because a side-effecting tool is refused
             // outright without the durable idempotency ledger. Running the tool
             // *with* the ledger in place is also the point: the ledger keys on
-            // the per-call tool id, which the replayed response mints afresh, so
+            // the per-call tool id, which a second model tool call would mint afresh, so
             // it cannot be what stops the repeat.
             memory: Arc::clone(&memory),
             tools_registry: Arc::new(vec![Box::new(AppendingTool { path: audit.clone() }) as Box<dyn Tool>]),
@@ -9120,7 +8716,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            reliability: Arc::new(crate::config::ReliabilityConfig {
+                provider_retries: 0,
+                ..crate::config::ReliabilityConfig::default()
+            }),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
 
@@ -9135,7 +8734,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9160,13 +8758,14 @@ BTC is currently around $65,000 based on latest tool output."#
             is_group_hint: false,
             sender_is_bot: false,
         };
+        let history_key = ConversationKey::from_message(&message);
         seed_channel_history_for_overflow_progress(runtime_ctx.as_ref(), &message);
         run_owned_channel_probe(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
             evidence.len() >= 3,
-            "test: the turn must actually have been replayed: {evidence:?}"
+            "test: the engine must actually compact and retry: {evidence:?}"
         );
         assert!(
             evidence.iter().skip(1).all(|seen| *seen),
@@ -9174,10 +8773,17 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tool");
-        let lines = appended.lines().filter(|line| !line.is_empty()).count();
+        let lines = appended.lines().filter(|line| *line == "appended").count();
         assert_eq!(
             lines, 1,
-            "the replay must not run the tool a second time; audit file: {appended:?}"
+            "engine recovery must not run the tool a second time; audit file: {appended:?}"
+        );
+        let cached = runtime_ctx.conversation_histories.lock();
+        assert!(
+            cached
+                .get(&history_key.canonical)
+                .is_some_and(|turns| turns.iter().any(|turn| turn.content == "older user turn 0")),
+            "the channel layer must not run an independent cache compactor after the engine gives up"
         );
     }
 
@@ -9328,7 +8934,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9537,7 +9142,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9788,10 +9392,10 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Like [`ReplayProbeProvider`] but asks for a *batch* of two side-effecting
+    /// Like [`EngineOverflowProbeProvider`] but asks for a *batch* of two side-effecting
     /// tools in one iteration, which is the shape that used to lose records.
     #[derive(Default)]
-    struct BatchReplayProbeProvider {
+    struct BatchEngineOverflowProbeProvider {
         saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
     }
 
@@ -9806,7 +9410,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[async_trait::async_trait]
-    impl Provider for BatchReplayProbeProvider {
+    impl Provider for BatchEngineOverflowProbeProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -9833,18 +9437,18 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// **Core evidence 3 (end to end)** — a replayed turn re-runs none of the
-    /// tools a whole batch already executed.
+    /// **Core evidence 3 (end to end)** — engine overflow recovery re-runs none
+    /// of the tools a whole batch already executed.
     ///
     /// Two side-effecting tools in a single iteration, one audit file, and the
-    /// context-overflow replay path (the one that survived the timeout's
-    /// deletion). Each tool must appear exactly once in the file.
+    /// production engine context-overflow path. Each tool must appear exactly
+    /// once in the file.
     #[tokio::test]
-    async fn channel_turn_replay_does_not_re_execute_an_already_executed_batch() {
+    async fn channel_turn_engine_overflow_recovery_does_not_re_execute_an_already_executed_batch() {
         let dir = TempDir::new().expect("test: tempdir");
         let audit = dir.path().join("batch-audit.log");
         let channel_impl = Arc::new(RecordingChannel::default());
-        let provider = Arc::new(BatchReplayProbeProvider::default());
+        let provider = Arc::new(BatchEngineOverflowProbeProvider::default());
         let ctx = evidence_runtime_ctx(
             &dir,
             Arc::clone(&provider) as Arc<dyn Provider>,
@@ -9856,13 +9460,14 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let message = evidence_message("msg-batch-replay-1", "append both lines please");
+        let history_key = ConversationKey::from_message(&message);
         seed_channel_history_for_overflow_progress(ctx.as_ref(), &message);
-        run_owned_channel_probe(ctx, message, CancellationToken::new()).await;
+        run_owned_channel_probe(Arc::clone(&ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
             evidence.len() >= 3,
-            "test: the turn must actually have been replayed: {evidence:?}"
+            "test: the engine must actually compact and retry: {evidence:?}"
         );
         let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tools");
         let first = appended.lines().filter(|line| *line == "appended").count();
@@ -9870,7 +9475,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             (first, second),
             (1, 1),
-            "each tool in the batch must run exactly once across the replay; audit file: {appended:?}"
+            "each tool in the batch must run exactly once across engine recovery; audit file: {appended:?}"
+        );
+        let cached = ctx.conversation_histories.lock();
+        assert!(
+            cached
+                .get(&history_key.canonical)
+                .is_some_and(|turns| turns.iter().any(|turn| turn.content == "older user turn 0")),
+            "the channel layer must not run an independent cache compactor after the engine gives up"
         );
     }
 
@@ -9990,60 +9602,6 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    /// A replayed turn starts its draft over instead of appending to the text of
-    /// the attempt that failed.
-    ///
-    /// The accumulator used to live for the whole turn, so the retry's deltas
-    /// were appended to the aborted attempt's half-finished sentence and the
-    /// user read "half a thought + the whole answer again". Restarting the
-    /// updater is what makes the second attempt begin from empty.
-    #[tokio::test]
-    async fn a_restarted_draft_updater_does_not_carry_the_previous_attempts_text() {
-        let channel_impl = Arc::new(DraftRecordingChannel::default());
-        let channel: Arc<dyn Channel> = Arc::clone(&channel_impl) as Arc<dyn Channel>;
-        let has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let (first_tx, first_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let first = spawn_channel_draft_updater(
-            Arc::clone(&channel),
-            "chat-evidence".to_string(),
-            "draft-1".to_string(),
-            first_rx,
-            Arc::clone(&has_text),
-        );
-        first_tx
-            .send("half a thou".to_string())
-            .await
-            .expect("test: send delta");
-        drop(first_tx);
-        first.await.expect("test: first updater should finish");
-        assert!(has_text.load(std::sync::atomic::Ordering::Acquire));
-
-        // What the replay branch does before it retries.
-        has_text.store(false, std::sync::atomic::Ordering::Release);
-        let (second_tx, second_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let second = spawn_channel_draft_updater(
-            Arc::clone(&channel),
-            "chat-evidence".to_string(),
-            "draft-1".to_string(),
-            second_rx,
-            Arc::clone(&has_text),
-        );
-        second_tx
-            .send("the whole answer".to_string())
-            .await
-            .expect("test: send delta");
-        drop(second_tx);
-        second.await.expect("test: second updater should finish");
-
-        let updates = channel_impl.draft_updates.lock().await.clone();
-        assert_eq!(
-            updates,
-            vec!["half a thou".to_string(), "the whole answer".to_string()],
-            "the retried attempt must start from empty, not from the aborted attempt's text"
-        );
-    }
-
     #[test]
     fn progress_lines_read_as_progress_and_never_as_a_deadline() {
         assert_eq!(
@@ -10053,32 +9611,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             channel_progress_line("", 3, Duration::from_secs(9)),
             "⏳ working… (step 3, 9s)"
-        );
-    }
-
-    #[test]
-    fn executed_tool_records_carry_the_assistant_turn_and_drop_mid_turn_system_noise() {
-        let history = vec![
-            ChatMessage::system("system prompt"),
-            ChatMessage::user("please do it"),
-            ChatMessage::assistant("assistant text without tools"),
-            ChatMessage::assistant("<tool_call>{\"name\":\"append_line\"}</tool_call>"),
-            ChatMessage::system("mid-turn compaction note"),
-            ChatMessage::user(format!(
-                "{}\nappended one line",
-                crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
-            )),
-        ];
-        let carried = executed_tool_records(&history);
-        let roles: Vec<&str> = carried.iter().map(|message| message.role.as_str()).collect();
-        assert_eq!(roles, vec!["assistant", "user"], "carried: {carried:?}");
-        assert!(carried[0].content.contains("append_line"));
-        assert!(carried[1].content.contains("appended one line"));
-
-        // A history with no executed tool has nothing to carry.
-        assert!(
-            executed_tool_records(&[ChatMessage::system("s"), ChatMessage::user("u")]).is_empty(),
-            "a turn that executed nothing must carry nothing"
         );
     }
 
@@ -10129,7 +9661,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -10223,7 +9754,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -10325,14 +9855,33 @@ BTC is currently around $65,000 based on latest tool output."#
         let fallback_provider_impl = Arc::new(ModelCaptureProvider::default());
         let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        let mut effective = Config::default();
+        effective.default_provider = Some("test-provider".to_string());
+        effective.default_model = Some("default-model".to_string());
+        let config_manager = crate::config::new_shared(effective);
+        let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "openrouter".to_string(),
+                "default-model".to_string(),
+            ),
+            fallback_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config: config_manager,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10365,7 +9914,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -10433,9 +9981,25 @@ BTC is currently around $65,000 based on latest tool output."#
         let routed_provider_impl = Arc::new(ModelCaptureProvider::default());
         let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+        let config_manager = crate::config::new_shared(Config::default());
+        let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "openrouter".to_string(),
+                "route-model".to_string(),
+            ),
+            routed_provider,
+        );
 
         let route_key = "telegram_alice".to_string();
         let mut route_overrides = HashMap::new();
@@ -10449,8 +10013,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config: config_manager,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10483,7 +10047,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -10532,13 +10095,19 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_provider: Arc<dyn Provider> = reloaded_provider_impl.clone();
         let mut ctx = ctx_with_histories(HashMap::new());
         ctx.provider = startup_provider;
-        ctx.provider_cache
-            .lock()
-            .insert("test-provider".to_string(), Arc::clone(&reloaded_provider));
+        ctx.provider_cache.lock().insert(
+            (
+                ctx.config_generation.id.0,
+                "test-provider".to_string(),
+                "default-model".to_string(),
+            ),
+            Arc::clone(&reloaded_provider),
+        );
 
-        let selected = get_or_create_provider_for_generation(&ctx, "test-provider", &ctx.config_generation)
-            .await
-            .expect("cached generation provider");
+        let selected =
+            get_or_create_provider_for_generation(&ctx, "test-provider", "default-model", &ctx.config_generation)
+                .await
+                .expect("cached generation provider");
         assert!(Arc::ptr_eq(&selected, &reloaded_provider));
         let response = selected
             .chat_with_history(
@@ -10559,6 +10128,164 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn generation_provider_cache_separates_models_on_the_same_provider() {
+        let ctx = ctx_with_histories(HashMap::new());
+        let selected_provider = "custom:http://127.0.0.1:9/v1";
+
+        let model_a = get_or_create_provider_for_generation(&ctx, selected_provider, "model-a", &ctx.config_generation)
+            .await
+            .expect("first model builds");
+        let model_a_again =
+            get_or_create_provider_for_generation(&ctx, selected_provider, "model-a", &ctx.config_generation)
+                .await
+                .expect("first model is cached");
+        let model_b = get_or_create_provider_for_generation(&ctx, selected_provider, "model-b", &ctx.config_generation)
+            .await
+            .expect("second model builds its own chain");
+
+        assert!(Arc::ptr_eq(&model_a, &model_a_again), "the exact cache key was rebuilt");
+        assert!(
+            !Arc::ptr_eq(&model_a, &model_b),
+            "a provider chain resolved for model-a was reused for model-b"
+        );
+        assert_eq!(ctx.provider_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generation_provider_cache_rebuilds_the_same_default_after_reload() {
+        const OLD_KEY: &str = "prx-channel-cache-key-old";
+        const NEW_KEY: &str = "prx-channel-cache-key-new";
+
+        let old_endpoint = providers::credential_probe::CredentialProbe::start().await;
+        let new_endpoint = providers::credential_probe::CredentialProbe::start().await;
+        let temp = TempDir::new().expect("test: temp state dir");
+        let mut initial = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        initial.default_provider = Some("openai".to_string());
+        initial.default_model = Some("gpt-4o".to_string());
+        initial.api_key = Some(OLD_KEY.to_string());
+        initial.api_url = Some(old_endpoint.base_url());
+        let manager = crate::config::new_shared(initial);
+        let old_generation = manager.pin();
+
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = Arc::clone(&old_generation);
+        ctx.default_provider = Arc::new("openai".to_string());
+        ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        let stale: Arc<dyn Provider> = Arc::new(ModelCaptureProvider::default());
+        let stale_weak = Arc::downgrade(&stale);
+        ctx.provider_cache
+            .lock()
+            .insert((old_generation.id.0, "openai".to_string(), "gpt-4o".to_string()), stale);
+
+        let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = Arc::new(ProviderReloadPermit);
+        manager.register_participant(&participant);
+        let mut reloaded = old_generation.effective.as_ref().clone();
+        reloaded.api_key = Some(NEW_KEY.to_string());
+        reloaded.api_url = Some(new_endpoint.base_url());
+        let report = manager
+            .apply_runtime_config(reloaded, crate::config::ConfigReloadTrigger::Test)
+            .expect("same-route credential reload");
+        assert_eq!(report.rebuilt, vec!["api_key", "api_url"]);
+        let new_generation = manager.pin();
+        assert_ne!(new_generation.id, old_generation.id);
+        ctx.config_generation = Arc::clone(&new_generation);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let command = traits::ChannelMessage {
+            sender: "prx_user".to_string(),
+            reply_target: "prx_channel".to_string(),
+            channel: "telegram".to_string(),
+            content: "/models openai".to_string(),
+            ..traits::ChannelMessage::default()
+        };
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &new_generation, &command, Some(&channel)).await,
+            "the production /models command did not claim its input"
+        );
+        assert!(
+            channel_impl
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(|message| message.contains("Provider switched to `openai`")),
+            "the production /models command did not report readiness"
+        );
+
+        let selected = get_or_create_provider_for_generation(&ctx, "openai", "gpt-4o", &new_generation)
+            .await
+            .expect("cached reloaded default provider");
+        let response = selected
+            .simple_chat("verify reloaded channel provider", "gpt-4o", 0.0)
+            .await
+            .expect("reloaded provider response");
+
+        assert_eq!(response, providers::credential_probe::PROBE_REPLY);
+        assert!(old_endpoint.requests().is_empty(), "the startup endpoint was reused");
+        let requests = new_endpoint.requests();
+        assert!(!requests.is_empty(), "the reloaded endpoint was not called");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.carries(NEW_KEY) && !request.carries(OLD_KEY)),
+            "the reloaded provider did not keep the new credential owner: {requests:?}"
+        );
+        assert!(
+            stale_weak.upgrade().is_none(),
+            "the stale credential chain remained cached"
+        );
+        let cached = ctx.provider_cache.lock();
+        assert_eq!(cached.len(), 1);
+        assert!(cached.contains_key(&(new_generation.id.0, "openai".to_string(), "gpt-4o".to_string())));
+    }
+
+    /// Finding 64: the per-sender `/models` provider getter resolves the
+    /// selected model's fallback contract before caching or warming a chain.
+    #[tokio::test]
+    async fn per_sender_provider_getter_refuses_a_cross_dialect_fallback_before_transport() {
+        let temp = TempDir::new().expect("test: temp state dir");
+        let probe = providers::credential_probe::CredentialProbe::start().await;
+        let selected_provider = probe.custom_provider();
+        let mut effective = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        crate::providers::entrypoint_consistency_tests::configure_cross_dialect(&mut effective, &selected_provider);
+        effective.default_provider = Some("openai".to_string());
+        let manager = crate::config::new_shared(effective);
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.default_provider = Arc::new("openai".to_string());
+        ctx.provider_runtime_options = isolated_provider_runtime_options(&temp);
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = manager.pin();
+
+        let error = get_or_create_provider_for_generation(
+            &ctx,
+            &selected_provider,
+            crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL,
+            &ctx.config_generation,
+        )
+        .await
+        .err()
+        .expect("the per-sender getter accepted an incompatible fallback");
+        let shown = format!("{error:#}");
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("channel per-sender", &shown);
+        assert!(
+            probe.requests().is_empty(),
+            "the channel getter reached transport: {shown}"
+        );
+        assert!(
+            ctx.provider_cache.lock().is_empty(),
+            "a refused chain entered the cache"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_builds_selected_provider_without_plain_turn_retrieval() {
         factory_reload_fixture::run().await;
     }
@@ -10573,9 +10300,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(ModelCaptureProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
-
         let temp = tempfile::TempDir::new().expect("temp dir");
         let mut live_config = Config::default();
         live_config.default_provider = Some("test-provider".to_string());
@@ -10583,6 +10307,15 @@ BTC is currently around $65,000 based on latest tool output."#
         live_config.default_temperature = 0.5;
         let config_manager = crate::config::new_shared(live_config);
         let config_generation = config_manager.pin();
+        let mut provider_cache_seed: HashMap<ProviderCacheKey, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert(
+            (
+                config_generation.id.0,
+                "test-provider".to_string(),
+                "hot-reloaded-model".to_string(),
+            ),
+            Arc::clone(&provider),
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
@@ -10623,7 +10356,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -10710,7 +10442,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -11080,7 +10811,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -11451,7 +11181,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -11846,7 +11575,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -12233,7 +11961,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -12626,7 +12353,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -12705,10 +12431,16 @@ BTC is currently around $65,000 based on latest tool output."#
             calls: parking_lot::Mutex::new(Vec::new()),
         });
 
+        let mut effective = Config::default();
+        effective.default_provider = Some("test-provider".to_string());
+        effective.default_model = Some("test-model".to_string());
+        let config = crate::config::new_shared(effective);
+        let config_generation = config.pin();
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
+            config,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -12741,7 +12473,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -12877,7 +12608,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -12985,7 +12715,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -13628,7 +13357,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -13742,7 +13470,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -13850,7 +13577,6 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -14655,7 +14381,6 @@ After"#;
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -15165,9 +14890,10 @@ After"#;
         ctx.config = shared.clone();
         ctx.config_generation = Arc::clone(&generation);
         ctx.default_provider = Arc::new("openrouter".to_string());
-        ctx.provider_cache
-            .lock()
-            .insert("openai".to_string(), Arc::new(DummyProvider) as Arc<dyn Provider>);
+        ctx.provider_cache.lock().insert(
+            (generation.id.0, "openai".to_string(), "vendor-model".to_string()),
+            Arc::new(DummyProvider) as Arc<dyn Provider>,
+        );
         let msg = traits::ChannelMessage {
             id: "msg-models".to_string(),
             sender: "alice".to_string(),

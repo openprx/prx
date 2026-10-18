@@ -10,7 +10,7 @@ use super::branch::{
     CausalCandidate, CostEstimate, Ns8, OpId, SideEffectClass,
 };
 use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
-use super::state::{CausalState, SideEffectMode};
+use super::state::{CausalState, ObservedStepKind, ObservedStepStatus, SideEffectMode};
 use crate::decision::DecisionKey;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
 
@@ -218,10 +218,7 @@ impl CausalCandidateGenerator {
         let raw = state.routing_input.as_str();
         let possible = catalog
             .iter_entries()
-            .filter(|entry| {
-                entry.family == CapabilityTarget::Filesystem
-                    && matches!(entry.public_name.as_str(), "file_write" | "file_edit")
-            })
+            .filter(|entry| collectable_approval_entry(entry))
             .any(|entry| {
                 entry.exact_mention_terms.iter().any(|term| {
                     !term.is_empty()
@@ -239,12 +236,26 @@ impl CausalCandidateGenerator {
         let folded = state.routing_input.as_str().to_lowercase();
         let mut exact = catalog.iter_entries().filter(|entry| exact_mention(&folded, entry));
         let entry = exact.next()?;
-        if exact.next().is_some()
-            || entry.family != CapabilityTarget::Filesystem
-            || !matches!(entry.public_name.as_str(), "file_write" | "file_edit")
+        let others = exact.next().is_some();
+        // File mutations need to be the only mention. An MCP tool is collected
+        // when its full public name or id is the single such mention; other
+        // matches (bare aliases, ordinary tools) are plain prose around it.
+        let entry = if others {
+            let mut named = catalog
+                .iter_entries()
+                .filter(|item| collectable_approval_entry(item) && names_entry(&folded, item));
+            let only = named.next()?;
+            if named.next().is_some() || only.family != CapabilityTarget::Mcp {
+                return None;
+            }
+            only
+        } else if collectable_approval_entry(entry)
+            && (entry.family != CapabilityTarget::Mcp || names_entry(&folded, entry))
         {
+            entry
+        } else {
             return None;
-        }
+        };
         let candidate = from_entry(
             CausalActionKind::UseTool,
             entry.family,
@@ -252,7 +263,14 @@ impl CausalCandidateGenerator {
             policy,
             Some(Ns8::of(policy.key, &entry.namespace)),
         );
-        (HardGates::check_one(state, catalog, &candidate, gates) == GateOutcome::ApprovalDeferred).then_some(candidate)
+        // A file mutation derives its exact operation from arguments, so it is
+        // deferred. An MCP tool has a fixed operation but its call is still
+        // unbound on a fresh turn, which collection binds before any review.
+        matches!(
+            HardGates::check_one(state, catalog, &candidate, gates),
+            GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. }
+        )
+        .then_some(candidate)
     }
 
     pub(crate) fn generate(
@@ -300,6 +318,9 @@ impl CausalCandidateGenerator {
         }
         let mut discoverable_families = DiscoveryFamilies::default();
         let mut exact_mentions = BTreeSet::new();
+        // Approval-only exact mentions with no bound call that must not turn
+        // into a plain Answer (full-name mentions of collectable entries).
+        let mut unbound_approval_mentions = BTreeSet::new();
         let mut exact_capability_requires_close = false;
         let mut proposed = Vec::new();
         let folded_input = if terminal_only || policy.delegation_target.is_some() {
@@ -330,6 +351,7 @@ impl CausalCandidateGenerator {
                 // target; neither path itself grants execution authority.
                 for family in CapabilityTarget::ALL {
                     let mut approval_only = None;
+                    let mut approval_only_unbound = false;
                     let mut selected = None;
                     for entry in catalog.iter_entries().filter(|entry| {
                         entry.family == family
@@ -354,8 +376,14 @@ impl CausalCandidateGenerator {
                                 selected = Some(candidate);
                                 break;
                             }
-                            GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
-                                approval_only = Some(candidate);
+                            GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() => {
+                                // A full-named collectable entry outranks an
+                                // earlier bare-alias match in the same family.
+                                let unbound = collectable_approval_entry(entry) && names_entry(&folded_input, entry);
+                                if approval_only.is_none() || (unbound && !approval_only_unbound) {
+                                    approval_only = Some(candidate);
+                                    approval_only_unbound = unbound;
+                                }
                             }
                             GateOutcome::ApprovalDeferred | GateOutcome::Blocked { gate: 4 | 7 | 9, .. } => {
                                 // An exact action that lacks approval scope,
@@ -367,6 +395,12 @@ impl CausalCandidateGenerator {
                             }
                             _ => {}
                         }
+                    }
+                    if selected.is_none()
+                        && approval_only_unbound
+                        && let Some(candidate) = &approval_only
+                    {
+                        unbound_approval_mentions.insert(candidate.candidate_id().clone());
                     }
                     if let Some(candidate) = selected.or(approval_only) {
                         exact_mentions.insert(candidate.candidate_id().clone());
@@ -441,7 +475,11 @@ impl CausalCandidateGenerator {
                 // A later capability_search call supplies its own bounded query.
                 // Only initial Discover hops require the raw source to fit that
                 // query contract; both paths use the same capability gates.
-                if !exact_capability_requires_close {
+                let discovery_completed =
+                    state.observed.completed_steps().iter().any(|step| {
+                        step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok
+                    });
+                if !exact_capability_requires_close && !discovery_completed {
                     let mut discovery_anchor = None;
                     for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
                         let searchable = catalog.iter_entries().filter(|entry| {
@@ -629,12 +667,14 @@ impl CausalCandidateGenerator {
             }
         }
         // An exactly named capability that is approval-only stays recorded as an
-        // exact mention: the selector uses it to prefer the approval request.
+        // exact mention: the selector uses it to prefer the approval request,
+        // or, with no bound call yet, to refuse a plain answer in its place.
         exact_mentions.retain(|id| {
             kept.iter().any(|candidate| candidate.candidate_id() == id)
                 || approval_only
                     .iter()
                     .any(|pending| pending.candidate.candidate_id() == id)
+                || unbound_approval_mentions.contains(id)
         });
         approval_scopes.retain(|id, _| kept.iter().any(|candidate| candidate.candidate_id() == id));
         Ok(CandidateSet::Legal {
@@ -760,10 +800,16 @@ fn terminal(action: CausalActionKind, policy: &CandidatePolicy<'_>) -> CausalCan
             } else {
                 estimate.map(|(cost, _)| cost)
             },
+            // Answer is the baseline serving path, so its normal model-response
+            // latency is not extra decision latency. Keep the estimate
+            // presence coupled to the pinned model price so an unpriced model
+            // still fails G6; the priced baseline contributes zero extra
+            // milliseconds. Tool and retrieval candidates retain their own
+            // execution-latency estimates.
             estimated_latency_ms: if action != CausalActionKind::Answer {
                 Some(0)
             } else {
-                estimate.map(|(_, latency)| latency)
+                estimate.map(|_| 0)
             },
         },
     )
@@ -785,6 +831,26 @@ fn approval_candidate(target: CapabilityTarget) -> CausalCandidate {
             estimated_latency_ms: Some(0),
         },
     )
+}
+
+/// Approval-required capabilities whose fresh-turn call arguments can be
+/// collected, never executed, before an owner reviews them: the file mutations
+/// and an MCP tool with one fixed approval operation. Under Supervised
+/// autonomy every discovered MCP tool qualifies; multi-operation entries such
+/// as nodes do not.
+pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
+    match entry.family {
+        CapabilityTarget::Filesystem => matches!(entry.public_name.as_str(), "file_write" | "file_edit"),
+        CapabilityTarget::Mcp => entry.effect > SideEffectClass::ReadOnly && entry.op_ids.len() == 1,
+        _ => false,
+    }
+}
+
+/// The text names the capability itself (public name or id), not one of its
+/// bare aliases, which are ordinary words such as `write` or `search`.
+fn names_entry(folded_text: &str, entry: &CapabilityEntry) -> bool {
+    contains_bounded(folded_text, &entry.id.as_str().to_lowercase())
+        || contains_bounded(folded_text, &entry.public_name.to_lowercase())
 }
 
 fn available_for_fallback(entry: &CapabilityEntry, policy: &CandidatePolicy<'_>) -> bool {
@@ -868,6 +934,33 @@ mod tests {
             }
         }
         cost
+    }
+
+    #[test]
+    fn priced_answer_does_not_charge_baseline_serving_latency_to_the_decision_budget() {
+        let key = fixtures::key();
+        let estimate = CostEstimate {
+            tokens: 128,
+            micro_usd: 7,
+        };
+        let cost = CapabilityCostModel {
+            per_capability: BTreeMap::new(),
+            estimates: BTreeMap::from([(CapabilityTarget::None, (estimate, 250))]),
+        };
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 1,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+
+        let answer = terminal(CausalActionKind::Answer, &policy);
+
+        assert_eq!(answer.estimated_cost(), Some(estimate));
+        assert_eq!(answer.estimated_latency_ms(), Some(0));
     }
 
     #[test]
@@ -3084,5 +3177,54 @@ mod tests {
             assert_eq!(actual_report.outcomes, expected_report.outcomes);
             assert_eq!(actual_report.gate_set_hash, expected_report.gate_set_hash);
         }
+    }
+
+    /// Finding 76 review: only a full-name mention of a single-operation
+    /// approval-required entry closes or collects; bare aliases are prose and
+    /// multi-operation node entries keep their previous behaviour.
+    #[test]
+    fn collection_trigger_is_full_name_and_single_operation_only() {
+        let temp = tempfile::tempdir().expect("test: tempdir");
+        let mut sources = CatalogSources::default();
+        sources.node_key = Some(crate::decision::DecisionKey::load_or_create(temp.path()).expect("test: key"));
+        sources.nodes.push(crate::tools::capability::catalog::NodeSource {
+            id: "prx_node".into(),
+            availability: crate::capability::CapabilityAvailability::configured("configured"),
+            binding_digest: [2; 32],
+        });
+        sources.mcp.push(McpCapabilitySpec {
+            server: "prx_server".into(),
+            tool: "write".into(),
+            state_digest: [3; 32],
+            spec: ToolSpec {
+                name: "mcp__prx_server__write".into(),
+                description: "Write remote data".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        });
+        let catalog = CapabilityCatalog::build(&[], &sources, &SurfacePolicy::default()).expect("test: catalog");
+        let view = catalog.view(&CatalogScope::default());
+        let write = view
+            .entries()
+            .iter()
+            .find(|entry| entry.public_name == "mcp__prx_server__write")
+            .expect("test: mcp entry");
+        let node = view
+            .entries()
+            .iter()
+            .find(|entry| entry.family == CapabilityTarget::Shell && entry.op_ids.len() == 2)
+            .expect("test: node entry");
+        assert!(collectable_approval_entry(write));
+        assert!(
+            !collectable_approval_entry(node),
+            "two-operation nodes are not collectable"
+        );
+        assert!(
+            exact_mention("write a poem about spring", write),
+            "the bare alias is an exact-mention term"
+        );
+        assert!(!names_entry("write a poem about spring", write));
+        assert!(!names_entry("search the docs for write", write));
+        assert!(names_entry("please call mcp__prx_server__write now", write));
     }
 }

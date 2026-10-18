@@ -18,6 +18,9 @@ use std::sync::Arc;
 /// Tool for vision/image understanding via the active provider.
 pub struct ImageTool {
     provider: Arc<dyn Provider>,
+    pinned_provider_resolver: Option<Arc<dyn crate::providers::generation::PinnedProviderResolver>>,
+    pinned_provider_name: Option<String>,
+    model_catalog: crate::providers::catalog::CatalogView,
     model: String,
     temperature: f64,
     security: Arc<SecurityPolicy>,
@@ -36,6 +39,9 @@ impl ImageTool {
         let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&security.workspace_dir);
         Self {
             provider,
+            pinned_provider_resolver: None,
+            pinned_provider_name: None,
+            model_catalog: crate::providers::catalog::CatalogView::release_only(),
             model: model.into(),
             temperature,
             security,
@@ -48,6 +54,31 @@ impl ImageTool {
     /// (This is a snapshot — callers re-construct or re-register the tool for model changes.)
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    #[must_use]
+    pub(crate) fn with_pinned_provider_resolver(
+        mut self,
+        resolver: Arc<dyn crate::providers::generation::PinnedProviderResolver>,
+    ) -> Self {
+        self.pinned_provider_resolver = Some(resolver);
+        self
+    }
+
+    /// Bind model capabilities when this runtime already owns an immutable
+    /// provider/model selection but does not perform generation reloads.
+    #[must_use]
+    pub(crate) fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        self.pinned_provider_name = Some(provider_name.into());
+        self
+    }
+
+    /// Bind the immutable operator/discovery/release model facts that own this
+    /// non-reloadable worker tool.
+    #[must_use]
+    pub(crate) fn with_model_catalog(mut self, catalog: crate::providers::catalog::CatalogView) -> Self {
+        self.model_catalog = catalog;
+        self
     }
 }
 
@@ -92,6 +123,37 @@ impl Tool for ImageTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let (provider, model, temperature, capabilities) = if let Some(resolver) = &self.pinned_provider_resolver {
+            let generation_id = crate::tools::execution::current_child_call_context()
+                .and_then(|caller| caller.context().envelope.config_generation_id)
+                .or_else(|| {
+                    args.get("_zc_scope_trusted")
+                        .and_then(serde_json::Value::as_bool)
+                        .filter(|trusted| *trusted)
+                        .and_then(|_| args.pointer("/_zc_scope/config_generation_id"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .ok_or_else(|| anyhow::anyhow!("image execution is missing its pinned configuration generation"))?;
+            let resolved = resolver.resolve_default(generation_id).await?;
+            (
+                resolved.provider,
+                resolved.model_name,
+                resolved.temperature,
+                resolved.capabilities,
+            )
+        } else {
+            let provider = Arc::clone(&self.provider);
+            let adapter =
+                provider.capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming);
+            let capabilities = self.pinned_provider_name.as_deref().map_or_else(
+                || adapter.clone(),
+                |name| {
+                    self.model_catalog
+                        .effective_provider_capabilities(name, &self.model, adapter.clone())
+                },
+            );
+            (provider, self.model.clone(), self.temperature, capabilities)
+        };
         // Collect image references from 'image' and/or 'images' parameters
         let mut image_refs: Vec<String> = Vec::new();
 
@@ -161,18 +223,16 @@ impl Tool for ImageTool {
             }
         }
 
-        // Check that the provider supports vision
-        if !self
-            .provider
-            .capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming)
-            .vision
-        {
+        // Check that the provider supports vision. Reloadable tools use the
+        // generation catalog so an operator declaration can refine the
+        // adapter and release-catalog facts for this exact provider/model.
+        if !capabilities.vision {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(
                     "Current model does not support vision. \
-                     Switch to a vision-capable model (e.g. gpt-4o, grok-4, claude-3-*)."
+                     Switch to a model whose catalog entry declares vision input."
                         .into(),
                 ),
             });
@@ -223,9 +283,8 @@ impl Tool for ImageTool {
             tools: None,
         };
 
-        let response = self
-            .provider
-            .chat(request, &self.model, self.temperature)
+        let response = provider
+            .chat(request, &model, temperature)
             .await
             .map_err(|e| anyhow::anyhow!("Vision model call failed: {e}"))?;
 
@@ -262,6 +321,7 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -387,6 +447,101 @@ mod tests {
             .unwrap();
         // Will fail at vision check OR at image prep if remote fetch disabled — either is ok
         assert!(!result.success);
+    }
+
+    struct CatalogVisionProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::providers::Provider for CatalogVisionProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected".to_string())
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                vision: true,
+                native_tool_calling: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_execution_is_gated_by_catalog_vision_input_before_transport() {
+        let provider = Arc::new(CatalogVisionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let tool = ImageTool::new(
+            provider_dyn,
+            "codellama",
+            0.0,
+            test_security(),
+            MultimodalConfig::default(),
+        )
+        .with_provider_name("ollama");
+
+        let result = tool
+            .execute(json!({
+                "image": "data:image/png;base64,iVBORw0KGgo=",
+                "prompt": "describe"
+            }))
+            .await
+            .expect("catalog refusal is a structured tool result");
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Current model does not support vision. Switch to a model whose catalog entry declares vision input.")
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "catalog refusal precedes transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_execution_uses_operator_vision_declaration_from_pinned_catalog() {
+        let provider = Arc::new(CatalogVisionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let mut config = crate::config::Config::default();
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"codellama\"\noperations = [\"chat\"]\nvision_input = true\n",
+            )
+            .expect("test: operator model declaration"),
+        );
+        let tool = ImageTool::new(
+            provider_dyn,
+            "codellama",
+            0.0,
+            test_security(),
+            MultimodalConfig::default(),
+        )
+        .with_provider_name("ollama")
+        .with_model_catalog(crate::providers::selection::catalog_for(&config));
+
+        let result = tool
+            .execute(json!({
+                "image": "data:image/png;base64,iVBORw0KGgo=",
+                "prompt": "describe"
+            }))
+            .await
+            .expect("operator-declared image request reaches the provider");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -180,7 +180,11 @@ impl ConfigGenerationParticipant for ReloadParticipant {
         Ok(Box::new(PreparedReload {
             cache: Arc::clone(&self.cache),
             provider: Arc::clone(&self.cached_provider),
-            previous: self.cache.lock().get("openai").cloned(),
+            previous: self
+                .cache
+                .lock()
+                .get(&(generation.id.0, "openai".to_owned(), MODEL.to_owned()))
+                .cloned(),
             committed: Arc::clone(&self.committed),
             generation: generation.id.0,
         }))
@@ -188,18 +192,20 @@ impl ConfigGenerationParticipant for ReloadParticipant {
 }
 impl PreparedConfigGeneration for PreparedReload {
     fn commit(&mut self) -> anyhow::Result<()> {
-        self.cache
-            .lock()
-            .insert("openai".to_owned(), Arc::clone(&self.provider));
+        self.cache.lock().insert(
+            (self.generation, "openai".to_owned(), MODEL.to_owned()),
+            Arc::clone(&self.provider),
+        );
         self.committed.lock().push(self.generation);
         Ok(())
     }
     fn rollback(&mut self) {
         let mut cache = self.cache.lock();
+        let key = (self.generation, "openai".to_owned(), MODEL.to_owned());
         if let Some(previous) = self.previous.take() {
-            cache.insert("openai".to_owned(), previous);
+            cache.insert(key, previous);
         } else {
-            cache.remove("openai");
+            cache.remove(&key);
         }
         self.committed.lock().retain(|id| *id != self.generation);
     }
@@ -502,17 +508,26 @@ pub(super) async fn run() {
         let cached_provider: Arc<dyn Provider> = Arc::new(CachedProviderProbe {
             calls: Arc::clone(&cached_calls),
         });
-        cache
-            .lock()
-            .insert("openai".to_owned(), Arc::clone(&cached_provider));
         let histories = Arc::new(Mutex::new(HashMap::new()));
         let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
         initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
         assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());
-        let mut initial_ctx = context(&tmp, crate::config::new_shared(initial), memory.clone(), channel.clone(), Arc::clone(&cache), Arc::clone(&histories));
+        let mut initial_ctx = context(
+            &tmp,
+            crate::config::new_shared(initial),
+            memory.clone(),
+            channel.clone(),
+            Arc::clone(&cache),
+            Arc::clone(&histories),
+        );
         let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
-        let config = Arc::clone(&initial_ctx.config); let g0 = config.pin();
+        let config = Arc::clone(&initial_ctx.config);
+        let g0 = config.pin();
+        cache.lock().insert(
+            (g0.id.0, "openai".to_owned(), MODEL.to_owned()),
+            Arc::clone(&cached_provider),
+        );
         let committed = Arc::new(Mutex::new(Vec::new()));
         let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(ReloadParticipant {
             cache: Arc::clone(&cache),
@@ -575,15 +590,25 @@ pub(super) async fn run() {
             let user = users.first().expect("unique generation-owned input");
             assert_eq!(user.config_source_revision.as_deref(), Some(generation.source_revision.fingerprint_sha256.as_str()));
             assert!(user.owner_id.is_some()); assert!(user.run_id.is_some());
-            let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
-            let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
+            let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind, protocol_version, abstention_reason FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
+            let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, u32>(3)?, row.get::<_, Option<String>>(4)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
             assert!(!rows.is_empty() && rows.len() <= 32, "bounded complete per-input decision evidence");
-            assert!(rows.iter().all(|(_, _, backend)| backend == "builtin"));
-            assert!(rows.iter().any(|(candidates, selected, _)| {
+            assert!(
+                rows.iter().all(|(_, _, backend, protocol, abstention)| {
+                    backend == "builtin"
+                        || (backend == "none" && *protocol == 0 && abstention.as_deref() == Some("hop_stopped"))
+                }),
+                "generation {phase} persisted configured-backend decision rows: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|(_, _, backend, _, _)| backend == "builtin"),
+                "generation {phase} omitted its builtin decision row: {rows:?}"
+            );
+            assert!(rows.iter().any(|(candidates, selected, _, _, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")
             }), "plain input must persist a selected direct answer");
-            assert!(rows.iter().all(|(candidates, selected, _)| {
+            assert!(rows.iter().all(|(candidates, selected, _, _, _)| {
                 let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().all(|candidate| Some(candidate.id.as_str()) != selected.as_deref() || candidate.action != "retrieve")
             }), "plain input must not select memory retrieval");

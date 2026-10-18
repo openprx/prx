@@ -12,11 +12,6 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Default model for each provider when no explicit model is given.
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
-const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
-const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-sonnet-4";
-
 /// Detect provider, API key, and model from file-based sources.
 ///
 /// Does NOT read environment variables for API keys.
@@ -141,10 +136,22 @@ fn infer_provider_from_key(key: &str) -> String {
 
 /// Default model for a given provider.
 fn default_model_for_provider(provider: &str) -> String {
-    match provider {
-        "anthropic" | "claude" | "claude-code" => DEFAULT_ANTHROPIC_MODEL.to_string(),
-        "openai" => DEFAULT_OPENAI_MODEL.to_string(),
-        _ => DEFAULT_OPENROUTER_MODEL.to_string(),
+    match crate::providers::catalog::ReleaseCatalog::embedded() {
+        Ok(catalog) => catalog
+            .default_model(provider)
+            .or_else(|| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.id == catalog.defaults.model)
+                    .map(|model| model.api_model.as_str())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::providers::selection::default_model_for_unset().to_string()),
+        Err(error) => {
+            tracing::error!(error = %error, "embedded model catalog is invalid");
+            crate::providers::selection::default_model_for_unset().to_string()
+        }
     }
 }
 
@@ -289,9 +296,10 @@ fn try_config_toml() -> Option<(String, String)> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .unwrap_or("openrouter");
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::providers::default_provider_for_unset().to_string());
 
-    Some((provider.to_string(), api_key.to_string()))
+    Some((provider, api_key.to_string()))
 }
 
 /// Try reading config.toml with secret decryption via SecretStore.
@@ -324,9 +332,10 @@ fn try_config_toml_with_decryption(config_dir: &Path, config_path: &Path) -> Opt
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .unwrap_or("openrouter");
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::providers::default_provider_for_unset().to_string());
 
-    Some((provider.to_string(), decrypted.to_string()))
+    Some((provider, decrypted.to_string()))
 }
 
 /// Try reading Claude Code OAuth credentials from ~/.claude/.credentials.json.
@@ -426,9 +435,9 @@ mod tests {
 
     #[test]
     fn default_models_match_expected() {
-        assert_eq!(default_model_for_provider("anthropic"), DEFAULT_ANTHROPIC_MODEL);
-        assert_eq!(default_model_for_provider("openai"), DEFAULT_OPENAI_MODEL);
-        assert_eq!(default_model_for_provider("openrouter"), DEFAULT_OPENROUTER_MODEL);
+        assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-5");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.6");
+        assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-5");
     }
 
     #[test]
@@ -448,7 +457,7 @@ mod tests {
         let (provider, key, model) = result.expect("test: detect_credentials should succeed");
         assert_eq!(provider, "anthropic");
         assert_eq!(key, "sk-ant-foobar");
-        assert_eq!(model, DEFAULT_ANTHROPIC_MODEL);
+        assert_eq!(model, default_model_for_provider("anthropic"));
     }
 
     /// A credential-shaped sentinel for the Claude Code store. Not a real key.
@@ -624,7 +633,7 @@ mod tests {
         let (provider, key, model) = outcome.expect("test: an alias of the detected provider is the same provider");
         assert_eq!(provider, "claude-code");
         assert_eq!(key, DETECTED_SENTINEL);
-        assert_eq!(model, DEFAULT_ANTHROPIC_MODEL);
+        assert_eq!(model, default_model_for_provider("anthropic"));
     }
 
     /// R-C1 F-2. `--provider` names the provider whose credential is wanted,
@@ -650,7 +659,7 @@ mod tests {
             key, REQUESTED_SENTINEL,
             "the requested provider's own key must be bound"
         );
-        assert_eq!(model, DEFAULT_OPENAI_MODEL);
+        assert_eq!(model, default_model_for_provider("openai"));
 
         // The other provider in the same store still gets its own key.
         let other = detect_in(
@@ -787,6 +796,6 @@ mod tests {
         let (provider, key, model) = outcome.expect("test: a detected credential is used as detected");
         assert_eq!(provider, "anthropic");
         assert_eq!(key, DETECTED_SENTINEL);
-        assert_eq!(model, DEFAULT_ANTHROPIC_MODEL);
+        assert_eq!(model, default_model_for_provider("anthropic"));
     }
 }

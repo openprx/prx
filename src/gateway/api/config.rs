@@ -486,7 +486,7 @@ pub async fn put_config_secret(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": crate::providers::sanitize_api_error(&format!("Config validation failed: {error}"))
+                "error": secret_paths::scrub_message(None, &format!("Config validation failed: {error}"))
             })),
         )
             .into_response();
@@ -1547,7 +1547,13 @@ mod tests {
                 stored.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
             }
         }
-        assert!(stored.contains("schema_version = 1"), "{stored}");
+        assert!(
+            stored.contains(&format!(
+                "schema_version = {}",
+                crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+            )),
+            "{stored}"
+        );
         server.abort();
     }
 

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A single route: maps a task hint to a provider + model combo.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct Route {
     pub provider_name: String,
@@ -28,17 +29,19 @@ pub struct Route {
 /// This wraps multiple pre-created providers and selects the right one per request.
 pub struct RouterProvider {
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
+    refused_routes: HashMap<String, String>,  // hint → construction/refusal reason
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     _default_model: String,
 }
 
 impl RouterProvider {
-    /// Create a new router with a default provider and optional routes.
+    /// Create a test router from name-indexed providers and routes.
     ///
     /// `providers` is a list of (name, provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
-    pub fn new(
+    #[cfg(test)]
+    pub(super) fn from_test_parts(
         providers: Vec<(String, Box<dyn Provider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
@@ -71,6 +74,34 @@ impl RouterProvider {
 
         Self {
             routes: resolved_routes,
+            refused_routes: HashMap::new(),
+            providers,
+            default_index: 0,
+            _default_model: default_model,
+        }
+    }
+
+    /// Build a router whose default and every route already own their exact
+    /// provider chain. Route destinations deliberately receive distinct
+    /// indices even when their provider labels match: two hints may name the
+    /// same vendor with different credentials, model facts or fallback policy.
+    pub(super) fn from_resolved(
+        default: (String, Box<dyn Provider>),
+        routes: Vec<(String, String, String, Box<dyn Provider>)>,
+        refused_routes: Vec<(String, String)>,
+        default_model: String,
+    ) -> Self {
+        let mut providers = Vec::with_capacity(routes.len() + 1);
+        providers.push(default);
+        let mut resolved_routes = HashMap::with_capacity(routes.len());
+        for (hint, provider_name, model, provider) in routes {
+            let index = providers.len();
+            providers.push((provider_name, provider));
+            resolved_routes.insert(hint, (index, model));
+        }
+        Self {
+            routes: resolved_routes,
+            refused_routes: refused_routes.into_iter().collect(),
             providers,
             default_index: 0,
             _default_model: default_model,
@@ -87,6 +118,9 @@ impl RouterProvider {
             validate_user_route_hint(model)?;
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
                 return Ok((*idx, resolved_model.clone()));
+            }
+            if let Some(refusal) = self.refused_routes.get(hint) {
+                anyhow::bail!("{refusal}");
             }
             anyhow::bail!("unknown route hint '{hint}'");
         }
@@ -259,13 +293,13 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
         use futures::StreamExt as _;
-        let Ok((provider_idx, resolved_model)) = self.resolve(model) else {
-            return futures::stream::once(async move {
-                Err(super::traits::StreamError::Provider(
-                    "RouterProvider: invalid route hint".to_string(),
-                ))
-            })
-            .boxed();
+        let (provider_idx, resolved_model) = match self.resolve(model) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let message = error.to_string();
+                return futures::stream::once(async move { Err(super::traits::StreamError::Provider(message)) })
+                    .boxed();
+            }
         };
         let Some((_, provider)) = self.providers.get(provider_idx) else {
             // resolve() always returns a valid idx; defensively return an error chunk instead of panicking.
@@ -854,7 +888,7 @@ mod tests {
             })
             .collect();
 
-        let router = RouterProvider::new(provider_list, route_list, "default-model".to_string());
+        let router = RouterProvider::from_test_parts(provider_list, route_list, "default-model".to_string());
 
         (router, mocks)
     }
@@ -999,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_system_passes_system_prompt() {
         let mock = Arc::new(MockProvider::new("response"));
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
@@ -1016,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_tools_delegates_to_resolved_provider() {
         let mock = Arc::new(MockProvider::new("tool-response"));
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
@@ -1076,7 +1110,7 @@ mod tests {
             seen_messages: Arc::clone(&seen_messages),
             seen_model: Arc::clone(&seen_model),
         };
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![("default".into(), Box::new(provider) as Box<dyn Provider>)],
             vec![(
                 "stream".into(),
@@ -1173,7 +1207,7 @@ mod tests {
             response: "smart-answer",
             seen_model: Arc::clone(&seen_model),
         };
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
@@ -1224,7 +1258,7 @@ mod tests {
     async fn chat_traced_non_hint_uses_default_provider_real_attribution() {
         // A plain (non-hint) model still routes to the default provider but must
         // carry that provider's real label, not the trait-default "default".
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![(
                 "primary".into(),
                 Box::new(TracingInnerMock {
@@ -1252,7 +1286,7 @@ mod tests {
 
     #[test]
     fn supports_native_tools_is_true_if_any_routed_provider_supports_it() {
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
@@ -1272,7 +1306,7 @@ mod tests {
 
     #[test]
     fn mode_capabilities_follow_the_resolved_route_not_any_provider() {
-        let router = RouterProvider::new(
+        let router = RouterProvider::from_test_parts(
             vec![
                 (
                     "default".into(),
