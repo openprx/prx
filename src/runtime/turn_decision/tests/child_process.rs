@@ -355,7 +355,6 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             .with_event_recording(config.memory.event_recording_config());
         let spawn = SessionsSpawnTool::new_with_registry(
             Arc::new(NoAnnouncements),
-            Arc::new(NoTransport),
             "ollama",
             if non_root_route {
                 route_binding::MODEL_HINT
@@ -372,6 +371,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             config.sessions_spawn.clone(),
             Arc::clone(&owned_runs),
         )
+        .with_test_parent_provider(Arc::new(NoTransport))
         .with_hint_config(&config)
         .with_model_catalog(crate::providers::selection::catalog_for(&config))
         .with_shared_memory(Arc::clone(&memory))
@@ -786,7 +786,6 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             }
             let recovery = SessionsSpawnTool::new(
                 Arc::new(NoAnnouncements),
-                Arc::new(NoTransport),
                 "ollama",
                 "prx-local-model",
                 0.0,
@@ -798,6 +797,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
                 crate::providers::ProviderRuntimeOptions::default(),
                 config.sessions_spawn.clone(),
             )
+            .with_test_parent_provider(Arc::new(NoTransport))
             .with_source_fabric(MemoryFabric::new(Arc::clone(&copied_memory), proof.workspace_id()));
             // Exact one-row page: errors cannot be hidden by a different launch.
             let page = recovery.recover_process_page_for_test(launch_event.id - 1, 1).await?;
@@ -937,7 +937,6 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         .with_event_recording(config.memory.event_recording_config());
     let spawn = SessionsSpawnTool::new_with_registry(
         Arc::new(NoAnnouncements),
-        Arc::new(NoTransport),
         "ollama",
         "prx-local-model",
         0.0,
@@ -950,6 +949,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         config.sessions_spawn.clone(),
         Arc::clone(&owned_runs),
     )
+    .with_test_parent_provider(Arc::new(NoTransport))
     .with_hint_config(&config)
     .with_model_catalog(crate::providers::selection::catalog_for(&config))
     .with_shared_memory(Arc::clone(&memory))

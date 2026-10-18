@@ -133,7 +133,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         let config = &generation.effective;
         let spawn = crate::tools::SessionsSpawnTool::new(
             Arc::new(NoOperatorAnnouncements),
-            Arc::clone(&provider),
             "ollama",
             "prx-local-model",
             0.0,
@@ -145,6 +144,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             crate::providers::provider_runtime_options_from_config(config),
             config.sessions_spawn.clone(),
         )
+        .with_test_parent_provider(Arc::clone(&provider))
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(crate::providers::selection::catalog_for(config))
         .with_hint_config(config)

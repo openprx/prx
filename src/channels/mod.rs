@@ -5802,8 +5802,6 @@ pub async fn start_channels_with_config(
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
-            #[cfg(test)]
-            Arc::clone(&provider),
             &provider_name,
             &resolved_default_model(&config),
             temperature,

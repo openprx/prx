@@ -234,7 +234,6 @@ fn worker_spawn_tool(
     manifest: &WorkerManifest,
     config: &Config,
     credentials: &WorkerCredentials<'_>,
-    #[cfg(test)] provider: Arc<dyn Provider>,
     security: Arc<SecurityPolicy>,
     options: &crate::providers::ProviderRuntimeOptions,
     active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>>,
@@ -254,8 +253,6 @@ fn worker_spawn_tool(
         .map_or_else(|| manifest.model.clone(), |hint| format!("hint:{hint}"));
     let tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::new(WorkerChannel),
-        #[cfg(test)]
-        provider,
         spawn_provider_name,
         spawn_model,
         manifest.temperature,
@@ -1849,8 +1846,6 @@ async fn run_owned_manifest(
         &manifest,
         &config,
         &credentials,
-        #[cfg(test)]
-        Arc::clone(&provider),
         Arc::clone(&security),
         &provider_runtime_options,
         Arc::clone(&active_runs),
@@ -3675,7 +3670,6 @@ mod tests {
             &manifest,
             &config,
             &credentials,
-            Arc::clone(&provider),
             security,
             &options,
             Arc::clone(&active_runs),

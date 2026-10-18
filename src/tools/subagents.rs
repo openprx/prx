@@ -626,7 +626,6 @@ mod tests {
     fn join_capable_spawn_tool() -> SessionsSpawnTool {
         SessionsSpawnTool::new(
             Arc::new(SilentChannel),
-            Arc::new(UnusedProvider),
             "test-provider",
             "test-model",
             0.7,
@@ -638,6 +637,7 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         )
+        .with_test_parent_provider(Arc::new(UnusedProvider))
     }
 
     fn kill_grant(run_id: &str) -> serde_json::Value {
