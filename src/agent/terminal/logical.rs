@@ -129,6 +129,7 @@ impl LogicalTaskTerminalRef {
             execution_trace: None,
             assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
             provider_outcome: &None,
+            prepared_parameters: &Vec::new(),
             served_auxiliary: None,
             usage_settlement: &None,
             cost_settlement: &None,

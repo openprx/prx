@@ -59,6 +59,12 @@ facts come from the embedded release catalog. TOML retains operator choices:
 documented boundaries. A configuration rollback therefore restores choices;
 the binary rollback restores the embedded catalog revision.
 
+Model selection also checks whether the adapter can express the release row's
+declared parameters. An unsupported adapter mapping is refused locally. Existing
+Codex reasoning-effort overrides still reach request resolution; recognized
+effort values clamp to the model's declared subset, while unrecognized values
+fail locally. No parameter setting can change a provider's credential owner.
+
 Provider add/update/remove, model declarations, defaults and routes use the
 management change flow. For example, `prx providers add <PROVIDER> --fallback`
 previews adding that provider to the fallback chain; `--yes` applies the plan.

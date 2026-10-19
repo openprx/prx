@@ -11,6 +11,7 @@
 )]
 
 pub(crate) mod admission;
+mod parameters;
 
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::context_budget::{budgeted_tokens, estimate_history_tokens_with_source};

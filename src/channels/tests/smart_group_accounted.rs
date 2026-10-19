@@ -481,6 +481,7 @@ async fn smart_group_heuristic_noise_requires_accounted_classifier_before_silenc
 fn a_skip_without_a_settled_classifier_outcome_fails_open_into_the_loop() {
     let now = chrono::Utc::now();
     let settled = crate::llm::route_decision::ProviderExecutionOutcome {
+        prepared_parameters: Vec::new(),
         decision_id: "prx_smart_fixture".to_owned(),
         started_at: now,
         finished_at: now,

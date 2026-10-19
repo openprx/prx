@@ -545,38 +545,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Returns `true` when this provider is a Kimi/Moonshot endpoint.
-    ///
-    /// Kimi's coding API (`api.kimi.com`) only accepts `temperature == 1`; any
-    /// other value causes a 400 "invalid temperature: only 1 is allowed" error.
-    /// Detection is based on the configured `base_url` so it is stable across
-    /// provider name variants (`kimi-code`, `kimi_coding`, `kimi_for_coding`).
-    fn is_kimi_provider(&self) -> bool {
-        self.base_url.to_ascii_lowercase().contains("kimi.com")
-    }
-
-    /// Clamp `temperature` to the value the provider actually accepts.
-    ///
-    /// Kimi Code (`api.kimi.com`) rejects any `temperature` other than `1.0`
-    /// with HTTP 400 "invalid temperature: only 1 is allowed". This helper
-    /// overrides the caller-supplied value for Kimi endpoints and logs a
-    /// one-shot `debug` message so the override is observable without being
-    /// noisy in normal runs.
-    fn effective_temperature(&self, requested: f64) -> f64 {
-        if self.is_kimi_provider() {
-            if (requested - 1.0_f64).abs() > f64::EPSILON {
-                tracing::debug!(
-                    provider = %self.name,
-                    requested_temperature = requested,
-                    "Kimi API only accepts temperature=1; overriding requested value"
-                );
-            }
-            1.0_f64
-        } else {
-            requested
-        }
-    }
-
     #[cfg(test)]
     fn tool_specs_to_openai_format(tools: &[crate::tools::ToolSpec]) -> Vec<serde_json::Value> {
         tools
@@ -1545,7 +1513,7 @@ pub(crate) fn spawn_until_closed<F>(tx: tokio::sync::mpsc::Sender<StreamResult<S
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    super::parameter_capture::spawn(async move {
         tokio::select! {
             () = tx.closed() => {}
             () = task => {}
@@ -1749,7 +1717,12 @@ impl OpenAiCompatibleProvider {
             model,
             &url,
             credential,
-            &request,
+            &super::parameter_wire::request(
+                self.configured_label.as_deref().unwrap_or(&self.name),
+                super::parameter_wire::Format::Responses,
+                &request.model,
+                &request,
+            ),
             super::attempt_accounting::PhysicalKind::Chat,
         )
         .await?;
@@ -2041,7 +2014,7 @@ impl OpenAiCompatibleProvider {
         Ok(NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages),
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(options.enabled),
             tools,
             tool_choice,
@@ -2072,7 +2045,7 @@ impl OpenAiCompatibleProvider {
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: native_messages,
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
@@ -2085,7 +2058,12 @@ impl OpenAiCompatibleProvider {
             model,
             &url,
             credential,
-            &native_request,
+            &super::parameter_wire::request(
+                self.configured_label.as_deref().unwrap_or(&self.name),
+                super::parameter_wire::Format::Compatible,
+                &native_request.model,
+                &native_request,
+            ),
             super::attempt_accounting::PhysicalKind::Chat,
         )
         .await
@@ -2315,7 +2293,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -2336,7 +2314,15 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&super::parameter_wire::request(
+                    self.configured_label.as_deref().unwrap_or(&self.name),
+                    super::parameter_wire::Format::Compatible,
+                    &request.model,
+                    &request,
+                )),
+                credential,
+            )
             .send()
             .await
         {
@@ -2410,7 +2396,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -2423,7 +2409,12 @@ impl Provider for OpenAiCompatibleProvider {
             model,
             &url,
             credential,
-            &request,
+            &super::parameter_wire::request(
+                self.configured_label.as_deref().unwrap_or(&self.name),
+                super::parameter_wire::Format::Compatible,
+                &request.model,
+                &request,
+            ),
             super::attempt_accounting::PhysicalKind::Chat,
         )
         .await
@@ -2499,7 +2490,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(false),
             tools: if tools.is_empty() { None } else { Some(tools.to_vec()) },
             tool_choice: if tools.is_empty() {
@@ -2512,7 +2503,15 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&super::parameter_wire::request(
+                    self.configured_label.as_deref().unwrap_or(&self.name),
+                    super::parameter_wire::Format::Compatible,
+                    &request.model,
+                    &request,
+                )),
+                credential,
+            )
             .send()
             .await
         {
@@ -2649,7 +2648,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
-            temperature: self.effective_temperature(temperature),
+            temperature,
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -2664,13 +2663,19 @@ impl Provider for OpenAiCompatibleProvider {
         let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let provider_name = self.name.clone();
+        let parameter_provider = self.configured_label.clone().unwrap_or_else(|| self.name.clone());
 
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = client.post(&url).json(&super::parameter_wire::request(
+                &parameter_provider,
+                super::parameter_wire::Format::Compatible,
+                &request.model,
+                &request,
+            ));
 
             // Apply auth header
             req_builder = Self::apply_auth_header_with_style(req_builder, &auth_header, credential.as_deref());
@@ -2699,7 +2704,12 @@ impl Provider for OpenAiCompatibleProvider {
                 );
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
-                let mut fallback_builder = client.post(&url).json(&fallback_request);
+                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::request(
+                    &parameter_provider,
+                    super::parameter_wire::Format::Compatible,
+                    &fallback_request.model,
+                    &fallback_request,
+                ));
                 fallback_builder =
                     Self::apply_auth_header_with_style(fallback_builder, &auth_header, credential.as_deref());
                 fallback_builder = fallback_builder.header("Accept", "text/event-stream");
@@ -2756,6 +2766,7 @@ impl Provider for OpenAiCompatibleProvider {
         let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let provider_name = self.name.clone();
+        let parameter_provider = self.configured_label.clone().unwrap_or_else(|| self.name.clone());
         // Only a request that offered tools can be rejected for their schema.
         let declaration_hint = request
             .tools
@@ -2766,7 +2777,12 @@ impl Provider for OpenAiCompatibleProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = client.post(&url).json(&super::parameter_wire::request(
+                &parameter_provider,
+                super::parameter_wire::Format::Compatible,
+                &request.model,
+                &request,
+            ));
             req_builder = Self::apply_auth_header_with_style(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -2790,7 +2806,12 @@ impl Provider for OpenAiCompatibleProvider {
                 );
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
-                let mut fallback_builder = client.post(&url).json(&fallback_request);
+                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::request(
+                    &parameter_provider,
+                    super::parameter_wire::Format::Compatible,
+                    &fallback_request.model,
+                    &fallback_request,
+                ));
                 fallback_builder =
                     Self::apply_auth_header_with_style(fallback_builder, &auth_header, credential.as_deref());
                 fallback_builder = fallback_builder.header("Accept", "text/event-stream");
@@ -2843,6 +2864,10 @@ impl Provider for OpenAiCompatibleProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "compatible/parameter_tests.rs"]
+mod parameter_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3879,11 +3904,17 @@ mod tests {
         let request = provider
             .build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true))
             .expect("test: streaming request builds");
-        let value = serde_json::to_value(&request).unwrap();
+        let value = serde_json::to_value(super::super::parameter_wire::request(
+            "kimi-code",
+            super::super::parameter_wire::Format::Compatible,
+            &request.model,
+            &request,
+        ))
+        .unwrap();
         let serialized_messages = value["messages"].as_array().unwrap();
 
         assert_eq!(value["model"], "kimi-k2");
-        // Kimi API only accepts temperature=1; the effective_temperature() override
+        // Kimi API only accepts temperature=1; the catalog parameter declaration
         // must clamp the caller-supplied 0.3 to 1.0 before serializing.
         assert_eq!(value["temperature"], 1.0);
         assert_eq!(value["stream"], true);
@@ -4702,58 +4733,6 @@ mod tests {
         assert_eq!(emitted2[0].id, "call_x");
         assert_eq!(emitted2[0].status, ToolCallChunkStatus::Streaming);
         assert_eq!(emitted2[0].arguments_delta.as_deref(), Some(""));
-    }
-
-    // ---------------------------------------------------------------
-    // is_kimi_provider / effective_temperature
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn kimi_code_base_url_detected_as_kimi_provider() {
-        let p = OpenAiCompatibleProvider::new_with_user_agent(
-            "Kimi Code",
-            "https://api.kimi.com/coding/v1",
-            Some("fake-key"),
-            AuthStyle::Bearer,
-            "KimiCLI/0.77",
-        );
-        assert!(
-            p.is_kimi_provider(),
-            "api.kimi.com base URL must be detected as Kimi provider"
-        );
-    }
-
-    #[test]
-    fn non_kimi_provider_not_detected_as_kimi() {
-        let p = make_provider("Venice", "https://api.venice.ai", Some("key"));
-        assert!(!p.is_kimi_provider());
-        let p2 = make_provider("OpenAI", "https://api.openai.com", Some("key"));
-        assert!(!p2.is_kimi_provider());
-    }
-
-    #[test]
-    fn effective_temperature_kimi_always_returns_one() {
-        let p = OpenAiCompatibleProvider::new_with_user_agent(
-            "Kimi Code",
-            "https://api.kimi.com/coding/v1",
-            Some("fake-key"),
-            AuthStyle::Bearer,
-            "KimiCLI/0.77",
-        );
-        // Default prx temperature (0.7) must be overridden to 1.0.
-        assert!((p.effective_temperature(0.7) - 1.0_f64).abs() < f64::EPSILON);
-        // Explicitly set 0.0 must also be overridden.
-        assert!((p.effective_temperature(0.0) - 1.0_f64).abs() < f64::EPSILON);
-        // Already-1.0 passes through unchanged.
-        assert!((p.effective_temperature(1.0) - 1.0_f64).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn effective_temperature_non_kimi_passes_through() {
-        let p = make_provider("Venice", "https://api.venice.ai", Some("key"));
-        assert!((p.effective_temperature(0.7) - 0.7_f64).abs() < f64::EPSILON);
-        assert!((p.effective_temperature(0.0) - 0.0_f64).abs() < f64::EPSILON);
-        assert!((p.effective_temperature(2.0) - 2.0_f64).abs() < f64::EPSILON);
     }
 
     /// STREAM-f: loopback stub answering `/chat/completions` with `body` as SSE.

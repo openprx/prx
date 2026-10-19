@@ -429,7 +429,7 @@ impl GeminiProvider {
         request: &GenerateContentRequest,
         model: &str,
     ) -> reqwest::RequestBuilder {
-        let req = self.http_client().post(url).json(request);
+        let parameter_model = model.strip_prefix("models/").unwrap_or(model);
         match auth {
             GeminiAuth::OAuthToken(token) => {
                 // cloudcode-pa expects an outer envelope with `request`.
@@ -444,9 +444,22 @@ impl GeminiProvider {
                         tools: request.tools.clone(),
                     },
                 };
-                self.http_client().post(url).json(&internal_request).bearer_auth(token)
+                self.http_client()
+                    .post(url)
+                    .json(&super::parameter_wire::request(
+                        "gemini",
+                        super::parameter_wire::Format::Gemini,
+                        parameter_model,
+                        &internal_request,
+                    ))
+                    .bearer_auth(token)
             }
-            _ => req,
+            _ => self.http_client().post(url).json(&super::parameter_wire::request(
+                "gemini",
+                super::parameter_wire::Format::Gemini,
+                parameter_model,
+                request,
+            )),
         }
     }
 }
@@ -1136,7 +1149,7 @@ impl Provider for GeminiProvider {
 
         let url = Self::build_stream_url(model, auth);
         let client = self.http_client();
-        let model_owned = model.to_string();
+        let model_owned = Self::format_internal_model_name(model);
         let auth_kind = match auth {
             GeminiAuth::OAuthToken(token) => OwnedGeminiAuth::OAuthToken(token.clone()),
             // The explicit API key is already embedded in `url` as the
@@ -1149,7 +1162,7 @@ impl Provider for GeminiProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
 
-        tokio::spawn(async move {
+        super::parameter_capture::spawn(async move {
             let request_builder = match &auth_kind {
                 OwnedGeminiAuth::OAuthToken(token) => {
                     let envelope = InternalGenerateContentEnvelope {
@@ -1166,13 +1179,25 @@ impl Provider for GeminiProvider {
                     client
                         .post(&url)
                         .header("accept", "text/event-stream")
-                        .json(&envelope)
+                        .json(&super::parameter_wire::request(
+                            "gemini",
+                            super::parameter_wire::Format::Gemini,
+                            &model_owned,
+                            &envelope,
+                        ))
                         .bearer_auth(token)
                 }
-                OwnedGeminiAuth::ExplicitKey => client
-                    .post(&url)
-                    .header("accept", "text/event-stream")
-                    .json(&request_body),
+                OwnedGeminiAuth::ExplicitKey => {
+                    client
+                        .post(&url)
+                        .header("accept", "text/event-stream")
+                        .json(&super::parameter_wire::request(
+                            "gemini",
+                            super::parameter_wire::Format::Gemini,
+                            &model_owned,
+                            &request_body,
+                        ))
+                }
             };
 
             let response = match request_builder.send().await {
@@ -1659,6 +1684,50 @@ mod tests {
         assert!(json.get("generationConfig").is_none());
         assert!(json.get("request").is_some());
         assert!(json["request"].get("generationConfig").is_some());
+    }
+
+    #[tokio::test]
+    async fn oauth_preparation_records_only_the_serialized_envelope() {
+        let auth = GeminiAuth::OAuthToken("prx-test-credential".into());
+        let provider = GeminiProvider { auth: None };
+        let body = GenerateContentRequest {
+            contents: Vec::new(),
+            system_instruction: None,
+            generation_config: GenerationConfig {
+                temperature: 3.0,
+                max_output_tokens: 8192,
+            },
+            tools: None,
+        };
+        for selected in ["gemini-2.0-flash", "models/gemini-2.0-flash"] {
+            let capture = super::super::parameter_capture::Capture::new(true);
+            let request = capture
+                .scope(async {
+                    provider
+                        .build_generate_content_request(&auth, "http://localhost", &body, selected)
+                        .build()
+                        .unwrap()
+                })
+                .await;
+            let payload: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert!(payload.get("generationConfig").is_none());
+            assert_eq!(
+                payload.pointer("/request/generationConfig/temperature"),
+                Some(&serde_json::json!(2.0))
+            );
+            let records = capture.take();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records.first().unwrap().model, "gemini/gemini-2.0-flash");
+            assert_eq!(
+                records
+                    .first()
+                    .unwrap()
+                    .values
+                    .get(&super::super::catalog::ModelParameter::Temperature),
+                payload.pointer("/request/generationConfig/temperature")
+            );
+        }
     }
 
     #[test]

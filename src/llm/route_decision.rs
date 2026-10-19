@@ -86,6 +86,10 @@ pub struct RouteConstraints {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderExecutionOutcome {
+    /// Final resolved values from request preparation; these are not proof of
+    /// transport or usage. Existing attempt and cost records retain that role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_parameters: Vec<crate::providers::catalog::parameters::ResolvedParameters>,
     pub decision_id: String,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
@@ -843,6 +847,14 @@ fn push_unique_candidate(candidates: &mut Vec<RouteCandidate>, candidate: RouteC
 
 impl ProviderExecutionOutcome {
     #[must_use]
+    pub fn with_prepared_parameters(
+        mut self,
+        parameters: Vec<crate::providers::catalog::parameters::ResolvedParameters>,
+    ) -> Self {
+        self.prepared_parameters = parameters;
+        self
+    }
+    #[must_use]
     pub fn success_for_decision(decision: &RouteDecision, started_at: DateTime<Utc>) -> Self {
         Self::success_for_decision_with_usage(decision, started_at, TokenUsage::default())
     }
@@ -855,6 +867,7 @@ impl ProviderExecutionOutcome {
     ) -> Self {
         let finished_at = Utc::now();
         Self {
+            prepared_parameters: Vec::new(),
             decision_id: decision.decision_id.clone(),
             started_at,
             finished_at,
@@ -971,6 +984,7 @@ impl ProviderExecutionOutcome {
         };
 
         Self {
+            prepared_parameters: Vec::new(),
             decision_id: decision.decision_id.clone(),
             started_at,
             finished_at,
@@ -1004,6 +1018,7 @@ impl ProviderExecutionOutcome {
         let finished_at = Utc::now();
         let error_class = classify_provider_error(error);
         Self {
+            prepared_parameters: Vec::new(),
             decision_id: decision.decision_id.clone(),
             started_at,
             finished_at,

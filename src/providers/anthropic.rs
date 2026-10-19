@@ -29,6 +29,7 @@ struct OAuthState {
 pub struct AnthropicProvider {
     oauth: Mutex<OAuthState>,
     base_url: String,
+    parameter_provider: super::ProviderId,
 }
 
 #[derive(Debug, Serialize)]
@@ -260,6 +261,7 @@ impl AnthropicProvider {
                 expires_at: None,
             }),
             base_url,
+            parameter_provider: super::ProviderId::of("anthropic"),
         }
     }
 
@@ -274,7 +276,13 @@ impl AnthropicProvider {
                 expires_at,
             }),
             base_url: "https://api.anthropic.com".to_string(),
+            parameter_provider: super::ProviderId::of("anthropic"),
         }
+    }
+
+    pub(crate) fn with_parameter_provider(mut self, provider: &str) -> Self {
+        self.parameter_provider = super::ProviderId::of(provider);
+        self
     }
 
     /// 90-second buffer before expiry to proactively refresh.
@@ -768,7 +776,12 @@ impl AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&native_request);
+            .json(&super::parameter_wire::request(
+                self.parameter_provider.as_str(),
+                super::parameter_wire::Format::Anthropic,
+                &native_request.model,
+                &native_request,
+            ));
 
         let response = self.apply_auth(req, &credential).send().await?;
 
@@ -779,7 +792,12 @@ impl AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&native_request);
+                    .json(&super::parameter_wire::request(
+                        self.parameter_provider.as_str(),
+                        super::parameter_wire::Format::Anthropic,
+                        &native_request.model,
+                        &native_request,
+                    ));
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
                     return Err(super::api_error("Anthropic", retry_response).await);
@@ -1299,7 +1317,12 @@ impl Provider for AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body);
+            .json(&super::parameter_wire::request(
+                self.parameter_provider.as_str(),
+                super::parameter_wire::Format::Anthropic,
+                &body.model,
+                &body,
+            ));
 
         let response = self.apply_auth(req, &credential).send().await?;
 
@@ -1311,7 +1334,12 @@ impl Provider for AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&body);
+                    .json(&super::parameter_wire::request(
+                        self.parameter_provider.as_str(),
+                        super::parameter_wire::Format::Anthropic,
+                        &body.model,
+                        &body,
+                    ));
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
                     return Err(super::api_error("Anthropic", retry_response).await);
@@ -1484,6 +1512,7 @@ impl Provider for AnthropicProvider {
 
         let url = format!("{}/v1/messages", self.base_url);
         let client = self.streaming_http_client();
+        let parameter_provider = self.parameter_provider.clone();
         let use_bearer = Self::is_setup_token(&credential);
 
         let request_body = StreamingChatRequest {
@@ -1504,7 +1533,12 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .json(&request_body);
+                .json(&super::parameter_wire::request(
+                    parameter_provider.as_str(),
+                    super::parameter_wire::Format::Anthropic,
+                    &request_body.model,
+                    &request_body,
+                ));
             req = if use_bearer {
                 req.header("Authorization", format!("Bearer {credential}"))
                     .header("anthropic-beta", "oauth-2025-04-20")

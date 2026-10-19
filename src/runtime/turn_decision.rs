@@ -22,6 +22,7 @@ mod accounting;
 mod auxiliary;
 mod build_error;
 mod issued;
+mod request_parameters;
 mod store_preparation;
 
 pub(crate) use build_error::TurnServiceBuildError;
@@ -650,6 +651,7 @@ pub(crate) struct TurnDecisionContext {
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
     recursive_allowance: std::sync::OnceLock<Arc<recursive_allowance::RecursiveAllowance>>,
+    main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     #[cfg(feature = "llm-router")]
     automix_deadline: std::sync::OnceLock<std::time::Instant>,
@@ -2505,6 +2507,7 @@ impl TurnDecisionService {
                 service_id: self.service_id,
                 record_admitted: AtomicBool::new(false),
                 recursive_allowance: self.recursive_allowances.retain(proof),
+                main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -2560,6 +2563,7 @@ impl TurnDecisionService {
                         service_id: self.service_id,
                         record_admitted: AtomicBool::new(false),
                         recursive_allowance: self.recursive_allowances.retain(proof),
+                        main_parameters: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
                         #[cfg(feature = "llm-router")]
                         automix_deadline: std::sync::OnceLock::new(),
@@ -2821,6 +2825,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2864,6 +2869,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2908,6 +2914,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -5119,6 +5126,7 @@ mod tests {
             service_id: uuid::Uuid::nil(),
             record_admitted: AtomicBool::new(false),
             recursive_allowance: Default::default(),
+            main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             #[cfg(feature = "llm-router")]
             automix_deadline: std::sync::OnceLock::new(),
@@ -6409,6 +6417,7 @@ mod tests {
                 service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
                 recursive_allowance: Default::default(),
+                main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -8356,6 +8365,7 @@ mod tests {
         );
         let priced_outcome =
             |decision_id: DecisionId, prompt_tokens: u32| crate::llm::route_decision::ProviderExecutionOutcome {
+                prepared_parameters: Vec::new(),
                 decision_id: decision_id.to_string(),
                 started_at: now,
                 finished_at: now,
@@ -8820,6 +8830,7 @@ mod tests {
             Some(crate::causal_tree::branch::CausalActionKind::Answer) => (
                 "success",
                 Some(crate::llm::route_decision::ProviderExecutionOutcome {
+                    prepared_parameters: Vec::new(),
                     decision_id: completed_context.decision_id().to_string(),
                     started_at: now,
                     finished_at: now,

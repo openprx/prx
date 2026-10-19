@@ -39,6 +39,11 @@ impl PhysicalRequest<'_> {
 #[async_trait]
 pub(crate) trait AttemptAccounting: sealed::AccountingOwner + Send + Sync {
     fn deadline(&self) -> Instant;
+    /// Owners with a durable provider outcome retain their own preparation
+    /// provenance. Metering-only owners do not create an outcome recorder.
+    fn parameter_capture(&self) -> Option<super::parameter_capture::Capture> {
+        None
+    }
     async fn begin(&self, request: PhysicalRequest<'_>) -> anyhow::Result<Box<dyn AttemptReceipt>>;
 }
 #[async_trait]
@@ -72,9 +77,15 @@ pub(crate) async fn chat_traced(
         return Err(AccountingRefusal.into());
     }
     let deadline = tokio::time::Instant::from_std(accounting.deadline());
+    let capture = accounting
+        .parameter_capture()
+        .unwrap_or_else(|| super::parameter_capture::Capture::new(false));
     tokio::time::timeout_at(
         deadline,
-        ACCOUNTING.scope(accounting, provider.chat_traced(request, model, temperature)),
+        ACCOUNTING.scope(
+            accounting,
+            capture.scope(provider.chat_traced(request, model, temperature)),
+        ),
     )
     .await
     .map_err(|_| AccountingRefusal)?

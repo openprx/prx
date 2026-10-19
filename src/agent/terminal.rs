@@ -356,7 +356,8 @@ pub(crate) fn provider_outcome_from_trace(
     started_at: chrono::DateTime<chrono::Utc>,
     trace: crate::agent::turn_contracts::ToolLoopTrace,
 ) -> ProviderExecutionOutcome {
-    if trace.final_model.is_some() && !trace.attempts.is_empty() {
+    let parameters = trace.prepared_parameters;
+    let outcome = if trace.final_model.is_some() && !trace.attempts.is_empty() {
         let final_provider = trace
             .final_provider
             .unwrap_or_else(|| decision.selected.provider.clone());
@@ -373,7 +374,8 @@ pub(crate) fn provider_outcome_from_trace(
         )
     } else {
         ProviderExecutionOutcome::success_for_decision_with_usage(decision, started_at, trace.tokens_used)
-    }
+    };
+    outcome.with_prepared_parameters(parameters)
 }
 
 #[must_use]
@@ -408,6 +410,8 @@ struct TurnTerminalPayload<'a> {
     execution_trace: Option<&'a crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     assistant_event_id: Option<&'a str>,
     provider_outcome: &'a Option<ProviderExecutionOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prepared_parameters: &'a Vec<crate::providers::catalog::parameters::ResolvedParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     served_auxiliary: Option<&'a served_auxiliary::ServedAuxiliaryProjection>,
     usage_settlement: &'a Option<MeteredTokenUsageRecord>,
@@ -633,6 +637,7 @@ async fn finalize_turn_impl(
     stop_after_marker: bool,
 ) -> anyhow::Result<TurnTerminalReceipt> {
     boxed_terminal_work(move || async move {
+        let mut commit = commit;
         // Held for the whole finalization: every exit releases the run's pins.
         let _skill_pins = SkillPinGuard::new(&commit.scope);
         anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
@@ -646,6 +651,12 @@ async fn finalize_turn_impl(
             workspace_dir,
             cost_config,
         )?;
+        let prepared_parameters = commit.decision.context.prepared_main_parameters();
+        if !prepared_parameters.is_empty()
+            && let Some(outcome) = commit.provider_outcome.as_mut()
+        {
+            outcome.prepared_parameters.clone_from(&prepared_parameters);
+        }
         commit
             .decision
             .context
@@ -761,6 +772,15 @@ async fn finalize_turn_impl(
             }));
             let semantic = {
                 let mut semantic = semantic;
+                if !prepared_parameters.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .context("terminal claim is not an object")?
+                        .insert(
+                            "prepared_parameters".to_owned(),
+                            redact_persisted_json(serde_json::to_value(&prepared_parameters)?),
+                        );
+                }
                 if let Some(event) = decision
                     .context
                     .served_auxiliary()
@@ -836,7 +856,6 @@ async fn finalize_turn_impl(
         // userinfo, and secrets in the reply and in every outcome string (provider
         // errors included) are replaced by the one redactor, which never
         // truncates (D-054).
-        let mut commit = commit;
         if let Some(outcome) = commit.provider_outcome.as_mut() {
             outcome.redact_provider_labels();
             *outcome = crate::security::redaction::redact_json_structure(&*outcome)?;
@@ -922,6 +941,7 @@ async fn finalize_turn_impl(
             execution_trace: execution_trace.as_ref(),
             assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
             provider_outcome: &commit.provider_outcome,
+            prepared_parameters: &prepared_parameters,
             served_auxiliary: commit
                 .decision
                 .context

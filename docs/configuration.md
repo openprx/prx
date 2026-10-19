@@ -5,6 +5,12 @@ OpenPRX uses `~/.openprx/config.toml` as the main configuration file.
 For decision admission, backend gates, inspection and rollback, see the
 [decision plane reference](decision-plane.md).
 
+The embedded [model catalog](model-catalog.md) owns declared request parameter
+defaults and model levels. The existing Codex reasoning override remains an
+explicit caller value; the resolver applies the selected model's constraints.
+Kimi Code's temperature constraint follows its selected model, without inferring
+model support from the endpoint URL. These changes do not write configuration.
+
 ## Quick Setup
 
 ```bash

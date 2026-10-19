@@ -642,10 +642,10 @@ async fn run_work(
                         false,
                         false,
                     );
-                    let call = AuxiliaryProviderCall::new_for(
+                    let call = AuxiliaryProviderCall::new_accounted(
                         AuxiliaryPurpose::AutomixPremium,
                         premium_route,
-                        scope.scope_id(),
+                        scope.as_ref(),
                     );
                     guard.register_auxiliary_call(Arc::clone(&call))?;
                     let mut messages = agent.tool_dispatcher.to_provider_messages(&agent.history);

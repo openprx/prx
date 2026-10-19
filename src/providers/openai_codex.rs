@@ -64,12 +64,14 @@ struct ResponsesInputContent {
 
 #[derive(Debug, Serialize)]
 struct ResponsesTextOptions {
-    verbosity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbosity: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsesReasoningOptions {
-    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
     summary: String,
 }
 
@@ -195,42 +197,6 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
     };
 
     (instructions, input)
-}
-
-fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
-    let id = normalize_model_id(model);
-    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
-        return "low".to_string();
-    }
-    if id == "gpt-5.1" && effort == "xhigh" {
-        return "high".to_string();
-    }
-    if id == "gpt-5.1-codex-mini" {
-        return if effort == "high" || effort == "xhigh" {
-            "high".to_string()
-        } else {
-            "medium".to_string()
-        };
-    }
-    effort.to_string()
-}
-
-const VALID_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
-
-fn resolve_reasoning_effort(model_id: &str, config_effort: Option<&str>) -> String {
-    let base = match config_effort {
-        None => "xhigh",
-        Some(effort) if VALID_REASONING_EFFORTS.contains(&effort) => effort,
-        Some(invalid) => {
-            tracing::warn!(
-                value = invalid,
-                valid = ?VALID_REASONING_EFFORTS,
-                "invalid reasoning_effort config value, falling back to default"
-            );
-            "xhigh"
-        }
-    };
-    clamp_reasoning_effort(model_id, base)
 }
 
 fn nonempty_preserve(text: Option<&str>) -> Option<String> {
@@ -748,7 +714,7 @@ fn responses_stream_to_chunks(
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    tokio::spawn(async move {
+    super::parameter_capture::spawn(async move {
         let normalized_content_type = normalize_content_type(
             response
                 .headers()
@@ -973,11 +939,9 @@ impl OpenAiCodexProvider {
             instructions,
             store: false,
             stream: true,
-            text: ResponsesTextOptions {
-                verbosity: "medium".to_string(),
-            },
+            text: ResponsesTextOptions { verbosity: None },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model, self.reasoning_effort_override.as_deref()),
+                effort: self.reasoning_effort_override.clone(),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -996,7 +960,12 @@ impl OpenAiCodexProvider {
             .header("accept", "text/event-stream")
             .header("accept-encoding", "identity")
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(&super::parameter_wire::request(
+                "openai-codex",
+                super::parameter_wire::Format::Responses,
+                &request.model,
+                &request,
+            ))
             .send()
             .await?;
 
@@ -1037,7 +1006,7 @@ impl OpenAiCodexProvider {
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-        tokio::spawn(async move {
+        super::parameter_capture::spawn(async move {
             let access_token = match auth
                 .get_valid_openai_access_token(auth_profile_override.as_deref())
                 .await
@@ -1086,11 +1055,9 @@ impl OpenAiCodexProvider {
                 instructions,
                 store: false,
                 stream: true,
-                text: ResponsesTextOptions {
-                    verbosity: "medium".to_string(),
-                },
+                text: ResponsesTextOptions { verbosity: None },
                 reasoning: ResponsesReasoningOptions {
-                    effort: resolve_reasoning_effort(normalized_model, reasoning_effort_override.as_deref()),
+                    effort: reasoning_effort_override.clone(),
                     summary: "auto".to_string(),
                 },
                 include: vec!["reasoning.encrypted_content".to_string()],
@@ -1108,7 +1075,12 @@ impl OpenAiCodexProvider {
                 .header("accept", "text/event-stream")
                 .header("accept-encoding", "identity")
                 .header("Content-Type", "application/json")
-                .json(&request)
+                .json(&super::parameter_wire::request(
+                    "openai-codex",
+                    super::parameter_wire::Format::Responses,
+                    &request.model,
+                    &request,
+                ))
                 .send()
                 .await
             {
@@ -1359,6 +1331,20 @@ mod tests {
 
     #[test]
     fn clamp_reasoning_effort_adjusts_known_models() {
+        fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
+            let body = serde_json::json!({"reasoning":{"effort":effort}});
+            let request = super::super::parameter_wire::request(
+                "openai-codex",
+                super::super::parameter_wire::Format::Responses,
+                model,
+                &body,
+            );
+            serde_json::to_value(request).expect("test: resolved request")["reasoning"]["effort"]
+                .as_str()
+                .expect("test: effort")
+                .to_owned()
+        }
+
         assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "minimal"), "low".to_string());
         assert_eq!(clamp_reasoning_effort("gpt-5.1", "xhigh"), "high".to_string());
         assert_eq!(
@@ -1370,6 +1356,18 @@ mod tests {
             "high".to_string()
         );
         assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "xhigh"), "xhigh".to_string());
+        assert_eq!(
+            clamp_reasoning_effort("prx-unknown-model", "minimal"),
+            "minimal".to_string()
+        );
+        let body = serde_json::json!({"reasoning":{"effort":"xhigh"}});
+        let request = super::super::parameter_wire::request(
+            "custom:https://example.com",
+            super::super::parameter_wire::Format::Responses,
+            "gpt-5.1",
+            &body,
+        );
+        assert_eq!(serde_json::to_value(request).unwrap()["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

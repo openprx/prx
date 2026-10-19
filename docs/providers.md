@@ -10,6 +10,12 @@ defaults, listings, and model evidence. `prx doctor models` (read-only) or
 `prx models refresh --provider <id>` (cache-updating) adds current provider
 discovery evidence when the provider exposes a model-list API.
 
+Declared request parameters are resolved from the embedded catalog before
+adapter serialization. Codex effort constraints and Kimi Code's fixed
+temperature follow the selected provider/model, including streaming requests;
+a matching endpoint URL supplies no model facts. See the
+[parameter resolution contract](model-catalog.md#format-and-validation).
+
 ## Embedded release catalog baseline (2026-07-18)
 
 | PRX provider | Curated default / current IDs | Endpoint and authoritative source | Live discovery |

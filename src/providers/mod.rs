@@ -31,6 +31,8 @@ pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub(crate) mod parameter_capture;
+pub(crate) mod parameter_wire;
 pub mod rate_limit;
 pub mod reliable;
 pub mod router;
@@ -2708,10 +2710,9 @@ fn create_provider_with_url_and_options(
                     // nothing about, so it is the one that needs a declaration.
                     .with_declared_tool_dialects(name, options),
             )),
-            ByoDialect::AnthropicCompatible => Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            ))),
+            ByoDialect::AnthropicCompatible => Ok(Box::new(
+                anthropic::AnthropicProvider::with_base_url(key, Some(&base_url)).with_parameter_provider(name),
+            )),
         };
     }
 
@@ -2800,13 +2801,16 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
-            "Kimi Code",
-            "https://api.kimi.com/coding/v1",
-            key,
-            AuthStyle::Bearer,
-            "KimiCLI/0.77",
-        ))),
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent(
+                "Kimi Code",
+                "https://api.kimi.com/coding/v1",
+                key,
+                AuthStyle::Bearer,
+                "KimiCLI/0.77",
+            )
+            .with_declared_tool_dialects(name, options),
+        )),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.com",

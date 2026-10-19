@@ -47,6 +47,18 @@ for integration, validation and rollback limits.
   that estimate. The window contains at most one reported pending settlement
   per scope and has no fixed storage-latency bound. See
   [the accounting contract](docs/decision-plane.md#admission-and-backend-selection).
+- Provider request serializers now resolve declared catalog parameters through
+  a closed vocabulary, including streaming, Gemini OAuth and signed Bedrock
+  bodies. Release data replaces the Kimi URL temperature heuristic and Codex
+  model-ID effort clamps; unsupported values are dropped, numeric bounds and
+  recognized effort values are clamped, and invalid typed values fail locally.
+  Unverified models use the adapter base request. Known catalog rows omit
+  undeclared canonical fields, including legacy overrides and adapter defaults;
+  an empty parameter declaration uses provider defaults. Catalog changes roll back
+  with the binary; operator TOML and credential ownership are unchanged.
+  Prepared values and revision stay in the existing main and auxiliary outcome
+  records, including failed auxiliary calls, without a separate event write.
+  Auxiliary owners keep their own capture rather than borrowing an outer turn.
 
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.

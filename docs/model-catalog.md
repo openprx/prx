@@ -31,6 +31,79 @@ Every chat model defines all three common model levels, even when a level does
 not change any parameters yet. A level is a bundle of typed parameter values;
 it is distinct from a provider's `reasoning_effort` value.
 
+Request parameter declarations use the closed vocabulary `temperature`,
+`top_p`, `max_output_tokens`, `reasoning_effort`, `thinking_budget`, `verbosity`,
+`service_tier`, and `seed`. Resolution starts with parameter defaults and the
+model's default level, then applies increasingly specific model, route and
+caller layers. A layer's explicit values follow its level. A later value removes
+mutually exclusive earlier values, including exclusions declared in the reverse
+direction. Unsupported or undeclared overrides are dropped; numeric values are
+clamped to the declared range and step. Invalid types, fractional token counts,
+unknown levels and unrecognized enum values fail before transport. Recognized
+reasoning-effort values outside a model's supported subset clamp to the nearest
+declared effort, preserving the former Codex clamp behavior without model-ID
+branches in adapter code.
+
+Adapter code maps canonical values to API fields; JSON metadata cannot add
+arbitrary request fields. The request serializer applies the same resolution to
+buffered and streaming requests, Gemini OAuth envelopes and signed Bedrock
+payloads. The accounted OpenAI and compatible paths estimate and send the same
+serialized body. A declared parameter that an adapter cannot express refuses
+selection and serialization locally. Bring-your-own identities retain their own
+catalog identity, including `anthropic-custom:`; using an Anthropic-compatible
+protocol does not borrow original-provider model facts. Unverified model IDs use
+the adapter's base request without catalog rewriting. For a catalog model, every
+canonical wire field is removed before the declared, resolved values are written;
+undeclared fields cannot survive from an adapter default or caller override. An
+empty declaration set therefore uses provider defaults for these parameters.
+This also applies to legacy temperature and reasoning overrides; a release row
+must declare support before a known model receives the value. The resolved values and catalog revision
+are retained in engine traces and the existing owner-bound
+`provider.final_outcome` event when that entrypoint records provider outcomes.
+The issued per-run decision context owns main preparation records, so an
+interrupted request keeps them in the existing `turn.finalized` payload even
+when no provider outcome was observed. A failed or cancelled preparation does
+not create an attempt, serving attribution or usage settlement. All entrypoints,
+including terminal Chat, use this common finalizer. Nonempty parameter records
+are included in the terminal claim and replay authentication; empty records
+preserve the existing payload shape.
+Signal vision, smart-group classification and Automix premium calls retain their
+own prepared values in the existing `provider.auxiliary.settled` receipt, including
+on failure. Their accounting owners use independent capture scopes; an outer
+turn cannot absorb an auxiliary call's records. The classifier's silence outcome
+uses that same owned capture. These records add no separate event write.
+They describe request preparation, not confirmed transport or billed usage;
+physical attempt and cost records retain those roles. Records include only the
+canonical model, release revision and resolved parameter values. Concurrent
+turns and nested streaming tasks keep separate captures, and disabled recording
+does not borrow an outer turn's recorder. Selection surfaces and TOML settings
+remain the next catalog phase.
+
+Release `2026-10-19.1` carries Kimi Code's fixed temperature, Codex
+effort/verbosity declarations, and explicit declarations for the shipped OpenAI,
+Anthropic, Gemini, Ollama, Bedrock and selected OpenRouter rows. Output defaults
+and conservative bounds preserve PRX's existing release policy; they do not
+claim every vendor-supported output size. Undeclared model facts remain unknown.
+The wire fields follow the provider APIs, including Ollama's
+[`options` and model-defined `think`](https://docs.ollama.com/api/chat) and
+Bedrock's [`inferenceConfig` and `additionalModelRequestFields`](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html). Declared Codex rows now use the catalog's
+`medium` default effort and verbosity; the legacy configured effort remains a
+caller override, validated against the selected row. Kimi's rule follows the
+selected provider and model; a URL containing `kimi.com` supplies no parameter evidence. The hidden
+`kimi-code/kimi-k2` row preserves historical serialization compatibility and
+does not add that spelling to the three model IDs accepted by the factory.
+Newly recorded deprecated Codex rows use this release's annotation date; it is
+not a claim about the vendor's original announcement date. Their parameter
+subsets preserve the former adapter assertions. See the official
+[GPT-5.3-Codex](https://developers.openai.com/api/docs/models/gpt-5.3-codex),
+[GPT-5.1](https://developers.openai.com/api/docs/models/gpt-5.1), and
+[GPT-5.1-Codex Mini](https://developers.openai.com/api/docs/models/gpt-5.1-codex-mini)
+references for the model identities and lifecycle notices.
+The Sonnet 5 rows retain all five provider effort values, including `xhigh` and
+`max`, as documented in [Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort).
+The three model-level bundles remain `low`, `medium` and `high`; provider effort
+values are a separate vocabulary.
+
 The loader rejects malformed JSON, unknown schema-v1 fields, unsupported schema
 majors, invalid model or provider defaults, duplicate IDs, aliases that collide
 with an ID or API model for the same provider, missing lifecycle replacements,

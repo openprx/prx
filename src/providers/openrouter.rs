@@ -301,7 +301,12 @@ impl Provider for OpenRouterProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/openprx/prx")
             .header("X-Title", "OpenPRX")
-            .json(&request)
+            .json(&super::parameter_wire::request(
+                "openrouter",
+                super::parameter_wire::Format::OpenRouter,
+                &request.model,
+                &request,
+            ))
             .send()
             .await?;
 
@@ -349,7 +354,12 @@ impl Provider for OpenRouterProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/openprx/prx")
             .header("X-Title", "OpenPRX")
-            .json(&request)
+            .json(&super::parameter_wire::request(
+                "openrouter",
+                super::parameter_wire::Format::OpenRouter,
+                &request.model,
+                &request,
+            ))
             .send()
             .await?;
 
@@ -393,7 +403,12 @@ impl Provider for OpenRouterProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/openprx/prx")
             .header("X-Title", "OpenPRX")
-            .json(&native_request)
+            .json(&super::parameter_wire::request(
+                "openrouter",
+                super::parameter_wire::Format::OpenRouter,
+                &native_request.model,
+                &native_request,
+            ))
             .send()
             .await?;
 
@@ -470,7 +485,12 @@ impl Provider for OpenRouterProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/openprx/prx")
             .header("X-Title", "OpenPRX")
-            .json(&native_request)
+            .json(&super::parameter_wire::request(
+                "openrouter",
+                super::parameter_wire::Format::OpenRouter,
+                &native_request.model,
+                &native_request,
+            ))
             .send()
             .await?;
 
@@ -539,7 +559,12 @@ impl Provider for OpenRouterProvider {
                 .header("HTTP-Referer", "https://github.com/openprx/prx")
                 .header("X-Title", "OpenPRX")
                 .header("Accept", "text/event-stream")
-                .json(&request)
+                .json(&super::parameter_wire::request(
+                    "openrouter",
+                    super::parameter_wire::Format::OpenRouter,
+                    &request.model,
+                    &request,
+                ))
                 .send()
                 .await
             {

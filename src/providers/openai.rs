@@ -398,7 +398,12 @@ impl OpenAiProvider {
             model,
             &endpoint,
             Some(credential),
-            &native_request,
+            &super::parameter_wire::request(
+                "openai",
+                super::parameter_wire::Format::OpenAiChat,
+                &native_request.model,
+                &native_request,
+            ),
             super::attempt_accounting::PhysicalKind::Chat,
         )
         .await?;
@@ -783,7 +788,12 @@ impl Provider for OpenAiProvider {
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
+            .json(&super::parameter_wire::request(
+                "openai",
+                super::parameter_wire::Format::OpenAiChat,
+                &request.model,
+                &request,
+            ))
             .send()
             .await?;
 
@@ -896,7 +906,12 @@ impl Provider for OpenAiProvider {
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
+            .json(&super::parameter_wire::request(
+                "openai",
+                super::parameter_wire::Format::OpenAiChat,
+                &native_request.model,
+                &native_request,
+            ))
             .send()
             .await?;
 
@@ -987,7 +1002,12 @@ impl Provider for OpenAiProvider {
                 .post(&url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("Accept", "text/event-stream")
-                .json(&request_body)
+                .json(&super::parameter_wire::request(
+                    "openai",
+                    super::parameter_wire::Format::OpenAiChat,
+                    &request_body.model,
+                    &request_body,
+                ))
                 .send()
                 .await
             {

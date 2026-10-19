@@ -18,6 +18,7 @@
 pub mod adapters;
 pub mod descriptor;
 pub mod discovery;
+pub mod parameters;
 pub(crate) mod process_snapshot;
 pub mod release;
 pub mod resolver;

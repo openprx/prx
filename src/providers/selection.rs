@@ -189,6 +189,9 @@ pub fn check_with(
         &ConfigCredentialSource::new(config),
         policy,
     )?;
+    if requirement.operation == ModelOperation::Chat {
+        super::parameter_wire::check_selection(catalog, resolved.provider(), resolved.model())?;
+    }
     if let Some(warning) = resolved.warning() {
         tracing::warn!(target: "providers::selection", "{warning}");
     }
@@ -486,6 +489,9 @@ pub fn check_model_unproven(
         (route.provider.as_str(), route.model.as_str())
     });
     let (_, descriptor, unproven) = catalog::resolver::resolve_model(provider, model, requirement, catalog, policy)?;
+    if requirement.operation == ModelOperation::Chat {
+        super::parameter_wire::check_selection(catalog, &ProviderId::of(provider), model)?;
+    }
     Ok((!unproven.is_empty()).then(|| UnverifiedModel {
         provider: provider.to_string(),
         model: model.trim().to_string(),
