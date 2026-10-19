@@ -101,6 +101,7 @@ async fn native_discovery_approval_retains_reported_usage_in_normal_terminal() {
             security,
         },
     )
+    .await
     .unwrap();
     use futures_util::FutureExt as _;
     let owned_cleanup_confirmed = AtomicBool::new(true);

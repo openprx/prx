@@ -321,6 +321,7 @@ async fn actual_builtin_fixture_characterization() {
             security,
         },
     )
+    .await
     .expect("actual source-owned builtin service");
     let mut input = if class == "max-native-cap32" {
         "inspect file_read skills_list memory_search web_search_tool sessions_history".to_owned()

@@ -39,6 +39,10 @@ fn prefix_ranks() -> Option<&'static HashMap<Vec<u8>, usize>> {
     RANKS.as_ref()
 }
 
+pub(super) fn initialize() {
+    let _ = prefix_ranks();
+}
+
 fn pair_rank(
     piece: &[u8],
     parts: &[(usize, usize)],

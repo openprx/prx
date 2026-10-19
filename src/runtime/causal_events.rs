@@ -3,13 +3,13 @@
 //! The observer receives ordinary phase events synchronously. Applied events
 //! notify it only after winning durable insertion; crash recovery can retain
 //! the durable event without a notification. A single task writes a
-//! metadata-only copy to `message_events` in order; no prompt, state,
+//! metadata-only copy to `message_events` with admission-local ordering; no prompt, state,
 //! request/response, endpoint, or configured model enters this copy.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::turn_decision::VerifiedDirectiveApplication;
 use crate::config::ConfigGeneration;
@@ -21,10 +21,17 @@ use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSou
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 mod deferral;
+mod worker;
 pub(super) use deferral::PersistenceGuard;
 
+struct QueuedEvent {
+    event: Box<CausalEvent>,
+    deferral: Option<Arc<deferral::AdmissionDeferral>>,
+    _permit: OwnedSemaphorePermit,
+}
+
 enum QueueItem {
-    Event(Box<CausalEvent>),
+    Event(QueuedEvent),
     Applied {
         event: Box<CausalEvent>,
         idempotency_key: String,
@@ -44,6 +51,7 @@ pub(crate) struct DurableCausalEventSink {
     observer: Arc<dyn CausalEventSink>,
     queue: mpsc::Sender<QueueItem>,
     deferral: Arc<deferral::PersistenceDeferral>,
+    ordinary_slots: Arc<Semaphore>,
 }
 
 impl DurableCausalEventSink {
@@ -53,7 +61,7 @@ impl DurableCausalEventSink {
         observer: Arc<dyn CausalEventSink>,
     ) -> Result<Self, tokio::runtime::TryCurrentError> {
         let handle = tokio::runtime::Handle::try_current()?;
-        let (queue, mut receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (queue, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
         let config_generation_id = generation.id.0;
         let config_source_revision = generation.source_revision.fingerprint_sha256.clone();
@@ -63,102 +71,20 @@ impl DurableCausalEventSink {
         let worker_observer = Arc::clone(&observer);
         let deferral = Arc::new(deferral::PersistenceDeferral::default());
         let worker_deferral = Arc::clone(&deferral);
-        handle.spawn(async move {
-            let mut pending = None;
-            loop {
-                let item = match pending.take() {
-                    Some(item) => item,
-                    None => match receiver.recv().await {
-                        Some(item) => item,
-                        None => break,
-                    },
-                };
-                match item {
-                    QueueItem::Event(event) => {
-                        worker_deferral.wait().await;
-                        let mut batch = vec![event];
-                        while batch.len() < crate::memory::traits::MESSAGE_EVENT_BATCH_LIMIT {
-                            match receiver.try_recv() {
-                                Ok(QueueItem::Event(event)) => batch.push(event),
-                                Ok(boundary) => {
-                                    pending = Some(boundary);
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        let inputs = batch
-                            .iter()
-                            .map(|event| {
-                                to_message_input(event, &workspace_id, config_generation_id, &config_source_revision)
-                            })
-                            .collect();
-                        let results = memory.append_message_events(inputs).await;
-                        if results.len() != batch.len() {
-                            for event in batch {
-                                report_incomplete(
-                                    worker_observer.as_ref(),
-                                    event.lineage.clone(),
-                                    IncompleteReason::StoreFailed,
-                                );
-                            }
-                            continue;
-                        }
-                        for (event, result) in batch.into_iter().zip(results) {
-                            if result.is_err() {
-                                report_incomplete(
-                                    worker_observer.as_ref(),
-                                    event.lineage.clone(),
-                                    IncompleteReason::StoreFailed,
-                                );
-                            }
-                        }
-                    }
-                    QueueItem::Drain(reply) => {
-                        let _ = reply.send(());
-                    }
-                    QueueItem::Applied {
-                        event,
-                        idempotency_key,
-                        original_generation,
-                        acknowledgement,
-                    } => {
-                        let (generation_id, revision) = original_generation.as_ref().map_or(
-                            (config_generation_id, config_source_revision.as_str()),
-                            |(id, revision)| (*id, revision.as_ref()),
-                        );
-                        let mut input = to_message_input(&event, &workspace_id, generation_id, revision);
-                        let event_id = uuid::Uuid::new_v4().to_string();
-                        input.event_id = Some(event_id.clone());
-                        input.idempotency_key = Some(idempotency_key);
-                        let persisted = match memory.append_message_event(input.clone()).await {
-                            Ok(stored) if applied_input_matches(&stored, &input) => {
-                                if stored.event_id == event_id {
-                                    worker_observer.emit(*event);
-                                }
-                                true
-                            }
-                            Ok(_) => {
-                                report_incomplete(worker_observer.as_ref(), event.lineage, IncompleteReason::Conflict);
-                                false
-                            }
-                            Err(_) => {
-                                report_incomplete(
-                                    worker_observer.as_ref(),
-                                    event.lineage,
-                                    IncompleteReason::StoreFailed,
-                                );
-                                false
-                            }
-                        };
-                        if let Some(reply) = acknowledgement {
-                            let _ = reply.send(persisted);
-                        }
-                    }
-                }
+        handle.spawn(
+            worker::Worker {
+                receiver,
+                memory,
+                observer: worker_observer,
+                workspace: workspace_id,
+                generation: config_generation_id,
+                revision: config_source_revision,
+                deferral: worker_deferral,
             }
-        });
+            .run(),
+        );
         Ok(Self {
+            ordinary_slots: Arc::new(Semaphore::new(EVENT_QUEUE_CAPACITY)),
             deferral,
             observer,
             queue,
@@ -169,10 +95,10 @@ impl DurableCausalEventSink {
         })
     }
 
-    /// Already-started I/O completes normally. New ordinary writes wait until
-    /// every guard drops; observers remain immediate and drain stays FIFO.
-    pub(super) fn defer_ordinary_persistence(&self) -> PersistenceGuard {
-        self.deferral.begin()
+    /// A source-bound admission may defer only its own ordinary events. Drain
+    /// overrides that preference; deferral expires at the admission deadline.
+    pub(super) fn defer_ordinary_persistence(&self, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
+        self.deferral.begin(lineage, deadline)
     }
 
     /// Wait at most until `deadline` for every event queued before this marker.
@@ -303,8 +229,24 @@ impl CausalEventSink for DurableCausalEventSink {
             return;
         }
         self.observer.emit(event.clone());
-        if self.queue.try_send(QueueItem::Event(Box::new(event.clone()))).is_err() {
+        let Ok(permit) = Arc::clone(&self.ordinary_slots).try_acquire_owned() else {
             report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::StoreDropped);
+            return;
+        };
+        let deferred = self.deferral.for_event(&event.lineage);
+        let queued = QueuedEvent {
+            event: Box::new(event),
+            deferral: deferred,
+            _permit: permit,
+        };
+        if let Err(failed) = self.queue.try_send(QueueItem::Event(queued)) {
+            if let QueueItem::Event(queued) = failed.into_inner() {
+                report_incomplete(
+                    self.observer.as_ref(),
+                    queued.event.lineage,
+                    IncompleteReason::StoreDropped,
+                );
+            }
         }
     }
 }
