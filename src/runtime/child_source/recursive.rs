@@ -4,7 +4,9 @@ use super::{Arc, ChildGrantData, IssuedChildGrant};
 use anyhow::Context as _;
 
 impl IssuedChildGrant {
-    pub(in crate::runtime) fn recursive_child_allowance(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    pub(in crate::runtime) fn recursive_child_allowance(
+        &self,
+    ) -> Option<Arc<crate::runtime::turn_decision::recursive_allowance::RecursiveAllowance>> {
         self.0.recursive_child_claimed.clone()
     }
 
@@ -12,33 +14,13 @@ impl IssuedChildGrant {
         self.scope().gate_inputs().0.authority.delegation.is_some()
     }
 
-    /// Refuse a spent grant before batch journaling. Publication still claims
-    /// atomically, since concurrent requests can pass this read-only check.
+    /// Publication claims atomically after this pre-journaling availability check.
     pub(crate) fn ensure_recursive_child_available(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self
-                .0
-                .recursive_child_claimed
-                .as_ref()
-                .context("recursive grant has no child allowance owner")?
-                .load(std::sync::atomic::Ordering::Acquire),
-            "recursive grant already allocated its one child allowance"
-        );
-        Ok(())
-    }
-
-    fn claim_recursive_child(&self) -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        anyhow::ensure!(
-            self.0
-                .recursive_child_claimed
-                .as_ref()
-                .context("recursive grant has no child allowance owner")?
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "recursive grant already allocated its one child allowance"
-        );
-        Ok(())
+        self.0
+            .recursive_child_claimed
+            .as_ref()
+            .context("recursive grant has no child allowance owner")?
+            .ensure_available()
     }
 
     pub(super) fn verify_child_model(&self, provider: &str, model: &str) -> anyhow::Result<()> {
@@ -62,10 +44,11 @@ impl IssuedChildGrant {
         let (issued, parent) = self.scope().gate_inputs();
         self.verify_child_model(provider, model)?;
         if !requested {
-            if issued.authority.delegation.is_some() {
-                self.claim_recursive_child()?;
-            }
-            return Ok(Arc::clone(self));
+            return if issued.authority.delegation.is_some() {
+                self.with_budgeted_scope(issued.clone())
+            } else {
+                Ok(Arc::clone(self))
+            };
         }
         let config = &self.generation().effective.sessions_spawn;
         anyhow::ensure!(
@@ -99,14 +82,26 @@ impl IssuedChildGrant {
             model.trim(),
             config.max_recursive_depth,
         )?;
+        self.with_budgeted_scope(manifest)
+    }
+
+    fn with_budgeted_scope(
+        self: &Arc<Self>,
+        manifest: crate::tools::capability::child::ChildCapabilityManifest,
+    ) -> anyhow::Result<Arc<Self>> {
+        let (_, parent) = self.scope().gate_inputs();
+        let (cents, recursive_child_claimed) = self
+            .0
+            .recursive_child_claimed
+            .as_ref()
+            .context("recursive grant has no budget owner")?
+            .carve_child(manifest.authority.max_cost_cents)?;
+        let manifest = manifest.with_cost_ceiling(parent, cents)?;
         let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
             manifest, parent,
         )?);
-        self.claim_recursive_child()?;
         Ok(Arc::new(Self(Arc::new(ChildGrantData {
-            // The newly published child owns one further child slot; the
-            // parent slot was consumed above and stays consumed across reissue.
-            recursive_child_claimed: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            recursive_child_claimed: Some(recursive_child_claimed),
             parent_model: self.0.parent_model.clone(),
             source_fabric: self.0.source_fabric.clone(),
             security: Arc::clone(&self.0.security),

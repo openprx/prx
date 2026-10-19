@@ -272,14 +272,23 @@ impl TurnDecisionService {
                         proof.config_source_revision().as_bytes(),
                     ],
                 );
-                Arc::new(crate::runtime::decision_accounting::AccountingScope::new(
-                    Arc::clone(&self.generation.effective),
-                    Arc::clone(&self.state_key),
-                    cleanup,
-                    scope_id,
-                    context.engine.state.trusted.parts().budgets,
-                    context.engine.deadline,
-                ))
+                Arc::new(
+                    crate::runtime::decision_accounting::AccountingScope::new(
+                        Arc::clone(&self.generation.effective),
+                        Arc::clone(&self.state_key),
+                        cleanup,
+                        scope_id,
+                        context.engine.state.trusted.parts().budgets,
+                        context.engine.deadline,
+                    )
+                    .with_money(
+                        context
+                            .recursive_allowance
+                            .get()
+                            .and_then(|owner| owner.funded_money())
+                            .or_else(|| self.recursive_money(proof)),
+                    ),
+                )
             },
             Arc::clone,
         );

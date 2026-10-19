@@ -9,7 +9,7 @@ pub(crate) use ordinary_process::OrdinaryProcessLaunch;
 use super::{
     Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityAvailabilityLevel, CapabilityRef, CapabilityTarget,
     CatalogScope, CausalDecisionStore, CausalEventSink, ConfigGeneration, Context, DecisionBackendFactory, DecisionKey,
-    DirectiveContext, Exposure, FactoryDeps, GateInputs, Memory, Ordering, Retention, SecurityPolicy, StoreMode, Tool,
+    DirectiveContext, Exposure, FactoryDeps, GateInputs, Memory, Ordering, SecurityPolicy, StoreMode, Tool,
     ToolExecutionService, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnLoopRuntime,
     TurnServiceBuild, TurnServiceBuildError, TurnSourceProof, TurnSurfaceKind, directive_from_selection,
     effective_agent_exclusions, pinned_policy_version, validate_agent_retrieval_provenance,
@@ -265,6 +265,7 @@ impl OrdinaryChildPublication {
         .with_unproven_budget_gate();
         Ok(Arc::new(TurnDecisionService {
             child_recovery: Default::default(),
+            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,

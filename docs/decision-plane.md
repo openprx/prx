@@ -163,6 +163,20 @@ as `estimated_unsent_v1`; older builds that do not recognize that event fail
 closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
+The bounded causal-event channel keeps 256 entries and admits at most 255
+ordinary phase events at once, reserving a control entry for Applied or Drain.
+Ordinary telemetry alone cannot fill that control entry. A queue already
+saturated by controls can still report StoreDropped; the application remains
+retryable and Drain waits within its caller's existing deadline.
+
+Workspace cost trackers share storage while each admitted caller retains its
+immutable cost configuration. Looking up an older generation cannot overwrite
+a newer caller's reservation limits.
+
+Creation-only directory sync remains mandatory: a failed sync rolls back the newly created journal entry, so a
+subsequent append must create and sync it again. Existing ledger files and
+replacement inodes are never removed by this rollback.
+
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Known usage updates the
 local budget while cleanup owns its durable settlement in the background, so
@@ -638,6 +652,7 @@ historical events are not rewritten by this change.
 SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
 
 Decision-store preparation runs on blocking workers before source admission.
+Operator-worker publication and admin opens use the same preparation path.
 The process registry only locates per-path slots; SQLite open, WAL setup and
 migration never hold the global registry lock. A concurrent open of the same
 path shares its slot, while unrelated workspaces can prepare independently.

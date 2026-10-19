@@ -15,6 +15,15 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+- Recursive child grants now subtract a strict half-share from the parent's
+  remaining monetary balance, rounded down to whole cents. Authenticated
+  approval resume keeps the original run's one-child slot and balance.
+- Operator-worker and admin store preparation runs off Tokio workers.
+- Workspace cost configuration views remain pinned across reloads.
+- Failed creation directory sync rolls back the new entry so retries cannot
+  skip that sync.
+
 - Automix premium escalation now has a separate window starting at the cheap
   reply: `router.automix.escalation_window_ms`, default 30,000 ms, range
   1–120,000 ms. It includes main settlement and premium reservation, sharing

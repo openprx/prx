@@ -1,3 +1,4 @@
+mod cost_allowance;
 pub(crate) mod wire;
 mod worker_constraints;
 

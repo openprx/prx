@@ -30,6 +30,7 @@ mod approval;
 mod child_recovery;
 mod delegation;
 mod discovery;
+pub(super) mod recursive_allowance;
 pub(super) mod segment_observation;
 pub(crate) use discovery::CapabilitySearchAuthority;
 mod execution;
@@ -147,6 +148,7 @@ impl ChildExecutionPolicy {
 
 pub(crate) struct TurnDecisionService {
     child_recovery: child_recovery::ChildRecoveryState,
+    recursive_allowances: recursive_allowance::RunAllowances,
     memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
     loop_runtime: Option<TurnLoopRuntime>,
     publication_policy: SurfacePolicy,
@@ -647,7 +649,7 @@ pub(crate) struct TurnDecisionContext {
     source_actor: (Arc<str>, Arc<str>),
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
-    recursive_child_claimed: std::sync::OnceLock<Arc<AtomicBool>>,
+    recursive_allowance: std::sync::OnceLock<Arc<recursive_allowance::RecursiveAllowance>>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     #[cfg(feature = "llm-router")]
     automix_deadline: std::sync::OnceLock<std::time::Instant>,
@@ -2141,6 +2143,9 @@ impl TurnDecisionService {
             () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
             admitted = self.admit_decision_resume(proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
         };
+        if self.generation.effective.sessions_spawn.allow_recursive_delegation {
+            self.recursive_allowances.inherit_resume(proof, admitted.original_run());
+        }
         let (mut context, telemetry) = self
             .decide_agent_initial_inner(
                 proof,
@@ -2499,7 +2504,7 @@ impl TurnDecisionService {
                 source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                 service_id: self.service_id,
                 record_admitted: AtomicBool::new(false),
-                recursive_child_claimed: Default::default(),
+                recursive_allowance: self.recursive_allowances.retain(proof),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -2554,7 +2559,7 @@ impl TurnDecisionService {
                         source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                         service_id: self.service_id,
                         record_admitted: AtomicBool::new(false),
-                        recursive_child_claimed: Default::default(),
+                        recursive_allowance: self.recursive_allowances.retain(proof),
                         execution_trace: std::sync::OnceLock::new(),
                         #[cfg(feature = "llm-router")]
                         automix_deadline: std::sync::OnceLock::new(),
@@ -2815,7 +2820,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
-                            recursive_child_claimed: Default::default(),
+                            recursive_allowance: self.recursive_allowances.retain(proof),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2858,7 +2863,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
-                            recursive_child_claimed: Default::default(),
+                            recursive_allowance: self.recursive_allowances.retain(proof),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2902,7 +2907,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
-                            recursive_child_claimed: Default::default(),
+                            recursive_allowance: self.recursive_allowances.retain(proof),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -3094,6 +3099,9 @@ impl TurnDecisionService {
             self.security.max_cost_per_day_cents,
         )
         .map_err(AgentDecisionBudgetError::Spend)?;
+        let remaining = self
+            .recursive_money(proof)
+            .map_or(remaining, |money| remaining.min(money.load(Ordering::Acquire)));
         Ok(AgentDecisionBudget {
             budgets: TurnBudgets {
                 tokens: u64::try_from(reservation.decision_tokens).unwrap_or(u64::MAX),
@@ -3395,6 +3403,7 @@ pub(crate) async fn build_turn_decision_service(
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
         child_recovery: Default::default(),
+        recursive_allowances: Default::default(),
         memory_loader: None,
         loop_runtime: None,
         publication_policy: build.surface_policy,
@@ -5109,7 +5118,7 @@ mod tests {
             source_actor: (Arc::from("cli"), Arc::from("local-user")),
             service_id: uuid::Uuid::nil(),
             record_admitted: AtomicBool::new(false),
-            recursive_child_claimed: Default::default(),
+            recursive_allowance: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             #[cfg(feature = "llm-router")]
             automix_deadline: std::sync::OnceLock::new(),
@@ -6399,7 +6408,7 @@ mod tests {
                 source_actor: (Arc::from("cli"), Arc::from("local-user")),
                 service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
-                recursive_child_claimed: Default::default(),
+                recursive_allowance: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),

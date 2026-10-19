@@ -1,0 +1,206 @@
+//! A recursive publication allocates money from its run, never duplicates it.
+use super::{TurnDecisionContext, TurnDecisionService, TurnSourceProof};
+use std::collections::BTreeMap;
+use std::sync::{
+    Arc, OnceLock, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+type Registry = parking_lot::Mutex<BTreeMap<[u8; 32], Arc<RecursiveAllowance>>>;
+
+// A config reload can publish a new service while an approval is pending.
+// The original run's allowance therefore belongs to the process, not a service.
+static RUN_ALLOWANCES: OnceLock<Arc<Registry>> = OnceLock::new();
+
+#[derive(Default)]
+pub(super) struct RunAllowances(OnceLock<Arc<Registry>>);
+
+pub(crate) struct RecursiveAllowance {
+    money: Arc<AtomicU64>,
+    claimed: AtomicBool,
+    funded: bool,
+    retention: Option<Weak<Registry>>,
+}
+
+impl RecursiveAllowance {
+    pub(crate) fn new(micro_usd: u64) -> Self {
+        Self {
+            money: Arc::new(AtomicU64::new(micro_usd)),
+            claimed: AtomicBool::new(false),
+            funded: true,
+            retention: None,
+        }
+    }
+
+    pub(crate) fn money(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.money)
+    }
+
+    pub(crate) fn funded_money(&self) -> Option<Arc<AtomicU64>> {
+        self.funded.then(|| self.money())
+    }
+
+    pub(crate) fn ensure_available(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.funded, "original recursive allowance is unavailable after resume");
+        anyhow::ensure!(
+            !self.claimed.load(Ordering::Acquire),
+            "recursive grant already allocated its one child allowance"
+        );
+        Ok(())
+    }
+
+    /// Claim once and subtract a whole-cent strict share before publication.
+    /// A failed publication keeps its allocation consumed, never reissues it.
+    pub(crate) fn carve_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
+        anyhow::ensure!(self.funded, "original recursive allowance is unavailable after resume");
+        anyhow::ensure!(
+            self.claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "recursive grant already allocated its one child allowance"
+        );
+        let mut available = self.money.load(Ordering::Acquire);
+        loop {
+            let cents = u32::try_from(available.min(u64::from(ceiling_cents) * 10_000) / 20_000)?;
+            anyhow::ensure!(
+                cents > 0,
+                "recursive parent allowance cannot fund a strict whole-cent child share"
+            );
+            let share = u64::from(cents) * 10_000;
+            match self
+                .money
+                .compare_exchange_weak(available, available - share, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok((cents, Arc::new(Self::new(share)))),
+                Err(current) => available = current,
+            }
+        }
+    }
+
+    fn retire(self: &Arc<Self>) {
+        if let Some(registry) = &self.retention
+            && let Some(registry) = registry.upgrade()
+        {
+            let mut registry = registry.lock();
+            registry.retain(|_, entry| !Arc::ptr_eq(entry, self));
+        }
+    }
+}
+
+impl RunAllowances {
+    fn existing(&self) -> Option<&Arc<Registry>> {
+        self.0.get().or_else(|| RUN_ALLOWANCES.get())
+    }
+
+    fn key(proof: &dyn TurnSourceProof) -> [u8; 32] {
+        Self::key_for_run(proof, proof.run_id())
+    }
+
+    fn key_for_run(proof: &dyn TurnSourceProof, run: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for part in [proof.workspace_id(), proof.owner_id(), proof.session_key(), run] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        hash.finalize().into()
+    }
+
+    pub(super) fn retain(&self, proof: &dyn TurnSourceProof) -> OnceLock<Arc<RecursiveAllowance>> {
+        self.lookup(proof).map_or_else(OnceLock::new, OnceLock::from)
+    }
+
+    pub(super) fn inherit_resume(&self, proof: &dyn TurnSourceProof, original_run: &str) {
+        let registry = self
+            .0
+            .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
+        let mut entries = registry.lock();
+        let original = entries
+            .get(&Self::key_for_run(proof, original_run))
+            .cloned()
+            .unwrap_or_else(|| {
+                // The process may have restarted, or the original run never
+                // published a grant. Neither case proves an unused child slot.
+                Arc::new(RecursiveAllowance {
+                    money: Arc::new(AtomicU64::new(0)),
+                    claimed: AtomicBool::new(true),
+                    funded: false,
+                    retention: Some(Arc::downgrade(registry)),
+                })
+            });
+        entries.insert(Self::key(proof), original);
+    }
+
+    fn lookup(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
+        self.existing()?.lock().get(&Self::key(proof)).cloned()
+    }
+
+    fn issue(&self, proof: &dyn TurnSourceProof, money: Arc<AtomicU64>) -> Arc<RecursiveAllowance> {
+        let registry = self
+            .0
+            .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
+        let key = Self::key(proof);
+        Arc::clone(registry.lock().entry(key).or_insert_with(|| {
+            Arc::new(RecursiveAllowance {
+                money,
+                claimed: AtomicBool::new(false),
+                funded: true,
+                retention: Some(Arc::downgrade(registry)),
+            })
+        }))
+    }
+}
+
+impl TurnDecisionService {
+    pub(super) fn recursive_money(&self, proof: &dyn TurnSourceProof) -> Option<Arc<AtomicU64>> {
+        if let Some(incoming) = &self.parent_grant {
+            return incoming
+                .has_recursive_ancestry()
+                .then(|| incoming.recursive_child_allowance())
+                .flatten()
+                .and_then(|owner| owner.funded_money());
+        }
+        if !self.generation.effective.sessions_spawn.allow_recursive_delegation {
+            return None;
+        }
+        self.recursive_allowances
+            .lookup(proof)
+            .and_then(|owner| owner.funded_money())
+    }
+
+    pub(super) fn issue_recursive_allowance(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> Option<Arc<RecursiveAllowance>> {
+        if let Some(incoming) = &self.parent_grant {
+            return incoming.recursive_child_allowance();
+        }
+        if !self.generation.effective.sessions_spawn.allow_recursive_delegation {
+            return None;
+        }
+        Some(Arc::clone(context.recursive_allowance.get_or_init(|| {
+            let money = context.accounting.as_ref().map_or_else(
+                || Arc::new(AtomicU64::new(context.engine.state.trusted.parts().budgets.micro_usd)),
+                |scope| scope.money_owner(),
+            );
+            self.recursive_allowances.issue(proof, money)
+        })))
+    }
+}
+
+impl TurnDecisionContext {
+    pub(crate) fn retire_recursive_allowance(&self) {
+        if let Some(owner) = self.recursive_allowance.get() {
+            if owner.funded
+                && self
+                    .resume
+                    .as_ref()
+                    .is_some_and(|resume| resume.claimed_event().is_none())
+            {
+                return;
+            }
+            owner.retire();
+        }
+    }
+}
