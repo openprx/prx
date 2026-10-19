@@ -3,7 +3,9 @@
 //! are separate packages and are not part of this module yet. SL08 store level
 //! adds the publication journal, generation CAS, rollback and recovery. SL06
 //! adds frozen evaluation suites and the baseline-versus-candidate evaluator. SL07
-//! adds the deterministic gate, its receipt and the optional judge.
+//! adds the deterministic gate, its receipt and the optional judge. SL09 adds
+//! the source review, the single candidate writer and the lifecycle service,
+//! the policy owner that every mutation goes through.
 
 /// Test-only crash injection point; expands to nothing outside `cfg(test)`.
 macro_rules! crash_point {
@@ -19,6 +21,8 @@ mod agent_executor;
 mod authorize;
 mod binding;
 mod bundle;
+mod candidate;
+mod capability;
 mod capture;
 mod consolidate;
 mod evaluate;
@@ -35,8 +39,12 @@ mod propose;
 mod proposer_model;
 mod publish;
 mod rejection;
+mod review;
+mod service;
 mod store;
 mod suite;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod types;
 
 #[cfg(test)]
@@ -45,7 +53,7 @@ mod tests;
 #[cfg(test)]
 use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
-pub use authorize::{MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
+pub use authorize::{Finalization, MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -87,7 +95,7 @@ pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationRepor
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
     MAX_PROPOSAL_ATTEMPTS, MAX_PROPOSAL_LISTING, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus,
-    PublicationAuthorization, PublicationRecord, SkillProposal,
+    PublicationAuthorization, PublicationRecord, SkillProposal, UnreadableProposal,
 };
 pub use propose::{
     MAX_EDIT_PERCENT, MAX_EDIT_TOKENS, MAX_EDITS, MAX_PROPOSAL_PATTERNS, ProposeOutcome, ProposeRequest,
@@ -98,6 +106,11 @@ pub use proposer_model::{
 };
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
+pub use review::{ReviewCheck, ReviewFinding, SOURCE_REVIEW_IDENTITY, SourceReviewOutcome, SourceReviewRecord};
+pub use service::{
+    LifecycleMode, LifecycleStatus, MIN_PUBLICATION_CASES_FLOOR, ProposalDetail, ProposalSummary, ReviewSummary,
+    ServiceError, SkillsLifecycleService, SkillsLifecycleSettings, StartupReport, SuiteRegistry, default_gate_policy,
+};
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use suite::{
     EvalCase, EvalSplit, EvalSuite, FixtureFile, FrozenSuite, MAX_ALLOWED_REGRESSIONS, MAX_HOLDOUT_ATTEMPTS,

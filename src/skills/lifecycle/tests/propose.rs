@@ -1811,3 +1811,69 @@ mod managed {
         assert!(proposal.candidate_revision.is_none());
     }
 }
+
+/// SL09: what the real proposer stages passes the source review, which
+/// recomputes the edit budget from the texts with the proposer's own helpers.
+#[tokio::test]
+async fn a_candidate_made_by_the_proposer_passes_the_source_review() {
+    for (label, reply) in [
+        ("replace", good_patch()),
+        (
+            "description and append",
+            json!({
+                "summary": "describe and extend",
+                "description": "Helps with safe deploys",
+                "edits": [{"file": "SKILL.md", "op": "append", "new": "Always run the migration step first."}]
+            })
+            .to_string(),
+        ),
+    ] {
+        let f = fixture();
+        let pattern = usable_pattern(&f);
+        let model = ScriptedModel::replying(&reply);
+        let ProposeOutcome::Staged(proposal) = run(&f, &model, request("req-review", &[&pattern])).await else {
+            panic!("test: expected a staged proposal ({label})");
+        };
+        let outcome = f
+            .store
+            .review_source(&proposal.proposal_id, "operator")
+            .expect("test: review");
+        assert!(outcome.record.passed, "{label}: {:?}", outcome.record.findings);
+        assert_eq!(outcome.proposal.status, Status::SourceReviewed, "{label}");
+    }
+}
+
+/// The review does not trust the figures in the record: an edit that blows the
+/// budget is refused even when the record claims it is small.
+#[tokio::test]
+async fn the_source_review_recomputes_the_edit_budget() {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    let model = ScriptedModel::replying(&good_patch());
+    let ProposeOutcome::Staged(proposal) = run(&f, &model, request("req-budget", &[&pattern])).await else {
+        panic!("test: expected a staged proposal");
+    };
+    {
+        let lock = f.store.lock_proposals().expect("test: lock");
+        let mut forged = proposal.clone();
+        if let Some(diff) = forged.diff.as_mut() {
+            diff.allowed_tokens = 300;
+            diff.changed_tokens = 1;
+        }
+        f.store.write_proposal(&lock, &forged).expect("test: write");
+    }
+    let outcome = f
+        .store
+        .review_source(&proposal.proposal_id, "operator")
+        .expect("test: review");
+    assert!(!outcome.record.passed);
+    assert!(
+        outcome
+            .record
+            .findings
+            .iter()
+            .any(|finding| finding.detail.contains("disagree")),
+        "{:?}",
+        outcome.record.findings
+    );
+}

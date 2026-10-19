@@ -27,26 +27,27 @@
 //! [`SkillLifecycleStore::finalize_published_proposals`] for a sweep to run
 //! with or after `recover()`).
 //!
-//! Provenance of the candidate revision: it must already be in the main store,
-//! and today nothing in production puts it there. `propose_revision` only stages
-//! the bundle under `proposals/<id>/candidate`; SL06 evaluation needs the
-//! candidate in the main store (`evaluator.rs` arm binding, `verify_evaluation`),
-//! and `AgentCaseExecutor::install_skill` writes only to a per-run workspace
-//! store. SL09 must add the single writer (proposal id = this proposal, parent
-//! = baseline, provenance Learned) and handle identical content across
-//! proposals before any evaluation spend. Here the revision is accepted when it
-//! carries no proposal id or this proposal's id, and refused
+//! Provenance of the candidate revision: it must already be in the main store.
+//! `propose_revision` only stages the bundle under `proposals/<id>/candidate`;
+//! the single production writer is `install_candidate` (candidate.rs), which
+//! the lifecycle service runs when a proposal enters evaluation (proposal id =
+//! this proposal, parent = baseline, provenance Learned). Here the revision is
+//! accepted when it carries no proposal id or this proposal's id, and refused
 //! (`RevisionConflict`) when it names another proposal. This authorization's own
 //! provenance (gate id, gate digest, pinned record digest) lives on the
 //! proposal record, not on the shared, content-addressed revision.
 //!
-//! Known limits, deferred (SL09 must account for them):
+//! Spec 8.3: the PREPARED journal entry pins a digest of the authorization
+//! (proposal, gate decision, gate digest and candidate record digest), and the
+//! candidate's capability requirements are re-checked against its baseline
+//! before the first journal entry of an attempt (`check_capabilities`).
+//!
+//! Known limits, deferred:
 //! - Failing evidence that lands between the final gate re-check and the
 //!   binding swap is not seen: evaluation writes do not take the proposal lock.
-//! - The PREPARED journal entry carries no gate or receipt hashes, and the
-//!   candidate's capability requirements are not re-checked at publication.
 //! - The proposal lock is held across the publish, up to the 10 s publication
-//!   lock timeout; callers must handle `LockTimeout` and retry.
+//!   lock timeout; callers must handle `LockTimeout` (the lifecycle service
+//!   turns it into a retryable error).
 
 use super::gate::{GateError, GatePolicy, VerifiedGate, gate_id_of};
 use super::journal::{TransactionId, TransactionState};
@@ -58,6 +59,9 @@ use super::publish::{PublishRequest, TransactionOutcome};
 use super::store::SkillLifecycleStore;
 use super::types::{LifecycleError, RevisionId};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
+
+const AUTHORIZATION_PIN_DOMAIN: &[u8] = b"prx-skill-authorization\0";
 
 /// Publication attempts one authorization allows (an aborted transaction
 /// consumes one).
@@ -102,7 +106,7 @@ impl SkillLifecycleStore {
     /// aborted attempt is verified again like any other).
     ///
     /// Blocking: waits for locks and does file I/O.
-    pub fn authorize_publication(
+    pub(in crate::skills) fn authorize_publication(
         &self,
         proposal_id: &str,
         gate_digest: &str,
@@ -143,7 +147,9 @@ impl SkillLifecycleStore {
             .verify_gate(&gate_id, gate_digest, policy, suite_digest)
             .map_err(|e| self.stale_after(&proposal.proposal_id, e))?;
         check_bound(&proposal, &gate_id, &verified)?;
+        self.require_source_review(&proposal)?;
         let candidate = self.candidate_record_digest(&proposal)?;
+        self.check_capabilities(&proposal, Some(&candidate))?;
         crash_point!("authorize_verified");
 
         let lock = self.lock_proposals()?;
@@ -201,7 +207,7 @@ impl SkillLifecycleStore {
     /// proposal that is already `Committed` returns its recorded publication.
     ///
     /// Blocking, like [`Self::publish`].
-    pub fn publish_authorized(
+    pub(in crate::skills) fn publish_authorized(
         &self,
         proposal_id: &str,
         policy: &GatePolicy,
@@ -232,6 +238,7 @@ impl SkillLifecycleStore {
         }
         let transaction_id = publication_tx(&proposal.proposal_id, auth.attempt)?;
         let request = publish_request(&proposal, &auth)?;
+        let pin = authorization_pin(&proposal.proposal_id, &auth);
         if proposal.status == ProposalStatus::PublicationAuthorized && self.journal_entry(&transaction_id)?.is_none() {
             // Nothing was journaled for this attempt: the authorization must
             // still hold under the caller's own rules.
@@ -239,9 +246,21 @@ impl SkillLifecycleStore {
                 Ok(verified) => check_bound(&proposal, &expected_gate, &verified)?,
                 Err(e) => return Err(self.stale_locked(&lock, &mut proposal, e)),
             }
+            self.require_source_review(&proposal)?;
+            // Spec 8.3 step 3: the capabilities are checked again at publication.
+            if let Err(e) = self.check_capabilities(&proposal, Some(&auth.candidate_record_digest)) {
+                if matches!(e, LifecycleError::CapabilityExpansion { .. }) {
+                    proposal.failure = Some(ProposalFailure {
+                        kind: ProposalFailureKind::CapabilityExpansion,
+                        detail: bounded(&e.to_string()),
+                    });
+                    self.move_locked(&lock, &mut proposal, ProposalStatus::Failed, &e.to_string())?;
+                }
+                return Err(e.into());
+            }
         }
         crash_point!("publish_before_store");
-        let outcome = match self.publish(&request) {
+        let outcome = match self.publish_pinned(&request, &pin) {
             Ok(outcome) => outcome,
             Err(e @ (LifecycleError::StaleGeneration { .. } | LifecycleError::RevisionAlreadyActive(_))) => {
                 if proposal.status == ProposalStatus::PublicationAuthorized {
@@ -314,6 +333,35 @@ impl SkillLifecycleStore {
         Ok(finalized)
     }
 
+    /// Startup variant of [`Self::finalize_published_proposals`]: a proposal
+    /// whose record cannot be read, or whose publication cannot be settled,
+    /// is logged and reported in `skipped` instead of blocking the others.
+    /// Only the proposal lock itself can fail the call.
+    ///
+    /// Blocking, like [`Self::publish`].
+    pub fn finalize_published_proposals_lenient(&self) -> Result<Finalization, GateError> {
+        let lock = self.lock_proposals()?;
+        let (proposals, unreadable) = self.list_proposals_lenient()?;
+        let mut report = Finalization {
+            finalized: Vec::new(),
+            skipped: unreadable.into_iter().map(|u| (u.proposal_id, u.reason)).collect(),
+        };
+        for mut proposal in proposals {
+            if proposal.status != ProposalStatus::PublicationAuthorized {
+                continue;
+            }
+            match self.settle_publication(&lock, &mut proposal) {
+                Ok(Settlement::Committed) => report.finalized.push(proposal.proposal_id),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(proposal = %proposal.proposal_id, %error, "could not settle a skill publication at startup");
+                    report.skipped.push((proposal.proposal_id, bounded(&error.to_string())));
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Looks up the journal entry of the proposal's current publication
     /// attempt and, when it exists, lets the store settle it under the skill
     /// lock. A committed attempt finalizes the proposal as `Committed`. The
@@ -334,7 +382,8 @@ impl SkillLifecycleStore {
         if self.journal_entry(&transaction_id)?.is_none() {
             return Ok(Settlement::NotPublished);
         }
-        match self.publish(&publish_request(proposal, &auth)?) {
+        let pin = authorization_pin(&proposal.proposal_id, &auth);
+        match self.publish_pinned(&publish_request(proposal, &auth)?, &pin) {
             Ok(outcome) => {
                 self.finish_commit(lock, proposal, &outcome)?;
                 Ok(Settlement::Committed)
@@ -446,6 +495,32 @@ impl SkillLifecycleStore {
         proposal.updated_at = Utc::now();
         self.write_proposal(lock, proposal)
     }
+}
+
+/// What [`SkillLifecycleStore::finalize_published_proposals_lenient`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Finalization {
+    /// Proposals whose committed publication was recorded.
+    pub finalized: Vec<String>,
+    /// Proposal ids that could not be read or settled, with the reason.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Digest of the authorization a publication runs under; pinned in the
+/// PREPARED journal entry.
+fn authorization_pin(proposal_id: &str, auth: &PublicationAuthorization) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHORIZATION_PIN_DOMAIN);
+    for part in [
+        proposal_id,
+        auth.gate_id.as_str(),
+        auth.gate_digest.as_str(),
+        auth.candidate_record_digest.as_str(),
+    ] {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// The verified decision must be this proposal's own, for its own candidate.

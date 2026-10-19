@@ -446,10 +446,34 @@ impl Tool for SkillReadTool {
     }
 }
 
+/// Lifecycle actions an agent may be offered that only read.
+pub(crate) const LIFECYCLE_READ_ACTIONS: [&str; 3] = ["lifecycle_status", "lifecycle_list", "lifecycle_inspect"];
+/// Lifecycle actions an agent may be offered that mutate. Each one goes
+/// through the lifecycle service under the operator's settings; none of them
+/// takes a suite, a policy, a mode or a revision body from the caller.
+pub(crate) const LIFECYCLE_MUTATING_ACTIONS: [&str; 3] =
+    ["lifecycle_publish", "lifecycle_cancel", "lifecycle_rollback"];
+/// Operations that are never an agent action: they choose what judges a
+/// proposal, or spend on evaluation, and belong to the operator and the
+/// scheduler only.
+#[cfg(test)]
+pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 7] = [
+    "write_suite",
+    "install_suite",
+    "begin_evaluation",
+    "evaluate",
+    "review_source",
+    "gate",
+    "advance",
+];
+
 pub struct SkillsManageTool {
     workspace_dir: PathBuf,
     config: Config,
     security: Arc<SecurityPolicy>,
+    /// The lifecycle policy owner, when the installation has one. Without it
+    /// no lifecycle action is offered or accepted.
+    lifecycle: Option<Arc<crate::skills::lifecycle::SkillsLifecycleService>>,
 }
 
 impl SkillsManageTool {
@@ -458,7 +482,127 @@ impl SkillsManageTool {
             workspace_dir,
             config,
             security,
+            lifecycle: None,
         }
+    }
+
+    /// Offers the lifecycle actions, served by `service` (the only way a
+    /// lifecycle mutation reaches the store from this tool).
+    #[must_use]
+    pub fn with_lifecycle(mut self, service: Arc<crate::skills::lifecycle::SkillsLifecycleService>) -> Self {
+        self.lifecycle = Some(service);
+        self
+    }
+
+    fn lifecycle_actions(&self) -> Vec<&'static str> {
+        if self.lifecycle.is_some() {
+            LIFECYCLE_READ_ACTIONS
+                .iter()
+                .chain(LIFECYCLE_MUTATING_ACTIONS.iter())
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn execute_lifecycle(&self, action: &str, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        use crate::skills::lifecycle::{RevisionId, ServiceError, SkillId};
+        let Some(service) = self.lifecycle.clone() else {
+            anyhow::bail!("Unsupported skills_manage action: {action}");
+        };
+        let optional = |key: &str| {
+            args.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let action_name = action.to_string();
+        let work: anyhow::Result<Result<serde_json::Value, ServiceError>> = match action {
+            "lifecycle_status" => {
+                tokio::task::spawn_blocking(move || service.status().map(|status| json!(status))).await
+            }
+            "lifecycle_list" => {
+                let skill = optional("skill_id").map(|id| SkillId::parse(&id)).transpose()?;
+                tokio::task::spawn_blocking(move || {
+                    service
+                        .list_proposals(skill.as_ref())
+                        .map(|proposals| json!({"proposals": proposals}))
+                })
+                .await
+            }
+            "lifecycle_inspect" => {
+                let id = Self::required_string(args, "proposal_id")?.to_string();
+                tokio::task::spawn_blocking(move || service.inspect_proposal(&id).map(|detail| json!(detail))).await
+            }
+            "lifecycle_publish" => {
+                let id = Self::required_string(args, "proposal_id")?.to_string();
+                tokio::task::spawn_blocking(move || {
+                    service.publish(&id).map(|outcome| {
+                        json!({
+                            "proposal_id": outcome.proposal.proposal_id,
+                            "status": outcome.proposal.status.as_str(),
+                            "revision_id": outcome.transaction.entry.candidate_revision_id.as_str(),
+                            "generation": outcome.transaction.entry.new_generation,
+                        })
+                    })
+                })
+                .await
+            }
+            "lifecycle_cancel" => {
+                let id = Self::required_string(args, "proposal_id")?.to_string();
+                let reason = optional("reason").unwrap_or_else(|| "cancelled through skills_manage".to_string());
+                tokio::task::spawn_blocking(move || {
+                    service.cancel(&id, &reason).map(
+                        |proposal| json!({"proposal_id": proposal.proposal_id, "status": proposal.status.as_str()}),
+                    )
+                })
+                .await
+            }
+            "lifecycle_rollback" => {
+                let skill = SkillId::parse(Self::required_string(args, "skill_id")?)?;
+                let revision = RevisionId::parse(Self::required_string(args, "revision_id")?)?;
+                let generation = args
+                    .get("expected_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("Missing non-negative integer 'expected_generation' parameter"))?;
+                tokio::task::spawn_blocking(move || {
+                    service.rollback(&skill, &revision, generation).map(|outcome| {
+                        json!({
+                            "skill_id": outcome.entry.skill_id.as_str(),
+                            "revision_id": outcome.entry.candidate_revision_id.as_str(),
+                            "generation": outcome.entry.new_generation,
+                            "replayed": outcome.replayed,
+                        })
+                    })
+                })
+                .await
+            }
+            _ => anyhow::bail!("Unsupported skills_manage action: {action}"),
+        }
+        .map_err(|error| anyhow::anyhow!("lifecycle worker failed: {error}"));
+        Ok(match work? {
+            Ok(mut output) => {
+                if let Some(object) = output.as_object_mut() {
+                    object.insert("action".to_string(), json!(action_name));
+                }
+                ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&output)?,
+                    error: None,
+                }
+            }
+            Err(error) => ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(if error.is_retryable() {
+                    format!("{error} (retryable)")
+                } else {
+                    error.to_string()
+                }),
+            },
+        })
     }
 
     fn approval_grant(args: &serde_json::Value) -> Option<ApprovalGrant> {
@@ -468,12 +612,51 @@ impl SkillsManageTool {
     }
 
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), ToolResult> {
+        if LIFECYCLE_READ_ACTIONS.contains(&action) {
+            // Status and listing change nothing.
+            return Ok(());
+        }
         let risk = match action {
             "enable" | "disable" | "validate" => ResourceRiskLevel::Low,
+            "lifecycle_publish" | "lifecycle_rollback" => ResourceRiskLevel::High,
             _ => ResourceRiskLevel::Medium,
         };
-        let operation = format!("skills_manage:{action}");
+        let arg = |key: &str| args.get(key).and_then(serde_json::Value::as_str).map(str::trim);
+        // A lifecycle mutation binds its target into the operation a grant
+        // authorizes, so a grant for one proposal (or one rollback) cannot be
+        // replayed against another.
+        let target = match action {
+            "lifecycle_publish" | "lifecycle_cancel" => arg("proposal_id").map(str::to_string),
+            "lifecycle_rollback" => match (arg("skill_id"), arg("revision_id")) {
+                (Some(skill), Some(revision)) => Some(format!("{skill}:{revision}")),
+                _ => None,
+            },
+            _ => None,
+        };
+        let operation = target.as_ref().map_or_else(
+            || format!("skills_manage:{action}"),
+            |target| format!("skills_manage:{action}:{target}"),
+        );
         let grant = Self::approval_grant(args);
+        if matches!(action, "lifecycle_publish" | "lifecycle_rollback") {
+            // Publication changes what every future task reads, so it needs an
+            // explicit grant bound to its target in every autonomy level, also
+            // under full autonomy where the gate would otherwise let it pass.
+            let now = chrono::Utc::now().timestamp();
+            let granted = target.is_some()
+                && grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.permits_resource_operation(self.name(), &operation, risk, now));
+            if !granted {
+                return Err(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "{action} requires an explicit approval grant bound to its target ({operation})"
+                    )),
+                });
+            }
+        }
         SideEffectGate::new(self.security.as_ref())
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map(|_| ())
@@ -500,63 +683,115 @@ impl Tool for SkillsManageTool {
     }
 
     fn description(&self) -> &str {
-        "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
+        if self.lifecycle.is_some() {
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
+        } else {
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "install", "update", "enable", "disable", "validate", "sync", "remove"],
-                        "description": "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one"
-                    },
-                    "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
-                    "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'"},
-                    "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
-                    "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
+        let mut actions = vec![
+            "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
+        ];
+        let lifecycle = self.lifecycle_actions();
+        actions.extend(lifecycle.iter().copied());
+        let mut action_description = "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one".to_string();
+        if !lifecycle.is_empty() {
+            action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision");
+        }
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": actions,
+                    "description": action_description
                 },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            "action",
-            &[
+                "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
+                "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'"},
+                "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
+                "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        });
+        if !lifecycle.is_empty()
+            && let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut)
+        {
+            properties.insert("proposal_id".to_string(), json!({"type": "string", "description": "Lifecycle proposal id; required for 'lifecycle_inspect', 'lifecycle_publish' and 'lifecycle_cancel'"}));
+            properties.insert("skill_id".to_string(), json!({"type": "string", "description": "Lifecycle skill id; optional filter for 'lifecycle_list', required for 'lifecycle_rollback'"}));
+            properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id; required for 'lifecycle_rollback'"}));
+            properties.insert("expected_generation".to_string(), json!({"type": "integer", "minimum": 0, "description": "Active generation the caller observed; required for 'lifecycle_rollback'"}));
+            properties.insert(
+                "reason".to_string(),
+                json!({"type": "string", "description": "Why the proposal is closed; optional for 'lifecycle_cancel'"}),
+            );
+        }
+        let mut requirements = vec![
+            crate::tools::schema::ActionRequirement {
+                action: "create",
+                required: &["name", "description", "instructions"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "install",
+                required: &["source"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "update",
+                required: &["name"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "enable",
+                required: &["name"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "disable",
+                required: &["name"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "validate",
+                required: &["name"],
+            },
+            crate::tools::schema::ActionRequirement {
+                action: "remove",
+                required: &["name"],
+            },
+        ];
+        if !lifecycle.is_empty() {
+            requirements.extend([
                 crate::tools::schema::ActionRequirement {
-                    action: "create",
-                    required: &["name", "description", "instructions"],
+                    action: "lifecycle_inspect",
+                    required: &["proposal_id"],
                 },
                 crate::tools::schema::ActionRequirement {
-                    action: "install",
-                    required: &["source"],
+                    action: "lifecycle_publish",
+                    required: &["proposal_id"],
                 },
                 crate::tools::schema::ActionRequirement {
-                    action: "update",
-                    required: &["name"],
+                    action: "lifecycle_cancel",
+                    required: &["proposal_id"],
                 },
                 crate::tools::schema::ActionRequirement {
-                    action: "enable",
-                    required: &["name"],
+                    action: "lifecycle_rollback",
+                    required: &["skill_id", "revision_id", "expected_generation"],
                 },
-                crate::tools::schema::ActionRequirement {
-                    action: "disable",
-                    required: &["name"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "validate",
-                    required: &["name"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "remove",
-                    required: &["name"],
-                },
-            ],
-        )
+            ]);
+        }
+        crate::tools::schema::with_action_requirements(schema, "action", &requirements)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = Self::required_string(&args, "action")?;
+        if action.starts_with("lifecycle_") {
+            if !self.lifecycle_actions().contains(&action) {
+                anyhow::bail!("Unsupported skills_manage action: {action}");
+            }
+            if let Err(result) = self.authorize(action, &args) {
+                return Ok(result);
+            }
+            return self.execute_lifecycle(action, &args).await;
+        }
         if let Err(result) = self.authorize(action, &args) {
             return Ok(result);
         }
@@ -1226,8 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn skill_read_serves_lifecycle_revisions_pinned_per_task() {
         use crate::skills::lifecycle::{
-            Bundle, BundleEntry, NewRevision, OwnerScope, SkillId, SkillLifecycleStore, SourceKind, apply_migration,
-            plan_migration,
+            Bundle, BundleEntry, OwnerScope, SkillId, SkillLifecycleStore, SourceKind, apply_migration, plan_migration,
         };
         let temp = TempDir::new().unwrap();
         let skill_dir = temp.path().join("skills/demo");
@@ -1260,19 +1494,7 @@ mod tests {
             executable: false,
         }])
         .unwrap();
-        let written = store
-            .write_revision(&NewRevision::new(id.clone(), SourceKind::Learned), &bundle)
-            .unwrap();
-        store
-            .publish(&crate::skills::lifecycle::PublishRequest {
-                transaction_id: crate::skills::lifecycle::TransactionId::generate(),
-                skill_id: id.clone(),
-                candidate: bundle.revision_id().clone(),
-                candidate_record_digest: written.record_digest,
-                expected_generation: 1,
-                enabled: true,
-            })
-            .unwrap();
+        crate::skills::lifecycle::test_support::publish_revision(&store, &id, SourceKind::Learned, &bundle, 1);
 
         let same_task = read(scoped_args(owner, "task-tool-1", json!({"name": "demo"}))).await;
         assert!(
@@ -1418,5 +1640,314 @@ mod tests {
             Some(&expected)
         );
         crate::skills::lifecycle::release_task_pins(&OwnerScope::new(owner).unwrap(), "run-corr");
+    }
+
+    fn lifecycle_tool(workspace: &Path, mode: crate::skills::lifecycle::LifecycleMode) -> SkillsManageTool {
+        lifecycle_tool_with(workspace, mode, Arc::new(SecurityPolicy::default()))
+    }
+
+    fn lifecycle_tool_with(
+        workspace: &Path,
+        mode: crate::skills::lifecycle::LifecycleMode,
+        security: Arc<SecurityPolicy>,
+    ) -> SkillsManageTool {
+        use crate::skills::lifecycle::{
+            OwnerScope, SkillLifecycleStore, SkillsLifecycleService, SkillsLifecycleSettings,
+        };
+        let store = SkillLifecycleStore::open(workspace, OwnerScope::new("owner:ws:cli:alice").unwrap()).unwrap();
+        let settings = SkillsLifecycleSettings {
+            enabled: true,
+            mode,
+            ..SkillsLifecycleSettings::default()
+        };
+        let service = SkillsLifecycleService::new(Arc::new(store), settings).unwrap();
+        SkillsManageTool::new(workspace.to_path_buf(), test_config(workspace), security)
+            .with_lifecycle(Arc::new(service))
+    }
+
+    fn offered_actions(tool: &SkillsManageTool) -> Vec<String> {
+        tool.parameters_schema()
+            .pointer("/properties/action/enum")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The actions the schema offers are exactly the legacy ones, plus the
+    /// lifecycle ones when a service is attached, and never an operator-only
+    /// operation or a parameter that lets the caller choose the suite, the
+    /// policy or the mode.
+    #[test]
+    fn lifecycle_actions_offered_match_the_policy_owner_split() {
+        let workspace = TempDir::new().unwrap();
+        let legacy = [
+            "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
+        ];
+        let plain = SkillsManageTool::new(
+            workspace.path().to_path_buf(),
+            test_config(workspace.path()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert_eq!(offered_actions(&plain), legacy);
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            plain.name(),
+            plain.description(),
+            &plain.parameters_schema(),
+        );
+
+        let tool = lifecycle_tool(workspace.path(), crate::skills::lifecycle::LifecycleMode::Shadow);
+        let mut expected: Vec<String> = legacy.iter().map(|a| (*a).to_string()).collect();
+        expected.extend(LIFECYCLE_READ_ACTIONS.iter().map(|a| (*a).to_string()));
+        expected.extend(LIFECYCLE_MUTATING_ACTIONS.iter().map(|a| (*a).to_string()));
+        let offered = offered_actions(&tool);
+        assert_eq!(offered, expected);
+        for forbidden in LIFECYCLE_OPERATOR_ONLY {
+            assert!(
+                !offered.iter().any(|action| action.contains(forbidden)),
+                "{forbidden} must never be offered"
+            );
+        }
+        let schema = tool.parameters_schema();
+        let properties = schema.get("properties").and_then(serde_json::Value::as_object).unwrap();
+        for forbidden in [
+            "suite",
+            "suite_digest",
+            "policy",
+            "mode",
+            "settings",
+            "candidate",
+            "bundle",
+            "path",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{forbidden} must not be a parameter"
+            );
+        }
+        crate::tools::schema::action_contract::assert_action_tool_contract(tool.name(), tool.description(), &schema);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actions_are_read_through_the_service_and_unknown_ones_are_refused() {
+        let workspace = TempDir::new().unwrap();
+        let tool = lifecycle_tool(workspace.path(), crate::skills::lifecycle::LifecycleMode::Shadow);
+
+        let status = tool.execute(json!({"action": "lifecycle_status"})).await.unwrap();
+        assert!(status.success, "{:?}", status.error);
+        let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
+        assert_eq!(status.get("mode").and_then(serde_json::Value::as_str), Some("shadow"));
+        assert!(
+            status
+                .get("publication_block")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+
+        let listed = tool.execute(json!({"action": "lifecycle_list"})).await.unwrap();
+        assert!(listed.success, "{:?}", listed.error);
+        assert!(listed.output.contains("\"proposals\": []"));
+
+        // Operator-only operations are not actions at all.
+        for forbidden in [
+            "write_suite",
+            "begin_evaluation",
+            "lifecycle_begin_evaluation",
+            "lifecycle_write_suite",
+        ] {
+            assert!(tool.execute(json!({"action": forbidden})).await.is_err(), "{forbidden}");
+        }
+
+        // A mutation reaches the service and is refused by the mode.
+        let publish = tool
+            .execute(with_grant(
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                &format!("skills_manage:lifecycle_publish:{PROPOSAL}"),
+            ))
+            .await
+            .unwrap();
+        assert!(!publish.success);
+        assert!(
+            publish.error.unwrap().contains("does not allow"),
+            "mode must refuse publication"
+        );
+        let rollback = tool
+            .execute(json!({
+                "action": "lifecycle_rollback",
+                "skill_id": "release-notes",
+                "revision_id": format!("r1-{}", "0".repeat(64)),
+                "expected_generation": 1
+            }))
+            .await
+            .unwrap();
+        assert!(!rollback.success);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actions_are_unavailable_without_a_service() {
+        let workspace = TempDir::new().unwrap();
+        let tool = SkillsManageTool::new(
+            workspace.path().to_path_buf(),
+            test_config(workspace.path()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        for action in LIFECYCLE_READ_ACTIONS.iter().chain(LIFECYCLE_MUTATING_ACTIONS.iter()) {
+            assert!(
+                tool.execute(json!({"action": action, "proposal_id": "x"}))
+                    .await
+                    .is_err(),
+                "{action}"
+            );
+        }
+    }
+
+    fn grant_for(operation: &str) -> serde_json::Value {
+        serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+            "skills_manage",
+            operation,
+            "test",
+            None,
+        ))
+        .unwrap()
+    }
+
+    fn with_grant(mut args: serde_json::Value, operation: &str) -> serde_json::Value {
+        if let Some(object) = args.as_object_mut() {
+            object.insert(
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                grant_for(operation),
+            );
+        }
+        args
+    }
+
+    const PROPOSAL: &str = "prop-00000000000000000000000000000000";
+    const OTHER_PROPOSAL: &str = "prop-11111111111111111111111111111111";
+
+    /// Publication and rollback need a grant bound to their target in every
+    /// autonomy level; cancel needs the bound grant when supervised.
+    #[tokio::test]
+    async fn lifecycle_mutations_need_grants_bound_to_their_target() {
+        use crate::security::AutonomyLevel;
+        let revision = format!("r1-{}", "0".repeat(64));
+        let rollback_args = json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 1});
+        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}");
+        let publish_args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let cancel_args = json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL});
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let tool = lifecycle_tool_with(
+                workspace.path(),
+                crate::skills::lifecycle::LifecycleMode::Shadow,
+                security,
+            );
+
+            // No grant: refused before the service is reached.
+            for args in [&publish_args, &rollback_args] {
+                let result = tool.execute(args.clone()).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("explicit approval grant"),
+                    "{autonomy:?}: {:?}",
+                    result.error
+                );
+            }
+            // A grant bound to another proposal or target is refused too.
+            for (args, operation) in [
+                (
+                    &publish_args,
+                    format!("skills_manage:lifecycle_publish:{OTHER_PROPOSAL}"),
+                ),
+                (&publish_args, "skills_manage:lifecycle_publish".to_string()),
+                (
+                    &rollback_args,
+                    "skills_manage:lifecycle_rollback:release-notes:r1-other".to_string(),
+                ),
+            ] {
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("explicit approval grant"),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+            // The bound grant reaches the service, which the mode then refuses.
+            for (args, operation) in [
+                (&publish_args, format!("skills_manage:lifecycle_publish:{PROPOSAL}")),
+                (&rollback_args, rollback_op.clone()),
+            ] {
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result.error.as_deref().unwrap_or_default().contains("does not allow"),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+        }
+
+        // Supervised cancel: refused without a grant, accepted with the bound one.
+        let workspace = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = lifecycle_tool_with(
+            workspace.path(),
+            crate::skills::lifecycle::LifecycleMode::Shadow,
+            security,
+        );
+        let refused = tool.execute(cancel_args.clone()).await.unwrap();
+        assert!(!refused.success);
+        assert!(
+            refused.error.as_deref().unwrap_or_default().contains("approval grant"),
+            "{:?}",
+            refused.error
+        );
+        let wrong = tool
+            .execute(with_grant(
+                cancel_args.clone(),
+                &format!("skills_manage:lifecycle_cancel:{OTHER_PROPOSAL}"),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wrong.error.as_deref().unwrap_or_default().contains("approval grant"),
+            "{:?}",
+            wrong.error
+        );
+        let reached = tool
+            .execute(with_grant(
+                cancel_args,
+                &format!("skills_manage:lifecycle_cancel:{PROPOSAL}"),
+            ))
+            .await
+            .unwrap();
+        assert!(!reached.success);
+        assert!(
+            reached
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no such proposal"),
+            "the bound grant must reach the service: {:?}",
+            reached.error
+        );
     }
 }

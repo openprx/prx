@@ -23,7 +23,7 @@ impl OwnedReceipt {
             let output = u64::from(output);
             let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
             let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-            let UsagePrice::Priced(cost) = usage_cost_resolution(
+            let cost = match usage_cost_resolution(
                 &self.provider,
                 &self.model,
                 input,
@@ -31,8 +31,19 @@ impl OwnedReceipt {
                 cache_write,
                 cache_read,
                 &self.config.cost,
-            ) else {
-                anyhow::bail!("decision usage has no valid pinned PMM price");
+            ) {
+                UsagePrice::Priced(cost) => cost,
+                UsagePrice::Missing
+                    if super::super::turn_cost::provider_is_zero_price_exempt(
+                        &crate::providers::ProviderId::of(&self.provider),
+                        super::effective_api_url(&self.config, &self.provider),
+                    ) =>
+                {
+                    0.0
+                }
+                UsagePrice::Missing | UsagePrice::Invalid => {
+                    anyhow::bail!("decision usage has no valid pinned PMM price")
+                }
             };
             let total = input + output;
             let record = MeteredTokenUsageRecord {

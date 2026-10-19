@@ -126,7 +126,9 @@ separate contracts. The admission input is currently populated as follows:
 The effective model window is pinned before decision dispatch. After the
 configured response reserve, the runtime reserves one sixteenth of the remaining
 window for the sealed decision request, capped at 4,096 tokens and by
-`causal_tree.policy.extra_token_ratio_limit` times that baseline window. The
+`causal_tree.policy.extra_token_ratio_limit` times that baseline window
+(the limit must be finite and greater than 0; zero or non-finite values are
+rejected at config load). The
 decision and main-turn input slices must both be positive. A smaller effective
 window, or a configured ratio too small to fund one decision token, fails closed with
 `resolved Agent context window has no safe decision reserve` before provider
@@ -284,6 +286,17 @@ Plain HTTP is permitted only for accepted loopback spelling: canonical decimal
 numeric alternate IP forms, mapped IPv6, `localhost.` and subdomains are not
 loopback exemptions. Other endpoints require HTTPS. URL user information,
 query strings and fragments are refused.
+
+`prx onboard --decision-backend typesafe|openrouter --decision-model <id>
+--decision-credential-stdin` (and the interactive wizard) store the hosted
+credential as `cred-decision-<kind>`, reference it and leave remote processing
+off; setup refuses when that reference already exists and never replaces it.
+
+`prx causal config set auto` (Gateway `{"op":"reset_backend_to_auto"}`) returns
+to `kind = auto`: it clears the endpoint, model, pinned snapshot and credential
+reference and turns remote processing off. The credential it referenced stays in
+the store, unreferenced; `prx doctor` lists it as an orphaned decision credential
+and `prx providers credential remove cred-<name>` deletes it.
 
 `credential_ref` names a stored credential; it is not a raw key. Use the
 credential management flow and protected input, never URL parameters, logs or

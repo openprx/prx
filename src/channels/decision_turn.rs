@@ -174,7 +174,7 @@ impl ChannelDecisionTurn {
             route.clone(),
             accounting.scope_id(),
         );
-        self.terminal.register_auxiliary_call(Arc::clone(&observation));
+        self.terminal.register_auxiliary_call(Arc::clone(&observation))?;
         Ok(SmartGroupClassifierCall {
             accounting,
             observation,
@@ -183,14 +183,14 @@ impl ChannelDecisionTurn {
         })
     }
 
-    pub(super) fn with_vision_observation(
-        mut self,
+    pub(super) fn register_vision_observation(
+        &mut self,
         accounting: &crate::runtime::auxiliary_call::AuxiliaryAccounting,
-    ) -> (Self, Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>) {
+    ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>> {
         let observation =
             crate::runtime::auxiliary_call::AuxiliaryProviderCall::new(self.route.clone(), accounting.scope_id());
-        self.terminal = self.terminal.with_auxiliary_call(Arc::clone(&observation));
-        (self, observation)
+        self.terminal.register_auxiliary_call(Arc::clone(&observation))?;
+        Ok(observation)
     }
 
     pub(super) fn build_provider(

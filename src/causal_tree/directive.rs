@@ -52,6 +52,10 @@ pub(crate) enum TurnExecutionDirective {
 /// later than this after issue is refused as mismatched.
 const MAX_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 
+/// An exactly named approval-required action on a surface with no owner review.
+const APPROVAL_UNAVAILABLE_REPLY: &str =
+    "This action needs owner approval, which this surface cannot collect; nothing was run.";
+
 /// Render only terminal dispositions that need no provider or capability call.
 /// Reason codes are internal diagnostics and never enter the reply text.
 pub(crate) fn render_terminal_directive(
@@ -62,6 +66,7 @@ pub(crate) fn render_terminal_directive(
             "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
             "retrieve_evidence" | "hop_stopped" => "What specific information should I use to answer your request?",
             "discover_capability" => "Which action would you like me to take?",
+            "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
             _ => "Could you clarify the result you want?",
         })),
         TurnExecutionDirective::RequestApproval { approval_scope } => Ok(std::borrow::Cow::Owned(format!(
@@ -72,9 +77,11 @@ pub(crate) fn render_terminal_directive(
         TurnExecutionDirective::Refuse { policy_code } => {
             // The internal code stays in the log; the reply never discloses policy detail.
             tracing::debug!(policy_code = %policy_code, "rendering terminal refusal");
-            Ok(std::borrow::Cow::Borrowed(
-                "I can't complete this request under the current policy.",
-            ))
+            Ok(std::borrow::Cow::Borrowed(if policy_code == "approval_requires_call" {
+                APPROVAL_UNAVAILABLE_REPLY
+            } else {
+                "I can't complete this request under the current policy."
+            }))
         }
         _ => Err(DirectiveError::ActionMismatch),
     }

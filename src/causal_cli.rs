@@ -170,6 +170,13 @@ pub enum CausalSetCommands {
         #[command(flatten)]
         apply: CausalApplyArgs,
     },
+    /// Go back to `kind = auto`: no endpoint, model, snapshot or credential
+    /// reference, and remote processing off (the builtin serves decisions
+    /// again)
+    Auto {
+        #[command(flatten)]
+        apply: CausalApplyArgs,
+    },
     /// Store a new credential for the configured backend and reference it,
     /// in one high-risk change (the previous decision credential is removed)
     Secret {
@@ -284,6 +291,7 @@ pub fn config_change(command: CausalConfigCommands, config: &Config) -> Result<C
                     apply,
                 }
             }
+            CausalSetCommands::Auto { apply } => plan(CausalMutation::ResetBackendToAuto, apply),
             CausalSetCommands::Policy {
                 max_candidates,
                 max_decision_hops,
@@ -414,6 +422,91 @@ impl DecisionSetup {
         Ok(())
     }
 
+    fn ensure_hosted_credential_free_in(
+        &self,
+        references: &crate::config::manage::credentials::CredentialReferences,
+    ) -> Result<String> {
+        use crate::config::manage::credentials::CredentialReferences;
+        let id = CredentialReferences::id_for(&format!("decision-{}", self.kind.as_str()))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // `set` creates or replaces. Setup must never overwrite (and, on a
+        // refusal, then delete) a credential an operator already stored under
+        // the documented name, so an existing one stops setup.
+        if references
+            .status(&id)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .is_some()
+        {
+            anyhow::bail!(
+                "the credential reference {id} already exists and setup never replaces it: keep it with `prx causal \
+                 config set backend --kind {kind} --model {model} --reference {id}`, rotate it with `prx causal \
+                 config set secret`, or remove it first with `prx providers credential remove {id}`",
+                kind = self.kind.as_str(),
+                model = self.model.as_deref().unwrap_or("<exact version>"),
+            );
+        }
+        Ok(id)
+    }
+
+    /// Refuse a hosted setup whose credential reference already exists in the
+    /// store next to `config_path`, before the base configuration is written.
+    ///
+    /// # Errors
+    ///
+    /// A kind that is not hosted, an unreadable store, or an existing reference.
+    pub fn ensure_hosted_credential_free(&self, config_path: &std::path::Path) -> Result<()> {
+        anyhow::ensure!(
+            hosted_owner(self.kind).is_some(),
+            "the decision backend `{}` is not a hosted service",
+            self.kind.as_str()
+        );
+        let config = Config {
+            config_path: config_path.to_path_buf(),
+            ..Config::default()
+        };
+        let references = crate::config::manage::credentials::CredentialReferences::for_config(&config)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.ensure_hosted_credential_free_in(&references).map(|_| ())
+    }
+
+    /// Check a hosted choice before anything is written: the kind is hosted, a
+    /// model is given, and the section rules accept the backend with a
+    /// credential reference (an openrouter model absent from the release
+    /// catalog still needs a pinned snapshot, so it is refused here).
+    ///
+    /// # Errors
+    ///
+    /// A kind that is not hosted, a missing model, or the refusal of the rules.
+    pub fn check_hosted(&self) -> Result<()> {
+        anyhow::ensure!(
+            hosted_owner(self.kind).is_some(),
+            "the decision backend `{}` is not a hosted service",
+            self.kind.as_str()
+        );
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .context("a hosted decision backend needs --decision-model, one exact version")?;
+        let mutations = vec![
+            CausalMutation::SetBackend {
+                kind: self.kind,
+                endpoint: self.endpoint.clone(),
+                model: Some(model.to_string()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            },
+            CausalMutation::SetCredentialRef(CredentialRefSetting::Profile(format!(
+                "cred-decision-{}",
+                self.kind.as_str()
+            ))),
+        ];
+        crate::config::manage::mutation::causal::CausalConfigService::mutate(&Config::default(), &mutations)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
     /// Apply this choice to the configuration written at `config`'s path,
     /// through the management service, as one recorded transaction, and
     /// return the plan text.
@@ -440,8 +533,97 @@ impl DecisionSetup {
         })
     }
 
+    /// Apply a hosted choice (`typesafe` or `openrouter`) together with its
+    /// credential, as setup: store `secret` as the credential reference
+    /// `cred-decision-<kind>` of the hosted provider, then plan the backend
+    /// and that reference as one recorded transaction, like [`Self::apply`].
+    /// Remote processing stays off (decision state does not leave this machine
+    /// until `prx causal config enable-remote`, which setup never does); the
+    /// returned text says so. A refusal removes the credential this call
+    /// stored, so nothing is left behind unreferenced.
+    ///
+    /// # Errors
+    ///
+    /// A kind that is not hosted, a missing model, a store failure, a
+    /// high-risk reason setup does not confirm, or the refusal of the plan or
+    /// the transaction. Every error says that the base configuration was
+    /// written and the decision backend was not.
+    pub async fn apply_hosted(
+        &self,
+        config: Config,
+        secret: crate::config::manage::credentials::SecretString,
+    ) -> Result<String> {
+        self.apply_hosted_written(config, secret).await.map_err(|error| {
+            anyhow::anyhow!(
+                "the base configuration was written, but the hosted decision backend was not configured: \
+                 {error:#}; configure it with `prx causal config set backend --kind {}`",
+                self.kind.as_str()
+            )
+        })
+    }
+
+    async fn apply_hosted_written(
+        &self,
+        config: Config,
+        secret: crate::config::manage::credentials::SecretString,
+    ) -> Result<String> {
+        use crate::config::manage::credentials::CredentialReferences;
+        let owner = hosted_owner(self.kind)
+            .with_context(|| format!("the decision backend `{}` is not a hosted service", self.kind.as_str()))?;
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .context("a hosted decision backend needs --decision-model, one exact version")?;
+        anyhow::ensure!(
+            !secret.expose().trim().is_empty(),
+            "the decision credential is empty; nothing was stored"
+        );
+        let references = CredentialReferences::for_config(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let name = format!("decision-{}", self.kind.as_str());
+        let id = self.ensure_hosted_credential_free_in(&references)?;
+        references
+            .set(owner, &name, secret.expose())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        drop(secret);
+        let applied = async {
+            let mut mutations = vec![
+                CausalMutation::SetBackend {
+                    kind: self.kind,
+                    endpoint: self.endpoint.clone(),
+                    model: Some(model.to_string()),
+                    pinned_snapshot: None,
+                    timeout_ms: None,
+                },
+                CausalMutation::SetCredentialRef(CredentialRefSetting::Profile(id.clone())),
+            ];
+            if self.enable {
+                mutations.push(CausalMutation::SetEnabled(true));
+            }
+            self.apply_mutations(config, mutations, true).await
+        }
+        .await;
+        match applied {
+            Ok(text) => Ok(format!(
+                "{text}\nDecision state stays on this machine until you run `prx causal config enable-remote`; \
+                 `prx causal test --live` asks the service once."
+            )),
+            Err(error) => {
+                if let Err(removal) = references.remove(&id) {
+                    tracing::warn!(reference = %id, "the decision credential stored for a refused setup could not be removed: {removal}");
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn apply_written(&self, config: Config) -> Result<String> {
         let mutations = self.mutations()?;
+        self.apply_mutations(config, mutations, false).await
+    }
+
+    async fn apply_mutations(&self, config: Config, mutations: Vec<CausalMutation>, hosted: bool) -> Result<String> {
         let service = crate::config::manage::ManagementService::deferred(crate::config::new_shared(config));
         let plan = service
             .plan_causal(&mutations, crate::config::manage::ConfigActor::Cli)
@@ -449,7 +631,7 @@ impl DecisionSetup {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let text = plan.text();
         let revision = plan.revision().map(str::to_string);
-        if !self.confirms(&plan.summary().risk_reasons) {
+        if !self.confirms(&plan.summary().risk_reasons, hosted) {
             anyhow::bail!(
                 "the change is high risk beyond a local decision endpoint ({}), and setup never confirms it: review \
                  it with `prx causal config set backend --kind {}{}{}` and apply it with `--yes \
@@ -484,8 +666,9 @@ impl DecisionSetup {
 
     /// Whether setup may confirm `reasons` itself: none, or only the new
     /// decision endpoint (and the model declaration naming it) when that
-    /// endpoint is a literal loopback address.
-    fn confirms(&self, reasons: &[crate::config::manage::RiskReason]) -> bool {
+    /// endpoint is a literal loopback address, plus (hosted setup only) the
+    /// reference to the credential setup just stored.
+    fn confirms(&self, reasons: &[crate::config::manage::RiskReason], hosted: bool) -> bool {
         let loopback = self
             .endpoint
             .as_deref()
@@ -495,6 +678,10 @@ impl DecisionSetup {
                 loopback
                     && (path == "causal_tree.backend.endpoint"
                         || (path.starts_with("providers.models[") && path.ends_with("].provider")))
+            }
+            // The hosted flow stored this credential itself, one step before.
+            crate::config::manage::RiskReason::CredentialChanged { path } => {
+                hosted && path == "causal_tree.backend.credential_ref"
             }
             _ => false,
         })
@@ -1096,6 +1283,24 @@ async fn execute(admin: &DecisionAdmin, json: bool, command: CausalReadCommands,
 mod tests {
     use super::*;
 
+    #[derive(clap::Parser)]
+    struct ConfigCli {
+        #[command(subcommand)]
+        command: CausalConfigCommands,
+    }
+
+    #[test]
+    fn set_auto_parses_and_plans_the_reset() {
+        use clap::Parser as _;
+        let parsed = ConfigCli::try_parse_from(["causal-config", "set", "auto", "--yes"]).expect("test: parses");
+        let change = config_change(parsed.command, &Config::default()).expect("test: plans");
+        assert!(matches!(
+            change,
+            CausalConfigChange::Plan { ref mutations, ref apply }
+                if apply.yes && matches!(mutations.as_slice(), [CausalMutation::ResetBackendToAuto])
+        ));
+    }
+
     // Exercise the production admin accounting entry under its real cleanup owner.
     #[tokio::test]
     async fn admin_accounting_accepts_real_configured_physical_slot() {
@@ -1438,6 +1643,109 @@ mod tests {
         edit(&mut config);
         config.save().await.expect("test: save");
         Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load")
+    }
+
+    /// Hosted onboarding stores the credential, references it, keeps remote
+    /// processing off, and a refused plan leaves no credential behind.
+    #[tokio::test]
+    async fn setup_stores_a_hosted_credential_and_references_it_without_enabling_remote() {
+        use crate::config::manage::credentials::{CredentialReferences, SecretString};
+        let temp = tempfile::TempDir::new().expect("test: temp");
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("test: catalog");
+        let entry = catalog
+            .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
+            .expect("test: hosted entry");
+        let setup = DecisionSetup {
+            kind: BackendKind::OpenRouter,
+            endpoint: None,
+            model: Some(entry.api_model.clone()),
+            enable: true,
+        };
+        let config = written(temp.path(), |_| {}).await;
+        let text = setup
+            .apply_hosted(
+                config.clone(),
+                SecretString::new("sk-or-test-hosted-credential-0001".to_string()),
+            )
+            .await
+            .expect("test: hosted setup applies");
+        assert!(text.contains("enable-remote"), "{text}");
+        let after = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load");
+        assert!(!after.causal_tree.backend.remote_enabled);
+        assert!(after.causal_tree.enabled);
+        assert_eq!(
+            after.causal_tree.backend.credential_ref,
+            CredentialRefSetting::Profile("cred-decision-openrouter".to_string())
+        );
+        let references = CredentialReferences::for_config(&after).expect("test: store");
+        assert!(
+            references
+                .check_reference("cred-decision-openrouter", "openrouter")
+                .is_ok()
+        );
+
+        // The existing reference is found before any base configuration is written.
+        assert!(
+            setup
+                .ensure_hosted_credential_free(&config.config_path)
+                .expect_err("test: existing reference")
+                .to_string()
+                .contains("already exists")
+        );
+        let fresh = tempfile::TempDir::new().expect("test: temp");
+        setup
+            .ensure_hosted_credential_free(&fresh.path().join("config.toml"))
+            .expect("test: nothing stored yet");
+        // A second run never replaces the stored credential, and says how to keep it.
+        let before = references.status("cred-decision-openrouter").expect("test: status");
+        let error = setup
+            .apply_hosted(
+                config.clone(),
+                SecretString::new("sk-or-test-hosted-credential-0003".to_string()),
+            )
+            .await
+            .expect_err("test: existing credential is kept")
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(
+            references.status("cred-decision-openrouter").expect("test: status"),
+            before,
+            "the existing credential was left untouched"
+        );
+
+        // A refusal after the store (an uncatalogued OpenRouter model has no
+        // pinned snapshot) removes only the credential this run stored.
+        let refused_dir = tempfile::TempDir::new().expect("test: temp");
+        let config = written(refused_dir.path(), |_| {}).await;
+        let error = DecisionSetup {
+            model: Some("vendor/not-in-the-catalog".to_string()),
+            ..setup.clone()
+        }
+        .apply_hosted(
+            config.clone(),
+            SecretString::new("sk-or-test-hosted-credential-0004".to_string()),
+        )
+        .await
+        .expect_err("test: plan refused")
+        .to_string();
+        assert!(error.contains("hosted decision backend was not configured"), "{error}");
+        let references_after = CredentialReferences::for_config(&config).expect("test: store");
+        assert_eq!(references_after.list().expect("test: list").len(), 0);
+
+        // A model-less choice is refused before anything is stored.
+        let other = tempfile::TempDir::new().expect("test: temp");
+        let config = written(other.path(), |_| {}).await;
+        let error = DecisionSetup { model: None, ..setup }
+            .apply_hosted(
+                config.clone(),
+                SecretString::new("sk-or-test-hosted-credential-0002".to_string()),
+            )
+            .await
+            .expect_err("test: model required")
+            .to_string();
+        assert!(error.contains("--decision-model"), "{error}");
+        let references = CredentialReferences::for_config(&config).expect("test: store");
+        assert_eq!(references.list().expect("test: list").len(), 0);
     }
 
     /// D-105 K-1: setup confirms a loopback decision endpoint itself, and

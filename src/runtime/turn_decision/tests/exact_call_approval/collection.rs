@@ -121,6 +121,7 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
                     provider: None,
                     configured_model: Arc::from("prx-local-model"),
                 },
+                family: "filesystem",
                 calls: Arc::clone(&predictions),
             })],
             Arc::clone(&owning.state_key),
@@ -497,6 +498,331 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
             tracing::error!(%error, "Failed to write retained approval collection fixture path");
         }
     }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(confirmed, "approval fixture final writer cleanup must be confirmed");
+}
+
+const MCP_WRITE_SERVER: &str = r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": message.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "prx-server", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}, {"name": "search", "description": "Search remote data", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}}]}
+    elif method == "tools/call":
+        with open("@MARKER@", "a") as marker:
+            marker.write("executed\n")
+        result = {"content": [{"type": "text", "text": "written"}], "isError": False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"#;
+
+/// Finding 76: a fresh Chat request that names a supervised, approval-required
+/// MCP write tool is owned by the decision plane. It collects the exact
+/// arguments without dispatching, parks a signed pending review, and only the
+/// approved resume reaches the real stdio server (once).
+#[tokio::test]
+async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
+    let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success()),
+        "test: python3 runs the stdio MCP fixture"
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("mcp-executed.marker");
+    let tool_name = "mcp__prx_server__write";
+    let executions = || std::fs::read_to_string(&marker).map_or(0, |text| text.lines().count());
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.config_path = workspace.path().join("config.toml");
+    config.causal_tree.enabled = true;
+    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+    config.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    config.mcp.servers.insert(
+        "prx_server".to_owned(),
+        crate::config::McpServerConfig {
+            command: Some("python3".into()),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                MCP_WRITE_SERVER.replace("@MARKER@", &marker.to_string_lossy()),
+            ],
+            startup_timeout_ms: 10_000,
+            request_timeout_ms: 10_000,
+            ..crate::config::McpServerConfig::default()
+        },
+    );
+    config.save().await.expect("owned fixture config");
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+    let mcp = Arc::new(
+        crate::tools::McpTool::new(Arc::clone(&security), config.mcp.clone(), workspace.path().to_owned())
+            .with_launch_root(workspace.path().join("mcp")),
+    );
+    let discovered = Tool::execute(mcp.as_ref(), serde_json::json!({"action": "refresh"}))
+        .await
+        .unwrap();
+    assert!(discovered.success, "real MCP discovery: {discovered:?}");
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![mcp.test_boxed_tool()]);
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let execution = Arc::new(
+        ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        )
+        .with_idempotency_memory(Arc::clone(&memory)),
+    );
+    let hooks = crate::hooks::HookDiagnostics {
+        configured: false,
+        valid: true,
+        config_path: String::new(),
+        timeout_ms: 0,
+        action_count: 0,
+        events: BTreeMap::new(),
+        catalog_digest: None,
+        error: None,
+        runs: false,
+        blocked: None,
+    };
+    let catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let mut service = build_turn_decision_service(
+        TurnSurfaceKind::Interactive,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry: Arc::clone(&registry),
+            execution,
+            catalog_sources: CatalogSources::from_runtime_inputs(
+                generation.id.0.to_string(),
+                &config,
+                mcp.capability_snapshot(),
+                &hooks,
+                0,
+            ),
+            surface_policy: SurfacePolicy {
+                direct_names: BTreeSet::new(),
+                excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .unwrap();
+    use futures_util::FutureExt as _;
+    let owned_cleanup_confirmed = AtomicBool::new(true);
+    let result = std::panic::AssertUnwindSafe(Box::pin(async {
+        let owning = Arc::get_mut(&mut service).unwrap();
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(FilesystemApprovalBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+                family: "mcp",
+                calls: Arc::new(AtomicUsize::new(0)),
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let cancel = CancellationToken::new();
+        // Bare server-side names are ordinary words, never a collection trigger.
+        for (seq, prose) in [
+            (11_u64, "write a poem about spring"),
+            (12, "search the docs for the release notes"),
+        ] {
+            let (prose_proof, _) = recorded_approval_source(
+                &generation,
+                Arc::clone(&memory),
+                prose,
+                ChatMode::Edit,
+                &format!("prx_mcp_prose_{seq}"),
+                seq,
+            )
+            .await;
+            let prose_context = service
+                .decide_agent_initial(prose_proof.as_ref(), AgentTurnKind::Repl, &cancel)
+                .await
+                .unwrap();
+            assert!(
+                prose_context.approval_collection_proof().is_none(),
+                "{prose:?} must not park an owner review"
+            );
+        }
+        // The full public name wins over other plain-word matches in the text.
+        let (mixed_proof, _) = recorded_approval_source(
+            &generation,
+            Arc::clone(&memory),
+            "Use mcp__prx_server__write after you search the notes",
+            ChatMode::Edit,
+            "prx_mcp_mixed",
+            13,
+        )
+        .await;
+        let mixed = service
+            .decide_agent_initial(mixed_proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            mixed
+                .approval_collection_proof()
+                .is_some_and(|proof| proof.capability().id.as_str().contains("write")),
+            "one full-name approval-required mention collects despite other matches"
+        );
+        assert_eq!(executions(), 0);
+        let input = format!("Call {tool_name} with path remote.txt and content approved exact contents");
+        let (proof, envelope) = recorded_approval_source(
+            &generation,
+            Arc::clone(&memory),
+            &input,
+            ChatMode::Edit,
+            "prx_mcp_approval_original",
+            1,
+        )
+        .await;
+        let context = service
+            .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .unwrap();
+        let collection = context
+            .approval_collection_proof()
+            .expect("an exactly named MCP write collects arguments, never answers");
+        let reference = collection.capability().clone();
+        assert!(context.execution_refs().is_empty());
+        assert_eq!(executions(), 0);
+        let writer = service.store.writer().unwrap();
+        assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
+        let arguments = serde_json::json!({"path": "remote.txt", "content": "approved exact contents"});
+        Box::pin(usage::exercise(usage::Fixture {
+            service: &service,
+            context: &context,
+            proof: proof.as_ref(),
+            envelope: &envelope,
+            config: &config,
+            memory: &memory,
+            registry: &registry,
+            tool_name,
+            arguments: &arguments,
+            cleanup_confirmed: &owned_cleanup_confirmed,
+        }))
+        .await;
+        assert_eq!(executions(), 0, "collection never dispatches");
+        let (owner, session, id) = (proof.owner_id(), proof.session_key(), context.decision_id());
+        assert!(
+            service
+                .inspect_pending_decision_approval(owner, session, id)
+                .await
+                .is_ok()
+        );
+        let altered = serde_json::json!({"path": "remote.txt", "content": "altered contents"});
+        assert!(
+            service
+                .prepare_decision_resume(
+                    owner,
+                    session,
+                    id,
+                    ToolExecutionCommand::new(tool_name, arguments.clone())
+                )
+                .await
+                .is_err(),
+            "no resume before the owner's review"
+        );
+        let review = service
+            .review_pending_decision_approval(owner, session, id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(review).unwrap().get("approved"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            service
+                .prepare_decision_resume(owner, session, id, ToolExecutionCommand::new(tool_name, altered))
+                .await
+                .is_err(),
+            "different arguments cannot ride the approval"
+        );
+        assert_eq!(executions(), 0);
+        let resume_input = serde_json::json!({"decision_id": id.to_string()}).to_string();
+        let (resume, resume_envelope) = recorded_approval_source(
+            &generation,
+            Arc::clone(&memory),
+            &resume_input,
+            ChatMode::Edit,
+            "prx_mcp_approval_resume",
+            3,
+        )
+        .await;
+        let resumed = service
+            .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .unwrap();
+        let selected = service.agent_execution_specs(resume.as_ref(), &resumed).unwrap();
+        assert_eq!(
+            selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            [tool_name]
+        );
+        assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
+        let actual_context = ToolExecutionContext::new(resume_envelope, resume.policy_chat_type());
+        let executed = service
+            .execute_agent_resume(resume.as_ref(), &resumed, &actual_context, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(executed.status, ToolExecutionStatus::Succeeded, "{:?}", executed.error);
+        assert_eq!(executions(), 1, "the approved call reaches the server exactly once");
+        assert!(
+            service
+                .execute_agent_resume(resume.as_ref(), &resumed, &actual_context, &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(executions(), 1);
+        assert!(reference.id.as_str().contains("write"));
+    }))
+    .catch_unwind()
+    .await;
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    let cleanup = tokio::time::timeout_at(cleanup_deadline.into(), service.drain_writes(cleanup_deadline)).await;
+    let confirmed = matches!(cleanup, Ok(true)) && owned_cleanup_confirmed.load(Ordering::SeqCst);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

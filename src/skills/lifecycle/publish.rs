@@ -18,6 +18,28 @@ use chrono::Utc;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
+/// Transaction id prefix of proposal publications (authorize.rs).
+pub(super) const PROPOSAL_TX_PREFIX: &str = "pub-";
+/// Transaction id prefix of legacy imports (migrate.rs).
+pub(super) const MIGRATION_TX_PREFIX: &str = "mig-";
+
+/// ASCII case-insensitive prefix test: `PUB-` must not slip past `pub-` and
+/// land on the same file on a case-insensitive file system.
+fn has_prefix(id: &str, prefix: &str) -> bool {
+    id.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn refuse_reserved(transaction: &TransactionId) -> Result<(), LifecycleError> {
+    let id = transaction.as_str();
+    if has_prefix(id, PROPOSAL_TX_PREFIX) || has_prefix(id, MIGRATION_TX_PREFIX) {
+        return Err(LifecycleError::ReservedTransactionId {
+            transaction_id: id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// How long a transition waits for the skill's publication lock.
 pub const PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -130,6 +152,8 @@ struct Fingerprint<'a> {
     expected_generation: u64,
     /// `None` for rollbacks, whose enabled state comes from the target's anchor.
     enabled: Option<bool>,
+    /// The authorization pin of the request; an entry without one is legacy.
+    authorization_digest: Option<&'a str>,
 }
 
 impl Fingerprint<'_> {
@@ -142,6 +166,10 @@ impl Fingerprint<'_> {
         ) == (self.kind, self.skill, self.candidate, self.expected_generation)
             && self.digest.is_none_or(|d| entry.candidate_record_digest == d)
             && self.enabled.is_none_or(|e| entry.enabled == e)
+            // A pinned request resumes only an entry carrying the same pin; an
+            // entry without one (legacy) is never taken for an authorized
+            // publication, and an unpinned request never resumes a pinned one.
+            && self.authorization_digest == entry.authorization_digest.as_deref()
     }
 }
 
@@ -149,9 +177,52 @@ impl SkillLifecycleStore {
     /// Publishes `request.candidate` as the active revision if the active
     /// generation still equals `request.expected_generation`.
     ///
+    /// This is the raw store-level transition: it applies no lifecycle mode,
+    /// gate policy or authorization, so it is `pub(in crate::skills)`; code
+    /// elsewhere goes through `SkillsLifecycleService` (test fixtures use
+    /// `test_support`). The transaction id
+    /// prefixes `pub-` (proposal publication) and `mig-` (legacy import) are
+    /// reserved for their owners and refused here.
+    ///
     /// Blocking: waits for locks and does file I/O; async callers must use
     /// `spawn_blocking`.
-    pub fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
+    pub(in crate::skills) fn publish(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
+        refuse_reserved(&request.transaction_id)?;
+        self.publish_inner(request, None)
+    }
+
+    /// Publication of an authorized proposal: the id must be `pub-...` and the
+    /// authorization digest is pinned in the PREPARED entry. A retry of the
+    /// same transaction id must carry the same digest; an entry without one,
+    /// or with another, is a [`LifecycleError::TransactionConflict`].
+    pub(super) fn publish_pinned(
+        &self,
+        request: &PublishRequest,
+        authorization_digest: &str,
+    ) -> Result<TransactionOutcome, LifecycleError> {
+        if !request.transaction_id.as_str().starts_with(PROPOSAL_TX_PREFIX) {
+            return Err(LifecycleError::ReservedTransactionId {
+                transaction_id: request.transaction_id.to_string(),
+            });
+        }
+        self.publish_inner(request, Some(authorization_digest))
+    }
+
+    /// Legacy import publication: the id must be `mig-...`.
+    pub(super) fn publish_migration(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
+        if !request.transaction_id.as_str().starts_with(MIGRATION_TX_PREFIX) {
+            return Err(LifecycleError::ReservedTransactionId {
+                transaction_id: request.transaction_id.to_string(),
+            });
+        }
+        self.publish_inner(request, None)
+    }
+
+    fn publish_inner(
+        &self,
+        request: &PublishRequest,
+        authorization_digest: Option<&str>,
+    ) -> Result<TransactionOutcome, LifecycleError> {
         self.ensure_publication_dirs()?;
         let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
@@ -162,6 +233,7 @@ impl SkillLifecycleStore {
             digest: Some(&request.candidate_record_digest),
             expected_generation: request.expected_generation,
             enabled: Some(request.enabled),
+            authorization_digest,
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -174,6 +246,7 @@ impl SkillLifecycleStore {
             &request.candidate_record_digest,
             request.expected_generation,
             request.enabled,
+            authorization_digest,
         )
     }
 
@@ -183,7 +256,7 @@ impl SkillLifecycleStore {
     /// from the journal entry that committed the target, not from the caller.
     ///
     /// Blocking, like [`Self::publish`].
-    pub fn rollback(&self, request: &RollbackRequest) -> Result<TransactionOutcome, LifecycleError> {
+    pub(in crate::skills) fn rollback(&self, request: &RollbackRequest) -> Result<TransactionOutcome, LifecycleError> {
         self.ensure_publication_dirs()?;
         let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
@@ -194,6 +267,7 @@ impl SkillLifecycleStore {
             digest: None,
             expected_generation: request.expected_generation,
             enabled: None,
+            authorization_digest: None,
         };
         if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
@@ -215,6 +289,7 @@ impl SkillLifecycleStore {
             &anchor.candidate_record_digest,
             request.expected_generation,
             anchor.enabled,
+            None,
         )
     }
 
@@ -256,6 +331,7 @@ impl SkillLifecycleStore {
         candidate_digest: &str,
         expected_generation: u64,
         enabled: bool,
+        authorization_digest: Option<&str>,
     ) -> Result<TransactionOutcome, LifecycleError> {
         let skill = lock.skill();
         // A PREPARED entry of this skill whose swap went live must be settled
@@ -297,6 +373,7 @@ impl SkillLifecycleStore {
             expected_generation,
             new_generation,
             enabled,
+            authorization_digest: authorization_digest.map(str::to_string),
             state: TransactionState::Prepared,
             prepared_at: Utc::now(),
             finished_at: None,

@@ -20,7 +20,10 @@
 //! A reference is used only by reference: the provider's own store lookup
 //! (`auth::select_profile_id`) never falls back to a `cred-` entry, so creating
 //! one for a route does not silently change the provider's default
-//! credential.
+//! credential. The one exception is the configured default provider's
+//! default-named reference (`cred-<catalog name>`, what `prx providers
+//! credential set <provider>` stores): default chat resolves it when the root
+//! connection holds no inline key (`providers::selection::credential_for`).
 //!
 //! Consumers: the management surfaces (PMM-E `prx providers credential`,
 //! PMM-F `PUT /api/providers/{id}/credential`) and the hosted decision
