@@ -171,6 +171,20 @@ dispatched hold stays in place until both writes finish. Another physical send
 waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
 retains its serialization gate from reservation through transport and settlement,
 so handing reported usage to persistence cannot suspend behind another request.
+Only one physical attempt can be in flight in one decision-accounting scope.
+A second attempt in that same scope waits even while the first provider call is
+still running; it can exhaust its unchanged admission deadline without being
+sent. Retry attempts proceed after the previous receipt has relinquished the
+gate. Independent scopes do not share this gate.
+
+Deferred settlement has a crash window: the in-memory usage adjustment can
+precede the canonical cost-row sync. The durable dispatched estimate remains,
+but any reported actual cost above that estimate can be absent after a crash
+in this interval. The gate bounds this window to at most one reported,
+not-yet-durable settlement per live scope; there is no fixed wall-clock bound
+on slow storage and no single global monetary bound across concurrent scopes.
+Cleanup waits for persistence and closes further accounting on failure. It
+cannot recover an excess that was never durably written before a process crash.
 Metering and estimated-liability reconciliation share one held ledger lock and
 snapshot. The canonical cost row is synced before journal reconciliation;
 invalid journal state still retains the charge and fails cleanup closed.

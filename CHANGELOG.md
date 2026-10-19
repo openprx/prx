@@ -19,6 +19,13 @@ for integration, validation and rollback limits.
   admission's deadline. Applied events bypass deferred phases; drain flushes
   earlier events without waiting for unrelated admissions. No admission budget
   is raised.
+- Decision accounting permits one in-flight physical attempt per scope, so a
+  concurrent same-scope attempt can expire while waiting for the first call.
+  Deferred reported-usage settlement retains the dispatched estimate during
+  I/O, but a crash before canonical cost-row sync can lose actual cost above
+  that estimate. The window contains at most one reported pending settlement
+  per scope and has no fixed storage-latency bound. See
+  [the accounting contract](docs/decision-plane.md#admission-and-backend-selection).
 
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.

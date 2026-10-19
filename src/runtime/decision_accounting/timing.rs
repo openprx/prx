@@ -24,6 +24,13 @@ struct Stage {
 }
 pub(crate) struct Capture(Arc<Mutex<Snapshot>>);
 impl Capture {
+    pub(crate) fn has_stage(&self, stage: &str) -> bool {
+        self.0
+            .lock()
+            .rows
+            .iter()
+            .any(|row| row.stages.iter().flatten().any(|record| record.stage == stage))
+    }
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(Snapshot {
             rows: Vec::with_capacity(16),

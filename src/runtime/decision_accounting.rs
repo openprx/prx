@@ -279,12 +279,20 @@ impl AccountingScope {
             #[cfg(test)]
             let (prepared, mut diagnostic_timing) = prepared;
             let mut prepared = prepared.map_err(|_| DecisionError::BudgetExceeded)?;
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark("settlement_wait_started");
+            }
             let settlement_guard = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(DecisionError::Cancelled),
                 result = tokio::time::timeout_at(deadline.into(), Arc::clone(&remaining.settlement_gate).lock_owned()) =>
                     result.map_err(|_| DecisionError::BudgetExceeded)?,
             };
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark("settlement_wait_acquired");
+            }
             if remaining.settlement_failed.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err(DecisionError::BudgetExceeded);
             }
