@@ -814,6 +814,17 @@ impl ApprovalGrant {
         self.v2.as_ref().map(|grant| (grant.grant_id.as_str(), grant.max_uses))
     }
 
+    /// Spends the one use of a signed v2 grant in the process-level replay
+    /// ledger. `true` when this call took the use; `false` for a replay and for
+    /// a grant without a signed use budget (a v1 grant), which cannot be
+    /// consumed. For callers that decide on a grant themselves, where the gate
+    /// does not consume it (the gate only does so under `supervised`).
+    #[must_use]
+    pub(crate) fn consume_single_use(&self) -> bool {
+        self.v2_single_use_key()
+            .is_some_and(|(grant_id, max_uses)| try_consume_v2_grant(grant_id, max_uses))
+    }
+
     /// Precise deny reason for a command decision when this grant did not
     /// authorize, for compliance audit logging. `None` when it did authorize.
     #[must_use]

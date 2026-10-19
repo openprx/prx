@@ -343,6 +343,61 @@ always_exclude = []
 [skill_rag]
 top_k = 32
 
+# Skill lifecycle: learned revisions of skills are proposed, evaluated against an
+# operator-owned frozen suite, gated and only then published. Everything here is
+# operator-owned; no tool or model output can change it. The section is read at
+# process start (changing it needs a restart) and is validated when the
+# configuration loads. Off by default: nothing is offered to the agent and no
+# store is opened.
+#   mode = "draft_only"  drafts and reviews only (default)
+#   mode = "shadow"      adds bounded evaluation and gating, never publishes
+#   mode = "auto"        publishes an eligible proposal after every gate
+# A weaker publication policy is refused at load, not downgraded:
+# `require_holdout = false` and `min_cases_floor` below 3 do not load, and
+# neither does `allow_executable_proposals = true` (reviewed executable bundles
+# are not available yet). `storage_dir` only accepts the default, the location
+# `skill_read` and recovery use. `owner_scope` names the owner whose store this
+# installation manages and is required when enabled; an agent run from another
+# owner, or from a caller whose owner the runtime cannot derive, does not reach
+# the lifecycle actions of `skills_manage` (the refusal names both owner ids,
+# and `prx skills lifecycle status` shows the configured one). The runtime
+# derives the caller's owner id from its trusted scope: the scope's `owner_id`
+# when it has one (gateway, console and webhook turns carry it), otherwise
+# "owner:<workspace>:<channel>:<sender>" composed from the workspace path, the
+# channel the session runs on (terminal chat, the Web Console and each IM
+# channel have their own channel name, for example "telegram") and the sender
+# (the operator or chat user id). Set `owner_scope` to exactly that id for the
+# sessions that should manage skills. An owner-isolated caller without its own
+# owner id never matches. Each `suites`
+# entry registers the frozen suite (by SHA-256 digest) that governs one skill.
+# Operate it with `prx skills lifecycle status|list|inspect|publish|cancel|
+# rollback|force-close`. `force-close` (CLI only) closes an authorized proposal
+# stuck on a transaction conflict as failed or stale with a recorded reason; it
+# never publishes and leaves the active revision as it is (a publication that
+# turns out to be live is recorded Committed instead of closed). Proposing is not
+# wired yet, so a lifecycle with no proposals stays idle. With the daemon, an
+# enabled lifecycle runs a recovery sweep at start (retrying with backoff while
+# another process holds the store lock) and `status` lists any proposal it had
+# to skip. Publishing or rolling back through `skills_manage` needs a signed
+# one-shot approval grant bound to the proposal (or to skill, revision and
+# observed generation for a rollback), in every autonomy level; the grant is
+# spent on use.
+[skills_lifecycle]
+enabled = false
+mode = "draft_only"
+# owner_scope = "owner:workspace:cli:alice"
+storage_dir = "self/skill-lifecycle"
+require_holdout = true
+min_cases_floor = 3
+max_concurrent_evaluations = 1
+max_proposals_per_cycle = 1
+max_edit_tokens = 300
+max_edit_fraction = 0.20
+allow_executable_proposals = false
+# [[skills_lifecycle.suites]]
+# skill_id = "release-notes"
+# suite_digest = "<64 lowercase hex digits>"
+
 # Optional exact-model tool allowlists constrain decision-eligible tools.
 # Models without an entry keep the ordinary tool set. An empty list deliberately
 # exposes no tools. Quote model names containing `/` or `:` in TOML.

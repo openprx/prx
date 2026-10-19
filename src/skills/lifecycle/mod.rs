@@ -53,7 +53,7 @@ mod tests;
 #[cfg(test)]
 use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
-pub use authorize::{Finalization, MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
+pub use authorize::{Finalization, ForceClose, MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
     release_task_pins, task_pin,
@@ -108,8 +108,9 @@ pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, Roll
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use review::{ReviewCheck, ReviewFinding, SOURCE_REVIEW_IDENTITY, SourceReviewOutcome, SourceReviewRecord};
 pub use service::{
-    LifecycleMode, LifecycleStatus, MIN_PUBLICATION_CASES_FLOOR, ProposalDetail, ProposalSummary, ReviewSummary,
-    ServiceError, SkillsLifecycleService, SkillsLifecycleSettings, StartupReport, SuiteRegistry, default_gate_policy,
+    LifecycleLimits, LifecycleMode, LifecycleStatus, MIN_PUBLICATION_CASES_FLOOR, ProposalDetail, ProposalSummary,
+    ReviewSummary, ServiceError, SkillsLifecycleService, SkillsLifecycleSettings, SkippedProposal, StartupReport,
+    StartupSummary, SuiteRegistry, default_gate_policy,
 };
 pub use store::{SkillLifecycleStore, VerifiedRevision, WriteOutcome, record_digest};
 pub use suite::{

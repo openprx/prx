@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::runtime::RuntimeAdapter;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
-use crate::security::policy::{ApprovalGrant, RUNTIME_APPROVAL_GRANT_ARG, ResourceRiskLevel, SideEffectGate};
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -457,7 +457,8 @@ pub(crate) const LIFECYCLE_MUTATING_ACTIONS: [&str; 3] =
 /// proposal, or spend on evaluation, and belong to the operator and the
 /// scheduler only.
 #[cfg(test)]
-pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 7] = [
+pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 8] = [
+    "force_close",
     "write_suite",
     "install_suite",
     "begin_evaluation",
@@ -483,6 +484,23 @@ impl SkillsManageTool {
             config,
             security,
             lifecycle: None,
+        }
+    }
+
+    /// Builds the tool for an installation: the lifecycle actions are attached
+    /// only when `[skills_lifecycle]` is enabled and its store opens. A
+    /// disabled lifecycle opens nothing and offers nothing; a lifecycle that
+    /// cannot start is logged and not offered.
+    pub fn from_config(workspace_dir: PathBuf, config: Config, security: Arc<SecurityPolicy>) -> Self {
+        let service = crate::skills::lifecycle_runtime::open_service(&workspace_dir, &config.skills_lifecycle);
+        let tool = Self::new(workspace_dir, config, security);
+        match service {
+            Ok(Some(service)) => tool.with_lifecycle(service),
+            Ok(None) => tool,
+            Err(error) => {
+                tracing::error!(%error, "skill lifecycle is enabled but could not start; its actions are not offered");
+                tool
+            }
         }
     }
 
@@ -605,10 +623,10 @@ impl SkillsManageTool {
         })
     }
 
+    /// The grant the runtime attached, with the trusted caller principal bound
+    /// from the trusted scope (a signed v2 grant is honoured only for it).
     fn approval_grant(args: &serde_json::Value) -> Option<ApprovalGrant> {
-        args.get(RUNTIME_APPROVAL_GRANT_ARG)
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
+        ApprovalGrant::from_runtime_args("skills_manage", args)
     }
 
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), ToolResult> {
@@ -627,8 +645,14 @@ impl SkillsManageTool {
         // replayed against another.
         let target = match action {
             "lifecycle_publish" | "lifecycle_cancel" => arg("proposal_id").map(str::to_string),
-            "lifecycle_rollback" => match (arg("skill_id"), arg("revision_id")) {
-                (Some(skill), Some(revision)) => Some(format!("{skill}:{revision}")),
+            // The expected generation is part of the bound operation, so a
+            // grant for one observed state cannot roll back another.
+            "lifecycle_rollback" => match (
+                arg("skill_id"),
+                arg("revision_id"),
+                args.get("expected_generation").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(skill), Some(revision), Some(generation)) => Some(format!("{skill}:{revision}:{generation}")),
                 _ => None,
             },
             _ => None,
@@ -643,10 +667,12 @@ impl SkillsManageTool {
             // explicit grant bound to its target in every autonomy level, also
             // under full autonomy where the gate would otherwise let it pass.
             let now = chrono::Utc::now().timestamp();
+            // Only a signed one-shot (v2) grant qualifies: it expires and can be
+            // spent once, which a v1 hash grant cannot.
             let granted = target.is_some()
-                && grant
-                    .as_ref()
-                    .is_some_and(|grant| grant.permits_resource_operation(self.name(), &operation, risk, now));
+                && grant.as_ref().is_some_and(|grant| {
+                    grant.v2.is_some() && grant.permits_resource_operation(self.name(), &operation, risk, now)
+                });
             if !granted {
                 return Err(ToolResult {
                     success: false,
@@ -664,7 +690,46 @@ impl SkillsManageTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
-            })
+            })?;
+        // Replay ledger. Under `supervised` the gate above has just spent the
+        // grant; under `full` it lets the call through without looking at the
+        // grant, so spend it here, after the gate allowed the call (a call the
+        // gate refuses must not burn the approval). The ledger is in memory:
+        // a restart forgets it, which is acceptable because runtime grants
+        // live about a minute, a repeated publish is idempotent by proposal
+        // state, and a repeated rollback fails its expected_generation CAS.
+        if matches!(action, "lifecycle_publish" | "lifecycle_rollback")
+            && self.security.autonomy == crate::security::AutonomyLevel::Full
+            && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
+        {
+            return Err(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("{action} approval grant was already used (replay refused)")),
+            });
+        }
+        Ok(())
+    }
+
+    /// The owner the runtime vouches for, `None` when it does not: no trusted
+    /// scope, an incomplete one, or an owner-isolated caller without its own
+    /// owner id (such a caller never gets an owner composed for it).
+    fn lifecycle_caller_owner(args: &serde_json::Value) -> Option<String> {
+        let isolated_without_owner = args.get("_zc_scope_trusted").and_then(serde_json::Value::as_bool) == Some(true)
+            && args
+                .get("_zc_scope")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|scope| {
+                    scope.get("owner_isolated").and_then(serde_json::Value::as_bool) == Some(true)
+                        && scope
+                            .get("owner_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|owner| owner.trim().is_empty())
+                });
+        if isolated_without_owner {
+            return None;
+        }
+        super::sessions_read_model::effective_run_owner(args)
     }
 
     fn required_string<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {
@@ -786,6 +851,30 @@ impl Tool for SkillsManageTool {
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
                 anyhow::bail!("Unsupported skills_manage action: {action}");
+            }
+            // The store belongs to one owner scope. Every lifecycle action,
+            // reads included (they expose the owner's proposals), needs a
+            // caller the runtime knows to be that owner: another owner, and a
+            // caller whose owner is unknown, never reach it and do not spend
+            // a grant trying.
+            if let Some(service) = self.lifecycle.as_ref() {
+                let configured = service.owner_scope().as_str();
+                let refusal = match Self::lifecycle_caller_owner(&args) {
+                    Some(caller) if caller == configured => None,
+                    Some(caller) => Some(format!(
+                        "the skill lifecycle store belongs to another owner scope (configured owner_scope: {configured}; this caller's owner id: {caller})"
+                    )),
+                    None => Some(format!(
+                        "the skill lifecycle needs a caller with a known owner scope (configured owner_scope: {configured}; the runtime could not derive one for this caller)"
+                    )),
+                };
+                if let Some(error) = refusal {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
             }
             if let Err(result) = self.authorize(action, &args) {
                 return Ok(result);
@@ -1734,7 +1823,10 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let tool = lifecycle_tool(workspace.path(), crate::skills::lifecycle::LifecycleMode::Shadow);
 
-        let status = tool.execute(json!({"action": "lifecycle_status"})).await.unwrap();
+        let status = tool
+            .execute(owned(json!({"action": "lifecycle_status"})))
+            .await
+            .unwrap();
         assert!(status.success, "{:?}", status.error);
         let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
         assert_eq!(status.get("mode").and_then(serde_json::Value::as_str), Some("shadow"));
@@ -1745,7 +1837,7 @@ mod tests {
                 .is_some()
         );
 
-        let listed = tool.execute(json!({"action": "lifecycle_list"})).await.unwrap();
+        let listed = tool.execute(owned(json!({"action": "lifecycle_list"}))).await.unwrap();
         assert!(listed.success, "{:?}", listed.error);
         assert!(listed.output.contains("\"proposals\": []"));
 
@@ -1773,12 +1865,12 @@ mod tests {
             "mode must refuse publication"
         );
         let rollback = tool
-            .execute(json!({
+            .execute(owned(json!({
                 "action": "lifecycle_rollback",
                 "skill_id": "release-notes",
                 "revision_id": format!("r1-{}", "0".repeat(64)),
                 "expected_generation": 1
-            }))
+            })))
             .await
             .unwrap();
         assert!(!rollback.success);
@@ -1802,24 +1894,60 @@ mod tests {
         }
     }
 
+    /// A signed one-shot grant for `operation`, as the agent loop issues it.
     fn grant_for(operation: &str) -> serde_json::Value {
-        serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
-            "skills_manage",
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+        let risk = if operation.contains(":lifecycle_cancel:") {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::High
+        };
+        let grant = ApprovalGrantV2::issue_one_shot(
+            WitnessKeyring::global_for_tests(),
+            Subject {
+                agent_id: "prx:test:agent".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:ws:cli:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("session".to_string()),
+            },
+            IssuerAuthority::HumanReview,
             operation,
+            risk,
+        )
+        .unwrap();
+        serde_json::to_value(crate::security::policy::ApprovalGrant::from_verified_v2(
+            "skills_manage",
             "test",
-            None,
+            grant,
         ))
         .unwrap()
     }
 
-    fn with_grant(mut args: serde_json::Value, operation: &str) -> serde_json::Value {
+    /// Attaches `grant` and the trusted caller principal it is bound to.
+    fn attach_grant(mut args: serde_json::Value, grant: serde_json::Value) -> serde_json::Value {
         if let Some(object) = args.as_object_mut() {
+            object.insert(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(), grant);
+            object.insert("_zc_scope_trusted".to_string(), json!(true));
             object.insert(
-                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
-                grant_for(operation),
+                "_zc_scope".to_string(),
+                json!({"principal_id": "telegram:alice", "owner_id": "owner:ws:cli:alice"}),
             );
         }
         args
+    }
+
+    /// A call from the configured owner, with no grant.
+    fn owned(mut args: serde_json::Value) -> serde_json::Value {
+        if let Some(object) = args.as_object_mut() {
+            object.insert("_zc_scope_trusted".to_string(), json!(true));
+            object.insert("_zc_scope".to_string(), json!({"owner_id": "owner:ws:cli:alice"}));
+        }
+        args
+    }
+
+    fn with_grant(args: serde_json::Value, operation: &str) -> serde_json::Value {
+        attach_grant(args, grant_for(operation))
     }
 
     const PROPOSAL: &str = "prop-00000000000000000000000000000000";
@@ -1832,7 +1960,7 @@ mod tests {
         use crate::security::AutonomyLevel;
         let revision = format!("r1-{}", "0".repeat(64));
         let rollback_args = json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 1});
-        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}");
+        let rollback_op = format!("skills_manage:lifecycle_rollback:release-notes:{revision}:1");
         let publish_args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
         let cancel_args = json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL});
         for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
@@ -1850,7 +1978,7 @@ mod tests {
 
             // No grant: refused before the service is reached.
             for args in [&publish_args, &rollback_args] {
-                let result = tool.execute(args.clone()).await.unwrap();
+                let result = tool.execute(owned(args.clone())).await.unwrap();
                 assert!(!result.success);
                 assert!(
                     result
@@ -1871,7 +1999,16 @@ mod tests {
                 (&publish_args, "skills_manage:lifecycle_publish".to_string()),
                 (
                     &rollback_args,
-                    "skills_manage:lifecycle_rollback:release-notes:r1-other".to_string(),
+                    "skills_manage:lifecycle_rollback:release-notes:r1-other:1".to_string(),
+                ),
+                // The grant binds the generation the caller observed.
+                (
+                    &rollback_args,
+                    format!("skills_manage:lifecycle_rollback:release-notes:{revision}:2"),
+                ),
+                (
+                    &rollback_args,
+                    format!("skills_manage:lifecycle_rollback:release-notes:{revision}"),
                 ),
             ] {
                 let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
@@ -1913,7 +2050,7 @@ mod tests {
             crate::skills::lifecycle::LifecycleMode::Shadow,
             security,
         );
-        let refused = tool.execute(cancel_args.clone()).await.unwrap();
+        let refused = tool.execute(owned(cancel_args.clone())).await.unwrap();
         assert!(!refused.success);
         assert!(
             refused.error.as_deref().unwrap_or_default().contains("approval grant"),
@@ -1948,6 +2085,447 @@ mod tests {
                 .contains("no such proposal"),
             "the bound grant must reach the service: {:?}",
             reached.error
+        );
+    }
+
+    /// What `grant_op_for_call` mints for `args`: the exact operation and
+    /// whether the grant is issued at high risk.
+    fn minted(args: &serde_json::Value) -> Option<(String, bool)> {
+        use crate::acl::approval_grant::RiskLevel;
+        use crate::security::approval_operation::{GrantOp, grant_op_for_call};
+        match grant_op_for_call("skills_manage", args)? {
+            GrantOp::ResourceExact(operation, risk) => Some((operation, risk == RiskLevel::High)),
+            GrantOp::Command(_) | GrantOp::ResourceGlob(..) => None,
+        }
+    }
+
+    fn supervised_tool(workspace: &Path, autonomy: crate::security::AutonomyLevel) -> SkillsManageTool {
+        lifecycle_tool_with(
+            workspace,
+            crate::skills::lifecycle::LifecycleMode::Shadow,
+            Arc::new(SecurityPolicy {
+                autonomy,
+                workspace_dir: workspace.to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+        )
+    }
+
+    /// The operation the runtime mints for a call is exactly the one the tool
+    /// checks: a grant for the minted operation gets the call to the service,
+    /// in both gated autonomy levels.
+    #[tokio::test]
+    async fn the_runtime_minted_operations_are_the_ones_the_tool_checks() {
+        use crate::security::AutonomyLevel;
+        let revision = format!("r1-{}", "0".repeat(64));
+        let cases = [
+            (
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                true,
+                "does not allow",
+            ),
+            (
+                json!({"action": "lifecycle_cancel", "proposal_id": PROPOSAL}),
+                false,
+                "no such proposal",
+            ),
+            (
+                json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 7}),
+                true,
+                "does not allow",
+            ),
+        ];
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let tool = supervised_tool(workspace.path(), autonomy);
+            for (args, high, reaches) in &cases {
+                let (operation, minted_high) = minted(args).expect("a lifecycle mutation gets a grant");
+                assert_eq!(minted_high, *high, "{operation}");
+                let result = tool.execute(with_grant(args.clone(), &operation)).await.unwrap();
+                assert!(!result.success);
+                assert!(
+                    result.error.as_deref().unwrap_or_default().contains(reaches),
+                    "{autonomy:?} {operation}: {:?}",
+                    result.error
+                );
+            }
+        }
+        let (rollback, _) = minted(&cases[2].0).unwrap();
+        assert_eq!(
+            rollback,
+            format!("skills_manage:lifecycle_rollback:release-notes:{revision}:7")
+        );
+        // Reads, incomplete mutations and the other actions get no grant.
+        for args in [
+            json!({"action": "lifecycle_status"}),
+            json!({"action": "lifecycle_list"}),
+            json!({"action": "lifecycle_inspect", "proposal_id": PROPOSAL}),
+            json!({"action": "lifecycle_publish"}),
+            json!({"action": "lifecycle_rollback", "skill_id": "a", "revision_id": "b"}),
+            json!({"action": "create", "name": "x"}),
+            json!({"action": "lifecycle_force_close", "proposal_id": PROPOSAL}),
+        ] {
+            assert!(minted(&args).is_none(), "{args}");
+        }
+    }
+
+    /// A rollback grant minted for one observed generation does not permit
+    /// another.
+    #[tokio::test]
+    async fn a_rollback_grant_is_bound_to_the_generation() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let revision = format!("r1-{}", "0".repeat(64));
+        let args_at = |generation: u64| json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": generation});
+        let (operation, _) = minted(&args_at(3)).unwrap();
+        let wrong = tool.execute(with_grant(args_at(4), &operation)).await.unwrap();
+        assert!(
+            wrong
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            wrong.error
+        );
+        let right = tool.execute(with_grant(args_at(3), &operation)).await.unwrap();
+        assert!(
+            right.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            right.error
+        );
+    }
+
+    /// A grant authorizes one publication or rollback: replaying it is refused
+    /// under supervised (the gate spends it) and under full (the tool does).
+    #[tokio::test]
+    async fn a_publication_grant_cannot_be_replayed_in_any_autonomy_level() {
+        use crate::security::AutonomyLevel;
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let workspace = TempDir::new().unwrap();
+            let tool = supervised_tool(workspace.path(), autonomy);
+            let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+            let (operation, _) = minted(&args).unwrap();
+            let grant = grant_for(&operation);
+
+            let first = tool.execute(attach_grant(args.clone(), grant.clone())).await.unwrap();
+            assert!(
+                first.error.as_deref().unwrap_or_default().contains("does not allow"),
+                "{autonomy:?}: the first use reaches the service: {:?}",
+                first.error
+            );
+            let replay = tool.execute(attach_grant(args.clone(), grant.clone())).await.unwrap();
+            assert!(!replay.success);
+            assert!(
+                replay.error.as_deref().unwrap_or_default().contains("replay"),
+                "{autonomy:?}: {:?}",
+                replay.error
+            );
+            assert!(
+                !replay.error.as_deref().unwrap_or_default().contains("does not allow"),
+                "{autonomy:?}: a replay must not reach the service"
+            );
+            // A fresh grant works again.
+            let fresh = tool.execute(with_grant(args, &operation)).await.unwrap();
+            assert!(fresh.error.as_deref().unwrap_or_default().contains("does not allow"));
+        }
+    }
+
+    /// Only a signed one-shot grant authorizes a publication or rollback: a v1
+    /// operation hash grant has no use budget and never expires.
+    #[tokio::test]
+    async fn a_hash_grant_does_not_authorize_a_publication() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let (operation, _) = minted(&args).unwrap();
+        let v1 = serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+            "skills_manage",
+            &operation,
+            "test",
+            None,
+        ))
+        .unwrap();
+        let result = tool.execute(attach_grant(args, v1)).await.unwrap();
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// A caller the runtime knows to be another owner never reaches the store,
+    /// and does not spend its grant trying.
+    #[tokio::test]
+    async fn another_owner_does_not_reach_the_lifecycle_store() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let foreign = |owner: &str| {
+            let mut args = with_grant(
+                json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL}),
+                &format!("skills_manage:lifecycle_publish:{PROPOSAL}"),
+            );
+            if let Some(object) = args.as_object_mut() {
+                object.insert(
+                    "_zc_scope".to_string(),
+                    json!({"principal_id": "telegram:alice", "owner_id": owner}),
+                );
+            }
+            args
+        };
+        let denied = tool.execute(foreign("owner:ws:cli:bob")).await.unwrap();
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another owner scope"),
+            "{:?}",
+            denied.error
+        );
+        let status = tool.execute(json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"owner_id": "owner:ws:cli:bob"}})).await.unwrap();
+        assert!(!status.success);
+        // The configured owner is served.
+        let served = tool.execute(foreign("owner:ws:cli:alice")).await.unwrap();
+        assert!(
+            served.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            served.error
+        );
+    }
+
+    /// A disabled lifecycle builds the tool without any lifecycle action and
+    /// opens no store.
+    #[test]
+    fn a_disabled_lifecycle_offers_nothing_and_opens_no_store() {
+        let workspace = TempDir::new().unwrap();
+        let tool = SkillsManageTool::from_config(
+            workspace.path().to_path_buf(),
+            test_config(workspace.path()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(tool.lifecycle.is_none());
+        assert!(
+            offered_actions(&tool)
+                .iter()
+                .all(|action| !action.starts_with("lifecycle_"))
+        );
+        assert!(!workspace.path().join("self").exists(), "no store was opened");
+
+        let mut config = test_config(workspace.path());
+        config.skills_lifecycle.enabled = true;
+        config.skills_lifecycle.owner_scope = Some("owner:ws:cli:alice".to_string());
+        let enabled = SkillsManageTool::from_config(
+            workspace.path().to_path_buf(),
+            config,
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(enabled.lifecycle.is_some());
+        assert!(
+            offered_actions(&enabled)
+                .iter()
+                .any(|action| action == "lifecycle_status")
+        );
+    }
+
+    /// A caller whose owner the runtime cannot vouch for reaches nothing, reads
+    /// included: no trusted scope, an incomplete scope, an owner-isolated
+    /// caller without an owner id of its own.
+    #[tokio::test]
+    async fn a_caller_with_an_unknown_owner_reaches_no_lifecycle_action() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let (operation, _) = minted(&args).unwrap();
+        let grant = grant_for(&operation);
+        let calls = [
+            // No scope at all.
+            json!({"action": "lifecycle_status"}),
+            json!({"action": "lifecycle_list"}),
+            // A scope the runtime did not mark trusted.
+            json!({"action": "lifecycle_status", "_zc_scope": {"owner_id": "owner:ws:cli:alice"}}),
+            // Trusted but incomplete.
+            json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"workspace_id": "ws"}}),
+            // Owner-isolated with workspace, channel and sender but no owner id.
+            json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"owner_isolated": true, "workspace_id": "ws", "channel": "cli", "sender": "alice"}}),
+            json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"owner_isolated": true, "owner_id": "  ", "workspace_id": "ws", "channel": "cli", "sender": "alice"}}),
+        ];
+        for call in calls {
+            let result = tool.execute(call.clone()).await.unwrap();
+            assert!(!result.success, "{call}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("known owner scope"),
+                "{call}: {:?}",
+                result.error
+            );
+        }
+        // A grant is not spent by an unknown caller: it still works for the owner.
+        let mut unknown = args.clone();
+        if let Some(object) = unknown.as_object_mut() {
+            object.insert(
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                grant.clone(),
+            );
+        }
+        let refused = tool.execute(unknown).await.unwrap();
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("known owner scope")
+        );
+        let served = tool.execute(attach_grant(args, grant)).await.unwrap();
+        assert!(
+            served.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            served.error
+        );
+        // An owner-isolated caller with its own owner id is served.
+        let isolated = tool
+            .execute(json!({"action": "lifecycle_status", "_zc_scope_trusted": true, "_zc_scope": {"owner_isolated": true, "owner_id": "owner:ws:cli:alice"}}))
+            .await
+            .unwrap();
+        assert!(isolated.success, "{:?}", isolated.error);
+    }
+
+    /// A call the gate refuses does not burn the approval.
+    #[tokio::test]
+    async fn a_refused_call_does_not_spend_its_grant() {
+        use crate::security::AutonomyLevel;
+        let workspace = TempDir::new().unwrap();
+        // Read-only autonomy: the gate refuses before any grant is looked at.
+        let denied = supervised_tool(workspace.path(), AutonomyLevel::ReadOnly);
+        let allowed = supervised_tool(workspace.path(), AutonomyLevel::Full);
+        let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let (operation, _) = minted(&args).unwrap();
+        let grant = grant_for(&operation);
+        let first = denied.execute(attach_grant(args.clone(), grant.clone())).await.unwrap();
+        assert!(!first.success);
+        assert!(!first.error.as_deref().unwrap_or_default().contains("does not allow"));
+        let then = allowed.execute(attach_grant(args, grant)).await.unwrap();
+        assert!(
+            then.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "the grant was not burned by the refused call: {:?}",
+            then.error
+        );
+    }
+
+    /// The decision-resume grant: a decision-bound grant is honoured only
+    /// inside the claimed-decision scope the resume path installs, and only for
+    /// the operation the runtime mints.
+    #[tokio::test]
+    async fn a_decision_bound_grant_works_only_inside_the_claimed_scope() {
+        use crate::acl::approval_grant::{
+            ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring,
+        };
+        use crate::security::decision_approval::{DecisionGrantAuthority, with_claimed_decision};
+        struct Claimed {
+            grant: ApprovalGrantV2,
+            operation: String,
+        }
+        impl DecisionGrantAuthority for Claimed {
+            fn verify(
+                &self,
+                grant: &ApprovalGrantV2,
+                tool: &str,
+                operation: &str,
+                _risk: RiskLevel,
+                caller_principal: Option<&str>,
+            ) -> Result<(), String> {
+                if *grant == self.grant
+                    && tool == "skills_manage"
+                    && operation == self.operation
+                    && caller_principal == Some(grant.subject.principal_id.as_str())
+                {
+                    Ok(())
+                } else {
+                    Err("decision grant differs from active claimed call".to_string())
+                }
+            }
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Supervised);
+        let args = json!({"action": "lifecycle_publish", "proposal_id": PROPOSAL});
+        let (operation, _) = minted(&args).unwrap();
+        let grant = ApprovalGrantV2::issue_decision_one_shot(
+            WitnessKeyring::global_for_tests(),
+            Subject {
+                agent_id: "prx:test:agent".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:ws:cli:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("session".to_string()),
+            },
+            operation.clone(),
+            RiskLevel::High,
+            DecisionApprovalBinding {
+                decision_id: uuid::Uuid::now_v7().to_string(),
+                catalog_generation: [1; 32],
+                call_digest: [2; 32],
+            },
+            chrono::Utc::now() + chrono::Duration::minutes(2),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(crate::security::policy::ApprovalGrant::from_verified_v2(
+            "skills_manage",
+            "approval_manager",
+            grant.clone(),
+        ))
+        .unwrap();
+
+        // Outside a claimed execution the grant is refused.
+        let outside = tool.execute(attach_grant(args.clone(), wire.clone())).await.unwrap();
+        assert!(
+            outside
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            outside.error
+        );
+        // Inside it, the call reaches the service (the mode then refuses).
+        let claimed = Claimed {
+            grant: grant.clone(),
+            operation: operation.clone(),
+        };
+        let inside = with_claimed_decision(
+            Box::new(claimed),
+            tool.execute(attach_grant(args.clone(), wire.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(
+            inside.error.as_deref().unwrap_or_default().contains("does not allow"),
+            "{:?}",
+            inside.error
+        );
+        // A claim for another operation does not cover this call.
+        let other = Claimed {
+            grant,
+            operation: format!("{operation}x"),
+        };
+        let mismatched = with_claimed_decision(Box::new(other), tool.execute(attach_grant(args, wire)))
+            .await
+            .unwrap();
+        assert!(
+            mismatched
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{:?}",
+            mismatched.error
         );
     }
 }

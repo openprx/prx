@@ -49,6 +49,9 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
 
     let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
 
+    // Skill lifecycle recovery sweep (no-op unless `[skills_lifecycle]` is enabled).
+    crate::skills::lifecycle_runtime::spawn_startup_recovery(&config);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone(), Arc::clone(&shared_config))];
 
     // Gateway is an always-available runtime capability.

@@ -293,6 +293,42 @@ impl SkillLifecycleStore {
         )
     }
 
+    /// The COMMITTED journal entry of the publication `transaction` of
+    /// `skill` when it is live, `None` when it is not. A PREPARED entry of a
+    /// dead writer is first reconciled by the rule recovery uses. `None` for an
+    /// ABORTED entry and for no entry. A binding that carries the transaction
+    /// while its entry is not committed is a tampered store. Read by the
+    /// operator repair path before it closes a proposal; takes the store and
+    /// skill locks.
+    pub(super) fn live_publication(
+        &self,
+        skill: &SkillId,
+        transaction: &TransactionId,
+    ) -> Result<Option<JournalEntry>, LifecycleError> {
+        self.ensure_publication_dirs()?;
+        let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
+        let lock = self.lock_skill(skill, PUBLICATION_LOCK_TIMEOUT)?;
+        let Some(mut entry) = self.journal_entry(transaction)? else {
+            return Ok(None);
+        };
+        if entry.state == TransactionState::Prepared {
+            self.reconcile(&lock, &mut entry)?;
+        }
+        if entry.state == TransactionState::Committed {
+            return Ok(Some(entry));
+        }
+        if self
+            .active_binding(skill)?
+            .is_some_and(|binding| &binding.transaction_id == transaction)
+        {
+            return Err(LifecycleError::InvalidRecord {
+                path: self.root().to_path_buf(),
+                reason: format!("the binding of {skill} carries {transaction} but its journal entry is not committed"),
+            });
+        }
+        Ok(None)
+    }
+
     /// Duplicate handling for a transaction id seen before. `None` means the
     /// id is new. Must run under the skill lock, so a PREPARED entry found
     /// here belongs to a dead writer and is reconciled first.

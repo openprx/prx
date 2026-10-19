@@ -151,6 +151,9 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
             let action = string_arg("action").unwrap_or_default();
             Some(GrantOp::ResourceExact(format!("gateway:{action}"), RiskLevel::Medium))
         }
+        "skills_manage" => {
+            skills_manage_lifecycle_operation(args).map(|(operation, risk)| GrantOp::ResourceExact(operation, risk))
+        }
         // ── Glob: tool derives op-id from runtime-resolved state ──────────────
         // file_write op-id uses the canonicalized resolved path; message_send /
         // memory_* use resolved recipient / owner-principal refs; http_request
@@ -182,6 +185,40 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
         )),
         // Unknown / unmodelled tools get no grant; the tightened gate denies
         // their supervised medium/high calls rather than wildcard-approving.
+        _ => None,
+    }
+}
+
+/// The operation `skills_manage` checks for a lifecycle mutation, with the risk
+/// it checks it at. It MUST equal what `SkillsManageTool::authorize` computes:
+/// the target is bound into the operation, trimmed the same way, and a rollback
+/// is also bound to the generation the caller observed. Read-only lifecycle
+/// actions and the non-lifecycle actions get no grant here.
+fn skills_manage_lifecycle_operation(
+    args: &serde_json::Value,
+) -> Option<(String, crate::acl::approval_grant::RiskLevel)> {
+    use crate::acl::approval_grant::RiskLevel;
+    let arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str).map(str::trim);
+    match arg("action")? {
+        "lifecycle_publish" => Some((
+            format!("skills_manage:lifecycle_publish:{}", arg("proposal_id")?),
+            RiskLevel::High,
+        )),
+        "lifecycle_cancel" => Some((
+            format!("skills_manage:lifecycle_cancel:{}", arg("proposal_id")?),
+            RiskLevel::Medium,
+        )),
+        "lifecycle_rollback" => {
+            let generation = args.get("expected_generation").and_then(serde_json::Value::as_u64)?;
+            Some((
+                format!(
+                    "skills_manage:lifecycle_rollback:{}:{}:{generation}",
+                    arg("skill_id")?,
+                    arg("revision_id")?
+                ),
+                RiskLevel::High,
+            ))
+        }
         _ => None,
     }
 }
