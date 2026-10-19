@@ -174,3 +174,85 @@ async fn an_unconfirmed_background_settlement_closes_further_accounting() -> any
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn request_preparation_overlaps_the_gate_without_authorizing_an_expired_send() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    let cleanup = Arc::new(CleanupTracker::default());
+    let budgets = TurnBudgets {
+        tokens: 1024,
+        micro_usd: 5000,
+        latency_ms: 500,
+    };
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::new(config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [7; 32],
+        budgets,
+        deadline,
+    );
+    let remaining = scope.remaining.get_or_init(|| {
+        Arc::new(RemainingBudgets {
+            tokens: AtomicU64::new(budgets.tokens),
+            micro_usd: AtomicU64::new(budgets.micro_usd),
+            settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
+            settlement_failed: AtomicBool::new(false),
+        })
+    });
+    // Model a prior settlement that cannot finish before this attempt's
+    // original 500 ms deadline. No ledger permission is granted by preparation.
+    let _pending_settlement = remaining.settlement_gate.lock().await;
+    let capture = timing::Capture::new();
+    let binding = [0; 32];
+    let body = serde_json::json!({"input": "bounded preparation ".repeat(128)}).to_string();
+    let result = capture
+        .scope(Box::pin(scope.begin_physical(PhysicalEstimate {
+            purpose: "decision",
+            provider: "openrouter",
+            model: "prx-settlement",
+            body: body.as_bytes(),
+            transport_binding: &binding,
+            request_id: "prx-overlap",
+            deadline,
+            remaining_attempts: 2,
+        })))
+        .await;
+    assert!(matches!(result, Err(DecisionError::BudgetExceeded)));
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    let path = workspace.path().join("preparation.json");
+    capture.write(&path)?;
+    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let rows = snapshot
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("missing accounting timing"))?;
+    assert_eq!(rows.len(), 1);
+    let stages = rows
+        .first()
+        .and_then(|row| row.get("stages"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("missing accounting stages"))?;
+    let prepared = stages
+        .iter()
+        .find(|row| row.get("stage").and_then(serde_json::Value::as_str) == Some("input_prepared"))
+        .ok_or_else(|| anyhow::anyhow!("request was not prepared while settlement held the gate"))?;
+    assert!(
+        prepared
+            .get("remaining_deadline_ns")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|remaining| remaining > 0)
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|row| row.get("stage").and_then(serde_json::Value::as_str) == Some("reserve"))
+    );
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
+    assert!(!workspace.path().join("state/costs.reservations.jsonl").exists());
+    Ok(())
+}

@@ -2643,6 +2643,10 @@ files. A crash between those writes retains both the actual charge and the
 hold until reconciliation; matching replay does not
 append another transition. Settled actual cost still consumes the turn allowance.
 Recovery reconstructs accounting receipts without permitting another dispatch.
+Request token sizing can overlap a prior physical attempt's background ledger
+settlement. Preparation reuses only that request's sizing result and grants no
+allowance; the next physical send still requires the prior durable settlement
+and its own durable reservation within the original decision deadline.
 Missing or conflicting cost projections block admission. Estimated reservations
 record fully reported actual token counts and charges even when they exceed the
 estimate; they do not classify ordinary underestimation as legacy bound
