@@ -295,7 +295,8 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             memory: Arc::clone(&memory),
             security,
         },
-    )?;
+    )
+    .await?;
     let owning = Arc::get_mut(&mut service).expect("unshared parent service");
     owning.factory = DecisionBackendFactory::from_slots(
         vec![Box::new(ParentDelegateBackend {
@@ -419,7 +420,8 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             memory: Arc::clone(&memory),
             security: Arc::clone(grant.security()),
         },
-    )?;
+    )
+    .await?;
     let owning = Arc::get_mut(&mut child_service).expect("private child before publication");
     owning.factory = DecisionBackendFactory::from_slots(
         vec![Box::new(ReadBackend {

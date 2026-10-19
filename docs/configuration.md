@@ -833,8 +833,9 @@ max_recursive_depth = 1
 ```
 
 The permission defaults to false, including when loading an older config.
-When permission is enabled, `max_recursive_depth` must be positive and caps the
-additional levels an opted-in child can receive. Each child remains a proper
+When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 are refused while
+permission is enabled; the current strict tool-subset contract supports one
+additional level. Each child remains a proper
 subset of its authenticated parent, cannot replenish depth or budget, and keeps
 the selected provider/model pins through descendants. A request without the
 opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
@@ -2508,7 +2509,11 @@ read, an authenticated embedding domain and enough records in the same source
 domain. The 2026-10-05 source addendum wires supported configured paid embeddings
 and AutoMix premium calls through per-physical-attempt accounting. Merely
 configuring a model is insufficient: source/model admission, a supported actual
-transport, pinned prices and remaining original budgets are required. See the
+transport, pinned prices and remaining original token/money budgets are required.
+Automix uses its own window starting at the cheap reply:
+`router.automix.escalation_window_ms = 30000` by default, with an allowed range
+of `1..=120000` ms. Main settlement and premium reservation consume that window;
+the 500 ms decision and 100 ms Router budgets are unchanged. See the
 [current candidate addendum](router.md#source-addendum-2026-10-05) for scope,
 unsupported cases and verification status.
 

@@ -100,8 +100,8 @@ impl FileWriteTool {
         ) {
             let error = if launch_file {
                 format!(
-                    "{error} (a workspace launch definition: hooks.json, mcp.json and everything under plugins/ decide which programs run as \
-                     PRX's user, so writing one is a high-risk operation of its own)"
+                    "{error} (a workspace launch definition: {}; writing one is a high-risk operation of its own)",
+                    crate::config::mcp_launch::describe_launch_target(&self.security.workspace_dir, &resolved_target)
                 )
             } else if git_control {
                 format!(
@@ -382,6 +382,10 @@ mod tests {
             );
             let error = result.error.unwrap_or_default();
             assert!(error.contains("workspace launch definition"), "{file}: {error}");
+            assert!(
+                error.contains("under plugins/"),
+                "the refusal must name the target: {file}: {error}"
+            );
             assert!(!workspace.join(file).exists(), "{file} was written");
         }
         // Names that merely contain "plugins" keep their ordinary approval.

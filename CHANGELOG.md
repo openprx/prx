@@ -34,6 +34,30 @@ for integration, validation and rollback limits.
   beside the trust file and is keyed by SHA-256; old `plugins/.cwasm-cache` is
   ignored. See `docs/configuration.md` (WASM plugins).
 
+- Automix premium escalation now has a separate window starting at the cheap
+  reply: `router.automix.escalation_window_ms`, default 30,000 ms, range
+  1–120,000 ms. It includes main settlement and premium reservation, sharing
+  the original token/money balance. Decision 500 ms and Router 100 ms are
+  unchanged. Existing configurations use the default.
+- Decision-store preparation runs off Tokio workers behind per-path gates;
+  SQLite migration and WAL fsync no longer hold the global store registry.
+  Cancelled publication retains preparation and queue cleanup ownership.
+  Runtime startup warms accounting tokenizers. Reservation and cost appends
+  reuse the workspace tracker and sync directories on journal creation,
+  retaining per-write file sync and existing security checks.
+
+- Causal telemetry deferral is now admission-local and expires at that
+  admission's deadline. Applied events bypass deferred phases; drain flushes
+  earlier events without waiting for unrelated admissions. No admission budget
+  is raised.
+- Decision accounting permits one in-flight physical attempt per scope, so a
+  concurrent same-scope attempt can expire while waiting for the first call.
+  Deferred reported-usage settlement retains the dispatched estimate during
+  I/O, but a crash before canonical cost-row sync can lose actual cost above
+  that estimate. The window contains at most one reported pending settlement
+  per scope and has no fixed storage-latency bound. See
+  [the accounting contract](docs/decision-plane.md#admission-and-backend-selection).
+
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.
   Older binaries reject this event and refuse the entire cost ledger. Once it

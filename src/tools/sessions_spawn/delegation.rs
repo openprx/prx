@@ -58,7 +58,7 @@ pub(super) fn request_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "boolean",
         "default": false,
-        "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; the child and its descendants retain the selected provider/model pins and bounded depth."
+        "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins."
     })
 }
 
@@ -92,14 +92,25 @@ pub(super) fn validate_batch(
     members: &[(String, serde_json::Value)],
     grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
 ) -> anyhow::Result<()> {
+    let mut recursive = grant.is_some_and(crate::runtime::child_source::IssuedChildGrant::has_recursive_ancestry);
     for (_, args) in members {
         if let Some(grant) = grant {
-            requested(args, &grant.generation().effective.sessions_spawn, true)?;
+            recursive |= requested(args, &grant.generation().effective.sessions_spawn, true)?;
         } else {
             // Without a parent grant recursive work is unavailable, including
             // on ordinary or operator surfaces. Missing/false is unchanged.
             requested(args, &crate::config::SessionsSpawnConfig::default(), false)?;
         }
+    }
+    anyhow::ensure!(
+        !recursive || members.len() <= 1,
+        "recursive grants allow at most one child per issued grant"
+    );
+    if recursive
+        && !members.is_empty()
+        && let Some(grant) = grant
+    {
+        grant.ensure_recursive_child_available()?;
     }
     Ok(())
 }

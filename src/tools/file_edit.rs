@@ -133,8 +133,8 @@ impl FileEditTool {
         ) {
             let error = if launch_file {
                 format!(
-                    "{error} (a workspace launch definition: hooks.json, mcp.json and everything under plugins/ decide which programs run as \
-                     PRX's user, so writing one is a high-risk operation of its own)"
+                    "{error} (a workspace launch definition: {}; writing one is a high-risk operation of its own)",
+                    crate::config::mcp_launch::describe_launch_target(&self.security.workspace_dir, &resolved_target)
                 )
             } else if git_control {
                 format!(

@@ -81,7 +81,9 @@ impl PrecompileCache {
     /// another wasmtime configuration is never reused. Each file starts with a
     /// seal, `sha256(component hash || native artifact)`, checked before the
     /// artifact is deserialized: a truncated, altered or swapped file fails the
-    /// seal and the component is recompiled instead. Files are written to a
+    /// seal and the component is recompiled instead. The seal is an integrity
+    /// check only, not authentication; the cache directory being out of the
+    /// agent's reach is what keeps planted native code out. Files are written to a
     /// temporary name and renamed into place.
     #[allow(unsafe_code)]
     pub fn get_or_compile(
@@ -162,6 +164,11 @@ impl PrecompileCache {
         result
     }
 
+    /// Integrity check, not authentication: the seal is an unkeyed SHA-256, so
+    /// it catches truncation, bit rot and a file swapped in under another
+    /// component's name, but anyone who can write the cache directory can
+    /// recompute it. The protection boundary is the cache location, which is
+    /// operator-owned and outside the workspace (see `PluginPolicy::cache_dir`).
     fn seal(wasm_sha256: &str, payload: &[u8]) -> String {
         let mut material = Vec::with_capacity(wasm_sha256.len() + payload.len());
         material.extend_from_slice(wasm_sha256.as_bytes());
@@ -198,12 +205,24 @@ impl PrecompileCache {
             .unwrap_or(0)
     }
 
-    /// `<component sha256>-<engine compatibility hash>`.
+    /// `<component sha256>-<first 16 hex of sha256(engine compatibility data)>`.
     fn cache_key(engine: &wasmtime::Engine, wasm_sha256: &str) -> String {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        engine.precompile_compatibility_hash().hash(&mut hasher);
-        format!("{wasm_sha256}-{:016x}", hasher.finish())
+        use std::hash::Hash as _;
+        /// Collects everything the engine feeds a `Hasher`, so the digest is a
+        /// SHA-256 of the compatibility data rather than a 64-bit std hash.
+        struct ByteSink(Vec<u8>);
+        impl std::hash::Hasher for ByteSink {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+        }
+        let mut sink = ByteSink(Vec::new());
+        engine.precompile_compatibility_hash().hash(&mut sink);
+        let digest = super::trust::sha256_hex(&sink.0);
+        format!("{wasm_sha256}-{}", digest.get(..16).unwrap_or(&digest))
     }
 }
 

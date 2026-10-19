@@ -342,6 +342,32 @@ fn is_plugin_trust_state(target: &std::path::Path) -> bool {
         })
 }
 
+/// Name what makes `target` a launch definition, for a refusal message:
+/// the plugin trust file, the compiled-component cache, a plugin file, or the
+/// `hooks.json` / `mcp.json` at the workspace root.
+#[must_use]
+pub fn describe_launch_target(workspace_dir: &std::path::Path, target: &std::path::Path) -> String {
+    let shown = target.display();
+    if is_plugin_trust_state(target) {
+        let cache = target.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name)
+                if name.to_str().is_some_and(|name| name.eq_ignore_ascii_case("plugin-cache")))
+        });
+        return if cache {
+            format!("{shown} is in the plugin compiled-component cache, which is loaded as native code")
+        } else {
+            format!(
+                "{shown} is the operator's plugin trust file, which decides which WASM plugins run and with which permissions"
+            )
+        };
+    }
+    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if is_under_plugins_dir(&workspace, target) {
+        return format!("{shown} is under plugins/, where WASM plugin code and manifests live");
+    }
+    format!("{shown} is a hooks.json or mcp.json that decides which programs run as PRX's user")
+}
+
 fn is_root_launch_file(workspace: &std::path::Path, target: &std::path::Path) -> bool {
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -777,6 +803,11 @@ mod plugin_launch_tests {
         ] {
             assert!(is_workspace_launch_file(workspace, Path::new(target)), "{target}");
         }
+        let describe = |target: &str| super::describe_launch_target(workspace, Path::new(target));
+        assert!(describe("/nonexistent-prx-test/state/plugin-trust.json").contains("plugin trust file"));
+        assert!(describe("/nonexistent-prx-test/state/plugin-cache/a.cwasm").contains("compiled-component cache"));
+        assert!(describe("/nonexistent-prx-test/ws/plugins/p/plugin.toml").contains("under plugins/"));
+        assert!(describe("/nonexistent-prx-test/ws/hooks.json").contains("hooks.json or mcp.json"));
         for target in [
             "/nonexistent-prx-test/ws/notes.txt",
             "/nonexistent-prx-test/ws/plugin-trust-notes.txt.bak/x",

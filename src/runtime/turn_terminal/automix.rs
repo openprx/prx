@@ -33,6 +33,10 @@ impl SettledAutomixContinuation {
                 && self.envelope.config_source_revision.as_deref() == Some(source.config_source_revision()),
             "Automix continuation differs from settled main source"
         );
+        anyhow::ensure!(
+            std::time::Instant::now() < context.automix_deadline()?,
+            "Automix continuation window expired"
+        );
         Ok(())
     }
 }

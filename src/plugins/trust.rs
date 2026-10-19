@@ -39,6 +39,9 @@ pub const CACHE_DIR_NAME: &str = "plugin-cache";
 const TRUST_FILE_VERSION: u32 = 1;
 const MAX_TRUST_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Longest wait for another process's trust-file write.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Serialises read-modify-write cycles on the trust file inside this process.
 static TRUST_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -420,8 +423,23 @@ impl PluginPolicy {
         let lock = options
             .open(self.trust_file.with_extension("json.lock"))
             .map_err(PluginError::Io)?;
-        lock.lock_exclusive().map_err(PluginError::Io)?;
-        Ok(lock)
+        // Bounded retry instead of a blocking wait; callers on an async
+        // runtime reach this through `spawn_blocking`.
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => return Ok(lock),
+                Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(PluginError::Runtime(
+                            "timed out waiting for the plugin trust file lock".to_string(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(PluginError::Io(error)),
+            }
+        }
     }
 
     fn write(&self, records: &[TrustRecord]) -> PluginResult<()> {

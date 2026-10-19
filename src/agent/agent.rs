@@ -359,6 +359,9 @@ impl AgentBuilder {
             "embedded Agent route providers require runtime_config"
         );
         let runtime = self.pin_runtime_config()?;
+        if runtime.is_some() {
+            crate::runtime::decision_accounting::initialize_tokenizers();
+        }
         let mut tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
         if runtime.is_some() && !tools.iter().any(|tool| tool.name() == "capability_search") {
             tools.push(Box::new(crate::tools::capability::search_tool::CapabilitySearchTool));
@@ -3105,6 +3108,7 @@ mod tests {
                 confidence_threshold: 0.7,
                 cheap_model_tiers: vec!["mini".into(), "ollama".into()],
                 premium_model_id: "openai/model-premium".into(),
+                ..Default::default()
             },
             models: vec![
                 crate::config::RouterModelConfig {

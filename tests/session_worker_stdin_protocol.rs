@@ -46,6 +46,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 
 const RECURSIVE_CHILD_TASK: &str = "Use sessions_spawn in process mode for PRX-NESTED-CHILD";
+const FANOUT_CHILD_TASK: &str = "Use sessions_spawn in process mode for PRX-FANOUT-CHILD";
 
 /// Exercise the real worker executable with a sealed route and an isolated
 /// loopback provider. The listener records headers from the OS child, while
@@ -127,13 +128,23 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         "PRX-NESTED-PARENT",
                         "PRX-NESTED-CHILD",
                         "PRX-NESTED-LEAF",
+                        "PRX-FANOUT-PARENT",
+                        "PRX-FANOUT-CHILD",
+                        "PRX-FANOUT-LEAF",
+                        "PRX-FANOUT-DENIED-A",
+                        "PRX-FANOUT-DENIED-B",
+                        "PRX-FANOUT-SECOND",
                     ]
                     .into_iter()
                     .find(|candidate| request_body.contains(candidate))
                     .expect("fixture request marker");
                     if !matches!(
                         marker,
-                        "PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-DENIED-PARENT" | "PRX-NESTED-PARENT"
+                        "PRX-ROUTE-PARENT"
+                            | "PRX-AGENT-PARENT"
+                            | "PRX-DENIED-PARENT"
+                            | "PRX-NESTED-PARENT"
+                            | "PRX-FANOUT-PARENT"
                     ) {
                         let mut manifests = server_captured.lock();
                         if !manifests.contains_key(marker) {
@@ -143,6 +154,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                                     &server_workspace_root,
                                     if marker == "PRX-NESTED-CHILD" {
                                         RECURSIVE_CHILD_TASK
+                                    } else if marker == "PRX-FANOUT-CHILD" {
+                                        FANOUT_CHILD_TASK
                                     } else {
                                         marker
                                     },
@@ -179,6 +192,22 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         })),
                         ("PRX-NESTED-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
                             "action": "spawn_batch", "mode": "process", "tasks": ["PRX-NESTED-LEAF"]
+                        })),
+                        ("PRX-FANOUT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": [
+                                {"task": FANOUT_CHILD_TASK, "allow_delegation": true}
+                            ]
+                        })),
+                        ("PRX-FANOUT-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process",
+                            "tasks": ["PRX-FANOUT-DENIED-A", "PRX-FANOUT-DENIED-B"]
+                        })),
+                        ("PRX-FANOUT-CHILD", 2) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-LEAF"]
+                        })),
+                        ("PRX-FANOUT-CHILD", 3) | ("PRX-FANOUT-PARENT", 2) => scripted_join_call(&request_body),
+                        ("PRX-FANOUT-CHILD", 4) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-SECOND"]
                         })),
                         ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-NESTED-PARENT" | "PRX-NESTED-CHILD", 2) => {
                             scripted_join_call(&request_body)
@@ -522,6 +551,89 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         Some("session-worker parent decision differs from issued authority")
     );
     assert_eq!(seen.lock().len(), requests_before_wrong_parent);
+    // Finding94: retain every original phase above, then exercise a new real
+    // recursive worker's fanout and reissue attempts. A refused two-leaf batch
+    // consumes no slot; one valid leaf can run, and another turn cannot mint
+    // a second copy of that same subtree allowance.
+    let fanout_config_dir = config_dir
+        .parent()
+        .expect("fixture config parent")
+        .join("fanout-config");
+    std::fs::create_dir_all(&fanout_config_dir).expect("isolated fanout config");
+    let fanout_workspace = fanout_config_dir.join("workspace");
+    let mut fanout_config = recursive_config.clone();
+    fanout_config.config_path = fanout_config_dir.join("config.toml");
+    fanout_config.workspace_dir = fanout_workspace.clone();
+    fanout_config.cost.prices.insert(
+        format!("{destination}/probe-model"),
+        openprx::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    write_worker_config(&fanout_config);
+    let fanout_output = run_model_parent(&fanout_config_dir, &home, "PRX-FANOUT-PARENT");
+    assert!(
+        fanout_output.status.success(),
+        "fanout parent stderr: {}",
+        String::from_utf8_lossy(&fanout_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&fanout_output.stdout).contains("PRX-WORKER-OK"));
+    {
+        let requests = seen.lock();
+        assert_parent_join(&requests, "PRX-FANOUT-PARENT", 1);
+        let child: Vec<_> = requests
+            .iter()
+            .filter(|request| request.marker == "PRX-FANOUT-CHILD")
+            .collect();
+        assert_eq!(
+            child.len(),
+            5,
+            "all refusal, successful leaf and reissue phases must reach the model"
+        );
+        assert_join_summary(child[3], 1);
+        assert!(child[1].body.contains("at most one child"));
+        assert!(child[4].body.contains("already allocated its one child allowance"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-FANOUT-LEAF")
+                .count(),
+            1
+        );
+        assert!(
+            requests.iter().all(|request| !matches!(
+                request.marker.as_str(),
+                "PRX-FANOUT-DENIED-A" | "PRX-FANOUT-DENIED-B" | "PRX-FANOUT-SECOND"
+            )),
+            "refused fanout and reissue must not dispatch a leaf"
+        );
+    }
+    let manifests = captured.lock();
+    let fanout = manifests.get("PRX-FANOUT-CHILD").expect("real recursive worker");
+    let only_leaf = manifests.get("PRX-FANOUT-LEAF").expect("one real leaf worker");
+    assert_authenticated_source(fanout);
+    assert_authenticated_source(only_leaf);
+    let allowance = fanout
+        .capability_manifest
+        .as_ref()
+        .expect("recursive allowance")
+        .max_cost_cents;
+    assert!(allowance > 0, "the fanout limit must protect a nonzero allowance");
+    assert!(
+        only_leaf
+            .capability_manifest
+            .as_ref()
+            .expect("leaf allowance")
+            .max_cost_cents
+            <= allowance
+    );
+    assert_eq!(only_leaf.parent_run_id.as_deref(), Some(fanout.run_id.as_str()));
+    assert_completion_journal(&fanout_workspace, fanout);
+    assert_completion_journal(&fanout_workspace, only_leaf);
+    drop(manifests);
     write_worker_config(&config);
     let agent_requests = seen.lock().len();
 
@@ -868,6 +980,10 @@ fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total
         .filter(|request| request.marker == marker)
         .nth(2)
         .expect("parent post-join request");
+    assert_join_summary(post_join, expected_total);
+}
+
+fn assert_join_summary(post_join: &ProviderRequest, expected_total: usize) {
     let request: serde_json::Value = serde_json::from_str(&post_join.body).expect("parent post-join JSON");
     let summary = request["messages"]
         .as_array()
@@ -1371,9 +1487,10 @@ fn the_stdin_control_reader_stays_a_detached_os_thread() {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("session_worker")
-            .join("runner.rs"),
+            .join("runner")
+            .join("steering.rs"),
     )
-    .expect("read src/session_worker/runner.rs");
+    .expect("read src/session_worker/runner/steering.rs");
     let body = function_body(&source, "spawn_stdin_control_reader");
 
     assert!(

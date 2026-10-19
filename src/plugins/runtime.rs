@@ -776,13 +776,17 @@ impl PluginManageTool {
         let identity = self
             .candidate_identity(source, args)
             .map_err(|error| refuse(error.to_string()))?;
-        // Hash the sorted list: a joined, normalised string would collide for
-        // ["a", "b"] and ["a_b"].
-        let permissions = crate::plugins::trust::sha256_hex(
-            serde_json::to_string(&identity.record.permissions)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        // Bind the sorted list by digest: a joined, normalised string would
+        // collide for ["a", "b"] and ["a_b"]. The readable list is added as its
+        // own segment so the approval text shows what is being granted.
+        let encoded = serde_json::to_string(&identity.record.permissions)
+            .map_err(|error| refuse(format!("cannot encode the permission grant: {error}")))?;
+        let permissions = crate::plugins::trust::sha256_hex(encoded.as_bytes());
+        let readable = if identity.record.permissions.is_empty() {
+            "grants_none".to_string()
+        } else {
+            format!("grants_{}", identity.record.permissions.join("_"))
+        };
         let operation = op_id::op_id(
             "wasm_plugins_manage",
             &format!("{action}-trust"),
@@ -790,6 +794,7 @@ impl PluginManageTool {
                 &identity.record.name,
                 &identity.record.sha256,
                 &identity.record.manifest_sha256,
+                &readable,
                 &permissions,
             ],
         );
@@ -920,20 +925,15 @@ impl PluginManageTool {
 
         // The operator's grant is recorded only now, after approval and a
         // successful compile, and is undone with the installation on failure.
-        let policy = self.runtime.policy.clone();
-        let previous_record = policy.record_for_name(&name).unwrap_or_else(|error| {
+        let previous_record = self.runtime.policy.record_for_name(&name).unwrap_or_else(|error| {
             tracing::warn!(plugin = %name, error = %error, "plugin trust file unreadable before install");
             None
         });
-        if let Err(error) = policy.record(identity.record.clone()) {
+        let record = identity.record.clone();
+        if let Err(error) = self.blocking_trust(move |policy| policy.record(record)).await {
             let _ = std::fs::remove_dir_all(&stage);
             anyhow::bail!("could not record the operator's trust for '{name}': {error}");
         }
-        let restore_trust = || {
-            if let Err(error) = policy.restore(&name, previous_record.clone()) {
-                tracing::error!(plugin = %name, error = %error, "could not roll back the plugin trust record");
-            }
-        };
 
         let backup = if destination.exists() {
             let moved = (|| -> anyhow::Result<PathBuf> {
@@ -946,7 +946,7 @@ impl PluginManageTool {
             match moved {
                 Ok(path) => Some(path),
                 Err(error) => {
-                    restore_trust();
+                    self.restore_trust(&name, previous_record.clone()).await;
                     let _ = std::fs::remove_dir_all(&stage);
                     return Err(error);
                 }
@@ -958,7 +958,7 @@ impl PluginManageTool {
             if let Some(backup) = &backup {
                 let _ = std::fs::rename(backup, &destination);
             }
-            restore_trust();
+            self.restore_trust(&name, previous_record.clone()).await;
             let _ = std::fs::remove_dir_all(&stage);
             return Err(error.into());
         }
@@ -986,7 +986,7 @@ impl PluginManageTool {
                 if let Some(backup) = &backup {
                     let _ = std::fs::rename(backup, &destination);
                 }
-                restore_trust();
+                self.restore_trust(&name, previous_record.clone()).await;
                 let _ = self.runtime.refresh_all().await;
                 if let Some(error) = refresh_error {
                     anyhow::bail!("plugin '{name}' refresh failed and installation was rolled back: {error}");
@@ -1005,6 +1005,28 @@ impl PluginManageTool {
             "plugin": loaded,
             "backup": backup,
         }))
+    }
+
+    /// Run a trust-file write on the blocking pool: it waits for a file lock
+    /// and must never stall a runtime worker.
+    async fn blocking_trust<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(PluginPolicy) -> PluginResult<T> + Send + 'static,
+    ) -> PluginResult<T> {
+        let policy = self.runtime.policy.clone();
+        tokio::task::spawn_blocking(move || work(policy))
+            .await
+            .map_err(|error| PluginError::Runtime(format!("trust file task failed: {error}")))?
+    }
+
+    async fn restore_trust(&self, name: &str, previous: Option<super::trust::TrustRecord>) {
+        let owned = name.to_string();
+        if let Err(error) = self
+            .blocking_trust(move |policy| policy.restore(&owned, previous))
+            .await
+        {
+            tracing::error!(plugin = %name, error = %error, "could not restore the plugin trust record");
+        }
     }
 
     async fn disable(&self, name: &str) -> anyhow::Result<serde_json::Value> {
@@ -1109,11 +1131,11 @@ impl PluginManageTool {
         };
         // A removed plugin keeps no standing trust: a copy restored later must
         // be installed (and approved) again.
-        for trusted_name in std::iter::once(name).chain(manifest_name.as_deref().filter(|n| *n != name)) {
-            if let Err(error) = self.runtime.policy.restore(trusted_name, None) {
-                tracing::warn!(plugin = %trusted_name, error = %error, "could not revoke the removed plugin's trust record");
-            }
-        }
+        // Trust is keyed by the manifest name; the folder name is used only
+        // when the manifest cannot be read. Revoking the folder name as well
+        // would drop an unrelated plugin that happens to carry that name.
+        let trusted_name = manifest_name.unwrap_or_else(|| name.to_string());
+        self.restore_trust(&trusted_name, None).await;
         Ok(serde_json::json!({
             "plugin": name,
             "removed": true,
@@ -3813,6 +3835,10 @@ max_execution_time_ms = 30000";
             "the approval operation must name the component hash: {error}"
         );
         assert!(error.contains("audit-hook"), "{error}");
+        assert!(
+            error.contains("grants_events_kv_log"),
+            "the approval text must show the sorted grant: {error}"
+        );
         let grant_digest = crate::plugins::trust::sha256_hex(br#"["events","kv","log"]"#);
         assert!(
             error.contains(&grant_digest),
@@ -3850,5 +3876,50 @@ max_execution_time_ms = 30000";
         runtime.refresh_all().await.unwrap();
         let info = plugin_status(&runtime, "optional-tool").await.unwrap();
         assert_eq!(info.permissions_granted, vec!["log", "memory"]);
+    }
+
+    /// Trust is keyed by manifest name. Removing folder `foo` (manifest `bar`)
+    /// must revoke `bar` and leave the unrelated trusted plugin named `foo`.
+    #[tokio::test]
+    async fn remove_revokes_the_manifest_name_not_the_folder_name() {
+        let temp = TempDir::new().unwrap();
+        install_example_fixture(temp.path(), "pipeline-middleware");
+        install_example_fixture(temp.path(), "echo-provider");
+        let plugins = temp.path().join("plugins");
+        std::fs::rename(plugins.join("pipeline-middleware"), plugins.join("foo")).unwrap();
+        std::fs::rename(plugins.join("echo-provider"), plugins.join("other")).unwrap();
+        let rewrite = |dir: &str, from: &str, to: &str| {
+            let path = plugins.join(dir).join("plugin.toml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(&format!("name = \"{from}\"")), "fixture name line");
+            std::fs::write(
+                &path,
+                text.replacen(&format!("name = \"{from}\""), &format!("name = \"{to}\""), 1),
+            )
+            .unwrap();
+        };
+        rewrite("foo", "pipeline-middleware", "bar");
+        rewrite("other", "echo-provider", "foo");
+
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let names = |records: Vec<crate::plugins::trust::TrustRecord>| {
+            let mut names: Vec<String> = records.into_iter().map(|record| record.name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(test_policy(temp.path()).records().unwrap()), vec!["bar", "foo"]);
+
+        let manage = manage_for(&runtime, temp.path(), crate::security::AutonomyLevel::Full);
+        let removed = manage
+            .execute(serde_json::json!({"action": "remove", "name": "foo"}))
+            .await
+            .unwrap();
+        assert!(removed.success, "{:?}", removed.error);
+        assert_eq!(
+            names(test_policy(temp.path()).records().unwrap()),
+            vec!["foo"],
+            "the folder-name collision revoked an unrelated plugin's trust"
+        );
+        assert!(plugins.join("other").is_dir());
     }
 }

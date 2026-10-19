@@ -14,10 +14,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-FILE=src/chat/mod.rs
+# chat/mod.rs was split into these files; the gate covers all of them.
+FILES=(src/chat/mod.rs src/chat/active_turn.rs src/chat/bootstrap.rs src/chat/chat_events.rs src/chat/compaction.rs src/chat/copy_select.rs src/chat/external_editor.rs src/chat/file_mention.rs src/chat/input_queue.rs src/chat/output.rs src/chat/provider_turns.rs src/chat/pty_attach.rs src/chat/run.rs src/chat/session_glue.rs src/chat/session_store.rs src/chat/session_switch.rs src/chat/terminal.rs src/chat/tui_loop.rs src/chat/views.rs)
 
 echo "[S4-A/B gate] grep chat_mirror.lock() / tui_mirror.lock() push 调用 ..."
-MIRROR_PUSH_COUNT=$(grep -c "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" "$FILE" || true)
+MIRROR_PUSH_COUNT=$(cat "${FILES[@]}" | grep -c "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" || true)
 echo "  mirror push 调用数: $MIRROR_PUSH_COUNT"
 
 if [ "$MIRROR_PUSH_COUNT" -eq 0 ]; then
@@ -27,7 +28,7 @@ fi
 
 # S4-A 阶段：检查守卫
 echo "[S4-A gate] grep 启发式 is_pure() / is_pure 守卫（前 5 行内）..."
-GUARDED_COUNT=$(grep -B 5 "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" "$FILE" | grep -c "is_pure" || true)
+GUARDED_COUNT=$(cat "${FILES[@]}" | grep -B 5 "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" | grep -c "is_pure" || true)
 echo "  is_pure 守卫数 (启发式, 前 5 行内): $GUARDED_COUNT"
 
 if [ "$GUARDED_COUNT" -lt "$MIRROR_PUSH_COUNT" ]; then
@@ -38,21 +39,22 @@ fi
 echo "[S4-A gate] AWK 块级扫描：每处 push 距离最近 'if !...is_pure' 守卫 <= 10 行 ..."
 UNGUARDED_OUT=$(awk '
     BEGIN { guard_line = 0; unguarded = 0 }
+    FNR == 1 { guard_line = 0 }
     /if \!.*is_pure|if .*is_pure\(\)/ {
         guard_line = NR
     }
     /chat_mirror\.lock\(\)\.push_|tui_mirror\.lock\(\)\.push_/ {
         dist = NR - guard_line
         if (guard_line == 0) {
-            print "  UNGUARDED push at line " NR " (no prior is_pure guard)"
+            print "  UNGUARDED push at " FILENAME ":" FNR " (no prior is_pure guard)"
             unguarded++
         } else if (dist > 10) {
-            print "  push at line " NR " too far from latest is_pure guard at line " guard_line " (" dist " lines apart)"
+            print "  push at " FILENAME ":" FNR " too far from latest is_pure guard at line " guard_line " (" dist " lines apart)"
             unguarded++
         }
     }
     END { exit (unguarded > 0 ? 1 : 0) }
-' "$FILE") || {
+' "${FILES[@]}") || {
     echo "$UNGUARDED_OUT"
     echo "[FAIL] AWK 块级扫描发现失守 mirror push（见上方）."
     exit 1

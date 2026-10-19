@@ -51,6 +51,9 @@ impl WriterThread {
                             }
                         }
                         Ok(None) => {
+                            tracing::warn!(
+                                "a conflicting decision chain was refused; no new rows from that chain were kept"
+                            );
                             for record in records {
                                 emit_incomplete(self.events.as_ref(), lineage_of(record), IncompleteReason::Conflict);
                             }
