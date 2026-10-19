@@ -163,6 +163,10 @@ as `estimated_unsent_v1`; older builds that do not recognize that event fail
 closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
+Workspace cost trackers share storage while each admitted caller retains its
+immutable cost configuration. Looking up an older generation cannot overwrite
+a newer caller's reservation limits.
+
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Known usage updates the
 local budget while cleanup owns its durable settlement in the background, so

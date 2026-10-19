@@ -19,6 +19,7 @@ for integration, validation and rollback limits.
   remaining monetary balance, rounded down to whole cents. Authenticated
   approval resume keeps the original run's one-child slot and balance.
 - Operator-worker and admin store preparation runs off Tokio workers.
+- Workspace cost configuration views remain pinned across reloads.
 
 - Automix premium escalation now has a separate window starting at the cheap
   reply: `router.automix.escalation_window_ms`, default 30,000 ms, range

@@ -29,7 +29,7 @@ impl CostTracker {
         record: &MeteredTokenUsageRecord,
         receipt: Option<&ReservationReceipt>,
     ) -> Result<CostSettlement> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         let settlement_id = record
             .settlement_id
             .as_deref()
