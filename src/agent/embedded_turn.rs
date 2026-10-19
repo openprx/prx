@@ -562,6 +562,8 @@ async fn run_work(
         ))
         .await;
     // Preserve interrupted tool history even if the terminal reports failure.
+    #[cfg(feature = "llm-router")]
+    let cheap_reply_at = std::time::Instant::now();
     history.finish(agent.tool_dispatcher.as_ref());
     let (outcome, trace) = match result {
         Ok(result) => result,
@@ -602,7 +604,9 @@ async fn run_work(
                     crate::router::automix::ConfidenceChecker::check_rules(&text, input),
                     automix.confidence_threshold,
                 )
-                && let Some(continuation) = guard.settle_main_before_auxiliary(&provider, &cancellation).await?
+                && let Some(continuation) = guard
+                    .settle_main_before_auxiliary(&provider, &cancellation, cheap_reply_at)
+                    .await?
             {
                 use crate::runtime::auxiliary_call::{AuxiliaryProviderCall, AuxiliaryPurpose};
                 // This read-only selection performs no provider call. Admission

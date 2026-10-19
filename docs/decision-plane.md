@@ -171,19 +171,39 @@ dispatched hold stays in place until both writes finish. Another physical send
 waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
 retains its serialization gate from reservation through transport and settlement,
 so handing reported usage to persistence cannot suspend behind another request.
+Only one physical attempt can be in flight in one decision-accounting scope.
+A second attempt in that same scope waits even while the first provider call is
+still running; it can exhaust its unchanged admission deadline without being
+sent. Retry attempts proceed after the previous receipt has relinquished the
+gate. Independent scopes do not share this gate.
+
+Deferred settlement has a crash window: the in-memory usage adjustment can
+precede the canonical cost-row sync. The durable dispatched estimate remains,
+but any reported actual cost above that estimate can be absent after a crash
+in this interval. The gate bounds this window to at most one reported,
+not-yet-durable settlement per live scope; there is no fixed wall-clock bound
+on slow storage and no single global monetary bound across concurrent scopes.
+Cleanup waits for persistence and closes further accounting on failure. It
+cannot recover an excess that was never durably written before a process crash.
 Metering and estimated-liability reconciliation share one held ledger lock and
 snapshot. The canonical cost row is synced before journal reconciliation;
 invalid journal state still retains the charge and fails cleanup closed.
-Ordinary phase writes remain deferred through final issuance, including delegation
-storage validation. Delegation reads its committed chain in one bounded operation
+Ordinary phase writes defer only for their own source admission, until its
+deadline or guard release. Each queued event retains that admission's deferral;
+overlapping sessions cannot extend it. Re-admitting the same source releases
+its earlier deferral. Delegation reads its committed chain in one bounded operation
 on the writer connection, retaining owner, lineage and replay-digest checks.
 Already queued ordinary phase events persist in batches of at most 32. SQLite
 commits each batch once, isolating individual invalid events with savepoints;
 other backends retain ordered per-event results. At most two SQLite event batches
 write concurrently across workspaces; scalar and Applied writes, selected reads
 and accounting are outside this background gate. Observers remain immediate.
-Batches stop at Applied and drain markers, preserving their FIFO boundary;
-a storage failure still reports incomplete persistence for each affected event.
+Applied events bypass deferred ordinary events. A drain marker flushes every
+earlier queued ordinary event before acknowledging, even while admission guards
+remain alive. Ordinary order is retained within an admission; unrelated sessions
+may persist independently. The ordinary backlog is bounded to 256 events across
+the queue, deferred events and in-flight writes, with overflow still reported.
+A storage failure still reports incomplete persistence for each affected event.
 The decision-store writer also commits up to 32 already queued ordinary chains
 in one transaction. Each chain has its own savepoint, so a conflict or SQL error
 rolls back that entire chain without losing its valid neighbors. Notifications
@@ -616,3 +636,22 @@ require the full behavioral, cancellation, privacy and performance gates; existi
 historical events are not rewritten by this change.
 
 SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
+
+Decision-store preparation runs on blocking workers before source admission.
+The process registry only locates per-path slots; SQLite open, WAL setup and
+migration never hold the global registry lock. A concurrent open of the same
+path shares its slot, while unrelated workspaces can prepare independently.
+Cancelled publication retains preparation tickets and prepared store/event
+queues under runtime cleanup until the actual work and drains complete.
+Accounting tokenizer tables initialize at runtime construction. Physical
+reservation and cost-ledger appends still sync every file write, but sync the
+directory only when creating its journal entry; existing journals keep their
+validated private-file and no-symlink checks. Physical accounting reuses the
+workspace cost tracker, retaining its locked reservation and settlement checks.
+
+Automix may continue after the original decision deadline, using a single
+configured premium window starting at the cheap reply (default 30 seconds,
+hard maximum 120 seconds). Main settlement, premium reservation and dispatch
+consume this window. The continuation shares the original accounting balance
+and settlement gate; it does not replenish money, tokens, tools or decision
+authority. See [Router configuration](router.md) for the field and range.

@@ -90,6 +90,7 @@ async fn default_greeting_keeps_production_discovery_closed() {
             security,
         },
     )
+    .await
     .unwrap();
     let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
         &generation,
@@ -225,6 +226,7 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                     security,
                 },
             )
+            .await
             .unwrap();
             // Deterministic local decision fixture, not hosted-backend admission
             // or a claim about builtin multilingual semantic understanding.
@@ -487,6 +489,7 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
             security,
         },
     )
+    .await
     .unwrap();
     let owning = Arc::get_mut(&mut service).unwrap();
     owning.factory = DecisionBackendFactory::from_slots(

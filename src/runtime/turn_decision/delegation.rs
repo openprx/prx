@@ -197,6 +197,22 @@ impl TurnDecisionService {
                 security: Arc::clone(&self.security),
             },
             crate::runtime::child_source::ChildGrantRuntime {
+                recursive_child_claimed: self.parent_grant.as_ref().map_or_else(
+                    || {
+                        self.generation
+                            .effective
+                            .sessions_spawn
+                            .allow_recursive_delegation
+                            .then(|| {
+                                Arc::clone(
+                                    context
+                                        .recursive_child_claimed
+                                        .get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false))),
+                                )
+                            })
+                    },
+                    |incoming| incoming.recursive_child_allowance(),
+                ),
                 decision_store: Arc::clone(&self.store),
                 source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
                     .with_event_recording(self.generation.effective.memory.event_recording_config()),

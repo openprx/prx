@@ -732,6 +732,7 @@ impl AdmittedTurn {
                 security,
             },
         )
+        .await
         .expect("actual fixture decision service")
         .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
             hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),

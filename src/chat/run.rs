@@ -1284,7 +1284,9 @@ pub async fn run(
                     break None;
                 };
                 #[cfg(feature = "terminal-tui")]
-                if let Some(active_task_id) = per_turn_contexts.keys().next().copied() {
+                let active_task_id = per_turn_contexts.keys().next().copied();
+                #[cfg(feature = "terminal-tui")]
+                if let Some(active_task_id) = active_task_id {
                     let mut emit_active_turn_output =
                         |text: &str| surface_active_turn_message(&chat_dispatcher, redraw_tx_for_main.as_ref(), text);
                     let daemon_control = DaemonControl {

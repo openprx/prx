@@ -5,6 +5,27 @@ use crate::providers::catalog::{Requirement, UnknownPolicy};
 use crate::runtime::auxiliary_call::{AuxiliaryAccounting, AuxiliaryPurpose};
 use std::sync::Arc;
 
+#[cfg(feature = "llm-router")]
+impl TurnDecisionContext {
+    pub(crate) fn begin_automix_window(
+        &self,
+        cheap_reply_at: std::time::Instant,
+        window_ms: u64,
+    ) -> anyhow::Result<std::time::Instant> {
+        anyhow::ensure!((1..=120_000).contains(&window_ms), "invalid Automix escalation window");
+        Ok(*self
+            .automix_deadline
+            .get_or_init(|| cheap_reply_at + std::time::Duration::from_millis(window_ms)))
+    }
+
+    pub(crate) fn automix_deadline(&self) -> anyhow::Result<std::time::Instant> {
+        self.automix_deadline
+            .get()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Automix window has not started"))
+    }
+}
+
 impl TurnDecisionService {
     pub(crate) fn auxiliary_accounting(
         &self,
@@ -120,8 +141,13 @@ impl TurnDecisionService {
                 .ok_or_else(|| anyhow::anyhow!("Automix requires a settled main continuation"))?
                 .verify(self, proof, context)?,
         }
+        let deadline = match purpose {
+            #[cfg(feature = "llm-router")]
+            AuxiliaryPurpose::AutomixPremium => context.automix_deadline()?,
+            _ => context.engine.deadline,
+        };
         anyhow::ensure!(
-            std::time::Instant::now() < context.engine.deadline,
+            std::time::Instant::now() < deadline,
             "auxiliary decision deadline expired"
         );
         let original = self
@@ -257,6 +283,12 @@ impl TurnDecisionService {
             },
             Arc::clone,
         );
+        #[cfg(feature = "llm-router")]
+        let scope = if purpose == AuxiliaryPurpose::AutomixPremium {
+            Arc::new(scope.automix_window(context.automix_deadline()?))
+        } else {
+            scope
+        };
         AuxiliaryAccounting::new(
             selected,
             requested,
@@ -310,6 +342,61 @@ fn premium_selection(config: &crate::config::Config, admitted_provider: &str) ->
 #[cfg(test)]
 mod tests {
     use super::premium_selection;
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn expired_premium_window_cannot_restart_or_change_the_decision_deadline() -> anyhow::Result<()> {
+        use super::super::{AgentTurnKind, tests::disabled_agent_service};
+        use std::time::{Duration, Instant};
+        let workspace = tempfile::tempdir()?;
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = false;
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let service = disabled_agent_service(
+            &generation,
+            &crate::providers::catalog::CatalogView::from_config(&config),
+        )
+        .await;
+        let source = crate::agent::entry::test_cli_agent_turn_proof_with_input(
+            &generation,
+            "ollama",
+            "prx-local-model",
+            "Explain `2 + 2`.",
+        );
+        let context = service
+            .decide_agent_initial(
+                &source,
+                AgentTurnKind::SingleShot,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        let decision_deadline = context.engine.deadline;
+        let reply_at = Instant::now()
+            .checked_sub(Duration::from_millis(650))
+            .ok_or_else(|| anyhow::anyhow!("fixture monotonic clock cannot represent the cheap reply"))?;
+        let expired = context.begin_automix_window(reply_at, 100)?;
+        assert_eq!(expired, reply_at + Duration::from_millis(100));
+        assert!(expired < Instant::now());
+        assert_eq!(context.begin_automix_window(Instant::now(), 30_000)?, expired);
+        assert_eq!(context.engine.deadline, decision_deadline);
+        assert!(context.begin_automix_window(Instant::now(), 120_001).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn automix_legacy_configuration_gets_bounded_default_and_rejects_invalid_windows() -> anyhow::Result<()> {
+        let mut config: crate::config::AutomixConfig = serde_json::from_str("{}")?;
+        assert_eq!(config.escalation_window_ms, 30_000);
+        config.validate()?;
+        for invalid in [0, 120_001, u64::MAX] {
+            config.escalation_window_ms = invalid;
+            assert!(config.validate().is_err());
+        }
+        config.escalation_window_ms = 120_000;
+        config.validate()?;
+        Ok(())
+    }
+
     #[test]
     fn configured_premium_keeps_route_hint_and_bare_model_source_provider() {
         let mut config = crate::config::Config::default();

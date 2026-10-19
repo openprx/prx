@@ -610,6 +610,7 @@ async fn run_owned_manifest(
                 source.parent_decision_digest.clone(),
             ),
             crate::runtime::child_source::ChildGrantRuntime {
+                recursive_child_claimed: None,
                 decision_store: Arc::clone(&authority.store),
                 source_fabric: decision_fabric
                     .as_ref()

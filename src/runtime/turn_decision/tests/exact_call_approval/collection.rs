@@ -106,6 +106,7 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
             security,
         },
     )
+    .await
     .unwrap();
     use futures_util::FutureExt as _;
     let owned_cleanup_confirmed = AtomicBool::new(true);
@@ -645,6 +646,7 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             security,
         },
     )
+    .await
     .unwrap();
     use futures_util::FutureExt as _;
     let owned_cleanup_confirmed = AtomicBool::new(true);
