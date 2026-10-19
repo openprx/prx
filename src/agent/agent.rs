@@ -3108,6 +3108,7 @@ mod tests {
                 confidence_threshold: 0.7,
                 cheap_model_tiers: vec!["mini".into(), "ollama".into()],
                 premium_model_id: "openai/model-premium".into(),
+                ..Default::default()
             },
             models: vec![
                 crate::config::RouterModelConfig {

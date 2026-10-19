@@ -15,6 +15,11 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Automix premium escalation now has a separate window starting at the cheap
+  reply: `router.automix.escalation_window_ms`, default 30,000 ms, range
+  1–120,000 ms. It includes main settlement and premium reservation, sharing
+  the original token/money balance. Decision 500 ms and Router 100 ms are
+  unchanged. Existing configurations use the default.
 - Decision-store preparation runs off Tokio workers behind per-path gates;
   SQLite migration and WAL fsync no longer hold the global store registry.
   Cancelled publication retains preparation and queue cleanup ownership.

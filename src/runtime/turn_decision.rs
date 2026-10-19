@@ -648,6 +648,8 @@ pub(crate) struct TurnDecisionContext {
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
+    #[cfg(feature = "llm-router")]
+    automix_deadline: std::sync::OnceLock<std::time::Instant>,
     served_auxiliary: std::sync::OnceLock<crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink>,
     execution_closed: AtomicBool,
     approval_collection_started: AtomicBool,
@@ -1065,11 +1067,6 @@ impl TurnDecisionContext {
             );
             Ok(())
         }
-    }
-
-    #[cfg(feature = "llm-router")]
-    pub(crate) const fn auxiliary_deadline(&self) -> std::time::Instant {
-        self.engine.deadline
     }
 
     pub(crate) fn served_auxiliary(&self) -> Option<&crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink> {
@@ -2502,6 +2499,8 @@ impl TurnDecisionService {
                 service_id: self.service_id,
                 record_admitted: AtomicBool::new(false),
                 execution_trace: std::sync::OnceLock::new(),
+                #[cfg(feature = "llm-router")]
+                automix_deadline: std::sync::OnceLock::new(),
                 served_auxiliary: std::sync::OnceLock::new(),
                 execution_closed: AtomicBool::new(false),
                 approval_collection_started: AtomicBool::new(false),
@@ -2554,6 +2553,8 @@ impl TurnDecisionService {
                         service_id: self.service_id,
                         record_admitted: AtomicBool::new(false),
                         execution_trace: std::sync::OnceLock::new(),
+                        #[cfg(feature = "llm-router")]
+                        automix_deadline: std::sync::OnceLock::new(),
                         served_auxiliary: std::sync::OnceLock::new(),
                         execution_closed: AtomicBool::new(false),
                         approval_collection_started: AtomicBool::new(false),
@@ -2812,6 +2813,8 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             execution_trace: std::sync::OnceLock::new(),
+                            #[cfg(feature = "llm-router")]
+                            automix_deadline: std::sync::OnceLock::new(),
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
@@ -2852,6 +2855,8 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             execution_trace: std::sync::OnceLock::new(),
+                            #[cfg(feature = "llm-router")]
+                            automix_deadline: std::sync::OnceLock::new(),
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
@@ -2893,6 +2898,8 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             execution_trace: std::sync::OnceLock::new(),
+                            #[cfg(feature = "llm-router")]
+                            automix_deadline: std::sync::OnceLock::new(),
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
@@ -5096,6 +5103,8 @@ mod tests {
             service_id: uuid::Uuid::nil(),
             record_admitted: AtomicBool::new(false),
             execution_trace: std::sync::OnceLock::new(),
+            #[cfg(feature = "llm-router")]
+            automix_deadline: std::sync::OnceLock::new(),
             served_auxiliary: std::sync::OnceLock::new(),
             execution_closed: AtomicBool::new(false),
             approval_collection_started: AtomicBool::new(false),
@@ -6383,6 +6392,8 @@ mod tests {
                 service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
                 execution_trace: std::sync::OnceLock::new(),
+                #[cfg(feature = "llm-router")]
+                automix_deadline: std::sync::OnceLock::new(),
                 served_auxiliary: std::sync::OnceLock::new(),
                 execution_closed: AtomicBool::new(false),
                 approval_collection_started: AtomicBool::new(false),

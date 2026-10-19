@@ -648,3 +648,10 @@ reservation and cost-ledger appends still sync every file write, but sync the
 directory only when creating its journal entry; existing journals keep their
 validated private-file and no-symlink checks. Physical accounting reuses the
 workspace cost tracker, retaining its locked reservation and settlement checks.
+
+Automix may continue after the original decision deadline, using a single
+configured premium window starting at the cheap reply (default 30 seconds,
+hard maximum 120 seconds). Main settlement, premium reservation and dispatch
+consume this window. The continuation shares the original accounting balance
+and settlement gate; it does not replenish money, tokens, tools or decision
+authority. See [Router configuration](router.md) for the field and range.
