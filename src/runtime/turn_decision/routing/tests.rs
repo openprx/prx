@@ -8,6 +8,7 @@ use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::memory::embeddings::LocalHashEmbedding;
 use crate::memory::{Memory, RouterHistoryRead, RouterHistoryRow, SqliteMemory};
 
+mod metadata_bounds;
 mod observed_sqlite;
 mod paid_embedding;
 use crate::providers::traits::ChatTrace;
@@ -310,11 +311,14 @@ impl Fixture {
     async fn assert_read_closed(&mut self, expected_error: &str) {
         // A fixed refusal may be an Ok user-facing response or an error. The
         // durable stage and provider count distinguish it from unrelated errors.
-        let _result = self.turn().await;
+        let result = self.turn().await;
         assert_eq!(self.calls.load(Ordering::SeqCst), 1);
         {
             let observed = self.observed.observations.lock();
-            assert_eq!(observed.read_calls, 2);
+            assert_eq!(
+                observed.read_calls, 2,
+                "expected={expected_error}; actual turn={result:?}"
+            );
             let chain = observed.last_read.as_ref().unwrap().as_ref().unwrap_err();
             assert!(
                 chain.iter().any(|cause| cause == expected_error),

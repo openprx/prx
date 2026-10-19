@@ -137,42 +137,57 @@ impl SqliteMemory {
         let pool = Arc::clone(&self.pool);
         crate::runtime::blocking::spawn_blocking(move || {
             check(deadline)?;
-            let connection=pool.write_until(deadline)?;
-            let _deadline=super::ingress_recovery::ConnectionDeadline::new(&connection,deadline)?;
-            let tx=connection.unchecked_transaction()?;
-            let sequence=source_sequence(&tx,&evidence)?;
+            let connection = pool.write_until(deadline)?;
+            let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
+            let tx = connection.unchecked_transaction()?;
+            let sequence = source_sequence(&tx, &evidence)?;
             // First selected read may observe an empty new history. It does not
             // create either a mutable record or a history table.
-            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='router_history_v1')",[],|row|row.get(0))?;
-            let mut result=RouterHistoryRead {source_sequence:sequence,rows:Vec::new()};
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='router_history_v1')",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut result = RouterHistoryRead {
+                source_sequence: sequence,
+                rows: Vec::new(),
+            };
             if exists {
-                let key=evidence.domain.key()?;
-                let (count,valid):(i64,i64)=tx.query_row("SELECT count(*),coalesce(min(CASE WHEN
-                    length(CAST(terminal AS BLOB)) BETWEEN 1 AND 512 AND length(CAST(provider AS BLOB)) BETWEEN 1 AND 512
-                    AND length(CAST(model AS BLOB)) BETWEEN 1 AND 512 AND length(CAST(workspace AS BLOB)) BETWEEN 1 AND 512
-                    AND length(CAST(owner AS BLOB)) BETWEEN 1 AND 512 AND length(CAST(session AS BLOB)) BETWEEN 1 AND 512
-                    AND length(CAST(embedding_model AS BLOB)) BETWEEN 1 AND 512 AND length(CAST(source_event AS BLOB)) BETWEEN 1 AND 512
-                    AND typeof(policy)='blob' AND length(policy)=32 AND typeof(fingerprint)='blob' AND length(fingerprint)=32
-                    AND dimensions BETWEEN 1 AND 2048 AND embedding_version=1 AND success IN (0,1)
-                    AND typeof(embedding)='blob' AND length(embedding)=dimensions*4
-                    THEN 1 ELSE 0 END),1) FROM (SELECT * FROM router_history_v1
+                let key = evidence.domain.key()?;
+                // Count before materializing rows; the guarded projection and
+                // decoder below validate each value once before it is used.
+                let count: i64 = tx.query_row(
+                    "SELECT count(*) FROM (SELECT 1 FROM router_history_v1
                     WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2 LIMIT ?3)",
-                    params![key,sequence,(ROUTER_HISTORY_MAX_RECORDS+1) as i64],|row|Ok((row.get(0)?,row.get(1)?)))?;
-                anyhow::ensure!(count<=ROUTER_HISTORY_MAX_RECORDS as i64,"Router history complete domain exceeds capacity");
-                anyhow::ensure!(valid==1,"Router history row exceeds encoding bounds");
+                    params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    count <= ROUTER_HISTORY_MAX_RECORDS as i64,
+                    "Router history complete domain exceeds capacity"
+                );
                 check(deadline)?;
-                let mut statement=tx.prepare(&format!("SELECT {COLUMNS} FROM router_history_v1
+                let mut statement = tx.prepare(&format!(
+                    "SELECT {COLUMNS} FROM router_history_v1
                     WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2
-                    ORDER BY source_sequence,terminal_sequence LIMIT ?3"))?;
-                let mut rows=statement.query(params![key,sequence,(ROUTER_HISTORY_MAX_RECORDS+1) as i64])?;
-                while let Some(row)=rows.next()? {
+                    ORDER BY source_sequence,terminal_sequence LIMIT ?3"
+                ))?;
+                let mut rows = statement.query(params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64])?;
+                while let Some(row) = rows.next()? {
                     check(deadline)?;
-                    anyhow::ensure!(result.rows.len()<ROUTER_HISTORY_MAX_RECORDS,"Router history complete domain exceeds capacity");
-                    result.rows.push(decode(row,&evidence.domain)?.0);
+                    anyhow::ensure!(
+                        result.rows.len() < ROUTER_HISTORY_MAX_RECORDS,
+                        "Router history complete domain exceeds capacity"
+                    );
+                    result.rows.push(decode(row, &evidence.domain)?.0);
                 }
             }
-            result.validate(&evidence.domain)?;check(deadline)?;tx.commit()?;Ok(result)
-        }).await?
+            result.validate(&evidence.domain)?;
+            check(deadline)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await?
     }
 
     pub(super) async fn router_history_commit(
