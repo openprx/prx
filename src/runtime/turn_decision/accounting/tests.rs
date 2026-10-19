@@ -48,18 +48,17 @@ async fn admission_releases_phase_writes_while_its_physical_accounting_is_retain
                 Some(1),
             );
             let sink = service.durable_events.as_ref().context("durable phase sink")?;
-            let drain = sink.drain(Instant::now() + Duration::from_secs(2));
-            tokio::pin!(drain);
-            assert!(futures::poll!(drain.as_mut()).is_pending());
-            tokio::task::yield_now().await;
-            assert_eq!(
-                memory.list_message_events_since(&principal, 0, 100).await?.len(),
-                before
+            let (first, concurrent) = tokio::join!(
+                sink.drain(Instant::now() + Duration::from_secs(2)),
+                sink.drain(Instant::now() + Duration::from_secs(2)),
+            );
+            assert!(
+                first && concurrent,
+                "drain must not wait for a live admission guard or its retained accounting"
             );
             drop(accounting);
-            assert!(futures::poll!(drain.as_mut()).is_pending());
             drop(guard);
-            assert!(drain.await, "issued accounting must not retain phase deferral");
+            assert!(sink.drain(Instant::now() + Duration::from_secs(2)).await);
             assert_eq!(retained.remaining_budgets().tokens, budgets.tokens);
             assert_eq!(
                 memory.list_message_events_since(&principal, 0, 100).await?.len(),

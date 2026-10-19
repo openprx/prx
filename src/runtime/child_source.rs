@@ -543,6 +543,7 @@ pub(crate) struct IssuedChildGrant(Arc<ChildGrantData>);
 mod recursive;
 
 pub(crate) struct ChildGrantRuntime {
+    pub(crate) recursive_child_claimed: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) decision_store: Arc<crate::causal_tree::store::CausalDecisionStore>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -556,6 +557,7 @@ struct ParentModelSelection {
 }
 
 struct ChildGrantData {
+    recursive_child_claimed: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Only a live parent decision can issue default child-model selection.
     // Restored incoming authority is used to admit that child, not to spawn
     // another child without a fresh decision-issued outgoing grant.
@@ -629,6 +631,7 @@ impl IssuedChildGrant {
     ) -> anyhow::Result<Self> {
         let (parent, parent_model) = source;
         let ChildGrantRuntime {
+            recursive_child_claimed,
             decision_store,
             source_fabric,
             security,
@@ -655,6 +658,11 @@ impl IssuedChildGrant {
             "child grant differs from admitted parent source"
         );
         Ok(Self(Arc::new(ChildGrantData {
+            recursive_child_claimed: recursive_child_claimed.or_else(|| {
+                (generation.effective.sessions_spawn.allow_recursive_delegation
+                    || manifest.authority.delegation.is_some())
+                .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            }),
             parent_model,
             source_fabric,
             security,
@@ -846,6 +854,7 @@ impl IssuedChildGrant {
             narrowed, parent,
         )?);
         Ok(Self(Arc::new(ChildGrantData {
+            recursive_child_claimed: self.0.recursive_child_claimed.clone(),
             parent_model: self.0.parent_model.clone(),
             source_fabric: self.0.source_fabric.clone(),
             security: Arc::clone(&self.0.security),

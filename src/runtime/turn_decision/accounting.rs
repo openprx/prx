@@ -22,11 +22,25 @@ pub(super) struct TurnAccounting<'a> {
 
 /// The telemetry guard belongs to admission, independently of the physical
 /// accounting scope that an issued context can retain after admission ends.
-pub(super) fn admission_persistence(service: &TurnDecisionService) -> Option<PersistenceGuard> {
-    service
-        .durable_events
-        .as_ref()
-        .map(|events| events.defer_ordinary_persistence())
+pub(super) fn admission_persistence(
+    service: &TurnDecisionService,
+    proof: &dyn TurnSourceProof,
+    deadline: Instant,
+) -> Option<PersistenceGuard> {
+    service.durable_events.as_ref().map(|events| {
+        events.defer_ordinary_persistence(
+            &crate::decision::telemetry::CausalLineage {
+                workspace_id: Arc::from(proof.workspace_id()),
+                owner_id: Some(Arc::from(proof.owner_id())),
+                session_key: Some(Arc::from(proof.session_key())),
+                run_id: Some(Arc::from(proof.run_id())),
+                source_event_id: proof.source_event_id().map(Arc::from),
+                task_id: proof.task_id().map(Arc::from),
+                ..Default::default()
+            },
+            deadline,
+        )
+    })
 }
 
 pub(super) fn admission_resources<'a>(
@@ -37,7 +51,7 @@ pub(super) fn admission_resources<'a>(
 ) -> (TurnAccounting<'a>, Option<PersistenceGuard>) {
     (
         TurnAccounting::new(service, proof, budgets, deadline),
-        admission_persistence(service),
+        admission_persistence(service, proof, deadline),
     )
 }
 

@@ -259,20 +259,27 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
     );
     let flags = match access {
         CostFileAccess::Read => OFlags::RDONLY,
-        CostFileAccess::Append => OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE,
+        CostFileAccess::Append => OFlags::WRONLY | OFlags::APPEND,
         CostFileAccess::Migration => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
         CostFileAccess::Lock => OFlags::RDWR | OFlags::CREATE,
     };
-    let fd = match rustix::fs::openat(
-        &state,
-        filename,
-        flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let creates = matches!(access, CostFileAccess::Append | CostFileAccess::Migration);
+    let creation_flags = if creates {
+        OFlags::CREATE | OFlags::EXCL
+    } else {
+        OFlags::empty()
     };
+    let secure_flags = flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let (fd, created) =
+        match rustix::fs::openat(&state, filename, secure_flags | creation_flags, Mode::RUSR | Mode::WUSR) {
+            Ok(fd) => (fd, creates),
+            Err(rustix::io::Errno::EXIST) if matches!(access, CostFileAccess::Append) => (
+                rustix::fs::openat(&state, filename, secure_flags, Mode::RUSR | Mode::WUSR)?,
+                false,
+            ),
+            Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
     let stat = rustix::fs::fstat(&fd)?;
     anyhow::ensure!(
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
@@ -280,13 +287,13 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
             && stat.st_mode & 0o022 == 0,
         "cost file is not a private single-link regular file"
     );
-    if matches!(access, CostFileAccess::Append | CostFileAccess::Migration) {
+    if created {
         // CostStorage may have just created state; persist that entry too.
         File::from(root)
             .sync_all()
             .context("failed to sync cost workspace directory")?;
     }
-    Ok(Some((File::from(fd), Some(File::from(state)))))
+    Ok(Some((File::from(fd), created.then(|| File::from(state)))))
 }
 
 // Keep ordinary cost recording available on non-Unix platforms. This path

@@ -55,7 +55,7 @@ impl Tool for SessionsSpawnTool {
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+                        "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap; recursive grants permit one child. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
                         "items": {
                             "anyOf": [
                                 {"type": "string", "minLength": 1},

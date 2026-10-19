@@ -130,7 +130,7 @@ async fn run_witness(slow: bool) {
         let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(Arc::clone(&registry),Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),Arc::new(DenyApprovalStrategy),Arc::new(AdapterOwnedPreparation),Arc::new(TracingToolExecutionAudit)));
         let provider_catalog = ProviderCatalogView::from_config(&config);
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace).expect("actual SQLite"));
-        let service = build_turn_decision_service(TurnSurfaceKind::AgentLoop,TurnServiceBuild { parent_grant:None,generation:Arc::clone(&generation),registry,execution,catalog_sources:sources(&generation,&config),surface_policy:SurfacePolicy::default(),provider_catalog:&provider_catalog,transports:&crate::decision::compatible_http::HttpDecisionTransports,events:Arc::new(SilentEvents),memory:Arc::clone(&memory),security }).expect("actual configured service");
+        let service = build_turn_decision_service(TurnSurfaceKind::AgentLoop,TurnServiceBuild { parent_grant:None,generation:Arc::clone(&generation),registry,execution,catalog_sources:sources(&generation,&config),surface_policy:SurfacePolicy::default(),provider_catalog:&provider_catalog,transports:&crate::decision::compatible_http::HttpDecisionTransports,events:Arc::new(SilentEvents),memory:Arc::clone(&memory),security }).await.expect("actual configured service");
         retained_service = Some(service);
         let service = retained_service.as_ref().expect("retained actual service");
         assert_eq!(service.factory.request_model(),Some("prx-decision-model"));

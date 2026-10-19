@@ -4,6 +4,68 @@ use super::super::*;
 use std::{task::Poll, time::Duration};
 
 #[tokio::test]
+async fn a_second_physical_attempt_reaches_the_gate_but_expires_while_the_first_is_in_flight() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.cost.prices.insert(
+        "openrouter/prx-serial".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let cleanup = Arc::new(CleanupTracker::default());
+    let budgets = TurnBudgets {
+        tokens: 1024,
+        micro_usd: 5000,
+        latency_ms: 500,
+    };
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::new(config),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [4; 32],
+        budgets,
+        deadline,
+    );
+    let binding = [0; 32];
+    let attempt = || PhysicalEstimate {
+        purpose: "decision",
+        provider: "openrouter",
+        model: "prx-serial",
+        body: b"{}",
+        transport_binding: &binding,
+        request_id: "prx-serial",
+        deadline,
+        remaining_attempts: 2,
+    };
+    let first = scope.begin_physical(attempt()).await?;
+    let reserved = scope.remaining_budgets();
+    let capture = super::super::timing::Capture::new();
+    let second = capture.scope(Box::pin(scope.begin_physical(attempt()))).await;
+    assert!(matches!(second, Err(DecisionError::BudgetExceeded)));
+    assert_eq!(scope.remaining_budgets().tokens, reserved.tokens);
+    assert_eq!(scope.remaining_budgets().micro_usd, reserved.micro_usd);
+    let rows = super::super::transport_tests::journal(workspace.path())?;
+    assert_eq!(rows.len(), 2, "the waiting attempt must not write another reservation");
+    drop(first);
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    assert!(
+        capture.has_stage("settlement_wait_started"),
+        "the real second attempt must reach the serialization gate"
+    );
+    assert!(
+        !capture.has_stage("settlement_wait_acquired"),
+        "the in-flight first receipt must retain the gate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_blocked_settlement_overlaps_admission_but_keeps_its_hold_and_cleanup_owner() -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let mut config = Config::default();

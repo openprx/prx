@@ -31,6 +31,14 @@ mod settlement;
 #[cfg(feature = "llm-router")]
 mod cl100k_prefix_bound;
 
+/// Initialize local CPU-heavy accounting tables at runtime construction,
+/// before a source starts its fixed admission clock.
+pub(crate) fn initialize_tokenizers() {
+    let _ = crate::agent::context_budget::count_tokens_with_source("");
+    #[cfg(feature = "llm-router")]
+    cl100k_prefix_bound::initialize();
+}
+
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
 pub(crate) struct AccountingScope {
@@ -75,6 +83,29 @@ impl AccountingScope {
             latency_ms: self.budgets.latency_ms.min(
                 u64::try_from(self.deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX),
             ),
+        }
+    }
+
+    /// Share the original monetary/token balance and settlement serialization;
+    /// only this premium continuation receives a later transport deadline.
+    #[cfg(feature = "llm-router")]
+    pub(super) fn automix_window(&self, deadline: Instant) -> Self {
+        let remaining = self.remaining.get_or_init(|| {
+            Arc::new(RemainingBudgets {
+                tokens: AtomicU64::new(self.budgets.tokens),
+                micro_usd: AtomicU64::new(self.budgets.micro_usd),
+                settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
+                settlement_failed: AtomicBool::new(false),
+            })
+        });
+        Self {
+            config: Arc::clone(&self.config),
+            key: Arc::clone(&self.key),
+            cleanup: Arc::clone(&self.cleanup),
+            scope_id: self.scope_id,
+            budgets: self.budgets,
+            deadline,
+            remaining: OnceLock::from(Arc::clone(remaining)),
         }
     }
 
@@ -279,12 +310,20 @@ impl AccountingScope {
             #[cfg(test)]
             let (prepared, mut diagnostic_timing) = prepared;
             let mut prepared = prepared.map_err(|_| DecisionError::BudgetExceeded)?;
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark("settlement_wait_started");
+            }
             let settlement_guard = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(DecisionError::Cancelled),
                 result = tokio::time::timeout_at(deadline.into(), Arc::clone(&remaining.settlement_gate).lock_owned()) =>
                     result.map_err(|_| DecisionError::BudgetExceeded)?,
             };
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark("settlement_wait_acquired");
+            }
             if remaining.settlement_failed.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err(DecisionError::BudgetExceeded);
             }
@@ -359,7 +398,7 @@ impl AccountingScope {
                             timing.mark("tracker_open");
                         }
                     }
-                    let tracker = CostTracker::new(config.cost.clone(), &config.workspace_dir)?;
+                    let tracker = CostTracker::for_workspace(config.cost.clone(), &config.workspace_dir)?;
                     #[cfg(test)]
                     {
                         diagnostic_stage = "reserve";
@@ -503,7 +542,7 @@ impl Drop for UnclaimedReceipt {
 
 pub(super) struct OwnedReceipt {
     _settlement_guard: tokio::sync::OwnedMutexGuard<()>,
-    tracker: CostTracker,
+    tracker: Arc<CostTracker>,
     receipt: ReservationReceipt,
     config: Arc<Config>,
     provider: String,
