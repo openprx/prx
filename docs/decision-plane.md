@@ -174,16 +174,22 @@ so handing reported usage to persistence cannot suspend behind another request.
 Metering and estimated-liability reconciliation share one held ledger lock and
 snapshot. The canonical cost row is synced before journal reconciliation;
 invalid journal state still retains the charge and fails cleanup closed.
-Ordinary phase writes remain deferred through final issuance, including delegation
-storage validation. Delegation reads its committed chain in one bounded operation
+Ordinary phase writes defer only for their own source admission, until its
+deadline or guard release. Each queued event retains that admission's deferral;
+overlapping sessions cannot extend it. Re-admitting the same source releases
+its earlier deferral. Delegation reads its committed chain in one bounded operation
 on the writer connection, retaining owner, lineage and replay-digest checks.
 Already queued ordinary phase events persist in batches of at most 32. SQLite
 commits each batch once, isolating individual invalid events with savepoints;
 other backends retain ordered per-event results. At most two SQLite event batches
 write concurrently across workspaces; scalar and Applied writes, selected reads
 and accounting are outside this background gate. Observers remain immediate.
-Batches stop at Applied and drain markers, preserving their FIFO boundary;
-a storage failure still reports incomplete persistence for each affected event.
+Applied events bypass deferred ordinary events. A drain marker flushes every
+earlier queued ordinary event before acknowledging, even while admission guards
+remain alive. Ordinary order is retained within an admission; unrelated sessions
+may persist independently. The ordinary backlog is bounded to 256 events across
+the queue, deferred events and in-flight writes, with overflow still reported.
+A storage failure still reports incomplete persistence for each affected event.
 The decision-store writer also commits up to 32 already queued ordinary chains
 in one transaction. Each chain has its own savepoint, so a conflict or SQL error
 rolls back that entire chain without losing its valid neighbors. Notifications

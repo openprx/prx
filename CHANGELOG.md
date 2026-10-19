@@ -15,6 +15,11 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Causal telemetry deferral is now admission-local and expires at that
+  admission's deadline. Applied events bypass deferred phases; drain flushes
+  earlier events without waiting for unrelated admissions. No admission budget
+  is raised.
+
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.
   Older binaries reject this event and refuse the entire cost ledger. Once it
