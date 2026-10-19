@@ -11,6 +11,30 @@ pub(super) struct OutgoingDelegation {
     pub requested: Vec<CapabilityRef>,
 }
 
+/// A child publication must retain the estimate that passed candidate
+/// admission. Missing estimates remain unknown and G1 continues to refuse
+/// them; constructing an unpriced publication must not erase an admitted one.
+pub(super) fn publication_cost(
+    decision: &crate::causal_tree::decision_engine::EngineDecision,
+    reference: &CapabilityRef,
+    delegator: bool,
+) -> Option<crate::causal_tree::branch::CostEstimate> {
+    use crate::causal_tree::branch::CausalActionKind;
+    let super::CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+        return None;
+    };
+    let action = if delegator {
+        CausalActionKind::Delegate
+    } else {
+        CausalActionKind::UseTool
+    };
+    candidates.iter().find_map(|candidate| {
+        (candidate.action() == action && candidate.required_capabilities() == std::slice::from_ref(reference))
+            .then(|| candidate.estimated_cost())
+            .flatten()
+    })
+}
+
 impl TurnDecisionService {
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
@@ -274,6 +298,22 @@ impl TurnDecisionService {
                     });
                 }
             }
+            // A root also owns its actual discovery control. Capture that
+            // reference when recursive spawning is permitted, so the child
+            // can drop it while retaining an explicitly requested delegator.
+            // An inherited child can never recover this root-only reference.
+            if self.generation.effective.sessions_spawn.allow_recursive_delegation
+                && let Some(entry) = self
+                    .catalog
+                    .entry_for_public_name("capability_search")
+                    .filter(|entry| permitted(entry))
+            {
+                allowed.insert(CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                });
+            }
         }
         if !allowed.iter().any(|reference| {
             catalog
@@ -341,6 +381,7 @@ impl TurnDecisionService {
                     level,
                     max_cost_cents,
                     remaining_depth,
+                    delegation: None,
                 },
                 |manifest| manifest.authority.clone(),
             ),

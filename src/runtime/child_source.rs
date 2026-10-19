@@ -540,6 +540,8 @@ impl ChildSegmentSequence {
 #[derive(Clone)]
 pub(crate) struct IssuedChildGrant(Arc<ChildGrantData>);
 
+mod recursive;
+
 pub(crate) struct ChildGrantRuntime {
     pub(crate) decision_store: Arc<crate::causal_tree::store::CausalDecisionStore>,
     pub(crate) source_fabric: MemoryFabric,
@@ -701,6 +703,7 @@ impl IssuedChildGrant {
             &worker.workspace_dir,
         )?;
         grant.verify_receipt(receipt)?;
+        grant.verify_child_model(&worker.provider_name, &worker.model)?;
         Ok(Arc::new(grant))
     }
 
@@ -727,7 +730,7 @@ impl IssuedChildGrant {
                 && event.run_id.as_deref() == Some(worker.run_id.as_str())
                 && event.session_key.as_deref() == Some(worker.session_scope_key.as_str())
                 && worker.owner_id.as_deref() == Some(parent.owner_id())
-                && worker.parent_run_id.as_deref() == Some(parent.run_id())
+                && worker.parent_run_id.as_deref() == Some(parent.spawn_run_id())
                 && worker.runtime_config_generation_id == Some(parent.config_generation_id())
                 && worker.runtime_config_source_revision.as_deref() == Some(parent.config_source_revision())
                 && worker.scope_channel.as_deref() == Some(parent.policy_channel())
@@ -764,6 +767,7 @@ impl IssuedChildGrant {
             &crate::providers::catalog::Requirement::chat(),
             crate::providers::catalog::UnknownPolicy::Invocation,
         )?;
+        self.verify_child_model(resolved.provider_label(), resolved.model())?;
         anyhow::ensure!(
             crate::providers::ProviderId::of(resolved.provider_label())
                 == crate::providers::ProviderId::of(&worker.provider_name)
@@ -837,8 +841,7 @@ impl IssuedChildGrant {
         if requested.len() == manifest.allowed.len() {
             return Ok(self.clone());
         }
-        let narrowed =
-            crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(parent, &requested)?;
+        let narrowed = manifest.narrow_allowed(parent, &requested)?;
         let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
             narrowed, parent,
         )?);
@@ -888,13 +891,13 @@ impl IssuedChildGrant {
             scope
                 .run_id
                 .as_deref()
-                .is_some_and(|id| !id.is_empty() && id != parent.run_id())
+                .is_some_and(|id| !id.is_empty() && id != parent.run_id() && id != parent.spawn_run_id())
                 && scope.session_key.as_deref().is_some_and(|id| !id.is_empty()),
             "child input requires a distinct run and a session"
         );
         for (field, expected) in [
             (&mut scope.owner_id, parent.owner_id()),
-            (&mut scope.parent_run_id, parent.run_id()),
+            (&mut scope.parent_run_id, parent.spawn_run_id()),
             (&mut scope.parent_session_key, parent.session_key()),
             (
                 &mut scope.causation_event_id,
@@ -928,11 +931,11 @@ impl IssuedChildGrant {
         anyhow::ensure!(
             event.workspace_id == parent.workspace_id()
                 && event.owner_id.as_deref() == Some(parent.owner_id())
-                && event.parent_run_id.as_deref() == Some(parent.run_id())
+                && event.parent_run_id.as_deref() == Some(parent.spawn_run_id())
                 && event
                     .run_id
                     .as_deref()
-                    .is_some_and(|id| !id.is_empty() && id != parent.run_id())
+                    .is_some_and(|id| !id.is_empty() && id != parent.run_id() && id != parent.spawn_run_id())
                 && event.parent_session_key.as_deref() == Some(parent.session_key())
                 && event.causation_event_id.as_deref() == parent.source_event_id()
                 && event.channel.as_deref() == Some(parent.policy_channel())
@@ -1228,10 +1231,19 @@ impl ChildProviderBinding {
         resolved: crate::providers::catalog::ResolvedModel,
         route: Option<crate::providers::catalog::RouteTarget>,
     ) -> anyhow::Result<Self> {
+        if let Some(grant) = &grant {
+            grant.verify_child_model(resolved.provider_label(), resolved.model())?;
+        }
         let config = &generation.effective;
         // A delegated provider remains pinned to its selected vendor, matching
         // the existing child contract. The factory validates model fallbacks.
-        let reliability = pinned_provider_reliability(&config.reliability);
+        let mut reliability = pinned_provider_reliability(&config.reliability);
+        if grant
+            .as_ref()
+            .is_some_and(|grant| grant.scope().gate_inputs().0.authority.delegation.is_some())
+        {
+            reliability.model_fallbacks.clear();
+        }
         let options = crate::providers::provider_runtime_options_from_config(config);
         let provider = Arc::from(crate::providers::create_provider_for(
             &resolved,

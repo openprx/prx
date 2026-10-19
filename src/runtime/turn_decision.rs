@@ -996,7 +996,9 @@ fn direct_answer_refs(
                     required_capabilities: vec![reference.clone()],
                     side_effect: entry.effect,
                     approval: entry.approval.clone(),
-                    estimated_cost: None,
+                    estimated_cost: gates
+                        .child_scope
+                        .and_then(|_| delegation::publication_cost(decision, &reference, delegation)),
                     estimated_latency_ms: None,
                 },
             );

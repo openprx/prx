@@ -1619,6 +1619,7 @@ mod tests {
                 level: AutonomyLevel::Full,
                 max_cost_cents: 100,
                 remaining_depth: 2,
+                delegation: None,
             },
             catalog_generation: *catalog.generation(),
             key: key.clone(),
