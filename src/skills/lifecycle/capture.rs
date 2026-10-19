@@ -22,6 +22,7 @@
 //! as having dropped evidence through a lock-free path (a marker file plus an
 //! in-process flag) that the terminal join consults.
 
+use super::facts::{TerminalFacts, TerminalObservations, derive};
 use super::generation::ensure_dir_synced;
 use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
 use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId};
@@ -125,6 +126,11 @@ pub struct TerminalJoin {
     pub terminal_receipt_id: String,
     pub outcome: ExperienceOutcome,
     pub joined_at: DateTime<Utc>,
+    /// Infrastructure, permission and adherence facts. Records written before
+    /// these existed read as all-unknown, which never satisfies the proposal
+    /// entry conditions.
+    #[serde(default)]
+    pub facts: TerminalFacts,
 }
 
 /// The persisted record.
@@ -413,6 +419,18 @@ impl SkillLifecycleStore {
         terminal_receipt_id: &str,
         outcome: ExperienceOutcome,
     ) -> Result<TerminalJoinOutcome, LifecycleError> {
+        self.join_terminal_with(task_id, terminal_receipt_id, outcome, &TerminalFacts::default())
+    }
+
+    /// [`Self::join_terminal`] with the facts the runtime observed. The facts
+    /// of the first join stand; a replay does not change them.
+    pub fn join_terminal_with(
+        &self,
+        task_id: &str,
+        terminal_receipt_id: &str,
+        outcome: ExperienceOutcome,
+        facts: &TerminalFacts,
+    ) -> Result<TerminalJoinOutcome, LifecycleError> {
         check_text("terminal receipt id", terminal_receipt_id)?;
         if outcome == ExperienceOutcome::Incomplete {
             return Err(LifecycleError::InvalidId {
@@ -434,6 +452,7 @@ impl SkillLifecycleStore {
                 terminal_receipt_id: terminal_receipt_id.clone(),
                 outcome,
                 joined_at: Utc::now(),
+                facts: facts.clone(),
             });
             record.outcome = outcome;
             Ok(Some(false))
@@ -518,6 +537,9 @@ pub struct TaskTerminal<'a> {
     pub task_id: &'a str,
     pub terminal_receipt_id: &'a str,
     pub outcome: ExperienceOutcome,
+    /// What the runtime observed (tool calls, refusals, provider end); `None`
+    /// leaves every fact unknown.
+    pub observations: Option<&'a TerminalObservations>,
 }
 
 /// The one call-in for a task terminal: joins the terminal to the task's
@@ -536,9 +558,17 @@ pub fn on_task_terminal(
             // A task that never touched a managed skill has no experience and
             // needs none; do not create an empty record for it.
             match store.read_experience(terminal.task_id)? {
-                Some(_) => store
-                    .join_terminal(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome)
-                    .map(Some),
+                Some(experience) => {
+                    // The facts of a terminal that is already joined stand.
+                    let facts = if experience.terminal.is_some() {
+                        TerminalFacts::default()
+                    } else {
+                        derive(&store, &experience, terminal.observations)
+                    };
+                    store
+                        .join_terminal_with(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome, &facts)
+                        .map(Some)
+                }
                 None => Ok(None),
             }
         }

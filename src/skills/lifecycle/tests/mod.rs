@@ -6,6 +6,7 @@ mod bundle;
 mod capture;
 mod evaluate;
 mod evaluate_agent;
+mod facts;
 mod gate;
 mod knowledge;
 mod manifest;

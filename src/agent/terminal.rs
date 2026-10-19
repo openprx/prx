@@ -568,6 +568,59 @@ fn skill_awaiting_approval(
         ) > 0
 }
 
+/// The runtime's terminal observations as the skill lifecycle takes them:
+/// plain values only, no interpretation (the lifecycle derives infrastructure,
+/// permission and adherence facts from them).
+fn skill_observations(
+    decision: &DecisionSettlementRef,
+    trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+    provider: Option<&ProviderExecutionOutcome>,
+) -> crate::skills::lifecycle::TerminalObservations {
+    trace.map_or_else(
+        || observations_from(&decision.context.terminal_execution_trace(), provider),
+        |trace| observations_from(trace, provider),
+    )
+}
+
+fn observations_from(
+    trace: &crate::tools::capability::execution_trace::ExecutionTraceSnapshot,
+    provider: Option<&ProviderExecutionOutcome>,
+) -> crate::skills::lifecycle::TerminalObservations {
+    use crate::llm::route_decision::ExecutionStatus;
+    use crate::skills::lifecycle::{ObservedCallStatus, ObservedToolCall, ProviderEnd, TerminalObservations};
+    let provider = match provider.map(|outcome| &outcome.status) {
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) => ProviderEnd::Served,
+        Some(ExecutionStatus::AllFailed { last_error_class }) => ProviderEnd::from_failure_class(last_error_class),
+        // Without a settled outcome the trace still shows a served final attempt.
+        None if trace
+            .provider_attempts
+            .as_ref()
+            .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
+            .is_some_and(|attempt| attempt.status == "success") =>
+        {
+            ProviderEnd::Served
+        }
+        None => ProviderEnd::Unknown,
+    };
+    TerminalObservations {
+        tool_calls: trace
+            .calls
+            .iter()
+            .filter_map(|call| {
+                Some(ObservedToolCall {
+                    capability_id: call.capability_id.clone(),
+                    status: ObservedCallStatus::from_trace_code(&call.status)?,
+                })
+            })
+            .collect(),
+        denied_attempts: trace.denied_attempts,
+        failed_attempts: trace.failed_attempts,
+        awaiting_approval_attempts: trace.awaiting_approval_attempts,
+        complete: !trace.incomplete && trace.pending_attempts == 0 && trace.unbound_attempts == 0,
+        provider,
+    }
+}
+
 /// Task-terminal call-in of the skill lifecycle: joins the terminal to the
 /// task's skill experience and releases the task's revision pins. A silent turn
 /// is not credited (pins are released, nothing is joined) and a turn waiting
@@ -580,6 +633,7 @@ async fn release_skill_lifecycle(
     terminal_id: &str,
     status: TurnTerminalStatus,
     awaiting_approval: bool,
+    observations: crate::skills::lifecycle::TerminalObservations,
 ) {
     use crate::skills::lifecycle::{ExperienceOutcome, OwnerScope};
     let (Some(owner), Some(task)) = (owner, task_key) else {
@@ -613,6 +667,7 @@ async fn release_skill_lifecycle(
                 task_id: &task,
                 terminal_receipt_id: &terminal_id,
                 outcome,
+                observations: Some(&observations),
             },
         )
         .map(|_| ())
@@ -982,6 +1037,11 @@ async fn finalize_turn_impl(
         // keeps its experience `incomplete` (its pins died with the process).
         // Recorded as a known gap.
         let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
+        let observations = skill_observations(
+            &commit.decision,
+            execution_trace.as_ref(),
+            commit.provider_outcome.as_ref(),
+        );
         release_skill_lifecycle(
             workspace_dir,
             skill_owner,
@@ -989,6 +1049,7 @@ async fn finalize_turn_impl(
             &commit.terminal_id,
             commit.status,
             awaiting_approval,
+            observations,
         )
         .await;
         let receipt = TurnTerminalReceipt {
@@ -2640,6 +2701,7 @@ mod tests {
             "silent-term",
             TurnTerminalStatus::Silent,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2678,6 +2740,7 @@ mod tests {
             "child-term",
             TurnTerminalStatus::Completed,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2690,6 +2753,7 @@ mod tests {
             "parent-term",
             TurnTerminalStatus::Failed,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
         assert!(!holds_pin(owner, "run-parent", &skill));
@@ -2714,6 +2778,7 @@ mod tests {
             "approval-term",
             TurnTerminalStatus::Completed,
             true,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2772,5 +2837,49 @@ mod tests {
         task_only.run_id = None;
         assert_eq!(scope_key(&task_only).as_deref(), Some("job-2"));
         assert_eq!(scope_key(&task_only), read_key(&task_only));
+    }
+    /// The runtime trace and provider outcome reach the skill lifecycle as plain
+    /// observations: an unavailable provider, a refused call and the called tools.
+    #[test]
+    fn skill_observations_carry_the_trace_and_provider_facts() {
+        use crate::causal_tree::store::RecordedToolCall;
+        use crate::skills::lifecycle::{ObservedCallStatus, ProviderEnd};
+        use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
+        let call = |id: &str, status: &str| RecordedToolCall {
+            capability_id: id.to_string(),
+            status: status.to_string(),
+        };
+        let trace = ExecutionTraceSnapshot {
+            calls: vec![
+                call("shell:builtin:deploy_check", "success"),
+                call("shell:builtin:rm", "denied"),
+                call("shell:builtin:odd", "no-such-code"),
+            ],
+            denied_attempts: 1,
+            ..ExecutionTraceSnapshot::default()
+        };
+        let down = ProviderExecutionOutcome::failed_for_decision(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            chrono::Utc::now(),
+            &anyhow::anyhow!("request timed out"),
+        );
+        let seen = observations_from(&trace, Some(&down));
+        assert_eq!(seen.provider, ProviderEnd::Unavailable);
+        assert_eq!(seen.denied_attempts, 1);
+        assert!(seen.complete);
+        assert_eq!(
+            seen.tool_calls.iter().map(|c| c.status).collect::<Vec<_>>(),
+            vec![ObservedCallStatus::Succeeded, ObservedCallStatus::Denied],
+            "a code the lifecycle does not know is dropped, not guessed"
+        );
+
+        // No outcome and no attempts: unknown, never served. An open trace is incomplete.
+        let open = ExecutionTraceSnapshot {
+            incomplete: true,
+            ..ExecutionTraceSnapshot::default()
+        };
+        let seen = observations_from(&open, None);
+        assert_eq!(seen.provider, ProviderEnd::Unknown);
+        assert!(!seen.complete);
     }
 }

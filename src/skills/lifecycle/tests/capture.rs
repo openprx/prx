@@ -290,6 +290,7 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
         task_id: "task-term",
         terminal_receipt_id: "term-9",
         outcome: ExperienceOutcome::Failure,
+        observations: None,
     };
     let joined = on_task_terminal(tmp.path(), &who, &terminal)
         .expect("test: terminal")
@@ -311,6 +312,7 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
         task_id: "task-term",
         terminal_receipt_id: "term-9",
         outcome: ExperienceOutcome::Success,
+        observations: None,
     };
     assert!(on_task_terminal(tmp.path(), &who, &conflicting).is_err());
     let mut reissued = false;
@@ -327,6 +329,7 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
         task_id: "task-none",
         terminal_receipt_id: "term-0",
         outcome: ExperienceOutcome::Success,
+        observations: None,
     };
     assert!(
         on_task_terminal(tmp.path(), &who, &untouched)

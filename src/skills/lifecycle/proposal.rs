@@ -234,9 +234,10 @@ pub struct ProposalBasis {
     pub failed_tasks_on_baseline: usize,
     /// Distinct root tasks that contradict the patterns on the same revision.
     pub contradicting_tasks: usize,
-    /// Always `false` today: the experience record carries no adherence fact,
-    /// so "the guidance was loaded but not followed" cannot be excluded from
-    /// stored facts alone. The failure class stays asserted on that axis.
+    /// `true` when every supporting experience carries a verified adherence
+    /// fact for the baseline revision (its declared tools were called) and
+    /// positively no infrastructure or permission cause. Experiences whose
+    /// facts are unknown (older records) never qualify as support.
     pub adherence_verified: bool,
 }
 

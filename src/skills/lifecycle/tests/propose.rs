@@ -6,11 +6,11 @@ use crate::skills::lifecycle::proposal::ProposalStatus as Status;
 use crate::skills::lifecycle::propose::{CallResult, Prepare};
 use crate::skills::lifecycle::proposer_model::TallyCounters;
 use crate::skills::lifecycle::{
-    AttemptOutcome, Bundle, BundleEntry, ConsolidationRequest, Correlation, ExperienceOutcome, FailureClass,
-    KnowledgePattern, LifecycleError, ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, NewRejection,
-    NewRevision, PatternId, PatternScope, PinnedSkillRevision, ProposalFailureKind, ProposalOperation, ProposeOutcome,
-    ProposeRequest, ProposerBudget, ProposerModel, PublishRequest, ReportedUsage, SkillId, SkillLifecycleStore,
-    SourceKind, SuppressionStage, TransactionId, propose_revision,
+    Adherence, AttemptOutcome, Bundle, BundleEntry, ConsolidationRequest, Correlation, ExperienceOutcome, FactState,
+    FailureClass, KnowledgePattern, LifecycleError, ManagedProviderModel, ModelBinding, ModelCallError, ModelReply,
+    NewRejection, NewRevision, PatternId, PatternScope, PinnedSkillRevision, ProposalFailureKind, ProposalOperation,
+    ProposeOutcome, ProposeRequest, ProposerBudget, ProposerModel, PublishRequest, ReportedUsage, SkillAdherence,
+    SkillId, SkillLifecycleStore, SourceKind, SuppressionStage, TerminalFacts, TransactionId, propose_revision,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -24,6 +24,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "owner:ws:cli:alice";
+const DECLARED_TOOL: &str = "deploy_check";
 
 fn skill() -> SkillId {
     SkillId::parse("deploy-helper").expect("test: skill id")
@@ -67,9 +68,10 @@ fn fixture_with(skill_md: &str) -> Fixture {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
     let bundle = Bundle::from_entries(baseline_entries(skill_md)).expect("test: bundle");
-    let written = store
-        .write_revision(&NewRevision::new(skill(), SourceKind::Operator), &bundle)
-        .expect("test: write");
+    // The baseline declares one tool, so that following it is checkable.
+    let mut new = NewRevision::new(skill(), SourceKind::Operator);
+    new.capability_requirements = vec![DECLARED_TOOL.to_string()];
+    let written = store.write_revision(&new, &bundle).expect("test: write");
     activate(
         &store,
         &skill(),
@@ -91,10 +93,37 @@ fn fixture() -> Fixture {
 
 /// An experience that hydrated the pinned revision and ended as `outcome`.
 fn experience(f: &Fixture, pin: &PinnedSkillRevision, task: &str, outcome: ExperienceOutcome) -> String {
+    experience_with(f, pin, task, outcome, &verified_facts(pin))
+}
+
+/// Facts that hold a failure against the guidance: no infrastructure or
+/// permission cause, and the pinned revision's declared tool was called.
+fn verified_facts(pin: &PinnedSkillRevision) -> TerminalFacts {
+    TerminalFacts {
+        infrastructure_unavailable: FactState::Absent,
+        permission_refused: FactState::Absent,
+        adherence: vec![SkillAdherence {
+            skill_id: pin.skill_id.clone(),
+            revision_id: pin.revision_id.clone(),
+            verdict: Adherence::Followed,
+            missing: Vec::new(),
+        }],
+    }
+}
+
+fn experience_with(
+    f: &Fixture,
+    pin: &PinnedSkillRevision,
+    task: &str,
+    outcome: ExperienceOutcome,
+    facts: &TerminalFacts,
+) -> String {
     f.store
         .record_hydration(task, pin, "SKILL.md", b"x", &Correlation::default())
         .expect("test: hydrate");
-    f.store.join_terminal(task, "term", outcome).expect("test: join");
+    f.store
+        .join_terminal_with(task, "term", outcome, facts)
+        .expect("test: join");
     crate::skills::lifecycle::experience_id(f.store.owner_scope(), task)
 }
 
@@ -313,7 +342,10 @@ async fn a_bounded_candidate_is_staged_and_nothing_is_activated() {
     assert_eq!(proposal.pattern_ids, vec![pattern.pattern_id.clone()]);
     assert_eq!(proposal.evidence_ids.len(), 2);
     assert_eq!(proposal.basis.failed_tasks_on_baseline, 2);
-    assert!(!proposal.basis.adherence_verified);
+    assert!(
+        proposal.basis.adherence_verified,
+        "every support fact is a verified-adherence failure"
+    );
     assert_eq!(proposal.expected_generation, before.generation);
     assert_eq!(proposal.baseline_revision, before.revision_id);
     let diff = proposal.diff.as_ref().expect("test: diff");
@@ -1876,4 +1908,87 @@ async fn the_source_review_recomputes_the_edit_budget() {
         "{:?}",
         outcome.record.findings
     );
+}
+
+fn facts_for(pin: &PinnedSkillRevision, infra: FactState, permission: FactState, verdict: Adherence) -> TerminalFacts {
+    TerminalFacts {
+        infrastructure_unavailable: infra,
+        permission_refused: permission,
+        adherence: vec![SkillAdherence {
+            skill_id: pin.skill_id.clone(),
+            revision_id: pin.revision_id.clone(),
+            verdict,
+            missing: Vec::new(),
+        }],
+    }
+}
+
+/// Two failed tasks with `facts` back a pattern; the proposal must be refused
+/// before any model call.
+async fn refused_for(facts: &TerminalFacts, second: Option<&TerminalFacts>) -> String {
+    let f = fixture();
+    let a = experience_with(&f, &f.pin, "fact-1", ExperienceOutcome::Failure, facts);
+    let b = experience_with(
+        &f,
+        &f.pin,
+        "fact-2",
+        ExperienceOutcome::Failure,
+        second.unwrap_or(facts),
+    );
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("facts", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: the facts must keep the proposal out");
+    assert!(matches!(err, LifecycleError::ProposalRefused(_)), "{err}");
+    assert_eq!(model.calls(), 0, "refused before any model call");
+    assert!(
+        f.store.list_proposals().expect("test: list").is_empty(),
+        "nothing was recorded"
+    );
+    err.to_string()
+}
+
+#[tokio::test]
+async fn failures_caused_by_infrastructure_or_a_permission_refusal_are_not_evidence() {
+    let ok = |pin: &PinnedSkillRevision| verified_facts(pin);
+    let pin = fixture().pin;
+
+    let infra = facts_for(&pin, FactState::Present, FactState::Absent, Adherence::Followed);
+    let message = refused_for(&infra, None).await;
+    assert!(message.contains("2 excluded for infrastructure"), "{message}");
+
+    let denied = facts_for(&pin, FactState::Absent, FactState::Present, Adherence::Followed);
+    let message = refused_for(&denied, None).await;
+    assert!(message.contains("2 for a permission refusal"), "{message}");
+
+    // One honest failure is not enough once the other is excluded.
+    let message = refused_for(&ok(&pin), Some(&infra)).await;
+    assert!(message.contains("rests on 1 failed task"), "{message}");
+}
+
+#[tokio::test]
+async fn unverified_adherence_or_unknown_facts_keep_a_proposal_out() {
+    let pin = fixture().pin;
+    for facts in [
+        facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::Unknown),
+        facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::NotFollowed),
+        facts_for(&pin, FactState::Unknown, FactState::Absent, Adherence::Followed),
+        facts_for(&pin, FactState::Absent, FactState::Unknown, Adherence::Followed),
+        // The adherence entry is for another revision of the skill.
+        TerminalFacts {
+            adherence: Vec::new(),
+            ..facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::Followed)
+        },
+        // A record written before the facts existed.
+        TerminalFacts::default(),
+    ] {
+        let message = refused_for(&facts, None).await;
+        assert!(message.contains("2 for unknown or unverified facts"), "{message}");
+    }
 }

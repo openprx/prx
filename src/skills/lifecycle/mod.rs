@@ -27,6 +27,7 @@ mod capture;
 mod consolidate;
 mod evaluate;
 mod evaluator;
+mod facts;
 mod gate;
 mod gate_judge;
 mod generation;
@@ -75,6 +76,10 @@ pub use evaluate::{
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
+pub use facts::{
+    Adherence, Exclusion, FactState, MAX_ADHERENCE_NAMES, MAX_ADHERENCE_SKILLS, ObservedCallStatus, ObservedToolCall,
+    ProviderEnd, SkillAdherence, TerminalFacts, TerminalObservations,
+};
 pub use gate::{
     EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
     GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision, VerifiedGate,
